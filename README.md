@@ -1,18 +1,42 @@
 # @mirrorstack-ai/billing-engine
 
-Open-source billing calculation for [MirrorStack](https://mirrorstack.ai) modules.
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Transparent pricing — module developers can verify every line of their bill.
+Open-source billing and usage metering for [MirrorStack](https://mirrorstack.ai).
 
-## How billing works
+Transparent pricing — developers can verify every line of their bill.
 
-MirrorStack charges module usage based on three components:
+> **Status:** Early stage — documentation and design only. No implementation yet.
+>
+> Currently scoped to **App Module** billing (database, storage, compute).
+> Future: platform API usage, AI agent credits, bandwidth, and other billable resources.
+
+## Scope
+
+### Now: App Module billing
 
 ```
 Total cost = (compute + storage + io) × 1.2
 ```
 
-The **1.2× multiplier** covers platform overhead (monitoring, backups, security, support).
+Tracks database usage per (module, app) pair via PostgreSQL roles and `pg_stat_statements`.
+
+### Future: other billable resources
+
+| Resource | Status | Description |
+|----------|--------|-------------|
+| App Module (DB, compute, I/O) | Designing | Per-module database cost attribution |
+| Storage (S3 + R2) | Planned | File storage and CDN bandwidth |
+| AI Agent credits | Planned | MCP tool invocations, token usage |
+| Platform API | Planned | API call metering |
+| Bandwidth | Planned | Data transfer out |
+| Background jobs (ECS/SQS) | Planned | Video transcoding, heavy compute |
+
+The billing engine is designed to be **extensible** — each resource type implements a collector + calculator interface. App Module billing is the first implementation.
+
+## Pricing formula (App Modules)
+
+All costs include a **1.2× platform multiplier** covering monitoring, backups, security, and support.
 
 ### Compute (ACU)
 
@@ -20,7 +44,7 @@ The **1.2× multiplier** covers platform overhead (monitoring, backups, security
 tenant_compute = (tenant_exec_time / total_exec_time) × actual_acu_bill × 1.2
 ```
 
-Proportional to query execution time. If your module uses 10% of total DB compute time, you pay 10% of the ACU bill.
+Proportional to query execution time. Source: `pg_stat_statements` per role.
 
 ### Storage
 
@@ -28,7 +52,7 @@ Proportional to query execution time. If your module uses 10% of total DB comput
 tenant_storage = schema_size_gb × $0.12/GB-month × 1.2
 ```
 
-Measured per schema via `pg_total_relation_size`. Includes tables, indexes, and TOAST data.
+Measured per schema via `pg_total_relation_size`.
 
 ### I/O
 
@@ -36,27 +60,19 @@ Measured per schema via `pg_total_relation_size`. Includes tables, indexes, and 
 tenant_io = ((blks_read + blks_written) × 2) × $0.24/1M × 1.2
 ```
 
-Each PostgreSQL block = 8KB. Aurora bills per 4KB page, so blocks × 2 = Aurora I/O requests.
+PostgreSQL block = 8KB, Aurora bills per 4KB page, so blocks × 2.
 
-## Pricing table (ap-northeast-1 Tokyo)
+## Raw AWS costs vs MirrorStack pricing (ap-northeast-1 Tokyo)
 
-### Raw AWS costs
+| Component | AWS price | × 1.2 | Unit |
+|-----------|----------|-------|------|
+| ACU-hours | $0.20 | $0.24 | per ACU-hour |
+| Storage | $0.12 | $0.144 | per GB-month |
+| I/O requests | $0.24 | $0.288 | per 1M requests |
 
-| Component | AWS price | Unit |
-|-----------|----------|------|
-| ACU-hours | $0.20 | per ACU-hour |
-| Storage | $0.12 | per GB-month |
-| I/O requests | $0.24 | per 1M requests |
+## Developer-facing pricing (simplified)
 
-### MirrorStack pricing (× 1.2)
-
-| Component | Price | Unit |
-|-----------|-------|------|
-| Compute | Proportional to exec_time × 1.2 | of actual ACU bill |
-| Storage | $0.144 | per GB-month |
-| I/O | $0.288 | per 1M requests |
-
-### Developer-facing pricing (simplified)
+Internally we calculate compute + storage + I/O precisely. Developers see a simpler model:
 
 | Tier | Rows read | Storage | Price |
 |------|-----------|---------|-------|
@@ -64,47 +80,7 @@ Each PostgreSQL block = 8KB. Aurora bills per 4KB page, so blocks × 2 = Aurora 
 | Pro | 10M/month | 5GB | $10/month |
 | Overage | +$0.60/1M rows | +$0.30/GB | metered |
 
-Row-based pricing is a simplification of the formula above. Internally, compute + I/O are calculated precisely; externally, developers see rows + storage.
-
-## Metrics collected
-
-All metrics come from PostgreSQL — no custom instrumentation in the SDK.
-
-### Per-role (per module+app) from pg_stat_statements
-
-| Metric | Column | What | Billing use |
-|--------|--------|------|------------|
-| Query count | `calls` | Times executed | Volume indicator |
-| Execution time | `total_exec_time` | Wall-clock query time (ms) | **Compute attribution** |
-| Planning time | `total_plan_time` | Query planning time (ms) | Compute attribution |
-| Rows | `rows` | Rows read/written | Developer-facing metric |
-| Disk reads | `shared_blks_read` | 8KB blocks from disk | **Read I/O cost** |
-| Disk writes | `shared_blks_written` | 8KB blocks to disk | **Write I/O cost** |
-| Cache hits | `shared_blks_hit` | 8KB blocks from RAM | Memory pressure |
-| WAL bytes | `wal_bytes` | WAL volume generated | Write amplification |
-| I/O read time | `shared_blk_read_time` | Disk read wait (ms) | I/O attribution |
-| I/O write time | `shared_blk_write_time` | Disk write wait (ms) | I/O attribution |
-
-Attribution key: `pg_stat_statements.userid` → `pg_roles.rolname` → `mod_{moduleId}__app_{appId}`
-
-### Per-schema from pg_catalog
-
-| Metric | Source | What | Billing use |
-|--------|--------|------|------------|
-| Total size | `pg_total_relation_size` | Table + indexes + TOAST | **Storage cost** |
-| Table size | `pg_table_size` | Table + TOAST only | Base storage |
-| Index size | `pg_indexes_size` | All indexes | Index overhead |
-| Dead tuples | `pg_stat_user_tables.n_dead_tup` | Bloat | Wasted storage |
-| Row counts | `n_tup_ins/upd/del` | Write volume per table | Write tracking |
-
-### Cluster-wide from CloudWatch
-
-| Metric | Source | What | Billing use |
-|--------|--------|------|------------|
-| ACU capacity | `ServerlessDatabaseCapacity` | Current ACU level | **Actual ACU bill** to split proportionally |
-| Volume I/O | `VolumeReadIOPs/WriteIOPs` | Billed I/O count | Calibrate pg_stat_statements estimates |
-| Volume size | `VolumeBytesUsed` | Total Aurora storage | Verify per-schema totals |
-| Connections | `DatabaseConnections` | Open connections | Monitor per-role |
+Row-based pricing is a simplification — recalibrated monthly to stay within ±10% of actual costs.
 
 ## Collection architecture
 
@@ -116,17 +92,54 @@ Every 60s:
 
 Daily:
   EventBridge → Lambda → aggregates daily totals
-    → writes to _billing.daily(role, date, metrics)
     → calculates cost per (module, app) pair
 
 Monthly:
   billing service → sums daily → applies tiers → generates invoice
 ```
 
+## Project structure (planned)
+
+```
+billing-engine/
+  collector/             — metric collection interface
+    pgstat/              — pg_stat_statements poller (App Modules)
+    storage/             — S3/R2 usage collector (future)
+    agent/               — AI agent credit tracker (future)
+  calculator/            — pricing formula per resource type
+    module/              — App Module cost calculation
+    storage/             — S3/R2 cost calculation (future)
+    agent/               — AI agent credit calculation (future)
+  estimator/             — CLI tool for cost prediction
+  pricing/               — pricing tables per region
+  docs/
+    formula.md           — detailed billing formula with examples
+    metrics.md           — complete metrics reference
+```
+
+## Extensibility
+
+Each billable resource implements two interfaces:
+
+```go
+// Collector gathers raw usage metrics
+type Collector interface {
+    Snapshot(ctx context.Context) ([]Metric, error)
+    Delta(ctx context.Context, prev, curr []Metric) []Delta
+}
+
+// Calculator turns raw metrics into costs
+type Calculator interface {
+    Calculate(deltas []Delta, pricing PricingTable) []Cost
+    Estimate(params EstimateParams) Cost
+}
+```
+
+Adding a new billable resource = implement Collector + Calculator, register in the billing pipeline.
+
 ## Required PostgreSQL configuration
 
 ```sql
--- Aurora parameter group
 shared_preload_libraries = 'pg_stat_statements'
 track_io_timing = on
 pg_stat_statements.track = top
@@ -134,18 +147,10 @@ pg_stat_statements.track_planning = on
 pg_stat_statements.max = 10000
 ```
 
-## Project structure
+## Documentation
 
-```
-billing-engine/
-  collector/       — polls pg_stat_statements, stores deltas
-  calculator/      — applies pricing formula to raw metrics
-  estimator/       — CLI tool for cost prediction
-  pricing/         — pricing tables per region
-  docs/            — detailed documentation
-```
-
-> **Status:** Under development. Documentation first, implementation follows.
+- [Billing formula (detailed)](docs/formula.md) — compute attribution, storage, I/O, calibration, example bill
+- [Metrics reference](docs/metrics.md) — every metric from pg_stat_statements, pg_catalog, CloudWatch
 
 ## License
 
