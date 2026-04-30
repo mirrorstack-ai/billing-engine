@@ -32,6 +32,43 @@ jobs:
         with:
           go-version: "1.26"
 
+      - name: Create schema
+        env:
+          PGHOST: localhost
+          PGUSER: mirrorstack
+          PGPASSWORD: mirrorstack
+          PGDATABASE: mirrorstack
+        run: |
+          psql -c "CREATE SCHEMA IF NOT EXISTS ms_billing_account;"
+
+      - name: Run migrations
+        env:
+          PGHOST: localhost
+          PGUSER: mirrorstack
+          PGPASSWORD: mirrorstack
+          PGDATABASE: mirrorstack
+        run: |
+          for f in migrations/account/*.up.sql; do
+            echo "Applying $f"
+            psql -f "$f"
+          done
+
+      - name: Validate migrations (down + up idempotent)
+        env:
+          PGHOST: localhost
+          PGUSER: mirrorstack
+          PGPASSWORD: mirrorstack
+          PGDATABASE: mirrorstack
+        run: |
+          for f in $(ls -r migrations/account/*.down.sql); do
+            echo "Rolling back $f"
+            psql -f "$f"
+          done
+          for f in migrations/account/*.up.sql; do
+            echo "Re-applying $f"
+            psql -f "$f"
+          done
+
       - name: Vet
         run: go vet ./...
 
