@@ -10,16 +10,24 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	chiadapter "github.com/awslabs/aws-lambda-go-api-proxy/chi"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	accountdb "github.com/mirrorstack-ai/billing-engine/internal/account/db"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/handler"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/service"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/middleware"
+	mstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 var adapter *chiadapter.ChiLambda
@@ -40,10 +48,47 @@ func buildRouter() *chi.Mux {
 	// #6 mount their handlers inside this group.
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.InternalSecret())
-		// handlers added by #5/#6
+		r.Post("/billing-portal/create", buildBillingPortalHandler())
 	})
 
 	return r
+}
+
+// buildBillingPortalHandler wires the billing-portal handler lazily: the
+// DB pool and Stripe client are constructed on the first request, not at
+// process init, so missing env vars surface as 5xx (logged) rather than
+// crashing the whole Lambda. Once initialised, the handler is reused.
+func buildBillingPortalHandler() http.HandlerFunc {
+	var (
+		once sync.Once
+		h    http.HandlerFunc
+		err  error
+	)
+	return func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() {
+			pool, perr := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+			if perr != nil {
+				err = perr
+				return
+			}
+			client, cerr := mstripe.NewClient()
+			if cerr != nil {
+				err = cerr
+				return
+			}
+			reader := accountdb.NewBillingAccountLookupQueries(pool)
+			svc := service.NewBillingPortalService(reader, client.API.V1BillingPortalSessions)
+			h = handler.NewBillingPortalHandler(svc).Create
+		})
+		if err != nil || h == nil {
+			slog.ErrorContext(r.Context(), "billing-portal handler init failed", "error", errors.Join(err))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"init_failed","message":"handler not ready"}}`))
+			return
+		}
+		h(w, r)
+	}
 }
 
 func health(w http.ResponseWriter, _ *http.Request) {
