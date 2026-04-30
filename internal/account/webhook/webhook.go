@@ -4,14 +4,17 @@
 // The flow is:
 //
 //	1. Verify the Stripe-Signature header against STRIPE_WEBHOOK_SECRET.
-//	2. Dedupe by event.id against webhook_events_processed (created in #2).
-//	3. Dispatch to a per-event-type handler stub (real handlers land in #8).
-//	4. Always return 200 once the event is recorded — Stripe retries
-//	   non-2xx, and we do not want a buggy handler to cause infinite redelivery.
+//	2. Open a pgx transaction.
+//	3. Insert into billing_webhook_events_processed for idempotency.
+//	4. Dispatch to a per-event-type handler that writes into the
+//	   account mirror tables on the SAME transaction.
+//	5. Commit on handler success, ROLLBACK on handler error so the
+//	   dedup row also disappears and Stripe's retry hits a fresh attempt.
 //
 // Bad signature is the only case that returns 4xx; everything else
-// (unknown event type, handler error, replay) returns 200 so Stripe
-// stops retrying and we surface the problem in our own logs/metrics.
+// (unknown event type, replay) returns 200 so Stripe stops retrying.
+// Handler errors and DB errors return 500 to trigger a Stripe retry —
+// because the dedup row was rolled back, the retry won't be a no-op.
 package webhook
 
 import (
@@ -19,23 +22,24 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 	"github.com/stripe/stripe-go/v85"
 	stripewebhook "github.com/stripe/stripe-go/v85/webhook"
 )
 
-// EventDB is the subset of pgx the webhook needs. Defined as an
-// interface so unit tests can supply a mock without standing up Postgres.
+// EventDB is the narrow interface needed to orchestrate the per-delivery
+// transaction. It exists so tests can mock it without standing up Postgres.
 type EventDB interface {
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
-// HandlerFunc handles a single decoded Stripe event. Real handlers
-// land in #8; the skeleton uses log-only stubs.
-type HandlerFunc func(ctx context.Context, event stripe.Event) error
+// HandlerFunc handles a single decoded Stripe event. It receives the same
+// pgx.Tx that already owns the dedup-row insert, so any writes happen
+// atomically with idempotency tracking.
+type HandlerFunc func(ctx context.Context, tx pgx.Tx, event stripe.Event) error
 
-// Handler is the webhook entrypoint. It owns the signing secret, the
-// dedup table, and the dispatch map. Construct one per Lambda cold-start.
+// Handler is the webhook entrypoint. It owns the signing secret, the DB
+// pool, and the dispatch map. Construct one per Lambda cold-start.
 type Handler struct {
 	secret   string
 	db       EventDB
@@ -45,15 +49,16 @@ type Handler struct {
 }
 
 // markProcessedSQL inserts the event id and reports a conflict via
-// RowsAffected()==0. The table is owned by migration #2.
+// RowsAffected()==0. Schema-qualified because the Lambda role's
+// search_path is not guaranteed to include ms_billing_account.
 const markProcessedSQL = `
-INSERT INTO webhook_events_processed (stripe_event_id, processed_at)
+INSERT INTO ms_billing_account.billing_webhook_events_processed (stripe_event_id, processed_at)
 VALUES ($1, now())
 ON CONFLICT (stripe_event_id) DO NOTHING
 `
 
 // NewHandler wires a Handler with the default Stripe verification path
-// and the default stub dispatch table for #7.
+// and the production dispatch table (real handlers from handlers.go).
 func NewHandler(secret string, db EventDB) *Handler {
 	return &Handler{
 		secret:   secret,
@@ -80,15 +85,23 @@ func (h *Handler) Process(ctx context.Context, payload []byte, sigHeader string)
 
 	logger := slog.With("event_id", event.ID, "event_type", event.Type)
 
-	inserted, err := h.markProcessed(ctx, event.ID)
+	tx, err := h.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		// We failed to record the dedup row. Returning 5xx here would
-		// trigger a Stripe retry, which is what we want — a transient
-		// DB blip should not silently drop the event.
+		logger.ErrorContext(ctx, "failed to begin webhook transaction", "error", err)
+		return Result{StatusCode: 500, Body: "tx begin failed"}
+	}
+	// Rollback is a no-op once Commit has succeeded, so deferring it is
+	// safe and guarantees we never leak a transaction on an early return.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	inserted, err := markProcessed(ctx, tx, event.ID)
+	if err != nil {
 		logger.ErrorContext(ctx, "failed to record webhook event", "error", err)
 		return Result{StatusCode: 500, Body: "dedup write failed"}
 	}
 	if !inserted {
+		// Already processed in a previous delivery. Roll back the
+		// no-op insert and tell Stripe we're done.
 		logger.InfoContext(ctx, "webhook event already processed, skipping dispatch")
 		return Result{StatusCode: 200, Body: "duplicate"}
 	}
@@ -97,23 +110,37 @@ func (h *Handler) Process(ctx context.Context, payload []byte, sigHeader string)
 	if !ok {
 		// Unknown event types should not 4xx; Stripe may add new types
 		// and we do not want them to wedge delivery for the fleet.
+		// We commit the dedup row so we don't re-process the same
+		// uninteresting event on every retry cycle.
+		if err := tx.Commit(ctx); err != nil {
+			logger.ErrorContext(ctx, "failed to commit dedup row for ignored event", "error", err)
+			return Result{StatusCode: 500, Body: "commit failed"}
+		}
 		logger.InfoContext(ctx, "no handler registered for event type")
 		return Result{StatusCode: 200, Body: "ignored"}
 	}
 
-	if err := handler(ctx, event); err != nil {
-		// Handler errors are logged and swallowed — the dedup row is
-		// already committed, so a retry would skip dispatch anyway.
-		// Real handlers in #8 are expected to be idempotent and surface
-		// their own retry signals via metrics, not via webhook 5xx.
+	if err := handler(ctx, tx, event); err != nil {
+		// Critical: returning 500 here causes the deferred Rollback to
+		// fire, which removes the dedup row inserted earlier in this
+		// tx. Stripe will retry, and the retry will see no dedup row
+		// and re-attempt the handler. This is the whole point of the
+		// transaction-based approach — without it, a transient handler
+		// error becomes a permanent silent drop.
 		logger.ErrorContext(ctx, "event handler returned error", "error", err)
+		return Result{StatusCode: 500, Body: "handler failed"}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		logger.ErrorContext(ctx, "failed to commit webhook transaction", "error", err)
+		return Result{StatusCode: 500, Body: "commit failed"}
 	}
 	return Result{StatusCode: 200, Body: "ok"}
 }
 
 // markProcessed inserts the event id; returns true iff the row was new.
-func (h *Handler) markProcessed(ctx context.Context, eventID string) (bool, error) {
-	tag, err := h.db.Exec(ctx, markProcessedSQL, eventID)
+func markProcessed(ctx context.Context, tx pgx.Tx, eventID string) (bool, error) {
+	tag, err := tx.Exec(ctx, markProcessedSQL, eventID)
 	if err != nil {
 		return false, fmt.Errorf("mark webhook event processed: %w", err)
 	}
@@ -128,23 +155,4 @@ func verifyStripeSignature(payload []byte, sigHeader, secret string) (stripe.Eve
 	return stripewebhook.ConstructEventWithOptions(payload, sigHeader, secret, stripewebhook.ConstructEventOptions{
 		IgnoreAPIVersionMismatch: true,
 	})
-}
-
-// defaultDispatch registers stub handlers for the event types we care
-// about in #8. Each stub logs and returns nil; #8 replaces them with
-// real subscription/invoice sync logic.
-func defaultDispatch() map[string]HandlerFunc {
-	stub := func(name string) HandlerFunc {
-		return func(ctx context.Context, event stripe.Event) error {
-			slog.InfoContext(ctx, fmt.Sprintf("received event %s id=%s", name, event.ID))
-			return nil
-		}
-	}
-	return map[string]HandlerFunc{
-		"customer.subscription.created": stub("customer.subscription.created"),
-		"customer.subscription.updated": stub("customer.subscription.updated"),
-		"customer.subscription.deleted": stub("customer.subscription.deleted"),
-		"invoice.paid":                  stub("invoice.paid"),
-		"invoice.payment_failed":        stub("invoice.payment_failed"),
-	}
 }
