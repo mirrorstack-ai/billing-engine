@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,15 +19,44 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	chiadapter "github.com/awslabs/aws-lambda-go-api-proxy/chi"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/handler"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/service"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/middleware"
+	mstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
-var adapter *chiadapter.ChiLambda
+// subscriptions is the handler for /subscriptions/* routes. Set by main()
+// at startup; unit tests on this package may leave it nil because the
+// only routes they exercise (/__health) do not depend on it.
+var subscriptions *handler.Subscriptions
 
 func init() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-	adapter = chiadapter.New(buildRouter())
+}
+
+// mustBuildSubscriptions wires the subscriptions handler from env. Fails
+// fast at cold-start if DATABASE_URL or STRIPE_SECRET_KEY is missing.
+func mustBuildSubscriptions() *handler.Subscriptions {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		slog.Error("DATABASE_URL not set")
+		os.Exit(1)
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		slog.Error("failed to create pgx pool", "error", err)
+		os.Exit(1)
+	}
+	stripeClient, err := mstripe.NewClient()
+	if err != nil {
+		slog.Error("failed to create stripe client", "error", err)
+		os.Exit(1)
+	}
+	svc := service.NewSubscriptions(db.NewBillingAccounts(pool), service.NewStripeAdapter(stripeClient))
+	return handler.NewSubscriptions(svc)
 }
 
 func buildRouter() *chi.Mux {
@@ -36,11 +66,12 @@ func buildRouter() *chi.Mux {
 	// Public health probe — no auth, used by load balancers and uptime checks.
 	r.Get("/__health", health)
 
-	// Everything else is gated on the internal shared secret. Issues #5 and
-	// #6 mount their handlers inside this group.
+	// Everything else is gated on the internal shared secret.
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.InternalSecret())
-		// handlers added by #5/#6
+		if subscriptions != nil {
+			r.Post("/subscriptions/create", subscriptions.Create)
+		}
 	})
 
 	return r
@@ -80,7 +111,11 @@ func (s *statusRecorder) WriteHeader(code int) {
 }
 
 func main() {
+	subscriptions = mustBuildSubscriptions()
+	router := buildRouter()
+
 	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+		adapter := chiadapter.New(router)
 		lambda.Start(adapter.ProxyWithContext)
 		return
 	}
@@ -89,7 +124,7 @@ func main() {
 		port = "8091"
 	}
 	slog.Info("account-api starting", "port", port)
-	if err := http.ListenAndServe(":"+port, buildRouter()); err != nil {
+	if err := http.ListenAndServe(":"+port, router); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
