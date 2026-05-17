@@ -1,45 +1,63 @@
 // Command account-webhook is the Stripe webhook receiver Lambda.
 //
-// v1 bootstrap: signature-verifies the incoming webhook against
-// STRIPE_WEBHOOK_SECRET and returns 200. The real event-routing
-// logic (subscription updates, invoice paid/failed, etc.) lands in
-// subsequent PRs once the matching handlers under
-// internal/account/webhook/ are wired.
+// Thin adapter: HTTP body + Stripe-Signature header in, HTTP status
+// out. All real logic lives in internal/account/webhook so it can be
+// unit-tested without a Lambda or API Gateway harness.
 //
-// Lambda-only. There is no local dev path — use unit tests for
-// signature-verify iteration; use `stripe trigger` against a
-// deployed staging for end-to-end runs.
+// Lambda-only. There is no local HTTP path — local iteration uses
+// unit tests; end-to-end testing uses `stripe listen --forward-to`
+// against deployed staging.
+//
+// Spec: mirrorstack-docs/api/billing/account-webhook.md.
 package main
 
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"os"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/stripe/stripe-go/v85/webhook"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
-// stripeSigHeader is the canonical name. API Gateway lower-cases
-// header names in the proxy event, so we look up both forms.
 const stripeSigHeader = "Stripe-Signature"
 
-var webhookSecret string
+var router *webhook.Router
 
 func init() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 
-	webhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
+	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
 	if webhookSecret == "" {
-		// Fail fast at cold-start rather than silently accepting every
-		// request as bad-signature. Catches misconfigured deploys.
 		slog.Error("STRIPE_WEBHOOK_SECRET not set")
 		os.Exit(1)
 	}
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		slog.Error("DATABASE_URL not set")
+		os.Exit(1)
+	}
+
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		slog.Error("pgxpool init failed", "error", err)
+		os.Exit(1)
+	}
+
+	verifier := billingstripe.NewVerifier(webhookSecret)
+	store := webhook.NewStore(pool)
+	router = webhook.NewRouter(verifier, store, slog.Default())
 }
 
+// proxyHandler is the Lambda entrypoint. Uses APIGatewayProxyRequest
+// (REST API / v1 proxy shape) because api-platform's existing API
+// Gateway already deploys behind it.
 func proxyHandler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	sig := req.Headers[stripeSigHeader]
 	if sig == "" {
@@ -50,42 +68,37 @@ func proxyHandler(ctx context.Context, req events.APIGatewayProxyRequest) (event
 	body, err := decodeBody(req)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to decode webhook body", "error", err)
-		return jsonResponse(400, "invalid body"), nil
+		return jsonResponse(400, webhook.StatusInvalidBody), nil
 	}
 
-	event, err := webhook.ConstructEvent(body, sig, webhookSecret)
-	if err != nil {
-		slog.WarnContext(ctx, "signature verify failed", "error", err)
-		return jsonResponse(400, "bad signature"), nil
-	}
-
-	// Real event routing lands in a subsequent PR. For now we
-	// acknowledge receipt so Stripe's webhook view shows green.
-	slog.InfoContext(ctx, "webhook received", "event_id", event.ID, "type", event.Type)
-	return jsonResponse(200, "ok"), nil
+	res := router.Process(ctx, body, sig)
+	return jsonResponse(res.HTTPStatus, res.Status), nil
 }
 
 func decodeBody(req events.APIGatewayProxyRequest) ([]byte, error) {
 	if req.IsBase64Encoded {
-		// Stripe's signature is over the raw bytes; base64-encoded
-		// proxy events must be decoded before verification.
+		// Stripe's signature is computed over the raw bytes; base64-
+		// encoded proxy events must be decoded before verification.
 		return base64.StdEncoding.DecodeString(req.Body)
 	}
 	return []byte(req.Body), nil
 }
 
-func jsonResponse(status int, msg string) events.APIGatewayProxyResponse {
+func jsonResponse(status int, statusBody webhook.Status) events.APIGatewayProxyResponse {
+	body, _ := json.Marshal(map[string]string{"status": string(statusBody)})
 	return events.APIGatewayProxyResponse{
 		StatusCode: status,
 		Headers:    map[string]string{"Content-Type": "application/json"},
-		Body:       `{"status":"` + msg + `"}`,
+		Body:       string(body),
 	}
 }
 
 func main() {
 	if !isLambda() {
-		// Local dev path: refuse to start without a runtime so
-		// developers don't accidentally think a stub server is live.
+		// account-webhook is Lambda-only in v1. Refuse to start outside
+		// the Lambda runtime so developers don't accidentally think a
+		// stub server is live. Use unit tests for local iteration;
+		// `stripe trigger` against deployed staging for end-to-end.
 		slog.Error("account-webhook is only runnable inside AWS Lambda; use unit tests for local iteration")
 		os.Exit(1)
 	}
