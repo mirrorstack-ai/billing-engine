@@ -23,8 +23,15 @@ func NewService(store Store, stripe billingstripe.Client) *Service {
 }
 
 // Ensure is the read-only gate. Pure DB read; no Stripe API call;
-// no DB write. Returns response.Missing populated when the user
-// is not in a payable state.
+// no DB write. Returns response.Missing populated for each requested
+// capability the user does not have.
+//
+// Caller specifies what to verify via req.Require. Default (empty
+// Require) checks payment_method only — PaaS/BaaS first. Subscription
+// is currently a v1 stub: req.Require containing "subscription"
+// always returns "subscription" in Missing because the subscriptions
+// table doesn't yet ship; this is honest behavior, not a bug. Real
+// subscription checks land when ms_billing.subscriptions ships in v2.
 //
 // Note: a missing user row in ms_account.users is NOT detected here —
 // billing-engine doesn't have authoritative read access to that table.
@@ -36,8 +43,21 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 		return nil, InvalidInput("user_id required")
 	}
 
+	// Default + validate the Require list.
+	require := req.Require
+	if len(require) == 0 {
+		require = []string{RequirePaymentMethod}
+	}
+	for _, r := range require {
+		if r != RequirePaymentMethod && r != RequireSubscription {
+			return nil, InvalidInput("unknown require: " + r)
+		}
+	}
+
 	resp := &EnsureResponse{Missing: []string{}}
 
+	// A missing accounts row blocks every capability — no point checking
+	// further. Return early with just "billing_account" in Missing.
 	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
@@ -47,14 +67,34 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 		return resp, nil
 	}
 
-	hasPM, err := s.store.HasUsablePaymentMethod(ctx, accountID)
-	if err != nil {
-		return nil, Internal("payment-method lookup failed", err)
+	// Per-capability checks. Order is fixed (payment_method before
+	// subscription) so the Missing slice is deterministic regardless of
+	// the request's Require ordering.
+	if contains(require, RequirePaymentMethod) {
+		hasPM, err := s.store.HasUsablePaymentMethod(ctx, accountID)
+		if err != nil {
+			return nil, Internal("payment-method lookup failed", err)
+		}
+		if !hasPM {
+			resp.Missing = append(resp.Missing, MissingPaymentMethod)
+		}
 	}
-	if !hasPM {
-		resp.Missing = append(resp.Missing, MissingPaymentMethod)
+	if contains(require, RequireSubscription) {
+		// v1 stub: subscriptions table not yet shipped, so no user
+		// has an active subscription. Always missing. Real check
+		// against ms_billing.subscriptions lands in v2.
+		resp.Missing = append(resp.Missing, MissingSubscription)
 	}
 	return resp, nil
+}
+
+func contains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
 
 // PrepareAddPaymentMethod implements the one-shot setup flow:
