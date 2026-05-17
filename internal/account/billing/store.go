@@ -51,17 +51,22 @@ type pgxStore struct {
 	pool *pgxpool.Pool
 }
 
+// advisoryLockNamespaceBillingAccountUser is the first argument to
+// pg_advisory_xact_lock(int, int) for EnsureAccount's per-user lock.
+// Using the 2-arg form (namespace, key) means the per-user key occupies
+// a full 32-bit space without colliding with unrelated advisory locks
+// across the codebase — hashtext alone collides at ~65K users (birthday
+// paradox on int32) and would silently serialize unrelated users.
+const advisoryLockNamespaceBillingAccountUser = 0x6c627461 // "lbta" — billing_account, easy to grep
+
 func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UUID, string, error) {
 	var id uuid.UUID
 	var stripeCustomerID string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		// Per-user advisory lock serializes concurrent EnsureAccount
-		// calls for the same user across all backends. Held for the
-		// duration of the transaction. The namespace prefix
-		// 'billing_account:user:' avoids collisions with unrelated
-		// advisory locks in the same database.
-		const lockQ = `SELECT pg_advisory_xact_lock(hashtext('billing_account:user:' || $1::text)::bigint)`
-		if _, err := tx.Exec(ctx, lockQ, userID); err != nil {
+		// pg_advisory_xact_lock(namespace, key) serializes concurrent
+		// EnsureAccount calls per user. Held for the transaction duration.
+		const lockQ = `SELECT pg_advisory_xact_lock($1::int, hashtext($2::text))`
+		if _, err := tx.Exec(ctx, lockQ, advisoryLockNamespaceBillingAccountUser, userID); err != nil {
 			return err
 		}
 
@@ -91,10 +96,27 @@ func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UU
 	return id, stripeCustomerID, nil
 }
 
+// ErrAccountNotFound is returned when SetStripeCustomer can't find the
+// account row to update. Service layer maps this to billing.Internal —
+// it means the EnsureAccount→SetStripeCustomer happy-path broke (the
+// row was just inserted/selected in the same RPC), so the orphan
+// reconciliation runbook should be checked.
+var ErrAccountNotFound = errors.New("billing account row not found for update")
+
 func (s *pgxStore) SetStripeCustomer(ctx context.Context, accountID uuid.UUID, stripeCustomerID string) error {
 	const q = `UPDATE ms_billing.accounts SET stripe_customer_id = $2 WHERE id = $1`
-	_, err := s.pool.Exec(ctx, q, accountID, stripeCustomerID)
-	return err
+	tag, err := s.pool.Exec(ctx, q, accountID, stripeCustomerID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// Zero rows: the account_id we just ensured doesn't match any
+		// row. Almost certainly a code bug; surface it instead of
+		// silently proceeding to a CreateSetupIntent that points at a
+		// Stripe Customer with no DB anchor.
+		return ErrAccountNotFound
+	}
+	return nil
 }
 
 func (s *pgxStore) AccountByUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, bool, error) {

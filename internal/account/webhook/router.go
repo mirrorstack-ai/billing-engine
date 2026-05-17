@@ -91,11 +91,19 @@ type Router struct {
 	log      *slog.Logger
 }
 
-// NewRouter wires a Router. All three dependencies are required.
-// If log is nil, slog.Default() is used.
+// NewRouter wires a Router. All three dependencies are required; nil
+// values panic at construction. The strict checks catch wiring bugs
+// at startup rather than silently falling back to defaults that would
+// mask the misconfiguration in production.
 func NewRouter(verifier billingstripe.Verifier, store Store, log *slog.Logger) *Router {
+	if verifier == nil {
+		panic("webhook.NewRouter: verifier must not be nil")
+	}
+	if store == nil {
+		panic("webhook.NewRouter: store must not be nil")
+	}
 	if log == nil {
-		log = slog.Default()
+		panic("webhook.NewRouter: log must not be nil")
 	}
 	return &Router{verifier: verifier, store: store, log: log}
 }
@@ -131,15 +139,15 @@ func (r *Router) Process(ctx context.Context, payload []byte, signature string) 
 // "unhandled" so Stripe doesn't retry events we deliberately ignore.
 func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 	switch event.Type {
-	case "customer.created":
+	case stripego.EventTypeCustomerCreated:
 		return r.handleCustomerCreated(ctx, event)
-	case "customer.updated":
+	case stripego.EventTypeCustomerUpdated:
 		return r.handleCustomerUpdated(ctx, event)
-	case "customer.deleted":
+	case stripego.EventTypeCustomerDeleted:
 		return r.handleCustomerDeleted(ctx, event)
-	case "payment_method.attached":
+	case stripego.EventTypePaymentMethodAttached:
 		return r.handlePaymentMethodAttached(ctx, event)
-	case "payment_method.detached":
+	case stripego.EventTypePaymentMethodDetached:
 		return r.handlePaymentMethodDetached(ctx, event)
 	default:
 		r.log.InfoContext(ctx, "webhook unhandled event", "event_id", event.ID, "type", event.Type)

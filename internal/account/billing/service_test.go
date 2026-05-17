@@ -201,7 +201,7 @@ func TestEnsure_RequireSubscription_AlwaysMissing_v1Stub(t *testing.T) {
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  userID,
-		Require: []string{billing.RequireSubscription},
+		Require: []billing.Capability{billing.RequireSubscription},
 	})
 
 	require.NoError(t, err)
@@ -221,7 +221,7 @@ func TestEnsure_RequirePaymentMethodAndSubscription_BothRequired(t *testing.T) {
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  userID,
-		Require: []string{billing.RequirePaymentMethod, billing.RequireSubscription},
+		Require: []billing.Capability{billing.RequirePaymentMethod, billing.RequireSubscription},
 	})
 
 	require.NoError(t, err)
@@ -239,7 +239,7 @@ func TestEnsure_RequireBoth_NoPM_BothMissing(t *testing.T) {
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  userID,
-		Require: []string{billing.RequirePaymentMethod, billing.RequireSubscription},
+		Require: []billing.Capability{billing.RequirePaymentMethod, billing.RequireSubscription},
 	})
 
 	require.NoError(t, err)
@@ -256,7 +256,7 @@ func TestEnsure_NoAccountRow_BillingAccountAlone(t *testing.T) {
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  uuid.New(),
-		Require: []string{billing.RequirePaymentMethod, billing.RequireSubscription},
+		Require: []billing.Capability{billing.RequirePaymentMethod, billing.RequireSubscription},
 	})
 
 	require.NoError(t, err)
@@ -268,7 +268,7 @@ func TestEnsure_UnknownRequire_InvalidInput(t *testing.T) {
 
 	_, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  uuid.New(),
-		Require: []string{"some_future_thing"},
+		Require: []billing.Capability{"some_future_thing"},
 	})
 
 	require.Error(t, err)
@@ -318,6 +318,22 @@ func TestPrepareAddPaymentMethod_StripeCustomerFails_ReturnsStripeError(t *testi
 	var be *billing.Error
 	require.ErrorAs(t, err, &be)
 	require.Equal(t, billing.CodeStripeError, be.Code)
+}
+
+func TestPrepareAddPaymentMethod_SetStripeCustomerFails_ReturnsInternal(t *testing.T) {
+	// Stripe Customer creates OK but persisting the ID fails. This is a
+	// DB error, not a Stripe error — INTERNAL is the honest code.
+	store := newFakeStore()
+	store.errSetStripeCustomer = errors.New("pool exhausted")
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake)
+
+	_, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: uuid.New()})
+
+	require.Error(t, err)
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInternal, be.Code)
 }
 
 func TestPrepareAddPaymentMethod_NilUserID_InvalidInput(t *testing.T) {
