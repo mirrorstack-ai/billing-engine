@@ -189,6 +189,94 @@ func TestEnsure_StoreError_BecomesInternal(t *testing.T) {
 	require.Equal(t, billing.CodeInternal, be.Code)
 }
 
+func TestEnsure_RequireSubscription_AlwaysMissing_v1Stub(t *testing.T) {
+	// v1 has no subscriptions table; the handler stubs subscription as
+	// always-missing regardless of state.
+	store := newFakeStore()
+	userID := uuid.New()
+	accountID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	store.hasUsablePM[accountID] = true // even with a PM, subscription is missing
+	svc := billing.NewService(store, &fakeStripe{})
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  userID,
+		Require: []string{billing.RequireSubscription},
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ready())
+	require.Equal(t, []string{billing.MissingSubscription}, resp.Missing)
+}
+
+func TestEnsure_RequirePaymentMethodAndSubscription_BothRequired(t *testing.T) {
+	// PM met, subscription stubbed-missing → Missing should be just
+	// ["subscription"]. Order is deterministic (PM before subscription).
+	store := newFakeStore()
+	userID := uuid.New()
+	accountID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	store.hasUsablePM[accountID] = true
+	svc := billing.NewService(store, &fakeStripe{})
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  userID,
+		Require: []string{billing.RequirePaymentMethod, billing.RequireSubscription},
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ready())
+	require.Equal(t, []string{billing.MissingSubscription}, resp.Missing)
+}
+
+func TestEnsure_RequireBoth_NoPM_BothMissing(t *testing.T) {
+	store := newFakeStore()
+	userID := uuid.New()
+	accountID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	// hasUsablePM[accountID] is false (default zero value)
+	svc := billing.NewService(store, &fakeStripe{})
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  userID,
+		Require: []string{billing.RequirePaymentMethod, billing.RequireSubscription},
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ready())
+	// Deterministic order: payment_method first, then subscription.
+	require.Equal(t, []string{billing.MissingPaymentMethod, billing.MissingSubscription}, resp.Missing)
+}
+
+func TestEnsure_NoAccountRow_BillingAccountAlone(t *testing.T) {
+	// Even when Require includes subscription, a missing accounts row
+	// short-circuits to just ["billing_account"] — there's nothing else
+	// the handler can usefully check.
+	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  uuid.New(),
+		Require: []string{billing.RequirePaymentMethod, billing.RequireSubscription},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{billing.MissingBillingAccount}, resp.Missing)
+}
+
+func TestEnsure_UnknownRequire_InvalidInput(t *testing.T) {
+	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+
+	_, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  uuid.New(),
+		Require: []string{"some_future_thing"},
+	})
+
+	require.Error(t, err)
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInvalidInput, be.Code)
+}
+
 func TestPrepareAddPaymentMethod_FirstTime_CreatesCustomerAndSetupIntent(t *testing.T) {
 	store := newFakeStore()
 	stripeFake := &fakeStripe{}
