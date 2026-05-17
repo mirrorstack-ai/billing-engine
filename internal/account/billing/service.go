@@ -2,6 +2,7 @@ package billing
 
 import (
 	"context"
+	"slices"
 
 	"github.com/google/uuid"
 
@@ -43,21 +44,23 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 		return nil, InvalidInput("user_id required")
 	}
 
-	// Default + validate the Require list.
+	// Default + validate the Require list. Capability is a typed string,
+	// so unknown values from in-process callers can't compile; the
+	// runtime validation here catches JSON-deserialized requests that
+	// might carry arbitrary strings from across the lambda.Invoke boundary.
 	require := req.Require
 	if len(require) == 0 {
-		require = []string{RequirePaymentMethod}
+		require = []Capability{RequirePaymentMethod}
 	}
 	for _, r := range require {
 		if r != RequirePaymentMethod && r != RequireSubscription {
-			return nil, InvalidInput("unknown require: " + r)
+			return nil, InvalidInput("unknown require: " + string(r))
 		}
 	}
 
 	resp := &EnsureResponse{Missing: []string{}}
 
-	// A missing accounts row blocks every capability — no point checking
-	// further. Return early with just "billing_account" in Missing.
+	// Missing billing account short-circuits: per-capability checks need account_id.
 	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
@@ -67,10 +70,9 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 		return resp, nil
 	}
 
-	// Per-capability checks. Order is fixed (payment_method before
-	// subscription) so the Missing slice is deterministic regardless of
-	// the request's Require ordering.
-	if contains(require, RequirePaymentMethod) {
+	// Per-capability checks. Order is fixed (PM before subscription) so
+	// the Missing slice is deterministic regardless of Require ordering.
+	if slices.Contains(require, RequirePaymentMethod) {
 		hasPM, err := s.store.HasUsablePaymentMethod(ctx, accountID)
 		if err != nil {
 			return nil, Internal("payment-method lookup failed", err)
@@ -79,33 +81,23 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 			resp.Missing = append(resp.Missing, MissingPaymentMethod)
 		}
 	}
-	if contains(require, RequireSubscription) {
-		// v1 stub: subscriptions table not yet shipped, so no user
-		// has an active subscription. Always missing. Real check
-		// against ms_billing.subscriptions lands in v2.
+	if slices.Contains(require, RequireSubscription) {
+		// v1: subscriptions table not yet shipped; always missing.
 		resp.Missing = append(resp.Missing, MissingSubscription)
 	}
 	return resp, nil
 }
 
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
-}
-
 // PrepareAddPaymentMethod implements the one-shot setup flow:
 //  1. INSERT or SELECT the accounts row (idempotent on user_id).
-//  2. Create the Stripe Customer if not yet present; record its ID.
+//  2. If no Stripe Customer yet: create one and persist its ID.
 //  3. Create a fresh SetupIntent and return its client_secret.
 //
-// Failure mode: if step 2 succeeds Stripe-side but step 2b
-// (SetStripeCustomer) fails, an orphan Stripe Customer is created.
-// Operational recovery via metadata lookup; not addressed in v1
-// handler.
+// Failure mode: step 2's "create then persist" pair is non-atomic. If
+// CreateCustomer succeeds but SetStripeCustomer fails, an orphan Stripe
+// Customer exists with no DB row pointing at it. Operational recovery
+// via Stripe metadata reconciliation (metadata.billing_account_id is
+// stable); not addressed in the v1 handler.
 func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPaymentMethodRequest) (*PrepareAddPaymentMethodResponse, error) {
 	if req.UserID == uuid.Nil {
 		return nil, InvalidInput("user_id required")
@@ -124,12 +116,11 @@ func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPay
 		}
 		stripeCustomerID = cust.ID
 		if err := s.store.SetStripeCustomer(ctx, accountID, stripeCustomerID); err != nil {
-			// Orphan Stripe Customer; see failure-mode note above. We
-			// still return STRIPE_ERROR rather than INTERNAL because the
-			// caller's retry path is clear (try again; idempotency on
-			// (owner_kind, owner_user_id) covers the row, and metadata
-			// reconciliation covers the Customer).
-			return nil, StripeError("set stripe_customer_id failed", err)
+			// DB write failure, not a Stripe API failure — INTERNAL is
+			// the honest code. The orphan-Customer recovery path is
+			// covered by the operational reconciliation job; the caller's
+			// retry is also safe (row exists; second attempt reuses it).
+			return nil, Internal("persist stripe_customer_id failed", err)
 		}
 	}
 

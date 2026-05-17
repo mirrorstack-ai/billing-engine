@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	stripego "github.com/stripe/stripe-go/v85"
 )
@@ -102,7 +103,8 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 
 // handlePaymentMethodDetached soft-deletes the mirror row. Idempotent:
 // a detached event for an already-soft-deleted row (e.g. Stripe retry
-// after another agent did the same delete) is a no-op.
+// after another agent did the same delete) is a no-op but logged so
+// monitoring can distinguish "expected retry" from "never-mirrored PM".
 func (r *Router) handlePaymentMethodDetached(ctx context.Context, event stripego.Event) Result {
 	pm, err := decodePaymentMethod(event)
 	if err != nil {
@@ -110,11 +112,16 @@ func (r *Router) handlePaymentMethodDetached(ctx context.Context, event stripego
 		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
 	}
 	if pm.ID == "" {
+		r.log.WarnContext(ctx, "payment_method.detached missing pm.ID", "event_id", event.ID)
 		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
 	}
-	if _, err := r.store.SoftDeletePaymentMethod(ctx, pm.ID); err != nil {
+	found, err := r.store.SoftDeletePaymentMethod(ctx, pm.ID)
+	if err != nil {
 		r.log.ErrorContext(ctx, "payment_method.detached soft-delete failed", "event_id", event.ID, "error", err)
 		return Result{HTTPStatus: 500, Status: StatusInternal}
+	}
+	if !found {
+		r.log.InfoContext(ctx, "payment_method.detached no-op: pm not in mirror", "event_id", event.ID, "stripe_payment_method_id", pm.ID)
 	}
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
@@ -126,7 +133,16 @@ func (r *Router) handlePaymentMethodDetached(ctx context.Context, event stripego
 // rather than re-decoding the whole event (Event.Data also exposes
 // `Object` but as a map[string]any; the typed struct is cleaner).
 
+// errNilEventData guards against a structurally valid but malformed
+// event payload where Verify accepts the signature but Data is nil.
+// In practice stripe-go's webhook.ConstructEvent populates Data, but
+// the nil check costs nothing and prevents a panic in production.
+var errNilEventData = errors.New("event.Data is nil")
+
 func decodeCustomer(event stripego.Event) (*stripego.Customer, error) {
+	if event.Data == nil {
+		return nil, errNilEventData
+	}
 	var c stripego.Customer
 	if err := json.Unmarshal(event.Data.Raw, &c); err != nil {
 		return nil, err
@@ -135,6 +151,9 @@ func decodeCustomer(event stripego.Event) (*stripego.Customer, error) {
 }
 
 func decodePaymentMethod(event stripego.Event) (*stripego.PaymentMethod, error) {
+	if event.Data == nil {
+		return nil, errNilEventData
+	}
 	var pm stripego.PaymentMethod
 	if err := json.Unmarshal(event.Data.Raw, &pm); err != nil {
 		return nil, err

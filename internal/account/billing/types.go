@@ -9,29 +9,33 @@ package billing
 
 import "github.com/google/uuid"
 
+// Capability is a typed string for the EnsureRequest.Require vocabulary.
+// Typing the slice prevents callers from passing arbitrary strings;
+// unknown values can't reach the handler in the first place.
+type Capability string
+
+const (
+	RequirePaymentMethod Capability = "payment_method"
+	RequireSubscription  Capability = "subscription"
+)
+
 // EnsureRequest is the payload of the Ensure RPC.
 //
-// Require lists the capabilities the caller wants verified for the user.
-// Defaults to [RequirePaymentMethod] when empty — preserves the PaaS/
-// BaaS-first behavior. The handler checks each requested capability
-// independently and returns the union of unmet capabilities in
-// EnsureResponse.Missing.
-//
-// Valid Require values: RequirePaymentMethod, RequireSubscription.
-// Unknown values produce an INVALID_INPUT error.
+// Require lists the capabilities the caller wants verified. Defaults
+// to [RequirePaymentMethod] when empty (PaaS/BaaS-first behavior).
+// Each requested capability is checked independently; the union of
+// unmet ones appears in EnsureResponse.Missing.
 type EnsureRequest struct {
-	UserID  uuid.UUID `json:"user_id"`
-	Require []string  `json:"require,omitempty"`
+	UserID  uuid.UUID    `json:"user_id"`
+	Require []Capability `json:"require,omitempty"`
 }
 
 // EnsureResponse is the body of the Ensure RPC's success response
 // envelope (the outer envelope adds {"ok": true, "response": …}).
 //
-// Missing is empty when the user has every required capability. When
-// non-empty, the entries are drawn from
-// {"billing_account", "payment_method", "subscription"}.
-// api-platform surfaces these to web-account as a 402 with
-// code: "billing_not_ready" and a per-entry CTA.
+// Missing is empty when every required capability is met. Entries are
+// drawn from {"billing_account", "payment_method", "subscription"}.
+// api-platform surfaces these to web-account as 402 + per-entry CTA.
 type EnsureResponse struct {
 	Missing []string `json:"missing"`
 }
@@ -39,16 +43,9 @@ type EnsureResponse struct {
 // Ready returns true when the user has every required capability.
 func (r *EnsureResponse) Ready() bool { return len(r.Missing) == 0 }
 
-// Request-side vocabulary: values valid in EnsureRequest.Require.
-const (
-	RequirePaymentMethod = "payment_method"
-	RequireSubscription  = "subscription"
-)
-
 // Response-side vocabulary: values that may appear in EnsureResponse.Missing.
-// billing_account is implicit (always checked first when any other
-// capability is requested); payment_method / subscription mirror the
-// Require constants 1:1.
+// Kept as plain strings because they're a wire-format projection; not all
+// Missing values have Require counterparts (billing_account doesn't).
 const (
 	MissingBillingAccount = "billing_account"
 	MissingPaymentMethod  = "payment_method"
