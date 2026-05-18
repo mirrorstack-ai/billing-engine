@@ -1,4 +1,4 @@
-.PHONY: db db-init db-reset test test-integration lint build
+.PHONY: db db-init db-reset test test-integration lint build dev-webhook
 
 # Start infrastructure (Postgres)
 db:
@@ -32,3 +32,10 @@ lint:
 # Build
 build:
 	go build ./...
+
+# Run the local-HTTP webhook receiver. Requires STRIPE_WEBHOOK_SECRET
+# and DATABASE_URL set in the environment (load .env.local first).
+# Pair with `stripe listen --forward-to localhost:8092/webhook` to
+# receive real test-mode events from your Stripe sandbox.
+dev-webhook:
+	cd cmd/account-webhook && go run .
