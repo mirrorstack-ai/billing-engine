@@ -30,9 +30,10 @@ import (
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/httputil"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/middleware"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -132,19 +133,11 @@ func makeHTTPHandler(d *dispatcher, action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, buildResponse(nil, billing.InvalidInput("failed to read body: "+err.Error())))
+			httputil.JSON(w, http.StatusBadRequest, buildResponse(nil, billing.InvalidInput("failed to read body: "+err.Error())))
 			return
 		}
 		resp, err := d.dispatch(r.Context(), action, body)
-		writeJSON(w, httpStatusForError(err), buildResponse(resp, err))
-	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload rpcResponse) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		slog.Error("encode response failed", "error", err)
+		httputil.JSON(w, httpStatusForError(err), buildResponse(resp, err))
 	}
 }
 
@@ -155,31 +148,13 @@ var disp *dispatcher
 func init() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 
-	pool := mustPgxPool()
-	stripeKey := os.Getenv("STRIPE_SECRET_KEY")
-	if stripeKey == "" {
-		slog.Error("STRIPE_SECRET_KEY not set")
-		os.Exit(1)
-	}
+	pool := config.MustPgxPool()
+	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 
 	store := billing.NewStore(pool)
 	stripeClient := billingstripe.NewClient(stripeKey)
 	svc := billing.NewService(store, stripeClient)
 	disp = &dispatcher{svc: svc}
-}
-
-func mustPgxPool() *pgxpool.Pool {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		slog.Error("DATABASE_URL not set")
-		os.Exit(1)
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		slog.Error("pgxpool init failed", "error", err)
-		os.Exit(1)
-	}
-	return pool
 }
 
 func buildRouter(d *dispatcher) *chi.Mux {
@@ -234,10 +209,10 @@ func (s *statusRecorder) WriteHeader(code int) {
 
 // --- lambda.Invoke entry point -------------------------------------------
 
-// lambdaInvokeHandler is the entry point when AWS_LAMBDA_FUNCTION_NAME
-// is set. Payload is the RPC envelope; response is the marshaled
-// envelope. Errors from dispatch flow through the envelope's ok=false
-// path; the Go-level error return is reserved for marshaling failures.
+// lambdaInvokeHandler is the entry point when running inside Lambda.
+// Payload is the RPC envelope; response is the marshaled envelope.
+// Errors from dispatch flow through the envelope's ok=false path; the
+// Go-level error return is reserved for marshaling failures.
 func lambdaInvokeHandler(ctx context.Context, payload json.RawMessage) (json.RawMessage, error) {
 	var env rpcEnvelope
 	if err := json.Unmarshal(payload, &env); err != nil {
@@ -248,14 +223,11 @@ func lambdaInvokeHandler(ctx context.Context, payload json.RawMessage) (json.Raw
 }
 
 func main() {
-	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+	if config.IsLambda() {
 		lambda.Start(lambdaInvokeHandler)
 		return
 	}
-	port := os.Getenv("ACCOUNT_API_PORT")
-	if port == "" {
-		port = "8091"
-	}
+	port := config.Port("ACCOUNT_API_PORT", "8091")
 	slog.Info("account-api starting", "port", port, "mode", "http-local")
 	if err := http.ListenAndServe(":"+port, buildRouter(disp)); err != nil {
 		slog.Error("server error", "error", err)
