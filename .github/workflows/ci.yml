@@ -66,7 +66,7 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Test
+      - name: Test (unit)
         env:
           DB_HOST: localhost
           DB_PORT: "5432"
@@ -74,4 +74,12 @@ jobs:
           DB_PASSWORD: mirrorstack
           DB_NAME: mirrorstack
           DB_SSL_MODE: disable
-        run: go test -v -race -count=1 ./...
+        run: go test -race -count=1 ./...
+
+      # Integration tests use testcontainers-go to boot their own
+      # ephemeral Postgres container per test. They don't touch the
+      # workflow-level `services: postgres` block above — that block
+      # is for the migration-validation psql step. The GHA ubuntu-latest
+      # runner has Docker pre-installed, so testcontainers Just Works.
+      - name: Test (integration)
+        run: go test -tags=integration -race -count=1 -timeout=10m ./...
