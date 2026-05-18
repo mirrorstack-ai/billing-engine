@@ -1,0 +1,121 @@
+// Package webhooktest provides fakes for unit-testing code that
+// depends on the billingstripe.Verifier and webhook.Store interfaces.
+//
+// FakeStore is configurable: zero values give a "successful no-op"
+// store useful for happy-path tests; tests that need to assert calls
+// (router_test.go) read the recorded slices/maps; tests that need to
+// simulate failures (drift, DB down) set the Err* fields.
+package webhooktest
+
+import (
+	"context"
+	"io"
+	"log/slog"
+
+	stripego "github.com/stripe/stripe-go/v85"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+)
+
+// FakeVerifier implements billingstripe.Verifier. Configure Event for
+// the happy path or Err to simulate a verification failure.
+type FakeVerifier struct {
+	Event stripego.Event
+	Err   error
+}
+
+// Verify returns the configured Event and Err pair.
+func (f *FakeVerifier) Verify(_ []byte, _ string) (stripego.Event, error) {
+	return f.Event, f.Err
+}
+
+// FakeStore implements webhook.Store. The recording fields (Processed,
+// DefaultsSet, Inserts, SoftDeletes) capture every call so tests can
+// assert post-conditions; the boolean fields (TouchedFound, InsertFound,
+// SoftDelFound) drive the "found" return value of each method; the
+// Err* fields force a particular error path on demand.
+//
+// Use NewFakeStore() for sensible defaults — every "found" boolean
+// true, the Processed map initialized, no errors.
+type FakeStore struct {
+	// Recording
+	Processed   map[string]bool                     // event IDs seen by MarkEventProcessed
+	DefaultsSet []string                            // "customerID=defaultPM" pairs from SetDefaultPaymentMethod
+	Inserts     []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
+	SoftDeletes []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
+
+	// Found-flag knobs
+	TouchedFound bool // returned by TouchAccountByStripeCustomer
+	InsertFound  bool // returned by InsertPaymentMethod
+	SoftDelFound bool // returned by SoftDeletePaymentMethod
+
+	// Error injection
+	ErrMark       error // from MarkEventProcessed
+	ErrTouch      error // from TouchAccountByStripeCustomer
+	ErrSetDefault error // from SetDefaultPaymentMethod
+	ErrInsert     error // from InsertPaymentMethod
+	ErrSoftDel    error // from SoftDeletePaymentMethod
+}
+
+// NewFakeStore returns a FakeStore configured for happy-path tests:
+// every "found" boolean true, the Processed map initialized, no
+// errors injected.
+func NewFakeStore() *FakeStore {
+	return &FakeStore{
+		Processed:    map[string]bool{},
+		TouchedFound: true,
+		InsertFound:  true,
+		SoftDelFound: true,
+	}
+}
+
+func (s *FakeStore) MarkEventProcessed(_ context.Context, eventID, _ string) (bool, error) {
+	if s.ErrMark != nil {
+		return false, s.ErrMark
+	}
+	if s.Processed == nil {
+		s.Processed = map[string]bool{}
+	}
+	if s.Processed[eventID] {
+		return false, nil
+	}
+	s.Processed[eventID] = true
+	return true, nil
+}
+
+func (s *FakeStore) TouchAccountByStripeCustomer(_ context.Context, _ string) (bool, error) {
+	if s.ErrTouch != nil {
+		return false, s.ErrTouch
+	}
+	return s.TouchedFound, nil
+}
+
+func (s *FakeStore) SetDefaultPaymentMethod(_ context.Context, customerID, defaultPM string) error {
+	if s.ErrSetDefault != nil {
+		return s.ErrSetDefault
+	}
+	s.DefaultsSet = append(s.DefaultsSet, customerID+"="+defaultPM)
+	return nil
+}
+
+func (s *FakeStore) InsertPaymentMethod(_ context.Context, _ string, params webhook.InsertPaymentMethodParams) (bool, error) {
+	if s.ErrInsert != nil {
+		return false, s.ErrInsert
+	}
+	s.Inserts = append(s.Inserts, params)
+	return s.InsertFound, nil
+}
+
+func (s *FakeStore) SoftDeletePaymentMethod(_ context.Context, stripePMID string) (bool, error) {
+	if s.ErrSoftDel != nil {
+		return false, s.ErrSoftDel
+	}
+	s.SoftDeletes = append(s.SoftDeletes, stripePMID)
+	return s.SoftDelFound, nil
+}
+
+// SilentLogger returns a slog.Logger that discards all output. Useful
+// for tests that don't make logging assertions.
+func SilentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}

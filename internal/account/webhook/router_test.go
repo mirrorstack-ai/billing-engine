@@ -4,92 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook/webhooktest"
 )
-
-// --- fakes ----------------------------------------------------------------
-
-type fakeVerifier struct {
-	event stripego.Event
-	err   error
-}
-
-func (f *fakeVerifier) Verify(_ []byte, _ string) (stripego.Event, error) {
-	return f.event, f.err
-}
-
-type fakeStore struct {
-	processed     map[string]bool
-	touchedFound  bool
-	defaultsSet   []string
-	inserts       []webhook.InsertPaymentMethodParams
-	softDeletes   []string
-	insertFound   bool
-	softDelFound  bool
-	errMark       error
-	errTouch      error
-	errSetDefault error
-	errInsert     error
-	errSoftDel    error
-}
-
-func newFakeStore() *fakeStore {
-	return &fakeStore{
-		processed:    map[string]bool{},
-		touchedFound: true,
-		insertFound:  true,
-		softDelFound: true,
-	}
-}
-
-func (s *fakeStore) MarkEventProcessed(_ context.Context, eventID, _ string) (bool, error) {
-	if s.errMark != nil {
-		return false, s.errMark
-	}
-	if s.processed[eventID] {
-		return false, nil
-	}
-	s.processed[eventID] = true
-	return true, nil
-}
-
-func (s *fakeStore) TouchAccountByStripeCustomer(_ context.Context, _ string) (bool, error) {
-	if s.errTouch != nil {
-		return false, s.errTouch
-	}
-	return s.touchedFound, nil
-}
-
-func (s *fakeStore) SetDefaultPaymentMethod(_ context.Context, customerID, defaultPM string) error {
-	if s.errSetDefault != nil {
-		return s.errSetDefault
-	}
-	s.defaultsSet = append(s.defaultsSet, customerID+"="+defaultPM)
-	return nil
-}
-
-func (s *fakeStore) InsertPaymentMethod(_ context.Context, _ string, params webhook.InsertPaymentMethodParams) (bool, error) {
-	if s.errInsert != nil {
-		return false, s.errInsert
-	}
-	s.inserts = append(s.inserts, params)
-	return s.insertFound, nil
-}
-
-func (s *fakeStore) SoftDeletePaymentMethod(_ context.Context, stripePMID string) (bool, error) {
-	if s.errSoftDel != nil {
-		return false, s.errSoftDel
-	}
-	s.softDeletes = append(s.softDeletes, stripePMID)
-	return s.softDelFound, nil
-}
 
 // --- event builders -------------------------------------------------------
 
@@ -128,17 +50,15 @@ func cardPMEvent(id, eventType, pmID, customerID, brand, last4 string, expMonth,
 	}
 }
 
-var silentLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
-
-func newRouter(v *fakeVerifier, s *fakeStore) *webhook.Router {
-	return webhook.NewRouter(v, s, silentLogger)
+func newRouter(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore) *webhook.Router {
+	return webhook.NewRouter(v, s, webhooktest.SilentLogger())
 }
 
 // --- tests ----------------------------------------------------------------
 
 func TestProcess_BadSignature(t *testing.T) {
-	v := &fakeVerifier{err: errors.New("signature mismatch")}
-	r := newRouter(v, newFakeStore())
+	v := &webhooktest.FakeVerifier{Err: errors.New("signature mismatch")}
+	r := newRouter(v, webhooktest.NewFakeStore())
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
@@ -148,9 +68,9 @@ func TestProcess_BadSignature(t *testing.T) {
 
 func TestProcess_Duplicate(t *testing.T) {
 	event := customerEvent("evt_dup_1", "customer.created", "cus_x", "")
-	v := &fakeVerifier{event: event}
-	s := newFakeStore()
-	s.processed["evt_dup_1"] = true
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	s.Processed["evt_dup_1"] = true
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
@@ -160,9 +80,9 @@ func TestProcess_Duplicate(t *testing.T) {
 }
 
 func TestProcess_IdempotencyInsertError(t *testing.T) {
-	v := &fakeVerifier{event: customerEvent("evt_e", "customer.created", "cus_x", "")}
-	s := newFakeStore()
-	s.errMark = errors.New("db down")
+	v := &webhooktest.FakeVerifier{Event: customerEvent("evt_e", "customer.created", "cus_x", "")}
+	s := webhooktest.NewFakeStore()
+	s.ErrMark = errors.New("db down")
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
@@ -172,47 +92,47 @@ func TestProcess_IdempotencyInsertError(t *testing.T) {
 }
 
 func TestProcess_CustomerCreated_LogOnly(t *testing.T) {
-	v := &fakeVerifier{event: customerEvent("evt_c1", "customer.created", "cus_x", "")}
-	s := newFakeStore()
+	v := &webhooktest.FakeVerifier{Event: customerEvent("evt_c1", "customer.created", "cus_x", "")}
+	s := webhooktest.NewFakeStore()
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusOK, res.Status)
-	require.Empty(t, s.inserts)
-	require.Empty(t, s.softDeletes)
-	require.Empty(t, s.defaultsSet)
+	require.Empty(t, s.Inserts)
+	require.Empty(t, s.SoftDeletes)
+	require.Empty(t, s.DefaultsSet)
 }
 
 func TestProcess_CustomerUpdated_SyncsDefault(t *testing.T) {
-	v := &fakeVerifier{event: customerEvent("evt_u1", "customer.updated", "cus_x", "pm_default")}
-	s := newFakeStore()
+	v := &webhooktest.FakeVerifier{Event: customerEvent("evt_u1", "customer.updated", "cus_x", "pm_default")}
+	s := webhooktest.NewFakeStore()
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusOK, res.Status)
-	require.Equal(t, []string{"cus_x=pm_default"}, s.defaultsSet)
+	require.Equal(t, []string{"cus_x=pm_default"}, s.DefaultsSet)
 }
 
 func TestProcess_CustomerUpdated_NoAccountRow_DriftWarning(t *testing.T) {
-	v := &fakeVerifier{event: customerEvent("evt_u2", "customer.updated", "cus_orphan", "")}
-	s := newFakeStore()
-	s.touchedFound = false
+	v := &webhooktest.FakeVerifier{Event: customerEvent("evt_u2", "customer.updated", "cus_orphan", "")}
+	s := webhooktest.NewFakeStore()
+	s.TouchedFound = false
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusDriftWarning, res.Status)
-	require.Empty(t, s.defaultsSet)
+	require.Empty(t, s.DefaultsSet)
 }
 
 func TestProcess_CustomerDeleted_LogOnly(t *testing.T) {
-	v := &fakeVerifier{event: customerEvent("evt_d1", "customer.deleted", "cus_x", "")}
-	s := newFakeStore()
+	v := &webhooktest.FakeVerifier{Event: customerEvent("evt_d1", "customer.deleted", "cus_x", "")}
+	s := webhooktest.NewFakeStore()
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
@@ -222,26 +142,26 @@ func TestProcess_CustomerDeleted_LogOnly(t *testing.T) {
 }
 
 func TestProcess_PaymentMethodAttached_InsertsMirror(t *testing.T) {
-	v := &fakeVerifier{event: cardPMEvent("evt_pma1", "payment_method.attached", "pm_x", "cus_x", "visa", "4242", 12, 2029)}
-	s := newFakeStore()
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma1", "payment_method.attached", "pm_x", "cus_x", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusOK, res.Status)
-	require.Len(t, s.inserts, 1)
-	require.Equal(t, "pm_x", s.inserts[0].StripePaymentMethodID)
-	require.Equal(t, "visa", s.inserts[0].Brand)
-	require.Equal(t, "4242", s.inserts[0].Last4)
-	require.Equal(t, 12, s.inserts[0].ExpMonth)
-	require.Equal(t, 2029, s.inserts[0].ExpYear)
+	require.Len(t, s.Inserts, 1)
+	require.Equal(t, "pm_x", s.Inserts[0].StripePaymentMethodID)
+	require.Equal(t, "visa", s.Inserts[0].Brand)
+	require.Equal(t, "4242", s.Inserts[0].Last4)
+	require.Equal(t, 12, s.Inserts[0].ExpMonth)
+	require.Equal(t, 2029, s.Inserts[0].ExpYear)
 }
 
 func TestProcess_PaymentMethodAttached_NoAccountRow_DriftWarning(t *testing.T) {
-	v := &fakeVerifier{event: cardPMEvent("evt_pma2", "payment_method.attached", "pm_x", "cus_orphan", "visa", "4242", 12, 2029)}
-	s := newFakeStore()
-	s.insertFound = false
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma2", "payment_method.attached", "pm_x", "cus_orphan", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
+	s.InsertFound = false
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
@@ -251,32 +171,32 @@ func TestProcess_PaymentMethodAttached_NoAccountRow_DriftWarning(t *testing.T) {
 }
 
 func TestProcess_PaymentMethodDetached_SoftDeletes(t *testing.T) {
-	v := &fakeVerifier{event: cardPMEvent("evt_pmd1", "payment_method.detached", "pm_x", "cus_x", "visa", "4242", 12, 2029)}
-	s := newFakeStore()
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pmd1", "payment_method.detached", "pm_x", "cus_x", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusOK, res.Status)
-	require.Equal(t, []string{"pm_x"}, s.softDeletes)
+	require.Equal(t, []string{"pm_x"}, s.SoftDeletes)
 }
 
 func TestProcess_UnknownEvent_Acks(t *testing.T) {
-	v := &fakeVerifier{event: stripego.Event{
+	v := &webhooktest.FakeVerifier{Event: stripego.Event{
 		ID:   "evt_unknown",
 		Type: stripego.EventType("invoice.paid"),
 		Data: &stripego.EventData{Raw: []byte(`{}`)},
 	}}
-	s := newFakeStore()
+	s := webhooktest.NewFakeStore()
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusUnhandled, res.Status)
-	require.Empty(t, s.inserts)
-	require.Empty(t, s.softDeletes)
+	require.Empty(t, s.Inserts)
+	require.Empty(t, s.SoftDeletes)
 }
 
 func TestProcess_PaymentMethodAttached_NonCard_Unhandled(t *testing.T) {
@@ -286,17 +206,17 @@ func TestProcess_PaymentMethodAttached_NonCard_Unhandled(t *testing.T) {
 		"customer": map[string]any{"id": "cus_x"},
 	}
 	raw, _ := json.Marshal(payload)
-	v := &fakeVerifier{event: stripego.Event{
+	v := &webhooktest.FakeVerifier{Event: stripego.Event{
 		ID:   "evt_pma_sepa",
 		Type: stripego.EventType("payment_method.attached"),
 		Data: &stripego.EventData{Raw: raw},
 	}}
-	s := newFakeStore()
+	s := webhooktest.NewFakeStore()
 	r := newRouter(v, s)
 
 	res := r.Process(context.Background(), []byte(`{}`), "sig")
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusUnhandled, res.Status)
-	require.Empty(t, s.inserts)
+	require.Empty(t, s.Inserts)
 }
