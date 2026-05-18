@@ -80,4 +80,7 @@ make lint       # go vet
 make build      # go build ./...
 ```
 
-Local Lambda dev: `cd cmd/account-api && go run .` (default port 8091). The webhook receiver is Lambda-only — use unit tests for signature-verify iteration.
+Local Lambda dev:
+
+- `cd cmd/account-api && go run .` — account-api on `:8091`.
+- `make dev-webhook` (or `cd cmd/account-webhook && go run .`) — account-webhook on `:8092`. Pair with `stripe listen --forward-to localhost:8092/webhook` to receive real test-mode events. Override the port via `ACCOUNT_WEBHOOK_PORT`. Both binaries auto-detect Lambda (`AWS_LAMBDA_RUNTIME_API`) and fall back to local HTTP otherwise — same code, two transports.
