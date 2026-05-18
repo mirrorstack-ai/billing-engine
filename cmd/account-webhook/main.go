@@ -29,9 +29,10 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/httputil"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -49,15 +50,12 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	router := buildRouter()
 
-	if isLambda() {
+	if config.IsLambda() {
 		lambda.Start(proxyHandler(router))
 		return
 	}
 
-	port := os.Getenv("ACCOUNT_WEBHOOK_PORT")
-	if port == "" {
-		port = defaultLocalHTTPPort
-	}
+	port := config.Port("ACCOUNT_WEBHOOK_PORT", defaultLocalHTTPPort)
 	mux := http.NewServeMux()
 	mux.Handle(webhookPath, httpHandler(router))
 	slog.Info("local HTTP mode", "port", port, "path", webhookPath)
@@ -70,22 +68,8 @@ func main() {
 // buildRouter reads env vars and wires the pgxpool + verifier + store
 // + router.
 func buildRouter() *webhook.Router {
-	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
-	if webhookSecret == "" {
-		slog.Error("STRIPE_WEBHOOK_SECRET not set")
-		os.Exit(1)
-	}
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		slog.Error("DATABASE_URL not set")
-		os.Exit(1)
-	}
-
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		slog.Error("pgxpool init failed", "error", err)
-		os.Exit(1)
-	}
+	webhookSecret := config.MustEnv("STRIPE_WEBHOOK_SECRET")
+	pool := config.MustPgxPool()
 
 	verifier := billingstripe.NewVerifier(webhookSecret)
 	store := webhook.NewStore(pool)
@@ -144,7 +128,7 @@ func decodeBody(req events.APIGatewayProxyRequest) ([]byte, error) {
 }
 
 func proxyResponse(status int, statusBody webhook.Status) events.APIGatewayProxyResponse {
-	body, _ := json.Marshal(map[string]string{"status": string(statusBody)})
+	body, _ := json.Marshal(webhook.StatusEnvelope{Status: statusBody})
 	return events.APIGatewayProxyResponse{
 		StatusCode: status,
 		Headers:    map[string]string{"Content-Type": "application/json"},
@@ -153,11 +137,5 @@ func proxyResponse(status int, statusBody webhook.Status) events.APIGatewayProxy
 }
 
 func writeJSONResponse(w http.ResponseWriter, status int, statusBody webhook.Status) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(statusBody)})
-}
-
-func isLambda() bool {
-	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
+	httputil.JSON(w, status, webhook.StatusEnvelope{Status: statusBody})
 }

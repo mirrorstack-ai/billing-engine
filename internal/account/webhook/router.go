@@ -37,6 +37,14 @@ type Result struct {
 	Status     Status
 }
 
+// StatusEnvelope is the JSON wire shape returned to Stripe. Defined
+// here so every transport (Lambda proxy + local HTTP) marshals the
+// same `{"status":"<status>"}` body — kept next to Status so the
+// envelope and its allowed values evolve together.
+type StatusEnvelope struct {
+	Status Status `json:"status"`
+}
+
 // Store is the persistence surface the webhook router writes to.
 // Narrow on purpose — every method maps to a specific webhook side
 // effect — so tests can fake it in-process.

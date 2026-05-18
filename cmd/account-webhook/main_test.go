@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,62 +15,20 @@ import (
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook/webhooktest"
 )
 
-// stubVerifier implements billingstripe.Verifier for transport-layer
-// tests. Tests configure event (returned when err is nil) and err
-// (returned otherwise).
-type stubVerifier struct {
-	event stripego.Event
-	err   error
-}
-
-func (s *stubVerifier) Verify(_ []byte, _ string) (stripego.Event, error) {
-	if s.err != nil {
-		return stripego.Event{}, s.err
-	}
-	return s.event, nil
-}
-
-// stubStore implements webhook.Store with the minimum needed to drive
-// transport-layer tests through router.Process. firstTime controls the
-// idempotency-record outcome; the per-event handlers (TouchAccount, ...)
-// return successful zero values so unhandled-event tests don't trip.
-type stubStore struct {
-	firstTime bool
-}
-
-func (s *stubStore) MarkEventProcessed(_ context.Context, _, _ string) (bool, error) {
-	return s.firstTime, nil
-}
-
-func (s *stubStore) TouchAccountByStripeCustomer(_ context.Context, _ string) (bool, error) {
-	return true, nil
-}
-
-func (s *stubStore) SetDefaultPaymentMethod(_ context.Context, _, _ string) error {
-	return nil
-}
-
-func (s *stubStore) InsertPaymentMethod(_ context.Context, _ string, _ webhook.InsertPaymentMethodParams) (bool, error) {
-	return true, nil
-}
-
-func (s *stubStore) SoftDeletePaymentMethod(_ context.Context, _ string) (bool, error) {
-	return true, nil
-}
-
-func makeRouter(t *testing.T, verifier *stubVerifier, store *stubStore) *webhook.Router {
+func makeRouter(t *testing.T, verifier *webhooktest.FakeVerifier, store *webhooktest.FakeStore) *webhook.Router {
 	t.Helper()
-	return webhook.NewRouter(verifier, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return webhook.NewRouter(verifier, store, webhooktest.SilentLogger())
 }
 
 // --- httpHandler ----------------------------------------------------------
 
 func TestHTTPHandler_BadSignature(t *testing.T) {
 	router := makeRouter(t,
-		&stubVerifier{err: errors.New("signature mismatch")},
-		&stubStore{firstTime: true},
+		&webhooktest.FakeVerifier{Err: errors.New("signature mismatch")},
+		webhooktest.NewFakeStore(),
 	)
 	handler := httpHandler(router)
 
@@ -92,8 +49,8 @@ func TestHTTPHandler_BadSignature(t *testing.T) {
 
 func TestHTTPHandler_UnhandledEvent(t *testing.T) {
 	router := makeRouter(t,
-		&stubVerifier{event: stripego.Event{ID: "evt_unhandled", Type: "ping"}},
-		&stubStore{firstTime: true},
+		&webhooktest.FakeVerifier{Event: stripego.Event{ID: "evt_unhandled", Type: "ping"}},
+		webhooktest.NewFakeStore(),
 	)
 	handler := httpHandler(router)
 
@@ -113,9 +70,12 @@ func TestHTTPHandler_UnhandledEvent(t *testing.T) {
 }
 
 func TestHTTPHandler_Duplicate(t *testing.T) {
+	store := webhooktest.NewFakeStore()
+	store.Processed["evt_dup"] = true // pre-populated → MarkEventProcessed reports duplicate
+
 	router := makeRouter(t,
-		&stubVerifier{event: stripego.Event{ID: "evt_dup", Type: stripego.EventTypeCustomerCreated}},
-		&stubStore{firstTime: false},
+		&webhooktest.FakeVerifier{Event: stripego.Event{ID: "evt_dup", Type: stripego.EventTypeCustomerCreated}},
+		store,
 	)
 	handler := httpHandler(router)
 
@@ -138,8 +98,8 @@ func TestHTTPHandler_Duplicate(t *testing.T) {
 
 func TestProxyHandler_BadSignature(t *testing.T) {
 	router := makeRouter(t,
-		&stubVerifier{err: errors.New("signature mismatch")},
-		&stubStore{firstTime: true},
+		&webhooktest.FakeVerifier{Err: errors.New("signature mismatch")},
+		webhooktest.NewFakeStore(),
 	)
 	handler := proxyHandler(router)
 
@@ -163,8 +123,8 @@ func TestProxyHandler_LowercaseHeaderFallback(t *testing.T) {
 	// API Gateway REST APIs sometimes deliver headers lowercased; the
 	// handler probes both forms.
 	router := makeRouter(t,
-		&stubVerifier{event: stripego.Event{ID: "evt_lc", Type: "ping"}},
-		&stubStore{firstTime: true},
+		&webhooktest.FakeVerifier{Event: stripego.Event{ID: "evt_lc", Type: "ping"}},
+		webhooktest.NewFakeStore(),
 	)
 	handler := proxyHandler(router)
 
