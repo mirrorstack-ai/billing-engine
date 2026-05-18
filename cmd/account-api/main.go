@@ -32,9 +32,9 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/httputil"
-	"github.com/mirrorstack-ai/billing-engine/internal/shared/middleware"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -167,7 +167,7 @@ func buildRouter(d *dispatcher) *chi.Mux {
 	// Internal-secret-gated RPC routes.
 	internalSecret := os.Getenv("INTERNAL_SECRET")
 	r.Group(func(r chi.Router) {
-		r.Use(middleware.InternalSecret(internalSecret))
+		r.Use(auth.InternalSecret(internalSecret))
 		r.Post("/v1/billing.Ensure", makeHTTPHandler(d, "Ensure"))
 		r.Post("/v1/billing.PrepareAddPaymentMethod", makeHTTPHandler(d, "PrepareAddPaymentMethod"))
 		r.Post("/v1/billing.GetPaymentMethods", makeHTTPHandler(d, "GetPaymentMethods"))

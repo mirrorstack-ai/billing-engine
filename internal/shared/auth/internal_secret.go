@@ -1,10 +1,12 @@
-// Package middleware contains chi-compatible HTTP middleware shared by
-// billing-engine's account-api Lambda.
+// Package auth contains service-authentication middleware for
+// billing-engine's HTTP transports. Today it gates the X-MS-Internal-
+// Secret header used by api-platform → billing-engine internal calls;
+// future auth concerns (JWT, OAuth client verification) land here too.
 //
-// The package is intentionally small: only middleware that's shared
-// across multiple binaries belongs here. Per-route gates (e.g., admin
-// scope checks for a single route group) stay closer to their handler.
-package middleware
+// Naming matches api-platform/internal/shared/auth so a developer
+// moving between the two repos finds the same package name doing the
+// same job.
+package auth
 
 import (
 	"crypto/subtle"
