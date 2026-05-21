@@ -32,11 +32,27 @@ type realClient struct {
 // owner-migration (user → org) safe without re-keying Stripe — the
 // metadata value never changes once set; only the Postgres row's
 // owner_kind / owner_user_id / owner_org_id can shift.
-func (c *realClient) CreateCustomer(ctx context.Context, billingAccountID string) (*stripego.Customer, error) {
+func (c *realClient) CreateCustomer(ctx context.Context, billingAccountID, email string) (*stripego.Customer, error) {
 	params := &stripego.CustomerParams{}
 	params.Context = ctx
 	params.AddMetadata("billing_account_id", billingAccountID)
+	// Stripe requires an email to confirm a setup-mode Checkout Session
+	// (and uses it for receipts/dunning). Only set when present so an
+	// empty value doesn't get sent.
+	if email != "" {
+		params.Email = stripego.String(email)
+	}
 	return c.sc.Customers.New(params)
+}
+
+// UpdateCustomerEmail backfills the email on an existing Customer (one
+// created before email capture). Idempotent — setting the same value is
+// a no-op on Stripe's side.
+func (c *realClient) UpdateCustomerEmail(ctx context.Context, stripeCustomerID, email string) error {
+	params := &stripego.CustomerParams{Email: stripego.String(email)}
+	params.Context = ctx
+	_, err := c.sc.Customers.Update(stripeCustomerID, params)
+	return err
 }
 
 // CreateCheckoutSession creates a setup-mode Checkout Session

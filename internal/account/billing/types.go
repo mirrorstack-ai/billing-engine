@@ -55,6 +55,11 @@ const (
 // PrepareAddPaymentMethodRequest is the payload of PrepareAddPaymentMethod.
 type PrepareAddPaymentMethodRequest struct {
 	UserID uuid.UUID `json:"user_id"`
+	// Email is the account email, set on the Stripe Customer so a
+	// setup-mode Checkout Session can be confirmed (Stripe requires one)
+	// and for receipts/dunning. api-platform supplies it from the
+	// authenticated user; empty is tolerated but blocks confirm.
+	Email string `json:"email,omitempty"`
 }
 
 // PrepareAddPaymentMethodResponse is the body of the success envelope.
