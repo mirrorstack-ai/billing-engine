@@ -150,10 +150,13 @@ func init() {
 
 	pool := config.MustPgxPool()
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
+	// Post-confirmation redirect target for the setup-mode Checkout
+	// Session (the frontend billing page). Required by ui_mode=elements.
+	returnURL := config.MustEnv("BILLING_RETURN_URL")
 
 	store := billing.NewStore(pool)
 	stripeClient := billingstripe.NewClient(stripeKey)
-	svc := billing.NewService(store, stripeClient)
+	svc := billing.NewService(store, stripeClient, returnURL)
 	disp = &dispatcher{svc: svc}
 }
 
