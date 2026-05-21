@@ -87,7 +87,13 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 		)
 		INSERT INTO ms_billing.payment_methods_mirror
 			(account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default)
-		SELECT acct.id, $2, $3, $4, $5, $6, false
+		SELECT acct.id, $2, $3, $4, $5, $6,
+			-- First active card for the account becomes the default, so the
+			-- user always has a usable default without an explicit choice.
+			NOT EXISTS (
+				SELECT 1 FROM ms_billing.payment_methods_mirror p
+				WHERE p.account_id = acct.id AND p.deleted_at IS NULL
+			)
 		FROM acct
 		ON CONFLICT (stripe_payment_method_id) DO NOTHING
 	`

@@ -169,3 +169,44 @@ func (s *Service) GetPaymentMethods(ctx context.Context, req GetPaymentMethodsRe
 	}
 	return &GetPaymentMethodsResponse{PaymentMethods: methods}, nil
 }
+
+// DetachPaymentMethod detaches a saved card from the user's Stripe
+// Customer. Ownership is enforced via PaymentMethodTarget — the PM must
+// belong to the caller's account. The mirror row is soft-deleted
+// asynchronously by the payment_method.detached webhook.
+func (s *Service) DetachPaymentMethod(ctx context.Context, req DetachPaymentMethodRequest) (*DetachPaymentMethodResponse, error) {
+	if req.UserID == uuid.Nil || req.PaymentMethodID == uuid.Nil {
+		return nil, InvalidInput("user_id and payment_method_id required")
+	}
+	stripePMID, _, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
+	if err != nil {
+		return nil, Internal("payment method lookup failed", err)
+	}
+	if !found {
+		return nil, NotFound("payment method not found")
+	}
+	if err := s.stripe.DetachPaymentMethod(ctx, stripePMID); err != nil {
+		return nil, StripeError("detach payment method failed", err)
+	}
+	return &DetachPaymentMethodResponse{}, nil
+}
+
+// SetDefaultPaymentMethod points the user's Stripe Customer
+// invoice-settings default at the given card. Ownership-checked as above;
+// is_default is synced asynchronously by the customer.updated webhook.
+func (s *Service) SetDefaultPaymentMethod(ctx context.Context, req SetDefaultPaymentMethodRequest) (*SetDefaultPaymentMethodResponse, error) {
+	if req.UserID == uuid.Nil || req.PaymentMethodID == uuid.Nil {
+		return nil, InvalidInput("user_id and payment_method_id required")
+	}
+	stripePMID, stripeCustomerID, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
+	if err != nil {
+		return nil, Internal("payment method lookup failed", err)
+	}
+	if !found {
+		return nil, NotFound("payment method not found")
+	}
+	if err := s.stripe.SetDefaultPaymentMethod(ctx, stripeCustomerID, stripePMID); err != nil {
+		return nil, StripeError("set default payment method failed", err)
+	}
+	return &SetDefaultPaymentMethodResponse{}, nil
+}

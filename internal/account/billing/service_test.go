@@ -19,16 +19,25 @@ type fakeStore struct {
 	hasUsablePM      map[uuid.UUID]bool
 	paymentMethodsBy map[uuid.UUID][]billing.PaymentMethod
 
+	// PM-target lookups for detach / set-default, keyed by payment method id.
+	pmTargets map[uuid.UUID]pmTarget
+
 	// Injected failures (set per-test as needed).
-	errEnsureAccount      error
-	errSetStripeCustomer  error
-	errAccountByUser      error
-	errHasUsablePaymentMx error
-	errListPaymentMethods error
+	errEnsureAccount       error
+	errSetStripeCustomer   error
+	errAccountByUser       error
+	errHasUsablePaymentMx  error
+	errListPaymentMethods  error
+	errPaymentMethodTarget error
 }
 
 type fakeAccount struct {
 	id               uuid.UUID
+	stripeCustomerID string
+}
+
+type pmTarget struct {
+	stripePMID       string
 	stripeCustomerID string
 }
 
@@ -37,6 +46,7 @@ func newFakeStore() *fakeStore {
 		accountsByUser:   map[uuid.UUID]fakeAccount{},
 		hasUsablePM:      map[uuid.UUID]bool{},
 		paymentMethodsBy: map[uuid.UUID][]billing.PaymentMethod{},
+		pmTargets:        map[uuid.UUID]pmTarget{},
 	}
 }
 
@@ -91,17 +101,32 @@ func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) (
 	return s.paymentMethodsBy[accountID], nil
 }
 
+func (s *fakeStore) PaymentMethodTarget(_ context.Context, _ uuid.UUID, paymentMethodID uuid.UUID) (string, string, bool, error) {
+	if s.errPaymentMethodTarget != nil {
+		return "", "", false, s.errPaymentMethodTarget
+	}
+	t, ok := s.pmTargets[paymentMethodID]
+	if !ok {
+		return "", "", false, nil
+	}
+	return t.stripePMID, t.stripeCustomerID, true, nil
+}
+
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
 	createdCustomers         []string
 	createdCustomerEmails    []string
 	updatedEmails            []string // "customerID=email" per UpdateCustomerEmail call
+	detached                 []string // pm ids passed to DetachPaymentMethod
+	defaultsSet              []string // "customerID=pmID" per SetDefaultPaymentMethod
 	customerIDToReturn       string
 	checkoutSecretToReturn   string
 	errCreateCustomer        error
 	errCreateCheckoutSession error
 	errUpdateCustomerEmail   error
+	errDetach                error
+	errSetDefault            error
 }
 
 func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID, email string) (*stripego.Customer, error) {
@@ -134,6 +159,22 @@ func (f *fakeStripe) CreateCheckoutSession(_ context.Context, _, _ string) (*str
 		cs = "cs_test_secret_xyz"
 	}
 	return &stripego.CheckoutSession{ClientSecret: cs}, nil
+}
+
+func (f *fakeStripe) DetachPaymentMethod(_ context.Context, stripePaymentMethodID string) error {
+	if f.errDetach != nil {
+		return f.errDetach
+	}
+	f.detached = append(f.detached, stripePaymentMethodID)
+	return nil
+}
+
+func (f *fakeStripe) SetDefaultPaymentMethod(_ context.Context, stripeCustomerID, stripePaymentMethodID string) error {
+	if f.errSetDefault != nil {
+		return f.errSetDefault
+	}
+	f.defaultsSet = append(f.defaultsSet, stripeCustomerID+"="+stripePaymentMethodID)
+	return nil
 }
 
 // --- tests ----------------------------------------------------------------
@@ -417,4 +458,64 @@ func TestGetPaymentMethods_HasMethods_ReturnsAll(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.PaymentMethods, 2)
 	require.True(t, resp.PaymentMethods[0].IsDefault)
+}
+
+func TestDetachPaymentMethod_OwnedPM_DetachesFromStripe(t *testing.T) {
+	store := newFakeStore()
+	pmID := uuid.New()
+	store.pmTargets[pmID] = pmTarget{stripePMID: "pm_x", stripeCustomerID: "cus_x"}
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake, "")
+
+	_, err := svc.DetachPaymentMethod(context.Background(),
+		billing.DetachPaymentMethodRequest{UserID: uuid.New(), PaymentMethodID: pmID})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"pm_x"}, stripeFake.detached)
+}
+
+func TestDetachPaymentMethod_NotOwned_ReturnsNotFound(t *testing.T) {
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
+
+	_, err := svc.DetachPaymentMethod(context.Background(),
+		billing.DetachPaymentMethodRequest{UserID: uuid.New(), PaymentMethodID: uuid.New()})
+
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeNotFound, be.Code)
+}
+
+func TestDetachPaymentMethod_NilIDs_InvalidInput(t *testing.T) {
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
+
+	_, err := svc.DetachPaymentMethod(context.Background(), billing.DetachPaymentMethodRequest{})
+
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInvalidInput, be.Code)
+}
+
+func TestSetDefaultPaymentMethod_OwnedPM_SetsCustomerDefault(t *testing.T) {
+	store := newFakeStore()
+	pmID := uuid.New()
+	store.pmTargets[pmID] = pmTarget{stripePMID: "pm_y", stripeCustomerID: "cus_y"}
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake, "")
+
+	_, err := svc.SetDefaultPaymentMethod(context.Background(),
+		billing.SetDefaultPaymentMethodRequest{UserID: uuid.New(), PaymentMethodID: pmID})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"cus_y=pm_y"}, stripeFake.defaultsSet)
+}
+
+func TestSetDefaultPaymentMethod_NotOwned_ReturnsNotFound(t *testing.T) {
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
+
+	_, err := svc.SetDefaultPaymentMethod(context.Background(),
+		billing.SetDefaultPaymentMethodRequest{UserID: uuid.New(), PaymentMethodID: uuid.New()})
+
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeNotFound, be.Code)
 }

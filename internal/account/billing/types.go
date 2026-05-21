@@ -73,6 +73,26 @@ type PrepareAddPaymentMethodResponse struct {
 	ClientSecret     string    `json:"client_secret"`
 }
 
+// DetachPaymentMethodRequest is the payload of DetachPaymentMethod.
+type DetachPaymentMethodRequest struct {
+	UserID          uuid.UUID `json:"user_id"`
+	PaymentMethodID uuid.UUID `json:"payment_method_id"`
+}
+
+// DetachPaymentMethodResponse is the (empty) success body. The mirror row
+// is soft-deleted asynchronously by the payment_method.detached webhook.
+type DetachPaymentMethodResponse struct{}
+
+// SetDefaultPaymentMethodRequest is the payload of SetDefaultPaymentMethod.
+type SetDefaultPaymentMethodRequest struct {
+	UserID          uuid.UUID `json:"user_id"`
+	PaymentMethodID uuid.UUID `json:"payment_method_id"`
+}
+
+// SetDefaultPaymentMethodResponse is the (empty) success body. is_default
+// is synced asynchronously by the customer.updated webhook.
+type SetDefaultPaymentMethodResponse struct{}
+
 // GetPaymentMethodsRequest is the payload of GetPaymentMethods.
 type GetPaymentMethodsRequest struct {
 	UserID uuid.UUID `json:"user_id"`

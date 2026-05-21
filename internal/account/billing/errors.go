@@ -39,12 +39,16 @@ func (e *Error) Unwrap() error { return e.Wrapped }
 
 // Constructors. Use these instead of struct literals so the package
 // vocabulary stays narrow (grep for "billing.InvalidInput(" to find
-// every site that emits a given code). CodeNotFound has no constructor
-// in v1 — no RPC returns it — but the Code constant is kept so the
-// dispatch layer can map future errors uniformly without a vocabulary
-// change.
+// every site that emits a given code).
 func InvalidInput(msg string) *Error {
 	return &Error{Code: CodeInvalidInput, Message: msg}
+}
+
+// NotFound is returned when a requested resource (e.g. a payment method)
+// doesn't exist or isn't owned by the caller. The dispatch layer maps it
+// to HTTP 404 on the local path.
+func NotFound(msg string) *Error {
+	return &Error{Code: CodeNotFound, Message: msg}
 }
 
 func StripeError(msg string, wrapped error) *Error {

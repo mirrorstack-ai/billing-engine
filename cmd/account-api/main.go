@@ -84,6 +84,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.svc.GetPaymentMethods(ctx, req)
 
+	case "DetachPaymentMethod":
+		var req billing.DetachPaymentMethodRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.DetachPaymentMethod(ctx, req)
+
+	case "SetDefaultPaymentMethod":
+		var req billing.SetDefaultPaymentMethodRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.SetDefaultPaymentMethod(ctx, req)
+
 	default:
 		return nil, billing.InvalidInput("unknown action: " + action)
 	}
@@ -174,6 +188,8 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.Ensure", makeHTTPHandler(d, "Ensure"))
 		r.Post("/v1/billing.PrepareAddPaymentMethod", makeHTTPHandler(d, "PrepareAddPaymentMethod"))
 		r.Post("/v1/billing.GetPaymentMethods", makeHTTPHandler(d, "GetPaymentMethods"))
+		r.Post("/v1/billing.DetachPaymentMethod", makeHTTPHandler(d, "DetachPaymentMethod"))
+		r.Post("/v1/billing.SetDefaultPaymentMethod", makeHTTPHandler(d, "SetDefaultPaymentMethod"))
 	})
 
 	return r
