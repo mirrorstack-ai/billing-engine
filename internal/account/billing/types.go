@@ -59,12 +59,13 @@ type PrepareAddPaymentMethodRequest struct {
 
 // PrepareAddPaymentMethodResponse is the body of the success envelope.
 //
-// SetupIntentClientSecret is what web-account passes to Stripe Elements
-// to drive the client-side card-attach flow. It expires per Stripe's
-// SetupIntent lifecycle (usually 24 hours).
+// ClientSecret is the setup-mode Checkout Session client secret that
+// web-account passes to Stripe's CheckoutElementsProvider to drive the
+// client-side card-attach flow. It expires per Stripe's Checkout
+// Session lifecycle (24 hours).
 type PrepareAddPaymentMethodResponse struct {
-	BillingAccountID        uuid.UUID `json:"billing_account_id"`
-	SetupIntentClientSecret string    `json:"setup_intent_client_secret"`
+	BillingAccountID uuid.UUID `json:"billing_account_id"`
+	ClientSecret     string    `json:"client_secret"`
 }
 
 // GetPaymentMethodsRequest is the payload of GetPaymentMethods.

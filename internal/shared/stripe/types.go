@@ -4,7 +4,7 @@
 // and (b) keeping stripe-go imports out of every consumer.
 //
 // We intentionally do NOT translate stripe-go's types into a domain
-// model — Client methods return *stripego.Customer / *stripego.SetupIntent
+// model — Client methods return *stripego.Customer / *stripego.CheckoutSession
 // directly. Callers consume what they need; nothing is hidden.
 package stripe
 
@@ -15,7 +15,7 @@ import (
 )
 
 // Client is the Stripe API surface billing-engine uses to create
-// Customers and SetupIntents. Implementations:
+// Customers and card-on-file Checkout Sessions. Implementations:
 //
 //   - Production: NewClient(secretKey) — calls the real Stripe API.
 //   - Tests: pass a fake satisfying this interface.
@@ -25,10 +25,14 @@ type Client interface {
 	// is what callers persist as accounts.stripe_customer_id.
 	CreateCustomer(ctx context.Context, billingAccountID string) (*stripego.Customer, error)
 
-	// CreateSetupIntent creates an off-session SetupIntent against an
-	// existing Stripe Customer. The returned SetupIntent.ClientSecret
-	// is what web-account passes to Stripe Elements.
-	CreateSetupIntent(ctx context.Context, stripeCustomerID string) (*stripego.SetupIntent, error)
+	// CreateCheckoutSession creates a setup-mode Checkout Session
+	// (ui_mode=elements) against an existing Stripe Customer. The
+	// returned CheckoutSession.ClientSecret is what web-account passes
+	// to Stripe's CheckoutElementsProvider to drive the card-attach
+	// flow. returnURL is where Stripe redirects after redirect-based
+	// confirmation (required by elements mode even when card-only
+	// confirmation stays in-page).
+	CreateCheckoutSession(ctx context.Context, stripeCustomerID, returnURL string) (*stripego.CheckoutSession, error)
 }
 
 // Verifier verifies Stripe webhook signatures. Kept separate from

@@ -39,18 +39,33 @@ func (c *realClient) CreateCustomer(ctx context.Context, billingAccountID string
 	return c.sc.Customers.New(params)
 }
 
-// CreateSetupIntent creates an off-session SetupIntent so the user
-// can attach a card via Stripe Elements client-side. usage=off_session
-// signals to Stripe that future charges may be initiated by the
-// platform (i.e. the user won't be present), enabling card-network
-// pre-authorization where applicable.
-func (c *realClient) CreateSetupIntent(ctx context.Context, stripeCustomerID string) (*stripego.SetupIntent, error) {
-	params := &stripego.SetupIntentParams{
-		Customer: stripego.String(stripeCustomerID),
-		Usage:    stripego.String(string(stripego.SetupIntentUsageOffSession)),
+// CreateCheckoutSession creates a setup-mode Checkout Session
+// (ui_mode=elements) so the user can attach a card via Stripe's
+// CheckoutElementsProvider client-side. mode=setup saves the payment
+// method for future off-session charges (subscription + metered
+// usage) without collecting a payment now — the card-on-file flow.
+//
+// This replaces the older SetupIntent + Elements integration per
+// Stripe's recommended migration to the Checkout Sessions API
+// (docs.stripe.com/payments/payment-element/migration-ewcs).
+//
+// Payment method selection follows the Stripe dashboard (Settings →
+// Payment methods) — the Payment Element renders whatever is enabled
+// there and adapts per-device (Apple Pay on Safari, Google Pay on
+// Chrome, etc.). returnURL is where Stripe redirects after a
+// redirect-based confirmation; elements mode requires it even though
+// card-only confirmation stays in-page. currency=usd scopes which
+// region-specific methods are eligible.
+func (c *realClient) CreateCheckoutSession(ctx context.Context, stripeCustomerID, returnURL string) (*stripego.CheckoutSession, error) {
+	params := &stripego.CheckoutSessionParams{
+		Mode:      stripego.String(string(stripego.CheckoutSessionModeSetup)),
+		UIMode:    stripego.String(string(stripego.CheckoutSessionUIModeElements)),
+		Customer:  stripego.String(stripeCustomerID),
+		Currency:  stripego.String("usd"),
+		ReturnURL: stripego.String(returnURL),
 	}
 	params.Context = ctx
-	return c.sc.SetupIntents.New(params)
+	return c.sc.CheckoutSessions.New(params)
 }
 
 // NewVerifier returns a Verifier for the configured webhook signing
