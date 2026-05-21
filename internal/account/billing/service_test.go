@@ -94,11 +94,11 @@ func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) (
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
-	createdCustomers     []string
-	customerIDToReturn   string
-	setupIntentToReturn  string
-	errCreateCustomer    error
-	errCreateSetupIntent error
+	createdCustomers         []string
+	customerIDToReturn       string
+	checkoutSecretToReturn   string
+	errCreateCustomer        error
+	errCreateCheckoutSession error
 }
 
 func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID string) (*stripego.Customer, error) {
@@ -113,21 +113,21 @@ func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID string) 
 	return &stripego.Customer{ID: id}, nil
 }
 
-func (f *fakeStripe) CreateSetupIntent(_ context.Context, _ string) (*stripego.SetupIntent, error) {
-	if f.errCreateSetupIntent != nil {
-		return nil, f.errCreateSetupIntent
+func (f *fakeStripe) CreateCheckoutSession(_ context.Context, _, _ string) (*stripego.CheckoutSession, error) {
+	if f.errCreateCheckoutSession != nil {
+		return nil, f.errCreateCheckoutSession
 	}
-	cs := f.setupIntentToReturn
+	cs := f.checkoutSecretToReturn
 	if cs == "" {
-		cs = "seti_test_secret_xyz"
+		cs = "cs_test_secret_xyz"
 	}
-	return &stripego.SetupIntent{ClientSecret: cs}, nil
+	return &stripego.CheckoutSession{ClientSecret: cs}, nil
 }
 
 // --- tests ----------------------------------------------------------------
 
 func TestEnsure_NoAccount_ReturnsMissingBillingAccount(t *testing.T) {
-	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{UserID: uuid.New()})
 
@@ -141,7 +141,7 @@ func TestEnsure_AccountButNoPM_ReturnsMissingPaymentMethod(t *testing.T) {
 	userID := uuid.New()
 	accountID := uuid.New()
 	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_existing"}
-	svc := billing.NewService(store, &fakeStripe{})
+	svc := billing.NewService(store, &fakeStripe{}, "")
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{UserID: userID})
 
@@ -156,7 +156,7 @@ func TestEnsure_AccountAndPM_Ready(t *testing.T) {
 	accountID := uuid.New()
 	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_existing"}
 	store.hasUsablePM[accountID] = true
-	svc := billing.NewService(store, &fakeStripe{})
+	svc := billing.NewService(store, &fakeStripe{}, "")
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{UserID: userID})
 
@@ -166,7 +166,7 @@ func TestEnsure_AccountAndPM_Ready(t *testing.T) {
 }
 
 func TestEnsure_NilUserID_ReturnsInvalidInput(t *testing.T) {
-	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
 
 	_, err := svc.Ensure(context.Background(), billing.EnsureRequest{UserID: uuid.Nil})
 
@@ -179,7 +179,7 @@ func TestEnsure_NilUserID_ReturnsInvalidInput(t *testing.T) {
 func TestEnsure_StoreError_BecomesInternal(t *testing.T) {
 	store := newFakeStore()
 	store.errAccountByUser = errors.New("conn dropped")
-	svc := billing.NewService(store, &fakeStripe{})
+	svc := billing.NewService(store, &fakeStripe{}, "")
 
 	_, err := svc.Ensure(context.Background(), billing.EnsureRequest{UserID: uuid.New()})
 
@@ -197,7 +197,7 @@ func TestEnsure_RequireSubscription_AlwaysMissing_v1Stub(t *testing.T) {
 	accountID := uuid.New()
 	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
 	store.hasUsablePM[accountID] = true // even with a PM, subscription is missing
-	svc := billing.NewService(store, &fakeStripe{})
+	svc := billing.NewService(store, &fakeStripe{}, "")
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  userID,
@@ -217,7 +217,7 @@ func TestEnsure_RequirePaymentMethodAndSubscription_BothRequired(t *testing.T) {
 	accountID := uuid.New()
 	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
 	store.hasUsablePM[accountID] = true
-	svc := billing.NewService(store, &fakeStripe{})
+	svc := billing.NewService(store, &fakeStripe{}, "")
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  userID,
@@ -235,7 +235,7 @@ func TestEnsure_RequireBoth_NoPM_BothMissing(t *testing.T) {
 	accountID := uuid.New()
 	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
 	// hasUsablePM[accountID] is false (default zero value)
-	svc := billing.NewService(store, &fakeStripe{})
+	svc := billing.NewService(store, &fakeStripe{}, "")
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  userID,
@@ -252,7 +252,7 @@ func TestEnsure_NoAccountRow_BillingAccountAlone(t *testing.T) {
 	// Even when Require includes subscription, a missing accounts row
 	// short-circuits to just ["billing_account"] — there's nothing else
 	// the handler can usefully check.
-	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
 
 	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  uuid.New(),
@@ -264,7 +264,7 @@ func TestEnsure_NoAccountRow_BillingAccountAlone(t *testing.T) {
 }
 
 func TestEnsure_UnknownRequire_InvalidInput(t *testing.T) {
-	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
 
 	_, err := svc.Ensure(context.Background(), billing.EnsureRequest{
 		UserID:  uuid.New(),
@@ -280,14 +280,14 @@ func TestEnsure_UnknownRequire_InvalidInput(t *testing.T) {
 func TestPrepareAddPaymentMethod_FirstTime_CreatesCustomerAndSetupIntent(t *testing.T) {
 	store := newFakeStore()
 	stripeFake := &fakeStripe{}
-	svc := billing.NewService(store, stripeFake)
+	svc := billing.NewService(store, stripeFake, "")
 	userID := uuid.New()
 
 	resp, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: userID})
 
 	require.NoError(t, err)
 	require.NotEqual(t, uuid.Nil, resp.BillingAccountID)
-	require.NotEmpty(t, resp.SetupIntentClientSecret)
+	require.NotEmpty(t, resp.ClientSecret)
 	require.Len(t, stripeFake.createdCustomers, 1, "should create Stripe Customer on first call")
 	require.NotEmpty(t, store.accountsByUser[userID].stripeCustomerID)
 }
@@ -295,7 +295,7 @@ func TestPrepareAddPaymentMethod_FirstTime_CreatesCustomerAndSetupIntent(t *test
 func TestPrepareAddPaymentMethod_SecondTime_ReusesCustomerAndMintsNewIntent(t *testing.T) {
 	store := newFakeStore()
 	stripeFake := &fakeStripe{}
-	svc := billing.NewService(store, stripeFake)
+	svc := billing.NewService(store, stripeFake, "")
 	userID := uuid.New()
 
 	_, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: userID})
@@ -304,13 +304,13 @@ func TestPrepareAddPaymentMethod_SecondTime_ReusesCustomerAndMintsNewIntent(t *t
 	require.NoError(t, err)
 
 	require.Len(t, stripeFake.createdCustomers, 1, "should NOT create a second Stripe Customer")
-	require.NotEmpty(t, resp2.SetupIntentClientSecret, "still mints a fresh SetupIntent")
+	require.NotEmpty(t, resp2.ClientSecret, "still mints a fresh Checkout Session")
 }
 
 func TestPrepareAddPaymentMethod_StripeCustomerFails_ReturnsStripeError(t *testing.T) {
 	store := newFakeStore()
 	stripeFake := &fakeStripe{errCreateCustomer: errors.New("stripe down")}
-	svc := billing.NewService(store, stripeFake)
+	svc := billing.NewService(store, stripeFake, "")
 
 	_, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: uuid.New()})
 
@@ -326,7 +326,7 @@ func TestPrepareAddPaymentMethod_SetStripeCustomerFails_ReturnsInternal(t *testi
 	store := newFakeStore()
 	store.errSetStripeCustomer = errors.New("pool exhausted")
 	stripeFake := &fakeStripe{}
-	svc := billing.NewService(store, stripeFake)
+	svc := billing.NewService(store, stripeFake, "")
 
 	_, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: uuid.New()})
 
@@ -337,7 +337,7 @@ func TestPrepareAddPaymentMethod_SetStripeCustomerFails_ReturnsInternal(t *testi
 }
 
 func TestPrepareAddPaymentMethod_NilUserID_InvalidInput(t *testing.T) {
-	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
 
 	_, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: uuid.Nil})
 
@@ -348,7 +348,7 @@ func TestPrepareAddPaymentMethod_NilUserID_InvalidInput(t *testing.T) {
 }
 
 func TestGetPaymentMethods_NoAccount_EmptySlice(t *testing.T) {
-	svc := billing.NewService(newFakeStore(), &fakeStripe{})
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
 
 	resp, err := svc.GetPaymentMethods(context.Background(), billing.GetPaymentMethodsRequest{UserID: uuid.New()})
 
@@ -366,7 +366,7 @@ func TestGetPaymentMethods_HasMethods_ReturnsAll(t *testing.T) {
 		{ID: uuid.New(), StripePaymentMethodID: "pm_1", Brand: "visa", Last4: "4242", ExpMonth: 12, ExpYear: 2029, IsDefault: true},
 		{ID: uuid.New(), StripePaymentMethodID: "pm_2", Brand: "mastercard", Last4: "5454", ExpMonth: 6, ExpYear: 2028, IsDefault: false},
 	}
-	svc := billing.NewService(store, &fakeStripe{})
+	svc := billing.NewService(store, &fakeStripe{}, "")
 
 	resp, err := svc.GetPaymentMethods(context.Background(), billing.GetPaymentMethodsRequest{UserID: userID})
 

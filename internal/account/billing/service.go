@@ -13,14 +13,17 @@ import (
 // GetPaymentMethods). It composes a Store (Postgres) and a Stripe Client
 // (real Stripe API); both are injected for testability.
 type Service struct {
-	store  Store
-	stripe billingstripe.Client
+	store     Store
+	stripe    billingstripe.Client
+	returnURL string
 }
 
-// NewService wires a Service. Both dependencies are required;
-// passing nil panics at the first call site.
-func NewService(store Store, stripe billingstripe.Client) *Service {
-	return &Service{store: store, stripe: stripe}
+// NewService wires a Service. store and stripe are required; passing
+// nil panics at the first call site. returnURL is the post-confirmation
+// redirect target for the setup-mode Checkout Session (the frontend
+// billing page); elements mode requires it.
+func NewService(store Store, stripe billingstripe.Client, returnURL string) *Service {
+	return &Service{store: store, stripe: stripe, returnURL: returnURL}
 }
 
 // Ensure is the read-only gate. Pure DB read; no Stripe API call;
@@ -91,7 +94,8 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 // PrepareAddPaymentMethod implements the one-shot setup flow:
 //  1. INSERT or SELECT the accounts row (idempotent on user_id).
 //  2. If no Stripe Customer yet: create one and persist its ID.
-//  3. Create a fresh SetupIntent and return its client_secret.
+//  3. Create a fresh setup-mode Checkout Session and return its
+//     client_secret.
 //
 // Failure mode: step 2's "create then persist" pair is non-atomic. If
 // CreateCustomer succeeds but SetStripeCustomer fails, an orphan Stripe
@@ -124,13 +128,13 @@ func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPay
 		}
 	}
 
-	si, err := s.stripe.CreateSetupIntent(ctx, stripeCustomerID)
+	session, err := s.stripe.CreateCheckoutSession(ctx, stripeCustomerID, s.returnURL)
 	if err != nil {
-		return nil, StripeError("create setup intent failed", err)
+		return nil, StripeError("create checkout session failed", err)
 	}
 	return &PrepareAddPaymentMethodResponse{
-		BillingAccountID:        accountID,
-		SetupIntentClientSecret: si.ClientSecret,
+		BillingAccountID: accountID,
+		ClientSecret:     session.ClientSecret,
 	}, nil
 }
 
