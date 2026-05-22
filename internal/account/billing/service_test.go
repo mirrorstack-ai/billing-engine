@@ -18,17 +18,28 @@ type fakeStore struct {
 	accountsByUser   map[uuid.UUID]fakeAccount
 	hasUsablePM      map[uuid.UUID]bool
 	paymentMethodsBy map[uuid.UUID][]billing.PaymentMethod
+	addCardRequests  map[uuid.UUID]*fakeAddCardRequest
 
 	// PM-target lookups for detach / set-default, keyed by payment method id.
 	pmTargets map[uuid.UUID]pmTarget
 
 	// Injected failures (set per-test as needed).
-	errEnsureAccount       error
-	errSetStripeCustomer   error
-	errAccountByUser       error
-	errHasUsablePaymentMx  error
-	errListPaymentMethods  error
-	errPaymentMethodTarget error
+	errEnsureAccount        error
+	errSetStripeCustomer    error
+	errAccountByUser        error
+	errHasUsablePaymentMx   error
+	errListPaymentMethods   error
+	errPaymentMethodTarget  error
+	errInsertAddCardRequest error
+	errSetSetupIntent       error
+	errGetAddCardRequest    error
+}
+
+type fakeAddCardRequest struct {
+	accountID     uuid.UUID
+	setupIntentID string
+	status        billing.AddCardStatus
+	paymentMethod *billing.PaymentMethod
 }
 
 type fakeAccount struct {
@@ -47,6 +58,7 @@ func newFakeStore() *fakeStore {
 		hasUsablePM:      map[uuid.UUID]bool{},
 		paymentMethodsBy: map[uuid.UUID][]billing.PaymentMethod{},
 		pmTargets:        map[uuid.UUID]pmTarget{},
+		addCardRequests:  map[uuid.UUID]*fakeAddCardRequest{},
 	}
 }
 
@@ -112,6 +124,39 @@ func (s *fakeStore) PaymentMethodTarget(_ context.Context, _ uuid.UUID, paymentM
 	return t.stripePMID, t.stripeCustomerID, true, nil
 }
 
+func (s *fakeStore) InsertAddCardRequest(_ context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	if s.errInsertAddCardRequest != nil {
+		return uuid.Nil, s.errInsertAddCardRequest
+	}
+	id := uuid.New()
+	s.addCardRequests[id] = &fakeAddCardRequest{
+		accountID: accountID,
+		status:    billing.AddCardStatusPending,
+	}
+	return id, nil
+}
+
+func (s *fakeStore) SetAddCardRequestSetupIntent(_ context.Context, requestID uuid.UUID, setupIntentID string) error {
+	if s.errSetSetupIntent != nil {
+		return s.errSetSetupIntent
+	}
+	if r, ok := s.addCardRequests[requestID]; ok && r.status == billing.AddCardStatusPending {
+		r.setupIntentID = setupIntentID
+	}
+	return nil
+}
+
+func (s *fakeStore) GetAddCardRequest(_ context.Context, requestID, accountID uuid.UUID) (*billing.AddCardRequestStatus, error) {
+	if s.errGetAddCardRequest != nil {
+		return nil, s.errGetAddCardRequest
+	}
+	r, ok := s.addCardRequests[requestID]
+	if !ok || r.accountID != accountID {
+		return nil, nil
+	}
+	return &billing.AddCardRequestStatus{Status: r.status, PaymentMethod: r.paymentMethod}, nil
+}
+
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
@@ -122,6 +167,7 @@ type fakeStripe struct {
 	defaultsSet              []string // "customerID=pmID" per SetDefaultPaymentMethod
 	customerIDToReturn       string
 	checkoutSecretToReturn   string
+	setupIntentIDToReturn    string
 	errCreateCustomer        error
 	errCreateCheckoutSession error
 	errUpdateCustomerEmail   error
@@ -158,7 +204,14 @@ func (f *fakeStripe) CreateCheckoutSession(_ context.Context, _, _ string) (*str
 	if cs == "" {
 		cs = "cs_test_secret_xyz"
 	}
-	return &stripego.CheckoutSession{ClientSecret: cs}, nil
+	siID := f.setupIntentIDToReturn
+	if siID == "" {
+		siID = "seti_test_xyz"
+	}
+	return &stripego.CheckoutSession{
+		ClientSecret: cs,
+		SetupIntent:  &stripego.SetupIntent{ID: siID},
+	}, nil
 }
 
 func (f *fakeStripe) DetachPaymentMethod(_ context.Context, stripePaymentMethodID string) error {

@@ -39,10 +39,12 @@ func (f *FakeVerifier) Verify(_ []byte, _ string) (stripego.Event, error) {
 // true, the Processed map initialized, no errors.
 type FakeStore struct {
 	// Recording
-	Processed   map[string]bool                     // event IDs seen by MarkEventProcessed
-	DefaultsSet []string                            // "customerID=defaultPM" pairs from SetDefaultPaymentMethod
-	Inserts     []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
-	SoftDeletes []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
+	Processed     map[string]bool                     // event IDs seen by MarkEventProcessed
+	DefaultsSet   []string                            // "customerID=defaultPM" pairs from SetDefaultPaymentMethod
+	Inserts       []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
+	SoftDeletes   []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
+	StampedPMs    []string                            // "setupIntentID=stripePMID" from SetAddCardRequestStripePM
+	ResolvedPMs   []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
 
 	// Found-flag knobs
 	TouchedFound bool // returned by TouchAccountByStripeCustomer
@@ -55,6 +57,8 @@ type FakeStore struct {
 	ErrSetDefault error // from SetDefaultPaymentMethod
 	ErrInsert     error // from InsertPaymentMethod
 	ErrSoftDel    error // from SoftDeletePaymentMethod
+	ErrStamp      error // from SetAddCardRequestStripePM
+	ErrResolve    error // from ResolvePendingAddCardRequest
 }
 
 // NewFakeStore returns a FakeStore configured for happy-path tests:
@@ -112,6 +116,22 @@ func (s *FakeStore) SoftDeletePaymentMethod(_ context.Context, stripePMID string
 	}
 	s.SoftDeletes = append(s.SoftDeletes, stripePMID)
 	return s.SoftDelFound, nil
+}
+
+func (s *FakeStore) SetAddCardRequestStripePM(_ context.Context, setupIntentID, stripePMID string) error {
+	if s.ErrStamp != nil {
+		return s.ErrStamp
+	}
+	s.StampedPMs = append(s.StampedPMs, setupIntentID+"="+stripePMID)
+	return nil
+}
+
+func (s *FakeStore) ResolvePendingAddCardRequest(_ context.Context, stripePMID string) error {
+	if s.ErrResolve != nil {
+		return s.ErrResolve
+	}
+	s.ResolvedPMs = append(s.ResolvedPMs, stripePMID)
+	return nil
 }
 
 // SilentLogger returns a slog.Logger that discards all output. Useful
