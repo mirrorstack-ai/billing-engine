@@ -2,7 +2,10 @@ package webhook
 
 import (
 	"context"
+	"errors"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -86,14 +89,15 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 			SELECT id FROM ms_billing.accounts WHERE stripe_customer_id = $1
 		)
 		INSERT INTO ms_billing.payment_methods_mirror
-			(account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default)
+			(account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default, fingerprint)
 		SELECT acct.id, $2, $3, $4, $5, $6,
 			-- First active card for the account becomes the default, so the
 			-- user always has a usable default without an explicit choice.
 			NOT EXISTS (
 				SELECT 1 FROM ms_billing.payment_methods_mirror p
 				WHERE p.account_id = acct.id AND p.deleted_at IS NULL
-			)
+			),
+			NULLIF($7, '')
 		FROM acct
 		ON CONFLICT (stripe_payment_method_id) DO NOTHING
 	`
@@ -104,6 +108,7 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 		pm.Last4,
 		pm.ExpMonth,
 		pm.ExpYear,
+		pm.Fingerprint,
 	)
 	if err != nil {
 		return false, err
@@ -136,6 +141,130 @@ func (s *pgxStore) SoftDeletePaymentMethod(ctx context.Context, stripePaymentMet
 		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// SetAddCardRequestStripePM stamps the resolved Stripe payment_method
+// id onto a still-pending add_card_requests row. Matched by the row's
+// setup_intent_id; the partial index acr_setup_intent_pending_idx
+// (migration 004) covers this query. No-op when the row is no longer
+// pending — the other resolution handler has already finalized it.
+func (s *pgxStore) SetAddCardRequestStripePM(ctx context.Context, setupIntentID, stripePaymentMethodID string) error {
+	const q = `
+		UPDATE ms_billing.add_card_requests
+		SET stripe_pm_id = $2
+		WHERE setup_intent_id = $1 AND status = 'pending'
+	`
+	_, err := s.pool.Exec(ctx, q, setupIntentID, stripePaymentMethodID)
+	return err
+}
+
+// ResolvePendingAddCardRequest is the terminal step of the add-card
+// flow. Runs in a single transaction:
+//
+//  1. Look up the just-mirrored row by stripe_payment_method_id. Returns
+//     no-op when the row hasn't been inserted yet (event ordering: the
+//     other webhook handler will resolve once both rows exist).
+//  2. Probe for ANOTHER active mirror row on the same account with the
+//     same Stripe card fingerprint. Hit → 'duplicate'; miss → 'completed'.
+//     Stripe issues a fresh pm_* ID per setup_intent confirm even when
+//     the customer enters the same card, so stripe_payment_method_id
+//     equality (the previous predicate) never fired in practice;
+//     fingerprint equality is the canonical "same card" check.
+//  3. On duplicate, soft-delete the just-mirrored row so the UI doesn't
+//     show two rows that share brand+last4. The duplicate PM stays
+//     attached on Stripe's side until the future reconciliation job
+//     detaches it — orphan PMs are harmless (no auto-charge).
+//  4. Resolve the request row in one UPDATE, pointing payment_method_id
+//     at the surviving row (the pre-existing card on duplicate, the
+//     just-mirrored row on completed).
+//
+// Idempotent: the WHERE status = 'pending' filter on the final UPDATE
+// is a no-op for rows another event already finalized.
+func (s *pgxStore) ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Step 1: lookup the just-mirrored row. ErrNoRows means the other
+	// webhook event (handlePaymentMethodAttached) hasn't run yet — bail
+	// out cleanly; the partner handler will re-enter this function once
+	// the mirror row lands.
+	var (
+		newID       uuid.UUID
+		accountID   uuid.UUID
+		fingerprint *string
+	)
+	const lookupQ = `
+		SELECT id, account_id, fingerprint
+		FROM ms_billing.payment_methods_mirror
+		WHERE stripe_payment_method_id = $1
+	`
+	if err := tx.QueryRow(ctx, lookupQ, stripePaymentMethodID).
+		Scan(&newID, &accountID, &fingerprint); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+
+	// Step 2: dedupe probe. Skip when fingerprint is unavailable
+	// (legacy rows pre-migration 005, or non-card Stripe PMs). The
+	// partial index pmm_account_fingerprint_active_idx already filters
+	// out NULL fingerprints, but the explicit Go guard keeps the empty
+	// case from emitting a needless query.
+	var duplicatePMID uuid.UUID
+	hasDuplicate := false
+	if fingerprint != nil && *fingerprint != "" {
+		const dupQ = `
+			SELECT id
+			FROM ms_billing.payment_methods_mirror
+			WHERE account_id = $1
+			  AND fingerprint = $2
+			  AND id <> $3
+			  AND deleted_at IS NULL
+			LIMIT 1
+		`
+		err := tx.QueryRow(ctx, dupQ, accountID, *fingerprint, newID).Scan(&duplicatePMID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		hasDuplicate = err == nil
+	}
+
+	// Step 3: when a pre-existing card already covers this fingerprint,
+	// soft-delete the freshly-mirrored row so the UI returns to a single
+	// canonical card per (account, fingerprint).
+	resolvedPMID := newID
+	resolvedStatus := "completed"
+	if hasDuplicate {
+		resolvedPMID = duplicatePMID
+		resolvedStatus = "duplicate"
+		const softDeleteQ = `
+			UPDATE ms_billing.payment_methods_mirror
+			SET deleted_at = now()
+			WHERE id = $1 AND deleted_at IS NULL
+		`
+		if _, err := tx.Exec(ctx, softDeleteQ, newID); err != nil {
+			return err
+		}
+	}
+
+	// Step 4: terminal resolve. WHERE status='pending' makes this safe to
+	// re-run after the partner handler already finalized the row.
+	const resolveQ = `
+		UPDATE ms_billing.add_card_requests
+		SET status = $2::ms_billing.add_card_request_status,
+		    payment_method_id = $3,
+		    resolved_at = now()
+		WHERE stripe_pm_id = $1 AND status = 'pending'
+	`
+	if _, err := tx.Exec(ctx, resolveQ, stripePaymentMethodID, resolvedStatus, resolvedPMID); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 // Compile-time interface check: pgxStore must satisfy Store.

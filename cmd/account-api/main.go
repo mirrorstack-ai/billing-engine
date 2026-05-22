@@ -77,6 +77,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.svc.PrepareAddPaymentMethod(ctx, req)
 
+	case "StartAddPaymentMethod":
+		var req billing.StartAddPaymentMethodRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.StartAddPaymentMethod(ctx, req)
+
+	case "FinishAddPaymentMethod":
+		var req billing.FinishAddPaymentMethodRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.FinishAddPaymentMethod(ctx, req)
+
 	case "GetPaymentMethods":
 		var req billing.GetPaymentMethodsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -187,6 +201,8 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Use(auth.InternalSecret(internalSecret))
 		r.Post("/v1/billing.Ensure", makeHTTPHandler(d, "Ensure"))
 		r.Post("/v1/billing.PrepareAddPaymentMethod", makeHTTPHandler(d, "PrepareAddPaymentMethod"))
+		r.Post("/v1/billing.StartAddPaymentMethod", makeHTTPHandler(d, "StartAddPaymentMethod"))
+		r.Post("/v1/billing.FinishAddPaymentMethod", makeHTTPHandler(d, "FinishAddPaymentMethod"))
 		r.Post("/v1/billing.GetPaymentMethods", makeHTTPHandler(d, "GetPaymentMethods"))
 		r.Post("/v1/billing.DetachPaymentMethod", makeHTTPHandler(d, "DetachPaymentMethod"))
 		r.Post("/v1/billing.SetDefaultPaymentMethod", makeHTTPHandler(d, "SetDefaultPaymentMethod"))

@@ -80,6 +80,11 @@ func (c *realClient) CreateCheckoutSession(ctx context.Context, stripeCustomerID
 		Currency:  stripego.String("usd"),
 		ReturnURL: stripego.String(returnURL),
 	}
+	// Expand the underlying SetupIntent so the caller can read
+	// session.SetupIntent.ID directly. StartAddPaymentMethod stamps
+	// this id onto ms_billing.add_card_requests so setup_intent.succeeded
+	// webhook events can correlate back to the originating request.
+	params.Expand = []*string{stripego.String("setup_intent")}
 	params.Context = ctx
 	return c.sc.CheckoutSessions.New(params)
 }
