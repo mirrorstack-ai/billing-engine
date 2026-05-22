@@ -288,16 +288,26 @@ func (s *Service) GetPaymentMethods(ctx context.Context, req GetPaymentMethodsRe
 // Customer. Ownership is enforced via PaymentMethodTarget — the PM must
 // belong to the caller's account. The mirror row is soft-deleted
 // asynchronously by the payment_method.detached webhook.
+//
+// Refuses to remove the default card: detaching it on Stripe clears
+// invoice_settings.default_payment_method (account ends up with no
+// default → next invoice fails with no_payment_method). The UI never
+// surfaces the option, and an INVALID_INPUT here makes the constraint
+// authoritative against direct API callers too. To remove the current
+// default, set another card as default first.
 func (s *Service) DetachPaymentMethod(ctx context.Context, req DetachPaymentMethodRequest) (*DetachPaymentMethodResponse, error) {
 	if req.UserID == uuid.Nil || req.PaymentMethodID == uuid.Nil {
 		return nil, InvalidInput("user_id and payment_method_id required")
 	}
-	stripePMID, _, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
+	stripePMID, _, isDefault, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
 	if err != nil {
 		return nil, Internal("payment method lookup failed", err)
 	}
 	if !found {
 		return nil, NotFound("payment method not found")
+	}
+	if isDefault {
+		return nil, InvalidInput("cannot remove default payment method; set another card as default first")
 	}
 	if err := s.stripe.DetachPaymentMethod(ctx, stripePMID); err != nil {
 		return nil, StripeError("detach payment method failed", err)
@@ -312,7 +322,7 @@ func (s *Service) SetDefaultPaymentMethod(ctx context.Context, req SetDefaultPay
 	if req.UserID == uuid.Nil || req.PaymentMethodID == uuid.Nil {
 		return nil, InvalidInput("user_id and payment_method_id required")
 	}
-	stripePMID, stripeCustomerID, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
+	stripePMID, stripeCustomerID, _, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
 	if err != nil {
 		return nil, Internal("payment method lookup failed", err)
 	}
