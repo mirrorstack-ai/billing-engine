@@ -50,6 +50,7 @@ type fakeAccount struct {
 type pmTarget struct {
 	stripePMID       string
 	stripeCustomerID string
+	isDefault        bool
 }
 
 func newFakeStore() *fakeStore {
@@ -113,15 +114,15 @@ func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) (
 	return s.paymentMethodsBy[accountID], nil
 }
 
-func (s *fakeStore) PaymentMethodTarget(_ context.Context, _ uuid.UUID, paymentMethodID uuid.UUID) (string, string, bool, error) {
+func (s *fakeStore) PaymentMethodTarget(_ context.Context, _ uuid.UUID, paymentMethodID uuid.UUID) (string, string, bool, bool, error) {
 	if s.errPaymentMethodTarget != nil {
-		return "", "", false, s.errPaymentMethodTarget
+		return "", "", false, false, s.errPaymentMethodTarget
 	}
 	t, ok := s.pmTargets[paymentMethodID]
 	if !ok {
-		return "", "", false, nil
+		return "", "", false, false, nil
 	}
-	return t.stripePMID, t.stripeCustomerID, true, nil
+	return t.stripePMID, t.stripeCustomerID, t.isDefault, true, nil
 }
 
 func (s *fakeStore) InsertAddCardRequest(_ context.Context, accountID uuid.UUID) (uuid.UUID, error) {
@@ -546,6 +547,28 @@ func TestDetachPaymentMethod_NilIDs_InvalidInput(t *testing.T) {
 	var be *billing.Error
 	require.ErrorAs(t, err, &be)
 	require.Equal(t, billing.CodeInvalidInput, be.Code)
+}
+
+func TestDetachPaymentMethod_DefaultPM_Rejected(t *testing.T) {
+	// Removing the default card on Stripe clears
+	// invoice_settings.default_payment_method (account ends up with no
+	// default → next invoice fails with no_payment_method). The service
+	// must refuse with INVALID_INPUT so a direct API caller can't slip
+	// past the UI guard. The Stripe API is not called.
+	store := newFakeStore()
+	pmID := uuid.New()
+	store.pmTargets[pmID] = pmTarget{stripePMID: "pm_def", stripeCustomerID: "cus_z", isDefault: true}
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake, "")
+
+	_, err := svc.DetachPaymentMethod(context.Background(),
+		billing.DetachPaymentMethodRequest{UserID: uuid.New(), PaymentMethodID: pmID})
+
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInvalidInput, be.Code)
+	require.Contains(t, be.Message, "default")
+	require.Empty(t, stripeFake.detached, "Stripe must not be called when the request is rejected up-front")
 }
 
 func TestSetDefaultPaymentMethod_OwnedPM_SetsCustomerDefault(t *testing.T) {
