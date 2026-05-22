@@ -182,6 +182,89 @@ func TestPgxStore_SetDefaultPaymentMethod_FlipsOneAndUnflipsRest(t *testing.T) {
 	require.False(t, defaults["pm_def_c"])
 }
 
+func TestPgxStore_ResolvePendingAddCardRequest_CompletedThenDuplicate(t *testing.T) {
+	// Add-card lifecycle, two passes:
+	//   1. Fresh card → resolver flips request to 'completed' and points
+	//      payment_method_id at the just-mirrored row.
+	//   2. Same card re-attached (new pm_* id, same fingerprint) → resolver
+	//      flips the second request to 'duplicate', points payment_method_id
+	//      at the EXISTING surviving row, and soft-deletes the just-mirrored
+	//      duplicate row so the UI shows one card per real-world fingerprint.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_dup")
+	ctx := context.Background()
+
+	// First pass: mirror a fresh card and resolve a pending request.
+	firstReqID := seedPendingAddCardRequest(t, pool, accountID, "pm_dup_1")
+	insertMirrorWithFingerprint(t, pool, accountID, "pm_dup_1", "fp_abc")
+	require.NoError(t, store.ResolvePendingAddCardRequest(ctx, "pm_dup_1"))
+
+	status, pmID, deleted := readAddCardRequest(t, pool, firstReqID)
+	require.Equal(t, "completed", status)
+	require.NotNil(t, pmID, "completed request should point at the mirrored row")
+	require.False(t, deleted, "the first card's mirror row stays active")
+
+	// Second pass: same fingerprint, fresh pm_* id (Stripe's normal
+	// re-attach behavior) → duplicate.
+	secondReqID := seedPendingAddCardRequest(t, pool, accountID, "pm_dup_2")
+	insertMirrorWithFingerprint(t, pool, accountID, "pm_dup_2", "fp_abc")
+	require.NoError(t, store.ResolvePendingAddCardRequest(ctx, "pm_dup_2"))
+
+	status, pmID, deleted = readAddCardRequest(t, pool, secondReqID)
+	require.Equal(t, "duplicate", status)
+	require.NotNil(t, pmID, "duplicate request still resolves to a PM (the surviving one)")
+
+	// The just-mirrored pm_dup_2 row should be soft-deleted.
+	require.True(t, isMirrorRowDeleted(t, pool, "pm_dup_2"))
+	require.False(t, isMirrorRowDeleted(t, pool, "pm_dup_1"),
+		"the pre-existing card should survive unchanged")
+
+	// And ListPaymentMethods (the UI query) sees exactly one row for this account.
+	var activeCount int
+	err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ms_billing.payment_methods_mirror
+		 WHERE account_id = $1 AND deleted_at IS NULL`, accountID).Scan(&activeCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, activeCount)
+}
+
+func TestPgxStore_ResolvePendingAddCardRequest_NoMirrorRow_IsNoOp(t *testing.T) {
+	// Event ordering: setup_intent.succeeded can arrive before
+	// payment_method.attached. The resolver should bail out cleanly when
+	// the mirror row isn't there yet — the partner handler resolves later.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_noop")
+	reqID := seedPendingAddCardRequest(t, pool, accountID, "pm_noop")
+
+	require.NoError(t, store.ResolvePendingAddCardRequest(context.Background(), "pm_noop"))
+
+	status, _, _ := readAddCardRequest(t, pool, reqID)
+	require.Equal(t, "pending", status, "request stays pending when mirror row absent")
+}
+
+func TestPgxStore_ResolvePendingAddCardRequest_NullFingerprint_NeverDeduplicates(t *testing.T) {
+	// Legacy rows pre-migration 005 have fingerprint=NULL. A new card
+	// inserted alongside one of those must always resolve to 'completed'
+	// — NULL fingerprints don't collide with anything.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_legacy")
+	ctx := context.Background()
+
+	// Legacy mirror row, no fingerprint.
+	seedActivePM(t, pool, accountID, "pm_legacy", 12, 2099)
+
+	// New attach with a real fingerprint.
+	reqID := seedPendingAddCardRequest(t, pool, accountID, "pm_new")
+	insertMirrorWithFingerprint(t, pool, accountID, "pm_new", "fp_real")
+	require.NoError(t, store.ResolvePendingAddCardRequest(ctx, "pm_new"))
+
+	status, _, _ := readAddCardRequest(t, pool, reqID)
+	require.Equal(t, "completed", status)
+}
+
 // --- helpers --------------------------------------------------------------
 
 func seedAccount(t *testing.T, pool *pgxpool.Pool, stripeCustomerID string) uuid.UUID {
@@ -205,6 +288,54 @@ func seedActivePM(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, pmID st
 		accountID, pmID, expMonth, expYear,
 	)
 	require.NoError(t, err)
+}
+
+func insertMirrorWithFingerprint(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, pmID, fingerprint string) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO ms_billing.payment_methods_mirror
+		   (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default, fingerprint)
+		 VALUES ($1, $2, 'visa', '4242', 12, 2099, false, $3)`,
+		accountID, pmID, fingerprint,
+	)
+	require.NoError(t, err)
+}
+
+func seedPendingAddCardRequest(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, stripePMID string) uuid.UUID {
+	t.Helper()
+	reqID := uuid.New()
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO ms_billing.add_card_requests (id, account_id, stripe_pm_id, status)
+		 VALUES ($1, $2, $3, 'pending')`,
+		reqID, accountID, stripePMID,
+	)
+	require.NoError(t, err)
+	return reqID
+}
+
+func readAddCardRequest(t *testing.T, pool *pgxpool.Pool, reqID uuid.UUID) (status string, paymentMethodID *uuid.UUID, mirrorDeleted bool) {
+	t.Helper()
+	var pmID *uuid.UUID
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT status::text, payment_method_id FROM ms_billing.add_card_requests WHERE id = $1`,
+		reqID).Scan(&status, &pmID))
+	if pmID != nil {
+		var del bool
+		require.NoError(t, pool.QueryRow(context.Background(),
+			`SELECT deleted_at IS NOT NULL FROM ms_billing.payment_methods_mirror WHERE id = $1`,
+			*pmID).Scan(&del))
+		mirrorDeleted = del
+	}
+	return status, pmID, mirrorDeleted
+}
+
+func isMirrorRowDeleted(t *testing.T, pool *pgxpool.Pool, stripePMID string) bool {
+	t.Helper()
+	var deleted bool
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT deleted_at IS NOT NULL FROM ms_billing.payment_methods_mirror WHERE stripe_payment_method_id = $1`,
+		stripePMID).Scan(&deleted))
+	return deleted
 }
 
 func readDefaultFlags(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID) map[string]bool {

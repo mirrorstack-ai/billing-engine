@@ -88,6 +88,10 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 		Last4:                 pm.Card.Last4,
 		ExpMonth:              int(pm.Card.ExpMonth),
 		ExpYear:               int(pm.Card.ExpYear),
+		// Stripe's "same card" identifier across PaymentMethod IDs —
+		// the resolver compares this against existing active mirror rows
+		// on the same account to set status='duplicate'.
+		Fingerprint: pm.Card.Fingerprint,
 	}
 	found, err := r.store.InsertPaymentMethod(ctx, pm.Customer.ID, params)
 	if err != nil {
