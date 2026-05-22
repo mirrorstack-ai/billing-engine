@@ -138,5 +138,50 @@ func (s *pgxStore) SoftDeletePaymentMethod(ctx context.Context, stripePaymentMet
 	return tag.RowsAffected() > 0, nil
 }
 
+// SetAddCardRequestStripePM stamps the resolved Stripe payment_method
+// id onto a still-pending add_card_requests row. Matched by the row's
+// setup_intent_id; the partial index acr_setup_intent_pending_idx
+// (migration 004) covers this query. No-op when the row is no longer
+// pending — the other resolution handler has already finalized it.
+func (s *pgxStore) SetAddCardRequestStripePM(ctx context.Context, setupIntentID, stripePaymentMethodID string) error {
+	const q = `
+		UPDATE ms_billing.add_card_requests
+		SET stripe_pm_id = $2
+		WHERE setup_intent_id = $1 AND status = 'pending'
+	`
+	_, err := s.pool.Exec(ctx, q, setupIntentID, stripePaymentMethodID)
+	return err
+}
+
+// ResolvePendingAddCardRequest is the terminal step of the add-card
+// flow. Single statement: join the pending request to its mirror row
+// (matched by stripe_pm_id), then set status + payment_method_id +
+// resolved_at in one shot.
+//
+// "duplicate" vs "completed": the mirror row's attached_at is set
+// to now() on a fresh INSERT (migration 002 default) and preserved
+// on ON CONFLICT DO NOTHING. So a mirror row older than the request
+// means the card was already on file — the user re-submitted a card
+// they'd previously attached. Tie-break (≤ rather than <) leans toward
+// "completed" since a freshly-inserted mirror row's attached_at is
+// stamped before the request row's created_at would be re-read.
+func (s *pgxStore) ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error {
+	const q = `
+		UPDATE ms_billing.add_card_requests r
+		SET status = CASE
+			WHEN pm.attached_at < r.created_at THEN 'duplicate'::ms_billing.add_card_request_status
+			ELSE 'completed'::ms_billing.add_card_request_status
+		END,
+		payment_method_id = pm.id,
+		resolved_at = now()
+		FROM ms_billing.payment_methods_mirror pm
+		WHERE r.stripe_pm_id = $1
+		  AND r.status = 'pending'
+		  AND pm.stripe_payment_method_id = $1
+	`
+	_, err := s.pool.Exec(ctx, q, stripePaymentMethodID)
+	return err
+}
+
 // Compile-time interface check: pgxStore must satisfy Store.
 var _ Store = (*pgxStore)(nil)

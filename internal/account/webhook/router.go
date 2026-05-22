@@ -78,6 +78,24 @@ type Store interface {
 	// stripe_payment_method_id row. Returns (found bool, error) where
 	// found=false is a no-op (idempotent on detach).
 	SoftDeletePaymentMethod(ctx context.Context, stripePaymentMethodID string) (found bool, err error)
+
+	// SetAddCardRequestStripePM stamps stripe_pm_id onto the still-pending
+	// add_card_requests row whose setup_intent_id matches. Called from the
+	// setup_intent.succeeded handler. Idempotent on already-resolved rows
+	// (UPDATE … WHERE status='pending' filters them out). No row matching
+	// the setup_intent_id is a no-op — happens for setup intents created
+	// outside the StartAddPaymentMethod flow (e.g. Stripe Dashboard).
+	SetAddCardRequestStripePM(ctx context.Context, setupIntentID, stripePaymentMethodID string) error
+
+	// ResolvePendingAddCardRequest flips the matching pending request
+	// row from pending → completed (fresh attach) or duplicate (the
+	// mirror row pre-existed the request). Distinguishes by comparing
+	// payment_methods_mirror.attached_at to add_card_requests.created_at:
+	// a mirror row older than the request means the card was already
+	// on file before the user clicked "Add card". No matching row OR
+	// no mirror row yet → no-op (the other webhook event resolves it
+	// when both have arrived).
+	ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error
 }
 
 // InsertPaymentMethodParams is the row data extracted from a
@@ -157,6 +175,8 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		return r.handlePaymentMethodAttached(ctx, event)
 	case stripego.EventTypePaymentMethodDetached:
 		return r.handlePaymentMethodDetached(ctx, event)
+	case stripego.EventTypeSetupIntentSucceeded:
+		return r.handleSetupIntentSucceeded(ctx, event)
 	default:
 		r.log.InfoContext(ctx, "webhook unhandled event", "event_id", event.ID, "type", event.Type)
 		return Result{HTTPStatus: 200, Status: StatusUnhandled}
