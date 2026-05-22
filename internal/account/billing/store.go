@@ -46,6 +46,32 @@ type Store interface {
 	// id. found=false when no active row matches (wrong owner, unknown id,
 	// or already soft-deleted) — the ownership check for detach/set-default.
 	PaymentMethodTarget(ctx context.Context, userID, paymentMethodID uuid.UUID) (stripePMID, stripeCustomerID string, found bool, err error)
+
+	// InsertAddCardRequest creates a pending row in
+	// ms_billing.add_card_requests for accountID and returns its id.
+	// The setup_intent_id is patched in via
+	// SetAddCardRequestSetupIntent once Stripe has returned the session.
+	InsertAddCardRequest(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error)
+
+	// SetAddCardRequestSetupIntent stamps the Stripe setup_intent_id
+	// onto a pending request row. Idempotent: if the row is no longer
+	// pending (already resolved by webhook), this is a no-op.
+	SetAddCardRequestSetupIntent(ctx context.Context, requestID uuid.UUID, setupIntentID string) error
+
+	// GetAddCardRequest returns the status of an add-card request row,
+	// scoped to accountID so a user can only poll requests they own.
+	// When status is "completed" or "duplicate", the associated
+	// PaymentMethod is populated via JOIN. Returns (nil, nil) when no
+	// row matches both id + account_id (treated as 404 by the service).
+	GetAddCardRequest(ctx context.Context, requestID, accountID uuid.UUID) (*AddCardRequestStatus, error)
+}
+
+// AddCardRequestStatus is the projection of an add_card_requests row
+// returned to the service layer. PaymentMethod is non-nil only when
+// the request has resolved to a card (completed or duplicate).
+type AddCardRequestStatus struct {
+	Status        AddCardStatus
+	PaymentMethod *PaymentMethod
 }
 
 // NewStore returns a Store backed by the given pgxpool.
@@ -157,6 +183,77 @@ func (s *pgxStore) HasUsablePaymentMethod(ctx context.Context, accountID uuid.UU
 	var has bool
 	err := s.pool.QueryRow(ctx, q, accountID).Scan(&has)
 	return has, err
+}
+
+func (s *pgxStore) InsertAddCardRequest(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	const q = `
+		INSERT INTO ms_billing.add_card_requests (account_id)
+		VALUES ($1)
+		RETURNING id
+	`
+	var id uuid.UUID
+	if err := s.pool.QueryRow(ctx, q, accountID).Scan(&id); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+func (s *pgxStore) SetAddCardRequestSetupIntent(ctx context.Context, requestID uuid.UUID, setupIntentID string) error {
+	// `AND status = 'pending'` is the idempotency guard: if the webhook
+	// has already resolved the row, we don't reopen its setup_intent_id.
+	const q = `
+		UPDATE ms_billing.add_card_requests
+		SET setup_intent_id = $2
+		WHERE id = $1 AND status = 'pending'
+	`
+	_, err := s.pool.Exec(ctx, q, requestID, setupIntentID)
+	return err
+}
+
+func (s *pgxStore) GetAddCardRequest(ctx context.Context, requestID, accountID uuid.UUID) (*AddCardRequestStatus, error) {
+	// LEFT JOIN: payment_method_id is NULL until the webhook resolves
+	// the row, so a single query handles every status. pm.id is the
+	// nullable sentinel — when NULL, the row hasn't resolved yet and
+	// the COALESCE'd defaults are ignored at the Go level. We keep
+	// COALESCEs on the other columns so Scan into non-nullable types
+	// still succeeds.
+	const q = `
+		SELECT
+			r.status,
+			pm.id,
+			COALESCE(pm.stripe_payment_method_id, ''),
+			COALESCE(pm.brand, ''),
+			COALESCE(pm.last4, ''),
+			COALESCE(pm.exp_month, 0),
+			COALESCE(pm.exp_year, 0),
+			COALESCE(pm.is_default, false)
+		FROM ms_billing.add_card_requests r
+		LEFT JOIN ms_billing.payment_methods_mirror pm
+			ON pm.id = r.payment_method_id
+		WHERE r.id = $1 AND r.account_id = $2
+	`
+	var (
+		status AddCardStatus
+		pm     PaymentMethod
+		pmID   *uuid.UUID
+	)
+	err := s.pool.QueryRow(ctx, q, requestID, accountID).Scan(
+		&status,
+		&pmID, &pm.StripePaymentMethodID, &pm.Brand, &pm.Last4,
+		&pm.ExpMonth, &pm.ExpYear, &pm.IsDefault,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := &AddCardRequestStatus{Status: status}
+	if pmID != nil {
+		pm.ID = *pmID
+		out.PaymentMethod = &pm
+	}
+	return out, nil
 }
 
 func (s *pgxStore) ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error) {

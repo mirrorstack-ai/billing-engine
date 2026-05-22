@@ -147,6 +147,120 @@ func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPay
 	}, nil
 }
 
+// StartAddPaymentMethod opens an add-card attempt and returns the
+// durable request_id the frontend polls against. Logical sequence:
+//
+//  1. Ensure the accounts row (idempotent on user_id).
+//  2. Create the Stripe Customer if absent (one-shot, persisted).
+//  3. INSERT a pending row in ms_billing.add_card_requests.
+//  4. CreateCheckoutSession (setup mode); the response expands
+//     setup_intent so we read its id immediately.
+//  5. Stamp setup_intent_id onto the request row so the webhook can
+//     correlate setup_intent.succeeded back here.
+//
+// Failure modes are bounded:
+//   - Steps 1–2 share the orphan-Customer recovery path as
+//     PrepareAddPaymentMethod (metadata.billing_account_id anchor).
+//   - Step 5 failing after 4 succeeds leaves a pending row with no
+//     setup_intent_id; the row is harmless (frontend's poll returns
+//     pending until the 24h TTL purge picks it up) but a retry would
+//     create a fresh request, which is fine.
+func (s *Service) StartAddPaymentMethod(ctx context.Context, req StartAddPaymentMethodRequest) (*StartAddPaymentMethodResponse, error) {
+	if req.UserID == uuid.Nil {
+		return nil, InvalidInput("user_id required")
+	}
+
+	accountID, stripeCustomerID, err := s.store.EnsureAccount(ctx, req.UserID)
+	if err != nil {
+		return nil, Internal("ensure account failed", err)
+	}
+
+	if stripeCustomerID == "" {
+		// First paid action for this user — create the Stripe Customer
+		// carrying the account email (Stripe needs it to confirm the
+		// setup-mode Checkout Session).
+		cust, err := s.stripe.CreateCustomer(ctx, accountID.String(), req.Email)
+		if err != nil {
+			return nil, StripeError("create customer failed", err)
+		}
+		stripeCustomerID = cust.ID
+		if err := s.store.SetStripeCustomer(ctx, accountID, stripeCustomerID); err != nil {
+			return nil, Internal("persist stripe_customer_id failed", err)
+		}
+	} else if req.Email != "" {
+		// Existing Customer (possibly created before email capture):
+		// backfill the email so the Checkout Session can be confirmed.
+		// Idempotent when the email is already set.
+		if err := s.stripe.UpdateCustomerEmail(ctx, stripeCustomerID, req.Email); err != nil {
+			return nil, StripeError("update customer email failed", err)
+		}
+	}
+
+	requestID, err := s.store.InsertAddCardRequest(ctx, accountID)
+	if err != nil {
+		return nil, Internal("insert add-card request failed", err)
+	}
+
+	session, err := s.stripe.CreateCheckoutSession(ctx, stripeCustomerID, s.returnURL)
+	if err != nil {
+		return nil, StripeError("create checkout session failed", err)
+	}
+
+	// The session expands setup_intent; the inner *SetupIntent is
+	// the one Stripe will emit setup_intent.succeeded for. Defensive
+	// nil-check: stripe-go has marked SetupIntent optional historically.
+	if session.SetupIntent != nil && session.SetupIntent.ID != "" {
+		if err := s.store.SetAddCardRequestSetupIntent(ctx, requestID, session.SetupIntent.ID); err != nil {
+			return nil, Internal("persist setup_intent_id failed", err)
+		}
+	}
+
+	return &StartAddPaymentMethodResponse{
+		RequestID:        requestID,
+		BillingAccountID: accountID,
+		ClientSecret:     session.ClientSecret,
+	}, nil
+}
+
+// FinishAddPaymentMethod returns the current resolution status of an
+// add-card request. The frontend polls this endpoint; the webhook
+// (setup_intent.succeeded + payment_method.attached) is what flips
+// the row from pending → completed / duplicate / failed.
+//
+// Ownership is enforced by joining account_id to the user's account:
+// a user can only read requests they themselves started. A request_id
+// that doesn't belong to the caller (or doesn't exist) returns 404
+// rather than leaking existence to a different user.
+func (s *Service) FinishAddPaymentMethod(ctx context.Context, req FinishAddPaymentMethodRequest) (*FinishAddPaymentMethodResponse, error) {
+	if req.UserID == uuid.Nil {
+		return nil, InvalidInput("user_id required")
+	}
+	if req.RequestID == uuid.Nil {
+		return nil, InvalidInput("request_id required")
+	}
+
+	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
+	if err != nil {
+		return nil, Internal("account lookup failed", err)
+	}
+	if !found {
+		return nil, NotFound("add-card request not found")
+	}
+
+	row, err := s.store.GetAddCardRequest(ctx, req.RequestID, accountID)
+	if err != nil {
+		return nil, Internal("get add-card request failed", err)
+	}
+	if row == nil {
+		return nil, NotFound("add-card request not found")
+	}
+
+	return &FinishAddPaymentMethodResponse{
+		Status:        row.Status,
+		PaymentMethod: row.PaymentMethod,
+	}, nil
+}
+
 // GetPaymentMethods returns the user's active payment methods.
 // Returns an empty slice (not nil, not an error) when the user has
 // no accounts row or no methods attached.
