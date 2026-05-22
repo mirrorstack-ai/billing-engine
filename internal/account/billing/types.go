@@ -68,6 +68,11 @@ type PrepareAddPaymentMethodRequest struct {
 // web-account passes to Stripe's CheckoutElementsProvider to drive the
 // client-side card-attach flow. It expires per Stripe's Checkout
 // Session lifecycle (24 hours).
+//
+// Deprecated: use StartAddPaymentMethod + FinishAddPaymentMethod for
+// new callers. The request-id flow eliminates the frontend's need to
+// diff the card list to detect duplicates. Kept until web-account is
+// fully migrated; removed in a follow-up cycle.
 type PrepareAddPaymentMethodResponse struct {
 	BillingAccountID uuid.UUID `json:"billing_account_id"`
 	ClientSecret     string    `json:"client_secret"`
@@ -92,6 +97,65 @@ type SetDefaultPaymentMethodRequest struct {
 // SetDefaultPaymentMethodResponse is the (empty) success body. is_default
 // is synced asynchronously by the customer.updated webhook.
 type SetDefaultPaymentMethodResponse struct{}
+
+// StartAddPaymentMethodRequest is the payload of StartAddPaymentMethod —
+// the half of the add-card RPC that allocates a durable request_id the
+// frontend can correlate against.
+//
+// Email mirrors PrepareAddPaymentMethodRequest.Email: api-platform
+// supplies the authenticated user's email so the Stripe Customer can
+// be confirmed against the setup-mode Checkout Session. Empty tolerated
+// but blocks confirm.
+type StartAddPaymentMethodRequest struct {
+	UserID uuid.UUID `json:"user_id"`
+	Email  string    `json:"email,omitempty"`
+}
+
+// StartAddPaymentMethodResponse is the body of the success envelope.
+//
+// RequestID is the row's primary key in ms_billing.add_card_requests;
+// the frontend stashes it locally for the matching Finish call.
+// ClientSecret is the setup-mode Checkout Session client secret used
+// to drive Stripe's CheckoutElementsProvider; expires after 24h.
+type StartAddPaymentMethodResponse struct {
+	RequestID        uuid.UUID `json:"request_id"`
+	BillingAccountID uuid.UUID `json:"billing_account_id"`
+	ClientSecret     string    `json:"client_secret"`
+}
+
+// FinishAddPaymentMethodRequest is the payload of FinishAddPaymentMethod —
+// the polling half of the add-card RPC. The frontend retries until
+// status is no longer "pending".
+type FinishAddPaymentMethodRequest struct {
+	UserID    uuid.UUID `json:"user_id"`
+	RequestID uuid.UUID `json:"request_id"`
+}
+
+// AddCardStatus is the wire vocabulary for FinishAddPaymentMethodResponse.Status.
+// Mirrors ms_billing.add_card_request_status one-for-one.
+type AddCardStatus string
+
+const (
+	AddCardStatusPending   AddCardStatus = "pending"
+	AddCardStatusCompleted AddCardStatus = "completed"
+	AddCardStatusDuplicate AddCardStatus = "duplicate"
+	AddCardStatusFailed    AddCardStatus = "failed"
+)
+
+// FinishAddPaymentMethodResponse is the body of the success envelope.
+//
+// Status is one of pending / completed / duplicate / failed:
+//   - pending:   webhook hasn't resolved yet; caller should retry.
+//   - completed: card attached; PaymentMethod is populated.
+//   - duplicate: card was already in payment_methods_mirror; PaymentMethod
+//     points at the existing row (so the UI can highlight it).
+//   - failed:    setup_intent reached a terminal failure state.
+//
+// PaymentMethod is populated only on completed / duplicate.
+type FinishAddPaymentMethodResponse struct {
+	Status        AddCardStatus  `json:"status"`
+	PaymentMethod *PaymentMethod `json:"payment_method,omitempty"`
+}
 
 // GetPaymentMethodsRequest is the payload of GetPaymentMethods.
 type GetPaymentMethodsRequest struct {

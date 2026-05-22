@@ -44,8 +44,11 @@ func InvalidInput(msg string) *Error {
 	return &Error{Code: CodeInvalidInput, Message: msg}
 }
 
-// NotFound is returned when a requested resource (e.g. a payment method)
-// doesn't exist or isn't owned by the caller. The dispatch layer maps it
+// NotFound is returned when a requested resource (e.g. a payment method
+// or an add-card request) doesn't exist or isn't owned by the caller.
+// We deliberately don't distinguish "no row" from "owned by someone else"
+// — both surface as NOT_FOUND so a malicious caller can't enumerate
+// resource ids belonging to other users. The dispatch layer maps it
 // to HTTP 404 on the local path.
 func NotFound(msg string) *Error {
 	return &Error{Code: CodeNotFound, Message: msg}
