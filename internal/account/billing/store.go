@@ -42,10 +42,12 @@ type Store interface {
 	ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error)
 
 	// PaymentMethodTarget resolves an active payment method owned by the
-	// user, returning its Stripe PM id and the account's Stripe customer
-	// id. found=false when no active row matches (wrong owner, unknown id,
-	// or already soft-deleted) — the ownership check for detach/set-default.
-	PaymentMethodTarget(ctx context.Context, userID, paymentMethodID uuid.UUID) (stripePMID, stripeCustomerID string, found bool, err error)
+	// user, returning its Stripe PM id, the account's Stripe customer
+	// id, and whether the row is currently the default. found=false when
+	// no active row matches (wrong owner, unknown id, or already soft-
+	// deleted) — the ownership check for detach/set-default. isDefault
+	// lets DetachPaymentMethod refuse to remove the default card.
+	PaymentMethodTarget(ctx context.Context, userID, paymentMethodID uuid.UUID) (stripePMID, stripeCustomerID string, isDefault, found bool, err error)
 
 	// InsertAddCardRequest creates a pending row in
 	// ms_billing.add_card_requests for accountID and returns its id.
@@ -280,21 +282,25 @@ func (s *pgxStore) ListPaymentMethods(ctx context.Context, accountID uuid.UUID) 
 	return out, rows.Err()
 }
 
-func (s *pgxStore) PaymentMethodTarget(ctx context.Context, userID, paymentMethodID uuid.UUID) (string, string, bool, error) {
+func (s *pgxStore) PaymentMethodTarget(ctx context.Context, userID, paymentMethodID uuid.UUID) (string, string, bool, bool, error) {
 	const q = `
-		SELECT pmm.stripe_payment_method_id, COALESCE(a.stripe_customer_id, '')
+		SELECT pmm.stripe_payment_method_id, COALESCE(a.stripe_customer_id, ''), pmm.is_default
 		FROM ms_billing.payment_methods_mirror pmm
 		JOIN ms_billing.accounts a ON a.id = pmm.account_id
 		WHERE a.owner_kind = 'user' AND a.owner_user_id = $1
 		  AND pmm.id = $2 AND pmm.deleted_at IS NULL
 	`
-	var stripePMID, stripeCustomerID string
-	err := s.pool.QueryRow(ctx, q, userID, paymentMethodID).Scan(&stripePMID, &stripeCustomerID)
+	var (
+		stripePMID, stripeCustomerID string
+		isDefault                    bool
+	)
+	err := s.pool.QueryRow(ctx, q, userID, paymentMethodID).
+		Scan(&stripePMID, &stripeCustomerID, &isDefault)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", "", false, nil
+		return "", "", false, false, nil
 	}
 	if err != nil {
-		return "", "", false, err
+		return "", "", false, false, err
 	}
-	return stripePMID, stripeCustomerID, true, nil
+	return stripePMID, stripeCustomerID, isDefault, true, nil
 }
