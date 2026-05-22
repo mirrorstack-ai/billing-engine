@@ -88,24 +88,27 @@ type Store interface {
 	SetAddCardRequestStripePM(ctx context.Context, setupIntentID, stripePaymentMethodID string) error
 
 	// ResolvePendingAddCardRequest flips the matching pending request
-	// row from pending → completed (fresh attach) or duplicate (the
-	// mirror row pre-existed the request). Distinguishes by comparing
-	// payment_methods_mirror.attached_at to add_card_requests.created_at:
-	// a mirror row older than the request means the card was already
-	// on file before the user clicked "Add card". No matching row OR
-	// no mirror row yet → no-op (the other webhook event resolves it
-	// when both have arrived).
+	// row from pending → completed (fresh card) or duplicate (the same
+	// fingerprint already exists on the account). On duplicate, the
+	// just-mirrored row is also soft-deleted so the UI shows one
+	// canonical row per real-world card. No matching row OR no mirror
+	// row yet → no-op (the partner webhook event resolves it when
+	// both have arrived).
 	ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error
 }
 
 // InsertPaymentMethodParams is the row data extracted from a
-// payment_method.attached event's card block.
+// payment_method.attached event's card block. Fingerprint is Stripe's
+// canonical "same card" identifier and is the key the duplicate-card
+// resolver uses; empty when Stripe omits it on legacy non-card PMs (we
+// log + skip those before reaching here, but the type stays tolerant).
 type InsertPaymentMethodParams struct {
 	StripePaymentMethodID string
 	Brand                 string
 	Last4                 string
 	ExpMonth              int
 	ExpYear               int
+	Fingerprint           string
 }
 
 // Router is the entry point exposed to cmd/account-webhook. It owns
