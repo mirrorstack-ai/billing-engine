@@ -41,6 +41,15 @@ type Client interface {
 	// confirmation (required by elements mode even when card-only
 	// confirmation stays in-page).
 	CreateCheckoutSession(ctx context.Context, stripeCustomerID, returnURL string) (*stripego.CheckoutSession, error)
+
+	// DetachPaymentMethod detaches a saved card from its Customer. The
+	// resulting payment_method.detached webhook soft-deletes the mirror row.
+	DetachPaymentMethod(ctx context.Context, stripePaymentMethodID string) error
+
+	// SetDefaultPaymentMethod points the Customer's invoice-settings
+	// default at the given payment method. The resulting customer.updated
+	// webhook syncs is_default across the account's mirror rows.
+	SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID, stripePaymentMethodID string) error
 }
 
 // Verifier verifies Stripe webhook signatures. Kept separate from
