@@ -21,9 +21,17 @@ import (
 //   - Tests: pass a fake satisfying this interface.
 type Client interface {
 	// CreateCustomer creates a Stripe Customer with the platform's
-	// canonical metadata anchor. The returned *stripego.Customer.ID
-	// is what callers persist as accounts.stripe_customer_id.
-	CreateCustomer(ctx context.Context, billingAccountID string) (*stripego.Customer, error)
+	// canonical metadata anchor and the account email. Stripe requires
+	// an email to confirm a setup-mode Checkout Session (and uses it for
+	// receipts/dunning); empty email is tolerated but blocks confirm.
+	// The returned *stripego.Customer.ID is what callers persist as
+	// accounts.stripe_customer_id.
+	CreateCustomer(ctx context.Context, billingAccountID, email string) (*stripego.Customer, error)
+
+	// UpdateCustomerEmail sets the email on an existing Stripe Customer.
+	// Used to backfill Customers created before the email was captured —
+	// a setup-mode Checkout Session can't be confirmed without one.
+	UpdateCustomerEmail(ctx context.Context, stripeCustomerID, email string) error
 
 	// CreateCheckoutSession creates a setup-mode Checkout Session
 	// (ui_mode=elements) against an existing Stripe Customer. The

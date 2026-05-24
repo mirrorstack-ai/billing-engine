@@ -113,8 +113,10 @@ func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPay
 	}
 
 	if stripeCustomerID == "" {
-		// First paid action for this user — create the Stripe Customer.
-		cust, err := s.stripe.CreateCustomer(ctx, accountID.String())
+		// First paid action for this user — create the Stripe Customer
+		// carrying the account email (Stripe needs it to confirm the
+		// setup-mode Checkout Session).
+		cust, err := s.stripe.CreateCustomer(ctx, accountID.String(), req.Email)
 		if err != nil {
 			return nil, StripeError("create customer failed", err)
 		}
@@ -125,6 +127,13 @@ func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPay
 			// covered by the operational reconciliation job; the caller's
 			// retry is also safe (row exists; second attempt reuses it).
 			return nil, Internal("persist stripe_customer_id failed", err)
+		}
+	} else if req.Email != "" {
+		// Existing Customer (possibly created before email capture):
+		// backfill the email so the Checkout Session can be confirmed.
+		// Idempotent when the email is already set.
+		if err := s.stripe.UpdateCustomerEmail(ctx, stripeCustomerID, req.Email); err != nil {
+			return nil, StripeError("update customer email failed", err)
 		}
 	}
 

@@ -95,22 +95,34 @@ func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) (
 
 type fakeStripe struct {
 	createdCustomers         []string
+	createdCustomerEmails    []string
+	updatedEmails            []string // "customerID=email" per UpdateCustomerEmail call
 	customerIDToReturn       string
 	checkoutSecretToReturn   string
 	errCreateCustomer        error
 	errCreateCheckoutSession error
+	errUpdateCustomerEmail   error
 }
 
-func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID string) (*stripego.Customer, error) {
+func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID, email string) (*stripego.Customer, error) {
 	if f.errCreateCustomer != nil {
 		return nil, f.errCreateCustomer
 	}
 	f.createdCustomers = append(f.createdCustomers, billingAccountID)
+	f.createdCustomerEmails = append(f.createdCustomerEmails, email)
 	id := f.customerIDToReturn
 	if id == "" {
 		id = "cus_test_" + billingAccountID[:8]
 	}
 	return &stripego.Customer{ID: id}, nil
+}
+
+func (f *fakeStripe) UpdateCustomerEmail(_ context.Context, stripeCustomerID, email string) error {
+	if f.errUpdateCustomerEmail != nil {
+		return f.errUpdateCustomerEmail
+	}
+	f.updatedEmails = append(f.updatedEmails, stripeCustomerID+"="+email)
+	return nil
 }
 
 func (f *fakeStripe) CreateCheckoutSession(_ context.Context, _, _ string) (*stripego.CheckoutSession, error) {
@@ -283,12 +295,13 @@ func TestPrepareAddPaymentMethod_FirstTime_CreatesCustomerAndSetupIntent(t *test
 	svc := billing.NewService(store, stripeFake, "")
 	userID := uuid.New()
 
-	resp, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: userID})
+	resp, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: userID, Email: "user@example.com"})
 
 	require.NoError(t, err)
 	require.NotEqual(t, uuid.Nil, resp.BillingAccountID)
 	require.NotEmpty(t, resp.ClientSecret)
 	require.Len(t, stripeFake.createdCustomers, 1, "should create Stripe Customer on first call")
+	require.Equal(t, []string{"user@example.com"}, stripeFake.createdCustomerEmails, "account email should be set on the new Customer")
 	require.NotEmpty(t, store.accountsByUser[userID].stripeCustomerID)
 }
 
@@ -305,6 +318,37 @@ func TestPrepareAddPaymentMethod_SecondTime_ReusesCustomerAndMintsNewIntent(t *t
 
 	require.Len(t, stripeFake.createdCustomers, 1, "should NOT create a second Stripe Customer")
 	require.NotEmpty(t, resp2.ClientSecret, "still mints a fresh Checkout Session")
+}
+
+func TestPrepareAddPaymentMethod_ExistingCustomer_BackfillsEmail(t *testing.T) {
+	// A Customer created before email capture must have its email
+	// backfilled so the setup-mode Checkout Session can be confirmed.
+	store := newFakeStore()
+	userID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: uuid.New(), stripeCustomerID: "cus_existing"}
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake, "")
+
+	_, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: userID, Email: "user@example.com"})
+
+	require.NoError(t, err)
+	require.Empty(t, stripeFake.createdCustomers, "should reuse the existing Customer")
+	require.Equal(t, []string{"cus_existing=user@example.com"}, stripeFake.updatedEmails, "existing Customer email should be backfilled")
+}
+
+func TestPrepareAddPaymentMethod_BackfillEmailFails_ReturnsStripeError(t *testing.T) {
+	store := newFakeStore()
+	userID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: uuid.New(), stripeCustomerID: "cus_existing"}
+	stripeFake := &fakeStripe{errUpdateCustomerEmail: errors.New("stripe down")}
+	svc := billing.NewService(store, stripeFake, "")
+
+	_, err := svc.PrepareAddPaymentMethod(context.Background(), billing.PrepareAddPaymentMethodRequest{UserID: userID, Email: "user@example.com"})
+
+	require.Error(t, err)
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeStripeError, be.Code)
 }
 
 func TestPrepareAddPaymentMethod_StripeCustomerFails_ReturnsStripeError(t *testing.T) {
