@@ -2,8 +2,13 @@ package webhook
 
 import (
 	"context"
+	"errors"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 )
 
 // NewStore returns a Store backed by the given pgxpool. Used by
@@ -12,11 +17,12 @@ func NewStore(pool *pgxpool.Pool) Store {
 	if pool == nil {
 		panic("webhook.NewStore: pool must not be nil")
 	}
-	return &pgxStore{pool: pool}
+	return &pgxStore{pool: pool, q: db.New(pool)}
 }
 
 type pgxStore struct {
 	pool *pgxpool.Pool
+	q    *db.Queries
 }
 
 // MarkEventProcessed inserts the event_id into webhook_events_processed
@@ -24,20 +30,18 @@ type pgxStore struct {
 //   - firstTime=true  → row was inserted; caller should run side effects.
 //   - firstTime=false → row already existed; caller should short-circuit.
 //
-// The check is done via pgx.CommandTag.RowsAffected rather than a
-// SELECT-then-INSERT race: one round-trip, race-free by virtue of
-// Postgres's atomic INSERT semantics.
+// The check is done via RowsAffected rather than a SELECT-then-INSERT
+// race: one round-trip, race-free by virtue of Postgres's atomic
+// INSERT semantics.
 func (s *pgxStore) MarkEventProcessed(ctx context.Context, eventID, eventType string) (bool, error) {
-	const q = `
-		INSERT INTO ms_billing.webhook_events_processed (event_id, event_type)
-		VALUES ($1, $2)
-		ON CONFLICT (event_id) DO NOTHING
-	`
-	tag, err := s.pool.Exec(ctx, q, eventID, eventType)
+	rows, err := s.q.MarkEventProcessed(ctx, db.MarkEventProcessedParams{
+		EventID:   eventID,
+		EventType: eventType,
+	})
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() == 1, nil
+	return rows == 1, nil
 }
 
 // TouchAccountByStripeCustomer updates accounts.updated_at for the
@@ -45,12 +49,11 @@ func (s *pgxStore) MarkEventProcessed(ctx context.Context, eventID, eventType st
 // installed by migration 001 maintains updated_at, but the explicit
 // SET is more discoverable than relying on a no-op UPDATE to fire it.
 func (s *pgxStore) TouchAccountByStripeCustomer(ctx context.Context, stripeCustomerID string) (bool, error) {
-	const q = `UPDATE ms_billing.accounts SET updated_at = now() WHERE stripe_customer_id = $1`
-	tag, err := s.pool.Exec(ctx, q, stripeCustomerID)
+	rows, err := s.q.TouchAccountByStripeCustomer(ctx, text(stripeCustomerID))
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	return rows > 0, nil
 }
 
 // SetDefaultPaymentMethod marks one PM as default and unmarks all
@@ -62,54 +65,47 @@ func (s *pgxStore) TouchAccountByStripeCustomer(ctx context.Context, stripeCusto
 // account_id is resolved inline via the stripe_customer_id lookup;
 // no separate fetch.
 func (s *pgxStore) SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID, defaultStripePMID string) error {
-	const q = `
-		UPDATE ms_billing.payment_methods_mirror
-		SET is_default = (stripe_payment_method_id = $2)
-		WHERE account_id = (
-			SELECT id FROM ms_billing.accounts WHERE stripe_customer_id = $1
-		)
-		AND deleted_at IS NULL
-	`
-	_, err := s.pool.Exec(ctx, q, stripeCustomerID, defaultStripePMID)
-	return err
+	return s.q.SetDefaultPaymentMethodByCustomer(ctx, db.SetDefaultPaymentMethodByCustomerParams{
+		StripeCustomerID:      text(stripeCustomerID),
+		StripePaymentMethodID: defaultStripePMID,
+	})
 }
 
 // InsertPaymentMethod inserts a row into payment_methods_mirror after
 // resolving account_id from stripeCustomerID. Returns (found, error):
 //   - found=false signals Stripe→DB drift (no accounts row for this
 //     customer); webhook handler converts to drift_warning response.
-//   - found=true on either successful insert OR ON CONFLICT no-op
-//     (idempotent retry; mirror already in the right state).
+//   - found=true on either successful insert OR a no-op (ON CONFLICT,
+//     or the insert-time dedupe skip) when the account does exist.
+//
+// First active card on the account becomes the default; subsequent cards
+// insert is_default=false. The INSERT…SELECT also skips when an active
+// row already shares brand/last4/exp (best-effort insert-time dedupe);
+// fingerprint-equality dedupe is the canonical check, applied later in
+// ResolvePendingAddCardRequest.
 func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (bool, error) {
-	const q = `
-		WITH acct AS (
-			SELECT id FROM ms_billing.accounts WHERE stripe_customer_id = $1
-		)
-		INSERT INTO ms_billing.payment_methods_mirror
-			(account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default)
-		SELECT acct.id, $2, $3, $4, $5, $6, false
-		FROM acct
-		ON CONFLICT (stripe_payment_method_id) DO NOTHING
-	`
-	tag, err := s.pool.Exec(ctx, q,
-		stripeCustomerID,
-		pm.StripePaymentMethodID,
-		pm.Brand,
-		pm.Last4,
-		pm.ExpMonth,
-		pm.ExpYear,
-	)
+	// Column7 is the NULLIF($7,'') fingerprint argument: the empty string
+	// becomes SQL NULL so legacy/non-card PMs don't pollute the dedupe
+	// index. sqlc types it as interface{}; pass the raw string.
+	rows, err := s.q.InsertPaymentMethod(ctx, db.InsertPaymentMethodParams{
+		StripeCustomerID:      text(stripeCustomerID),
+		StripePaymentMethodID: pm.StripePaymentMethodID,
+		Brand:                 pm.Brand,
+		Last4:                 pm.Last4,
+		ExpMonth:              int32(pm.ExpMonth),
+		ExpYear:               int32(pm.ExpYear),
+		Column7:               pm.Fingerprint,
+	})
 	if err != nil {
 		return false, err
 	}
-	if tag.RowsAffected() == 1 {
+	if rows == 1 {
 		return true, nil
 	}
-	// 0 rows: either drift (no accounts row) or ON CONFLICT (PM already
-	// mirrored). Disambiguate; the drift case needs a different status.
-	var exists bool
-	const checkQ = `SELECT EXISTS (SELECT 1 FROM ms_billing.accounts WHERE stripe_customer_id = $1)`
-	if err := s.pool.QueryRow(ctx, checkQ, stripeCustomerID).Scan(&exists); err != nil {
+	// 0 rows: either drift (no accounts row) or a no-op (ON CONFLICT /
+	// dedupe skip). Disambiguate; the drift case needs a different status.
+	exists, err := s.q.AccountExistsByStripeCustomer(ctx, text(stripeCustomerID))
+	if err != nil {
 		return false, err
 	}
 	return exists, nil
@@ -120,16 +116,131 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 // idempotent no-op (the PM was never mirrored, or was already soft-
 // deleted in a prior call).
 func (s *pgxStore) SoftDeletePaymentMethod(ctx context.Context, stripePaymentMethodID string) (bool, error) {
-	const q = `
-		UPDATE ms_billing.payment_methods_mirror
-		SET deleted_at = now()
-		WHERE stripe_payment_method_id = $1 AND deleted_at IS NULL
-	`
-	tag, err := s.pool.Exec(ctx, q, stripePaymentMethodID)
+	rows, err := s.q.SoftDeletePaymentMethod(ctx, stripePaymentMethodID)
 	if err != nil {
 		return false, err
 	}
-	return tag.RowsAffected() > 0, nil
+	return rows > 0, nil
+}
+
+// SetAddCardRequestStripePM stamps the resolved Stripe payment_method
+// id onto a still-pending add_card_requests row. Matched by the row's
+// setup_intent_id; the partial index acr_setup_intent_pending_idx
+// (migration 004) covers this query. No-op when the row is no longer
+// pending — the other resolution handler has already finalized it.
+func (s *pgxStore) SetAddCardRequestStripePM(ctx context.Context, setupIntentID, stripePaymentMethodID string) error {
+	return s.q.SetAddCardRequestStripePM(ctx, db.SetAddCardRequestStripePMParams{
+		SetupIntentID: text(setupIntentID),
+		StripePmID:    text(stripePaymentMethodID),
+	})
+}
+
+// ResolvePendingAddCardRequest is the terminal step of the add-card
+// flow. Runs in a single transaction:
+//
+//  1. Look up the just-mirrored row by stripe_payment_method_id. Returns
+//     no-op when the row hasn't been inserted yet (event ordering: the
+//     other webhook handler will resolve once both rows exist).
+//  2. Probe for ANOTHER active mirror row on the same account with the
+//     same Stripe card fingerprint. Hit → 'duplicate'; miss → 'completed'.
+//     Stripe issues a fresh pm_* ID per setup_intent confirm even when
+//     the customer enters the same card, so stripe_payment_method_id
+//     equality (the previous predicate) never fired in practice;
+//     fingerprint equality is the canonical "same card" check.
+//  3. On duplicate, soft-delete the just-mirrored row so the UI doesn't
+//     show two rows that share brand+last4. The duplicate PM stays
+//     attached on Stripe's side until the future reconciliation job
+//     detaches it — orphan PMs are harmless (no auto-charge).
+//  4. Resolve the request row in one UPDATE, pointing payment_method_id
+//     at the surviving row (the pre-existing card on duplicate, the
+//     just-mirrored row on completed).
+//
+// Idempotent: the WHERE status = 'pending' filter on the final UPDATE
+// is a no-op for rows another event already finalized.
+func (s *pgxStore) ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := s.q.WithTx(tx)
+
+	// Step 1: lookup the just-mirrored row. ErrNoRows means the other
+	// webhook event (handlePaymentMethodAttached) hasn't run yet — bail
+	// out cleanly; the partner handler will re-enter this function once
+	// the mirror row lands.
+	mirror, err := qtx.MirrorRowByStripePM(ctx, stripePaymentMethodID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+
+	// Step 2: dedupe probe. Skip when fingerprint is unavailable
+	// (legacy rows pre-migration 005, or non-card Stripe PMs). The
+	// partial index pmm_account_fingerprint_active_idx already filters
+	// out NULL fingerprints, but the explicit Go guard keeps the empty
+	// case from emitting a needless query.
+	var duplicatePMID string
+	hasDuplicate := false
+	if mirror.Fingerprint.Valid && mirror.Fingerprint.String != "" {
+		duplicatePMID, err = qtx.DuplicateFingerprintPM(ctx, db.DuplicateFingerprintPMParams{
+			AccountID:   mirror.AccountID,
+			Fingerprint: mirror.Fingerprint,
+			ID:          mirror.ID,
+		})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		hasDuplicate = err == nil
+	}
+
+	// Step 3: when a pre-existing card already covers this fingerprint,
+	// soft-delete the freshly-mirrored row so the UI returns to a single
+	// canonical card per (account, fingerprint).
+	resolvedPMID := mirror.ID
+	resolvedStatus := db.MsBillingAddCardRequestStatusCompleted
+	if hasDuplicate {
+		resolvedPMID = duplicatePMID
+		resolvedStatus = db.MsBillingAddCardRequestStatusDuplicate
+		if err := qtx.SoftDeleteMirrorByID(ctx, mirror.ID); err != nil {
+			return err
+		}
+	}
+
+	resolvedPMUUID, err := uuidText(resolvedPMID)
+	if err != nil {
+		return err
+	}
+
+	// Step 4: terminal resolve. WHERE status='pending' makes this safe to
+	// re-run after the partner handler already finalized the row.
+	if err := qtx.ResolveAddCardRequest(ctx, db.ResolveAddCardRequestParams{
+		StripePmID:      text(stripePaymentMethodID),
+		Column2:         resolvedStatus,
+		PaymentMethodID: resolvedPMUUID,
+	}); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// text wraps a non-null Go string in the pgtype.Text the generated
+// queries expect for nullable TEXT columns.
+func text(s string) pgtype.Text {
+	return pgtype.Text{String: s, Valid: true}
+}
+
+// uuidText parses a UUID string into the pgtype.UUID the generated
+// resolve query expects for the nullable payment_method_id column.
+func uuidText(s string) (pgtype.UUID, error) {
+	var u pgtype.UUID
+	if err := u.Scan(s); err != nil {
+		return pgtype.UUID{}, err
+	}
+	return u, nil
 }
 
 // Compile-time interface check: pgxStore must satisfy Store.

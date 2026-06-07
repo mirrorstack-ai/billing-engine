@@ -78,16 +78,37 @@ type Store interface {
 	// stripe_payment_method_id row. Returns (found bool, error) where
 	// found=false is a no-op (idempotent on detach).
 	SoftDeletePaymentMethod(ctx context.Context, stripePaymentMethodID string) (found bool, err error)
+
+	// SetAddCardRequestStripePM stamps stripe_pm_id onto the still-pending
+	// add_card_requests row whose setup_intent_id matches. Called from the
+	// setup_intent.succeeded handler. Idempotent on already-resolved rows
+	// (UPDATE … WHERE status='pending' filters them out). No row matching
+	// the setup_intent_id is a no-op — happens for setup intents created
+	// outside the StartAddPaymentMethod flow (e.g. Stripe Dashboard).
+	SetAddCardRequestStripePM(ctx context.Context, setupIntentID, stripePaymentMethodID string) error
+
+	// ResolvePendingAddCardRequest flips the matching pending request
+	// row from pending → completed (fresh card) or duplicate (the same
+	// fingerprint already exists on the account). On duplicate, the
+	// just-mirrored row is also soft-deleted so the UI shows one
+	// canonical row per real-world card. No matching row OR no mirror
+	// row yet → no-op (the partner webhook event resolves it when
+	// both have arrived).
+	ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error
 }
 
 // InsertPaymentMethodParams is the row data extracted from a
-// payment_method.attached event's card block.
+// payment_method.attached event's card block. Fingerprint is Stripe's
+// canonical "same card" identifier and is the key the duplicate-card
+// resolver uses; empty when Stripe omits it on legacy non-card PMs (we
+// log + skip those before reaching here, but the type stays tolerant).
 type InsertPaymentMethodParams struct {
 	StripePaymentMethodID string
 	Brand                 string
 	Last4                 string
 	ExpMonth              int
 	ExpYear               int
+	Fingerprint           string
 }
 
 // Router is the entry point exposed to cmd/account-webhook. It owns
@@ -157,6 +178,8 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		return r.handlePaymentMethodAttached(ctx, event)
 	case stripego.EventTypePaymentMethodDetached:
 		return r.handlePaymentMethodDetached(ctx, event)
+	case stripego.EventTypeSetupIntentSucceeded:
+		return r.handleSetupIntentSucceeded(ctx, event)
 	default:
 		r.log.InfoContext(ctx, "webhook unhandled event", "event_id", event.ID, "type", event.Type)
 		return Result{HTTPStatus: 200, Status: StatusUnhandled}
