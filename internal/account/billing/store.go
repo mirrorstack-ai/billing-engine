@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -95,7 +96,11 @@ type pgxStore struct {
 // a full 32-bit space without colliding with unrelated advisory locks
 // across the codebase — hashtext alone collides at ~65K users (birthday
 // paradox on int32) and would silently serialize unrelated users.
-const advisoryLockNamespaceBillingAccountUser = 0x6c627461 // "lbta" — billing_account, easy to grep
+// Explicit int32: pg_advisory_xact_lock(int, int) takes 32-bit args and
+// the generated param field is int32; typing the constant here keeps the
+// value in range and avoids an implicit untyped-const conversion at the
+// call site.
+const advisoryLockNamespaceBillingAccountUser int32 = 0x6c627461 // "lbta" — billing_account, easy to grep
 
 func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UUID, string, error) {
 	var id string
@@ -235,10 +240,22 @@ func (s *pgxStore) InsertAddCardRequest(ctx context.Context, accountID uuid.UUID
 func (s *pgxStore) SetAddCardRequestSetupIntent(ctx context.Context, requestID uuid.UUID, setupIntentID string) error {
 	// `AND status = 'pending'` is the idempotency guard: if the webhook
 	// has already resolved the row, we don't reopen its setup_intent_id.
-	return s.q.SetAddCardRequestSetupIntent(ctx, db.SetAddCardRequestSetupIntentParams{
+	rows, err := s.q.SetAddCardRequestSetupIntent(ctx, db.SetAddCardRequestSetupIntentParams{
 		ID:            requestID.String(),
 		SetupIntentID: pgtype.Text{String: setupIntentID, Valid: true},
 	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		// No-op stamp: the row was already resolved by the webhook before
+		// Stripe returned the session. Expected and harmless — debug-log it
+		// so the no-op is observable, matching SetStripeCustomer's
+		// RowsAffected branch. Not an error.
+		slog.DebugContext(ctx, "SetAddCardRequestSetupIntent no-op: request not pending",
+			"request_id", requestID.String())
+	}
+	return nil
 }
 
 func (s *pgxStore) GetAddCardRequest(ctx context.Context, requestID, accountID uuid.UUID) (*AddCardRequestStatus, error) {
