@@ -99,6 +99,22 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 			),
 			NULLIF($7, '')
 		FROM acct
+		-- Dedupe by card identity: re-binding the same card mints a fresh
+		-- Stripe PM id, so the (stripe_payment_method_id) unique constraint
+		-- doesn't catch it. Skip when an active row already has the same
+		-- brand/last4/exp on this account so the user doesn't end up with
+		-- duplicate rows. (Best-effort — two physical cards with identical
+		-- brand/last4/exp would collide; fingerprint-based dedupe is a
+		-- follow-up.)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM ms_billing.payment_methods_mirror p2
+			WHERE p2.account_id = acct.id
+			  AND p2.deleted_at IS NULL
+			  AND p2.brand = $3
+			  AND p2.last4 = $4
+			  AND p2.exp_month = $5
+			  AND p2.exp_year = $6
+		)
 		ON CONFLICT (stripe_payment_method_id) DO NOTHING
 	`
 	tag, err := s.pool.Exec(ctx, q,

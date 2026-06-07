@@ -1,0 +1,7 @@
+[build]
+cmd = "go build -buildvcs=false -o /tmp/billing-api ./cmd/account-api"
+bin = "/tmp/billing-api"
+include_ext = ["go"]
+exclude_dir = ["tmp"]
+poll = true
+poll_interval = 2000
