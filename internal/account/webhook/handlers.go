@@ -63,8 +63,11 @@ func (r *Router) handleCustomerDeleted(ctx context.Context, event stripego.Event
 }
 
 // handlePaymentMethodAttached mirrors the new payment method into
-// payment_methods_mirror. is_default is set to false initially;
-// the follow-on customer.updated event syncs it. This keeps webhook
+// payment_methods_mirror. is_default on this INSERT is ADVISORY: the
+// first active card on an account auto-defaults (#14's feature) so a
+// new account has a usable default, but the authoritative default is
+// owned by customer.updated → SetDefaultPaymentMethod. The follow-on
+// customer.updated event syncs the real default. This keeps webhook
 // processing to a single DB write per event (no synchronous Stripe
 // API call inside the transaction).
 func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego.Event) Result {
@@ -126,6 +129,13 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 //     here, if not the attached handler will when it runs.
 //
 // Both store calls are idempotent against already-resolved rows.
+//
+// Unresolvable case: if setup_intent.succeeded is never delivered (and
+// payment_method.attached never correlates either), the matching
+// add_card_requests row stays status='pending' indefinitely. A TTL sweep
+// — mark rows >24h old still 'pending' as 'failed' (setup intents expire
+// at 24h; see migration 004's operational note) — is a tracked
+// follow-up; the request row carries no FK pressure so it is safe to age.
 func (r *Router) handleSetupIntentSucceeded(ctx context.Context, event stripego.Event) Result {
 	si, err := decodeSetupIntent(event)
 	if err != nil {

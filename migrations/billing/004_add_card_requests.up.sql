@@ -47,3 +47,10 @@ CREATE INDEX IF NOT EXISTS acr_setup_intent_pending_idx
 CREATE INDEX IF NOT EXISTS acr_stripe_pm_pending_idx
     ON ms_billing.add_card_requests (stripe_pm_id)
     WHERE status = 'pending';
+
+-- Index the account_id FK: GetAddCardRequest filters on (id, account_id)
+-- and a future TTL sweep / per-account listing scans by account_id. The
+-- ON DELETE CASCADE FK also benefits from an index on the referencing
+-- column to avoid a seq scan on parent-row deletes.
+CREATE INDEX IF NOT EXISTS acr_account_id_idx
+    ON ms_billing.add_card_requests (account_id);

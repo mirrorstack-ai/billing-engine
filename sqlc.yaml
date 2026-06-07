@@ -10,6 +10,11 @@ sql:
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_empty_slices: true
+        # These db_type overrides apply ONLY to NOT NULL columns: sqlc maps
+        # a NOT NULL uuid → string and a NOT NULL timestamptz → time.Time.
+        # NULLABLE uuid / timestamptz columns are unaffected and keep sqlc's
+        # default nullable types (pgtype.UUID / pgtype.Timestamptz) so NULL
+        # round-trips correctly. This is documentation only — no type change.
         overrides:
           - db_type: "uuid"
             go_type: "string"

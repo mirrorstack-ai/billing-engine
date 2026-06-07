@@ -56,6 +56,8 @@ WITH acct AS (
 INSERT INTO ms_billing.payment_methods_mirror
     (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default, fingerprint)
 SELECT acct.id, $2, $3, $4, $5, $6,
+    -- ADVISORY first-card default (see header). Authoritative default is
+    -- set by customer.updated → SetDefaultPaymentMethodByCustomer.
     NOT EXISTS (
         SELECT 1 FROM ms_billing.payment_methods_mirror p
         WHERE p.account_id = acct.id AND p.deleted_at IS NULL
@@ -89,6 +91,14 @@ type InsertPaymentMethodParams struct {
 // Skips when an active row already shares brand/last4/exp (best-effort
 // insert-time dedupe). fingerprint stored via NULLIF($7,”). No RETURNING
 // → :execrows; the Go layer disambiguates 0 rows via AccountExists.
+//
+// is_default on INSERT is ADVISORY (the first-card auto-default feature
+// from #14): it gives a brand-new account a usable default without an
+// explicit choice. It is NOT authoritative — customer.updated →
+// SetDefaultPaymentMethodByCustomer is the single source of truth for
+// which PM is default. This INSERT-time value matches #14's raw
+// InsertPaymentMethod exactly (NOT EXISTS over non-soft-deleted rows);
+// do not "promote" it to authoritative here.
 func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMethodParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertPaymentMethod,
 		arg.StripeCustomerID,
@@ -132,7 +142,7 @@ func (q *Queries) MarkEventProcessed(ctx context.Context, arg MarkEventProcessed
 const mirrorRowByStripePM = `-- name: MirrorRowByStripePM :one
 SELECT id, account_id, fingerprint
 FROM ms_billing.payment_methods_mirror
-WHERE stripe_payment_method_id = $1
+WHERE stripe_payment_method_id = $1 AND deleted_at IS NULL
 `
 
 type MirrorRowByStripePMRow struct {
@@ -143,6 +153,9 @@ type MirrorRowByStripePMRow struct {
 
 // MirrorRowByStripePM looks up a just-mirrored row by Stripe PM id, for
 // the resolve transaction (step 1). fingerprint is nullable.
+// `AND deleted_at IS NULL` guards the resolve anchor: a soft-deleted
+// mirror row (e.g. detached then a stale attached/setup_intent event
+// replays) must never become the row the request resolves against.
 func (q *Queries) MirrorRowByStripePM(ctx context.Context, stripePaymentMethodID string) (MirrorRowByStripePMRow, error) {
 	row := q.db.QueryRow(ctx, mirrorRowByStripePM, stripePaymentMethodID)
 	var i MirrorRowByStripePMRow

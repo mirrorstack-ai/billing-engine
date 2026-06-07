@@ -25,8 +25,10 @@ RETURNING id;
 
 -- SetAddCardRequestSetupIntent stamps the Stripe setup_intent_id onto a
 -- still-pending request row. WHERE status='pending' is the idempotency
--- guard: a webhook may already have resolved the row.
--- name: SetAddCardRequestSetupIntent :exec
+-- guard: a webhook may already have resolved the row. :execrows so the
+-- store can log a debug no-op stamp when rows==0 (the row was already
+-- resolved), matching SetStripeCustomer's RowsAffected pattern.
+-- name: SetAddCardRequestSetupIntent :execrows
 UPDATE ms_billing.add_card_requests
 SET setup_intent_id = $2
 WHERE id = $1 AND status = 'pending';
@@ -36,6 +38,13 @@ WHERE id = $1 AND status = 'pending';
 -- until the webhook resolves the row. The COALESCE'd columns stay
 -- non-null so they scan into the projection regardless of status.
 -- Scoped to account_id so a user can only poll requests they own.
+--
+-- `AND pm.deleted_at IS NULL` is part of the LEFT JOIN condition (not a
+-- WHERE clause) on purpose: a request that resolved to a card which was
+-- later detached must not leak the now-soft-deleted card through the
+-- status poll — the join simply yields NULLs (request still returns with
+-- its status). Keeping it in the JOIN preserves the LEFT JOIN so the
+-- request row still comes back when no/!active PM is attached.
 -- name: GetAddCardRequest :one
 SELECT
     r.status,
@@ -48,5 +57,5 @@ SELECT
     COALESCE(pm.is_default, false)::boolean AS is_default
 FROM ms_billing.add_card_requests r
 LEFT JOIN ms_billing.payment_methods_mirror pm
-    ON pm.id = r.payment_method_id
+    ON pm.id = r.payment_method_id AND pm.deleted_at IS NULL
 WHERE r.id = $1 AND r.account_id = $2;
