@@ -80,8 +80,37 @@ func (c *realClient) CreateCheckoutSession(ctx context.Context, stripeCustomerID
 		Currency:  stripego.String("usd"),
 		ReturnURL: stripego.String(returnURL),
 	}
+	// Expand the underlying SetupIntent so the caller can read
+	// session.SetupIntent.ID directly. StartAddPaymentMethod stamps
+	// this id onto ms_billing.add_card_requests so setup_intent.succeeded
+	// webhook events can correlate back to the originating request.
+	params.Expand = []*string{stripego.String("setup_intent")}
 	params.Context = ctx
 	return c.sc.CheckoutSessions.New(params)
+}
+
+// DetachPaymentMethod detaches a payment method from its Customer. The
+// mirror row is soft-deleted by the payment_method.detached webhook, not
+// here — this call only performs the Stripe-side detach.
+func (c *realClient) DetachPaymentMethod(ctx context.Context, stripePaymentMethodID string) error {
+	params := &stripego.PaymentMethodDetachParams{}
+	params.Context = ctx
+	_, err := c.sc.PaymentMethods.Detach(stripePaymentMethodID, params)
+	return err
+}
+
+// SetDefaultPaymentMethod sets the Customer's invoice-settings default
+// payment method. The resulting customer.updated webhook syncs the
+// mirror's is_default flags for the account.
+func (c *realClient) SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID, stripePaymentMethodID string) error {
+	params := &stripego.CustomerParams{
+		InvoiceSettings: &stripego.CustomerInvoiceSettingsParams{
+			DefaultPaymentMethod: stripego.String(stripePaymentMethodID),
+		},
+	}
+	params.Context = ctx
+	_, err := c.sc.Customers.Update(stripeCustomerID, params)
+	return err
 }
 
 // NewVerifier returns a Verifier for the configured webhook signing
