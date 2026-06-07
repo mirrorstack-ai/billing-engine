@@ -6,7 +6,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 )
 
 // Store is the persistence interface Service depends on. The shape
@@ -40,15 +43,50 @@ type Store interface {
 	// methods for an account, newest-first. Empty slice (not nil) when
 	// none exist.
 	ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error)
+
+	// PaymentMethodTarget resolves an active payment method owned by the
+	// user, returning its Stripe PM id, the account's Stripe customer
+	// id, and whether the row is currently the default. found=false when
+	// no active row matches (wrong owner, unknown id, or already soft-
+	// deleted) — the ownership check for detach/set-default. isDefault
+	// lets DetachPaymentMethod refuse to remove the default card.
+	PaymentMethodTarget(ctx context.Context, userID, paymentMethodID uuid.UUID) (stripePMID, stripeCustomerID string, isDefault, found bool, err error)
+
+	// InsertAddCardRequest creates a pending row in
+	// ms_billing.add_card_requests for accountID and returns its id.
+	// The setup_intent_id is patched in via
+	// SetAddCardRequestSetupIntent once Stripe has returned the session.
+	InsertAddCardRequest(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error)
+
+	// SetAddCardRequestSetupIntent stamps the Stripe setup_intent_id
+	// onto a pending request row. Idempotent: if the row is no longer
+	// pending (already resolved by webhook), this is a no-op.
+	SetAddCardRequestSetupIntent(ctx context.Context, requestID uuid.UUID, setupIntentID string) error
+
+	// GetAddCardRequest returns the status of an add-card request row,
+	// scoped to accountID so a user can only poll requests they own.
+	// When status is "completed" or "duplicate", the associated
+	// PaymentMethod is populated via JOIN. Returns (nil, nil) when no
+	// row matches both id + account_id (treated as 404 by the service).
+	GetAddCardRequest(ctx context.Context, requestID, accountID uuid.UUID) (*AddCardRequestStatus, error)
+}
+
+// AddCardRequestStatus is the projection of an add_card_requests row
+// returned to the service layer. PaymentMethod is non-nil only when
+// the request has resolved to a card (completed or duplicate).
+type AddCardRequestStatus struct {
+	Status        AddCardStatus
+	PaymentMethod *PaymentMethod
 }
 
 // NewStore returns a Store backed by the given pgxpool.
 func NewStore(pool *pgxpool.Pool) Store {
-	return &pgxStore{pool: pool}
+	return &pgxStore{pool: pool, q: db.New(pool)}
 }
 
 type pgxStore struct {
 	pool *pgxpool.Pool
+	q    *db.Queries
 }
 
 // advisoryLockNamespaceBillingAccountUser is the first argument to
@@ -60,40 +98,44 @@ type pgxStore struct {
 const advisoryLockNamespaceBillingAccountUser = 0x6c627461 // "lbta" — billing_account, easy to grep
 
 func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UUID, string, error) {
-	var id uuid.UUID
+	var id string
 	var stripeCustomerID string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+
 		// pg_advisory_xact_lock(namespace, key) serializes concurrent
 		// EnsureAccount calls per user. Held for the transaction duration.
-		const lockQ = `SELECT pg_advisory_xact_lock($1::int, hashtext($2::text))`
-		if _, err := tx.Exec(ctx, lockQ, advisoryLockNamespaceBillingAccountUser, userID); err != nil {
+		if err := qtx.AcquireBillingAccountUserLock(ctx, db.AcquireBillingAccountUserLockParams{
+			Column1: advisoryLockNamespaceBillingAccountUser,
+			Column2: userID.String(),
+		}); err != nil {
 			return err
 		}
 
-		const selectQ = `
-			SELECT id, COALESCE(stripe_customer_id, '')
-			FROM ms_billing.accounts
-			WHERE owner_kind = 'user' AND owner_user_id = $1
-		`
-		err := tx.QueryRow(ctx, selectQ, userID).Scan(&id, &stripeCustomerID)
+		existing, err := qtx.SelectAccountByUser(ctx, nullableUUID(userID))
 		if err == nil {
+			id, stripeCustomerID = existing.ID, existing.StripeCustomerID
 			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
 
-		const insertQ = `
-			INSERT INTO ms_billing.accounts (owner_kind, owner_user_id)
-			VALUES ('user', $1)
-			RETURNING id, COALESCE(stripe_customer_id, '')
-		`
-		return tx.QueryRow(ctx, insertQ, userID).Scan(&id, &stripeCustomerID)
+		inserted, err := qtx.InsertUserAccount(ctx, nullableUUID(userID))
+		if err != nil {
+			return err
+		}
+		id, stripeCustomerID = inserted.ID, inserted.StripeCustomerID
+		return nil
 	})
 	if err != nil {
 		return uuid.Nil, "", err
 	}
-	return id, stripeCustomerID, nil
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, "", err
+	}
+	return parsed, stripeCustomerID, nil
 }
 
 // ErrAccountNotFound is returned when SetStripeCustomer can't find the
@@ -104,12 +146,14 @@ func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UU
 var ErrAccountNotFound = errors.New("billing account row not found for update")
 
 func (s *pgxStore) SetStripeCustomer(ctx context.Context, accountID uuid.UUID, stripeCustomerID string) error {
-	const q = `UPDATE ms_billing.accounts SET stripe_customer_id = $2 WHERE id = $1`
-	tag, err := s.pool.Exec(ctx, q, accountID, stripeCustomerID)
+	rows, err := s.q.SetStripeCustomer(ctx, db.SetStripeCustomerParams{
+		ID:               accountID.String(),
+		StripeCustomerID: pgtype.Text{String: stripeCustomerID, Valid: true},
+	})
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if rows == 0 {
 		// Zero rows: the account_id we just ensured doesn't match any
 		// row. Almost certainly a code bug; surface it instead of
 		// silently proceeding to a CreateSetupIntent that points at a
@@ -120,59 +164,121 @@ func (s *pgxStore) SetStripeCustomer(ctx context.Context, accountID uuid.UUID, s
 }
 
 func (s *pgxStore) AccountByUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, bool, error) {
-	const q = `SELECT id FROM ms_billing.accounts WHERE owner_kind = 'user' AND owner_user_id = $1`
-	var id uuid.UUID
-	err := s.pool.QueryRow(ctx, q, userID).Scan(&id)
+	id, err := s.q.AccountIDByUser(ctx, nullableUUID(userID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, nil
 	}
 	if err != nil {
 		return uuid.Nil, false, err
 	}
-	return id, true, nil
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
 }
 
 func (s *pgxStore) HasUsablePaymentMethod(ctx context.Context, accountID uuid.UUID) (bool, error) {
-	// "Usable" = not soft-deleted AND not expired (exp_year, exp_month >=
-	// current year-month). Tuple comparison via row constructor; uses
-	// the partial index pmm_account_active_idx for the deleted_at filter.
-	const q = `
-		SELECT EXISTS (
-			SELECT 1
-			FROM ms_billing.payment_methods_mirror
-			WHERE account_id = $1
-			  AND deleted_at IS NULL
-			  AND (exp_year, exp_month) >= (
-			      EXTRACT(YEAR  FROM current_date)::INT,
-			      EXTRACT(MONTH FROM current_date)::INT
-			  )
-		)
-	`
-	var has bool
-	err := s.pool.QueryRow(ctx, q, accountID).Scan(&has)
-	return has, err
+	return s.q.HasUsablePaymentMethod(ctx, accountID.String())
 }
 
 func (s *pgxStore) ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error) {
-	const q = `
-		SELECT id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default
-		FROM ms_billing.payment_methods_mirror
-		WHERE account_id = $1 AND deleted_at IS NULL
-		ORDER BY attached_at DESC
-	`
-	rows, err := s.pool.Query(ctx, q, accountID)
+	rows, err := s.q.ListPaymentMethods(ctx, accountID.String())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	out := []PaymentMethod{}
-	for rows.Next() {
-		var pm PaymentMethod
-		if err := rows.Scan(&pm.ID, &pm.StripePaymentMethodID, &pm.Brand, &pm.Last4, &pm.ExpMonth, &pm.ExpYear, &pm.IsDefault); err != nil {
+	out := make([]PaymentMethod, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.ID)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, pm)
+		out = append(out, PaymentMethod{
+			ID:                    id,
+			StripePaymentMethodID: r.StripePaymentMethodID,
+			Brand:                 r.Brand,
+			Last4:                 r.Last4,
+			ExpMonth:              int(r.ExpMonth),
+			ExpYear:               int(r.ExpYear),
+			IsDefault:             r.IsDefault,
+		})
 	}
-	return out, rows.Err()
+	return out, nil
+}
+
+func (s *pgxStore) PaymentMethodTarget(ctx context.Context, userID, paymentMethodID uuid.UUID) (string, string, bool, bool, error) {
+	row, err := s.q.PaymentMethodTarget(ctx, db.PaymentMethodTargetParams{
+		OwnerUserID: nullableUUID(userID),
+		ID:          paymentMethodID.String(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, false, nil
+	}
+	if err != nil {
+		return "", "", false, false, err
+	}
+	return row.StripePaymentMethodID, row.StripeCustomerID, row.IsDefault, true, nil
+}
+
+func (s *pgxStore) InsertAddCardRequest(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	id, err := s.q.InsertAddCardRequest(ctx, accountID.String())
+	if err != nil {
+		return uuid.Nil, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return parsed, nil
+}
+
+func (s *pgxStore) SetAddCardRequestSetupIntent(ctx context.Context, requestID uuid.UUID, setupIntentID string) error {
+	// `AND status = 'pending'` is the idempotency guard: if the webhook
+	// has already resolved the row, we don't reopen its setup_intent_id.
+	return s.q.SetAddCardRequestSetupIntent(ctx, db.SetAddCardRequestSetupIntentParams{
+		ID:            requestID.String(),
+		SetupIntentID: pgtype.Text{String: setupIntentID, Valid: true},
+	})
+}
+
+func (s *pgxStore) GetAddCardRequest(ctx context.Context, requestID, accountID uuid.UUID) (*AddCardRequestStatus, error) {
+	// LEFT JOIN: payment_method_id is NULL until the webhook resolves
+	// the row, so a single query handles every status. payment_method_id
+	// is the nullable sentinel — when invalid, the row hasn't resolved
+	// yet and the COALESCE'd defaults are ignored at the Go level.
+	row, err := s.q.GetAddCardRequest(ctx, db.GetAddCardRequestParams{
+		ID:        requestID.String(),
+		AccountID: accountID.String(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := &AddCardRequestStatus{Status: AddCardStatus(row.Status)}
+	if row.PaymentMethodID.Valid {
+		pmID, err := uuid.FromBytes(row.PaymentMethodID.Bytes[:])
+		if err != nil {
+			return nil, err
+		}
+		out.PaymentMethod = &PaymentMethod{
+			ID:                    pmID,
+			StripePaymentMethodID: row.StripePaymentMethodID,
+			Brand:                 row.Brand,
+			Last4:                 row.Last4,
+			ExpMonth:              int(row.ExpMonth),
+			ExpYear:               int(row.ExpYear),
+			IsDefault:             row.IsDefault,
+		}
+	}
+	return out, nil
+}
+
+// nullableUUID converts a google/uuid.UUID into the pgtype.UUID the
+// generated queries expect for the nullable owner_user_id column. A
+// non-Nil UUID is always marked Valid; callers never pass Nil here
+// (the service layer rejects Nil user ids before reaching the store).
+func nullableUUID(id uuid.UUID) pgtype.UUID {
+	return pgtype.UUID{Bytes: id, Valid: true}
 }

@@ -88,6 +88,10 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 		Last4:                 pm.Card.Last4,
 		ExpMonth:              int(pm.Card.ExpMonth),
 		ExpYear:               int(pm.Card.ExpYear),
+		// Stripe's "same card" identifier across PaymentMethod IDs —
+		// the resolver compares this against existing active mirror rows
+		// on the same account to set status='duplicate'.
+		Fingerprint: pm.Card.Fingerprint,
 	}
 	found, err := r.store.InsertPaymentMethod(ctx, pm.Customer.ID, params)
 	if err != nil {
@@ -97,6 +101,48 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 	if !found {
 		r.log.WarnContext(ctx, "payment_method.attached drift: no accounts row for customer", "event_id", event.ID, "stripe_customer_id", pm.Customer.ID)
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
+	}
+
+	// Resolve any pending add-card request keyed on this Stripe PM.
+	// Best-effort: setup_intent.succeeded may not have stamped the
+	// stripe_pm_id yet (event ordering), in which case this is a no-op
+	// and that handler resolves the row instead.
+	if err := r.store.ResolvePendingAddCardRequest(ctx, pm.ID); err != nil {
+		r.log.ErrorContext(ctx, "payment_method.attached resolve add-card request failed", "event_id", event.ID, "error", err)
+		return Result{HTTPStatus: 500, Status: StatusInternal}
+	}
+	return Result{HTTPStatus: 200, Status: StatusOK}
+}
+
+// handleSetupIntentSucceeded is the primary resolution path for
+// add-card requests. The event carries the setup_intent.id (linked
+// to ms_billing.add_card_requests.setup_intent_id by Start) and the
+// pm.id Stripe ended up attaching. We:
+//
+//  1. Stamp stripe_pm_id on the matching pending request row so
+//     payment_method.attached's eventual resolve can correlate.
+//  2. Try to resolve immediately — payment_method.attached may have
+//     already arrived (inserting the mirror row); if so we resolve
+//     here, if not the attached handler will when it runs.
+//
+// Both store calls are idempotent against already-resolved rows.
+func (r *Router) handleSetupIntentSucceeded(ctx context.Context, event stripego.Event) Result {
+	si, err := decodeSetupIntent(event)
+	if err != nil {
+		r.log.WarnContext(ctx, "setup_intent.succeeded decode failed", "event_id", event.ID, "error", err)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+	if si.PaymentMethod == nil || si.PaymentMethod.ID == "" {
+		r.log.WarnContext(ctx, "setup_intent.succeeded missing payment_method", "event_id", event.ID, "setup_intent_id", si.ID)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+	if err := r.store.SetAddCardRequestStripePM(ctx, si.ID, si.PaymentMethod.ID); err != nil {
+		r.log.ErrorContext(ctx, "setup_intent.succeeded stamp stripe_pm_id failed", "event_id", event.ID, "error", err)
+		return Result{HTTPStatus: 500, Status: StatusInternal}
+	}
+	if err := r.store.ResolvePendingAddCardRequest(ctx, si.PaymentMethod.ID); err != nil {
+		r.log.ErrorContext(ctx, "setup_intent.succeeded resolve add-card request failed", "event_id", event.ID, "error", err)
+		return Result{HTTPStatus: 500, Status: StatusInternal}
 	}
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
@@ -159,4 +205,15 @@ func decodePaymentMethod(event stripego.Event) (*stripego.PaymentMethod, error) 
 		return nil, err
 	}
 	return &pm, nil
+}
+
+func decodeSetupIntent(event stripego.Event) (*stripego.SetupIntent, error) {
+	if event.Data == nil {
+		return nil, errNilEventData
+	}
+	var si stripego.SetupIntent
+	if err := json.Unmarshal(event.Data.Raw, &si); err != nil {
+		return nil, err
+	}
+	return &si, nil
 }
