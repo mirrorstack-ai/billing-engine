@@ -7,3 +7,8 @@
 \i migrations/billing/003_webhook_events_processed.up.sql
 \i migrations/billing/004_add_card_requests.up.sql
 \i migrations/billing/005_payment_methods_fingerprint.up.sql
+\i migrations/billing/006_metric_definitions.up.sql
+\i migrations/billing/007_usage_events.up.sql
+\i migrations/billing/008_billing_periods.up.sql
+\i migrations/billing/009_usage_aggregates.up.sql
+\i migrations/billing/010_module_visibility.up.sql

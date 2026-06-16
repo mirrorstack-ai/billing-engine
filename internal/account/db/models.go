@@ -56,6 +56,135 @@ func (ns NullMsBillingAddCardRequestStatus) Value() (driver.Value, error) {
 	return string(ns.MsBillingAddCardRequestStatus), nil
 }
 
+type MsBillingBillingPeriodStatus string
+
+const (
+	MsBillingBillingPeriodStatusOpen     MsBillingBillingPeriodStatus = "open"
+	MsBillingBillingPeriodStatusClosing  MsBillingBillingPeriodStatus = "closing"
+	MsBillingBillingPeriodStatusInvoiced MsBillingBillingPeriodStatus = "invoiced"
+)
+
+func (e *MsBillingBillingPeriodStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = MsBillingBillingPeriodStatus(s)
+	case string:
+		*e = MsBillingBillingPeriodStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for MsBillingBillingPeriodStatus: %T", src)
+	}
+	return nil
+}
+
+type NullMsBillingBillingPeriodStatus struct {
+	MsBillingBillingPeriodStatus MsBillingBillingPeriodStatus `json:"ms_billing_billing_period_status"`
+	Valid                        bool                         `json:"valid"` // Valid is true if MsBillingBillingPeriodStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullMsBillingBillingPeriodStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.MsBillingBillingPeriodStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.MsBillingBillingPeriodStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullMsBillingBillingPeriodStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.MsBillingBillingPeriodStatus), nil
+}
+
+type MsBillingMarginShareClass string
+
+const (
+	MsBillingMarginShareClassPrivate   MsBillingMarginShareClass = "private"
+	MsBillingMarginShareClassPublished MsBillingMarginShareClass = "published"
+)
+
+func (e *MsBillingMarginShareClass) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = MsBillingMarginShareClass(s)
+	case string:
+		*e = MsBillingMarginShareClass(s)
+	default:
+		return fmt.Errorf("unsupported scan type for MsBillingMarginShareClass: %T", src)
+	}
+	return nil
+}
+
+type NullMsBillingMarginShareClass struct {
+	MsBillingMarginShareClass MsBillingMarginShareClass `json:"ms_billing_margin_share_class"`
+	Valid                     bool                      `json:"valid"` // Valid is true if MsBillingMarginShareClass is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullMsBillingMarginShareClass) Scan(value interface{}) error {
+	if value == nil {
+		ns.MsBillingMarginShareClass, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.MsBillingMarginShareClass.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullMsBillingMarginShareClass) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.MsBillingMarginShareClass), nil
+}
+
+type MsBillingMetricKind string
+
+const (
+	MsBillingMetricKindCount        MsBillingMetricKind = "count"
+	MsBillingMetricKindSum          MsBillingMetricKind = "sum"
+	MsBillingMetricKindPeak         MsBillingMetricKind = "peak"
+	MsBillingMetricKindTimeWeighted MsBillingMetricKind = "time_weighted"
+)
+
+func (e *MsBillingMetricKind) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = MsBillingMetricKind(s)
+	case string:
+		*e = MsBillingMetricKind(s)
+	default:
+		return fmt.Errorf("unsupported scan type for MsBillingMetricKind: %T", src)
+	}
+	return nil
+}
+
+type NullMsBillingMetricKind struct {
+	MsBillingMetricKind MsBillingMetricKind `json:"ms_billing_metric_kind"`
+	Valid               bool                `json:"valid"` // Valid is true if MsBillingMetricKind is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullMsBillingMetricKind) Scan(value interface{}) error {
+	if value == nil {
+		ns.MsBillingMetricKind, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.MsBillingMetricKind.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullMsBillingMetricKind) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.MsBillingMetricKind), nil
+}
+
 type MsBillingAccount struct {
 	ID               string      `json:"id"`
 	OwnerKind        string      `json:"owner_kind"`
@@ -77,6 +206,33 @@ type MsBillingAddCardRequest struct {
 	ResolvedAt      pgtype.Timestamptz            `json:"resolved_at"`
 }
 
+type MsBillingBillingPeriod struct {
+	ID          string                       `json:"id"`
+	AccountID   string                       `json:"account_id"`
+	PeriodStart time.Time                    `json:"period_start"`
+	PeriodEnd   time.Time                    `json:"period_end"`
+	Status      MsBillingBillingPeriodStatus `json:"status"`
+	CreatedAt   time.Time                    `json:"created_at"`
+}
+
+type MsBillingMetricDefinition struct {
+	ID              string              `json:"id"`
+	ModuleID        string              `json:"module_id"`
+	Metric          string              `json:"metric"`
+	Kind            MsBillingMetricKind `json:"kind"`
+	Unit            string              `json:"unit"`
+	UnitPriceMicros pgtype.Int8         `json:"unit_price_micros"`
+	Active          bool                `json:"active"`
+	CreatedAt       time.Time           `json:"created_at"`
+	UpdatedAt       time.Time           `json:"updated_at"`
+}
+
+type MsBillingModuleVisibility struct {
+	ModuleID   string                    `json:"module_id"`
+	Visibility MsBillingMarginShareClass `json:"visibility"`
+	UpdatedAt  time.Time                 `json:"updated_at"`
+}
+
 type MsBillingPaymentMethodsMirror struct {
 	ID                    string             `json:"id"`
 	AccountID             string             `json:"account_id"`
@@ -89,6 +245,35 @@ type MsBillingPaymentMethodsMirror struct {
 	AttachedAt            time.Time          `json:"attached_at"`
 	DeletedAt             pgtype.Timestamptz `json:"deleted_at"`
 	Fingerprint           pgtype.Text        `json:"fingerprint"`
+}
+
+type MsBillingUsageAggregate struct {
+	ID                string              `json:"id"`
+	PeriodID          string              `json:"period_id"`
+	AccountID         string              `json:"account_id"`
+	AppID             string              `json:"app_id"`
+	ModuleID          string              `json:"module_id"`
+	Metric            string              `json:"metric"`
+	Kind              MsBillingMetricKind `json:"kind"`
+	BillableQuantity  pgtype.Numeric      `json:"billable_quantity"`
+	UnitPriceMicros   int64               `json:"unit_price_micros"`
+	CustomerMarkupNum int32               `json:"customer_markup_num"`
+	CustomerMarkupDen int32               `json:"customer_markup_den"`
+	RawCostMicros     int64               `json:"raw_cost_micros"`
+	ChargedMicros     int64               `json:"charged_micros"`
+	RolledUpAt        time.Time           `json:"rolled_up_at"`
+}
+
+type MsBillingUsageEvent struct {
+	EventID    string              `json:"event_id"`
+	AccountID  pgtype.UUID         `json:"account_id"`
+	AppID      string              `json:"app_id"`
+	ModuleID   string              `json:"module_id"`
+	Metric     string              `json:"metric"`
+	Kind       MsBillingMetricKind `json:"kind"`
+	Value      pgtype.Numeric      `json:"value"`
+	RecordedAt time.Time           `json:"recorded_at"`
+	IngestedAt time.Time           `json:"ingested_at"`
 }
 
 type MsBillingWebhookEventsProcessed struct {
