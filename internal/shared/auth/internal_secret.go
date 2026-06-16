@@ -33,6 +33,25 @@ import (
 // unauthenticated traffic. Callers should fail-fast at startup
 // instead of relying on this fallback.
 func InternalSecret(secret string) func(http.Handler) http.Handler {
+	return secretGuard(headerInternalSecret, secret)
+}
+
+// MeterSecret returns a chi middleware identical in behavior to
+// InternalSecret but gated behind a DEDICATED X-MS-Meter-Secret header
+// and its own secret. The metering ingest path (RecordUsage) is gated by
+// this rather than the general internal secret so the high-volume,
+// dispatch-asserted meter seam carries a credential the platform can
+// rotate independently of every other internal billing RPC (design §5:
+// "RecordUsage MUST use a NEW dedicated meter secret/header, not overload
+// X-MS-Internal-Secret"). Same fail-closed contract: empty secret → 503.
+func MeterSecret(secret string) func(http.Handler) http.Handler {
+	return secretGuard(headerMeterSecret, secret)
+}
+
+// secretGuard is the shared constant-time header-secret gate backing both
+// InternalSecret and MeterSecret. Differing only by header name + secret
+// keeps the two surfaces' behavior provably identical.
+func secretGuard(headerName, secret string) func(http.Handler) http.Handler {
 	expected := []byte(secret)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +76,10 @@ func InternalSecret(secret string) func(http.Handler) http.Handler {
 	}
 }
 
-const headerName = "X-MS-Internal-Secret"
+const (
+	headerInternalSecret = "X-MS-Internal-Secret"
+	headerMeterSecret    = "X-MS-Meter-Secret"
+)
 
 // writeError emits the billing-engine RPC error envelope. Kept inline
 // rather than imported from a separate package because the middleware

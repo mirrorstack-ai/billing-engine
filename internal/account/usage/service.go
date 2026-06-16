@@ -1,0 +1,284 @@
+package usage
+
+import (
+	"context"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+)
+
+// reservedMetricPrefixes are the platform-measured namespaces a module
+// must NOT self-report through the developer-controlled SDK meter
+// (design §3a build rule 3). Platform infra (egress/compute/storage/
+// tokens) is metered at the platform's own chokepoints and fed to
+// RecordUsage platform-side; accepting these from the SDK ingress would
+// let a module forge or zero a platform-billable metric.
+var reservedMetricPrefixes = []string{"platform.", "infra."}
+
+// Service implements the RecordUsage / GetUsageSummary /
+// SetMetricDefinitions / SetModuleVisibility RPCs. It composes a Store;
+// nowFn is injectable for deterministic tests.
+type Service struct {
+	store Store
+	nowFn func() time.Time
+}
+
+// NewService wires a Service. store is required; passing nil panics at
+// the first call site.
+func NewService(store Store) *Service {
+	return &Service{store: store, nowFn: time.Now}
+}
+
+// RecordUsage is the ingest seam. It:
+//  1. validates the dispatch-asserted request (identity is trusted here;
+//     it was re-derived upstream — design §3a),
+//  2. rejects the reserved platform.* / infra.* namespaces (build rule 3),
+//  3. resolves the DECLARED kind from metric_definitions and REJECTS an
+//     undeclared metric with INVALID_INPUT (declaration-first — design §1):
+//     the catalog (manifest-fed via SetMetricDefinitions) must declare the
+//     metric before any event is accepted. A retired (active=false) metric
+//     is also rejected — it no longer accepts events,
+//  4. resolves the owner's billing account (Nil = lazy, recorded NULL),
+//  5. inserts ON CONFLICT(event_id) DO NOTHING (idempotent retry).
+//
+// A deduped retry returns Recorded=false with a nil error — the fact is
+// already stored; callers must treat false as success.
+func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*RecordUsageResponse, error) {
+	if req.EventID == "" {
+		return nil, billing.InvalidInput("event_id required")
+	}
+	if req.AppID == uuid.Nil {
+		return nil, billing.InvalidInput("app_id required")
+	}
+	if req.ModuleID == uuid.Nil {
+		return nil, billing.InvalidInput("module_id required")
+	}
+	if req.Metric == "" {
+		return nil, billing.InvalidInput("metric required")
+	}
+	// Non-negative + finite value guard (design Axis 1: meters never carry
+	// negative or non-finite quantities; the SDK validates too, but this
+	// is the authoritative server-side gate).
+	if math.IsNaN(req.Value) || math.IsInf(req.Value, 0) {
+		return nil, billing.InvalidInput("value must be finite")
+	}
+	if req.Value < 0 {
+		return nil, billing.InvalidInput("value must be non-negative")
+	}
+	if isReservedMetric(req.Metric) {
+		return nil, billing.InvalidInput("metric uses a reserved platform namespace (platform.* / infra.* are platform-measured and cannot be self-reported)")
+	}
+	if req.OwnerUserID != uuid.Nil && req.OwnerOrgID != uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
+	}
+
+	// Resolve the DECLARED kind from the manifest-fed catalog. Metering is
+	// declaration-first (design §1): a metric must be declared (ms.Meter →
+	// manifest → SetMetricDefinitions) before any event is accepted, so an
+	// undeclared metric is REJECTED rather than recorded with a fallback
+	// kind. A retired (active=false) metric likewise no longer accepts
+	// events. The resolved kind is snapshotted onto the usage_events row so
+	// a later catalog edit can't retro-change how the event rolls up.
+	def, found, err := s.store.LookupMetricDefinition(ctx, req.ModuleID, req.Metric)
+	if err != nil {
+		return nil, billing.Internal("metric definition lookup failed", err)
+	}
+	if !found {
+		return nil, billing.InvalidInput("metric not declared (declare it via ms.Meter so the platform can resolve its kind and price)")
+	}
+	if !def.Active {
+		return nil, billing.InvalidInput("metric is retired and no longer accepts events")
+	}
+	kind := def.Kind
+
+	// Resolve the owner's billing account. Nil owner (or no account yet)
+	// records a lazy event with NULL account_id — retained and backfilled
+	// on conversion (design §8 "Lazy account").
+	accountID := uuid.Nil
+	owner := Owner{UserID: req.OwnerUserID, OrgID: req.OwnerOrgID}
+	if !owner.IsZero() {
+		id, ok, err := s.store.AccountByOwner(ctx, owner)
+		if err != nil {
+			return nil, billing.Internal("account lookup failed", err)
+		}
+		if ok {
+			accountID = id
+		}
+	}
+
+	recordedAt := req.RecordedAt
+	if recordedAt.IsZero() {
+		recordedAt = s.nowFn().UTC()
+	}
+
+	recorded, err := s.store.InsertUsageEvent(ctx, UsageEvent{
+		EventID:    req.EventID,
+		AccountID:  accountID,
+		AppID:      req.AppID,
+		ModuleID:   req.ModuleID,
+		Metric:     req.Metric,
+		Kind:       kind,
+		Value:      req.Value,
+		RecordedAt: recordedAt,
+	})
+	if err != nil {
+		return nil, billing.Internal("insert usage event failed", err)
+	}
+	return &RecordUsageResponse{Recorded: recorded}, nil
+}
+
+// GetUsageSummary returns the live current-period charged_micros per
+// metric for an owner. For a third-party custom metric the charge is
+// quantity × the developer's declared per-unit price with NO blanket
+// markup (design §1 / §4 Axis 1) — so charged == raw cost here. No
+// billing account yet → an empty Metrics slice and a nil error.
+func (s *Service) GetUsageSummary(ctx context.Context, req GetUsageSummaryRequest) (*GetUsageSummaryResponse, error) {
+	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
+	}
+	if req.OwnerUserID != uuid.Nil && req.OwnerOrgID != uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
+	}
+
+	owner := Owner{UserID: req.OwnerUserID, OrgID: req.OwnerOrgID}
+	accountID, found, err := s.store.AccountByOwner(ctx, owner)
+	if err != nil {
+		return nil, billing.Internal("account lookup failed", err)
+	}
+	if !found {
+		return &GetUsageSummaryResponse{Metrics: []MetricUsage{}}, nil
+	}
+
+	// Live current-period window: the calendar-month-to-date the events
+	// fell in. The authoritative billing_periods row + signup-day
+	// anniversary windowing is a PR #5/#6 concern; this fast-path estimate
+	// uses the current UTC month so a developer can see running usage
+	// before any rollup exists.
+	start, end := currentPeriodWindow(s.nowFn().UTC())
+
+	rows, err := s.store.CurrentPeriodUsage(ctx, accountID, start, end)
+	if err != nil {
+		return nil, billing.Internal("usage summary query failed", err)
+	}
+
+	metrics := make([]MetricUsage, 0, len(rows))
+	for _, r := range rows {
+		// Custom metrics charge at the declared price with no blanket markup,
+		// so the customer charge equals the raw (quantity × unit_price) cost.
+		// The flat 1.2× for platform-infra / built-in metrics is not in this
+		// PR's scope (PR #5/#10).
+		metrics = append(metrics, MetricUsage{
+			Metric:          r.Metric,
+			Kind:            r.Kind,
+			Quantity:        r.Quantity,
+			UnitPriceMicros: r.UnitPriceMicros,
+			RawCostMicros:   r.RawCostMicros,
+			ChargedMicros:   r.RawCostMicros,
+		})
+	}
+	return &GetUsageSummaryResponse{
+		PeriodStart: start,
+		PeriodEnd:   end,
+		Metrics:     metrics,
+	}, nil
+}
+
+// SetMetricDefinitions syncs a module's declared metrics into the catalog
+// (declaration-first — design §1 / §5). It is a platform CONTROL-PLANE
+// call: api-platform reads the manifest's declarations on install/publish
+// and upserts each one so the catalog (kind/unit/price) exists before any
+// event. Validates each declaration and rejects the reserved platform.* /
+// infra.* namespaces a module must never self-declare (design §3a build
+// rule 3). Idempotent per (module, metric).
+func (s *Service) SetMetricDefinitions(ctx context.Context, req SetMetricDefinitionsRequest) (*SetMetricDefinitionsResponse, error) {
+	if req.ModuleID == uuid.Nil {
+		return nil, billing.InvalidInput("module_id required")
+	}
+	// Validate every declaration BEFORE touching the store, then upsert the
+	// whole set in one transaction (UpsertMetricDefinitions is all-or-nothing).
+	// A partial catalog would accept some declared metrics at ingest and
+	// reject others until the next sync — declaration-first correctness
+	// (design §1) requires the catalog be fully-or-nothing.
+	defs := make([]MetricDeclaration, 0, len(req.Metrics))
+	for _, m := range req.Metrics {
+		if m.Metric == "" {
+			return nil, billing.InvalidInput("metric required")
+		}
+		if isReservedMetric(m.Metric) {
+			return nil, billing.InvalidInput("metric uses a reserved platform namespace (platform.* / infra.* are platform-measured and cannot be declared by a module): " + m.Metric)
+		}
+		if !isValidKind(m.Kind) {
+			return nil, billing.InvalidInput("invalid metric kind: " + string(m.Kind))
+		}
+		if m.Priced && m.UnitPriceMicros < 0 {
+			return nil, billing.InvalidInput("unit_price_micros must be non-negative")
+		}
+		defs = append(defs, MetricDeclaration{
+			ModuleID:        req.ModuleID,
+			Metric:          m.Metric,
+			Kind:            m.Kind,
+			Unit:            m.Unit,
+			UnitPriceMicros: m.UnitPriceMicros,
+			Priced:          m.Priced,
+			Active:          m.Active,
+		})
+	}
+	if err := s.store.UpsertMetricDefinitions(ctx, defs); err != nil {
+		return nil, billing.Internal("upsert metric definitions failed", err)
+	}
+	return &SetMetricDefinitionsResponse{Synced: len(req.Metrics)}, nil
+}
+
+// SetModuleVisibility upserts the developer margin-share mirror. It
+// NEVER affects the customer charge; it governs only the developer
+// settlement rate (PR #5). Fired by api-platform on every
+// publish/unpublish.
+func (s *Service) SetModuleVisibility(ctx context.Context, req SetModuleVisibilityRequest) (*SetModuleVisibilityResponse, error) {
+	if req.ModuleID == uuid.Nil {
+		return nil, billing.InvalidInput("module_id required")
+	}
+	if req.Visibility != VisibilityPrivate && req.Visibility != VisibilityPublished {
+		return nil, billing.InvalidInput("visibility must be 'private' or 'published'")
+	}
+	if err := s.store.UpsertModuleVisibility(ctx, req.ModuleID, req.Visibility); err != nil {
+		return nil, billing.Internal("set module visibility failed", err)
+	}
+	return &SetModuleVisibilityResponse{}, nil
+}
+
+// isValidKind reports whether k is one of the four catalog kinds. Guards
+// the SetMetricDefinitions sync so a malformed manifest can't write an
+// invalid enum (which the DB would reject anyway, with a worse error).
+func isValidKind(k Kind) bool {
+	switch k {
+	case KindCount, KindSum, KindPeak, KindTimeWeighted:
+		return true
+	default:
+		return false
+	}
+}
+
+// isReservedMetric reports whether the metric name falls in a
+// platform-measured namespace the SDK ingress must reject. Case-sensitive:
+// the platform owns the exact lowercase prefixes.
+func isReservedMetric(metric string) bool {
+	for _, p := range reservedMetricPrefixes {
+		if strings.HasPrefix(metric, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// currentPeriodWindow returns the [start, end) of the UTC calendar month
+// containing t — the live-estimate window for GetUsageSummary before the
+// authoritative billing_periods row exists (PR #5/#6).
+func currentPeriodWindow(t time.Time) (time.Time, time.Time) {
+	start := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	return start, end
+}
