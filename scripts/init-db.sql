@@ -12,3 +12,9 @@
 \i migrations/billing/008_billing_periods.up.sql
 \i migrations/billing/009_usage_aggregates.up.sql
 \i migrations/billing/010_module_visibility.up.sql
+-- 011–013 are RESERVED for the meter charge-chain PRs
+-- (invoices / billing_runs / developer_settlements) and not in the tree yet;
+-- budgets (014–015) only read usage_events × metric_definitions and reference
+-- accounts, so they apply cleanly over the gap. See migrations/billing/README.md.
+\i migrations/billing/014_budgets.up.sql
+\i migrations/billing/015_budget_alerts.up.sql

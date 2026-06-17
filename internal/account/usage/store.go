@@ -303,6 +303,12 @@ func floatFromNumeric(n pgtype.Numeric) (float64, error) {
 	return fv.Float64, nil
 }
 
+// MicrosFromNumeric is the exported entry to microsFromNumeric so sibling
+// billing packages (the budget engine sums the SAME value × unit_price
+// NUMERIC) decode money through this single rounding point rather than
+// duplicating the big.Rat logic.
+func MicrosFromNumeric(n pgtype.Numeric) (int64, error) { return microsFromNumeric(n) }
+
 // microsFromNumeric converts a NUMERIC micro-dollar amount to int64,
 // rounding half-up to the whole micro deterministically (matching the
 // agent cents precedent — money never carries sub-micro fractions). The
