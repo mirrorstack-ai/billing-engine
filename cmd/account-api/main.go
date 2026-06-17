@@ -32,6 +32,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/httputil"
@@ -58,7 +59,8 @@ type rpcResponseError struct {
 
 // dispatcher is the action → handler dispatch shared by both transports.
 type dispatcher struct {
-	svc *billing.Service
+	svc      *billing.Service
+	usageSvc *usage.Service
 }
 
 func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload json.RawMessage) (any, error) {
@@ -111,6 +113,34 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
 		}
 		return d.svc.SetDefaultPaymentMethod(ctx, req)
+
+	case "RecordUsage":
+		var req usage.RecordUsageRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.RecordUsage(ctx, req)
+
+	case "GetUsageSummary":
+		var req usage.GetUsageSummaryRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.GetUsageSummary(ctx, req)
+
+	case "SetMetricDefinitions":
+		var req usage.SetMetricDefinitionsRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.SetMetricDefinitions(ctx, req)
+
+	case "SetModuleVisibility":
+		var req usage.SetModuleVisibilityRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.SetModuleVisibility(ctx, req)
 
 	default:
 		return nil, billing.InvalidInput("unknown action: " + action)
@@ -185,7 +215,10 @@ func init() {
 	store := billing.NewStore(pool)
 	stripeClient := billingstripe.NewClient(stripeKey)
 	svc := billing.NewService(store, stripeClient, returnURL)
-	disp = &dispatcher{svc: svc}
+
+	usageSvc := usage.NewService(usage.NewStore(pool))
+
+	disp = &dispatcher{svc: svc, usageSvc: usageSvc}
 }
 
 func buildRouter(d *dispatcher) *chi.Mux {
@@ -195,7 +228,7 @@ func buildRouter(d *dispatcher) *chi.Mux {
 	// Public health probe — no auth.
 	r.Get("/__health", health)
 
-	// Internal-secret-gated RPC routes.
+	// Internal-secret-gated RPC routes (api-platform → billing-engine).
 	internalSecret := os.Getenv("INTERNAL_SECRET")
 	r.Group(func(r chi.Router) {
 		r.Use(auth.InternalSecret(internalSecret))
@@ -206,6 +239,24 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.GetPaymentMethods", makeHTTPHandler(d, "GetPaymentMethods"))
 		r.Post("/v1/billing.DetachPaymentMethod", makeHTTPHandler(d, "DetachPaymentMethod"))
 		r.Post("/v1/billing.SetDefaultPaymentMethod", makeHTTPHandler(d, "SetDefaultPaymentMethod"))
+		// Usage RPCs invoked by the platform control plane (manifest metric
+		// sync on install/publish, publish-hook visibility, billing-summary
+		// read), not the high-volume meter seam — they share the internal
+		// secret with the other api-platform → billing calls.
+		r.Post("/v1/billing.GetUsageSummary", makeHTTPHandler(d, "GetUsageSummary"))
+		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
+		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
+	})
+
+	// Meter-secret-gated ingest route. RecordUsage is the high-volume
+	// dispatch-asserted metering seam; it carries a DEDICATED secret +
+	// header (X-MS-Meter-Secret) so it can be rotated independently of the
+	// general internal secret and never shares a credential with the
+	// Stripe-touching billing RPCs (design §5).
+	meterSecret := os.Getenv("METER_SECRET")
+	r.Group(func(r chi.Router) {
+		r.Use(auth.MeterSecret(meterSecret))
+		r.Post("/v1/billing.RecordUsage", makeHTTPHandler(d, "RecordUsage"))
 	})
 
 	return r
