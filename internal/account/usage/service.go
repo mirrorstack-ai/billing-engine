@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -19,18 +20,40 @@ import (
 // let a module forge or zero a platform-billable metric.
 var reservedMetricPrefixes = []string{"platform.", "infra."}
 
+// BudgetEvaluator is the per-app budget hook the ingest path fires after a
+// fresh usage event. It is satisfied by *budget.Service (kept as an interface
+// here to avoid a usage→budget import cycle — budget imports usage for the
+// money helper). nil means budgets are not wired and the hook is skipped.
+//
+// EvaluateAppBudget recomputes the app's current-period spend and records any
+// newly-crossed threshold; it is called BEST-EFFORT (its error never fails
+// the usage ingest).
+type BudgetEvaluator interface {
+	EvaluateAppBudget(ctx context.Context, appID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error)
+}
+
 // Service implements the RecordUsage / GetUsageSummary /
 // SetMetricDefinitions / SetModuleVisibility RPCs. It composes a Store;
-// nowFn is injectable for deterministic tests.
+// nowFn is injectable for deterministic tests. budget is the optional per-app
+// budget hook fired on a fresh usage event (nil = budgets not wired).
 type Service struct {
-	store Store
-	nowFn func() time.Time
+	store  Store
+	nowFn  func() time.Time
+	budget BudgetEvaluator
 }
 
 // NewService wires a Service. store is required; passing nil panics at
 // the first call site.
 func NewService(store Store) *Service {
 	return &Service{store: store, nowFn: time.Now}
+}
+
+// WithBudgetEvaluator attaches the per-app budget hook fired on the ingest
+// path. Returns the receiver for chaining at construction. A nil evaluator
+// leaves budgets unwired (the hook is skipped).
+func (s *Service) WithBudgetEvaluator(b BudgetEvaluator) *Service {
+	s.budget = b
+	return s
 }
 
 // RecordUsage is the ingest seam. It:
@@ -128,6 +151,22 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 	if err != nil {
 		return nil, billing.Internal("insert usage event failed", err)
 	}
+
+	// Per-app budget evaluation (design §5 / §10). Fire ONLY on a fresh
+	// insert: recorded=false is a deduped retry whose event was already
+	// evaluated, so re-evaluating would re-walk the same spend (harmless —
+	// the alert insert is idempotent — but wasteful). BEST-EFFORT: a budget
+	// error must NOT fail the usage ingest, so we log and continue. The
+	// window matches GetUsageSummary's (the calendar month the event fell in)
+	// so the budget is checked against exactly what the user sees.
+	if recorded && s.budget != nil {
+		start, end := currentPeriodWindow(recordedAt.UTC())
+		if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, start, end); err != nil {
+			slog.Error("budget evaluation failed (usage still recorded)",
+				"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
+		}
+	}
+
 	return &RecordUsageResponse{Recorded: recorded}, nil
 }
 

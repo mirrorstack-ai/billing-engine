@@ -297,6 +297,61 @@ func TestRecordUsage_InternalOnLookupError(t *testing.T) {
 	require.Empty(t, store.events, "no event recorded when the catalog lookup fails")
 }
 
+// fakeBudgetEvaluator satisfies usage.BudgetEvaluator. err lets a test force
+// a budget-eval failure to prove it does NOT fail the usage ingest; called
+// records whether the hook ran.
+type fakeBudgetEvaluator struct {
+	err     error
+	called  bool
+	gotApp  uuid.UUID
+	gotFrom time.Time
+	gotTo   time.Time
+}
+
+func (f *fakeBudgetEvaluator) EvaluateAppBudget(_ context.Context, appID uuid.UUID, from, to time.Time) ([]int, error) {
+	f.called = true
+	f.gotApp = appID
+	f.gotFrom = from
+	f.gotTo = to
+	return nil, f.err
+}
+
+func TestRecordUsage_BudgetEvalErrorDoesNotFailIngest(t *testing.T) {
+	// Best-effort hook (design §10): a budget-evaluation error must NOT fail
+	// the usage ingest — the event is already recorded.
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+	eval := &fakeBudgetEvaluator{err: errors.New("budget boom")}
+
+	svc := usage.NewService(store).WithBudgetEvaluator(eval)
+	resp, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err, "budget error must not surface on the ingest path")
+	require.True(t, resp.Recorded)
+	require.True(t, eval.called, "the hook fires on a fresh insert")
+	require.Equal(t, req.AppID, eval.gotApp)
+	require.Len(t, store.events, 1)
+}
+
+func TestRecordUsage_BudgetEvalSkippedOnDedupedRetry(t *testing.T) {
+	// A deduped retry (recorded=false) was already evaluated for its event_id;
+	// the hook must be skipped so the same spend isn't re-walked.
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+	eval := &fakeBudgetEvaluator{}
+	svc := usage.NewService(store).WithBudgetEvaluator(eval)
+
+	_, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, eval.called)
+
+	eval.called = false
+	_, err = svc.RecordUsage(context.Background(), req) // same event_id → deduped
+	require.NoError(t, err)
+	require.False(t, eval.called, "hook is skipped on a deduped retry")
+}
+
 // --- GetUsageSummary ------------------------------------------------------
 
 func TestGetUsageSummary_ChargesDeclaredPriceNoMarkup(t *testing.T) {
