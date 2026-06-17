@@ -77,3 +77,43 @@ func TestInternalSecret_EmptySecretReturns503(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	require.Contains(t, rec.Body.String(), `"secret_unconfigured"`)
 }
+
+// MeterSecret mirrors InternalSecret's behavior on a dedicated header
+// (X-MS-Meter-Secret); these assert it gates correctly and is isolated
+// from the internal secret so the meter seam carries its own credential.
+
+func TestMeterSecret_Pass(t *testing.T) {
+	mw := MeterSecret("meter-secret")(ok200)
+	req := httptest.NewRequest(http.MethodPost, "/v1/billing.RecordUsage", nil)
+	req.Header.Set("X-MS-Meter-Secret", "meter-secret")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), `"ok":true`)
+}
+
+func TestMeterSecret_IgnoresInternalSecretHeader(t *testing.T) {
+	// A request carrying only the internal-secret header must NOT pass the
+	// meter gate — the two credentials are distinct.
+	mw := MeterSecret("meter-secret")(ok200)
+	req := httptest.NewRequest(http.MethodPost, "/v1/billing.RecordUsage", nil)
+	req.Header.Set("X-MS-Internal-Secret", "meter-secret")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestMeterSecret_EmptySecretReturns503(t *testing.T) {
+	mw := MeterSecret("")(ok200)
+	req := httptest.NewRequest(http.MethodPost, "/v1/billing.RecordUsage", nil)
+	req.Header.Set("X-MS-Meter-Secret", "anything")
+	rec := httptest.NewRecorder()
+
+	mw.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
