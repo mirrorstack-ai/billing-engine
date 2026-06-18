@@ -144,6 +144,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.SetModuleVisibility(ctx, req)
 
+	case "RecordInfraUsage":
+		var req usage.RecordInfraUsageRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.RecordInfraUsage(ctx, req)
+
 	case "SetBudget":
 		var req budget.SetBudgetRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -226,9 +233,11 @@ func makeHTTPHandler(d *dispatcher, action string) http.HandlerFunc {
 
 var disp *dispatcher
 
-func init() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-
+// buildDispatcher wires the production dispatcher from the environment. It is
+// called from main() (NOT an init()) so the test binary — which imports this
+// package to exercise buildRouter — does not trigger the os.Exit-on-missing-env
+// config loads at package load time.
+func buildDispatcher() *dispatcher {
 	pool := config.MustPgxPool()
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 	// Post-confirmation redirect target for the setup-mode Checkout
@@ -244,7 +253,7 @@ func init() {
 	// usage event (design §5 / §10).
 	usageSvc := usage.NewService(usage.NewStore(pool)).WithBudgetEvaluator(budgetSvc)
 
-	disp = &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc}
+	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc}
 }
 
 func buildRouter(d *dispatcher) *chi.Mux {
@@ -272,6 +281,13 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.GetUsageSummary", makeHTTPHandler(d, "GetUsageSummary"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
 		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
+		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of
+		// the SDK meter seam: it is called by platform-trusted producers
+		// (dispatch compute, cdn-worker egress — deferred PRs), accepts ONLY
+		// reserved infra.* / platform.* metrics, and is gated by the INTERNAL
+		// secret (NOT the meter secret) so it shares the control-plane
+		// credential and a module can never reach it (design §3a / §5).
+		r.Post("/v1/billing.RecordInfraUsage", makeHTTPHandler(d, "RecordInfraUsage"))
 		// Budget RPCs — control-plane (api-platform writes the cap, reads
 		// status/alerts for in-app display). Internal secret, NOT the meter
 		// secret: budget config is low-volume and shares the api-platform
@@ -332,6 +348,14 @@ func (s *statusRecorder) WriteHeader(code int) {
 // Payload is the RPC envelope; response is the marshaled envelope.
 // Errors from dispatch flow through the envelope's ok=false path; the
 // Go-level error return is reserved for marshaling failures.
+//
+// AUTH NOTE (plane isolation): in prod the dispatcher is reached only via
+// lambda.Invoke — the function is not publicly exposed, so invocation is gated
+// by IAM (the caller needs lambda:InvokeFunction on this ARN). That IAM grant,
+// not the X-MS-Internal-Secret header (which the local HTTP path checks in
+// buildRouter), is what keeps RecordInfraUsage and the other internal RPCs out
+// of a module's reach in production. RecordInfraUsage is absent from any
+// SDK-accessible / meter-secret surface on BOTH transports (design §3a / §5).
 func lambdaInvokeHandler(ctx context.Context, payload json.RawMessage) (json.RawMessage, error) {
 	var env rpcEnvelope
 	if err := json.Unmarshal(payload, &env); err != nil {
@@ -342,6 +366,9 @@ func lambdaInvokeHandler(ctx context.Context, payload json.RawMessage) (json.Raw
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+	disp = buildDispatcher()
+
 	if config.IsLambda() {
 		lambda.Start(lambdaInvokeHandler)
 		return
