@@ -258,6 +258,17 @@ type MsBillingBillingPeriod struct {
 	CreatedAt   time.Time                    `json:"created_at"`
 }
 
+type MsBillingBillingRun struct {
+	ID              string         `json:"id"`
+	AccountID       string         `json:"account_id"`
+	PeriodStart     time.Time      `json:"period_start"`
+	PeriodEnd       time.Time      `json:"period_end"`
+	Status          string         `json:"status"`
+	StripeInvoiceID pgtype.Text    `json:"stripe_invoice_id"`
+	TotalAmount     pgtype.Numeric `json:"total_amount"`
+	CreatedAt       time.Time      `json:"created_at"`
+}
+
 type MsBillingBudget struct {
 	ID            string               `json:"id"`
 	Scope         MsBillingBudgetScope `json:"scope"`
@@ -293,6 +304,20 @@ type MsBillingDeveloperSettlement struct {
 	DeveloperOwedMicros int64                     `json:"developer_owed_micros"`
 	Status              string                    `json:"status"`
 	CreatedAt           time.Time                 `json:"created_at"`
+}
+
+type MsBillingInvoice struct {
+	ID              string             `json:"id"`
+	AccountID       string             `json:"account_id"`
+	StripeInvoiceID string             `json:"stripe_invoice_id"`
+	Status          string             `json:"status"`
+	AmountDue       pgtype.Numeric     `json:"amount_due"`
+	AmountPaid      pgtype.Numeric     `json:"amount_paid"`
+	Currency        string             `json:"currency"`
+	PeriodStart     pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd       pgtype.Timestamptz `json:"period_end"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
 type MsBillingMetricDefinition struct {

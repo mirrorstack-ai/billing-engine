@@ -65,7 +65,7 @@ func seedEvent(t *testing.T, pool *pgxpool.Pool, acct, app, mod uuid.UUID, metri
 func TestRollupPeriod_Integration_SumAndTimeWeighted(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := cycle.NewStore(pool)
-	svc := cycle.NewService(store)
+	svc := cycle.NewService(store, nil)
 	ctx := context.Background()
 
 	acct := seedAccount(t, pool)
@@ -104,7 +104,7 @@ func TestRollupPeriod_Integration_SumAndTimeWeighted(t *testing.T) {
 
 func TestRollupPeriod_Integration_Idempotent(t *testing.T) {
 	pool := testutil.NewTestDB(t)
-	svc := cycle.NewService(cycle.NewStore(pool))
+	svc := cycle.NewService(cycle.NewStore(pool), nil)
 	ctx := context.Background()
 
 	acct := seedAccount(t, pool)
@@ -131,7 +131,7 @@ func TestRollupPeriod_Integration_Idempotent(t *testing.T) {
 func TestSettleDevelopers_Integration_FromAggregates(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := cycle.NewStore(pool)
-	svc := cycle.NewService(store)
+	svc := cycle.NewService(store, nil)
 	ctx := context.Background()
 
 	acct := seedAccount(t, pool)
@@ -165,7 +165,7 @@ func TestSettleDevelopers_Integration_FromAggregates(t *testing.T) {
 
 func TestSettleDevelopers_Integration_UnknownVisibilityDefaultsPrivate(t *testing.T) {
 	pool := testutil.NewTestDB(t)
-	svc := cycle.NewService(cycle.NewStore(pool))
+	svc := cycle.NewService(cycle.NewStore(pool), nil)
 	ctx := context.Background()
 
 	acct := seedAccount(t, pool)
@@ -180,4 +180,89 @@ func TestSettleDevelopers_Integration_UnknownVisibilityDefaultsPrivate(t *testin
 	require.NoError(t, err)
 	require.EqualValues(t, 300_000, set.Settlements[0].PlatformTakeMicros) // 30%
 	require.Equal(t, usage.VisibilityPrivate, set.Settlements[0].MarginShareClass)
+}
+
+// --- charge-cycle SQL (PR #6) ---------------------------------------------
+
+// TestAccountsWithUsageEvents_Integration verifies the rollup-phase work list:
+// accounts with raw usage_events in the half-open window, excluding NULL-account
+// (lazy) events and events outside the window.
+func TestAccountsWithUsageEvents_Integration(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	in := seedAccount(t, pool)
+	out := seedAccount(t, pool)
+	app, mod := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, mod, "orders.placed", usage.KindSum, 50_000)
+
+	seedEvent(t, pool, in, app, mod, "orders.placed", usage.KindSum, 1, "2026-06-10T00:00:00Z")  // inside
+	seedEvent(t, pool, out, app, mod, "orders.placed", usage.KindSum, 1, "2026-07-05T00:00:00Z") // after end
+
+	got, err := store.AccountsWithUsageEvents(ctx, mustTime(t, pStart), mustTime(t, pEnd))
+	require.NoError(t, err)
+	require.Contains(t, got, in)
+	require.NotContains(t, got, out, "events outside the half-open window are excluded")
+}
+
+// TestChargeCycleSQL_ReclaimAndExactWindow verifies the two blocking fixes at
+// the SQL layer: (1) AccountsWithUnbilledUsage surfaces an account whose only
+// run is non-terminal and hides it once invoiced, matched on the EXACT window;
+// (2) InsertBillingRun reclaims a non-terminal run (same id) and refuses an
+// invoiced one.
+func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	svc := cycle.NewService(store, nil)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	app, mod := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, mod, "orders.placed", usage.KindSum, 50_000)
+	seedEvent(t, pool, acct, app, mod, "orders.placed", usage.KindSum, 20, "2026-06-10T00:00:00Z")
+
+	start, end := mustTime(t, pStart), mustTime(t, pEnd)
+	_, err := svc.RollupPeriod(ctx, acct, start, end)
+	require.NoError(t, err)
+
+	// No run yet → account appears in the charge work list.
+	unbilled, err := store.AccountsWithUnbilledUsage(ctx, start, end)
+	require.NoError(t, err)
+	require.Contains(t, unbilled, acct)
+
+	// First InsertBillingRun creates the row (shouldCharge=true). Mark it
+	// skipped_no_pm (a non-terminal outcome).
+	run1, should1, err := store.InsertBillingRun(ctx, acct, start, end)
+	require.NoError(t, err)
+	require.True(t, should1)
+	require.NoError(t, store.MarkBillingRun(ctx, run1, cycle.RunStatusSkippedNoPM, "", 0))
+
+	// A skipped run still surfaces in the work list (RETAINED, re-attempt).
+	unbilled, err = store.AccountsWithUnbilledUsage(ctx, start, end)
+	require.NoError(t, err)
+	require.Contains(t, unbilled, acct, "skipped_no_pm must re-appear for retry")
+
+	// InsertBillingRun reclaims the SAME run row for a fresh attempt.
+	run2, should2, err := store.InsertBillingRun(ctx, acct, start, end)
+	require.NoError(t, err)
+	require.True(t, should2, "a skipped run is reclaimed")
+	require.Equal(t, run1, run2, "reclaim reuses the same run id (stable idem-keys)")
+
+	// Mark invoiced → terminal. Now it disappears + reclaim refuses.
+	require.NoError(t, store.MarkBillingRun(ctx, run2, cycle.RunStatusInvoiced, "in_test_x", 123))
+	unbilled, err = store.AccountsWithUnbilledUsage(ctx, start, end)
+	require.NoError(t, err)
+	require.NotContains(t, unbilled, acct, "invoiced run excludes the account")
+
+	_, should3, err := store.InsertBillingRun(ctx, acct, start, end)
+	require.NoError(t, err)
+	require.False(t, should3, "an invoiced run blocks re-charge")
+
+	// Exact-window match: a different window must not collide with this run.
+	otherStart := mustTime(t, "2026-07-01T00:00:00Z")
+	otherEnd := mustTime(t, "2026-08-01T00:00:00Z")
+	_, shouldOther, err := store.InsertBillingRun(ctx, acct, otherStart, otherEnd)
+	require.NoError(t, err)
+	require.True(t, shouldOther, "a different window is a distinct run")
 }

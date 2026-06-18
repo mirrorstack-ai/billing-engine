@@ -67,6 +67,24 @@ func takeMicros(base int64, num, den int) (int64, error) {
 	return roundRatHalfUp(scaled)
 }
 
+// centsFromMicros converts a micro-dollar amount to whole cents, round-half-up,
+// for the Stripe boundary — Stripe amounts are integer minor units (cents),
+// never micro-dollars and never float. 1 cent = 10_000 micro-dollars, so
+// cents = round_half_up(micros / 10_000). The single big.Rat round matches the
+// money rounding convention used everywhere else in this package (one
+// deterministic rounding point). micros is non-negative at this call site (an
+// arrears charge), so half-up is the conventional merchant rounding; the
+// overflow guard in roundRatHalfUp still applies (cents ≤ micros, so a value
+// that fit as micros fits as cents).
+func centsFromMicros(micros int64) (int64, error) {
+	r := new(big.Rat).SetFrac(big.NewInt(micros), big.NewInt(microsPerCent))
+	return roundRatHalfUp(r)
+}
+
+// microsPerCent is the micro-dollar value of one cent (1e-2 USD = 10_000 ×
+// 1e-6 USD). The micros → cents conversion factor at the Stripe boundary.
+const microsPerCent = 10_000
+
 // roundRatHalfUp rounds a big.Rat to the nearest integer, halves up (toward +∞
 // on a .5 tie). Identical rounding to usage.roundRatHalfUp — money rounds at one
 // deterministic point so the rollup and the live summary agree to the micro.

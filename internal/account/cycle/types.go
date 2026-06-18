@@ -119,3 +119,63 @@ type SettlementSummary struct {
 	PeriodID    uuid.UUID
 	Settlements []ModuleSettlement
 }
+
+// BillingRunStatus is the terminal state of a RunBillingCycle attempt. It
+// mirrors the ms_billing.billing_runs.status CHECK one-for-one.
+type BillingRunStatus string
+
+const (
+	// RunStatusInvoiced is the terminal success state: either the arrears
+	// charge was created + the invoice mirrored, OR the netted arrears were 0
+	// (nothing to charge — the run is "done" with no Stripe call).
+	RunStatusInvoiced BillingRunStatus = "invoiced"
+
+	// RunStatusSkippedNoPM means the account had positive arrears but no usable
+	// default payment method. The usage is RETAINED (the usage_aggregates rows
+	// are untouched); the next cycle re-attempts. NOT a failure, NOT lost usage.
+	RunStatusSkippedNoPM BillingRunStatus = "skipped_no_pm"
+
+	// RunStatusFailed means the charge errored after the PM gate (Stripe call or
+	// mirror failed). Terminal; PR #7 webhook reconciliation + risk-graded
+	// retry build on this. The run row stays so the failure is auditable.
+	RunStatusFailed BillingRunStatus = "failed"
+)
+
+// chargeCurrency is the Stripe charge currency. Fixed to usd for v1 (matching
+// the card-on-file Checkout Session currency); multi-currency is a future
+// concern that travels with per-account billing locale.
+const chargeCurrency = "usd"
+
+// ChargeSummary reports what a RunBillingCycle call did for one (account,
+// period). It is the in-memory account of the run row + (when a charge
+// happened) the mirrored invoice.
+//
+// FirstRun is false when InsertBillingRun hit the idempotency gate — the window
+// already has an 'invoiced' (terminal-success) run — so the cycle did NOTHING
+// this call (no arrears read, no Stripe charge). Callers MUST treat
+// FirstRun=false as success, not an error: the work was already done. A
+// non-terminal prior run (skipped_no_pm / failed / pending-died-mid-flight) is
+// RECLAIMED and re-attempted, so it reports FirstRun=true.
+type ChargeSummary struct {
+	// FirstRun is true when this call performed a charge attempt — either it
+	// inserted a fresh billing_runs row, or it reclaimed a non-terminal one
+	// (skipped_no_pm / failed / pending). False = idempotent no-op: the window
+	// already has an 'invoiced' run.
+	FirstRun bool
+
+	// Status is the terminal run status this call set. Zero ("") when
+	// FirstRun is false (no status was set this call).
+	Status BillingRunStatus
+
+	// ArrearsMicros is the netted arrears = max(0, Σ charged_micros −
+	// allowanceMicros) the cycle computed. 0 → no Stripe call.
+	ArrearsMicros int64
+
+	// ChargedCents is the whole-cent amount sent to Stripe (micros → cents
+	// round-half-up). 0 when no charge happened.
+	ChargedCents int64
+
+	// StripeInvoiceID is the created Stripe invoice id, empty when no charge
+	// happened (zero arrears or skipped_no_pm).
+	StripeInvoiceID string
+}
