@@ -298,6 +298,75 @@ func TestProcess_InvoicePaid_RecordsAmountPaid(t *testing.T) {
 	require.Len(t, s.AppliedInvoices, 1)
 	require.Equal(t, "paid", s.AppliedInvoices[0].Status)
 	require.Equal(t, int64(1200), s.AppliedInvoices[0].AmountPaidCents)
+	// invoice.paid ALSO runs the relax driver (PR #9).
+	require.Equal(t, []string{"in_1"}, s.RelaxedInvoices, "invoice.paid must attempt the prepaid → arrears relax")
+}
+
+// --- risk-graded RELAX driver (PR #9) -------------------------------------
+
+func TestProcess_InvoicePaid_RelaxesPrepaidAccount(t *testing.T) {
+	// A paid invoice that clears the last delinquency flips the account back to
+	// arrears: the store reports relaxed=true, the handler ACKs ok.
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_relax", "invoice.paid", "in_relax", "paid", 1200, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.Relaxed = true
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Equal(t, []string{"in_relax"}, s.RelaxedInvoices)
+}
+
+func TestProcess_NonPaidInvoiceEvent_DoesNotRelax(t *testing.T) {
+	// Only invoice.paid drives the relax. A finalized/failed/void event lands the
+	// mirror but NEVER attempts to re-trust the account.
+	for _, ev := range []struct{ name, typ, status string }{
+		{"finalized", "invoice.finalized", "open"},
+		{"payment_failed", "invoice.payment_failed", "open"},
+		{"voided", "invoice.voided", "void"},
+		{"uncollectible", "invoice.marked_uncollectible", "uncollectible"},
+	} {
+		t.Run(ev.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_"+ev.name, ev.typ, "in_x", ev.status, 0, 1200)}
+			s := webhooktest.NewFakeStore()
+			r := newRouter(v, s)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, webhook.StatusOK, res.Status)
+			require.Empty(t, s.RelaxedInvoices, "only invoice.paid relaxes the account")
+		})
+	}
+}
+
+func TestProcess_InvoicePaid_DriftMirror_DoesNotRelax(t *testing.T) {
+	// If the invoice has no mirror row (drift), the relax driver is not reached —
+	// the handler returns drift_warning before the relax step.
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_relax_drift", "invoice.paid", "in_orphan", "paid", 1200, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Empty(t, s.RelaxedInvoices, "drift short-circuits before the relax driver")
+}
+
+func TestProcess_InvoicePaid_RelaxError_Internal(t *testing.T) {
+	// A relax-driver store error surfaces as 500 so Stripe retries (the relax
+	// UPDATE is idempotent, so a retry is safe).
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_relax_err", "invoice.paid", "in_1", "paid", 1200, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.ErrRelax = errors.New("db down")
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
 }
 
 func TestProcess_InvoicePaymentFailed_StaysOpen(t *testing.T) {

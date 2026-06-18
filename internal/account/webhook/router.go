@@ -109,6 +109,14 @@ type Store interface {
 	// is at-least-once + unordered, so the guard MUST tolerate replays and
 	// reordering without regressing a terminal status.
 	ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceStatusParams) (found bool, err error)
+
+	// RelaxCollectionOnPaidInvoice is the risk-graded RELAX driver (PR #9): on a
+	// paid invoice, conservatively re-trust an account that was tightened to
+	// 'prepaid' back to 'arrears' — but ONLY when no open/uncollectible invoice
+	// remains for the account. Returns (relaxed bool, error): relaxed=false is a
+	// no-op (the account was not prepaid, is still delinquent, or has no mirror
+	// row), never an error. It NEVER charges — relax and charge are decoupled.
+	RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoiceID string) (relaxed bool, err error)
 }
 
 // ApplyInvoiceStatusParams carries the columns ApplyInvoiceStatus reconciles
