@@ -261,6 +261,18 @@ func (s *pgxStore) ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceSt
 	return rows > 0, nil
 }
 
+// RelaxCollectionOnPaidInvoice re-trusts a prepaid account back to arrears when
+// an invoice is paid and no delinquency remains (see the query doc). Returns
+// (relaxed, error): relaxed=false (0 rows) is a no-op — not prepaid, still
+// delinquent, or no mirror row. It never charges.
+func (s *pgxStore) RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoiceID string) (bool, error) {
+	rows, err := s.q.RelaxCollectionOnPaidInvoice(ctx, stripeInvoiceID)
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // text wraps a non-null Go string in the pgtype.Text the generated
 // queries expect for nullable TEXT columns.
 func text(s string) pgtype.Text {

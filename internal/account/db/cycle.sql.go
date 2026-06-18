@@ -12,6 +12,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const accountCollectionFields = `-- name: AccountCollectionFields :one
+SELECT
+    usage_billing_mode,
+    credit_limit_micros,
+    spend_ceiling_micros,
+    created_at
+FROM ms_billing.accounts
+WHERE id = $1
+`
+
+type AccountCollectionFieldsRow struct {
+	UsageBillingMode   MsBillingUsageBillingMode `json:"usage_billing_mode"`
+	CreditLimitMicros  int64                     `json:"credit_limit_micros"`
+	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
+	CreatedAt          time.Time                 `json:"created_at"`
+}
+
+// AccountCollectionFields loads the risk-graded collection controls for the
+// charge gate (PR #9): the off-session arrears leg reads these to decide whether
+// to charge, skip-prepaid, cap at the spend ceiling, or tighten over the credit
+// limit. created_at is returned so the risk-judge can compute account tenure
+// WITHOUT a cross-schema read into ms_account (billing-engine never reads
+// ms_account tables). spend_ceiling_micros is NULL when no ceiling is set; the
+// Go layer carries it as a nullable.
+func (q *Queries) AccountCollectionFields(ctx context.Context, id string) (AccountCollectionFieldsRow, error) {
+	row := q.db.QueryRow(ctx, accountCollectionFields, id)
+	var i AccountCollectionFieldsRow
+	err := row.Scan(
+		&i.UsageBillingMode,
+		&i.CreditLimitMicros,
+		&i.SpendCeilingMicros,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const accountStripeCustomer = `-- name: AccountStripeCustomer :one
 SELECT COALESCE(stripe_customer_id, '')::text AS stripe_customer_id
 FROM ms_billing.accounts
@@ -55,14 +91,30 @@ type AccountsWithUnbilledUsageParams struct {
 // is one period row), so two adjacent months never both match a single run.
 //
 // The anti-join surfaces an account when EITHER it has no run row
-// (br.id IS NULL) OR its run is non-terminal — 'skipped_no_pm' (no PM last
-// cycle), 'failed' (charge errored), or 'pending' (a prior run died mid-flight,
-// before MarkBillingRun). Those MUST re-appear so the next cycle re-attempts
-// (usage is RETAINED, never abandoned). Only an 'invoiced' run excludes the
-// account. InsertBillingRun's ON CONFLICT reclaims the same non-terminal row,
-// and the deterministic Stripe Idempotency-Keys (ii-<run>/inv-<run>, stable per
-// run id) make a pending re-attempt reuse the same Stripe objects — no double
-// charge.
+// (br.id IS NULL) OR its run is non-terminal. 'invoiced' is the ONLY terminal
+// (excluding) status; every other status re-surfaces the account so the next
+// cycle re-attempts (usage is RETAINED, never abandoned):
+//
+//	'pending'         a prior run died mid-flight, before MarkBillingRun
+//	'failed'          the charge errored
+//	'skipped_no_pm'   no usable payment method last cycle
+//	'skipped_prepaid' the account was in / tightened to prepaid mode
+//	'skipped_ceiling' the arrears breached the per-cycle spend ceiling
+//
+// InsertBillingRun's ON CONFLICT (WHERE status <> 'invoiced') reclaims the SAME
+// non-terminal row, and the deterministic Stripe Idempotency-Keys
+// (ii-<run>/inv-<run>, stable per run id) make a pending re-attempt reuse the
+// same Stripe objects — no double charge.
+//
+// RE-CHARGE AFTER RELAX (a deliberate design decision): retained usage is
+// DEFERRED, never FORGIVEN. If an account was tightened to prepaid in cycle N
+// (its period-N run marked skipped_prepaid) and is later RELAXED back to arrears
+// (invoice.paid clears the delinquency — see RelaxCollectionOnPaidInvoice), the
+// period-N row is still non-terminal here, so it re-surfaces and the next cycle
+// charges that retained period-N usage. That is correct: the customer always owes
+// the metered usage; prepaid only postpones the off-session collection, it does
+// not waive the debt. Forgiveness would require an explicit credit, which v1 does
+// not do.
 func (q *Queries) AccountsWithUnbilledUsage(ctx context.Context, arg AccountsWithUnbilledUsageParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, accountsWithUnbilledUsage, arg.PeriodStart, arg.PeriodEnd)
 	if err != nil {
@@ -277,6 +329,38 @@ func (q *Queries) PeriodChargedTotal(ctx context.Context, arg PeriodChargedTotal
 	var total_micros int64
 	err := row.Scan(&total_micros)
 	return total_micros, err
+}
+
+const updateAccountCollection = `-- name: UpdateAccountCollection :execrows
+UPDATE ms_billing.accounts
+SET usage_billing_mode   = $2,
+    credit_limit_micros  = $3,
+    spend_ceiling_micros = $4
+WHERE id = $1
+`
+
+type UpdateAccountCollectionParams struct {
+	ID                 string                    `json:"id"`
+	UsageBillingMode   MsBillingUsageBillingMode `json:"usage_billing_mode"`
+	CreditLimitMicros  int64                     `json:"credit_limit_micros"`
+	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
+}
+
+// UpdateAccountCollection persists a risk-judge mode transition (and, when the
+// trust-ramp recomputes, the credit limit + spend ceiling). :execrows so the Go
+// store maps RowsAffected == 0 to "account not found". updated_at is bumped by
+// the accounts_set_updated_at trigger automatically.
+func (q *Queries) UpdateAccountCollection(ctx context.Context, arg UpdateAccountCollectionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateAccountCollection,
+		arg.ID,
+		arg.UsageBillingMode,
+		arg.CreditLimitMicros,
+		arg.SpendCeilingMicros,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertInvoice = `-- name: UpsertInvoice :exec

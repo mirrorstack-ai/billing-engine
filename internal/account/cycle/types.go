@@ -139,6 +139,30 @@ const (
 	// mirror failed). Terminal; PR #7 webhook reconciliation + risk-graded
 	// retry build on this. The run row stays so the failure is auditable.
 	RunStatusFailed BillingRunStatus = "failed"
+
+	// RunStatusSkippedPrepaid means the risk-graded gate (PR #9) did NOT
+	// off-session-charge this cycle's accrued arrears because the account is in
+	// 'prepaid' usage_billing_mode — either it was already prepaid, or the
+	// risk-judge just tightened it to prepaid this cycle (delinquency / over
+	// credit_limit / usage spike). The usage is RETAINED (usage_aggregates
+	// untouched); it is NOT lost. The prepaid-credit WALLET (balance / top-ups)
+	// that would settle it is a DEFERRED follow-up. NOT a failure, NOT lost usage.
+	//
+	// This status is reserved for a MODE-driven skip. A per-cycle spend_ceiling
+	// breach (which does NOT change the mode) is RunStatusSkippedCeiling — the two
+	// are kept distinct so an operator querying billing_runs can tell "account is
+	// in prepaid mode" apart from "arrears exceeded the customer-set spend ceiling
+	// for this one cycle".
+	RunStatusSkippedPrepaid BillingRunStatus = "skipped_prepaid"
+
+	// RunStatusSkippedCeiling means the netted arrears would breach the account's
+	// customer-set spend_ceiling (the hard per-cycle bill-shock cap) so the
+	// off-session charge was skipped this cycle — WITHOUT changing the account's
+	// usage_billing_mode (the ceiling is a per-cycle cap, not a mode/trust
+	// transition; the next cycle re-attempts once the ceiling is raised or the
+	// arrears netted below it). The usage is RETAINED. Distinct from
+	// RunStatusSkippedPrepaid so the skip reason is unambiguous in the audit trail.
+	RunStatusSkippedCeiling BillingRunStatus = "skipped_ceiling"
 )
 
 // chargeCurrency is the Stripe charge currency. Fixed to usd for v1 (matching

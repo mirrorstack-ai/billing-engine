@@ -599,3 +599,58 @@ func readDefaultFlags(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID) map
 	require.NoError(t, rows.Err())
 	return out
 }
+
+// TestPgxStore_RelaxCollectionOnPaidInvoice verifies the risk-graded RELAX
+// driver (PR #9): a paid invoice re-trusts a PREPAID account back to arrears, but
+// ONLY when no open/uncollectible invoice remains. It never touches an arrears
+// account and is a no-op while delinquency persists.
+func TestPgxStore_RelaxCollectionOnPaidInvoice(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	ctx := context.Background()
+
+	accountID := seedAccount(t, pool, "cus_relax")
+	// Tighten the account to prepaid (the state a relax must reverse).
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.accounts SET usage_billing_mode = 'prepaid' WHERE id = $1`, accountID.String())
+	require.NoError(t, err)
+
+	// The just-paid invoice + a SECOND still-open invoice: relax must NOT fire
+	// while another invoice is unpaid.
+	seedInvoice(t, pool, accountID, "in_relax_paid", "paid", 1200, 1200)
+	seedInvoice(t, pool, accountID, "in_relax_open", "open", 0, 800)
+
+	relaxed, err := store.RelaxCollectionOnPaidInvoice(ctx, "in_relax_paid")
+	require.NoError(t, err)
+	require.False(t, relaxed, "still delinquent (another open invoice) → no relax")
+	require.Equal(t, "prepaid", readMode(t, pool, accountID))
+
+	// Pay off the remaining invoice; now the relax fires.
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.invoices SET status = 'paid' WHERE stripe_invoice_id = $1`, "in_relax_open")
+	require.NoError(t, err)
+
+	relaxed, err = store.RelaxCollectionOnPaidInvoice(ctx, "in_relax_paid")
+	require.NoError(t, err)
+	require.True(t, relaxed, "no remaining delinquency → relax prepaid → arrears")
+	require.Equal(t, "arrears", readMode(t, pool, accountID))
+
+	// Idempotent: a second relax on an already-arrears account is a no-op.
+	relaxed, err = store.RelaxCollectionOnPaidInvoice(ctx, "in_relax_paid")
+	require.NoError(t, err)
+	require.False(t, relaxed, "already arrears → no-op")
+
+	// Unknown invoice id → safe no-op.
+	relaxed, err = store.RelaxCollectionOnPaidInvoice(ctx, "in_does_not_exist")
+	require.NoError(t, err)
+	require.False(t, relaxed)
+}
+
+func readMode(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID) string {
+	t.Helper()
+	var mode string
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT usage_billing_mode::text FROM ms_billing.accounts WHERE id = $1`,
+		accountID.String()).Scan(&mode))
+	return mode
+}

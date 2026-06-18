@@ -19,3 +19,5 @@
 \i migrations/billing/013_developer_settlements.up.sql
 \i migrations/billing/014_budgets.up.sql
 \i migrations/billing/015_budget_alerts.up.sql
+-- 016: risk-graded collection fields on accounts + billing_runs status (PR #9).
+\i migrations/billing/016_account_collection.up.sql

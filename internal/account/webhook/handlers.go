@@ -192,7 +192,15 @@ func (r *Router) handlePaymentMethodDetached(ctx context.Context, event stripego
 // carries status 'open' (Stripe smart-retries the invoice), which is the unpaid
 // state Ensure derives the delinquency signal from; voided (status 'void')
 // clears that signal and marked_uncollectible (status 'uncollectible') keeps
-// it. This handler just lands the mirror, the policy is PR #9.
+// it. This handler lands the mirror; the COLLECTION policy is PR #9.
+//
+// On invoice.paid it ALSO runs the risk-graded RELAX driver
+// (RelaxCollectionOnPaidInvoice): a paid invoice that clears the account's last
+// delinquency conservatively re-trusts a prepaid account back to arrears. This is
+// the inverse of the charge cycle's tighten and the ONLY path that flips an
+// account out of prepaid — without it a tightened account would be stuck in
+// prepaid forever. It runs AFTER ApplyInvoiceStatus so the just-paid invoice no
+// longer counts as unpaid; it never charges (relax and charge are decoupled).
 //
 // found=false (no mirror row, OR the guard rejected a stale event) is a
 // drift_warning, not an error: the charge spine's UpsertInvoice may not have
@@ -226,6 +234,20 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 	if !found {
 		r.log.WarnContext(ctx, "invoice event drift/stale: no mirror row updated", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "status", inv.Status)
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
+	}
+
+	// RELAX driver — invoice.paid only. A failure here is surfaced (500) so Stripe
+	// retries: the relax UPDATE is idempotent (a no-op once the account is already
+	// arrears), so a retry after the mirror already advanced is safe.
+	if event.Type == stripego.EventTypeInvoicePaid {
+		relaxed, err := r.store.RelaxCollectionOnPaidInvoice(ctx, inv.ID)
+		if err != nil {
+			r.log.ErrorContext(ctx, "invoice.paid relax collection failed", "event_id", event.ID, "stripe_invoice_id", inv.ID, "error", err)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		if relaxed {
+			r.log.InfoContext(ctx, "invoice.paid relaxed account prepaid → arrears", "event_id", event.ID, "stripe_invoice_id", inv.ID)
+		}
 	}
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }

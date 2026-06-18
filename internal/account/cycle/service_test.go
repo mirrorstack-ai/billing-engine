@@ -3,6 +3,7 @@ package cycle_test
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -40,6 +41,13 @@ type fakeStore struct {
 	unbilledAccounts []uuid.UUID // AccountsWithUnbilledUsage return
 	usageEventAccts  []uuid.UUID // AccountsWithUsageEvents return
 
+	// risk-graded collection inputs (PR #9)
+	collection    cycle.AccountCollection // AccountCollection return
+	unpaidInvoice bool                    // HasUnpaidInvoice return (delinquency signal)
+
+	// captured collection writes
+	updatedCollection *cycle.AccountCollection // last UpdateAccountCollection arg
+
 	// captured charge writes
 	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
 	runStatus    map[uuid.UUID]cycle.BillingRunStatus // run id → current status (models the DB row's terminal state)
@@ -62,6 +70,9 @@ type fakeStore struct {
 	errMarkRun     error
 	errUnbilled    error
 	errUsageEvents error
+	errCollection  error // AccountCollection
+	errUpdateColl  error // UpdateAccountCollection
+	errUnpaid      error // HasUnpaidInvoice
 }
 
 // markedRun records a MarkBillingRun call so a test can assert the terminal
@@ -83,6 +94,15 @@ func newFakeStore() *fakeStore {
 		runStatus:    map[uuid.UUID]cycle.BillingRunStatus{},
 		markedRuns:   map[uuid.UUID]markedRun{},
 		invoices:     map[string]cycle.InvoiceMirror{},
+		// Default collection state: arrears mode with a high credit limit + no
+		// spend ceiling, so the existing charge tests (which don't set risk
+		// fields) flow through the gate to the charge path unchanged. Risk tests
+		// override these explicitly.
+		collection: cycle.AccountCollection{
+			Mode:              cycle.BillingModeArrears,
+			CreditLimitMicros: math.MaxInt64, // effectively unlimited so legacy charge tests never tighten
+			HasSpendCeiling:   false,
+		},
 	}
 }
 
@@ -188,6 +208,48 @@ func (f *fakeStore) AccountStripeCustomer(_ context.Context, _ uuid.UUID) (strin
 		return "", f.errCustomer
 	}
 	return f.stripeCustomer, nil
+}
+
+func (f *fakeStore) AccountCollection(_ context.Context, _ uuid.UUID) (cycle.AccountCollection, error) {
+	if f.errCollection != nil {
+		return cycle.AccountCollection{}, f.errCollection
+	}
+	return f.collection, nil
+}
+
+func (f *fakeStore) UpdateAccountCollection(_ context.Context, _ uuid.UUID, c cycle.AccountCollection) error {
+	if f.errUpdateColl != nil {
+		return f.errUpdateColl
+	}
+	f.collection = c // persist so a re-run reads the transitioned mode
+	cp := c
+	f.updatedCollection = &cp
+	return nil
+}
+
+func (f *fakeStore) TightenAndMarkRun(_ context.Context, _ uuid.UUID, c cycle.AccountCollection, runID uuid.UUID, status cycle.BillingRunStatus) error {
+	// Models the atomic tx: persist the mode transition AND mark the run skipped.
+	// An injected error on EITHER underlying op fails the whole call (all-or-
+	// nothing) so a test can assert the cycle surfaces a tighten-tx failure.
+	if f.errUpdateColl != nil {
+		return f.errUpdateColl
+	}
+	if f.errMarkRun != nil {
+		return f.errMarkRun
+	}
+	f.collection = c
+	cp := c
+	f.updatedCollection = &cp
+	f.markedRuns[runID] = markedRun{status: status, totalCents: 0}
+	f.runStatus[runID] = status
+	return nil
+}
+
+func (f *fakeStore) HasUnpaidInvoice(_ context.Context, _ uuid.UUID) (bool, error) {
+	if f.errUnpaid != nil {
+		return false, f.errUnpaid
+	}
+	return f.unpaidInvoice, nil
 }
 
 func (f *fakeStore) UpsertInvoice(_ context.Context, inv cycle.InvoiceMirror) error {
