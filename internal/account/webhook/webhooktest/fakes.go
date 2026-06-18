@@ -39,26 +39,30 @@ func (f *FakeVerifier) Verify(_ []byte, _ string) (stripego.Event, error) {
 // true, the Processed map initialized, no errors.
 type FakeStore struct {
 	// Recording
-	Processed     map[string]bool                     // event IDs seen by MarkEventProcessed
-	DefaultsSet   []string                            // "customerID=defaultPM" pairs from SetDefaultPaymentMethod
-	Inserts       []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
-	SoftDeletes   []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
-	StampedPMs    []string                            // "setupIntentID=stripePMID" from SetAddCardRequestStripePM
-	ResolvedPMs   []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
+	Processed   map[string]bool                     // event IDs seen by MarkEventProcessed
+	DefaultsSet []string                            // "customerID=defaultPM" pairs from SetDefaultPaymentMethod
+	Inserts     []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
+	SoftDeletes []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
+	StampedPMs  []string                            // "setupIntentID=stripePMID" from SetAddCardRequestStripePM
+	ResolvedPMs []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
+
+	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
 
 	// Found-flag knobs
 	TouchedFound bool // returned by TouchAccountByStripeCustomer
 	InsertFound  bool // returned by InsertPaymentMethod
 	SoftDelFound bool // returned by SoftDeletePaymentMethod
+	InvoiceFound bool // returned by ApplyInvoiceStatus
 
 	// Error injection
-	ErrMark       error // from MarkEventProcessed
-	ErrTouch      error // from TouchAccountByStripeCustomer
-	ErrSetDefault error // from SetDefaultPaymentMethod
-	ErrInsert     error // from InsertPaymentMethod
-	ErrSoftDel    error // from SoftDeletePaymentMethod
-	ErrStamp      error // from SetAddCardRequestStripePM
-	ErrResolve    error // from ResolvePendingAddCardRequest
+	ErrMark         error // from MarkEventProcessed
+	ErrTouch        error // from TouchAccountByStripeCustomer
+	ErrSetDefault   error // from SetDefaultPaymentMethod
+	ErrInsert       error // from InsertPaymentMethod
+	ErrSoftDel      error // from SoftDeletePaymentMethod
+	ErrStamp        error // from SetAddCardRequestStripePM
+	ErrResolve      error // from ResolvePendingAddCardRequest
+	ErrApplyInvoice error // from ApplyInvoiceStatus
 }
 
 // NewFakeStore returns a FakeStore configured for happy-path tests:
@@ -70,6 +74,7 @@ func NewFakeStore() *FakeStore {
 		TouchedFound: true,
 		InsertFound:  true,
 		SoftDelFound: true,
+		InvoiceFound: true,
 	}
 }
 
@@ -132,6 +137,14 @@ func (s *FakeStore) ResolvePendingAddCardRequest(_ context.Context, stripePMID s
 	}
 	s.ResolvedPMs = append(s.ResolvedPMs, stripePMID)
 	return nil
+}
+
+func (s *FakeStore) ApplyInvoiceStatus(_ context.Context, params webhook.ApplyInvoiceStatusParams) (bool, error) {
+	if s.ErrApplyInvoice != nil {
+		return false, s.ErrApplyInvoice
+	}
+	s.AppliedInvoices = append(s.AppliedInvoices, params)
+	return s.InvoiceFound, nil
 }
 
 // SilentLogger returns a slog.Logger that discards all output. Useful
