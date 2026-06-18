@@ -32,6 +32,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/budget"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
@@ -59,8 +60,9 @@ type rpcResponseError struct {
 
 // dispatcher is the action → handler dispatch shared by both transports.
 type dispatcher struct {
-	svc      *billing.Service
-	usageSvc *usage.Service
+	svc       *billing.Service
+	usageSvc  *usage.Service
+	budgetSvc *budget.Service
 }
 
 func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload json.RawMessage) (any, error) {
@@ -142,6 +144,27 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.SetModuleVisibility(ctx, req)
 
+	case "SetBudget":
+		var req budget.SetBudgetRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.budgetSvc.SetBudget(ctx, req)
+
+	case "GetBudgetStatus":
+		var req budget.GetBudgetStatusRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.budgetSvc.GetBudgetStatus(ctx, req)
+
+	case "GetBudgetAlerts":
+		var req budget.GetBudgetAlertsRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.budgetSvc.GetBudgetAlerts(ctx, req)
+
 	default:
 		return nil, billing.InvalidInput("unknown action: " + action)
 	}
@@ -216,9 +239,12 @@ func init() {
 	stripeClient := billingstripe.NewClient(stripeKey)
 	svc := billing.NewService(store, stripeClient, returnURL)
 
-	usageSvc := usage.NewService(usage.NewStore(pool))
+	budgetSvc := budget.NewService(budget.NewStore(pool))
+	// The ingest path fires the per-app budget hook best-effort on a fresh
+	// usage event (design §5 / §10).
+	usageSvc := usage.NewService(usage.NewStore(pool)).WithBudgetEvaluator(budgetSvc)
 
-	disp = &dispatcher{svc: svc, usageSvc: usageSvc}
+	disp = &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc}
 }
 
 func buildRouter(d *dispatcher) *chi.Mux {
@@ -246,6 +272,13 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.GetUsageSummary", makeHTTPHandler(d, "GetUsageSummary"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
 		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
+		// Budget RPCs — control-plane (api-platform writes the cap, reads
+		// status/alerts for in-app display). Internal secret, NOT the meter
+		// secret: budget config is low-volume and shares the api-platform
+		// credential, while evaluation runs internally off the meter ingest.
+		r.Post("/v1/billing.SetBudget", makeHTTPHandler(d, "SetBudget"))
+		r.Post("/v1/billing.GetBudgetStatus", makeHTTPHandler(d, "GetBudgetStatus"))
+		r.Post("/v1/billing.GetBudgetAlerts", makeHTTPHandler(d, "GetBudgetAlerts"))
 	})
 
 	// Meter-secret-gated ingest route. RecordUsage is the high-volume
