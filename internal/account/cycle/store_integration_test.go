@@ -266,3 +266,77 @@ func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, shouldOther, "a different window is a distinct run")
 }
+
+// TestAccountCollection_Integration_DefaultsAndUpdate verifies migration 016's
+// born-clean column defaults (arrears mode, $25 credit floor, NULL ceiling) and
+// the UpdateAccountCollection round-trip (mode + ceiling persisted and read
+// back). PR #9.
+func TestAccountCollection_Integration_DefaultsAndUpdate(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+
+	// Migration 016 defaults: arrears mode, $25 credit floor, no ceiling.
+	got, err := store.AccountCollection(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, cycle.BillingModeArrears, got.Mode)
+	require.EqualValues(t, 25_000_000, got.CreditLimitMicros)
+	require.False(t, got.HasSpendCeiling)
+	require.False(t, got.CreatedAt.IsZero(), "created_at populated for tenure")
+
+	// Update: flip to prepaid + set a ceiling; read it back.
+	require.NoError(t, store.UpdateAccountCollection(ctx, acct, cycle.AccountCollection{
+		Mode:               cycle.BillingModePrepaid,
+		CreditLimitMicros:  25_000_000,
+		HasSpendCeiling:    true,
+		SpendCeilingMicros: 5_000_000,
+	}))
+	got, err = store.AccountCollection(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, cycle.BillingModePrepaid, got.Mode)
+	require.True(t, got.HasSpendCeiling)
+	require.EqualValues(t, 5_000_000, got.SpendCeilingMicros)
+
+	// Missing account → ErrAccountNotFound.
+	err = store.UpdateAccountCollection(ctx, uuid.New(), cycle.AccountCollection{Mode: cycle.BillingModeArrears})
+	require.ErrorIs(t, err, cycle.ErrAccountNotFound)
+}
+
+// TestTightenAndMarkRun_Integration verifies the atomic tighten: in ONE tx the
+// account mode flips to prepaid AND the billing run is marked skipped_prepaid,
+// and the new skipped_ceiling status satisfies migration 016's CHECK. PR #9.
+func TestTightenAndMarkRun_Integration(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	start, end := mustTime(t, pStart), mustTime(t, pEnd)
+
+	runID, should, err := store.InsertBillingRun(ctx, acct, start, end)
+	require.NoError(t, err)
+	require.True(t, should)
+
+	require.NoError(t, store.TightenAndMarkRun(ctx, acct,
+		cycle.AccountCollection{Mode: cycle.BillingModePrepaid, CreditLimitMicros: 25_000_000},
+		runID, cycle.RunStatusSkippedPrepaid))
+
+	// Mode persisted.
+	got, err := store.AccountCollection(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, cycle.BillingModePrepaid, got.Mode)
+
+	// Run row marked skipped_prepaid (non-terminal → still reclaimable).
+	var status string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status FROM ms_billing.billing_runs WHERE id = $1`, runID.String()).Scan(&status))
+	require.Equal(t, "skipped_prepaid", status)
+
+	// skipped_ceiling is accepted by the CHECK (born-clean migration 016).
+	require.NoError(t, store.MarkBillingRun(ctx, runID, cycle.RunStatusSkippedCeiling, "", 0))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status FROM ms_billing.billing_runs WHERE id = $1`, runID.String()).Scan(&status))
+	require.Equal(t, "skipped_ceiling", status)
+}
