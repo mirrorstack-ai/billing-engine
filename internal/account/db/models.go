@@ -280,6 +280,21 @@ type MsBillingBudgetAlert struct {
 	FiredAt     time.Time `json:"fired_at"`
 }
 
+type MsBillingDeveloperSettlement struct {
+	ID                  string                    `json:"id"`
+	PeriodID            string                    `json:"period_id"`
+	AccountID           string                    `json:"account_id"`
+	ModuleID            string                    `json:"module_id"`
+	DeveloperID         pgtype.UUID               `json:"developer_id"`
+	IncomeMicros        int64                     `json:"income_micros"`
+	InfraMicros         int64                     `json:"infra_micros"`
+	MarginShareClass    MsBillingMarginShareClass `json:"margin_share_class"`
+	PlatformTakeMicros  int64                     `json:"platform_take_micros"`
+	DeveloperOwedMicros int64                     `json:"developer_owed_micros"`
+	Status              string                    `json:"status"`
+	CreatedAt           time.Time                 `json:"created_at"`
+}
+
 type MsBillingMetricDefinition struct {
 	ID              string              `json:"id"`
 	ModuleID        string              `json:"module_id"`
