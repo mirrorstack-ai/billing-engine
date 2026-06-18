@@ -229,6 +229,48 @@ func (q *Queries) MirrorRowByStripePM(ctx context.Context, stripePaymentMethodID
 	return i, err
 }
 
+const relaxCollectionOnPaidInvoice = `-- name: RelaxCollectionOnPaidInvoice :execrows
+UPDATE ms_billing.accounts AS a
+SET usage_billing_mode = 'arrears'
+WHERE a.id = (
+        SELECT inv.account_id FROM ms_billing.invoices AS inv
+        WHERE inv.stripe_invoice_id = $1
+      )
+  AND a.usage_billing_mode = 'prepaid'
+  AND NOT EXISTS (
+        SELECT 1 FROM ms_billing.invoices i
+        WHERE i.account_id = a.id
+          AND i.status IN ('open', 'uncollectible')
+      )
+`
+
+// RelaxCollectionOnPaidInvoice is the risk-graded RELAX driver (PR #9, design
+// §7-A "relax back toward arrears only on sustained clean standing"). It is the
+// inverse of the charge cycle's tighten: when an invoice is PAID, an account that
+// was tightened to 'prepaid' is conservatively re-trusted back to 'arrears' — but
+// ONLY when no delinquency remains. The guards make it safe + idempotent:
+//   - resolve the account from the paid invoice's mirror row (subquery on
+//     stripe_invoice_id);
+//   - act only on a 'prepaid' account (a 'arrears' account is already relaxed →
+//     no-op);
+//   - relax only when the account has NO other 'open'/'uncollectible' invoice
+//     (the same delinquency predicate AccountHasUnpaidInvoice uses) — a single
+//     paid invoice while another is still unpaid must NOT re-trust.
+//
+// It NEVER charges (the charge cycle is tighten-only); relax + charge are
+// decoupled so an account is never relaxed and charged in the same beat. The
+// caller invokes this AFTER ApplyInvoiceStatus has landed the 'paid' status, so
+// the just-paid invoice is no longer counted as unpaid by the NOT EXISTS guard.
+// :execrows → 1 = relaxed, 0 = no-op (not prepaid, or still delinquent, or no
+// mirror row); the Go layer logs the outcome but treats 0 as success.
+func (q *Queries) RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoiceID string) (int64, error) {
+	result, err := q.db.Exec(ctx, relaxCollectionOnPaidInvoice, stripeInvoiceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const resolveAddCardRequest = `-- name: ResolveAddCardRequest :exec
 UPDATE ms_billing.add_card_requests
 SET status = $2::ms_billing.add_card_request_status,

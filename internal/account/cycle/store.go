@@ -85,6 +85,35 @@ type Store interface {
 	// at the charge leg is an anomaly the caller surfaces.
 	AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error)
 
+	// AccountCollection loads the account's risk-graded collection state (PR #9):
+	// the usage_billing_mode, credit_limit, optional spend_ceiling, and the
+	// account's created_at (so the risk-judge derives tenure WITHOUT a
+	// cross-schema read into ms_account).
+	AccountCollection(ctx context.Context, accountID uuid.UUID) (AccountCollection, error)
+
+	// UpdateAccountCollection persists the mode transition only — it carries the
+	// existing credit_limit / spend_ceiling through unchanged. The trust-ramp
+	// RECOMPUTE of credit_limit (collection.TrustRampedCreditLimit) is a deferred
+	// follow-up (it must run on a tenure/history-driven schedule, not the charge
+	// path), so this write never grows the limit. ErrAccountNotFound when the row
+	// is gone.
+	UpdateAccountCollection(ctx context.Context, accountID uuid.UUID, c AccountCollection) error
+
+	// TightenAndMarkRun ATOMICALLY persists a risk-judge mode tighten AND marks
+	// the billing run skipped in ONE transaction. The two writes must not be
+	// split: a crash between them would leave the account tightened but the run
+	// row 'pending', so the next cycle reclaims the pending row and writes a
+	// SECOND skip row for the same period — a phantom duplicate in the audit
+	// trail. Wrapping both in a transaction makes the tighten+mark all-or-nothing.
+	// ErrAccountNotFound when the account row is gone (the tx rolls back, the run
+	// stays 'pending', and the cycle re-attempts).
+	TightenAndMarkRun(ctx context.Context, accountID uuid.UUID, c AccountCollection, runID uuid.UUID, status BillingRunStatus) error
+
+	// HasUnpaidInvoice is the delinquency signal (mirrors billing.Ensure's #7
+	// derivation): true when the account has an open/uncollectible invoice in the
+	// mirror. The risk-judge tightens toward prepaid on it.
+	HasUnpaidInvoice(ctx context.Context, accountID uuid.UUID) (bool, error)
+
 	// UpsertInvoice mirrors a created Stripe invoice into ms_billing.invoices,
 	// idempotent on stripe_invoice_id (a deterministic Idempotency-Key re-run
 	// returns the same invoice → the same mirror row).
@@ -99,6 +128,35 @@ type Store interface {
 	// — the work list for cmd/billing-cycle.
 	AccountsWithUnbilledUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
 }
+
+// ErrAccountNotFound is returned by UpdateAccountCollection when no accounts row
+// matches the id (the UPDATE affected zero rows).
+var ErrAccountNotFound = errors.New("billing account not found")
+
+// AccountCollection is the in-memory form of the risk-graded collection columns
+// on ms_billing.accounts (PR #9). Money is integer micros. SpendCeilingMicros is
+// only meaningful when HasSpendCeiling is true (the column is NULL = no ceiling).
+// CreatedAt feeds the risk-judge's tenure derivation without a cross-schema read.
+type AccountCollection struct {
+	Mode               BillingMode
+	CreditLimitMicros  int64
+	HasSpendCeiling    bool
+	SpendCeilingMicros int64
+	CreatedAt          time.Time
+}
+
+// BillingMode mirrors ms_billing.usage_billing_mode (and collection.Mode)
+// one-for-one. Kept as a cycle-package type so the charge spine doesn't import
+// the db enum directly; the store maps it to/from db.MsBillingUsageBillingMode.
+type BillingMode string
+
+const (
+	// BillingModeArrears: off-session arrears charging permitted (gated).
+	BillingModeArrears BillingMode = "arrears"
+	// BillingModePrepaid: off-session arrears charging NOT permitted (skip +
+	// retain; prepaid wallet deferred).
+	BillingModePrepaid BillingMode = "prepaid"
+)
 
 // InvoiceMirror is the in-memory form of a ms_billing.invoices row the charge
 // spine writes after creating a Stripe invoice. Amounts are whole cents (Stripe
@@ -133,11 +191,12 @@ type ModuleIncome struct {
 
 // NewStore returns a Store backed by the given pgxpool.
 func NewStore(pool *pgxpool.Pool) Store {
-	return &pgxStore{q: db.New(pool)}
+	return &pgxStore{pool: pool, q: db.New(pool)}
 }
 
 type pgxStore struct {
-	q *db.Queries
+	pool *pgxpool.Pool
+	q    *db.Queries
 }
 
 func (s *pgxStore) OpenPeriodForAccount(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (uuid.UUID, error) {
@@ -333,6 +392,82 @@ func (s *pgxStore) HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) 
 
 func (s *pgxStore) AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error) {
 	return s.q.AccountStripeCustomer(ctx, accountID.String())
+}
+
+func (s *pgxStore) AccountCollection(ctx context.Context, accountID uuid.UUID) (AccountCollection, error) {
+	row, err := s.q.AccountCollectionFields(ctx, accountID.String())
+	if err != nil {
+		return AccountCollection{}, err
+	}
+	return AccountCollection{
+		Mode:               BillingMode(row.UsageBillingMode),
+		CreditLimitMicros:  row.CreditLimitMicros,
+		HasSpendCeiling:    row.SpendCeilingMicros.Valid,
+		SpendCeilingMicros: row.SpendCeilingMicros.Int64,
+		CreatedAt:          row.CreatedAt,
+	}, nil
+}
+
+func (s *pgxStore) UpdateAccountCollection(ctx context.Context, accountID uuid.UUID, c AccountCollection) error {
+	rows, err := s.q.UpdateAccountCollection(ctx, db.UpdateAccountCollectionParams{
+		ID:                 accountID.String(),
+		UsageBillingMode:   db.MsBillingUsageBillingMode(c.Mode),
+		CreditLimitMicros:  c.CreditLimitMicros,
+		SpendCeilingMicros: pgtype.Int8{Int64: c.SpendCeilingMicros, Valid: c.HasSpendCeiling},
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrAccountNotFound
+	}
+	return nil
+}
+
+// TightenAndMarkRun runs UpdateAccountCollection + MarkBillingRun inside a single
+// transaction so the mode tighten and the run-mark commit together or not at all
+// — no crash window can leave the account tightened with the run row still
+// 'pending' (which would re-fire the gate next cycle and write a duplicate skip
+// row for the same period). The whole tx aborts if the account row is gone.
+func (s *pgxStore) TightenAndMarkRun(ctx context.Context, accountID uuid.UUID, c AccountCollection, runID uuid.UUID, status BillingRunStatus) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := s.q.WithTx(tx)
+
+	rows, err := qtx.UpdateAccountCollection(ctx, db.UpdateAccountCollectionParams{
+		ID:                 accountID.String(),
+		UsageBillingMode:   db.MsBillingUsageBillingMode(c.Mode),
+		CreditLimitMicros:  c.CreditLimitMicros,
+		SpendCeilingMicros: pgtype.Int8{Int64: c.SpendCeilingMicros, Valid: c.HasSpendCeiling},
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrAccountNotFound
+	}
+
+	total, err := centsNumeric(0) // a skip mark carries no charged total / invoice id
+	if err != nil {
+		return err
+	}
+	if err := qtx.MarkBillingRun(ctx, db.MarkBillingRunParams{
+		ID:              runID.String(),
+		Status:          string(status),
+		StripeInvoiceID: pgtype.Text{}, // NULL: no Stripe invoice on a skip
+		TotalAmount:     total,
+	}); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (s *pgxStore) HasUnpaidInvoice(ctx context.Context, accountID uuid.UUID) (bool, error) {
+	return s.q.AccountHasUnpaidInvoice(ctx, accountID.String())
 }
 
 func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {

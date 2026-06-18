@@ -228,14 +228,59 @@ func (ns NullMsBillingMetricKind) Value() (driver.Value, error) {
 	return string(ns.MsBillingMetricKind), nil
 }
 
+type MsBillingUsageBillingMode string
+
+const (
+	MsBillingUsageBillingModeArrears MsBillingUsageBillingMode = "arrears"
+	MsBillingUsageBillingModePrepaid MsBillingUsageBillingMode = "prepaid"
+)
+
+func (e *MsBillingUsageBillingMode) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = MsBillingUsageBillingMode(s)
+	case string:
+		*e = MsBillingUsageBillingMode(s)
+	default:
+		return fmt.Errorf("unsupported scan type for MsBillingUsageBillingMode: %T", src)
+	}
+	return nil
+}
+
+type NullMsBillingUsageBillingMode struct {
+	MsBillingUsageBillingMode MsBillingUsageBillingMode `json:"ms_billing_usage_billing_mode"`
+	Valid                     bool                      `json:"valid"` // Valid is true if MsBillingUsageBillingMode is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullMsBillingUsageBillingMode) Scan(value interface{}) error {
+	if value == nil {
+		ns.MsBillingUsageBillingMode, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.MsBillingUsageBillingMode.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullMsBillingUsageBillingMode) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.MsBillingUsageBillingMode), nil
+}
+
 type MsBillingAccount struct {
-	ID               string      `json:"id"`
-	OwnerKind        string      `json:"owner_kind"`
-	OwnerUserID      pgtype.UUID `json:"owner_user_id"`
-	OwnerOrgID       pgtype.UUID `json:"owner_org_id"`
-	StripeCustomerID pgtype.Text `json:"stripe_customer_id"`
-	CreatedAt        time.Time   `json:"created_at"`
-	UpdatedAt        time.Time   `json:"updated_at"`
+	ID                 string                    `json:"id"`
+	OwnerKind          string                    `json:"owner_kind"`
+	OwnerUserID        pgtype.UUID               `json:"owner_user_id"`
+	OwnerOrgID         pgtype.UUID               `json:"owner_org_id"`
+	StripeCustomerID   pgtype.Text               `json:"stripe_customer_id"`
+	CreatedAt          time.Time                 `json:"created_at"`
+	UpdatedAt          time.Time                 `json:"updated_at"`
+	UsageBillingMode   MsBillingUsageBillingMode `json:"usage_billing_mode"`
+	CreditLimitMicros  int64                     `json:"credit_limit_micros"`
+	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
 }
 
 type MsBillingAddCardRequest struct {

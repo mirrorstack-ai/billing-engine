@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/collection"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -71,6 +72,27 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return &ChargeSummary{FirstRun: false}, nil
 	}
 
+	// RISK-GRADED COLLECTION GATE (PR #9, design §7-A / billing-tiers §3). Load
+	// the account's collection state up front. The off-session arrears leg may
+	// only ship behind this gate (the GA gate); the run row already exists, so a
+	// skip here is auditable as skipped_prepaid and the deterministic Stripe
+	// idem keys stay stable if the mode later flips back to arrears.
+	acct, err := s.store.AccountCollection(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("account collection lookup failed", err)
+	}
+
+	// Fast path: an account ALREADY in prepaid mode never reads aggregates or
+	// touches Stripe — the off-session arrears leg is not permitted. The usage is
+	// RETAINED (usage_aggregates untouched); the prepaid-credit wallet that would
+	// settle it is a DEFERRED follow-up.
+	if acct.Mode == BillingModePrepaid {
+		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
+			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
+		}
+		return &ChargeSummary{FirstRun: true, Status: RunStatusSkippedPrepaid}, nil
+	}
+
 	total, err := s.store.PeriodChargedTotal(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("period charged total query failed", err)
@@ -86,12 +108,74 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears}
 
 	// Zero arrears (empty/zero period, or allowance ≥ usage): mark invoiced with
-	// NO Stripe call — never auto-create a Customer with nothing to charge.
+	// NO Stripe call — never auto-create a Customer with nothing to charge. Zero
+	// arrears can never breach a limit/ceiling, so this short-circuits ahead of
+	// the risk gate.
 	if arrears == 0 {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
 		}
 		summary.Status = RunStatusInvoiced
+		return summary, nil
+	}
+
+	// SPEND CEILING (hard bill-shock cap, billing-tiers §3): the off-session leg
+	// must NEVER auto-charge accrued arrears above the customer-set per-cycle
+	// ceiling. A breach skips the charge (usage RETAINED) rather than charging a
+	// shocking amount — checked against the NETTED arrears so the allowance is
+	// credited first. Independent of mode/credit-limit (a hard cap, not a trust
+	// judgment).
+	if collection.ExceedsSpendCeiling(toCollectionAccount(acct), arrears) {
+		// skipped_ceiling, NOT skipped_prepaid: the ceiling is a per-cycle cap, not
+		// a mode transition — the account stays in arrears mode and the next cycle
+		// re-attempts once the ceiling is raised or the arrears net below it. The
+		// distinct status keeps "spend-ceiling breach" legible apart from "prepaid
+		// mode" in the audit trail.
+		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedCeiling, "", 0); err != nil {
+			return nil, billing.Internal("mark billing run (spend_ceiling) failed", err)
+		}
+		summary.Status = RunStatusSkippedCeiling
+		return summary, nil
+	}
+
+	// RISK-JUDGE (design §7-A): tighten an arrears account toward prepaid on a
+	// delinquency signal (an unpaid invoice, #7), accrual at/over the credit
+	// limit, or a usage spike. A tighten PERSISTS the prepaid transition and
+	// skips this cycle's off-session charge (usage RETAINED). v1 supplies no
+	// usage-spike detector yet, so that input is conservative (spike=false).
+	//
+	// The charge cycle is TIGHTEN-ONLY (cleanStanding=false): it NEVER auto-relaxes
+	// prepaid → arrears. The relax driver lives in the webhook (invoice.paid with
+	// no remaining open delinquency → RelaxCollectionOnPaidInvoice) so a relax is
+	// driven by a real successful-payment signal and is decoupled from charging —
+	// an account is never relaxed and charged in the same beat. TODO(#9-followup):
+	// wire a usage-spike anomaly signal + a sustained-clean-standing window.
+	delinquent, err := s.store.HasUnpaidInvoice(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("delinquency lookup failed", err)
+	}
+	decision := collection.RiskAssess(
+		toCollectionAccount(acct),
+		collection.Signals{Delinquent: delinquent, AccruedArrearsMicros: arrears},
+		false, // cleanStanding: the charge cycle never auto-relaxes (relax is webhook-driven)
+	)
+	if decision.Action == collection.ActionSkipPrepaid {
+		summary.Status = RunStatusSkippedPrepaid
+		if decision.ModeChanged {
+			// A fresh tighten: persist the prepaid mode AND mark the run skipped in
+			// ONE transaction (TightenAndMarkRun) so a crash can't strand the account
+			// tightened with the run row still 'pending'.
+			updated := acct
+			updated.Mode = BillingMode(decision.DesiredMode)
+			if err := s.store.TightenAndMarkRun(ctx, accountID, updated, runID, RunStatusSkippedPrepaid); err != nil {
+				return nil, billing.Internal("tighten and mark billing run failed", err)
+			}
+			return summary, nil
+		}
+		// Already prepaid (no transition to persist): just mark the run skipped.
+		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
+			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
+		}
 		return summary, nil
 	}
 
@@ -209,3 +293,15 @@ func (s *Service) AccountsWithUnbilledUsage(ctx context.Context, periodStart, pe
 // per-metric) — matching the single combined invoice item this leg creates.
 func invoiceItemIdemKey(runID uuid.UUID) string { return "ii-" + runID.String() }
 func invoiceIdemKey(runID uuid.UUID) string     { return "inv-" + runID.String() }
+
+// toCollectionAccount maps the cycle store's AccountCollection to the pure-policy
+// collection.Account the risk-judge reasons over. Kept here so the collection
+// package stays free of any persistence type.
+func toCollectionAccount(a AccountCollection) collection.Account {
+	return collection.Account{
+		Mode:               collection.Mode(a.Mode),
+		CreditLimitMicros:  a.CreditLimitMicros,
+		HasSpendCeiling:    a.HasSpendCeiling,
+		SpendCeilingMicros: a.SpendCeilingMicros,
+	}
+}

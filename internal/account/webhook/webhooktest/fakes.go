@@ -47,12 +47,14 @@ type FakeStore struct {
 	ResolvedPMs []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
 
 	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
+	RelaxedInvoices []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
 
 	// Found-flag knobs
 	TouchedFound bool // returned by TouchAccountByStripeCustomer
 	InsertFound  bool // returned by InsertPaymentMethod
 	SoftDelFound bool // returned by SoftDeletePaymentMethod
 	InvoiceFound bool // returned by ApplyInvoiceStatus
+	Relaxed      bool // returned by RelaxCollectionOnPaidInvoice
 
 	// Error injection
 	ErrMark         error // from MarkEventProcessed
@@ -63,6 +65,7 @@ type FakeStore struct {
 	ErrStamp        error // from SetAddCardRequestStripePM
 	ErrResolve      error // from ResolvePendingAddCardRequest
 	ErrApplyInvoice error // from ApplyInvoiceStatus
+	ErrRelax        error // from RelaxCollectionOnPaidInvoice
 }
 
 // NewFakeStore returns a FakeStore configured for happy-path tests:
@@ -145,6 +148,14 @@ func (s *FakeStore) ApplyInvoiceStatus(_ context.Context, params webhook.ApplyIn
 	}
 	s.AppliedInvoices = append(s.AppliedInvoices, params)
 	return s.InvoiceFound, nil
+}
+
+func (s *FakeStore) RelaxCollectionOnPaidInvoice(_ context.Context, stripeInvoiceID string) (bool, error) {
+	if s.ErrRelax != nil {
+		return false, s.ErrRelax
+	}
+	s.RelaxedInvoices = append(s.RelaxedInvoices, stripeInvoiceID)
+	return s.Relaxed, nil
 }
 
 // SilentLogger returns a slog.Logger that discards all output. Useful
