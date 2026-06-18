@@ -324,7 +324,8 @@ func TestRollupPeriod_CustomMetricNoMarkup(t *testing.T) {
 
 func TestRollupPeriod_ReservedMetricInfraMarkup(t *testing.T) {
 	// A reserved infra.* / platform.* name takes the 12/10 (1.2×) markup plane.
-	// These don't ingest until PR #10, but the plane logic is implemented.
+	// As of PR #10a the platform-infra ingest (RecordInfraUsage) records these,
+	// so they DO reach the rollup; the plane logic prices them at cost × 1.2.
 	store := newFakeStore()
 	app, mod := uuid.New(), uuid.New()
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "infra.compute.ms", usage.KindSum, "100")}
@@ -338,6 +339,31 @@ func TestRollupPeriod_ReservedMetricInfraMarkup(t *testing.T) {
 	require.Equal(t, 10, a.MarkupDen)
 	require.EqualValues(t, 100_000, a.RawCostMicros) // 100 × 1_000
 	require.EqualValues(t, 120_000, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_InfraEgressUnderSentinelPricesAt12Over10(t *testing.T) {
+	// PR #10a foundation contract: an infra.egress.bytes event recorded by
+	// RecordInfraUsage is stamped under the platform-infra SENTINEL module_id
+	// (usage.PlatformInfraModuleID()); migration 017 seeds the matching
+	// metric_definitions row under the SAME sentinel with the per-unit COGS, so
+	// the rollup's price-lookup resolves a non-zero cost and the reserved-name
+	// branch marks it up cost × 12/10. This proves an infra event prices at
+	// 12/10 (NOT 10/10) end-to-end through the sentinel.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.egress.bytes", usage.KindSum, "1000")}
+	store.prices[priceKey(sentinel, "infra.egress.bytes")] = 2 // seeded per-byte COGS (micros)
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+
+	a := resp.Aggregates[0]
+	require.Equal(t, sentinel, a.ModuleID)
+	require.Equal(t, 12, a.MarkupNum) // reserved-name markup plane, NOT 10/10
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 2_000, a.RawCostMicros) // 1000 × 2
+	require.EqualValues(t, 2_400, a.ChargedMicros) // × 1.2
 }
 
 func TestRollupPeriod_PlatformReservedPrefix(t *testing.T) {
@@ -365,6 +391,21 @@ func TestRollupPeriod_NullPriceZeroCharge(t *testing.T) {
 	require.EqualValues(t, 0, a.UnitPriceMicros)
 	require.EqualValues(t, 0, a.RawCostMicros)
 	require.EqualValues(t, 0, a.ChargedMicros)
+}
+
+func TestRollupPeriod_InfraMissingCatalogErrors(t *testing.T) {
+	// A reserved infra metric with NO seeded price (migration 017 missing or
+	// rolled back) MUST fail the cycle loudly — NOT silently price to 0 like an
+	// unpriced custom metric. This guards the infra revenue-leak path: the
+	// platform incurred the cloud COGS, so a zero charge is never acceptable.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.compute.ms", usage.KindSum, "100")}
+	// deliberately register NO price for the infra metric
+
+	_, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	requireCode(t, err, billing.CodeInternal)
 }
 
 func TestRollupPeriod_FractionalQuantityRoundHalfUp(t *testing.T) {
