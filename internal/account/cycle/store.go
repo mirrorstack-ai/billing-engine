@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,6 +55,63 @@ type Store interface {
 	// idempotently on (period_id, module_id). developer_id is NULL (no
 	// module→developer sync yet); status defaults 'accrued'.
 	UpsertDeveloperSettlement(ctx context.Context, periodID, accountID uuid.UUID, s ModuleSettlement) error
+
+	// InsertBillingRun is the charge idempotency gate: one run row per
+	// (account, period window). It inserts a 'pending' row, or on conflict
+	// RECLAIMS the existing row when it is non-terminal (a 'pending' run that
+	// died mid-flight, 'skipped_no_pm', or 'failed'). shouldCharge=true (with the
+	// run id) means this attempt must proceed to charge — the reclaimed row keeps
+	// its id so the deterministic Stripe Idempotency-Keys stay stable across
+	// attempts. shouldCharge=false means the window already has an 'invoiced'
+	// (terminal-success) run and the cycle must NOT re-charge.
+	InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (runID uuid.UUID, shouldCharge bool, err error)
+
+	// AccountsWithUsageEvents returns the accounts with raw usage_events in the
+	// window [periodStart, periodEnd) — the rollup-phase work list for
+	// cmd/billing-cycle (phase 1: roll each up into usage_aggregates before the
+	// charge phase reads them).
+	AccountsWithUsageEvents(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+
+	// PeriodChargedTotal returns Σ usage_aggregates.charged_micros for the
+	// account's period window — the arrears input before allowance-netting.
+	PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+
+	// HasUsableDefaultPM is the no-PM charge gate: true iff the account has an
+	// active, not-expired payment method. Mirrors the billing hot-path gate.
+	HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error)
+
+	// AccountStripeCustomer returns the account's Stripe Customer id (empty when
+	// none exists yet). The charge never auto-creates a Customer — an empty id
+	// at the charge leg is an anomaly the caller surfaces.
+	AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error)
+
+	// UpsertInvoice mirrors a created Stripe invoice into ms_billing.invoices,
+	// idempotent on stripe_invoice_id (a deterministic Idempotency-Key re-run
+	// returns the same invoice → the same mirror row).
+	UpsertInvoice(ctx context.Context, inv InvoiceMirror) error
+
+	// MarkBillingRun sets a run's terminal status, the Stripe invoice id
+	// (empty → NULL), and the charged total in whole cents.
+	MarkBillingRun(ctx context.Context, runID uuid.UUID, status BillingRunStatus, stripeInvoiceID string, totalCents int64) error
+
+	// AccountsWithUnbilledUsage returns the accounts that have usage_aggregates
+	// in a closed period window [periodStart, periodEnd) with no billing_run yet
+	// — the work list for cmd/billing-cycle.
+	AccountsWithUnbilledUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+}
+
+// InvoiceMirror is the in-memory form of a ms_billing.invoices row the charge
+// spine writes after creating a Stripe invoice. Amounts are whole cents (Stripe
+// minor units).
+type InvoiceMirror struct {
+	AccountID       uuid.UUID
+	StripeInvoiceID string
+	Status          string
+	AmountDueCents  int64
+	AmountPaidCents int64
+	Currency        string
+	PeriodStart     time.Time
+	PeriodEnd       time.Time
 }
 
 // RawAggregate is one per-kind aggregated row from the rollup SELECTs, before
@@ -238,4 +296,118 @@ func (s *pgxStore) UpsertDeveloperSettlement(ctx context.Context, periodID, acco
 		PlatformTakeMicros:  set.PlatformTakeMicros,
 		DeveloperOwedMicros: set.DeveloperOwedMicros,
 	})
+}
+
+func (s *pgxStore) InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (uuid.UUID, bool, error) {
+	id, err := s.q.InsertBillingRun(ctx, db.InsertBillingRunParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The DO UPDATE's WHERE excluded the row → the existing run is 'invoiced'
+		// (terminal success). The window was already charged; do not re-charge.
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	runID, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return runID, true, nil
+}
+
+func (s *pgxStore) PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	return s.q.PeriodChargedTotal(ctx, db.PeriodChargedTotalParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+}
+
+func (s *pgxStore) HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error) {
+	return s.q.HasUsableDefaultPM(ctx, accountID.String())
+}
+
+func (s *pgxStore) AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error) {
+	return s.q.AccountStripeCustomer(ctx, accountID.String())
+}
+
+func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {
+	due, err := centsNumeric(inv.AmountDueCents)
+	if err != nil {
+		return err
+	}
+	paid, err := centsNumeric(inv.AmountPaidCents)
+	if err != nil {
+		return err
+	}
+	return s.q.UpsertInvoice(ctx, db.UpsertInvoiceParams{
+		AccountID:       inv.AccountID.String(),
+		StripeInvoiceID: inv.StripeInvoiceID,
+		Status:          inv.Status,
+		AmountDue:       due,
+		AmountPaid:      paid,
+		Currency:        inv.Currency,
+		PeriodStart:     pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
+		PeriodEnd:       pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
+	})
+}
+
+func (s *pgxStore) MarkBillingRun(ctx context.Context, runID uuid.UUID, status BillingRunStatus, stripeInvoiceID string, totalCents int64) error {
+	total, err := centsNumeric(totalCents)
+	if err != nil {
+		return err
+	}
+	return s.q.MarkBillingRun(ctx, db.MarkBillingRunParams{
+		ID:              runID.String(),
+		Status:          string(status),
+		StripeInvoiceID: pgtype.Text{String: stripeInvoiceID, Valid: stripeInvoiceID != ""},
+		TotalAmount:     total,
+	})
+}
+
+func (s *pgxStore) AccountsWithUsageEvents(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
+	rows, err := s.q.AccountsWithUsageEvents(ctx, db.AccountsWithUsageEventsParams{
+		RecordedAt:   periodStart,
+		RecordedAt_2: periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+func (s *pgxStore) AccountsWithUnbilledUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
+	rows, err := s.q.AccountsWithUnbilledUsage(ctx, db.AccountsWithUnbilledUsageParams{
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+// parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc
+// NOT NULL uuid → string override yields) into uuid.UUID.
+func parseUUIDs(ids []string) ([]uuid.UUID, error) {
+	out := make([]uuid.UUID, 0, len(ids))
+	for _, s := range ids {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// centsNumeric encodes a whole-cent int64 as the pgtype.Numeric the invoices /
+// billing_runs NUMERIC money columns expect. Cents are whole integers, so the
+// numeric is exact (no scale).
+func centsNumeric(cents int64) (pgtype.Numeric, error) {
+	return numericFromString(strconv.FormatInt(cents, 10))
 }

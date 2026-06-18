@@ -8,18 +8,23 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
-// Service implements the period rollup + developer settlement. It composes a
-// Store.
+// Service implements the period rollup + developer settlement + the Stripe
+// charge cycle. It composes a Store and (for the charge leg) a Stripe Client.
 type Service struct {
-	store Store
+	store  Store
+	stripe billingstripe.Client
 }
 
 // NewService wires a Service. store is required; passing nil panics at the
-// first call site.
-func NewService(store Store) *Service {
-	return &Service{store: store}
+// first call site. stripe is required only for RunBillingCycle (the charge
+// leg); RollupPeriod / SettleDevelopers never touch Stripe, so a nil stripe is
+// tolerated for rollup-only wiring (it panics only if RunBillingCycle is then
+// called). Mirrors the billing.Service constructor pattern.
+func NewService(store Store, stripe billingstripe.Client) *Service {
+	return &Service{store: store, stripe: stripe}
 }
 
 // RollupPeriod turns the account's raw usage_events for [periodStart,
@@ -105,6 +110,12 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			return nil, billing.Internal("upsert usage aggregate failed", err)
 		}
 		summary.Aggregates = append(summary.Aggregates, agg)
+		// Guard the cross-metric sum: each charged is non-negative + int64, so a
+		// wrap shows as the sum going DOWN. Per-metric overflow is already caught
+		// in chargedMicros; this catches the (impossible-at-real-scale) total.
+		if summary.TotalChargedMicros+charged < summary.TotalChargedMicros {
+			return nil, billing.Internal("period charged total overflows int64 micros", nil)
+		}
 		summary.TotalChargedMicros += charged
 	}
 

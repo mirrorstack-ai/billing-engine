@@ -1,4 +1,4 @@
-.PHONY: db db-init db-reset test test-integration lint build dev-webhook
+.PHONY: db db-init db-reset test test-integration lint build dev-webhook dev-cycle
 
 # Start infrastructure (Postgres)
 db:
@@ -39,3 +39,11 @@ build:
 # receive real test-mode events from your Stripe sandbox.
 dev-webhook:
 	cd cmd/account-webhook && go run .
+
+# Run the billing charge cycle once locally (the USAGE/arrears leg, Milestone D
+# PR #6). Derives the just-closed UTC calendar-month window, charges every
+# account with unbilled usage in it via Stripe, then exits. Requires
+# DATABASE_URL + STRIPE_SECRET_KEY (use a restricted rk_test_* key from
+# .env.local). Prod runs the same binary on an EventBridge schedule.
+dev-cycle:
+	cd cmd/billing-cycle && go run .
