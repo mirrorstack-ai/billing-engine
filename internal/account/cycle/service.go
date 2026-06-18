@@ -65,7 +65,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		Aggregates: make([]MetricAggregate, 0, len(raws)),
 	}
 	for _, raw := range raws {
-		priceMicros, _, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric)
+		priceMicros, priced, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric)
 		if err != nil {
 			return nil, billing.Internal("metric price lookup failed", err)
 		}
@@ -73,12 +73,20 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		// Pricing plane: a reserved infra.* / platform.* metric is a
 		// platform-billed line marked up 12/10; every other (custom) metric
 		// carries the identity 10/10 (no markup — the platform's third-party
-		// cut is the dev-side margin-share at settlement). infra.* metrics are
-		// not ingested until PR #10, so in practice this is always custom now;
-		// the plane is implemented + defaults safely.
+		// cut is the dev-side margin-share at settlement).
 		num, den := customMarkupNum, customMarkupDen
 		if isReservedMetric(raw.Metric) {
 			num, den = infraMarkupNum, infraMarkupDen
+			// An infra event in the rollup MUST resolve a seeded cost (migration
+			// 017's sentinel metric_definitions rows). A custom metric with no
+			// catalog price legitimately prices to 0 (metered-but-unpriced); a
+			// RESERVED metric with no price means migration 017 is missing or was
+			// rolled back without re-seeding — the platform incurred the cloud cost
+			// but would bill 0 (a silent revenue leak that still marks the cycle
+			// invoiced). Fail loud instead so ops catches it, never zero-charge it.
+			if !priced {
+				return nil, billing.Internal("infra metric "+raw.Metric+" has no seeded price — migration 017 missing or rolled back", nil)
+			}
 		}
 
 		// raw_cost = quantity × unit_price (the un-marked-up cost, snapshotted

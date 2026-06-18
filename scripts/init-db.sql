@@ -21,3 +21,5 @@
 \i migrations/billing/015_budget_alerts.up.sql
 -- 016: risk-graded collection fields on accounts + billing_runs status (PR #9).
 \i migrations/billing/016_account_collection.up.sql
+-- 017: platform-infra metric catalog seed (Plane 1, PR #10a).
+\i migrations/billing/017_platform_infra_metrics.up.sql

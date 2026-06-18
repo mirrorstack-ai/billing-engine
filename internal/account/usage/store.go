@@ -341,13 +341,20 @@ func microsFromNumeric(n pgtype.Numeric) (int64, error) {
 		div := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-n.Exp)), nil)
 		rat.Quo(rat, new(big.Rat).SetInt(div))
 	}
-	return roundRatHalfUp(rat), nil
+	return roundRatHalfUp(rat)
 }
 
 // roundRatHalfUp rounds a big.Rat to the nearest integer, halves up
 // (toward +∞ on a .5 tie). Usage costs are non-negative, so half-up is
 // the conventional "round .5 up" merchants expect.
-func roundRatHalfUp(r *big.Rat) int64 {
+//
+// It returns an error rather than silently wrapping when the result does not
+// fit in int64: big.Int.Int64() returns the low 64 bits on overflow, which
+// would silently corrupt the live-summary money read. The live summary sums
+// SUM(value × unit_price) as a NUMERIC; an infra.egress.bytes accumulation at
+// planetary scale (or many high-priced events) can exceed int64 micros, so
+// guard it identically to cycle.roundRatHalfUp.
+func roundRatHalfUp(r *big.Rat) (int64, error) {
 	// floor(r) then compare the remainder to 1/2.
 	num := new(big.Int).Set(r.Num())
 	den := r.Denom()
@@ -363,5 +370,10 @@ func roundRatHalfUp(r *big.Rat) int64 {
 	if new(big.Int).Mul(rem, big.NewInt(2)).Cmp(den) >= 0 {
 		q.Add(q, big.NewInt(1))
 	}
-	return q.Int64()
+	// int64 holds values whose magnitude needs ≤ 63 bits; anything wider would
+	// wrap silently in Int64().
+	if q.BitLen() > 63 {
+		return 0, fmt.Errorf("money value %s overflows int64 micros", q.String())
+	}
+	return q.Int64(), nil
 }
