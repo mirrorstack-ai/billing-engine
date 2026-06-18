@@ -18,6 +18,7 @@ import (
 type fakeStore struct {
 	accountsByUser   map[uuid.UUID]fakeAccount
 	hasUsablePM      map[uuid.UUID]bool
+	hasUnpaidInvoice map[uuid.UUID]bool
 	paymentMethodsBy map[uuid.UUID][]billing.PaymentMethod
 	addCardRequests  map[uuid.UUID]*fakeAddCardRequest
 
@@ -29,6 +30,7 @@ type fakeStore struct {
 	errSetStripeCustomer    error
 	errAccountByUser        error
 	errHasUsablePaymentMx   error
+	errHasUnpaidInvoice     error
 	errListPaymentMethods   error
 	errPaymentMethodTarget  error
 	errInsertAddCardRequest error
@@ -58,6 +60,7 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		accountsByUser:   map[uuid.UUID]fakeAccount{},
 		hasUsablePM:      map[uuid.UUID]bool{},
+		hasUnpaidInvoice: map[uuid.UUID]bool{},
 		paymentMethodsBy: map[uuid.UUID][]billing.PaymentMethod{},
 		pmTargets:        map[uuid.UUID]pmTarget{},
 		addCardRequests:  map[uuid.UUID]*fakeAddCardRequest{},
@@ -106,6 +109,13 @@ func (s *fakeStore) HasUsablePaymentMethod(_ context.Context, accountID uuid.UUI
 		return false, s.errHasUsablePaymentMx
 	}
 	return s.hasUsablePM[accountID], nil
+}
+
+func (s *fakeStore) HasUnpaidInvoice(_ context.Context, accountID uuid.UUID) (bool, error) {
+	if s.errHasUnpaidInvoice != nil {
+		return false, s.errHasUnpaidInvoice
+	}
+	return s.hasUnpaidInvoice[accountID], nil
 }
 
 func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) ([]billing.PaymentMethod, error) {
@@ -381,6 +391,81 @@ func TestEnsure_NoAccountRow_BillingAccountAlone(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, []string{billing.MissingBillingAccount}, resp.Missing)
+}
+
+func TestEnsure_RequireNotDelinquent_UnpaidInvoice_ReportsDelinquent(t *testing.T) {
+	store := newFakeStore()
+	userID := uuid.New()
+	accountID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	store.hasUnpaidInvoice[accountID] = true
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  userID,
+		Require: []billing.Capability{billing.RequireNotDelinquent},
+	})
+
+	require.NoError(t, err)
+	require.False(t, resp.Ready())
+	require.Equal(t, []string{billing.MissingDelinquent}, resp.Missing)
+}
+
+func TestEnsure_RequireNotDelinquent_NoUnpaidInvoice_Ready(t *testing.T) {
+	store := newFakeStore()
+	userID := uuid.New()
+	accountID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	// hasUnpaidInvoice[accountID] is false (default zero value)
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  userID,
+		Require: []billing.Capability{billing.RequireNotDelinquent},
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Ready())
+	require.Empty(t, resp.Missing)
+}
+
+func TestEnsure_RequirePMAndNotDelinquent_DeterministicOrder(t *testing.T) {
+	// PM missing AND delinquent → Missing is [payment_method, delinquent]:
+	// fixed order (PM before delinquency before subscription) regardless of
+	// Require ordering.
+	store := newFakeStore()
+	userID := uuid.New()
+	accountID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	store.hasUnpaidInvoice[accountID] = true
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  userID,
+		Require: []billing.Capability{billing.RequireNotDelinquent, billing.RequirePaymentMethod},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{billing.MissingPaymentMethod, billing.MissingDelinquent}, resp.Missing)
+}
+
+func TestEnsure_DelinquencyLookupError_BecomesInternal(t *testing.T) {
+	store := newFakeStore()
+	userID := uuid.New()
+	accountID := uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	store.errHasUnpaidInvoice = errors.New("conn dropped")
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	_, err := svc.Ensure(context.Background(), billing.EnsureRequest{
+		UserID:  userID,
+		Require: []billing.Capability{billing.RequireNotDelinquent},
+	})
+
+	require.Error(t, err)
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInternal, be.Code)
 }
 
 func TestEnsure_UnknownRequire_InvalidInput(t *testing.T) {

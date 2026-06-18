@@ -24,6 +24,72 @@ func (q *Queries) AccountExistsByStripeCustomer(ctx context.Context, stripeCusto
 	return account_exists, err
 }
 
+const applyInvoiceStatus = `-- name: ApplyInvoiceStatus :execrows
+UPDATE ms_billing.invoices AS i
+SET status      = $2,
+    amount_paid = $3,
+    amount_due  = $4
+WHERE i.stripe_invoice_id = $1
+  AND (
+        -- forward transition: incoming rank strictly above the stored rank …
+        (CASE $2::text
+            WHEN 'draft' THEN 0 WHEN 'open' THEN 1
+            WHEN 'paid' THEN 2 WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2
+            ELSE -1 END)
+        >
+        (CASE i.status
+            WHEN 'draft' THEN 0 WHEN 'open' THEN 1
+            WHEN 'paid' THEN 2 WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2
+            ELSE -1 END)
+        -- … OR an identical re-apply (idempotent amount refresh on replay).
+        OR i.status = $2
+      )
+`
+
+type ApplyInvoiceStatusParams struct {
+	StripeInvoiceID string         `json:"stripe_invoice_id"`
+	Status          string         `json:"status"`
+	AmountPaid      pgtype.Numeric `json:"amount_paid"`
+	AmountDue       pgtype.Numeric `json:"amount_due"`
+}
+
+// ApplyInvoiceStatus reconciles a Stripe invoice.* event onto the mirror row
+// keyed by stripe_invoice_id. It updates status + amount_paid + amount_due
+// ONLY (period_start/end + currency belong to the charge spine's UpsertInvoice
+// and must not be clobbered by a webhook). updated_at is trigger-maintained.
+//
+// Out-of-order + at-least-once safety: Stripe delivers webhooks at-least-once
+// and NOT in guaranteed order, so a late invoice.finalized (open) can arrive
+// after invoice.paid (paid). The WHERE guard enforces a MONOTONIC status
+// transition via a rank ladder — draft(0) < open(1) < paid/void/uncollectible(2,
+// terminal) — so the row's status can only move forward. The new status's rank
+// must be strictly greater than the current rank (a forward transition), with
+// one exception: an identical re-apply of the SAME status is allowed through so
+// a replayed paid can refresh amount_paid/amount_due idempotently. A terminal
+// status (rank 2) is never overwritten by a different status because no rank
+// exceeds 2 and the equal-rank branch requires status equality, so paid→void
+// (both rank 2) is a no-op — terminal-once-set holds. The CASE ladder is inline
+// (not a stored ENUM) so a new Stripe status maps to the bottom rung (-1) and
+// can never silently regress a known terminal state.
+//
+// :execrows → >0 means the row existed AND the guard let the update through; 0
+// means either no mirror row (drift: the charge spine's UpsertInvoice hasn't
+// run, or the invoice was created out-of-band) OR the guard rejected a stale /
+// regressing event. Both are safe no-ops the Go layer logs as drift_warning,
+// never an error.
+func (q *Queries) ApplyInvoiceStatus(ctx context.Context, arg ApplyInvoiceStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, applyInvoiceStatus,
+		arg.StripeInvoiceID,
+		arg.Status,
+		arg.AmountPaid,
+		arg.AmountDue,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const duplicateFingerprintPM = `-- name: DuplicateFingerprintPM :one
 SELECT id
 FROM ms_billing.payment_methods_mirror

@@ -40,6 +40,13 @@ type Store interface {
 	// not expired. The hot-path predicate for Ensure.
 	HasUsablePaymentMethod(ctx context.Context, accountID uuid.UUID) (bool, error)
 
+	// HasUnpaidInvoice returns true iff the account has at least one invoice
+	// in an unpaid, collection-relevant state (open or uncollectible). The
+	// delinquency predicate for Ensure — derived from the invoices mirror
+	// (reconciled by the invoice.* webhooks), not a stored flag. 'draft' is
+	// excluded (not finalized); 'paid'/'void' are clean.
+	HasUnpaidInvoice(ctx context.Context, accountID uuid.UUID) (bool, error)
+
 	// ListPaymentMethods returns the active (not soft-deleted) payment
 	// methods for an account, newest-first. Empty slice (not nil) when
 	// none exist.
@@ -185,6 +192,12 @@ func (s *pgxStore) AccountByUser(ctx context.Context, userID uuid.UUID) (uuid.UU
 
 func (s *pgxStore) HasUsablePaymentMethod(ctx context.Context, accountID uuid.UUID) (bool, error) {
 	return s.q.HasUsablePaymentMethod(ctx, accountID.String())
+}
+
+// HasUnpaidInvoice mirrors HasUsablePaymentMethod's NOT NULL uuid → string
+// override: the generated query takes the account id as a plain string.
+func (s *pgxStore) HasUnpaidInvoice(ctx context.Context, accountID uuid.UUID) (bool, error) {
+	return s.q.AccountHasUnpaidInvoice(ctx, accountID.String())
 }
 
 func (s *pgxStore) ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error) {
