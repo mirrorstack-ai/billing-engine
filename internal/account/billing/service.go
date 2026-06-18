@@ -56,7 +56,7 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 		require = []Capability{RequirePaymentMethod}
 	}
 	for _, r := range require {
-		if r != RequirePaymentMethod && r != RequireSubscription {
+		if r != RequirePaymentMethod && r != RequireSubscription && r != RequireNotDelinquent {
 			return nil, InvalidInput("unknown require: " + string(r))
 		}
 	}
@@ -82,6 +82,20 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 		}
 		if !hasPM {
 			resp.Missing = append(resp.Missing, MissingPaymentMethod)
+		}
+	}
+	if slices.Contains(require, RequireNotDelinquent) {
+		// Delinquency is DERIVED from the invoices mirror: an open or
+		// uncollectible invoice means a charge has been attempted and not
+		// collected. This only SURFACES the past-due signal; the collection
+		// POLICY (grace/suspend/force-prepaid, risk-graded) is PR #9 — do NOT
+		// add enforcement here.
+		delinquent, err := s.store.HasUnpaidInvoice(ctx, accountID)
+		if err != nil {
+			return nil, Internal("delinquency lookup failed", err)
+		}
+		if delinquent {
+			resp.Missing = append(resp.Missing, MissingDelinquent)
 		}
 	}
 	if slices.Contains(require, RequireSubscription) {

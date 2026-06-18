@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
@@ -265,7 +266,248 @@ func TestPgxStore_ResolvePendingAddCardRequest_NullFingerprint_NeverDeduplicates
 	require.Equal(t, "completed", status)
 }
 
+// --- ApplyInvoiceStatus reconciliation ------------------------------------
+
+func TestPgxStore_ApplyInvoiceStatus_ForwardTransitions(t *testing.T) {
+	// draft → open → paid: each forward step lands; amount_paid is recorded on
+	// paid.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_inv_fwd")
+	seedInvoice(t, pool, accountID, "in_fwd", "draft", 0, 1200)
+	ctx := context.Background()
+
+	found, err := store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_fwd", Status: "open", AmountPaidCents: 0, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "open", readInvoiceStatus(t, pool, "in_fwd"))
+
+	found, err = store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_fwd", Status: "paid", AmountPaidCents: 1200, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	status, paid := readInvoiceStatusAndPaid(t, pool, "in_fwd")
+	require.Equal(t, "paid", status)
+	require.Equal(t, int64(1200), paid)
+}
+
+func TestPgxStore_ApplyInvoiceStatus_OutOfOrder_LateFinalizedDoesNotRegressPaid(t *testing.T) {
+	// Stripe delivers out of order: invoice.paid lands first, then a late
+	// invoice.finalized (open). The monotonic guard must keep the row 'paid'.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_inv_ooo")
+	seedInvoice(t, pool, accountID, "in_ooo", "open", 0, 1200)
+	ctx := context.Background()
+
+	found, err := store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_ooo", Status: "paid", AmountPaidCents: 1200, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+
+	// Late finalized (open) arrives — must be rejected by the guard.
+	found, err = store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_ooo", Status: "open", AmountPaidCents: 0, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.False(t, found, "a late finalized must NOT regress a paid row")
+
+	status, paid := readInvoiceStatusAndPaid(t, pool, "in_ooo")
+	require.Equal(t, "paid", status, "row stays paid")
+	require.Equal(t, int64(1200), paid, "amount_paid is not zeroed by the stale event")
+}
+
+func TestPgxStore_ApplyInvoiceStatus_TerminalNotOverwritten(t *testing.T) {
+	// paid is terminal; a void event (also terminal, equal rank but different
+	// status) must not overwrite it — terminal-once-set holds.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_inv_term")
+	seedInvoice(t, pool, accountID, "in_term", "paid", 1200, 1200)
+	ctx := context.Background()
+
+	found, err := store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_term", Status: "void", AmountPaidCents: 0, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.False(t, found, "void must not overwrite a paid invoice")
+	require.Equal(t, "paid", readInvoiceStatus(t, pool, "in_term"))
+}
+
+func TestPgxStore_ApplyInvoiceStatus_IdempotentReplay(t *testing.T) {
+	// A replayed invoice.paid (same status) is allowed through to refresh the
+	// amounts idempotently — the row stays paid with the same values.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_inv_replay")
+	seedInvoice(t, pool, accountID, "in_replay", "paid", 1200, 1200)
+	ctx := context.Background()
+
+	found, err := store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_replay", Status: "paid", AmountPaidCents: 1200, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found, "identical re-apply is allowed (idempotent amount refresh)")
+	require.Equal(t, "paid", readInvoiceStatus(t, pool, "in_replay"))
+}
+
+func TestPgxStore_ApplyInvoiceStatus_UnknownInvoiceID_NoOp(t *testing.T) {
+	// An event for an invoice the charge spine never mirrored → 0 rows,
+	// found=false, no crash.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+
+	found, err := store.ApplyInvoiceStatus(context.Background(), webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_does_not_exist", Status: "paid", AmountPaidCents: 1200, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.False(t, found, "unknown stripe_invoice_id is a safe no-op")
+}
+
+// --- HasUnpaidInvoice (delinquency signal) ---------------------------------
+
+func TestPgxStore_HasUnpaidInvoice_DerivesFromInvoiceState(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := billing.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_delinq")
+	ctx := context.Background()
+
+	// No invoices → not delinquent.
+	has, err := store.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.False(t, has)
+
+	// A paid invoice → still not delinquent.
+	seedInvoice(t, pool, accountID, "in_paid", "paid", 1200, 1200)
+	has, err = store.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.False(t, has, "paid invoice is clean")
+
+	// A draft invoice → not delinquent (no collection attempt yet).
+	seedInvoice(t, pool, accountID, "in_draft", "draft", 0, 500)
+	has, err = store.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.False(t, has, "draft is excluded — not finalized")
+
+	// An open invoice (payment_failed leaves it open) → delinquent.
+	seedInvoice(t, pool, accountID, "in_open", "open", 0, 800)
+	has, err = store.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.True(t, has, "an open invoice surfaces the delinquency signal")
+}
+
+func TestPgxStore_HasUnpaidInvoice_PaymentFailedThenPaid_ClearsSignal(t *testing.T) {
+	// payment_failed leaves the invoice 'open' (delinquent); a later paid
+	// flips it to 'paid' and the signal clears.
+	pool := testutil.NewTestDB(t)
+	billingStore := billing.NewStore(pool)
+	webhookStore := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_recover")
+	seedInvoice(t, pool, accountID, "in_recover", "open", 0, 1200)
+	ctx := context.Background()
+
+	has, err := billingStore.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.True(t, has, "open invoice → delinquent")
+
+	// Subsequent invoice.paid reconciles via the webhook store.
+	found, err := webhookStore.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_recover", Status: "paid", AmountPaidCents: 1200, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+
+	has, err = billingStore.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.False(t, has, "paid clears the delinquency signal")
+}
+
+func TestPgxStore_ApplyInvoiceStatus_VoidClearsDelinquencySignal(t *testing.T) {
+	// An admin voids a finalized invoice (open → void), or Stripe voids one on
+	// subscription cancellation. invoice.voided MUST flip the mirror to 'void'
+	// so HasUnpaidInvoice stops reporting the account delinquent — the debt was
+	// forgiven and there is no other recovery path (the event is ACKed 200).
+	pool := testutil.NewTestDB(t)
+	webhookStore := webhook.NewStore(pool)
+	billingStore := billing.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_inv_void")
+	seedInvoice(t, pool, accountID, "in_void", "open", 0, 1200)
+	ctx := context.Background()
+
+	has, err := billingStore.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.True(t, has, "open invoice → delinquent")
+
+	found, err := webhookStore.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_void", Status: "void", AmountPaidCents: 0, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found, "void must advance an open invoice (open<terminal)")
+	require.Equal(t, "void", readInvoiceStatus(t, pool, "in_void"))
+
+	has, err = billingStore.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.False(t, has, "void clears the delinquency signal")
+}
+
+func TestPgxStore_ApplyInvoiceStatus_UncollectibleKeepsDelinquencySignal(t *testing.T) {
+	// Stripe gives up collecting (open → uncollectible). The mirror must record
+	// the precise terminal state, and the delinquency signal stays TRUE because
+	// the account still owes the money.
+	pool := testutil.NewTestDB(t)
+	webhookStore := webhook.NewStore(pool)
+	billingStore := billing.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_inv_unc")
+	seedInvoice(t, pool, accountID, "in_unc", "open", 0, 1200)
+	ctx := context.Background()
+
+	found, err := webhookStore.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_unc", Status: "uncollectible", AmountPaidCents: 0, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found, "uncollectible must advance an open invoice (open<terminal)")
+	require.Equal(t, "uncollectible", readInvoiceStatus(t, pool, "in_unc"))
+
+	has, err := billingStore.HasUnpaidInvoice(ctx, accountID)
+	require.NoError(t, err)
+	require.True(t, has, "uncollectible keeps the delinquency signal (account still owes)")
+}
+
 // --- helpers --------------------------------------------------------------
+
+func seedInvoice(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, stripeInvoiceID, status string, amountPaid, amountDue int64) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO ms_billing.invoices
+		   (account_id, stripe_invoice_id, status, amount_paid, amount_due, currency)
+		 VALUES ($1, $2, $3, $4, $5, 'usd')`,
+		accountID, stripeInvoiceID, status, amountPaid, amountDue,
+	)
+	require.NoError(t, err)
+}
+
+func readInvoiceStatus(t *testing.T, pool *pgxpool.Pool, stripeInvoiceID string) string {
+	t.Helper()
+	var status string
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT status FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		stripeInvoiceID).Scan(&status))
+	return status
+}
+
+func readInvoiceStatusAndPaid(t *testing.T, pool *pgxpool.Pool, stripeInvoiceID string) (string, int64) {
+	t.Helper()
+	var status string
+	var paid int64
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT status, amount_paid FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		stripeInvoiceID).Scan(&status, &paid))
+	return status, paid
+}
 
 func seedAccount(t *testing.T, pool *pgxpool.Pool, stripeCustomerID string) uuid.UUID {
 	t.Helper()
