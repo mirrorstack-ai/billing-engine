@@ -1,0 +1,71 @@
+-- Migration 017 — platform-infra metric catalog seed (Plane 1).
+--
+-- Milestone D, PR #10a (platform-infra metering foundation). The INVERSE
+-- of the SDK metering plane: where the developer-controlled SDK (RecordUsage)
+-- REJECTS the reserved `infra.*` / `platform.*` namespaces (design §3a build
+-- rule 3), the platform-trusted ingest (RecordInfraUsage) accepts ONLY those
+-- namespaces. They are AUTHORITATIVE, non-zeroable, and never SDK-sourced:
+-- the platform measures them at its own chokepoints (dispatch compute, the
+-- cdn-worker egress edge — both DEFERRED producer PRs) and feeds them in.
+--
+-- WHY A SEED ROW IS REQUIRED (not just a config const):
+-- The period rollup (cycle.RollupPeriod, PR #5) reads a metric's per-unit
+-- price from ms_billing.metric_definitions.unit_price_micros via the
+-- LookupMetricPrice query — there is NO code path that injects a hardcoded
+-- price for a reserved metric. The reserved-name 12/10 (cost × 1.2) customer
+-- markup is ALREADY wired in cycle/service.go and applies automatically once
+-- the metric name matches isReservedMetric(); but the per-unit COST it
+-- multiplies still comes from this catalog row. With no row, a rolled-up
+-- infra event prices to 0 regardless of the 1.2× multiplier. This seed
+-- supplies that cost so a recorded infra.compute.ms / infra.egress.bytes
+-- rolls up to charged = quantity × infra_cost × 12/10.
+--
+-- The SetMetricDefinitions RPC CANNOT create these rows: it rejects the
+-- reserved prefixes (design §3a build rule 3) so a module can never declare a
+-- platform-infra metric. So the rows are seeded HERE, by the platform, in a
+-- born-clean migration that bypasses that module-facing gate.
+--
+-- SENTINEL module_id: ms_billing.metric_definitions.module_id is NOT NULL
+-- (migration 006) and UNIQUE(module_id, metric), so the platform-infra rows
+-- need a stable, reserved module_id that is NOT a real module. The all-zero
+-- UUID is that platform-infra sentinel; RecordInfraUsage stamps the SAME
+-- sentinel as the usage_events.module_id, so both the ingest kind-lookup
+-- (LookupMetricDefinition) and the rollup price-lookup (LookupMetricPrice)
+-- resolve through these rows. (Per-(app,module) infra ATTRIBUTION — keying the
+-- cost back to the specific module call that incurred it — is a producer-PR
+-- refinement, not a foundation concern; the foundation prices infra correctly
+-- under the sentinel.)
+--
+-- COSTS are FINANCE-OWNED + CONSERVATIVE placeholders. They are the platform's
+-- per-unit COGS in micro-dollars (1e-6 USD), BEFORE the 1.2× customer markup:
+--   infra.compute.ms    per-millisecond dispatch/runtime wall-time cost
+--   infra.egress.bytes  per-byte CDN/egress cost
+-- TODO(finance): replace with the measured cloud-provider unit costs once the
+-- producer PRs (dispatch compute meter, cdn-worker egress accounting) land.
+-- Mirror these values in billing-engine RecordInfraUsage's registry comment
+-- and mirrorstack-docs/db/ms_billing/tables.md if they change.
+--
+-- KIND is platform-owned (the platform owns infra-metric semantics, §3a):
+--   infra.compute.ms    → 'sum'  (additive milliseconds across the period)
+--   infra.egress.bytes  → 'sum'  (additive bytes across the period)
+-- These match the platformInfraMetrics registry in internal/account/usage.
+--
+-- Idempotent: ON CONFLICT (module_id, metric) DO NOTHING keeps a re-applied
+-- migration (or a re-run init-db) from erroring. DO NOTHING (not DO UPDATE) is
+-- deliberate: before the producer PRs land, finance may UPDATE these per-unit
+-- COGS rows directly in the DB; a DO UPDATE would silently clobber that finance
+-- value back to the placeholder on the next `make db-init`. The seed is the
+-- INITIAL value only — once a row exists, the DB row (finance-owned) wins. To
+-- change the seed cost in code, edit the literal here AND apply a follow-up
+-- UPDATE migration for already-seeded environments.
+--
+-- Spec: mirrorstack-docs/db/ms_billing/tables.md#metric_definitions
+
+INSERT INTO ms_billing.metric_definitions (
+    module_id, metric, kind, unit, unit_price_micros, active
+) VALUES
+    -- Compute duration: per-millisecond dispatch/runtime wall-time COGS.
+    ('00000000-0000-0000-0000-000000000000', 'infra.compute.ms',   'sum', 'millisecond', 1,  true),
+    -- Egress: per-byte CDN/egress COGS.
+    ('00000000-0000-0000-0000-000000000000', 'infra.egress.bytes', 'sum', 'byte',        1,  true)
+ON CONFLICT (module_id, metric) DO NOTHING;
