@@ -17,6 +17,12 @@ type Capability string
 const (
 	RequirePaymentMethod Capability = "payment_method"
 	RequireSubscription  Capability = "subscription"
+	// RequireNotDelinquent asks Ensure to verify the account has no unpaid
+	// (open/uncollectible) invoice. The delinquency is DERIVED from the
+	// invoices mirror (reconciled by the invoice.* webhooks), not a stored
+	// flag. This wires the SIGNAL only — the enforcement POLICY
+	// (grace/suspend/prepaid, risk-graded collection) is PR #9.
+	RequireNotDelinquent Capability = "not_delinquent"
 )
 
 // EnsureRequest is the payload of the Ensure RPC.
@@ -34,8 +40,9 @@ type EnsureRequest struct {
 // envelope (the outer envelope adds {"ok": true, "response": …}).
 //
 // Missing is empty when every required capability is met. Entries are
-// drawn from {"billing_account", "payment_method", "subscription"}.
-// api-platform surfaces these to web-account as 402 + per-entry CTA.
+// drawn from {"billing_account", "payment_method", "subscription",
+// "delinquent"}. api-platform surfaces these to web-account as 402 +
+// per-entry CTA.
 type EnsureResponse struct {
 	Missing []string `json:"missing"`
 }
@@ -50,6 +57,11 @@ const (
 	MissingBillingAccount = "billing_account"
 	MissingPaymentMethod  = "payment_method"
 	MissingSubscription   = "subscription"
+	// MissingDelinquent appears when the account has an unpaid
+	// (open/uncollectible) invoice. It is the past-due SIGNAL only; what to
+	// DO about it (block, grace, suspend, force prepaid) is the collection
+	// POLICY in PR #9.
+	MissingDelinquent = "delinquent"
 )
 
 // PrepareAddPaymentMethodRequest is the payload of PrepareAddPaymentMethod.

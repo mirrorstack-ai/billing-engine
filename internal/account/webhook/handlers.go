@@ -182,6 +182,54 @@ func (r *Router) handlePaymentMethodDetached(ctx context.Context, event stripego
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 
+// handleInvoiceLifecycle reconciles an invoice.created / .finalized / .paid /
+// .payment_failed / .voided / .marked_uncollectible event onto the
+// ms_billing.invoices mirror. The six events share one handler because each
+// delivers the full Invoice object carrying its current status;
+// ApplyInvoiceStatus's monotonic guard (draft<open<terminal) is what makes the
+// path safe under Stripe's at-least-once + out-of-order delivery — a replayed
+// or late event can never regress a row past a terminal state. payment_failed
+// carries status 'open' (Stripe smart-retries the invoice), which is the unpaid
+// state Ensure derives the delinquency signal from; voided (status 'void')
+// clears that signal and marked_uncollectible (status 'uncollectible') keeps
+// it. This handler just lands the mirror, the policy is PR #9.
+//
+// found=false (no mirror row, OR the guard rejected a stale event) is a
+// drift_warning, not an error: the charge spine's UpsertInvoice may not have
+// mirrored the invoice yet, or the invoice was created out-of-band. We ACK 200
+// either way so Stripe stops retrying.
+func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Event) Result {
+	inv, err := decodeInvoice(event)
+	if err != nil {
+		r.log.WarnContext(ctx, "invoice event decode failed", "event_id", event.ID, "type", event.Type, "error", err)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+	if inv.ID == "" {
+		r.log.WarnContext(ctx, "invoice event missing invoice id", "event_id", event.ID, "type", event.Type)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+
+	found, err := r.store.ApplyInvoiceStatus(ctx, ApplyInvoiceStatusParams{
+		StripeInvoiceID: inv.ID,
+		// Stripe invoice status mirrored verbatim (draft/open/paid/
+		// uncollectible/void); the column is TEXT so a new status never needs
+		// a migration.
+		Status: string(inv.Status),
+		// Stripe amounts are integer cents (minor units).
+		AmountPaidCents: inv.AmountPaid,
+		AmountDueCents:  inv.AmountDue,
+	})
+	if err != nil {
+		r.log.ErrorContext(ctx, "invoice event apply status failed", "event_id", event.ID, "type", event.Type, "error", err)
+		return Result{HTTPStatus: 500, Status: StatusInternal}
+	}
+	if !found {
+		r.log.WarnContext(ctx, "invoice event drift/stale: no mirror row updated", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "status", inv.Status)
+		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
+	}
+	return Result{HTTPStatus: 200, Status: StatusOK}
+}
+
 // --- decode helpers -------------------------------------------------------
 //
 // stripe-go's Event.Data.Raw is the JSON payload of the event's data
@@ -226,4 +274,15 @@ func decodeSetupIntent(event stripego.Event) (*stripego.SetupIntent, error) {
 		return nil, err
 	}
 	return &si, nil
+}
+
+func decodeInvoice(event stripego.Event) (*stripego.Invoice, error) {
+	if event.Data == nil {
+		return nil, errNilEventData
+	}
+	var inv stripego.Invoice
+	if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
+		return nil, err
+	}
+	return &inv, nil
 }

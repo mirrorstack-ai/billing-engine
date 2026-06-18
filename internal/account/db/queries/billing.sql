@@ -54,3 +54,20 @@ SELECT id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_defau
 FROM ms_billing.payment_methods_mirror
 WHERE account_id = $1 AND deleted_at IS NULL
 ORDER BY attached_at DESC;
+
+-- AccountHasUnpaidInvoice is the delinquency predicate for Ensure: true when the
+-- account has at least one invoice in an unpaid, collection-relevant state.
+-- 'open' = finalized but payment not yet collected (a payment_failed leaves the
+-- invoice 'open' for Stripe's smart retries); 'uncollectible' = Stripe gave up.
+-- 'draft' is excluded (the charge spine hasn't finalized it; no collection
+-- attempt has been made). 'paid'/'void' are clean. Delinquency is DERIVED from
+-- invoice state, not a stored flag — the invoice mirror (reconciled by the
+-- invoice.* webhooks) is the single source of truth. The ENFORCEMENT policy
+-- (grace/suspend/prepaid) is PR #9; this only surfaces the signal.
+-- name: AccountHasUnpaidInvoice :one
+SELECT EXISTS (
+    SELECT 1
+    FROM ms_billing.invoices
+    WHERE account_id = $1
+      AND status IN ('open', 'uncollectible')
+) AS has_unpaid;

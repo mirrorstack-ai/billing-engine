@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -227,10 +228,56 @@ func (s *pgxStore) ResolvePendingAddCardRequest(ctx context.Context, stripePayme
 	return tx.Commit(ctx)
 }
 
+// ApplyInvoiceStatus reconciles a Stripe invoice.* event onto the mirror row
+// keyed by stripe_invoice_id. Returns (found, error):
+//   - found=true  → the row existed and the monotonic-status guard let the
+//     update through (status + amounts written).
+//   - found=false → no-op: either no mirror row exists (drift — invoice created
+//     out-of-band, or the charge spine hasn't mirrored it yet) OR the guard
+//     rejected a stale/out-of-order event (a late finalized after paid, etc.).
+//     The webhook handler maps found=false to a drift_warning, never an error,
+//     because Stripe delivers events at-least-once and out of order.
+//
+// Amounts are whole cents (Stripe minor units) encoded as the NUMERIC the
+// invoices money columns expect — never float.
+func (s *pgxStore) ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceStatusParams) (bool, error) {
+	paid, err := centsNumeric(params.AmountPaidCents)
+	if err != nil {
+		return false, err
+	}
+	due, err := centsNumeric(params.AmountDueCents)
+	if err != nil {
+		return false, err
+	}
+	rows, err := s.q.ApplyInvoiceStatus(ctx, db.ApplyInvoiceStatusParams{
+		StripeInvoiceID: params.StripeInvoiceID,
+		Status:          params.Status,
+		AmountPaid:      paid,
+		AmountDue:       due,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // text wraps a non-null Go string in the pgtype.Text the generated
 // queries expect for nullable TEXT columns.
 func text(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: true}
+}
+
+// centsNumeric encodes a whole-cent int64 as the pgtype.Numeric the invoices
+// NUMERIC money columns expect. Cents are whole integers, so the numeric is
+// exact (no scale). Mirrors cycle.centsNumeric — kept local rather than
+// widening the cycle package's API for this single webhook consumer (the same
+// 2-line strconv.FormatInt → pgtype.Numeric pattern).
+func centsNumeric(cents int64) (pgtype.Numeric, error) {
+	var n pgtype.Numeric
+	if err := n.Scan(strconv.FormatInt(cents, 10)); err != nil {
+		return pgtype.Numeric{}, err
+	}
+	return n, nil
 }
 
 // uuidText parses a UUID string into the pgtype.UUID the generated

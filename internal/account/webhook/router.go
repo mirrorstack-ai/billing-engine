@@ -1,7 +1,8 @@
-// Package webhook implements the v1 Stripe webhook router. Five events
-// are handled (customer + payment_method CRUD); idempotency is enforced
-// via ms_billing.webhook_events_processed. All other events ACK with
-// status "unhandled" so Stripe doesn't retry.
+// Package webhook implements the v1 Stripe webhook router. It handles
+// customer + payment_method CRUD plus the invoice lifecycle
+// (created/finalized/paid/payment_failed/voided/marked_uncollectible);
+// idempotency is enforced via ms_billing.webhook_events_processed. All
+// other events ACK with status "unhandled" so Stripe doesn't retry.
 //
 // Spec: mirrorstack-docs/api/billing/account-webhook.md
 package webhook
@@ -95,6 +96,29 @@ type Store interface {
 	// row yet → no-op (the partner webhook event resolves it when
 	// both have arrived).
 	ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error
+
+	// ApplyInvoiceStatus reconciles a Stripe invoice.* event onto the
+	// ms_billing.invoices mirror row keyed by stripe_invoice_id. It
+	// updates status + amount_paid + amount_due only; period + currency
+	// are owned by the charge spine's UpsertInvoice. Returns (found, error)
+	// where found=false means the row was not updated — either no mirror
+	// row exists yet (drift: the invoice was created out-of-band or the
+	// charge spine hasn't mirrored it) OR the monotonic-status guard
+	// rejected a stale / out-of-order event (e.g. a late finalized after
+	// paid). A not-found is a logged no-op, never an error: webhook delivery
+	// is at-least-once + unordered, so the guard MUST tolerate replays and
+	// reordering without regressing a terminal status.
+	ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceStatusParams) (found bool, err error)
+}
+
+// ApplyInvoiceStatusParams carries the columns ApplyInvoiceStatus reconciles
+// onto the invoices mirror row. Money is whole cents (Stripe minor units;
+// Stripe invoice amounts are integer cents) — never float.
+type ApplyInvoiceStatusParams struct {
+	StripeInvoiceID string
+	Status          string // Stripe invoice status verbatim: draft/open/paid/uncollectible/void
+	AmountPaidCents int64
+	AmountDueCents  int64
 }
 
 // InsertPaymentMethodParams is the row data extracted from a
@@ -180,6 +204,27 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		return r.handlePaymentMethodDetached(ctx, event)
 	case stripego.EventTypeSetupIntentSucceeded:
 		return r.handleSetupIntentSucceeded(ctx, event)
+	case stripego.EventTypeInvoiceCreated,
+		stripego.EventTypeInvoiceFinalized,
+		stripego.EventTypeInvoicePaid,
+		stripego.EventTypeInvoicePaymentFailed,
+		stripego.EventTypeInvoiceVoided,
+		stripego.EventTypeInvoiceMarkedUncollectible:
+		// All six ride the same reconciler: each carries the full Invoice
+		// object with its current status, and ApplyInvoiceStatus's monotonic
+		// guard decides whether the event advances the mirror. payment_failed
+		// leaves the invoice 'open' (Stripe keeps retrying), which is exactly
+		// the unpaid state Ensure derives delinquency from — no separate flag.
+		// voided (status 'void') and marked_uncollectible (status
+		// 'uncollectible') are the terminal collection outcomes the
+		// delinquency predicate (AccountHasUnpaidInvoice's IN clause) keys on:
+		// void CLEARS the signal (debt forgiven), uncollectible KEEPS it
+		// (Stripe gave up but the account still owes) — both must reach the
+		// mirror or the row sticks at 'open' and the signal never recovers /
+		// never reflects the precise terminal state. The monotonic rank ladder
+		// already ranks void/uncollectible as terminal (rank 2), so no handler
+		// change is needed — they only need to be dispatched here.
+		return r.handleInvoiceLifecycle(ctx, event)
 	default:
 		r.log.InfoContext(ctx, "webhook unhandled event", "event_id", event.ID, "type", event.Type)
 		return Result{HTTPStatus: 200, Status: StatusUnhandled}
