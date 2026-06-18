@@ -113,6 +113,62 @@ func (c *realClient) SetDefaultPaymentMethod(ctx context.Context, stripeCustomer
 	return err
 }
 
+// CreateInvoiceItem creates a pending invoice item on the Customer for one
+// metered metric line. amountCents is whole cents (the caller converts
+// micro-dollars → cents round-half-up before this call; Stripe amounts are
+// integer minor units). The deterministic Idempotency-Key (ii-<run>-<metric>)
+// makes a re-run safe — Stripe returns the original item instead of creating a
+// second one. We project to a plain InvoiceItem (id only) so consumers stay
+// off stripe-go.
+func (c *realClient) CreateInvoiceItem(ctx context.Context, custID string, amountCents int64, currency, desc, idemKey string) (InvoiceItem, error) {
+	params := &stripego.InvoiceItemParams{
+		Customer: stripego.String(custID),
+		Amount:   stripego.Int64(amountCents),
+		Currency: stripego.String(currency),
+	}
+	if desc != "" {
+		params.Description = stripego.String(desc)
+	}
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	item, err := c.sc.InvoiceItems.New(params)
+	if err != nil {
+		return InvoiceItem{}, err
+	}
+	return InvoiceItem{ID: item.ID}, nil
+}
+
+// CreateInvoice creates a draft invoice with
+// collection_method=charge_automatically that sweeps up the Customer's pending
+// invoice items. With autoAdvance=true Stripe finalizes the draft and runs the
+// off-session PaymentIntent against the default PM automatically — the metered
+// auto-charge. PendingInvoiceItemsBehavior=include pulls the pending items
+// created just above into this invoice (the default behavior changed across
+// Stripe API versions; pinning it keeps the line items deterministic). The
+// deterministic Idempotency-Key (inv-<run>) makes a re-run reuse the original
+// invoice. Projected to a plain Invoice (id/status/amounts) for the mirror.
+func (c *realClient) CreateInvoice(ctx context.Context, custID string, autoAdvance bool, idemKey string) (Invoice, error) {
+	params := &stripego.InvoiceParams{
+		Customer:                    stripego.String(custID),
+		CollectionMethod:            stripego.String(string(stripego.InvoiceCollectionMethodChargeAutomatically)),
+		AutoAdvance:                 stripego.Bool(autoAdvance),
+		PendingInvoiceItemsBehavior: stripego.String("include"),
+	}
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	inv, err := c.sc.Invoices.New(params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return Invoice{
+		ID:         inv.ID,
+		Status:     string(inv.Status),
+		AmountDue:  inv.AmountDue,
+		AmountPaid: inv.AmountPaid,
+		Currency:   string(inv.Currency),
+	}, nil
+}
+
 // NewVerifier returns a Verifier for the configured webhook signing
 // secret. webhookSecret is distinct from the main Stripe secret key
 // and is rotated independently (Stripe Dashboard → Developers →

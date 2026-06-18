@@ -10,6 +10,7 @@ import (
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // --- in-memory Store fake -------------------------------------------------
@@ -229,6 +230,18 @@ func (f *fakeStripe) SetDefaultPaymentMethod(_ context.Context, stripeCustomerID
 	}
 	f.defaultsSet = append(f.defaultsSet, stripeCustomerID+"="+stripePaymentMethodID)
 	return nil
+}
+
+// CreateInvoiceItem / CreateInvoice are the PR #6 charge methods. The billing
+// package never calls them (the charge cycle lives in internal/account/cycle),
+// so these are panic stubs present only to keep this fake satisfying the
+// widened billingstripe.Client interface.
+func (f *fakeStripe) CreateInvoiceItem(context.Context, string, int64, string, string, string) (billingstripe.InvoiceItem, error) {
+	panic("CreateInvoiceItem must not be called by the billing package")
+}
+
+func (f *fakeStripe) CreateInvoice(context.Context, string, bool, string) (billingstripe.Invoice, error) {
+	panic("CreateInvoice must not be called by the billing package")
 }
 
 // --- tests ----------------------------------------------------------------

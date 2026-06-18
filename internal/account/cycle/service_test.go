@@ -33,24 +33,63 @@ type fakeStore struct {
 	aggregates  map[aggKey]cycle.MetricAggregate
 	settlements map[string]cycle.ModuleSettlement // period/module → settlement
 
+	// charge-cycle inputs
+	chargedTotal     int64       // PeriodChargedTotal return
+	hasPM            bool        // HasUsableDefaultPM return
+	stripeCustomer   string      // AccountStripeCustomer return
+	unbilledAccounts []uuid.UUID // AccountsWithUnbilledUsage return
+	usageEventAccts  []uuid.UUID // AccountsWithUsageEvents return
+
+	// captured charge writes
+	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
+	runStatus    map[uuid.UUID]cycle.BillingRunStatus // run id → current status (models the DB row's terminal state)
+	markedRuns   map[uuid.UUID]markedRun              // run id → terminal mark
+	invoices     map[string]cycle.InvoiceMirror       // stripe_invoice_id → mirror
+
 	// injected errors
-	errOpen   error
-	errRaw    error
-	errPrice  error
-	errUpsert error
-	errIncome error
-	errVis    error
-	errSettle error
+	errOpen        error
+	errRaw         error
+	errPrice       error
+	errUpsert      error
+	errIncome      error
+	errVis         error
+	errSettle      error
+	errInsertRun   error
+	errTotal       error
+	errPM          error
+	errCustomer    error
+	errInvoice     error
+	errMarkRun     error
+	errUnbilled    error
+	errUsageEvents error
+}
+
+// markedRun records a MarkBillingRun call so a test can assert the terminal
+// status + invoice id + charged cents the cycle wrote.
+type markedRun struct {
+	status     cycle.BillingRunStatus
+	invoiceID  string
+	totalCents int64
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		prices:      map[string]int64{},
-		visibility:  map[uuid.UUID]cycle.Visibility{},
-		periodID:    uuid.New(),
-		aggregates:  map[aggKey]cycle.MetricAggregate{},
-		settlements: map[string]cycle.ModuleSettlement{},
+		prices:       map[string]int64{},
+		visibility:   map[uuid.UUID]cycle.Visibility{},
+		periodID:     uuid.New(),
+		aggregates:   map[aggKey]cycle.MetricAggregate{},
+		settlements:  map[string]cycle.ModuleSettlement{},
+		insertedRuns: map[string]uuid.UUID{},
+		runStatus:    map[uuid.UUID]cycle.BillingRunStatus{},
+		markedRuns:   map[uuid.UUID]markedRun{},
+		invoices:     map[string]cycle.InvoiceMirror{},
 	}
+}
+
+// runKey is the idempotency key the fake's InsertBillingRun dedupes on, mirroring
+// the DB UNIQUE(account_id, period_start, period_end).
+func runKey(accountID uuid.UUID, start, end time.Time) string {
+	return accountID.String() + "/" + start.Format(time.RFC3339Nano) + "/" + end.Format(time.RFC3339Nano)
 }
 
 func priceKey(moduleID uuid.UUID, metric string) string { return moduleID.String() + "/" + metric }
@@ -108,6 +147,80 @@ func (f *fakeStore) UpsertDeveloperSettlement(_ context.Context, periodID, _ uui
 	return nil
 }
 
+func (f *fakeStore) InsertBillingRun(_ context.Context, accountID uuid.UUID, start, end time.Time) (uuid.UUID, bool, error) {
+	if f.errInsertRun != nil {
+		return uuid.Nil, false, f.errInsertRun
+	}
+	k := runKey(accountID, start, end)
+	if id, exists := f.insertedRuns[k]; exists {
+		// Conflict on an existing row. Mirrors the DB ON CONFLICT DO UPDATE …
+		// WHERE status <> 'invoiced': an 'invoiced' row blocks (shouldCharge=
+		// false); any non-terminal row (skipped_no_pm / failed / pending) is
+		// RECLAIMED — same id, reset to pending, shouldCharge=true.
+		if f.runStatus[id] == cycle.RunStatusInvoiced {
+			return id, false, nil
+		}
+		f.runStatus[id] = "pending"
+		return id, true, nil
+	}
+	id := uuid.New()
+	f.insertedRuns[k] = id
+	f.runStatus[id] = "pending"
+	return id, true, nil
+}
+
+func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time.Time) (int64, error) {
+	if f.errTotal != nil {
+		return 0, f.errTotal
+	}
+	return f.chargedTotal, nil
+}
+
+func (f *fakeStore) HasUsableDefaultPM(_ context.Context, _ uuid.UUID) (bool, error) {
+	if f.errPM != nil {
+		return false, f.errPM
+	}
+	return f.hasPM, nil
+}
+
+func (f *fakeStore) AccountStripeCustomer(_ context.Context, _ uuid.UUID) (string, error) {
+	if f.errCustomer != nil {
+		return "", f.errCustomer
+	}
+	return f.stripeCustomer, nil
+}
+
+func (f *fakeStore) UpsertInvoice(_ context.Context, inv cycle.InvoiceMirror) error {
+	if f.errInvoice != nil {
+		return f.errInvoice
+	}
+	f.invoices[inv.StripeInvoiceID] = inv
+	return nil
+}
+
+func (f *fakeStore) MarkBillingRun(_ context.Context, runID uuid.UUID, status cycle.BillingRunStatus, invoiceID string, totalCents int64) error {
+	if f.errMarkRun != nil {
+		return f.errMarkRun
+	}
+	f.markedRuns[runID] = markedRun{status: status, invoiceID: invoiceID, totalCents: totalCents}
+	f.runStatus[runID] = status // persist terminal state so a re-run's reclaim gate sees it
+	return nil
+}
+
+func (f *fakeStore) AccountsWithUsageEvents(_ context.Context, _, _ time.Time) ([]uuid.UUID, error) {
+	if f.errUsageEvents != nil {
+		return nil, f.errUsageEvents
+	}
+	return f.usageEventAccts, nil
+}
+
+func (f *fakeStore) AccountsWithUnbilledUsage(_ context.Context, _, _ time.Time) ([]uuid.UUID, error) {
+	if f.errUnbilled != nil {
+		return nil, f.errUnbilled
+	}
+	return f.unbilledAccounts, nil
+}
+
 // --- helpers --------------------------------------------------------------
 
 func requireCode(t *testing.T, err error, want billing.Code) {
@@ -135,7 +248,7 @@ func TestRollupPeriod_CustomMetricNoMarkup(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindSum, "10")}
 	store.prices[priceKey(mod, "orders.placed")] = 50_000 // $0.05/unit
 
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	require.Len(t, resp.Aggregates, 1)
 
@@ -155,7 +268,7 @@ func TestRollupPeriod_ReservedMetricInfraMarkup(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "infra.compute.ms", usage.KindSum, "100")}
 	store.prices[priceKey(mod, "infra.compute.ms")] = 1_000
 
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 
 	a := resp.Aggregates[0]
@@ -171,7 +284,7 @@ func TestRollupPeriod_PlatformReservedPrefix(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "platform.tokens", usage.KindSum, "5")}
 	store.prices[priceKey(mod, "platform.tokens")] = 2_000
 
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	require.Equal(t, 12, resp.Aggregates[0].MarkupNum)
 	require.EqualValues(t, 12_000, resp.Aggregates[0].ChargedMicros) // 5×2_000×1.2
@@ -184,7 +297,7 @@ func TestRollupPeriod_NullPriceZeroCharge(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindCount, "42")}
 	// no price registered → unpriced
 
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	a := resp.Aggregates[0]
 	require.EqualValues(t, 0, a.UnitPriceMicros)
@@ -200,7 +313,7 @@ func TestRollupPeriod_FractionalQuantityRoundHalfUp(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "myapp.objects.byte_hours", usage.KindTimeWeighted, "2.5")}
 	store.prices[priceKey(mod, "myapp.objects.byte_hours")] = 3
 
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	require.EqualValues(t, 8, resp.Aggregates[0].RawCostMicros)
 	require.EqualValues(t, 8, resp.Aggregates[0].ChargedMicros)
@@ -213,7 +326,7 @@ func TestRollupPeriod_HalfUpExactBoundary(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "m", usage.KindTimeWeighted, "0.5")}
 	store.prices[priceKey(mod, "m")] = 1
 
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, resp.Aggregates[0].RawCostMicros)
 }
@@ -229,7 +342,7 @@ func TestRollupPeriod_InfraMarkupSingleRound(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "infra.compute.ms", usage.KindTimeWeighted, "0.1")}
 	store.prices[priceKey(mod, "infra.compute.ms")] = 13
 
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	a := resp.Aggregates[0]
 	require.EqualValues(t, 1, a.RawCostMicros) // round_half_up(0.1×13)=round(1.3)=1
@@ -245,7 +358,7 @@ func TestRollupPeriod_OverflowRejected(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindSum, "1000000000000")}
 	store.prices[priceKey(mod, "orders.placed")] = 50_000_000
 
-	_, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	_, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	requireCode(t, err, billing.CodeInternal)
 }
 
@@ -259,7 +372,7 @@ func TestRollupPeriod_KindsCarriedThrough(t *testing.T) {
 		rawAgg(app, m2, "b", usage.KindPeak, "9"),
 		rawAgg(app, m3, "c", usage.KindTimeWeighted, "4"),
 	}
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	kinds := map[string]cycle.Kind{}
 	for _, a := range resp.Aggregates {
@@ -272,7 +385,7 @@ func TestRollupPeriod_KindsCarriedThrough(t *testing.T) {
 
 func TestRollupPeriod_NoEventsEmpty(t *testing.T) {
 	store := newFakeStore() // no raws (no-sample period → 0 aggregates)
-	resp, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 	require.NoError(t, err)
 	require.Empty(t, resp.Aggregates)
 	require.EqualValues(t, 0, resp.TotalChargedMicros)
@@ -290,7 +403,7 @@ func TestRollupPeriod_IdempotentReRun(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindSum, "10")}
 	store.prices[priceKey(mod, "orders.placed")] = 50_000
 	acct := uuid.New()
-	svc := cycle.NewService(store)
+	svc := cycle.NewService(store, nil)
 
 	first, err := svc.RollupPeriod(context.Background(), acct, periodStart, periodEnd)
 	require.NoError(t, err)
@@ -305,7 +418,7 @@ func TestRollupPeriod_IdempotentReRun(t *testing.T) {
 // --- RollupPeriod: validation + error propagation -------------------------
 
 func TestRollupPeriod_RejectsNilAccount(t *testing.T) {
-	_, err := cycle.NewService(newFakeStore()).RollupPeriod(context.Background(), uuid.Nil, periodStart, periodEnd)
+	_, err := cycle.NewService(newFakeStore(), nil).RollupPeriod(context.Background(), uuid.Nil, periodStart, periodEnd)
 	requireCode(t, err, billing.CodeInvalidInput)
 }
 
@@ -320,7 +433,7 @@ func TestRollupPeriod_RejectsBadWindow(t *testing.T) {
 		{"equal", periodStart, periodStart},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := cycle.NewService(newFakeStore()).RollupPeriod(context.Background(), uuid.New(), tc.start, tc.end)
+			_, err := cycle.NewService(newFakeStore(), nil).RollupPeriod(context.Background(), uuid.New(), tc.start, tc.end)
 			requireCode(t, err, billing.CodeInvalidInput)
 		})
 	}
@@ -346,7 +459,7 @@ func TestRollupPeriod_PropagatesStoreErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newFakeStore()
 			tc.setup(store)
-			_, err := cycle.NewService(store).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+			_, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
 			requireCode(t, err, billing.CodeInternal)
 		})
 	}
@@ -360,7 +473,7 @@ func TestSettleDevelopers_PrivateThirtyPercent(t *testing.T) {
 	store.incomes = []cycle.ModuleIncome{{ModuleID: mod, IncomeMicros: 1_000_000}}
 	store.visibility[mod] = usage.VisibilityPrivate
 
-	resp, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+	resp, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 	require.NoError(t, err)
 	require.Len(t, resp.Settlements, 1)
 	s := resp.Settlements[0]
@@ -376,7 +489,7 @@ func TestSettleDevelopers_PublishedFifteenPercent(t *testing.T) {
 	store.incomes = []cycle.ModuleIncome{{ModuleID: mod, IncomeMicros: 1_000_000}}
 	store.visibility[mod] = usage.VisibilityPublished
 
-	resp, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+	resp, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 	require.NoError(t, err)
 	s := resp.Settlements[0]
 	require.Equal(t, usage.VisibilityPublished, s.MarginShareClass)
@@ -392,7 +505,7 @@ func TestSettleDevelopers_UnknownVisibilityDefaultsPrivate(t *testing.T) {
 	store.incomes = []cycle.ModuleIncome{{ModuleID: mod, IncomeMicros: 1_000_000}}
 	// no visibility registered
 
-	resp, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+	resp, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 	require.NoError(t, err)
 	s := resp.Settlements[0]
 	require.Equal(t, usage.VisibilityPrivate, s.MarginShareClass)
@@ -405,7 +518,7 @@ func TestSettleDevelopers_ZeroIncomeZeroOwed(t *testing.T) {
 	store.incomes = []cycle.ModuleIncome{{ModuleID: mod, IncomeMicros: 0}}
 	store.visibility[mod] = usage.VisibilityPublished
 
-	resp, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+	resp, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 	require.NoError(t, err)
 	s := resp.Settlements[0]
 	require.EqualValues(t, 0, s.PlatformTakeMicros)
@@ -419,7 +532,7 @@ func TestSettleDevelopers_RoundHalfUpTake(t *testing.T) {
 	store.incomes = []cycle.ModuleIncome{{ModuleID: mod, IncomeMicros: 5}}
 	store.visibility[mod] = usage.VisibilityPrivate
 
-	resp, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+	resp, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 	require.NoError(t, err)
 	s := resp.Settlements[0]
 	require.EqualValues(t, 2, s.PlatformTakeMicros)
@@ -434,7 +547,7 @@ func TestSettleDevelopers_TakePlusOwedEqualsIncome(t *testing.T) {
 		store.incomes = append(store.incomes, cycle.ModuleIncome{ModuleID: mod, IncomeMicros: income})
 		store.visibility[mod] = usage.VisibilityPrivate
 	}
-	resp, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+	resp, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 	require.NoError(t, err)
 	for _, s := range resp.Settlements {
 		require.Equal(t, s.IncomeMicros, s.PlatformTakeMicros+s.DeveloperOwedMicros,
@@ -452,7 +565,7 @@ func TestSettleDevelopers_MultipleModules(t *testing.T) {
 	store.visibility[mPub] = usage.VisibilityPublished
 	store.visibility[mPriv] = usage.VisibilityPrivate
 
-	resp, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+	resp, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 	require.NoError(t, err)
 	require.Len(t, store.settlements, 2)
 	byMod := map[uuid.UUID]cycle.ModuleSettlement{}
@@ -469,7 +582,7 @@ func TestSettleDevelopers_IdempotentReRun(t *testing.T) {
 	store.incomes = []cycle.ModuleIncome{{ModuleID: mod, IncomeMicros: 1_000_000}}
 	store.visibility[mod] = usage.VisibilityPrivate
 	acct := uuid.New()
-	svc := cycle.NewService(store)
+	svc := cycle.NewService(store, nil)
 
 	_, err := svc.SettleDevelopers(context.Background(), acct, store.periodID)
 	require.NoError(t, err)
@@ -479,9 +592,9 @@ func TestSettleDevelopers_IdempotentReRun(t *testing.T) {
 }
 
 func TestSettleDevelopers_Validation(t *testing.T) {
-	_, err := cycle.NewService(newFakeStore()).SettleDevelopers(context.Background(), uuid.Nil, uuid.New())
+	_, err := cycle.NewService(newFakeStore(), nil).SettleDevelopers(context.Background(), uuid.Nil, uuid.New())
 	requireCode(t, err, billing.CodeInvalidInput)
-	_, err = cycle.NewService(newFakeStore()).SettleDevelopers(context.Background(), uuid.New(), uuid.Nil)
+	_, err = cycle.NewService(newFakeStore(), nil).SettleDevelopers(context.Background(), uuid.New(), uuid.Nil)
 	requireCode(t, err, billing.CodeInvalidInput)
 }
 
@@ -504,7 +617,7 @@ func TestSettleDevelopers_PropagatesStoreErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newFakeStore()
 			tc.setup(store)
-			_, err := cycle.NewService(store).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
+			_, err := cycle.NewService(store, nil).SettleDevelopers(context.Background(), uuid.New(), store.periodID)
 			requireCode(t, err, billing.CodeInternal)
 		})
 	}
@@ -521,7 +634,7 @@ func TestRollupThenSettle_IncomeFromAggregates(t *testing.T) {
 	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindSum, "20")}
 	store.prices[priceKey(mod, "orders.placed")] = 50_000
 	acct := uuid.New()
-	svc := cycle.NewService(store)
+	svc := cycle.NewService(store, nil)
 
 	roll, err := svc.RollupPeriod(context.Background(), acct, periodStart, periodEnd)
 	require.NoError(t, err)
