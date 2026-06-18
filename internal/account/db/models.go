@@ -99,6 +99,49 @@ func (ns NullMsBillingBillingPeriodStatus) Value() (driver.Value, error) {
 	return string(ns.MsBillingBillingPeriodStatus), nil
 }
 
+type MsBillingBudgetScope string
+
+const (
+	MsBillingBudgetScopeApp     MsBillingBudgetScope = "app"
+	MsBillingBudgetScopeOrg     MsBillingBudgetScope = "org"
+	MsBillingBudgetScopeAccount MsBillingBudgetScope = "account"
+)
+
+func (e *MsBillingBudgetScope) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = MsBillingBudgetScope(s)
+	case string:
+		*e = MsBillingBudgetScope(s)
+	default:
+		return fmt.Errorf("unsupported scan type for MsBillingBudgetScope: %T", src)
+	}
+	return nil
+}
+
+type NullMsBillingBudgetScope struct {
+	MsBillingBudgetScope MsBillingBudgetScope `json:"ms_billing_budget_scope"`
+	Valid                bool                 `json:"valid"` // Valid is true if MsBillingBudgetScope is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullMsBillingBudgetScope) Scan(value interface{}) error {
+	if value == nil {
+		ns.MsBillingBudgetScope, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.MsBillingBudgetScope.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullMsBillingBudgetScope) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.MsBillingBudgetScope), nil
+}
+
 type MsBillingMarginShareClass string
 
 const (
@@ -213,6 +256,28 @@ type MsBillingBillingPeriod struct {
 	PeriodEnd   time.Time                    `json:"period_end"`
 	Status      MsBillingBillingPeriodStatus `json:"status"`
 	CreatedAt   time.Time                    `json:"created_at"`
+}
+
+type MsBillingBudget struct {
+	ID            string               `json:"id"`
+	Scope         MsBillingBudgetScope `json:"scope"`
+	ScopeID       string               `json:"scope_id"`
+	AccountID     pgtype.UUID          `json:"account_id"`
+	LimitMicros   int64                `json:"limit_micros"`
+	AlertPercents []int32              `json:"alert_percents"`
+	Active        bool                 `json:"active"`
+	CreatedAt     time.Time            `json:"created_at"`
+	UpdatedAt     time.Time            `json:"updated_at"`
+}
+
+type MsBillingBudgetAlert struct {
+	ID          string    `json:"id"`
+	BudgetID    string    `json:"budget_id"`
+	PeriodStart time.Time `json:"period_start"`
+	Percent     int32     `json:"percent"`
+	SpendMicros int64     `json:"spend_micros"`
+	LimitMicros int64     `json:"limit_micros"`
+	FiredAt     time.Time `json:"fired_at"`
 }
 
 type MsBillingMetricDefinition struct {
