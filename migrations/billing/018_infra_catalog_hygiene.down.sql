@@ -12,6 +12,9 @@ WHERE  module_id = '00000000-0000-0000-0000-000000000000'
   AND  metric    = 'infra.compute.ms';
 
 -- (b) Rename infra.compute.walltime.ms back to infra.compute.ms (017's name).
+-- The unit = 'millisecond' write is a defensive no-op (017 and 018 both use
+-- 'millisecond'); only `metric` actually changes. Kept symmetric with 018.up
+-- step (1) so the pair reads as an exact rename/un-rename.
 UPDATE ms_billing.metric_definitions
 SET    metric = 'infra.compute.ms',
        unit   = 'millisecond'
