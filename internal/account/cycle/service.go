@@ -2,6 +2,7 @@ package cycle
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -71,6 +72,12 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		// resolved straight from the catalog (migration 018).
 		priceMicros, priced, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric, raw.Model)
 		if err != nil {
+			// A RETIRED per-model price (active=false) must fail the cycle loud,
+			// not silently fall back to the cheaper catalog floor and under-bill
+			// the retired model. Surface it as a distinct, ops-actionable error.
+			if errors.Is(err, ErrInactiveModelPrice) {
+				return nil, billing.Internal("infra metric "+raw.Metric+" has a RETIRED per-model price for model "+raw.Model+" (active=false) — re-activate or re-price it in metric_model_prices; refusing to silently bill the catalog fallback", err)
+			}
 			return nil, billing.Internal("metric price lookup failed", err)
 		}
 
@@ -89,7 +96,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			// but would bill 0 (a silent revenue leak that still marks the cycle
 			// invoiced). Fail loud instead so ops catches it, never zero-charge it.
 			if !priced {
-				return nil, billing.Internal("infra metric "+raw.Metric+" has no seeded price — migration 017 missing or rolled back", nil)
+				return nil, billing.Internal("infra metric "+raw.Metric+" has no seeded price — migration 017 or 018 missing or rolled back", nil)
 			}
 		}
 

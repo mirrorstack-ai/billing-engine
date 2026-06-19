@@ -16,8 +16,10 @@ import (
 
 // stubUsageStore is a minimal usage.Store for the route wiring test: it accepts
 // every InsertUsageEvent and reports no account. It exercises the RPC plumbing
-// (auth gate → dispatch → service) without a database.
-type stubUsageStore struct{}
+// (auth gate → dispatch → service) without a database. It captures the last
+// inserted event so a route test can assert a field (e.g. model) survived JSON
+// decoding through the HTTP layer.
+type stubUsageStore struct{ last *usage.UsageEvent }
 
 func (stubUsageStore) LookupMetricDefinition(context.Context, uuid.UUID, string) (usage.MetricDefinition, bool, error) {
 	return usage.MetricDefinition{}, false, nil
@@ -25,7 +27,8 @@ func (stubUsageStore) LookupMetricDefinition(context.Context, uuid.UUID, string)
 func (stubUsageStore) UpsertMetricDefinitions(context.Context, []usage.MetricDeclaration) error {
 	return nil
 }
-func (stubUsageStore) InsertUsageEvent(context.Context, usage.UsageEvent) (bool, error) {
+func (s *stubUsageStore) InsertUsageEvent(_ context.Context, e usage.UsageEvent) (bool, error) {
+	s.last = &e
 	return true, nil
 }
 func (stubUsageStore) AccountByOwner(context.Context, usage.Owner) (uuid.UUID, bool, error) {
@@ -40,9 +43,14 @@ func (stubUsageStore) UpsertModuleVisibility(context.Context, uuid.UUID, usage.V
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()
+	return newRouterWithStore(t, &stubUsageStore{})
+}
+
+func newRouterWithStore(t *testing.T, store *stubUsageStore) http.Handler {
+	t.Helper()
 	t.Setenv("INTERNAL_SECRET", "internal-secret")
 	t.Setenv("METER_SECRET", "meter-secret")
-	d := &dispatcher{usageSvc: usage.NewService(stubUsageStore{})}
+	d := &dispatcher{usageSvc: usage.NewService(store)}
 	return buildRouter(d)
 }
 
@@ -75,6 +83,24 @@ func TestRecordInfraUsage_NotReachableOnMeterSecret(t *testing.T) {
 	r.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestRecordInfraUsage_ModelRoundTripsThroughRoute(t *testing.T) {
+	// The optional "model" JSON field decodes through the HTTP layer and reaches
+	// the inserted usage_events row — closing the gap between the service-layer
+	// model tests and the wire format.
+	store := &stubUsageStore{}
+	r := newRouterWithStore(t, store)
+	body := `{"event_id":"infra-route-model","app_id":"11111111-1111-1111-1111-111111111111","metric":"infra.ai.input.tokens","model":"anthropic.claude-sonnet-4-6","value":2}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/billing.RecordInfraUsage", strings.NewReader(body))
+	req.Header.Set("X-MS-Internal-Secret", "internal-secret")
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, store.last)
+	require.Equal(t, "anthropic.claude-sonnet-4-6", store.last.Model)
 }
 
 func TestRecordInfraUsage_RejectsNonReservedThroughRoute(t *testing.T) {

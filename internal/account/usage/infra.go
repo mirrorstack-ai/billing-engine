@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -202,6 +203,16 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	kind, registered := platformInfraKind(req.Metric)
 	if !registered {
 		return nil, billing.InvalidInput("unknown platform-infra metric: " + req.Metric)
+	}
+
+	// Model is a pricing dimension EXCLUSIVE to the infra.ai.* family (migration
+	// 018). Reject it on any other infra metric: a stray model on, say,
+	// infra.compute.ms would persist as a non-NULL usage_events.model and then
+	// trigger a spurious per-model lookup at rollup that always misses and falls
+	// back to the catalog — a silent footgun. The comment that model is "never
+	// read for non-AI metrics" is now ENFORCED, not just documented.
+	if req.Model != "" && !strings.HasPrefix(req.Metric, "infra.ai.") {
+		return nil, billing.InvalidInput("model is only valid for infra.ai.* metrics")
 	}
 
 	// Resolve the owner's billing account. Nil owner (or no account yet)

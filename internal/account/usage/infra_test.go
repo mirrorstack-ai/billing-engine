@@ -152,6 +152,13 @@ func TestRecordInfraUsage_Validation(t *testing.T) {
 		{"nan value", func(r *usage.RecordInfraUsageRequest) { r.Value = nan() }},
 		{"inf value", func(r *usage.RecordInfraUsageRequest) { r.Value = inf() }},
 		{"both owners set", func(r *usage.RecordInfraUsageRequest) { r.OwnerUserID = uuid.New(); r.OwnerOrgID = uuid.New() }},
+		// Model is a pricing dimension EXCLUSIVE to infra.ai.* — a model on a
+		// non-AI infra metric is a caller bug (it would persist a stray
+		// usage_events.model and trigger spurious per-model lookups at rollup).
+		{"model on non-AI metric", func(r *usage.RecordInfraUsageRequest) {
+			r.Metric = "infra.compute.ms"
+			r.Model = "anthropic.claude-sonnet-4-6"
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

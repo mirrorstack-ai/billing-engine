@@ -26,6 +26,11 @@ type fakeStore struct {
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
 	modelPrices map[string]int64 // metric/model → per-model price (migration 018); checked before prices when a model is carried
+	// inactiveModelPrices models metric_model_prices rows that EXIST but were
+	// retired (active=false). A model in this set returns ErrInactiveModelPrice
+	// (the rollup fails loud) rather than silently falling back to the catalog,
+	// mirroring the pgxStore's active-flag handling.
+	inactiveModelPrices map[string]bool // metric/model → retired
 	// settlement inputs
 	incomes    []cycle.ModuleIncome
 	visibility map[uuid.UUID]cycle.Visibility
@@ -86,16 +91,17 @@ type markedRun struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		prices:       map[string]int64{},
-		modelPrices:  map[string]int64{},
-		visibility:   map[uuid.UUID]cycle.Visibility{},
-		periodID:     uuid.New(),
-		aggregates:   map[aggKey]cycle.MetricAggregate{},
-		settlements:  map[string]cycle.ModuleSettlement{},
-		insertedRuns: map[string]uuid.UUID{},
-		runStatus:    map[uuid.UUID]cycle.BillingRunStatus{},
-		markedRuns:   map[uuid.UUID]markedRun{},
-		invoices:     map[string]cycle.InvoiceMirror{},
+		prices:              map[string]int64{},
+		modelPrices:         map[string]int64{},
+		inactiveModelPrices: map[string]bool{},
+		visibility:          map[uuid.UUID]cycle.Visibility{},
+		periodID:            uuid.New(),
+		aggregates:          map[aggKey]cycle.MetricAggregate{},
+		settlements:         map[string]cycle.ModuleSettlement{},
+		insertedRuns:        map[string]uuid.UUID{},
+		runStatus:           map[uuid.UUID]cycle.BillingRunStatus{},
+		markedRuns:          map[uuid.UUID]markedRun{},
+		invoices:            map[string]cycle.InvoiceMirror{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -138,8 +144,12 @@ func (f *fakeStore) MetricPriceMicros(_ context.Context, moduleID uuid.UUID, met
 		return 0, false, f.errPrice
 	}
 	// Per-model price wins when the event carries a model (migration 018); a miss
-	// falls back to the (module, metric) catalog price, mirroring the pgxStore.
+	// falls back to the (module, metric) catalog price, mirroring the pgxStore. A
+	// RETIRED per-model row (active=false) fails loud rather than falling back.
 	if model != "" {
+		if f.inactiveModelPrices[modelPriceKey(metric, model)] {
+			return 0, false, cycle.ErrInactiveModelPrice
+		}
 		if p, ok := f.modelPrices[modelPriceKey(metric, model)]; ok {
 			return p, true, nil
 		}
@@ -841,6 +851,25 @@ func TestRollupPeriod_AITokensFallbackToDefinitionWhenNoModelPrice(t *testing.T)
 	a := resp.Aggregates[0]
 	require.EqualValues(t, 1000, a.UnitPriceMicros, "missing per-model price falls back to the catalog row")
 	require.EqualValues(t, 3600, a.ChargedMicros)
+}
+
+func TestRollupPeriod_RetiredModelPriceFailsLoud(t *testing.T) {
+	// A per-model price that EXISTS but was RETIRED (active=false) must NOT
+	// silently fall back to the cheaper catalog floor and under-bill — it fails
+	// the cycle loud. This is the asymmetry the money review flagged: a MISSING
+	// row falls back (legitimate unpriced-model), a RETIRED row fails. Here Sonnet
+	// input is retired and the cheaper Haiku-floor catalog price (1000) is present
+	// as the would-be silent fallback; the rollup must error instead of using it.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAggModel(app, sentinel, "infra.ai.input.tokens", usage.KindSum, modelSonnet, "2")}
+	store.inactiveModelPrices[modelPriceKey("infra.ai.input.tokens", modelSonnet)] = true
+	store.prices[priceKey(sentinel, "infra.ai.input.tokens")] = 1000 // would-be silent fallback — must NOT be used
+
+	_, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.Error(t, err, "a retired per-model price must fail the cycle, not silently under-bill")
+	require.Contains(t, err.Error(), "RETIRED")
 }
 
 func TestRollupPeriod_InfraAINoModelUsesDefinition(t *testing.T) {
