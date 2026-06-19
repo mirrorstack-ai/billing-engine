@@ -164,3 +164,85 @@ func TestRecordInfraUsage_Validation(t *testing.T) {
 		})
 	}
 }
+
+// --- AI metering foundation (migration 018 / infra-metrics PR #1) ---------
+
+func TestRecordInfraUsage_AcceptsAITokenMetrics(t *testing.T) {
+	// The four AI token metrics are registered platform-infra metrics with
+	// kind=sum (additive token counts; per-1k priced at rollup). The producer
+	// (PR #2) emits them; the foundation must ACCEPT and kind-resolve them here.
+	for _, metric := range []string{
+		"infra.ai.input.tokens",
+		"infra.ai.output.tokens",
+		"infra.ai.cache_write.tokens",
+		"infra.ai.cache_read.tokens",
+	} {
+		t.Run(metric, func(t *testing.T) {
+			store := newFakeStore()
+			req := validInfra()
+			req.EventID = "ai-" + metric
+			req.Metric = metric
+
+			resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			ev := store.events[req.EventID]
+			require.Equal(t, usage.KindSum, ev.Kind, "AI token metrics are platform-owned kind=sum")
+			require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+		})
+	}
+}
+
+func TestRecordInfraUsage_AcceptsAIRequests(t *testing.T) {
+	// infra.ai.requests is a registered platform-infra metric with kind=count
+	// (provider-API-call count; unpriced observability).
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "ai-requests"
+	req.Metric = "infra.ai.requests"
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, usage.KindCount, store.events[req.EventID].Kind)
+}
+
+func TestRecordInfraUsage_CarriesModel(t *testing.T) {
+	// The optional Model field (the AI pricing dimension) is carried onto the
+	// usage_events.model column so the rollup can price PER MODEL.
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "ai-with-model"
+	req.Metric = "infra.ai.input.tokens"
+	req.Model = "anthropic.claude-sonnet-4-6"
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "anthropic.claude-sonnet-4-6", store.events[req.EventID].Model)
+}
+
+func TestRecordInfraUsage_ModelEmptyForNonAIMetric(t *testing.T) {
+	// A non-AI infra metric carries no model → empty string (stored as NULL).
+	// Model is purely a pricing dimension; it never gates acceptance.
+	store := newFakeStore()
+	req := validInfra() // infra.compute.ms, no Model
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "", store.events[req.EventID].Model)
+}
+
+func TestRecordInfraUsage_AIMetricWithoutModelStillAccepted(t *testing.T) {
+	// Model is optional even for AI metrics: an infra.ai.* event with no model is
+	// accepted (it prices via the catalog fallback at rollup, never rejected).
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "ai-no-model"
+	req.Metric = "infra.ai.output.tokens"
+	// req.Model intentionally empty
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, "", store.events[req.EventID].Model)
+}

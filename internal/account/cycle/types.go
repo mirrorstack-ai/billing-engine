@@ -78,7 +78,11 @@ type MetricAggregate struct {
 	AppID    uuid.UUID
 	ModuleID uuid.UUID
 	Metric   string
-	Kind     Kind
+	// Model is the AI pricing dimension (migration 018): '' for non-AI metrics,
+	// a roster model id for infra.ai.*. Part of the usage_aggregates idempotency
+	// key so two models on one metric are distinct billable rows.
+	Model string
+	Kind  Kind
 
 	// BillableQuantity is the per-kind aggregate (count/sum → SUM, peak → MAX,
 	// time_weighted → integral). Carried as the exact NUMERIC string so the
