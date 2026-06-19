@@ -23,6 +23,12 @@
 -- placeholder (1 µ$/ms, design §2.1 "1 (placeholder, re-priced)") — finance
 -- pins the real fallback rate later via its own follow-up UPDATE; this PR only
 -- renames + restates the fallback charter, it does NOT invent a price.
+--
+-- NOTE (finance-environment awareness): this UPDATE is a no-op if the row was
+-- already manually renamed away from 'infra.compute.ms' (0 rows matched). In
+-- that case step (2)'s alias INSERT also no-ops via ON CONFLICT and the rename
+-- is simply not re-applied — no error, no double-write. The 017 seed names the
+-- row 'infra.compute.ms', so the standard path matches exactly one row.
 UPDATE ms_billing.metric_definitions
 SET    metric = 'infra.compute.walltime.ms',
        unit   = 'millisecond'
