@@ -1,4 +1,4 @@
-.PHONY: db db-init db-reset test test-integration lint build dev-webhook dev-cycle
+.PHONY: db db-init db-reset test test-integration lint build dev-webhook dev-cycle dev-egress-sync
 
 # Start infrastructure (Postgres)
 db:
@@ -47,3 +47,13 @@ dev-webhook:
 # .env.local). Prod runs the same binary on an EventBridge schedule.
 dev-cycle:
 	cd cmd/billing-cycle && go run .
+
+# Run the CDN-egress puller once locally (the platform-infra egress metering
+# chokepoint, Milestone D PR #10c). Sweeps the last few CLOSED hour windows,
+# queries the Cloudflare Analytics Engine "cdn_egress" dataset, and records each
+# (app, module) egress total via RecordInfraUsage (idempotent on a deterministic
+# event_id), then exits. Requires DATABASE_URL + CF_ANALYTICS_API_TOKEN (a
+# READ-ONLY CF API token) + CF_ACCOUNT_ID. Prod runs the same binary on an
+# EventBridge schedule.
+dev-egress-sync:
+	cd cmd/infra-egress-sync && go run .
