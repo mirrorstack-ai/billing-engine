@@ -124,13 +124,20 @@ WHERE module_id = $1 AND metric = $2;
 -- LookupModelPrice returns the RAW provider COGS for a (metric, model) pair from
 -- the per-model side-table (migration 018) — the AUTHORITATIVE price when a
 -- usage_event carries a model. unit_price_micros is NOT NULL here (a row exists
--- only to price), so this returns a plain BIGINT; pgx.ErrNoRows means no
--- per-model price → the Go caller falls back to LookupMetricPrice (the catalog
--- row). Only active prices resolve.
+-- only to price), so it is a plain BIGINT.
+--
+-- It does NOT filter active in the WHERE: it returns the active flag so the Go
+-- caller can DISTINGUISH "no row at all" (pgx.ErrNoRows → fall back to the
+-- LookupMetricPrice catalog row, the legitimate unpriced-model path) from "a row
+-- exists but was RETIRED to active = false". The latter must NOT silently fall
+-- back to the catalog's conservative (Haiku-floor) fallback price — that would
+-- under-bill a deliberately-retired model at a cheaper rate, defeating the loud
+-- revenue-leak guard the rollup enforces for missing infra prices. The Go caller
+-- fails the cycle loud on an inactive AI price instead.
 -- name: LookupModelPrice :one
-SELECT unit_price_micros
+SELECT unit_price_micros, active
 FROM ms_billing.metric_model_prices
-WHERE metric = $1 AND model = $2 AND active = true;
+WHERE metric = $1 AND model = $2;
 
 -- UpsertUsageAggregate writes the snapshotted billable record idempotently:
 -- a rollup re-run for the same (period, app, module, metric, model) upserts the

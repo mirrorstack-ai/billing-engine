@@ -35,9 +35,9 @@ func (q *Queries) LookupMetricPrice(ctx context.Context, arg LookupMetricPricePa
 }
 
 const lookupModelPrice = `-- name: LookupModelPrice :one
-SELECT unit_price_micros
+SELECT unit_price_micros, active
 FROM ms_billing.metric_model_prices
-WHERE metric = $1 AND model = $2 AND active = true
+WHERE metric = $1 AND model = $2
 `
 
 type LookupModelPriceParams struct {
@@ -45,17 +45,29 @@ type LookupModelPriceParams struct {
 	Model  string `json:"model"`
 }
 
+type LookupModelPriceRow struct {
+	UnitPriceMicros int64 `json:"unit_price_micros"`
+	Active          bool  `json:"active"`
+}
+
 // LookupModelPrice returns the RAW provider COGS for a (metric, model) pair from
 // the per-model side-table (migration 018) — the AUTHORITATIVE price when a
 // usage_event carries a model. unit_price_micros is NOT NULL here (a row exists
-// only to price), so this returns a plain BIGINT; pgx.ErrNoRows means no
-// per-model price → the Go caller falls back to LookupMetricPrice (the catalog
-// row). Only active prices resolve.
-func (q *Queries) LookupModelPrice(ctx context.Context, arg LookupModelPriceParams) (int64, error) {
+// only to price), so it is a plain BIGINT.
+//
+// It does NOT filter active in the WHERE: it returns the active flag so the Go
+// caller can DISTINGUISH "no row at all" (pgx.ErrNoRows → fall back to the
+// LookupMetricPrice catalog row, the legitimate unpriced-model path) from "a row
+// exists but was RETIRED to active = false". The latter must NOT silently fall
+// back to the catalog's conservative (Haiku-floor) fallback price — that would
+// under-bill a deliberately-retired model at a cheaper rate, defeating the loud
+// revenue-leak guard the rollup enforces for missing infra prices. The Go caller
+// fails the cycle loud on an inactive AI price instead.
+func (q *Queries) LookupModelPrice(ctx context.Context, arg LookupModelPriceParams) (LookupModelPriceRow, error) {
 	row := q.db.QueryRow(ctx, lookupModelPrice, arg.Metric, arg.Model)
-	var unit_price_micros int64
-	err := row.Scan(&unit_price_micros)
-	return unit_price_micros, err
+	var i LookupModelPriceRow
+	err := row.Scan(&i.UnitPriceMicros, &i.Active)
+	return i, err
 }
 
 const moduleIncomeForPeriod = `-- name: ModuleIncomeForPeriod :many

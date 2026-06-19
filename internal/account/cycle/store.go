@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -13,6 +14,15 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 )
+
+// ErrInactiveModelPrice is returned by MetricPriceMicros when a usage row's
+// (metric, model) has a per-model price ROW that has been retired (active =
+// false). It is deliberately NOT pgx.ErrNoRows: a missing row legitimately falls
+// back to the catalog price, but a retired model price must fail the cycle loud
+// rather than silently bill at the cheaper catalog (Haiku-floor) fallback — that
+// would under-bill a deliberately-retired model and defeat the rollup's loud
+// revenue-leak guard. The Service maps this to a loud Internal error.
+var ErrInactiveModelPrice = errors.New("per-model price is retired (active=false)")
 
 // Store is the persistence interface the rollup + settlement Service depends
 // on. Narrow on purpose — every method maps to a specific rollup step — so
@@ -37,7 +47,10 @@ type Store interface {
 	// model) price from metric_model_prices (migration 018) first, falling back
 	// to the (module, metric) catalog row when no per-model price exists; model
 	// == "" resolves the catalog row directly. priced=false (NULL/absent price)
-	// → the metric is metered-but-unpriced and prices to 0.
+	// → the metric is metered-but-unpriced and prices to 0. A per-model row that
+	// EXISTS but is RETIRED (active=false) returns ErrInactiveModelPrice instead
+	// of silently falling back to the cheaper catalog floor — the Service fails
+	// the cycle loud rather than under-bill a deliberately-retired model.
 	MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model string) (micros int64, priced bool, err error)
 
 	// UpsertUsageAggregate writes one snapshotted billable record idempotently
@@ -286,21 +299,28 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model string) (int64, bool, error) {
 	// PER-MODEL FIRST: an event that carries a model (the infra.ai.* family,
 	// migration 018) is priced from the AUTHORITATIVE (metric, model) side-table.
-	// A miss there is NOT unpriced — it falls through to the catalog row below
-	// (the sentinel metric_definitions fallback), so a model with no per-model
-	// price still bills at the metric's fallback rate rather than zero-charging.
+	// A MISSING row (pgx.ErrNoRows) is NOT unpriced — it falls through to the
+	// catalog row below (the sentinel metric_definitions fallback), so a model
+	// with no per-model price still bills at the metric's fallback rate rather
+	// than zero-charging. A row that EXISTS but is RETIRED (active = false) is a
+	// different case: it must NOT silently fall back to the cheaper catalog floor
+	// (that would under-bill a deliberately-retired model), so it returns
+	// ErrInactiveModelPrice and the Service fails the cycle loud.
 	if model != "" {
-		micros, err := s.q.LookupModelPrice(ctx, db.LookupModelPriceParams{
+		row, err := s.q.LookupModelPrice(ctx, db.LookupModelPriceParams{
 			Metric: metric,
 			Model:  model,
 		})
 		if err == nil {
-			return micros, true, nil // NOT NULL column → a row means priced
+			if !row.Active {
+				return 0, false, fmt.Errorf("%w: metric=%s model=%s", ErrInactiveModelPrice, metric, model)
+			}
+			return row.UnitPriceMicros, true, nil // NOT NULL column → a row means priced
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return 0, false, err
 		}
-		// pgx.ErrNoRows → no per-model price; fall back to the catalog row.
+		// pgx.ErrNoRows → no per-model price row at all; fall back to the catalog.
 	}
 
 	price, err := s.q.LookupMetricPrice(ctx, db.LookupMetricPriceParams{

@@ -99,6 +99,16 @@ EXECUTE FUNCTION ms_billing.set_updated_at();
 ALTER TABLE ms_billing.usage_events
     ADD COLUMN model TEXT NULL;
 
+-- 2a) Cover the new GROUP BY dimension. The rollup now groups usage_events BY
+--     (app, module, metric, COALESCE(model,'')) (rollup.sql RollupSumKinds), so
+--     model joins the per-(app, module) attribution index. Without it the
+--     group/sort pass can never be index-served once a single AI metric carries
+--     several models. Appending model after recorded_at keeps the existing
+--     leading-column lookups (app, module, metric, time) unchanged while letting
+--     the rollup's grouping be covered. IF NOT EXISTS for re-run safety.
+CREATE INDEX IF NOT EXISTS usage_events_app_module_metric_model_time_idx
+    ON ms_billing.usage_events (app_id, module_id, metric, model, recorded_at);
+
 -- 2b) The per-aggregate model dimension on usage_aggregates. The rollup now
 --     GROUPs usage_events BY (app, module, metric, model), so two AI aggregate
 --     rows for the same metric under the same sentinel module differ ONLY by
@@ -111,8 +121,11 @@ ALTER TABLE ms_billing.usage_events
 ALTER TABLE ms_billing.usage_aggregates
     ADD COLUMN model TEXT NOT NULL DEFAULT '';
 
+-- IF EXISTS for defensiveness + symmetry with the down migration's own DROP:
+-- in sequential migration order the named constraint always exists (009 created
+-- it), but a manual rename/drop upstream should not hard-fail this migration.
 ALTER TABLE ms_billing.usage_aggregates
-    DROP CONSTRAINT usage_aggregates_period_app_module_metric_key;
+    DROP CONSTRAINT IF EXISTS usage_aggregates_period_app_module_metric_key;
 
 ALTER TABLE ms_billing.usage_aggregates
     ADD CONSTRAINT usage_aggregates_period_app_module_metric_model_key
