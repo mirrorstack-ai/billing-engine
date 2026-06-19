@@ -393,6 +393,54 @@ func TestRollupPeriod_InfraEgressUnderSentinelPricesAt12Over10(t *testing.T) {
 	require.EqualValues(t, 2_400, a.ChargedMicros) // × 1.2
 }
 
+func TestRollupPeriod_WalltimeMSPricesAt12Over10(t *testing.T) {
+	// Catalog hygiene (migration 018): the re-chartered infra.compute.walltime.ms
+	// is a reserved infra.* name, so it takes the 12/10 (1.2×) platform-infra
+	// markup plane exactly like the old infra.compute.ms did, pricing from its
+	// migration-018 sentinel row (the renamed 017 seed, placeholder 1 µ$/ms).
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.compute.walltime.ms", usage.KindSum, "100")}
+	store.prices[priceKey(sentinel, "infra.compute.walltime.ms")] = 1 // re-chartered placeholder COGS
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+
+	a := resp.Aggregates[0]
+	require.Equal(t, sentinel, a.ModuleID)
+	require.Equal(t, 12, a.MarkupNum) // reserved-name markup plane
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 100, a.RawCostMicros) // 100 × 1
+	require.EqualValues(t, 120, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_EgressBytesRetiredZeroPriceNoLoudFail(t *testing.T) {
+	// Catalog hygiene (migration 018): infra.egress.bytes is RETIRED to an
+	// unpriced reporting parent via an explicit price=0 (NOT NULL). Because the
+	// metric is still INGESTED (cmd/infra-egress-sync), its events reach the
+	// rollup. A NULL price would set priced=false and trip the reserved-metric
+	// loud-fail in service.go; an explicit 0 sets priced=true → charged=0 and the
+	// cycle SUCCEEDS. The fake store models the price=0 catalog row as a present
+	// (ok=true) entry, exactly like the seeded row.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.egress.bytes", usage.KindSum, "1000000")}
+	store.prices[priceKey(sentinel, "infra.egress.bytes")] = 0 // retired: present-but-zero, NOT absent/NULL
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err, "a deliberately-unpriced (price=0) retired metric must roll up to 0, not loud-fail")
+
+	a := resp.Aggregates[0]
+	require.Equal(t, sentinel, a.ModuleID)
+	require.Equal(t, 12, a.MarkupNum) // still on the reserved markup plane
+	require.EqualValues(t, 0, a.UnitPriceMicros)
+	require.EqualValues(t, 0, a.RawCostMicros)
+	require.EqualValues(t, 0, a.ChargedMicros) // 1_000_000 × 0 × 1.2 = 0
+	require.EqualValues(t, 0, resp.TotalChargedMicros)
+}
+
 func TestRollupPeriod_PlatformReservedPrefix(t *testing.T) {
 	store := newFakeStore()
 	app, mod := uuid.New(), uuid.New()
