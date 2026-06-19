@@ -377,6 +377,15 @@ type MsBillingMetricDefinition struct {
 	UpdatedAt       time.Time           `json:"updated_at"`
 }
 
+type MsBillingMetricModelPrice struct {
+	Metric          string    `json:"metric"`
+	Model           string    `json:"model"`
+	UnitPriceMicros int64     `json:"unit_price_micros"`
+	Active          bool      `json:"active"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 type MsBillingModuleVisibility struct {
 	ModuleID   string                    `json:"module_id"`
 	Visibility MsBillingMarginShareClass `json:"visibility"`
@@ -412,6 +421,7 @@ type MsBillingUsageAggregate struct {
 	RawCostMicros     int64               `json:"raw_cost_micros"`
 	ChargedMicros     int64               `json:"charged_micros"`
 	RolledUpAt        time.Time           `json:"rolled_up_at"`
+	Model             string              `json:"model"`
 }
 
 type MsBillingUsageEvent struct {
@@ -424,6 +434,7 @@ type MsBillingUsageEvent struct {
 	Value      pgtype.Numeric      `json:"value"`
 	RecordedAt time.Time           `json:"recorded_at"`
 	IngestedAt time.Time           `json:"ingested_at"`
+	Model      pgtype.Text         `json:"model"`
 }
 
 type MsBillingWebhookEventsProcessed struct {

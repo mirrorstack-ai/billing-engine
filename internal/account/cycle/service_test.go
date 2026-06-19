@@ -18,13 +18,14 @@ import (
 // --- in-memory Store fake -------------------------------------------------
 
 type aggKey struct {
-	period, app, module, metric string
+	period, app, module, metric, model string
 }
 
 type fakeStore struct {
 	// rollup inputs
-	raws   []cycle.RawAggregate
-	prices map[string]int64 // module/metric → price; absent = unpriced (0)
+	raws        []cycle.RawAggregate
+	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
+	modelPrices map[string]int64 // metric/model → per-model price (migration 018); checked before prices when a model is carried
 	// settlement inputs
 	incomes    []cycle.ModuleIncome
 	visibility map[uuid.UUID]cycle.Visibility
@@ -86,6 +87,7 @@ type markedRun struct {
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		prices:       map[string]int64{},
+		modelPrices:  map[string]int64{},
 		visibility:   map[uuid.UUID]cycle.Visibility{},
 		periodID:     uuid.New(),
 		aggregates:   map[aggKey]cycle.MetricAggregate{},
@@ -114,6 +116,9 @@ func runKey(accountID uuid.UUID, start, end time.Time) string {
 
 func priceKey(moduleID uuid.UUID, metric string) string { return moduleID.String() + "/" + metric }
 
+// modelPriceKey mirrors the metric_model_prices PRIMARY KEY (metric, model).
+func modelPriceKey(metric, model string) string { return metric + "/" + model }
+
 func (f *fakeStore) OpenPeriodForAccount(_ context.Context, _ uuid.UUID, _, _ time.Time) (uuid.UUID, error) {
 	if f.errOpen != nil {
 		return uuid.Nil, f.errOpen
@@ -128,9 +133,16 @@ func (f *fakeStore) RawAggregates(_ context.Context, _ uuid.UUID, _, _ time.Time
 	return f.raws, nil
 }
 
-func (f *fakeStore) MetricPriceMicros(_ context.Context, moduleID uuid.UUID, metric string) (int64, bool, error) {
+func (f *fakeStore) MetricPriceMicros(_ context.Context, moduleID uuid.UUID, metric, model string) (int64, bool, error) {
 	if f.errPrice != nil {
 		return 0, false, f.errPrice
+	}
+	// Per-model price wins when the event carries a model (migration 018); a miss
+	// falls back to the (module, metric) catalog price, mirroring the pgxStore.
+	if model != "" {
+		if p, ok := f.modelPrices[modelPriceKey(metric, model)]; ok {
+			return p, true, nil
+		}
 	}
 	p, ok := f.prices[priceKey(moduleID, metric)]
 	return p, ok, nil
@@ -140,7 +152,7 @@ func (f *fakeStore) UpsertUsageAggregate(_ context.Context, periodID, _ uuid.UUI
 	if f.errUpsert != nil {
 		return f.errUpsert
 	}
-	f.aggregates[aggKey{periodID.String(), agg.AppID.String(), agg.ModuleID.String(), agg.Metric}] = agg
+	f.aggregates[aggKey{periodID.String(), agg.AppID.String(), agg.ModuleID.String(), agg.Metric, agg.Model}] = agg
 	return nil
 }
 
@@ -300,6 +312,11 @@ var (
 
 func rawAgg(app, mod uuid.UUID, metric string, kind cycle.Kind, qty string) cycle.RawAggregate {
 	return cycle.RawAggregate{AppID: app, ModuleID: mod, Metric: metric, Kind: kind, BillableQuantity: qty}
+}
+
+// rawAggModel is rawAgg with the AI pricing-dimension model set (migration 018).
+func rawAggModel(app, mod uuid.UUID, metric string, kind cycle.Kind, model, qty string) cycle.RawAggregate {
+	return cycle.RawAggregate{AppID: app, ModuleID: mod, Metric: metric, Kind: kind, Model: model, BillableQuantity: qty}
 }
 
 // --- RollupPeriod: pricing + aggregation ----------------------------------
@@ -750,4 +767,160 @@ func TestRollupThenSettle_IncomeFromAggregates(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 150_000, set.Settlements[0].PlatformTakeMicros)
 	require.EqualValues(t, 850_000, set.Settlements[0].DeveloperOwedMicros)
+}
+
+// --- RollupPeriod: per-model AI token pricing (migration 018) --------------
+
+// The roster model ids the producer (infra-metrics PR #2) stamps on AI events.
+const (
+	modelHaiku  = "anthropic.claude-haiku-4-5-20251001-v1:0"
+	modelSonnet = "anthropic.claude-sonnet-4-6"
+)
+
+func TestRollupPeriod_AIInputTokensPerModelPrice(t *testing.T) {
+	// An infra.ai.input.tokens event carrying a model is priced from the PER-MODEL
+	// side-table (metric_model_prices), NOT the sentinel metric_definitions
+	// fallback. Sonnet input = 3000 µ$/1k; the catalog fallback is the cheaper
+	// Haiku rate (1000) — proving the per-model price is what resolves. Quantity
+	// is in 1k-token units (design §3 rule 5). 2 (×1k) × 3000 × 12/10 = 7200.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAggModel(app, sentinel, "infra.ai.input.tokens", usage.KindSum, modelSonnet, "2")}
+	store.modelPrices[modelPriceKey("infra.ai.input.tokens", modelSonnet)] = 3000
+	store.prices[priceKey(sentinel, "infra.ai.input.tokens")] = 1000 // cheaper catalog fallback, must NOT win
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.EqualValues(t, 3000, a.UnitPriceMicros, "per-model price must win over the catalog fallback")
+	require.Equal(t, 12, a.MarkupNum) // infra.* → 12/10 plane unchanged
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 6000, a.RawCostMicros) // 2 × 3000
+	require.EqualValues(t, 7200, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_AIInputTokensDistinctPerModel(t *testing.T) {
+	// Two models on the same metric resolve to DIFFERENT prices in one rollup —
+	// the whole point of the side-table. Haiku in = 1000, Sonnet in = 3000.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{
+		rawAggModel(app, sentinel, "infra.ai.input.tokens", usage.KindSum, modelHaiku, "1"),
+		rawAggModel(app, sentinel, "infra.ai.input.tokens", usage.KindSum, modelSonnet, "1"),
+	}
+	store.modelPrices[modelPriceKey("infra.ai.input.tokens", modelHaiku)] = 1000
+	store.modelPrices[modelPriceKey("infra.ai.input.tokens", modelSonnet)] = 3000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	byModel := map[string]cycle.MetricAggregate{}
+	for _, a := range resp.Aggregates {
+		byModel[a.Model] = a
+	}
+	require.EqualValues(t, 1000, byModel[modelHaiku].UnitPriceMicros)
+	require.EqualValues(t, 3000, byModel[modelSonnet].UnitPriceMicros)
+	require.EqualValues(t, 1200, byModel[modelHaiku].ChargedMicros)  // 1×1000×1.2
+	require.EqualValues(t, 3600, byModel[modelSonnet].ChargedMicros) // 1×3000×1.2
+}
+
+func TestRollupPeriod_AITokensFallbackToDefinitionWhenNoModelPrice(t *testing.T) {
+	// A model with NO per-model price row falls back to the catalog (sentinel
+	// metric_definitions) fallback price — it does NOT zero-charge. Fallback =
+	// 1000 µ$/1k. 3 × 1000 × 1.2 = 3600.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAggModel(app, sentinel, "infra.ai.input.tokens", usage.KindSum, "some-future-model", "3")}
+	// no modelPrices row for "some-future-model"
+	store.prices[priceKey(sentinel, "infra.ai.input.tokens")] = 1000 // catalog fallback
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.EqualValues(t, 1000, a.UnitPriceMicros, "missing per-model price falls back to the catalog row")
+	require.EqualValues(t, 3600, a.ChargedMicros)
+}
+
+func TestRollupPeriod_InfraAINoModelUsesDefinition(t *testing.T) {
+	// A model-less AI event (model == "") resolves straight from the catalog
+	// fallback, never the per-model table. Even with a Sonnet per-model price
+	// present, an empty-model row must use the catalog fallback (1000).
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.ai.input.tokens", usage.KindSum, "4")} // model ""
+	store.modelPrices[modelPriceKey("infra.ai.input.tokens", modelSonnet)] = 3000
+	store.prices[priceKey(sentinel, "infra.ai.input.tokens")] = 1000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, "", a.Model)
+	require.EqualValues(t, 1000, a.UnitPriceMicros)
+	require.EqualValues(t, 4800, a.ChargedMicros) // 4×1000×1.2
+}
+
+func TestRollupPeriod_AITokensMarkupIs12Over10(t *testing.T) {
+	// AI token metrics are infra.* → they take the reserved 12/10 markup plane,
+	// unchanged by the per-model price source.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAggModel(app, sentinel, "infra.ai.output.tokens", usage.KindSum, modelSonnet, "10")}
+	store.modelPrices[modelPriceKey("infra.ai.output.tokens", modelSonnet)] = 15000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, 12, a.MarkupNum)
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 150_000, a.RawCostMicros) // 10 × 15000
+	require.EqualValues(t, 180_000, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_CacheWriteVsCacheReadPriceDifference(t *testing.T) {
+	// The cache-class split is the whole reason cache_write/cache_read are
+	// separate metrics: write ≈ 1.25× input, read ≈ 0.1× input — pricing read as
+	// input over-bills ~10×. Sonnet cache_write = 3750, cache_read = 300. They
+	// resolve to distinct per-model prices in one rollup.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{
+		rawAggModel(app, sentinel, "infra.ai.cache_write.tokens", usage.KindSum, modelSonnet, "2"),
+		rawAggModel(app, sentinel, "infra.ai.cache_read.tokens", usage.KindSum, modelSonnet, "2"),
+	}
+	store.modelPrices[modelPriceKey("infra.ai.cache_write.tokens", modelSonnet)] = 3750
+	store.modelPrices[modelPriceKey("infra.ai.cache_read.tokens", modelSonnet)] = 300
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	byMetric := map[string]cycle.MetricAggregate{}
+	for _, a := range resp.Aggregates {
+		byMetric[a.Metric] = a
+	}
+	require.EqualValues(t, 3750, byMetric["infra.ai.cache_write.tokens"].UnitPriceMicros)
+	require.EqualValues(t, 300, byMetric["infra.ai.cache_read.tokens"].UnitPriceMicros)
+	require.EqualValues(t, 9000, byMetric["infra.ai.cache_write.tokens"].ChargedMicros) // 2×3750×1.2
+	require.EqualValues(t, 720, byMetric["infra.ai.cache_read.tokens"].ChargedMicros)   // 2×300×1.2
+}
+
+func TestRollupPeriod_AIRequestsZeroCharge(t *testing.T) {
+	// infra.ai.requests is unpriced observability (price 0, no per-model rows):
+	// it charges 0 regardless of the 12/10 plane. It still aggregates (the count
+	// is retained for rate/abuse signal) but never bills.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAggModel(app, sentinel, "infra.ai.requests", usage.KindCount, modelSonnet, "5")}
+	store.prices[priceKey(sentinel, "infra.ai.requests")] = 0 // seeded price 0 (observability)
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.EqualValues(t, 0, a.UnitPriceMicros)
+	require.EqualValues(t, 0, a.RawCostMicros)
+	require.EqualValues(t, 0, a.ChargedMicros)
 }

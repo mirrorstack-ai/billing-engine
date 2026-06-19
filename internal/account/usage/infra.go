@@ -47,21 +47,45 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // lookup — owns infra-metric semantics (design §3a / §5 "cdn-worker + module
 // runtime"), so the kind is fixed HERE rather than read from metric_definitions:
 //
-//	infra.compute.ms    additive dispatch/runtime wall-time ms  → sum
-//	infra.egress.bytes  additive CDN/egress bytes               → sum
+//	infra.compute.ms             additive dispatch/runtime wall-time ms → sum
+//	infra.egress.bytes           additive CDN/egress bytes              → sum
+//	infra.ai.input.tokens        additive provider INPUT tokens         → sum
+//	infra.ai.output.tokens       additive provider OUTPUT tokens        → sum
+//	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens     → sum
+//	infra.ai.cache_read.tokens   additive prompt-cache READ tokens      → sum
+//	infra.ai.requests            provider-API-call count                → count
+//
+// The infra.ai.* family is priced PER MODEL: the producer (infra-metrics PR #2,
+// in api-platform cmd/agent) stamps the model on RecordInfraUsageRequest.Model,
+// the rollup resolves the per-(metric, model) price from metric_model_prices
+// (migration 018) and falls back to the sentinel metric_definitions row when no
+// model is carried. The token metrics are metered/priced in THOUSANDS of tokens
+// (per-1k, design §3 rule 5) so the integer-micro price floor survives;
+// infra.ai.requests is unpriced observability (price 0). Their kind is fixed
+// here, never read from the catalog.
 //
 // A switch (not a package-level map) keeps this registry immutable by
 // construction — there is no mutable global a test could corrupt. Adding a new
 // platform-measured infra metric means a new case HERE plus a seeded
-// metric_definitions row (migration 017) with its per-unit COGS. RecordInfraUsage
-// rejects any reserved name without a case (an unregistered infra metric has no
-// platform-owned kind).
+// metric_definitions row (migration 017/018) with its per-unit COGS.
+// RecordInfraUsage rejects any reserved name without a case (an unregistered
+// infra metric has no platform-owned kind).
 func platformInfraKind(metric string) (Kind, bool) {
 	switch metric {
 	case "infra.compute.ms":
 		return KindSum, true
 	case "infra.egress.bytes":
 		return KindSum, true
+	case "infra.ai.input.tokens":
+		return KindSum, true
+	case "infra.ai.output.tokens":
+		return KindSum, true
+	case "infra.ai.cache_write.tokens":
+		return KindSum, true
+	case "infra.ai.cache_read.tokens":
+		return KindSum, true
+	case "infra.ai.requests":
+		return KindCount, true
 	default:
 		return "", false
 	}
@@ -97,6 +121,16 @@ type RecordInfraUsageRequest struct {
 	// platformInfraKind. A non-reserved or unregistered metric is rejected with
 	// INVALID_INPUT (the inverse of the SDK gate).
 	Metric string `json:"metric"`
+
+	// Model is the OPTIONAL AI pricing dimension (migration 018). The producer
+	// (infra-metrics PR #2) stamps the roster model id (e.g.
+	// "anthropic.claude-sonnet-4-6") on an infra.ai.* event so the rollup prices
+	// it from metric_model_prices PER MODEL; the catalog row is the fallback when
+	// it is empty. Empty for every non-AI infra metric → stored as a NULL
+	// usage_events.model. It is purely a pricing dimension: it does NOT gate
+	// acceptance (an AI metric with no model still records and prices via the
+	// catalog fallback), and it is never read for non-AI metrics.
+	Model string `json:"model,omitempty"`
 
 	// Value is the platform-MEASURED quantity (ms / bytes). Authoritative and
 	// non-zeroable — it comes from the platform's chokepoint, never an SDK hint.
@@ -199,6 +233,7 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		Kind:       kind,
 		Value:      req.Value,
 		RecordedAt: recordedAt,
+		Model:      req.Model, // empty for non-AI metrics → NULL usage_events.model
 	})
 	if err != nil {
 		return nil, billing.Internal("insert infra usage event failed", err)

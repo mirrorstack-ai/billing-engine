@@ -65,7 +65,11 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		Aggregates: make([]MetricAggregate, 0, len(raws)),
 	}
 	for _, raw := range raws {
-		priceMicros, priced, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric)
+		// Resolve the per-unit price by (module, metric, model): an infra.ai.*
+		// event carries a model → priced PER MODEL from metric_model_prices, with
+		// the catalog row as fallback; every other metric carries model="" →
+		// resolved straight from the catalog (migration 018).
+		priceMicros, priced, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric, raw.Model)
 		if err != nil {
 			return nil, billing.Internal("metric price lookup failed", err)
 		}
@@ -106,6 +110,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			AppID:            raw.AppID,
 			ModuleID:         raw.ModuleID,
 			Metric:           raw.Metric,
+			Model:            raw.Model,
 			Kind:             raw.Kind,
 			BillableQuantity: raw.BillableQuantity,
 			UnitPriceMicros:  priceMicros,

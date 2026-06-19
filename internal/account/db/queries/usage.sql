@@ -57,12 +57,13 @@ WHERE module_id = $1 AND metric = $2;
 -- same SDK call (same minted eventId) a no-op. :execrows so the caller
 -- can tell a fresh insert (1) from a deduped retry (0). account_id is
 -- nullable (lazy account); kind is the declared kind resolved from
--- metric_definitions.
+-- metric_definitions. model is the per-event AI pricing dimension
+-- (migration 018) — NULL for every non-AI event.
 -- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
-    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at
+    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at, model
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8
+    $1, $2, $3, $4, $5, $6, $7, $8, $9
 )
 ON CONFLICT (event_id) DO NOTHING;
 
