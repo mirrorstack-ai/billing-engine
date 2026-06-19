@@ -1001,3 +1001,155 @@ func TestRollupPeriod_AIRequestsZeroCharge(t *testing.T) {
 	require.EqualValues(t, 0, a.RawCostMicros)
 	require.EqualValues(t, 0, a.ChargedMicros)
 }
+
+// --- P1 producer-target catalog seed rollup (migration 020 / infra-metrics PR #4) ---
+//
+// Each P1 metric is a reserved infra.* name → the 12/10 (1.2×) markup plane,
+// priced from its sentinel metric_definitions row at the chosen rule-5 unit. The
+// seeded prices mirror migration 020. These prove (a) each new metric prices at
+// cost × 12/10 applied ONCE, and (b) a single per-1k / per-GiB UNIT value
+// resolves to a non-zero charge — the regression guard that the rule-5 unit
+// choice avoids the sub-micro floor-to-0.
+
+func TestRollupPeriod_P1RequestCountPricesAt12Over10(t *testing.T) {
+	// §2.7 per-request fee, per-unit (1.2 µ$/req ≥ 1 → seeded 1 µ$/request).
+	// 1000 requests × 1 × 12/10 = 1200.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.request.count", usage.KindCount, "1000")}
+	store.prices[priceKey(sentinel, "infra.request.count")] = 1
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, 12, a.MarkupNum)
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 1000, a.RawCostMicros) // 1000 × 1
+	require.EqualValues(t, 1200, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_P1McpToolCallPricesAt12Over10(t *testing.T) {
+	// §2.7 per-call fee, per-unit (1.5 µ$/call ≥ 1 → seeded 1 µ$/call).
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.mcp.tool_call.count", usage.KindCount, "100")}
+	store.prices[priceKey(sentinel, "infra.mcp.tool_call.count")] = 1
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, 12, a.MarkupNum)
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 100, a.RawCostMicros) // 100 × 1
+	require.EqualValues(t, 120, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_P1CronCountPricesAt12Over10(t *testing.T) {
+	// §2.2 scheduler fire, per-unit (1 µ$/fire ≥ 1 → seeded 1 µ$/fire).
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.cron.count", usage.KindCount, "50")}
+	store.prices[priceKey(sentinel, "infra.cron.count")] = 1
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, 12, a.MarkupNum)
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 50, a.RawCostMicros) // 50 × 1
+	require.EqualValues(t, 60, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_P1EventCountPer1kNoFloorTo0(t *testing.T) {
+	// §2.2 fanout delivery: 0.4 µ$/delivery floors to 0 per-unit; rule 5 prices
+	// PER 1K (400 µ$/1k). The producer emits value = deliveries/1000. Assert a
+	// non-trivial volume bills NON-ZERO: 5 (×1k) = 5000 deliveries → 5 × 400 ×
+	// 12/10 = 2400 (the per-1k unit survives the floor, unlike a per-delivery seed
+	// of floor(0.4)=0 µ$ which would charge nothing for any volume).
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.event.count", usage.KindCount, "5")}
+	store.prices[priceKey(sentinel, "infra.event.count")] = 400
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, 12, a.MarkupNum)
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 2000, a.RawCostMicros) // 5 × 400
+	require.EqualValues(t, 2400, a.ChargedMicros) // × 1.2 — NOT floored to 0
+}
+
+func TestRollupPeriod_P1EventBytesPerGiBNoFloorTo0(t *testing.T) {
+	// §2.2 event-bus payload: named bytes, priced/emitted PER GiB (rule 5). The
+	// conservative placeholder is 1 µ$/GiB (≥ 1, so a non-zero seed; finance pins
+	// the real ~1,000,000 µ$/GiB). Producer value is in GiB. 10 GiB × 1 × 12/10 =
+	// 12 — non-zero, proving the GiB unit survives the per-byte floor.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.event.bytes", usage.KindSum, "10")}
+	store.prices[priceKey(sentinel, "infra.event.bytes")] = 1
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, 12, a.MarkupNum)
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 10, a.RawCostMicros) // 10 × 1
+	require.EqualValues(t, 12, a.ChargedMicros) // × 1.2 — NOT floored to 0
+}
+
+func TestRollupPeriod_P1EgressApiBytesPerGiBNoFloorTo0(t *testing.T) {
+	// §2.5 non-CDN egress: named bytes, priced/emitted PER GiB (rule 5; per-byte
+	// 0.0000838 µ$ floors to 0). Seeded 90000 µ$/GiB (≈$0.09/GiB). Producer value
+	// in GiB: a SINGLE GiB → 1 × 90000 × 12/10 = 108000, definitively non-zero —
+	// the regression guard that the GiB unit avoids the silent per-byte zero.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{rawAgg(app, sentinel, "infra.egress.api.bytes", usage.KindSum, "1")}
+	store.prices[priceKey(sentinel, "infra.egress.api.bytes")] = 90000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	a := resp.Aggregates[0]
+	require.Equal(t, 12, a.MarkupNum)
+	require.Equal(t, 10, a.MarkupDen)
+	require.EqualValues(t, 90000, a.RawCostMicros)  // 1 GiB × 90000
+	require.EqualValues(t, 108000, a.ChargedMicros) // × 1.2
+}
+
+func TestRollupPeriod_P1StoragePutListPer1kNoFloorTo0(t *testing.T) {
+	// §2.4 S3 tier-1 ops: 0.005 µ$/op floors to 0 per-op; rule 5 prices PER 1K
+	// (5 µ$/1k). Producer value = ops/1000. 2 (×1k) = 2000 ops each → 2 × 5 ×
+	// 12/10 = 12 per metric, proving the per-1k unit survives the floor.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{
+		rawAgg(app, sentinel, "infra.storage.put.count", usage.KindCount, "2"),
+		rawAgg(app, sentinel, "infra.storage.list.count", usage.KindCount, "2"),
+	}
+	store.prices[priceKey(sentinel, "infra.storage.put.count")] = 5
+	store.prices[priceKey(sentinel, "infra.storage.list.count")] = 5
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	byMetric := map[string]cycle.MetricAggregate{}
+	for _, a := range resp.Aggregates {
+		byMetric[a.Metric] = a
+	}
+	require.Equal(t, 12, byMetric["infra.storage.put.count"].MarkupNum)
+	require.Equal(t, 10, byMetric["infra.storage.put.count"].MarkupDen)
+	require.Equal(t, 12, byMetric["infra.storage.list.count"].MarkupNum)
+	require.Equal(t, 10, byMetric["infra.storage.list.count"].MarkupDen)
+	require.EqualValues(t, 10, byMetric["infra.storage.put.count"].RawCostMicros)  // 2 × 5
+	require.EqualValues(t, 12, byMetric["infra.storage.put.count"].ChargedMicros)  // × 1.2
+	require.EqualValues(t, 10, byMetric["infra.storage.list.count"].RawCostMicros) // 2 × 5
+	require.EqualValues(t, 12, byMetric["infra.storage.list.count"].ChargedMicros) // × 1.2
+}
