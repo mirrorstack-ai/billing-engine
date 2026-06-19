@@ -56,7 +56,7 @@ func TestRecordInfraUsage_AcceptsEgressBytes(t *testing.T) {
 }
 
 func TestRecordInfraUsage_AcceptsWalltimeMS(t *testing.T) {
-	// Catalog hygiene (migration 018): infra.compute.ms was re-chartered +
+	// Catalog hygiene (migration 019): infra.compute.ms was re-chartered +
 	// renamed to infra.compute.walltime.ms. The registry must recognize the NEW
 	// name with the same platform-owned KIND (sum), stamped under the sentinel.
 	store := newFakeStore()
