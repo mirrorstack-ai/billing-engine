@@ -17,11 +17,11 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
-// These integration tests validate migration 018 (infra catalog hygiene)
+// These integration tests validate migration 019 (infra catalog hygiene)
 // against a real Postgres 17 (gated by the `integration` build tag; run via
 // `make test-integration`, skipped when Docker is unavailable). NewTestDB
-// applies ALL *.up.sql in lexical order, so 018.up is already applied on entry;
-// the round-trip test then runs 018.down + 018.up explicitly. No Stripe.
+// applies ALL *.up.sql in lexical order, so 019.up is already applied on entry;
+// the round-trip test then runs 019.down + 019.up explicitly. No Stripe.
 
 const sentinelModuleID = usage.PlatformInfraModuleIDString
 
@@ -66,7 +66,7 @@ func assertHygieneApplied(t *testing.T, pool *pgxpool.Pool) {
 
 	// (1) compute.ms renamed → walltime.ms (sum, ms, placeholder 1 µ$, active).
 	kind, unit, price, active, ok := metricRow(t, pool, "infra.compute.walltime.ms")
-	require.True(t, ok, "infra.compute.walltime.ms row must exist after 018.up")
+	require.True(t, ok, "infra.compute.walltime.ms row must exist after 019.up")
 	require.Equal(t, "sum", kind)
 	require.Equal(t, "millisecond", unit)
 	require.NotNil(t, price)
@@ -75,7 +75,7 @@ func assertHygieneApplied(t *testing.T, pool *pgxpool.Pool) {
 
 	// (2) deprecated alias compute.ms still present (same sentinel/kind/price).
 	kind, unit, price, active, ok = metricRow(t, pool, "infra.compute.ms")
-	require.True(t, ok, "deprecated alias infra.compute.ms row must exist after 018.up")
+	require.True(t, ok, "deprecated alias infra.compute.ms row must exist after 019.up")
 	require.Equal(t, "sum", kind)
 	require.Equal(t, "millisecond", unit)
 	require.NotNil(t, price)
@@ -90,17 +90,17 @@ func assertHygieneApplied(t *testing.T, pool *pgxpool.Pool) {
 	require.True(t, active)
 }
 
-func TestMigration018_Up_AppliesCatalogHygiene(t *testing.T) {
-	pool := testutil.NewTestDB(t) // applies through 018.up
+func TestMigration019_Up_AppliesCatalogHygiene(t *testing.T) {
+	pool := testutil.NewTestDB(t) // applies through 019.up
 	assertHygieneApplied(t, pool)
 }
 
-func TestMigration018_UpDownUp_RoundTrips(t *testing.T) {
-	pool := testutil.NewTestDB(t) // 018.up already applied
+func TestMigration019_UpDownUp_RoundTrips(t *testing.T) {
+	pool := testutil.NewTestDB(t) // 019.up already applied
 	ctx := context.Background()
 
 	// --- down: reverse to 017's seeded state ---
-	_, err := pool.Exec(ctx, migrationSQL(t, "018_infra_catalog_hygiene.down.sql"))
+	_, err := pool.Exec(ctx, migrationSQL(t, "019_infra_catalog_hygiene.down.sql"))
 	require.NoError(t, err)
 
 	// walltime.ms gone; compute.ms back to the single 017 seed (price 1);
@@ -129,14 +129,14 @@ func TestMigration018_UpDownUp_RoundTrips(t *testing.T) {
 		sentinelModuleID).Scan(&computeCount))
 	require.Equal(t, 1, computeCount, "post-down there is exactly one compute row (the 017 original)")
 
-	// --- up again: re-apply 018 cleanly (validates idempotent forward path) ---
-	_, err = pool.Exec(ctx, migrationSQL(t, "018_infra_catalog_hygiene.up.sql"))
+	// --- up again: re-apply 019 cleanly (validates idempotent forward path) ---
+	_, err = pool.Exec(ctx, migrationSQL(t, "019_infra_catalog_hygiene.up.sql"))
 	require.NoError(t, err)
 	assertHygieneApplied(t, pool)
 }
 
-func TestMigration018_WalltimeMSRollupPricesViaNewRow(t *testing.T) {
-	pool := testutil.NewTestDB(t) // 018.up applied → walltime.ms seeded at 1 µ$
+func TestMigration019_WalltimeMSRollupPricesViaNewRow(t *testing.T) {
+	pool := testutil.NewTestDB(t) // 019.up applied → walltime.ms seeded at 1 µ$
 	store := cycle.NewStore(pool)
 	svc := cycle.NewService(store, nil)
 	ctx := context.Background()
@@ -159,8 +159,8 @@ func TestMigration018_WalltimeMSRollupPricesViaNewRow(t *testing.T) {
 	require.EqualValues(t, 120, resp.TotalChargedMicros)
 }
 
-func TestMigration018_EgressBytesRollsUpToZero(t *testing.T) {
-	pool := testutil.NewTestDB(t) // 018.up applied → egress.bytes price 0
+func TestMigration019_EgressBytesRollsUpToZero(t *testing.T) {
+	pool := testutil.NewTestDB(t) // 019.up applied → egress.bytes price 0
 	store := cycle.NewStore(pool)
 	svc := cycle.NewService(store, nil)
 	ctx := context.Background()

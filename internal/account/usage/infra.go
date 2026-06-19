@@ -73,11 +73,11 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // RecordInfraUsage rejects any reserved name without a case (an unregistered
 // infra metric has no platform-owned kind).
 //
-// Catalog hygiene (infra-metrics design §1, migration 018): infra.compute.ms was
+// Catalog hygiene (infra-metrics design §1, migration 019): infra.compute.ms was
 // RE-CHARTERED + RENAMED to infra.compute.walltime.ms (dispatch-observed
 // wall-time, the FALLBACK-ONLY compute basis — never co-billed with a
 // substrate-native metric). infra.egress.bytes was RETIRED to an unpriced
-// reporting parent (price 0 in 018; its CDN children infra.egress.cdn.* are P2).
+// reporting parent (price 0 in 019; its CDN children infra.egress.cdn.* are P2).
 // The retired/renamed names stay registered because both are still ingested
 // during the transition window.
 func platformInfraKind(metric string) (Kind, bool) {
@@ -90,11 +90,11 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// (billing.MetricInfraComputeMs in internal/dispatch/handler) still emits
 		// this OLD name until the producer rename lands (PR #4). Keep the case so
 		// a transition-window event is not rejected at the ingest gate; migration
-		// 018 keeps the matching alias metric_definitions row so it also prices at
+		// 019 keeps the matching alias metric_definitions row so it also prices at
 		// rollup (otherwise the reserved-metric loud-fail in cycle/service.go
 		// would abort the cycle on an old-name event).
 		// TODO(PR #4): drop this case once api-platform emits walltime.ms and no
-		// in-flight event carries the old name (drop the 018 alias row too).
+		// in-flight event carries the old name (drop the 019 alias row too).
 		return KindSum, true
 	case "infra.egress.bytes":
 		// RETIRED flat egress, kept as an unpriced reporting parent (design §2.5);
