@@ -394,10 +394,10 @@ func TestRollupPeriod_InfraEgressUnderSentinelPricesAt12Over10(t *testing.T) {
 }
 
 func TestRollupPeriod_WalltimeMSPricesAt12Over10(t *testing.T) {
-	// Catalog hygiene (migration 018): the re-chartered infra.compute.walltime.ms
+	// Catalog hygiene (migration 019): the re-chartered infra.compute.walltime.ms
 	// is a reserved infra.* name, so it takes the 12/10 (1.2×) platform-infra
 	// markup plane exactly like the old infra.compute.ms did, pricing from its
-	// migration-018 sentinel row (the renamed 017 seed, placeholder 1 µ$/ms).
+	// migration-019 sentinel row (the renamed 017 seed, placeholder 1 µ$/ms).
 	store := newFakeStore()
 	app := uuid.New()
 	sentinel := usage.PlatformInfraModuleID()
@@ -416,7 +416,7 @@ func TestRollupPeriod_WalltimeMSPricesAt12Over10(t *testing.T) {
 }
 
 func TestRollupPeriod_EgressBytesRetiredZeroPriceNoLoudFail(t *testing.T) {
-	// Catalog hygiene (migration 018): infra.egress.bytes is RETIRED to an
+	// Catalog hygiene (migration 019): infra.egress.bytes is RETIRED to an
 	// unpriced reporting parent via an explicit price=0 (NOT NULL). Because the
 	// metric is still INGESTED (cmd/infra-egress-sync), its events reach the
 	// rollup. A NULL price would set priced=false and trip the reserved-metric

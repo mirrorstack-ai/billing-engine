@@ -1,4 +1,4 @@
--- Migration 018 — infra catalog hygiene (P0, no new producer).
+-- Migration 019 — infra catalog hygiene (P0, no new producer).
 --
 -- Infra-metrics design (docs-temp/infra-metrics/design.md §1 + §7 P0). Two
 -- catalog-only corrections to the platform-infra metrics seeded under the
