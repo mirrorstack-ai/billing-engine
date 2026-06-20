@@ -217,6 +217,7 @@ func (s *Service) GetUsageSummary(ctx context.Context, req GetUsageSummaryReques
 			UnitPriceMicros: r.UnitPriceMicros,
 			RawCostMicros:   r.RawCostMicros,
 			ChargedMicros:   r.RawCostMicros,
+			Group:           r.Group,
 		})
 	}
 	return &GetUsageSummaryResponse{
