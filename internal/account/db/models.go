@@ -184,6 +184,54 @@ func (ns NullMsBillingMarginShareClass) Value() (driver.Value, error) {
 	return string(ns.MsBillingMarginShareClass), nil
 }
 
+type MsBillingMetricGroup string
+
+const (
+	MsBillingMetricGroupCompute          MsBillingMetricGroup = "compute"
+	MsBillingMetricGroupDatabase         MsBillingMetricGroup = "database"
+	MsBillingMetricGroupStorage          MsBillingMetricGroup = "storage"
+	MsBillingMetricGroupNetwork          MsBillingMetricGroup = "network"
+	MsBillingMetricGroupAi               MsBillingMetricGroup = "ai"
+	MsBillingMetricGroupRequests         MsBillingMetricGroup = "requests"
+	MsBillingMetricGroupPlatformSecurity MsBillingMetricGroup = "platform_security"
+	MsBillingMetricGroupOther            MsBillingMetricGroup = "other"
+)
+
+func (e *MsBillingMetricGroup) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = MsBillingMetricGroup(s)
+	case string:
+		*e = MsBillingMetricGroup(s)
+	default:
+		return fmt.Errorf("unsupported scan type for MsBillingMetricGroup: %T", src)
+	}
+	return nil
+}
+
+type NullMsBillingMetricGroup struct {
+	MsBillingMetricGroup MsBillingMetricGroup `json:"ms_billing_metric_group"`
+	Valid                bool                 `json:"valid"` // Valid is true if MsBillingMetricGroup is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullMsBillingMetricGroup) Scan(value interface{}) error {
+	if value == nil {
+		ns.MsBillingMetricGroup, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.MsBillingMetricGroup.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullMsBillingMetricGroup) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.MsBillingMetricGroup), nil
+}
+
 type MsBillingMetricKind string
 
 const (
@@ -366,15 +414,16 @@ type MsBillingInvoice struct {
 }
 
 type MsBillingMetricDefinition struct {
-	ID              string              `json:"id"`
-	ModuleID        string              `json:"module_id"`
-	Metric          string              `json:"metric"`
-	Kind            MsBillingMetricKind `json:"kind"`
-	Unit            string              `json:"unit"`
-	UnitPriceMicros pgtype.Int8         `json:"unit_price_micros"`
-	Active          bool                `json:"active"`
-	CreatedAt       time.Time           `json:"created_at"`
-	UpdatedAt       time.Time           `json:"updated_at"`
+	ID              string               `json:"id"`
+	ModuleID        string               `json:"module_id"`
+	Metric          string               `json:"metric"`
+	Kind            MsBillingMetricKind  `json:"kind"`
+	Unit            string               `json:"unit"`
+	UnitPriceMicros pgtype.Int8          `json:"unit_price_micros"`
+	Active          bool                 `json:"active"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
+	DisplayGroup    MsBillingMetricGroup `json:"display_group"`
 }
 
 type MsBillingMetricModelPrice struct {
