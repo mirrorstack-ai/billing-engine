@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -13,6 +14,15 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 )
+
+// ErrInactiveModelPrice is returned by MetricPriceMicros when a usage row's
+// (metric, model) has a per-model price ROW that has been retired (active =
+// false). It is deliberately NOT pgx.ErrNoRows: a missing row legitimately falls
+// back to the catalog price, but a retired model price must fail the cycle loud
+// rather than silently bill at the cheaper catalog (Haiku-floor) fallback — that
+// would under-bill a deliberately-retired model and defeat the rollup's loud
+// revenue-leak guard. The Service maps this to a loud Internal error.
+var ErrInactiveModelPrice = errors.New("per-model price is retired (active=false)")
 
 // Store is the persistence interface the rollup + settlement Service depends
 // on. Narrow on purpose — every method maps to a specific rollup step — so
@@ -32,10 +42,16 @@ type Store interface {
 	// row re-encodes it without a float round-trip.
 	RawAggregates(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]RawAggregate, error)
 
-	// MetricPriceMicros returns the per-unit customer price snapshotted onto
-	// the aggregate. priced=false (NULL catalog price) → the metric is
-	// metered-but-unpriced and prices to 0.
-	MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric string) (micros int64, priced bool, err error)
+	// MetricPriceMicros returns the per-unit customer price snapshotted onto the
+	// aggregate. When model != "" it resolves the AUTHORITATIVE per-(metric,
+	// model) price from metric_model_prices (migration 018) first, falling back
+	// to the (module, metric) catalog row when no per-model price exists; model
+	// == "" resolves the catalog row directly. priced=false (NULL/absent price)
+	// → the metric is metered-but-unpriced and prices to 0. A per-model row that
+	// EXISTS but is RETIRED (active=false) returns ErrInactiveModelPrice instead
+	// of silently falling back to the cheaper catalog floor — the Service fails
+	// the cycle loud rather than under-bill a deliberately-retired model.
+	MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model string) (micros int64, priced bool, err error)
 
 	// UpsertUsageAggregate writes one snapshotted billable record idempotently
 	// on (period_id, app_id, module_id, metric). A re-run upserts the identical
@@ -174,12 +190,16 @@ type InvoiceMirror struct {
 
 // RawAggregate is one per-kind aggregated row from the rollup SELECTs, before
 // pricing. BillableQuantity is the exact NUMERIC string (count/sum SUM, peak
-// MAX, time_weighted integral).
+// MAX, time_weighted integral). Model is the AI pricing dimension the rollup
+// groups by (migration 018): empty for non-AI metrics (the rollup's
+// COALESCE(model, ”)), a roster model id for infra.ai.* events. It selects the
+// price source in MetricPriceMicros (per-model vs catalog).
 type RawAggregate struct {
 	AppID            uuid.UUID
 	ModuleID         uuid.UUID
 	Metric           string
 	Kind             Kind
+	Model            string
 	BillableQuantity string
 }
 
@@ -239,7 +259,7 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 	}
 
 	out := make([]RawAggregate, 0, len(sumRows)+len(peakRows)+len(twRows))
-	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, qty pgtype.Numeric) error {
+	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, model string, qty pgtype.Numeric) error {
 		app, err := uuid.Parse(appID)
 		if err != nil {
 			return err
@@ -253,29 +273,56 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 			ModuleID:         mod,
 			Metric:           metric,
 			Kind:             Kind(kind),
+			Model:            model, // "" for non-AI rows (COALESCE(model, ''))
 			BillableQuantity: numericString(qty),
 		})
 		return nil
 	}
 	for _, r := range sumRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.BillableQuantity); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range peakRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.BillableQuantity); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range twRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.BillableQuantity); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
 }
 
-func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric string) (int64, bool, error) {
+func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model string) (int64, bool, error) {
+	// PER-MODEL FIRST: an event that carries a model (the infra.ai.* family,
+	// migration 018) is priced from the AUTHORITATIVE (metric, model) side-table.
+	// A MISSING row (pgx.ErrNoRows) is NOT unpriced — it falls through to the
+	// catalog row below (the sentinel metric_definitions fallback), so a model
+	// with no per-model price still bills at the metric's fallback rate rather
+	// than zero-charging. A row that EXISTS but is RETIRED (active = false) is a
+	// different case: it must NOT silently fall back to the cheaper catalog floor
+	// (that would under-bill a deliberately-retired model), so it returns
+	// ErrInactiveModelPrice and the Service fails the cycle loud.
+	if model != "" {
+		row, err := s.q.LookupModelPrice(ctx, db.LookupModelPriceParams{
+			Metric: metric,
+			Model:  model,
+		})
+		if err == nil {
+			if !row.Active {
+				return 0, false, fmt.Errorf("%w: metric=%s model=%s", ErrInactiveModelPrice, metric, model)
+			}
+			return row.UnitPriceMicros, true, nil // NOT NULL column → a row means priced
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, err
+		}
+		// pgx.ErrNoRows → no per-model price row at all; fall back to the catalog.
+	}
+
 	price, err := s.q.LookupMetricPrice(ctx, db.LookupMetricPriceParams{
 		ModuleID: moduleID.String(),
 		Metric:   metric,
@@ -306,6 +353,7 @@ func (s *pgxStore) UpsertUsageAggregate(ctx context.Context, periodID, accountID
 		AppID:             agg.AppID.String(),
 		ModuleID:          agg.ModuleID.String(),
 		Metric:            agg.Metric,
+		Model:             agg.Model,
 		Kind:              db.MsBillingMetricKind(agg.Kind),
 		BillableQuantity:  qty,
 		UnitPriceMicros:   agg.UnitPriceMicros,

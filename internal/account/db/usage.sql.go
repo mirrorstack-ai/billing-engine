@@ -86,9 +86,9 @@ func (q *Queries) CurrentPeriodUsageSummary(ctx context.Context, arg CurrentPeri
 
 const insertUsageEvent = `-- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
-    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at
+    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at, model
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8
+    $1, $2, $3, $4, $5, $6, $7, $8, $9
 )
 ON CONFLICT (event_id) DO NOTHING
 `
@@ -102,6 +102,7 @@ type InsertUsageEventParams struct {
 	Kind       MsBillingMetricKind `json:"kind"`
 	Value      pgtype.Numeric      `json:"value"`
 	RecordedAt time.Time           `json:"recorded_at"`
+	Model      pgtype.Text         `json:"model"`
 }
 
 // InsertUsageEvent writes one raw metered fact, idempotent on event_id.
@@ -109,7 +110,8 @@ type InsertUsageEventParams struct {
 // same SDK call (same minted eventId) a no-op. :execrows so the caller
 // can tell a fresh insert (1) from a deduped retry (0). account_id is
 // nullable (lazy account); kind is the declared kind resolved from
-// metric_definitions.
+// metric_definitions. model is the per-event AI pricing dimension
+// (migration 018) — NULL for every non-AI event.
 func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertUsageEvent,
 		arg.EventID,
@@ -120,6 +122,7 @@ func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventPara
 		arg.Kind,
 		arg.Value,
 		arg.RecordedAt,
+		arg.Model,
 	)
 	if err != nil {
 		return 0, err

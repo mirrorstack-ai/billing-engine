@@ -32,38 +32,45 @@ DO UPDATE SET status = ms_billing.billing_periods.status
 RETURNING id, status;
 
 -- RollupSumKinds aggregates the additive kinds (count, sum) by SUM(value)
--- over [period_start, period_end) per (app, module, metric). count and sum
--- both roll up by SUM; kind is carried through so the aggregate row snapshots
--- the right accumulation semantics.
+-- over [period_start, period_end) per (app, module, metric, model). count and
+-- sum both roll up by SUM; kind is carried through so the aggregate row
+-- snapshots the right accumulation semantics. model is grouped so AI events
+-- aggregate PER MODEL (the pricing dimension, migration 018) rather than
+-- collapsing models that differ ~15× into one row; COALESCE(model, '') keys
+-- non-AI events (NULL model) under a stable empty string.
 -- name: RollupSumKinds :many
 SELECT
     app_id                         AS app_id,
     module_id                      AS module_id,
     metric                         AS metric,
     kind                           AS kind,
+    COALESCE(model, '')            AS model,
     COALESCE(SUM(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
   AND recorded_at >= $2
   AND recorded_at <  $3
   AND kind IN ('count', 'sum')
-GROUP BY app_id, module_id, metric, kind;
+GROUP BY app_id, module_id, metric, kind, COALESCE(model, '');
 
 -- RollupPeakKind aggregates the peak kind by MAX(value) — the highest
--- absolute level observed in the window is the billable quantity.
+-- absolute level observed in the window is the billable quantity. model is
+-- grouped (COALESCE(model, '')) for parity with the other rollups; peak AI
+-- metrics are not expected today but the dimension stays consistent.
 -- name: RollupPeakKind :many
 SELECT
     app_id                         AS app_id,
     module_id                      AS module_id,
     metric                         AS metric,
     kind                           AS kind,
+    COALESCE(model, '')            AS model,
     COALESCE(MAX(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
   AND recorded_at >= $2
   AND recorded_at <  $3
   AND kind = 'peak'
-GROUP BY app_id, module_id, metric, kind;
+GROUP BY app_id, module_id, metric, kind, COALESCE(model, '');
 
 -- RollupTimeWeightedKind integrates the step function under the ordered
 -- samples: each sample's value is held until the NEXT sample (or until
@@ -83,6 +90,7 @@ SELECT
     module_id,
     metric,
     kind,
+    model,
     COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity
 FROM (
     SELECT
@@ -90,9 +98,10 @@ FROM (
         module_id,
         metric,
         kind,
+        COALESCE(model, '') AS model,
         value * EXTRACT(EPOCH FROM (
             LEAD(recorded_at, 1, $3::timestamptz)
-                OVER (PARTITION BY app_id, module_id, metric ORDER BY recorded_at, event_id)
+                OVER (PARTITION BY app_id, module_id, metric, COALESCE(model, '') ORDER BY recorded_at, event_id)
             - recorded_at
         )) / 3600.0 AS segment_byte_hours
     FROM ms_billing.usage_events
@@ -101,31 +110,52 @@ FROM (
       AND recorded_at <  $3
       AND kind = 'time_weighted'
 ) segments
-GROUP BY app_id, module_id, metric, kind;
+GROUP BY app_id, module_id, metric, kind, model;
 
 -- LookupMetricPrice returns the per-unit customer price for a (module, metric)
 -- at rollup time, to snapshot onto the aggregate. NULL price → unpriced
--- (decoded to 0 in Go). The rollup prices every aggregated metric through this.
+-- (decoded to 0 in Go). The rollup prices every aggregated metric through this
+-- when the event carries NO model (the catalog row is the fallback price).
 -- name: LookupMetricPrice :one
 SELECT unit_price_micros
 FROM ms_billing.metric_definitions
 WHERE module_id = $1 AND metric = $2;
 
+-- LookupModelPrice returns the RAW provider COGS for a (metric, model) pair from
+-- the per-model side-table (migration 018) — the AUTHORITATIVE price when a
+-- usage_event carries a model. unit_price_micros is NOT NULL here (a row exists
+-- only to price), so it is a plain BIGINT.
+--
+-- It does NOT filter active in the WHERE: it returns the active flag so the Go
+-- caller can DISTINGUISH "no row at all" (pgx.ErrNoRows → fall back to the
+-- LookupMetricPrice catalog row, the legitimate unpriced-model path) from "a row
+-- exists but was RETIRED to active = false". The latter must NOT silently fall
+-- back to the catalog's conservative (Haiku-floor) fallback price — that would
+-- under-bill a deliberately-retired model at a cheaper rate, defeating the loud
+-- revenue-leak guard the rollup enforces for missing infra prices. The Go caller
+-- fails the cycle loud on an inactive AI price instead.
+-- name: LookupModelPrice :one
+SELECT unit_price_micros, active
+FROM ms_billing.metric_model_prices
+WHERE metric = $1 AND model = $2;
+
 -- UpsertUsageAggregate writes the snapshotted billable record idempotently:
--- a rollup re-run for the same (period, app, module, metric) upserts the SAME
--- row (identical values) rather than duplicating it. Snapshots
--- billable_quantity + unit_price + the markup multiplier + raw/charged so a
--- closed invoice is reproducible.
+-- a rollup re-run for the same (period, app, module, metric, model) upserts the
+-- SAME row (identical values) rather than duplicating it. model is '' for non-AI
+-- metrics and the roster model id for infra.ai.* (migration 018) — it is part of
+-- the idempotency key so two models on one AI metric are distinct billable rows.
+-- Snapshots billable_quantity + unit_price + the markup multiplier + raw/charged
+-- so a closed invoice is reproducible.
 -- name: UpsertUsageAggregate :exec
 INSERT INTO ms_billing.usage_aggregates (
-    period_id, account_id, app_id, module_id, metric, kind,
+    period_id, account_id, app_id, module_id, metric, model, kind,
     billable_quantity, unit_price_micros,
     customer_markup_num, customer_markup_den,
     raw_cost_micros, charged_micros, rolled_up_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now()
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()
 )
-ON CONFLICT (period_id, app_id, module_id, metric)
+ON CONFLICT (period_id, app_id, module_id, metric, model)
 DO UPDATE SET
     billable_quantity   = EXCLUDED.billable_quantity,
     unit_price_micros   = EXCLUDED.unit_price_micros,
