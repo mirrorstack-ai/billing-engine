@@ -96,7 +96,9 @@ type Owner struct {
 func (o Owner) IsZero() bool { return o.UserID == uuid.Nil && o.OrgID == uuid.Nil }
 
 // UsageEvent is the raw fact handed to InsertUsageEvent. AccountID is Nil
-// for the lazy case (persisted as a NULL account_id).
+// for the lazy case (persisted as a NULL account_id). Model is the optional AI
+// pricing dimension (migration 018): empty for every non-AI event, persisted as
+// a NULL usage_events.model.
 type UsageEvent struct {
 	EventID    string
 	AccountID  uuid.UUID
@@ -106,6 +108,7 @@ type UsageEvent struct {
 	Kind       Kind
 	Value      float64
 	RecordedAt time.Time
+	Model      string
 }
 
 // MetricUsageRaw is one grouped row from the live current-period query.
@@ -193,6 +196,7 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 		Kind:       db.MsBillingMetricKind(ev.Kind),
 		Value:      value,
 		RecordedAt: ev.RecordedAt,
+		Model:      nullableModel(ev.Model),
 	})
 	if err != nil {
 		return false, err
@@ -267,6 +271,18 @@ func nullableAccountID(id uuid.UUID) pgtype.UUID {
 		return pgtype.UUID{} // Valid: false → NULL
 	}
 	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+// nullableModel maps the optional AI model dimension to the nullable TEXT
+// usage_events.model column: an empty model (every non-AI event) → SQL NULL, a
+// non-empty model → a valid pgtype.Text. Keeps NULL (not "") as the canonical
+// "no model" so the rollup's COALESCE(model, ”) and the metric_model_prices
+// lookup agree on the absent case.
+func nullableModel(model string) pgtype.Text {
+	if model == "" {
+		return pgtype.Text{} // Valid: false → NULL
+	}
+	return pgtype.Text{String: model, Valid: true}
 }
 
 // nullablePriceMicros maps a declared price to the nullable BIGINT the
