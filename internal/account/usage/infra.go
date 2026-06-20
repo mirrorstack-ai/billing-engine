@@ -56,6 +56,22 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens        → sum
 //	infra.ai.cache_read.tokens   additive prompt-cache READ tokens         → sum
 //	infra.ai.requests            provider-API-call count                   → count
+//	infra.request.count          per-invocation request fee                → count
+//	infra.mcp.tool_call.count    MCP routing+auth fixed cost               → count
+//	infra.cron.count             scheduler fire (the tick)                 → count
+//	infra.event.count            per-subscriber fanout delivery            → count
+//	infra.event.bytes            event-bus payload size (per-GiB)          → sum
+//	infra.egress.api.bytes       non-CDN API egress bytes (per-GiB)        → sum
+//	infra.storage.put.count      S3 tier-1 PUT/COPY ops (per-1k)           → count
+//	infra.storage.list.count     S3 tier-1 LIST ops (per-1k)               → count
+//
+// The eight P1 metrics (migration 020, design §2.2/§2.4/§2.5/§2.7) are
+// PRODUCER-TARGET: seeded + registered here so the producer PRs (#5/#6/#7) emit
+// names that already exist. Per design §3 rule 5, any per-unit COGS < 1 µ$ is
+// priced in the COARSEST unit ≥ 1 µ$ and the PRODUCER emits the value pre-scaled
+// to that unit — egress/event bytes per GiB (value = bytes/1024^3), event
+// deliveries + storage PUT/LIST per 1k (value = n/1000); request/mcp/cron stay
+// per-unit (≥ 1 µ$). The per-row contract lives in migration 020.
 //
 // The infra.ai.* family is priced PER MODEL: the producer (infra-metrics PR #2,
 // in api-platform cmd/agent) stamps the model on RecordInfraUsageRequest.Model,
@@ -110,6 +126,45 @@ func platformInfraKind(metric string) (Kind, bool) {
 		return KindSum, true
 	case "infra.ai.requests":
 		return KindCount, true
+
+	// --- P1 producer-target metrics (migration 020, design §2.2/§2.4/§2.5/§2.7).
+	// Seeded + registered HERE so the downstream producer PRs (#5 dispatch
+	// ingress, #6 async, #7 storage) emit names that already exist in BOTH this
+	// registry and the catalog. No producer in this PR. The chosen BILLING unit +
+	// the required producer value scaling live in migration 020's per-row comments
+	// (rule-5 contract); the KIND is fixed here.
+	case "infra.request.count":
+		// §2.7 per-invocation APIGW+Lambda request fee. count; value = 1/request.
+		return KindCount, true
+	case "infra.mcp.tool_call.count":
+		// §2.7 MCP routing+auth fixed cost. count; value = 1/call.
+		return KindCount, true
+	case "infra.cron.count":
+		// §2.2 scheduler fire (the tick only). count; value = 1/fire.
+		return KindCount, true
+	case "infra.event.count":
+		// §2.2 per-subscriber fanout delivery. count; priced per-1k → producer
+		// value = deliveries/1000 (rule 5; 0.4 µ$/delivery floors per-unit).
+		return KindCount, true
+	case "infra.event.bytes":
+		// §2.2 event-bus payload size. sum; NAMED bytes but priced/emitted PER GiB
+		// (rule 5; per-byte floors) → producer value = bytes/1024^3. DISTINCT from
+		// infra.egress.* (internal bus, different cost basis).
+		return KindSum, true
+	case "infra.egress.api.bytes":
+		// §2.5 non-CDN egress (JSON API + proxied module bodies). sum; NAMED bytes
+		// but priced/emitted PER GiB (rule 5; 0.0000838 µ$/byte floors) → producer
+		// value = bytes/1024^3.
+		return KindSum, true
+	case "infra.storage.put.count":
+		// §2.4 S3 tier-1 PUT/COPY ops. count; priced per-1k → producer value =
+		// puts/1000 (rule 5; 0.005 µ$/PUT floors per-unit).
+		return KindCount, true
+	case "infra.storage.list.count":
+		// §2.4 S3 tier-1 LIST ops. count; priced per-1k → producer value =
+		// lists/1000 (rule 5; 0.005 µ$/LIST floors per-unit).
+		return KindCount, true
+
 	default:
 		return "", false
 	}
