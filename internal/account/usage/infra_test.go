@@ -55,6 +55,40 @@ func TestRecordInfraUsage_AcceptsEgressBytes(t *testing.T) {
 	require.Equal(t, usage.KindSum, store.events[req.EventID].Kind)
 }
 
+func TestRecordInfraUsage_AcceptsWalltimeMS(t *testing.T) {
+	// Catalog hygiene (migration 019): infra.compute.ms was re-chartered +
+	// renamed to infra.compute.walltime.ms. The registry must recognize the NEW
+	// name with the same platform-owned KIND (sum), stamped under the sentinel.
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "infra-evt-walltime"
+	req.Metric = "infra.compute.walltime.ms"
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+
+	ev := store.events[req.EventID]
+	require.Equal(t, usage.KindSum, ev.Kind)
+	require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+	require.Equal(t, "infra.compute.walltime.ms", ev.Metric)
+}
+
+func TestRecordInfraUsage_AcceptsComputeMSDeprecatedAlias(t *testing.T) {
+	// The OLD name infra.compute.ms is kept as a DEPRECATED ALIAS so a
+	// transition-window event (api-platform dispatch still emits the old name
+	// until the producer rename in PR #4) is NOT rejected at the ingest gate.
+	// Same platform-owned KIND (sum) as the renamed metric.
+	store := newFakeStore()
+	req := validInfra() // validInfra() already uses "infra.compute.ms"
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, usage.KindSum, store.events[req.EventID].Kind)
+	require.Equal(t, "infra.compute.ms", store.events[req.EventID].Metric)
+}
+
 func TestRecordInfraUsage_RejectsNonReservedMetric(t *testing.T) {
 	// The INVERSE of the SDK gate: a non-reserved (custom) metric is rejected.
 	// A registered catalog row for it must NOT let it through this path.
