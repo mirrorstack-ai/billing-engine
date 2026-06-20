@@ -1,0 +1,47 @@
+-- Migration 022 — drop the deprecated infra.compute.ms alias (P0 cleanup).
+--
+-- Infra-metrics design (docs-temp/infra-metrics/design.md §1, PR #9). Migration
+-- 019 re-chartered infra.compute.ms → infra.compute.walltime.ms but KEPT
+-- 'infra.compute.ms' as a DEPRECATED ALIAS row (this sentinel-keyed
+-- metric_definitions row + the matching platformInfraKind switch case in
+-- internal/account/usage/infra.go) so transition-window events from the
+-- api-platform dispatch producer — which still emitted the OLD literal name —
+-- still resolved a price at rollup instead of tripping the reserved-metric
+-- loud-fail in cycle/service.go.
+--
+-- api-platform #266 has since renamed the dispatch producer to emit
+-- 'infra.compute.walltime.ms' EXCLUSIVELY (verified: internal/dispatch/handler/
+-- infra_meter.go now uses billing.MetricInfraComputeWalltimeMs; the old
+-- MetricInfraComputeMs constant is gone). Nothing emits 'infra.compute.ms'
+-- anymore, so this migration drops the now-dead alias. The authoritative
+-- compute row 'infra.compute.walltime.ms' (kind/unit/price/display_group)
+-- is untouched.
+--
+-- ───────────────────────────────────────────────────────────────────────────
+-- HARD MERGE-ORDER DEPENDENCY — APPLY LAST, AFTER api-platform #266 IS DEPLOYED.
+-- ───────────────────────────────────────────────────────────────────────────
+-- Once this DELETE lands, the alias has no platform-owned kind (its switch case
+-- is removed in the same PR) AND no catalog row, so a RecordInfraUsage call for
+-- 'infra.compute.ms' is REJECTED at the ingest gate (unregistered reserved
+-- metric). That is CORRECT only because no live producer emits the old name
+-- post-#266; applying this while any Lambda still emits 'infra.compute.ms' would
+-- start rejecting live infra facts. Do NOT apply migration 022 until api-platform
+-- #266 is merged AND deployed.
+--
+-- OPERATOR PRE-CHECK (historical usage_events): if any event was ingested under
+-- the OLD name during the 019→#266 transition window, that usage_events row
+-- persists and — after this DELETE removes the catalog row — its rollup
+-- price-lookup returns priced=false, tripping the reserved-metric loud-fail.
+-- Before applying, run:
+--   SELECT count(*) FROM ms_billing.usage_events WHERE metric = 'infra.compute.ms';
+-- If the count is 0 (expected for a pre-production system), apply freely. If > 0,
+-- first rename those historical rows forward (no schema change, data fix only):
+--   UPDATE ms_billing.usage_events
+--      SET metric = 'infra.compute.walltime.ms'
+--    WHERE metric = 'infra.compute.ms';
+--
+-- Spec: mirrorstack-docs/db/ms_billing/tables.md#metric_definitions
+
+DELETE FROM ms_billing.metric_definitions
+WHERE  module_id = '00000000-0000-0000-0000-000000000000'
+  AND  metric    = 'infra.compute.ms';

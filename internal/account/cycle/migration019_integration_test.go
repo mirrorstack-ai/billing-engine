@@ -61,6 +61,13 @@ func metricRow(t *testing.T, pool *pgxpool.Pool, metric string) (kind, unit stri
 	return kind, unit, price, active, true
 }
 
+// assertHygieneApplied verifies the catalog state produced by a DIRECT 019.up
+// (re-charter compute, keep the deprecated alias, retire egress to price 0).
+// Called ONLY from the 019.down+019.up round-trip test, where 022 is NOT
+// re-applied — so the alias 019.up creates is still present here. This is
+// deliberately NOT the end-of-full-stack state: migration 022 later DROPS the
+// alias, so the full-stack test (TestMigration019_Up_AppliesCatalogHygiene)
+// asserts the alias is absent inline instead.
 func assertHygieneApplied(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 
@@ -82,8 +89,14 @@ func assertHygieneApplied(t *testing.T, pool *pgxpool.Pool) {
 	require.EqualValues(t, 1, *price)
 	require.True(t, active)
 
-	// (3) egress.bytes retired → price 0 (NOT NULL), still active.
-	_, _, price, active, ok = metricRow(t, pool, "infra.egress.bytes")
+	assertEgressRetired(t, pool)
+}
+
+// assertEgressRetired verifies egress.bytes is the unpriced (price 0, NOT NULL)
+// reporting parent — true from 019.up onward and unaffected by later migrations.
+func assertEgressRetired(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	_, _, price, active, ok := metricRow(t, pool, "infra.egress.bytes")
 	require.True(t, ok, "infra.egress.bytes row must remain as the unpriced parent")
 	require.NotNil(t, price, "retired egress price must be 0, NOT NULL (NULL would loud-fail the cycle)")
 	require.EqualValues(t, 0, *price)
@@ -91,8 +104,23 @@ func assertHygieneApplied(t *testing.T, pool *pgxpool.Pool) {
 }
 
 func TestMigration019_Up_AppliesCatalogHygiene(t *testing.T) {
-	pool := testutil.NewTestDB(t) // applies through 019.up
-	assertHygieneApplied(t, pool)
+	pool := testutil.NewTestDB(t) // applies the FULL stack (019 re-charter … 022 alias drop)
+
+	// 019's re-charter survives the full stack: walltime.ms is the live compute row.
+	kind, unit, price, active, ok := metricRow(t, pool, "infra.compute.walltime.ms")
+	require.True(t, ok, "infra.compute.walltime.ms must exist after the full migration stack")
+	require.Equal(t, "sum", kind)
+	require.Equal(t, "millisecond", unit)
+	require.NotNil(t, price)
+	require.EqualValues(t, 1, *price)
+	require.True(t, active)
+
+	// 019 kept the infra.compute.ms alias, but migration 022 drops it — so after
+	// the full stack the alias is GONE (no producer emits the old name post-#266).
+	_, _, _, _, ok = metricRow(t, pool, "infra.compute.ms")
+	require.False(t, ok, "migration 022 drops the deprecated infra.compute.ms alias from the full stack")
+
+	assertEgressRetired(t, pool)
 }
 
 func TestMigration019_UpDownUp_RoundTrips(t *testing.T) {
