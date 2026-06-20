@@ -20,15 +20,15 @@ func validInfra() usage.RecordInfraUsageRequest {
 		EventID:     "infra-evt-1",
 		AppID:       uuid.New(),
 		OwnerUserID: uuid.New(),
-		Metric:      "infra.compute.ms",
+		Metric:      "infra.compute.walltime.ms",
 		Value:       1500,
 		RecordedAt:  time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC),
 	}
 }
 
-func TestRecordInfraUsage_AcceptsComputeMS(t *testing.T) {
+func TestRecordInfraUsage_AcceptsComputeWalltimeMS(t *testing.T) {
 	store := newFakeStore()
-	req := validInfra()
+	req := validInfra() // validInfra() uses the primary "infra.compute.walltime.ms"
 	store.accounts[req.OwnerUserID] = uuid.New()
 
 	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
@@ -40,7 +40,7 @@ func TestRecordInfraUsage_AcceptsComputeMS(t *testing.T) {
 	require.Equal(t, usage.KindSum, ev.Kind)
 	// Stamped under the platform-infra sentinel module_id, never a real module.
 	require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
-	require.Equal(t, "infra.compute.ms", ev.Metric)
+	require.Equal(t, "infra.compute.walltime.ms", ev.Metric)
 }
 
 func TestRecordInfraUsage_AcceptsEgressBytes(t *testing.T) {
@@ -55,38 +55,19 @@ func TestRecordInfraUsage_AcceptsEgressBytes(t *testing.T) {
 	require.Equal(t, usage.KindSum, store.events[req.EventID].Kind)
 }
 
-func TestRecordInfraUsage_AcceptsWalltimeMS(t *testing.T) {
-	// Catalog hygiene (migration 019): infra.compute.ms was re-chartered +
-	// renamed to infra.compute.walltime.ms. The registry must recognize the NEW
-	// name with the same platform-owned KIND (sum), stamped under the sentinel.
+func TestRecordInfraUsage_RejectsDroppedComputeMsAlias(t *testing.T) {
+	// The OLD name infra.compute.ms was a deprecated transition alias kept by
+	// migration 019; migration 022 (this PR) DROPPED it now that api-platform
+	// #266 renamed the dispatch producer to emit infra.compute.walltime.ms
+	// exclusively. With no registry case and no catalog row, the old name is an
+	// unregistered reserved metric and must be REJECTED at the ingest gate.
 	store := newFakeStore()
 	req := validInfra()
-	req.EventID = "infra-evt-walltime"
-	req.Metric = "infra.compute.walltime.ms"
+	req.Metric = "infra.compute.ms"
 
-	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
-	require.NoError(t, err)
-	require.True(t, resp.Recorded)
-
-	ev := store.events[req.EventID]
-	require.Equal(t, usage.KindSum, ev.Kind)
-	require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
-	require.Equal(t, "infra.compute.walltime.ms", ev.Metric)
-}
-
-func TestRecordInfraUsage_AcceptsComputeMSDeprecatedAlias(t *testing.T) {
-	// The OLD name infra.compute.ms is kept as a DEPRECATED ALIAS so a
-	// transition-window event (api-platform dispatch still emits the old name
-	// until the producer rename in PR #4) is NOT rejected at the ingest gate.
-	// Same platform-owned KIND (sum) as the renamed metric.
-	store := newFakeStore()
-	req := validInfra() // validInfra() already uses "infra.compute.ms"
-
-	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
-	require.NoError(t, err)
-	require.True(t, resp.Recorded)
-	require.Equal(t, usage.KindSum, store.events[req.EventID].Kind)
-	require.Equal(t, "infra.compute.ms", store.events[req.EventID].Metric)
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.events, "the dropped infra.compute.ms alias must never reach the infra plane")
 }
 
 func TestRecordInfraUsage_RejectsNonReservedMetric(t *testing.T) {
@@ -190,7 +171,7 @@ func TestRecordInfraUsage_Validation(t *testing.T) {
 		// non-AI infra metric is a caller bug (it would persist a stray
 		// usage_events.model and trigger spurious per-model lookups at rollup).
 		{"model on non-AI metric", func(r *usage.RecordInfraUsageRequest) {
-			r.Metric = "infra.compute.ms"
+			r.Metric = "infra.compute.walltime.ms"
 			r.Model = "anthropic.claude-sonnet-4-6"
 		}},
 	}
@@ -266,7 +247,7 @@ func TestRecordInfraUsage_ModelEmptyForNonAIMetric(t *testing.T) {
 	// A non-AI infra metric carries no model → empty string (stored as NULL).
 	// Model is purely a pricing dimension; it never gates acceptance.
 	store := newFakeStore()
-	req := validInfra() // infra.compute.ms, no Model
+	req := validInfra() // infra.compute.walltime.ms, no Model
 
 	_, err := newService(store).RecordInfraUsage(context.Background(), req)
 	require.NoError(t, err)

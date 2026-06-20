@@ -55,7 +55,7 @@ func newRouterWithStore(t *testing.T, store *stubUsageStore) http.Handler {
 }
 
 // infraBody is a valid RecordInfraUsage request body.
-const infraBody = `{"event_id":"infra-route-1","app_id":"11111111-1111-1111-1111-111111111111","metric":"infra.compute.ms","value":42}`
+const infraBody = `{"event_id":"infra-route-1","app_id":"11111111-1111-1111-1111-111111111111","metric":"infra.compute.walltime.ms","value":42}`
 
 func TestRecordInfraUsage_ReachableOnInternalSecret(t *testing.T) {
 	r := newRouterForTest(t)
