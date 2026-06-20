@@ -141,6 +141,13 @@ type MetricUsage struct {
 	// ChargedMicros is the customer-facing live estimate. For custom
 	// metrics it equals RawCostMicros (declared price, no markup).
 	ChargedMicros int64 `json:"charged_micros"`
+	// Group is the §11 display-group taxonomy bucket (compute / database /
+	// storage / network / ai / requests / platform_security / other) the
+	// billing UI rolls these rows up by. It is the AUTHORITATIVE catalog
+	// classification (metric_definitions.display_group); api-platform proxies
+	// it and the frontend groups on it — no name-prefix mapping. Defaults to
+	// "other" for any metric not (yet) mapped, including every custom metric.
+	Group string `json:"group"`
 }
 
 // SetModuleVisibilityRequest is the payload of SetModuleVisibility, fired

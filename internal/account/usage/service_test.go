@@ -374,6 +374,46 @@ func TestGetUsageSummary_ChargesDeclaredPriceNoMarkup(t *testing.T) {
 	require.Equal(t, int64(100), resp.Metrics[0].UnitPriceMicros)
 }
 
+func TestGetUsageSummary_PropagatesDisplayGroup(t *testing.T) {
+	// §11 billing-display compaction: the catalog's display_group classification
+	// (resolved at the store from metric_definitions.display_group) must travel
+	// verbatim through GetUsageSummary so api-platform can proxy it and the
+	// frontend can roll metrics up into ~7 group rows. billing-engine is the
+	// AUTHORITATIVE classifier; the service never re-derives the group.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.periodRows = []usage.MetricUsageRaw{
+		{Metric: "infra.ai.input.tokens", Kind: usage.KindSum, Quantity: 5, UnitPriceMicros: 1000, RawCostMicros: 5000, Group: "ai"},
+		{Metric: "infra.egress.bytes", Kind: usage.KindSum, Quantity: 2, UnitPriceMicros: 1, RawCostMicros: 2, Group: "network"},
+	}
+
+	resp, err := newService(store).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Len(t, resp.Metrics, 2)
+	require.Equal(t, "ai", resp.Metrics[0].Group)
+	require.Equal(t, "network", resp.Metrics[1].Group)
+}
+
+func TestGetUsageSummary_DefaultsGroupToOther(t *testing.T) {
+	// A custom (Plane-2) metric, or any infra metric not yet mapped, carries
+	// display_group 'other' — the store COALESCEs a missing/ungrouped catalog
+	// row to "other" (mirroring the column's NOT NULL DEFAULT 'other'). The
+	// service passes that through unchanged so the frontend always has a valid
+	// group to bucket into.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.periodRows = []usage.MetricUsageRaw{
+		{Metric: "orders.placed", Kind: usage.KindCount, Quantity: 10, UnitPriceMicros: 100, RawCostMicros: 1000, Group: "other"},
+	}
+
+	resp, err := newService(store).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Len(t, resp.Metrics, 1)
+	require.Equal(t, "other", resp.Metrics[0].Group)
+}
+
 func TestGetUsageSummary_NoAccountReturnsEmpty(t *testing.T) {
 	resp, err := newService(newFakeStore()).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: uuid.New()})
 	require.NoError(t, err)
