@@ -121,6 +121,10 @@ type MetricUsageRaw struct {
 	Quantity        float64
 	UnitPriceMicros int64
 	RawCostMicros   int64
+	// Group is the §11 display-group taxonomy bucket from the catalog
+	// (metric_definitions.display_group), COALESCE'd to 'other' in the query
+	// for a missing/ungrouped row. Carried verbatim to MetricUsage.Group.
+	Group string
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -252,6 +256,7 @@ func (s *pgxStore) CurrentPeriodUsage(ctx context.Context, accountID uuid.UUID, 
 			Quantity:        qty,
 			UnitPriceMicros: r.UnitPriceMicros,
 			RawCostMicros:   rawCost,
+			Group:           string(r.DisplayGroup),
 		})
 	}
 	return out, nil

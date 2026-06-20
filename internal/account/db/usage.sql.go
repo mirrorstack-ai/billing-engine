@@ -21,7 +21,15 @@ SELECT
     COALESCE(
         SUM(e.value * COALESCE(md.unit_price_micros, 0)),
         0
-    )::numeric                                          AS raw_cost_micros
+    )::numeric                                          AS raw_cost_micros,
+    -- display_group is the §11 compaction taxonomy the frontend rolls up by.
+    -- COALESCE to 'other' so an event whose catalog row is missing (LEFT JOIN
+    -- miss) or not-yet-grouped still carries a valid group — the same defensive
+    -- default the column itself uses. MAX() picks the single group per
+    -- (metric, kind) group-by; a metric has exactly one display_group, so MAX
+    -- is just "the group" (no aggregation ambiguity).
+    COALESCE(MAX(md.display_group), 'other')::ms_billing.metric_group
+                                                        AS display_group
 FROM ms_billing.usage_events e
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric
@@ -39,11 +47,12 @@ type CurrentPeriodUsageSummaryParams struct {
 }
 
 type CurrentPeriodUsageSummaryRow struct {
-	Metric          string              `json:"metric"`
-	Kind            MsBillingMetricKind `json:"kind"`
-	TotalQuantity   pgtype.Numeric      `json:"total_quantity"`
-	UnitPriceMicros int64               `json:"unit_price_micros"`
-	RawCostMicros   pgtype.Numeric      `json:"raw_cost_micros"`
+	Metric          string               `json:"metric"`
+	Kind            MsBillingMetricKind  `json:"kind"`
+	TotalQuantity   pgtype.Numeric       `json:"total_quantity"`
+	UnitPriceMicros int64                `json:"unit_price_micros"`
+	RawCostMicros   pgtype.Numeric       `json:"raw_cost_micros"`
+	DisplayGroup    MsBillingMetricGroup `json:"display_group"`
 }
 
 // CurrentPeriodUsageSummary is the LIVE current-period fast path used by
@@ -73,6 +82,7 @@ func (q *Queries) CurrentPeriodUsageSummary(ctx context.Context, arg CurrentPeri
 			&i.TotalQuantity,
 			&i.UnitPriceMicros,
 			&i.RawCostMicros,
+			&i.DisplayGroup,
 		); err != nil {
 			return nil, err
 		}
