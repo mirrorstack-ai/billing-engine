@@ -97,7 +97,15 @@ SELECT
     COALESCE(
         SUM(e.value * COALESCE(md.unit_price_micros, 0)),
         0
-    )::numeric                                          AS raw_cost_micros
+    )::numeric                                          AS raw_cost_micros,
+    -- display_group is the §11 compaction taxonomy the frontend rolls up by.
+    -- COALESCE to 'other' so an event whose catalog row is missing (LEFT JOIN
+    -- miss) or not-yet-grouped still carries a valid group — the same defensive
+    -- default the column itself uses. MAX() picks the single group per
+    -- (metric, kind) group-by; a metric has exactly one display_group, so MAX
+    -- is just "the group" (no aggregation ambiguity).
+    COALESCE(MAX(md.display_group), 'other')::ms_billing.metric_group
+                                                        AS display_group
 FROM ms_billing.usage_events e
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric
