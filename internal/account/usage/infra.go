@@ -49,7 +49,6 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // runtime"), so the kind is fixed HERE rather than read from metric_definitions:
 //
 //	infra.compute.walltime.ms    additive dispatch wall-time ms (fallback) → sum
-//	infra.compute.ms             DEPRECATED alias of walltime.ms           → sum
 //	infra.egress.bytes           additive CDN/egress bytes (retired)       → sum
 //	infra.ai.input.tokens        additive provider INPUT tokens            → sum
 //	infra.ai.output.tokens       additive provider OUTPUT tokens           → sum
@@ -94,23 +93,17 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // wall-time, the FALLBACK-ONLY compute basis — never co-billed with a
 // substrate-native metric). infra.egress.bytes was RETIRED to an unpriced
 // reporting parent (price 0 in 019; its CDN children infra.egress.cdn.* are P2).
-// The retired/renamed names stay registered because both are still ingested
-// during the transition window.
+// infra.egress.bytes stays registered because it is still ingested.
+//
+// The old infra.compute.ms name was kept as a deprecated transition alias in 019
+// but has now been DROPPED (migration 022 + this PR): api-platform #266 renamed
+// the dispatch producer to emit infra.compute.walltime.ms exclusively, so nothing
+// emits the old name. A RecordInfraUsage for infra.compute.ms is now rejected as
+// an unregistered reserved metric — correct, because no producer emits it.
 func platformInfraKind(metric string) (Kind, bool) {
 	switch metric {
 	case "infra.compute.walltime.ms":
 		// Re-chartered fallback-only dispatch wall-time (design §1 / §2.1).
-		return KindSum, true
-	case "infra.compute.ms":
-		// DEPRECATED alias of infra.compute.walltime.ms. api-platform dispatch
-		// (billing.MetricInfraComputeMs in internal/dispatch/handler) still emits
-		// this OLD name until the producer rename lands (PR #4). Keep the case so
-		// a transition-window event is not rejected at the ingest gate; migration
-		// 019 keeps the matching alias metric_definitions row so it also prices at
-		// rollup (otherwise the reserved-metric loud-fail in cycle/service.go
-		// would abort the cycle on an old-name event).
-		// TODO(PR #4): drop this case once api-platform emits walltime.ms and no
-		// in-flight event carries the old name (drop the 019 alias row too).
 		return KindSum, true
 	case "infra.egress.bytes":
 		// RETIRED flat egress, kept as an unpriced reporting parent (design §2.5);
@@ -285,7 +278,7 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 
 	// Model is a pricing dimension EXCLUSIVE to the infra.ai.* family (migration
 	// 018). Reject it on any other infra metric: a stray model on, say,
-	// infra.compute.ms would persist as a non-NULL usage_events.model and then
+	// infra.compute.walltime.ms would persist as a non-NULL usage_events.model and then
 	// trigger a spurious per-model lookup at rollup that always misses and falls
 	// back to the catalog — a silent footgun. The comment that model is "never
 	// read for non-AI metrics" is now ENFORCED, not just documented.
