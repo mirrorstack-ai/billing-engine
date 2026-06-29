@@ -1,7 +1,7 @@
 -- Migration 020 — P1 PRODUCER-TARGET infra catalog seed (no new producer).
 --
 -- Infra-metrics design (docs-temp/infra-metrics/design.md §2.2/§2.4/§2.5/§2.7,
--- §3 rule 5, §6). Seeds the eight P1 platform-infra metrics under the all-zero
+-- §3 rule 5, §6). Seeds the nine P1 platform-infra metrics under the all-zero
 -- sentinel module_id so the downstream PRODUCER PRs (#5 dispatch ingress / #6
 -- async / #7 storage) emit names that ALREADY exist in the catalog AND in the
 -- platformInfraKind() registry (internal/account/usage/infra.go — extended in
@@ -31,6 +31,7 @@
 --   infra.egress.api.bytes     0.0000838 µ$/B   <  1 → PER-GiB      (value in GiB)
 --   infra.storage.put.count    0.005 µ$/PUT     <  1 → PER-1K       (value = n/1000)
 --   infra.storage.list.count   0.005 µ$/LIST    <  1 → PER-1K       (value = n/1000)
+--   infra.storage.gib_hours    31.5 µ$/GiB-hr   >= 1 → PER-GiB-HOUR (value = GiB-hours)
 -- ===========================================================================
 --
 -- COSTS are the RAW PROVIDER LIST cost (COGS), NOT the customer price. The flat
@@ -49,6 +50,7 @@
 --   infra.egress.api.bytes     → sum
 --   infra.storage.put.count    → count
 --   infra.storage.list.count   → count
+--   infra.storage.gib_hours    → time_weighted
 --
 -- NAME/UNIT INCONSISTENCY FLAGGED, NOT FIXED HERE: design §3 rule 1 says the
 -- name ends in its UNIT token, but rule 5 forces a coarser BILLING unit than the
@@ -119,5 +121,15 @@ INSERT INTO ms_billing.metric_definitions (
     -- §2.4 Object storage. $0.005/1k LIST = 0.005 µ$/LIST < 1 µ$ → floors to 0
     -- per-LIST. RULE 5: bill PER 1K LISTs → 5 µ$/1k. PRODUCER value = lists /
     -- 1000.0 (one ListByPrefix continuation page emits 0.001).
-    ('00000000-0000-0000-0000-000000000000', 'infra.storage.list.count',  'count', '1k requests',   5,     true)
+    ('00000000-0000-0000-0000-000000000000', 'infra.storage.list.count',  'count', '1k requests',   5,     true),
+
+    -- §2.4 Object storage VOLUME — the dominant storage cost (not the op counts).
+    -- S3 Standard $0.023/GiB-month ÷ 730 h ≈ 31.5 µ$/GiB-hour >= 1 µ$ (no per-unit
+    -- floor — unlike the per-PUT/LIST rates). KIND time_weighted: the rollup
+    -- INTEGRATES the stored-bytes gauge over the period → GiB-hours, so cost
+    -- tracks how MUCH was stored AND for HOW LONG. NOT a peak (which would bill the
+    -- busiest instant for the whole month) and NOT an op count. Name carries the
+    -- GiB-hour basis (rule 1); PRODUCER (PR #7) emits the time-weighted GiB-hour
+    -- integral. TODO(finance): pin the per-GiB-hour rate (32 µ$ ≈ $0.023/GiB-mo).
+    ('00000000-0000-0000-0000-000000000000', 'infra.storage.gib_hours',   'time_weighted', 'GiB-hour', 32, true)
 ON CONFLICT (module_id, metric) DO NOTHING;
