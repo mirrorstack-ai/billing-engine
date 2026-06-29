@@ -48,13 +48,30 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // lookup — owns infra-metric semantics (design §3a / §5 "cdn-worker + module
 // runtime"), so the kind is fixed HERE rather than read from metric_definitions:
 //
-//	infra.compute.ms             additive dispatch/runtime wall-time ms → sum
-//	infra.egress.bytes           additive CDN/egress bytes              → sum
-//	infra.ai.input.tokens        additive provider INPUT tokens         → sum
-//	infra.ai.output.tokens       additive provider OUTPUT tokens        → sum
-//	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens     → sum
-//	infra.ai.cache_read.tokens   additive prompt-cache READ tokens      → sum
-//	infra.ai.requests            provider-API-call count                → count
+//	infra.compute.walltime.ms    additive dispatch wall-time ms (fallback) → sum
+//	infra.egress.bytes           additive CDN/egress bytes (retired)       → sum
+//	infra.ai.input.tokens        additive provider INPUT tokens            → sum
+//	infra.ai.output.tokens       additive provider OUTPUT tokens           → sum
+//	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens        → sum
+//	infra.ai.cache_read.tokens   additive prompt-cache READ tokens         → sum
+//	infra.ai.requests            provider-API-call count                   → count
+//	infra.request.count          per-invocation request fee                → count
+//	infra.mcp.tool_call.count    MCP routing+auth fixed cost               → count
+//	infra.cron.count             scheduler fire (the tick)                 → count
+//	infra.event.count            per-subscriber fanout delivery            → count
+//	infra.event.bytes            event-bus payload size (per-GiB)          → sum
+//	infra.egress.api.bytes       non-CDN API egress bytes (per-GiB)        → sum
+//	infra.storage.put.count      S3 tier-1 PUT/COPY ops (per-1k)           → count
+//	infra.storage.list.count     S3 tier-1 LIST ops (per-1k)               → count
+//	infra.storage.gib_hours      S3 stored volume (GiB-hours integral)     → time_weighted
+//
+// The eight P1 metrics (migration 020, design §2.2/§2.4/§2.5/§2.7) are
+// PRODUCER-TARGET: seeded + registered here so the producer PRs (#5/#6/#7) emit
+// names that already exist. Per design §3 rule 5, any per-unit COGS < 1 µ$ is
+// priced in the COARSEST unit ≥ 1 µ$ and the PRODUCER emits the value pre-scaled
+// to that unit — egress/event bytes per GiB (value = bytes/1024^3), event
+// deliveries + storage PUT/LIST per 1k (value = n/1000); request/mcp/cron stay
+// per-unit (≥ 1 µ$). The per-row contract lives in migration 020.
 //
 // The infra.ai.* family is priced PER MODEL: the producer (infra-metrics PR #2,
 // in api-platform cmd/agent) stamps the model on RecordInfraUsageRequest.Model,
@@ -71,11 +88,27 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // metric_definitions row (migration 017/018) with its per-unit COGS.
 // RecordInfraUsage rejects any reserved name without a case (an unregistered
 // infra metric has no platform-owned kind).
+//
+// Catalog hygiene (infra-metrics design §1, migration 019): infra.compute.ms was
+// RE-CHARTERED + RENAMED to infra.compute.walltime.ms (dispatch-observed
+// wall-time, the FALLBACK-ONLY compute basis — never co-billed with a
+// substrate-native metric). infra.egress.bytes was RETIRED to an unpriced
+// reporting parent (price 0 in 019; its CDN children infra.egress.cdn.* are P2).
+// infra.egress.bytes stays registered because it is still ingested.
+//
+// The old infra.compute.ms name was kept as a deprecated transition alias in 019
+// but has now been DROPPED (migration 022 + this PR): api-platform #266 renamed
+// the dispatch producer to emit infra.compute.walltime.ms exclusively, so nothing
+// emits the old name. A RecordInfraUsage for infra.compute.ms is now rejected as
+// an unregistered reserved metric — correct, because no producer emits it.
 func platformInfraKind(metric string) (Kind, bool) {
 	switch metric {
-	case "infra.compute.ms":
+	case "infra.compute.walltime.ms":
+		// Re-chartered fallback-only dispatch wall-time (design §1 / §2.1).
 		return KindSum, true
 	case "infra.egress.bytes":
+		// RETIRED flat egress, kept as an unpriced reporting parent (design §2.5);
+		// still ingested by cmd/infra-egress-sync, so it stays registered.
 		return KindSum, true
 	case "infra.ai.input.tokens":
 		return KindSum, true
@@ -87,6 +120,50 @@ func platformInfraKind(metric string) (Kind, bool) {
 		return KindSum, true
 	case "infra.ai.requests":
 		return KindCount, true
+
+	// --- P1 producer-target metrics (migration 020, design §2.2/§2.4/§2.5/§2.7).
+	// Seeded + registered HERE so the downstream producer PRs (#5 dispatch
+	// ingress, #6 async, #7 storage) emit names that already exist in BOTH this
+	// registry and the catalog. No producer in this PR. The chosen BILLING unit +
+	// the required producer value scaling live in migration 020's per-row comments
+	// (rule-5 contract); the KIND is fixed here.
+	case "infra.request.count":
+		// §2.7 per-invocation APIGW+Lambda request fee. count; value = 1/request.
+		return KindCount, true
+	case "infra.mcp.tool_call.count":
+		// §2.7 MCP routing+auth fixed cost. count; value = 1/call.
+		return KindCount, true
+	case "infra.cron.count":
+		// §2.2 scheduler fire (the tick only). count; value = 1/fire.
+		return KindCount, true
+	case "infra.event.count":
+		// §2.2 per-subscriber fanout delivery. count; priced per-1k → producer
+		// value = deliveries/1000 (rule 5; 0.4 µ$/delivery floors per-unit).
+		return KindCount, true
+	case "infra.event.bytes":
+		// §2.2 event-bus payload size. sum; NAMED bytes but priced/emitted PER GiB
+		// (rule 5; per-byte floors) → producer value = bytes/1024^3. DISTINCT from
+		// infra.egress.* (internal bus, different cost basis).
+		return KindSum, true
+	case "infra.egress.api.bytes":
+		// §2.5 non-CDN egress (JSON API + proxied module bodies). sum; NAMED bytes
+		// but priced/emitted PER GiB (rule 5; 0.0000838 µ$/byte floors) → producer
+		// value = bytes/1024^3.
+		return KindSum, true
+	case "infra.storage.put.count":
+		// §2.4 S3 tier-1 PUT/COPY ops. count; priced per-1k → producer value =
+		// puts/1000 (rule 5; 0.005 µ$/PUT floors per-unit).
+		return KindCount, true
+	case "infra.storage.list.count":
+		// §2.4 S3 tier-1 LIST ops. count; priced per-1k → producer value =
+		// lists/1000 (rule 5; 0.005 µ$/LIST floors per-unit).
+		return KindCount, true
+	case "infra.storage.gib_hours":
+		// §2.4 S3 stored VOLUME. time_weighted: producer (PR #7) emits the
+		// GiB-hours integral of the stored-bytes gauge (how much × how long), NOT
+		// a peak and NOT an op count. Priced per GiB-hour (~31.5 µ$ >= 1, no floor).
+		return KindTimeWeighted, true
+
 	default:
 		return "", false
 	}
@@ -207,7 +284,7 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 
 	// Model is a pricing dimension EXCLUSIVE to the infra.ai.* family (migration
 	// 018). Reject it on any other infra metric: a stray model on, say,
-	// infra.compute.ms would persist as a non-NULL usage_events.model and then
+	// infra.compute.walltime.ms would persist as a non-NULL usage_events.model and then
 	// trigger a spurious per-model lookup at rollup that always misses and falls
 	// back to the catalog — a silent footgun. The comment that model is "never
 	// read for non-AI metrics" is now ENFORCED, not just documented.

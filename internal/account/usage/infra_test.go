@@ -20,15 +20,15 @@ func validInfra() usage.RecordInfraUsageRequest {
 		EventID:     "infra-evt-1",
 		AppID:       uuid.New(),
 		OwnerUserID: uuid.New(),
-		Metric:      "infra.compute.ms",
+		Metric:      "infra.compute.walltime.ms",
 		Value:       1500,
 		RecordedAt:  time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC),
 	}
 }
 
-func TestRecordInfraUsage_AcceptsComputeMS(t *testing.T) {
+func TestRecordInfraUsage_AcceptsComputeWalltimeMS(t *testing.T) {
 	store := newFakeStore()
-	req := validInfra()
+	req := validInfra() // validInfra() uses the primary "infra.compute.walltime.ms"
 	store.accounts[req.OwnerUserID] = uuid.New()
 
 	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
@@ -40,7 +40,7 @@ func TestRecordInfraUsage_AcceptsComputeMS(t *testing.T) {
 	require.Equal(t, usage.KindSum, ev.Kind)
 	// Stamped under the platform-infra sentinel module_id, never a real module.
 	require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
-	require.Equal(t, "infra.compute.ms", ev.Metric)
+	require.Equal(t, "infra.compute.walltime.ms", ev.Metric)
 }
 
 func TestRecordInfraUsage_AcceptsEgressBytes(t *testing.T) {
@@ -53,6 +53,21 @@ func TestRecordInfraUsage_AcceptsEgressBytes(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, resp.Recorded)
 	require.Equal(t, usage.KindSum, store.events[req.EventID].Kind)
+}
+
+func TestRecordInfraUsage_RejectsDroppedComputeMsAlias(t *testing.T) {
+	// The OLD name infra.compute.ms was a deprecated transition alias kept by
+	// migration 019; migration 022 (this PR) DROPPED it now that api-platform
+	// #266 renamed the dispatch producer to emit infra.compute.walltime.ms
+	// exclusively. With no registry case and no catalog row, the old name is an
+	// unregistered reserved metric and must be REJECTED at the ingest gate.
+	store := newFakeStore()
+	req := validInfra()
+	req.Metric = "infra.compute.ms"
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.events, "the dropped infra.compute.ms alias must never reach the infra plane")
 }
 
 func TestRecordInfraUsage_RejectsNonReservedMetric(t *testing.T) {
@@ -156,7 +171,7 @@ func TestRecordInfraUsage_Validation(t *testing.T) {
 		// non-AI infra metric is a caller bug (it would persist a stray
 		// usage_events.model and trigger spurious per-model lookups at rollup).
 		{"model on non-AI metric", func(r *usage.RecordInfraUsageRequest) {
-			r.Metric = "infra.compute.ms"
+			r.Metric = "infra.compute.walltime.ms"
 			r.Model = "anthropic.claude-sonnet-4-6"
 		}},
 	}
@@ -232,7 +247,7 @@ func TestRecordInfraUsage_ModelEmptyForNonAIMetric(t *testing.T) {
 	// A non-AI infra metric carries no model → empty string (stored as NULL).
 	// Model is purely a pricing dimension; it never gates acceptance.
 	store := newFakeStore()
-	req := validInfra() // infra.compute.ms, no Model
+	req := validInfra() // infra.compute.walltime.ms, no Model
 
 	_, err := newService(store).RecordInfraUsage(context.Background(), req)
 	require.NoError(t, err)
@@ -252,4 +267,77 @@ func TestRecordInfraUsage_AIMetricWithoutModelStillAccepted(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, resp.Recorded)
 	require.Equal(t, "", store.events[req.EventID].Model)
+}
+
+// --- P1 producer-target catalog seed (migration 020 / infra-metrics PR #4) -----
+
+func TestRecordInfraUsage_AcceptsP1CountMetrics(t *testing.T) {
+	// The P1 COUNT-kind metrics (design §2.2/§2.4/§2.7) are registered here so the
+	// downstream producer PRs (#5/#6/#7) emit names that already exist in the
+	// registry + catalog. RecordInfraUsage must ACCEPT each with kind=count,
+	// stamped under the platform-infra sentinel (no per-module catalog lookup).
+	// The per-1k vs per-unit BILLING scaling is the producer's job (it pre-scales
+	// the value); the ingest registry only fixes the KIND.
+	for _, metric := range []string{
+		"infra.request.count",
+		"infra.mcp.tool_call.count",
+		"infra.cron.count",
+		"infra.event.count",
+		"infra.storage.put.count",
+		"infra.storage.list.count",
+	} {
+		t.Run(metric, func(t *testing.T) {
+			store := newFakeStore()
+			req := validInfra()
+			req.EventID = "p1-" + metric
+			req.Metric = metric
+
+			resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			ev := store.events[req.EventID]
+			require.Equal(t, usage.KindCount, ev.Kind, "P1 count metrics are platform-owned kind=count")
+			require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+			require.Equal(t, metric, ev.Metric)
+		})
+	}
+}
+
+func TestRecordInfraUsage_AcceptsP1SumByteMetrics(t *testing.T) {
+	// The P1 SUM-kind byte metrics (design §2.2/§2.5) are additive byte totals.
+	// They are NAMED in bytes but priced/emitted PER GiB (rule 5); the registry
+	// only fixes the KIND (sum). Both must be accepted under the sentinel.
+	for _, metric := range []string{
+		"infra.event.bytes",
+		"infra.egress.api.bytes",
+	} {
+		t.Run(metric, func(t *testing.T) {
+			store := newFakeStore()
+			req := validInfra()
+			req.EventID = "p1-" + metric
+			req.Metric = metric
+
+			resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			ev := store.events[req.EventID]
+			require.Equal(t, usage.KindSum, ev.Kind, "P1 byte metrics are platform-owned kind=sum")
+			require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+			require.Equal(t, metric, ev.Metric)
+		})
+	}
+}
+
+func TestRecordInfraUsage_RejectsModelOnP1Metric(t *testing.T) {
+	// Model is a pricing dimension EXCLUSIVE to infra.ai.* — none of the P1
+	// metrics are AI, so a stray model must be rejected (it would persist a
+	// non-NULL usage_events.model and trigger spurious per-model lookups).
+	store := newFakeStore()
+	req := validInfra()
+	req.Metric = "infra.request.count"
+	req.Model = "anthropic.claude-sonnet-4-6"
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.events)
 }
