@@ -63,6 +63,7 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.egress.api.bytes       non-CDN API egress bytes (per-GiB)        → sum
 //	infra.storage.put.count      S3 tier-1 PUT/COPY ops (per-1k)           → count
 //	infra.storage.list.count     S3 tier-1 LIST ops (per-1k)               → count
+//	infra.storage.gib_hours      S3 stored volume (GiB-hours integral)     → time_weighted
 //
 // The eight P1 metrics (migration 020, design §2.2/§2.4/§2.5/§2.7) are
 // PRODUCER-TARGET: seeded + registered here so the producer PRs (#5/#6/#7) emit
@@ -157,6 +158,11 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// §2.4 S3 tier-1 LIST ops. count; priced per-1k → producer value =
 		// lists/1000 (rule 5; 0.005 µ$/LIST floors per-unit).
 		return KindCount, true
+	case "infra.storage.gib_hours":
+		// §2.4 S3 stored VOLUME. time_weighted: producer (PR #7) emits the
+		// GiB-hours integral of the stored-bytes gauge (how much × how long), NOT
+		// a peak and NOT an op count. Priced per GiB-hour (~31.5 µ$ >= 1, no floor).
+		return KindTimeWeighted, true
 
 	default:
 		return "", false

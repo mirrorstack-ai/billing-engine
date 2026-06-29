@@ -39,7 +39,8 @@
 --   ai      : infra.ai.input.tokens, infra.ai.output.tokens,
 --             infra.ai.cache_write.tokens, infra.ai.cache_read.tokens,
 --             infra.ai.requests
---   storage : infra.storage.put.count, infra.storage.list.count
+--   storage : infra.storage.put.count, infra.storage.list.count,
+--             infra.storage.gib_hours
 --   requests: infra.request.count, infra.mcp.tool_call.count,
 --             infra.event.count, infra.event.bytes
 -- (database / platform_security have no seeded rows yet; nothing to backfill.)
@@ -107,7 +108,7 @@ WHERE module_id = '00000000-0000-0000-0000-000000000000'
 UPDATE ms_billing.metric_definitions
 SET display_group = 'storage'
 WHERE module_id = '00000000-0000-0000-0000-000000000000'
-  AND metric IN ('infra.storage.put.count', 'infra.storage.list.count');
+  AND metric IN ('infra.storage.put.count', 'infra.storage.list.count', 'infra.storage.gib_hours');
 
 UPDATE ms_billing.metric_definitions
 SET display_group = 'requests'
