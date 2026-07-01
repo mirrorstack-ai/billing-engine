@@ -57,6 +57,24 @@ type Store interface {
 	// visibility (developer margin-share dimension; NEVER a customer
 	// markup). Idempotent on module_id.
 	UpsertModuleVisibility(ctx context.Context, moduleID uuid.UUID, vis Visibility) error
+
+	// UsageHistory reads the IMMUTABLE billable record (usage_aggregates,
+	// joined to its billing_periods row) for every closed period whose
+	// period_start falls in [windowStart, windowEnd) — the multi-month
+	// trend-chart read GetUsageHistory serves. Rows are grouped at (period,
+	// metric, kind), summed across every model / module_version split, and
+	// returned ordered oldest-to-newest by period then metric. A period with
+	// no usage_aggregates rows yet (not rolled up, or truly zero usage)
+	// simply contributes no rows.
+	UsageHistory(ctx context.Context, accountID uuid.UUID, windowStart, windowEnd time.Time) ([]PeriodMetricUsageRaw, error)
+
+	// VersionBreakdown sums usage_aggregates grouped by module_version for
+	// ONE period — the period whose billing_periods row is keyed
+	// (accountID, periodStart). moduleID == uuid.Nil means "every one of the
+	// owner's modules"; a non-zero moduleID narrows to that module's
+	// versions only. A period not yet rolled up returns no rows (not an
+	// error).
+	VersionBreakdown(ctx context.Context, accountID uuid.UUID, periodStart time.Time, moduleID uuid.UUID) ([]VersionUsageRaw, error)
 }
 
 // MetricDefinition is the catalog projection the ingest path resolves
@@ -98,17 +116,20 @@ func (o Owner) IsZero() bool { return o.UserID == uuid.Nil && o.OrgID == uuid.Ni
 // UsageEvent is the raw fact handed to InsertUsageEvent. AccountID is Nil
 // for the lazy case (persisted as a NULL account_id). Model is the optional AI
 // pricing dimension (migration 018): empty for every non-AI event, persisted as
-// a NULL usage_events.model.
+// a NULL usage_events.model. ModuleVersion is the optional version-attribution
+// dimension (migration 023, purely reporting — never priced): empty when no
+// version is carried, persisted as a NULL usage_events.module_version.
 type UsageEvent struct {
-	EventID    string
-	AccountID  uuid.UUID
-	AppID      uuid.UUID
-	ModuleID   uuid.UUID
-	Metric     string
-	Kind       Kind
-	Value      float64
-	RecordedAt time.Time
-	Model      string
+	EventID       string
+	AccountID     uuid.UUID
+	AppID         uuid.UUID
+	ModuleID      uuid.UUID
+	Metric        string
+	Kind          Kind
+	Value         float64
+	RecordedAt    time.Time
+	Model         string
+	ModuleVersion string
 }
 
 // MetricUsageRaw is one grouped row from the live current-period query.
@@ -116,6 +137,9 @@ type UsageEvent struct {
 // (round-half-up) at the store boundary. For custom metrics this IS the
 // customer charge (no blanket markup applied by the service).
 type MetricUsageRaw struct {
+	// ModuleID is the module that emitted the metric (the query now groups by
+	// it, widened from PR #3's (metric, kind) only — see CurrentPeriodUsage).
+	ModuleID        uuid.UUID
 	Metric          string
 	Kind            Kind
 	Quantity        float64
@@ -125,6 +149,37 @@ type MetricUsageRaw struct {
 	// (metric_definitions.display_group), COALESCE'd to 'other' in the query
 	// for a missing/ungrouped row. Carried verbatim to MetricUsage.Group.
 	Group string
+	// Visibility is the module's published/private margin-share class
+	// (module_visibility, migration 010), COALESCE'd to 'private' in the
+	// query for a module with no visibility row yet (design §7-B default).
+	Visibility Visibility
+}
+
+// PeriodMetricUsageRaw is one grouped row from the multi-month history query:
+// a metric's rolled-up totals within ONE billing period, summed across every
+// model / module_version split. Money fields are already whole int64 micros
+// (unlike MetricUsageRaw's live-estimate NUMERIC decode) because
+// usage_aggregates snapshots money as BIGINT, so SUM() stays exact.
+type PeriodMetricUsageRaw struct {
+	PeriodStart     time.Time
+	PeriodEnd       time.Time
+	Metric          string
+	Kind            Kind
+	Quantity        float64
+	UnitPriceMicros int64
+	RawCostMicros   int64
+	ChargedMicros   int64
+	Group           string
+}
+
+// VersionUsageRaw is one grouped row from the version-breakdown query: a
+// module_version's summed totals across every metric (and every model split)
+// in the resolved period.
+type VersionUsageRaw struct {
+	ModuleVersion    string
+	BillableQuantity float64
+	RawCostMicros    int64
+	ChargedMicros    int64
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -192,15 +247,16 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 		return false, err
 	}
 	rows, err := s.q.InsertUsageEvent(ctx, db.InsertUsageEventParams{
-		EventID:    ev.EventID,
-		AccountID:  nullableAccountID(ev.AccountID),
-		AppID:      ev.AppID.String(),
-		ModuleID:   ev.ModuleID.String(),
-		Metric:     ev.Metric,
-		Kind:       db.MsBillingMetricKind(ev.Kind),
-		Value:      value,
-		RecordedAt: ev.RecordedAt,
-		Model:      nullableModel(ev.Model),
+		EventID:       ev.EventID,
+		AccountID:     nullableAccountID(ev.AccountID),
+		AppID:         ev.AppID.String(),
+		ModuleID:      ev.ModuleID.String(),
+		Metric:        ev.Metric,
+		Kind:          db.MsBillingMetricKind(ev.Kind),
+		Value:         value,
+		RecordedAt:    ev.RecordedAt,
+		Model:         nullableModel(ev.Model),
+		ModuleVersion: nullableModuleVersion(ev.ModuleVersion),
 	})
 	if err != nil {
 		return false, err
@@ -250,13 +306,84 @@ func (s *pgxStore) CurrentPeriodUsage(ctx context.Context, accountID uuid.UUID, 
 		if err != nil {
 			return nil, fmt.Errorf("decode raw_cost_micros for metric %q: %w", r.Metric, err)
 		}
+		moduleID, err := uuid.Parse(r.ModuleID)
+		if err != nil {
+			return nil, fmt.Errorf("decode module_id for metric %q: %w", r.Metric, err)
+		}
 		out = append(out, MetricUsageRaw{
+			ModuleID:        moduleID,
 			Metric:          r.Metric,
 			Kind:            Kind(r.Kind),
 			Quantity:        qty,
 			UnitPriceMicros: r.UnitPriceMicros,
 			RawCostMicros:   rawCost,
 			Group:           string(r.DisplayGroup),
+			Visibility:      Visibility(r.Visibility),
+		})
+	}
+	return out, nil
+}
+
+// UsageHistory reads the immutable billable record (usage_aggregates joined
+// to billing_periods) for the trailing window — see the Store interface doc.
+func (s *pgxStore) UsageHistory(ctx context.Context, accountID uuid.UUID, windowStart, windowEnd time.Time) ([]PeriodMetricUsageRaw, error) {
+	rows, err := s.q.UsageHistoryForAccount(ctx, db.UsageHistoryForAccountParams{
+		AccountID:     accountID.String(),
+		PeriodStart:   windowStart,
+		PeriodStart_2: windowEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PeriodMetricUsageRaw, 0, len(rows))
+	for _, r := range rows {
+		qty, err := floatFromNumeric(r.TotalQuantity)
+		if err != nil {
+			return nil, fmt.Errorf("decode total_quantity for metric %q: %w", r.Metric, err)
+		}
+		out = append(out, PeriodMetricUsageRaw{
+			PeriodStart:     r.PeriodStart,
+			PeriodEnd:       r.PeriodEnd,
+			Metric:          r.Metric,
+			Kind:            Kind(r.Kind),
+			Quantity:        qty,
+			UnitPriceMicros: r.UnitPriceMicros,
+			RawCostMicros:   r.RawCostMicros,
+			ChargedMicros:   r.ChargedMicros,
+			Group:           string(r.DisplayGroup),
+		})
+	}
+	return out, nil
+}
+
+// VersionBreakdown sums usage_aggregates grouped by module_version for one
+// period — see the Store interface doc. moduleID == uuid.Nil disables the
+// module filter (every one of the owner's modules is included).
+func (s *pgxStore) VersionBreakdown(ctx context.Context, accountID uuid.UUID, periodStart time.Time, moduleID uuid.UUID) ([]VersionUsageRaw, error) {
+	hasFilter := moduleID != uuid.Nil
+	// $3::boolean short-circuits the OR before $4 is ever compared when
+	// hasFilter is false, so moduleID (uuid.Nil in that case) is just an inert
+	// well-formed placeholder satisfying the NOT NULL uuid column type.
+	rows, err := s.q.VersionBreakdownForAccount(ctx, db.VersionBreakdownForAccountParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		Column3:     hasFilter,
+		ModuleID:    moduleID.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VersionUsageRaw, 0, len(rows))
+	for _, r := range rows {
+		qty, err := floatFromNumeric(r.TotalQuantity)
+		if err != nil {
+			return nil, fmt.Errorf("decode total_quantity for module_version %q: %w", r.ModuleVersion, err)
+		}
+		out = append(out, VersionUsageRaw{
+			ModuleVersion:    r.ModuleVersion,
+			BillableQuantity: qty,
+			RawCostMicros:    r.RawCostMicros,
+			ChargedMicros:    r.ChargedMicros,
 		})
 	}
 	return out, nil
@@ -288,6 +415,17 @@ func nullableModel(model string) pgtype.Text {
 		return pgtype.Text{} // Valid: false → NULL
 	}
 	return pgtype.Text{String: model, Valid: true}
+}
+
+// nullableModuleVersion maps the optional version-attribution dimension to
+// the nullable TEXT usage_events.module_version column: an empty version
+// (every event that doesn't report one) → SQL NULL, matching nullableModel's
+// contract for the analogous model column.
+func nullableModuleVersion(version string) pgtype.Text {
+	if version == "" {
+		return pgtype.Text{} // Valid: false → NULL
+	}
+	return pgtype.Text{String: version, Valid: true}
 }
 
 // nullablePriceMicros maps a declared price to the nullable BIGINT the

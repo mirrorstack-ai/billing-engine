@@ -210,6 +210,13 @@ type RecordInfraUsageRequest struct {
 	// catalog fallback), and it is never read for non-AI metrics.
 	Model string `json:"model,omitempty"`
 
+	// ModuleVersion is the OPTIONAL version-attribution dimension (migration
+	// 023): purely a reporting dimension, never a pricing one (unlike Model,
+	// it is not restricted to the infra.ai.* family — any infra metric may
+	// carry a version). Empty when the producer doesn't report one → stored
+	// as a NULL usage_events.module_version.
+	ModuleVersion string `json:"module_version,omitempty"`
+
 	// Value is the platform-MEASURED quantity (ms / bytes). Authoritative and
 	// non-zeroable — it comes from the platform's chokepoint, never an SDK hint.
 	//
@@ -313,15 +320,16 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	}
 
 	recorded, err := s.store.InsertUsageEvent(ctx, UsageEvent{
-		EventID:    req.EventID,
-		AccountID:  accountID,
-		AppID:      req.AppID,
-		ModuleID:   platformInfraModuleID, // platform-infra sentinel
-		Metric:     req.Metric,
-		Kind:       kind,
-		Value:      req.Value,
-		RecordedAt: recordedAt,
-		Model:      req.Model, // empty for non-AI metrics → NULL usage_events.model
+		EventID:       req.EventID,
+		AccountID:     accountID,
+		AppID:         req.AppID,
+		ModuleID:      platformInfraModuleID, // platform-infra sentinel
+		Metric:        req.Metric,
+		Kind:          kind,
+		Value:         req.Value,
+		RecordedAt:    recordedAt,
+		Model:         req.Model,         // empty for non-AI metrics → NULL usage_events.model
+		ModuleVersion: req.ModuleVersion, // empty → NULL usage_events.module_version
 	})
 	if err != nil {
 		return nil, billing.Internal("insert infra usage event failed", err)
