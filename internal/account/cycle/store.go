@@ -193,13 +193,18 @@ type InvoiceMirror struct {
 // MAX, time_weighted integral). Model is the AI pricing dimension the rollup
 // groups by (migration 018): empty for non-AI metrics (the rollup's
 // COALESCE(model, ”)), a roster model id for infra.ai.* events. It selects the
-// price source in MetricPriceMicros (per-model vs catalog).
+// price source in MetricPriceMicros (per-model vs catalog). ModuleVersion is
+// the version-attribution dimension the rollup ALSO groups by (migration
+// 023): empty for a version-less event, the emitting module's version
+// otherwise. It never affects pricing — it is carried straight through onto
+// the aggregate for reporting only.
 type RawAggregate struct {
 	AppID            uuid.UUID
 	ModuleID         uuid.UUID
 	Metric           string
 	Kind             Kind
 	Model            string
+	ModuleVersion    string
 	BillableQuantity string
 }
 
@@ -259,7 +264,7 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 	}
 
 	out := make([]RawAggregate, 0, len(sumRows)+len(peakRows)+len(twRows))
-	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, model string, qty pgtype.Numeric) error {
+	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, qty pgtype.Numeric) error {
 		app, err := uuid.Parse(appID)
 		if err != nil {
 			return err
@@ -273,23 +278,24 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 			ModuleID:         mod,
 			Metric:           metric,
 			Kind:             Kind(kind),
-			Model:            model, // "" for non-AI rows (COALESCE(model, ''))
+			Model:            model,         // "" for non-AI rows (COALESCE(model, ''))
+			ModuleVersion:    moduleVersion, // "" for version-less rows (COALESCE(module_version, ''))
 			BillableQuantity: numericString(qty),
 		})
 		return nil
 	}
 	for _, r := range sumRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range peakRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range twRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity); err != nil {
 			return nil, err
 		}
 	}
@@ -354,6 +360,7 @@ func (s *pgxStore) UpsertUsageAggregate(ctx context.Context, periodID, accountID
 		ModuleID:          agg.ModuleID.String(),
 		Metric:            agg.Metric,
 		Model:             agg.Model,
+		ModuleVersion:     agg.ModuleVersion,
 		Kind:              db.MsBillingMetricKind(agg.Kind),
 		BillableQuantity:  qty,
 		UnitPriceMicros:   agg.UnitPriceMicros,

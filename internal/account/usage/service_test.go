@@ -20,11 +20,17 @@ func inf() float64 { return math.Inf(1) }
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
-	defs       map[string]usage.MetricDefinition // key: module/metric
-	accounts   map[uuid.UUID]uuid.UUID           // owner userID → accountID
-	events     map[string]usage.UsageEvent       // event_id → event (idempotency)
-	periodRows []usage.MetricUsageRaw
-	visibility map[uuid.UUID]usage.Visibility
+	defs        map[string]usage.MetricDefinition // key: module/metric
+	accounts    map[uuid.UUID]uuid.UUID           // owner userID → accountID
+	events      map[string]usage.UsageEvent       // event_id → event (idempotency)
+	periodRows  []usage.MetricUsageRaw
+	historyRows []usage.PeriodMetricUsageRaw
+	versionRows []usage.VersionUsageRaw
+	visibility  map[uuid.UUID]usage.Visibility
+
+	// captured VersionBreakdown call args, so a test can assert the resolved
+	// module filter reached the store unchanged.
+	gotVersionModuleID uuid.UUID
 
 	errLookup     error
 	errAccount    error
@@ -32,6 +38,8 @@ type fakeStore struct {
 	errPeriod     error
 	errVisibility error
 	errUpsertDef  error
+	errHistory    error
+	errVersion    error
 }
 
 func newFakeStore() *fakeStore {
@@ -104,6 +112,21 @@ func (f *fakeStore) UpsertModuleVisibility(_ context.Context, moduleID uuid.UUID
 	}
 	f.visibility[moduleID] = vis
 	return nil
+}
+
+func (f *fakeStore) UsageHistory(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]usage.PeriodMetricUsageRaw, error) {
+	if f.errHistory != nil {
+		return nil, f.errHistory
+	}
+	return f.historyRows, nil
+}
+
+func (f *fakeStore) VersionBreakdown(_ context.Context, _ uuid.UUID, _ time.Time, moduleID uuid.UUID) ([]usage.VersionUsageRaw, error) {
+	f.gotVersionModuleID = moduleID
+	if f.errVersion != nil {
+		return nil, f.errVersion
+	}
+	return f.versionRows, nil
 }
 
 // --- helpers --------------------------------------------------------------
@@ -276,6 +299,29 @@ func TestRecordUsage_DefaultsRecordedAtToNow(t *testing.T) {
 	require.False(t, store.events[req.EventID].RecordedAt.IsZero())
 }
 
+func TestRecordUsage_CarriesModuleVersion(t *testing.T) {
+	// The optional ModuleVersion field (migration 023, purely reporting) is
+	// carried onto the usage_events.module_version column.
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+	req.ModuleVersion = "3.2.1"
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "3.2.1", store.events[req.EventID].ModuleVersion)
+}
+
+func TestRecordUsage_ModuleVersionEmptyWhenNotCarried(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord() // no ModuleVersion set
+	declare(store, req, usage.KindCount)
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "", store.events[req.EventID].ModuleVersion)
+}
+
 func TestRecordUsage_InternalOnStoreError(t *testing.T) {
 	store := newFakeStore()
 	req := validRecord()
@@ -414,6 +460,42 @@ func TestGetUsageSummary_DefaultsGroupToOther(t *testing.T) {
 	require.Equal(t, "other", resp.Metrics[0].Group)
 }
 
+func TestGetUsageSummary_PropagatesModuleIDAndVisibility(t *testing.T) {
+	// A consumer previously had to hardcode a 30% platform-take assumption
+	// because it couldn't see the real module_visibility value; GetUsageSummary
+	// now carries both the emitting module_id and its visibility per metric.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	mod := uuid.New()
+	store.periodRows = []usage.MetricUsageRaw{
+		{ModuleID: mod, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 10, UnitPriceMicros: 100, RawCostMicros: 1000, Visibility: usage.VisibilityPublished},
+	}
+
+	resp, err := newService(store).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Len(t, resp.Metrics, 1)
+	require.Equal(t, mod, resp.Metrics[0].ModuleID)
+	require.Equal(t, usage.VisibilityPublished, resp.Metrics[0].Visibility)
+}
+
+func TestGetUsageSummary_DefaultsVisibilityToPrivate(t *testing.T) {
+	// A module with no visibility row yet defaults to 'private' (the higher
+	// platform-take rate), matching the settlement default (design §7-B: never
+	// under-collect on a lagging publish).
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.periodRows = []usage.MetricUsageRaw{
+		{Metric: "orders.placed", Kind: usage.KindCount, Quantity: 10, UnitPriceMicros: 100, RawCostMicros: 1000, Visibility: usage.VisibilityPrivate},
+	}
+
+	resp, err := newService(store).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Len(t, resp.Metrics, 1)
+	require.Equal(t, usage.VisibilityPrivate, resp.Metrics[0].Visibility)
+}
+
 func TestGetUsageSummary_NoAccountReturnsEmpty(t *testing.T) {
 	resp, err := newService(newFakeStore()).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: uuid.New()})
 	require.NoError(t, err)
@@ -423,6 +505,169 @@ func TestGetUsageSummary_NoAccountReturnsEmpty(t *testing.T) {
 func TestGetUsageSummary_RequiresOwner(t *testing.T) {
 	_, err := newService(newFakeStore()).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{})
 	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+// --- GetUsageHistory -------------------------------------------------------
+
+func TestGetUsageHistory_BucketsRowsIntoOrderedPeriods(t *testing.T) {
+	// Multi-month data returns correctly ordered/bucketed: rows for two
+	// different periods (already ordered period_start ASC, metric ASC by the
+	// store contract) must split into two PeriodUsage entries, oldest first,
+	// each carrying only its own period's metrics.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	jan := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	feb := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	mar := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	store.historyRows = []usage.PeriodMetricUsageRaw{
+		{PeriodStart: jan, PeriodEnd: feb, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 10, RawCostMicros: 1000, ChargedMicros: 1000},
+		{PeriodStart: feb, PeriodEnd: mar, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 20, RawCostMicros: 2000, ChargedMicros: 2000},
+	}
+
+	resp, err := newService(store).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{OwnerUserID: owner, Months: 6})
+	require.NoError(t, err)
+	require.Len(t, resp.Periods, 2)
+	require.True(t, resp.Periods[0].PeriodStart.Equal(jan), "oldest period first")
+	require.True(t, resp.Periods[1].PeriodStart.Equal(feb))
+	require.Len(t, resp.Periods[0].Metrics, 1)
+	require.EqualValues(t, 1000, resp.Periods[0].Metrics[0].ChargedMicros)
+	require.EqualValues(t, 2000, resp.Periods[1].Metrics[0].ChargedMicros)
+}
+
+func TestGetUsageHistory_MultipleMetricsWithinOnePeriod(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	jan := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	feb := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	store.historyRows = []usage.PeriodMetricUsageRaw{
+		{PeriodStart: jan, PeriodEnd: feb, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 10, ChargedMicros: 1000},
+		{PeriodStart: jan, PeriodEnd: feb, Metric: "storage.bytes", Kind: usage.KindTimeWeighted, Quantity: 5, ChargedMicros: 500},
+	}
+
+	resp, err := newService(store).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{OwnerUserID: owner, Months: 6})
+	require.NoError(t, err)
+	require.Len(t, resp.Periods, 1, "both rows share one period_start")
+	require.Len(t, resp.Periods[0].Metrics, 2)
+}
+
+func TestGetUsageHistory_MissingMonthsDoNotError(t *testing.T) {
+	// A month with no rolled-up usage (rollup hasn't run, or zero usage)
+	// simply contributes no row — a gap in the returned Periods, never an
+	// error.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	// historyRows stays empty: no usage_aggregates rows exist for the window.
+
+	resp, err := newService(store).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{OwnerUserID: owner, Months: 6})
+	require.NoError(t, err)
+	require.Empty(t, resp.Periods)
+}
+
+func TestGetUsageHistory_NoAccountReturnsEmpty(t *testing.T) {
+	resp, err := newService(newFakeStore()).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{OwnerUserID: uuid.New(), Months: 6})
+	require.NoError(t, err)
+	require.Empty(t, resp.Periods)
+}
+
+func TestGetUsageHistory_RequiresOwner(t *testing.T) {
+	_, err := newService(newFakeStore()).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{Months: 6})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestGetUsageHistory_RejectsNonPositiveMonths(t *testing.T) {
+	for _, months := range []int{0, -1} {
+		_, err := newService(newFakeStore()).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{OwnerUserID: uuid.New(), Months: months})
+		requireCode(t, err, billing.CodeInvalidInput)
+	}
+}
+
+func TestGetUsageHistory_InternalOnStoreError(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errHistory = errors.New("boom")
+	_, err := newService(store).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{OwnerUserID: owner, Months: 6})
+	requireCode(t, err, billing.CodeInternal)
+}
+
+// --- GetVersionBreakdown ---------------------------------------------------
+
+func TestGetVersionBreakdown_GroupsByVersion(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.versionRows = []usage.VersionUsageRaw{
+		{ModuleVersion: "1.0.0", BillableQuantity: 10, RawCostMicros: 1000, ChargedMicros: 1000},
+		{ModuleVersion: "2.0.0", BillableQuantity: 5, RawCostMicros: 500, ChargedMicros: 500},
+	}
+
+	resp, err := newService(store).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Len(t, resp.Versions, 2)
+	require.Equal(t, "1.0.0", resp.Versions[0].ModuleVersion)
+	require.EqualValues(t, 1000, resp.Versions[0].ChargedMicros)
+	require.Equal(t, "2.0.0", resp.Versions[1].ModuleVersion)
+	require.EqualValues(t, 500, resp.Versions[1].ChargedMicros)
+}
+
+func TestGetVersionBreakdown_EmptyVersionRollsUpWithoutCrashing(t *testing.T) {
+	// An event with an empty/missing version rolls up under '' (migration
+	// 023's COALESCE(module_version, '')) rather than erroring.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.versionRows = []usage.VersionUsageRaw{
+		{ModuleVersion: "", BillableQuantity: 10, RawCostMicros: 1000, ChargedMicros: 1000},
+	}
+
+	resp, err := newService(store).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Len(t, resp.Versions, 1)
+	require.Equal(t, "", resp.Versions[0].ModuleVersion)
+}
+
+func TestGetVersionBreakdown_PassesThroughOptionalModuleFilter(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	mod := uuid.New()
+
+	_, err := newService(store).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{OwnerUserID: owner, ModuleID: mod})
+	require.NoError(t, err)
+	require.Equal(t, mod, store.gotVersionModuleID)
+}
+
+func TestGetVersionBreakdown_NoModuleFilterMeansAllModules(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+
+	_, err := newService(store).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Equal(t, uuid.Nil, store.gotVersionModuleID, "omitted module_id reaches the store as the zero UUID (no filter)")
+}
+
+func TestGetVersionBreakdown_NoAccountReturnsEmpty(t *testing.T) {
+	resp, err := newService(newFakeStore()).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{OwnerUserID: uuid.New()})
+	require.NoError(t, err)
+	require.Empty(t, resp.Versions)
+}
+
+func TestGetVersionBreakdown_RequiresOwner(t *testing.T) {
+	_, err := newService(newFakeStore()).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestGetVersionBreakdown_InternalOnStoreError(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errVersion = errors.New("boom")
+	_, err := newService(store).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{OwnerUserID: owner})
+	requireCode(t, err, billing.CodeInternal)
 }
 
 // --- SetModuleVisibility --------------------------------------------------

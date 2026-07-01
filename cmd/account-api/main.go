@@ -130,6 +130,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.GetUsageSummary(ctx, req)
 
+	case "GetUsageHistory":
+		var req usage.GetUsageHistoryRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.GetUsageHistory(ctx, req)
+
+	case "GetVersionBreakdown":
+		var req usage.GetVersionBreakdownRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.GetVersionBreakdown(ctx, req)
+
 	case "SetMetricDefinitions":
 		var req usage.SetMetricDefinitionsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -279,6 +293,11 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// read), not the high-volume meter seam — they share the internal
 		// secret with the other api-platform → billing calls.
 		r.Post("/v1/billing.GetUsageSummary", makeHTTPHandler(d, "GetUsageSummary"))
+		// Trend-chart + per-version breakdown reads (this PR): both are
+		// read-only surface over the SAME data GetUsageSummary/rollup already
+		// produce, so they share its control-plane credential and route group.
+		r.Post("/v1/billing.GetUsageHistory", makeHTTPHandler(d, "GetUsageHistory"))
+		r.Post("/v1/billing.GetVersionBreakdown", makeHTTPHandler(d, "GetVersionBreakdown"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
 		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
 		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of
