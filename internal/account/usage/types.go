@@ -89,6 +89,14 @@ type RecordUsageRequest struct {
 	// recordedAtHint). Empty is tolerated and defaulted to now() so a
 	// malformed timestamp can't drop a billable fact.
 	RecordedAt time.Time `json:"recorded_at,omitempty"`
+
+	// ModuleVersion is the OPTIONAL version-attribution dimension (migration
+	// 023): the version of the module that emitted the event (e.g. "2.1.0"),
+	// dispatch-supplied like every other identity field. Purely a reporting
+	// dimension — it never affects price. Empty is tolerated (every event
+	// before this PR, and any module that doesn't report a version) → stored
+	// as a NULL usage_events.module_version.
+	ModuleVersion string `json:"module_version,omitempty"`
 }
 
 // RecordUsageResponse reports whether the event was newly recorded.
@@ -129,8 +137,12 @@ type GetUsageSummaryResponse struct {
 // blanket markup (design §1 / §4 Axis 1); the flat 1.2× is platform-infra-
 // only and not in this PR's scope.
 type MetricUsage struct {
-	Metric string `json:"metric"`
-	Kind   Kind   `json:"kind"`
+	// ModuleID is the module that emitted the metric. Carried so a consumer
+	// can pair a metric with its module's Visibility below without a second
+	// round-trip; it was implicit (ungrouped) before this PR.
+	ModuleID uuid.UUID `json:"module_id"`
+	Metric   string    `json:"metric"`
+	Kind     Kind      `json:"kind"`
 	// Quantity is a DISPLAY value (the running metered amount), not a
 	// billing-critical field — money is carried only in the *_micros int64
 	// fields below. Float is deliberate here and must not be widened into a
@@ -148,6 +160,80 @@ type MetricUsage struct {
 	// it and the frontend groups on it — no name-prefix mapping. Defaults to
 	// "other" for any metric not (yet) mapped, including every custom metric.
 	Group string `json:"group"`
+	// Visibility is the module's published/private margin-share class
+	// (module_visibility, migration 010) as of now. Exposed here so a
+	// consumer can compute the REAL platform-take share instead of hardcoding
+	// an assumed rate; defaults to "private" (the safer, higher-take default)
+	// when the module has no visibility row yet, matching the settlement
+	// default (design §7-B). NEVER a customer markup — this is informational.
+	Visibility Visibility `json:"visibility"`
+}
+
+// GetUsageHistoryRequest is the payload of GetUsageHistory: the owner
+// principal (same shape as GetUsageSummary) plus how many trailing calendar
+// months of ROLLED-UP history to return. Months <= 0 is rejected —
+// GetUsageSummary already covers "the current period"; this RPC exists for
+// the multi-month trend chart.
+type GetUsageHistoryRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	// Months is how many trailing CLOSED calendar months to return (e.g. 6).
+	// The window excludes the current, still-open month (usage_aggregates for
+	// it won't exist until cmd/billing-cycle rolls it up at month-end) —
+	// GetUsageSummary is the live-estimate read for the in-progress month.
+	Months int `json:"months"`
+}
+
+// PeriodUsage is one bucketed billing period's rolled-up metrics — the
+// trend-chart unit GetUsageHistory returns one of per closed month.
+type PeriodUsage struct {
+	PeriodStart time.Time     `json:"period_start"`
+	PeriodEnd   time.Time     `json:"period_end"`
+	Metrics     []MetricUsage `json:"metrics"`
+}
+
+// GetUsageHistoryResponse is the multi-month trend-chart read. Periods is
+// ordered oldest-to-newest; a calendar month with no rolled-up usage simply
+// contributes no PeriodUsage entry (a gap, never an error — callers must not
+// treat a missing month as a failure).
+type GetUsageHistoryResponse struct {
+	Periods []PeriodUsage `json:"periods"`
+}
+
+// GetVersionBreakdownRequest is the payload of GetVersionBreakdown: the owner
+// principal plus an OPTIONAL module_id filter. A zero ModuleID (the default)
+// means "every one of the owner's modules"; a non-zero ModuleID narrows to
+// one module's versions. Always the CURRENT period (the same
+// calendar-month-to-date window GetUsageSummary resolves) — there is no
+// Months field here, unlike GetUsageHistory.
+type GetVersionBreakdownRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	ModuleID    uuid.UUID `json:"module_id,omitempty"`
+}
+
+// ModuleVersionUsage is one module_version's totals across every metric (and
+// every model split) in the period: the per-version cost/income breakdown
+// line. BillableQuantity is summed across metrics that may carry different
+// units (e.g. request count + byte-hours) — it is a rough secondary total;
+// RawCostMicros / ChargedMicros (both money, always comparable) are the
+// authoritative cost/income figures this RPC exists to expose.
+type ModuleVersionUsage struct {
+	ModuleVersion    string  `json:"module_version"`
+	BillableQuantity float64 `json:"billable_quantity"`
+	RawCostMicros    int64   `json:"raw_cost_micros"`
+	ChargedMicros    int64   `json:"charged_micros"`
+}
+
+// GetVersionBreakdownResponse is the per-version cost/income breakdown for
+// the resolved period. PeriodStart/PeriodEnd echo the resolved window (zero
+// when no billing account exists yet). Versions is empty (not nil) when the
+// period hasn't been rolled up yet (data appears once cmd/billing-cycle's
+// RollupPeriod runs for the window) — an empty result is not an error.
+type GetVersionBreakdownResponse struct {
+	PeriodStart time.Time            `json:"period_start"`
+	PeriodEnd   time.Time            `json:"period_end"`
+	Versions    []ModuleVersionUsage `json:"versions"`
 }
 
 // SetModuleVisibilityRequest is the payload of SetModuleVisibility, fired

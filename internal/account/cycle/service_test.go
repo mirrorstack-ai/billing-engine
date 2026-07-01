@@ -18,7 +18,7 @@ import (
 // --- in-memory Store fake -------------------------------------------------
 
 type aggKey struct {
-	period, app, module, metric, model string
+	period, app, module, metric, model, moduleVersion string
 }
 
 type fakeStore struct {
@@ -162,7 +162,7 @@ func (f *fakeStore) UpsertUsageAggregate(_ context.Context, periodID, _ uuid.UUI
 	if f.errUpsert != nil {
 		return f.errUpsert
 	}
-	f.aggregates[aggKey{periodID.String(), agg.AppID.String(), agg.ModuleID.String(), agg.Metric, agg.Model}] = agg
+	f.aggregates[aggKey{periodID.String(), agg.AppID.String(), agg.ModuleID.String(), agg.Metric, agg.Model, agg.ModuleVersion}] = agg
 	return nil
 }
 
@@ -327,6 +327,13 @@ func rawAgg(app, mod uuid.UUID, metric string, kind cycle.Kind, qty string) cycl
 // rawAggModel is rawAgg with the AI pricing-dimension model set (migration 018).
 func rawAggModel(app, mod uuid.UUID, metric string, kind cycle.Kind, model, qty string) cycle.RawAggregate {
 	return cycle.RawAggregate{AppID: app, ModuleID: mod, Metric: metric, Kind: kind, Model: model, BillableQuantity: qty}
+}
+
+// rawAggVersion is rawAgg with the version-attribution dimension set
+// (migration 023). Unlike model, version never selects a different price —
+// it is carried straight through onto the aggregate for reporting only.
+func rawAggVersion(app, mod uuid.UUID, metric string, kind cycle.Kind, version, qty string) cycle.RawAggregate {
+	return cycle.RawAggregate{AppID: app, ModuleID: mod, Metric: metric, Kind: kind, ModuleVersion: version, BillableQuantity: qty}
 }
 
 // --- RollupPeriod: pricing + aggregation ----------------------------------
@@ -1000,6 +1007,72 @@ func TestRollupPeriod_AIRequestsZeroCharge(t *testing.T) {
 	require.EqualValues(t, 0, a.UnitPriceMicros)
 	require.EqualValues(t, 0, a.RawCostMicros)
 	require.EqualValues(t, 0, a.ChargedMicros)
+}
+
+// --- module_version attribution dimension (migration 023) ----------------
+
+func TestRollupPeriod_DistinctPerModuleVersion(t *testing.T) {
+	// Two versions of the same (module, metric) are DISTINCT aggregate rows
+	// (the widened idempotency key), but — unlike model — version never
+	// selects a different price: both charge at the SAME catalog rate.
+	store := newFakeStore()
+	app, mod := uuid.New(), uuid.New()
+	store.raws = []cycle.RawAggregate{
+		rawAggVersion(app, mod, "orders.placed", usage.KindSum, "1.0.0", "10"),
+		rawAggVersion(app, mod, "orders.placed", usage.KindSum, "2.0.0", "5"),
+	}
+	store.prices[priceKey(mod, "orders.placed")] = 50_000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	require.Len(t, resp.Aggregates, 2, "two versions must roll up into two distinct aggregate rows")
+
+	byVersion := map[string]cycle.MetricAggregate{}
+	for _, a := range resp.Aggregates {
+		byVersion[a.ModuleVersion] = a
+	}
+	require.EqualValues(t, 50_000, byVersion["1.0.0"].UnitPriceMicros)
+	require.EqualValues(t, 50_000, byVersion["2.0.0"].UnitPriceMicros, "version never changes the resolved price")
+	require.EqualValues(t, 500_000, byVersion["1.0.0"].RawCostMicros) // 10 × 50_000
+	require.EqualValues(t, 250_000, byVersion["2.0.0"].RawCostMicros) // 5 × 50_000
+	require.EqualValues(t, 750_000, resp.TotalChargedMicros, "both versions' charges sum into the period total")
+}
+
+func TestRollupPeriod_NoModuleVersionRollsUpUnderEmptyString(t *testing.T) {
+	// An event that never carried a version rolls up with ModuleVersion == ""
+	// (the rollup's COALESCE(module_version, '') — mirrors the pre-023 shape)
+	// rather than erroring or being dropped.
+	store := newFakeStore()
+	app, mod := uuid.New(), uuid.New()
+	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindSum, "10")}
+	store.prices[priceKey(mod, "orders.placed")] = 50_000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	require.Len(t, resp.Aggregates, 1)
+	require.Equal(t, "", resp.Aggregates[0].ModuleVersion)
+}
+
+func TestRollupPeriod_ModuleVersionAndModelBothDistinctDimensions(t *testing.T) {
+	// The two independent dimensions (model, migration 018; module_version,
+	// migration 023) compose: two versions of the SAME AI model are still
+	// distinct aggregate rows, and only the model selects the price.
+	store := newFakeStore()
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	store.raws = []cycle.RawAggregate{
+		{AppID: app, ModuleID: sentinel, Metric: "infra.ai.input.tokens", Kind: usage.KindSum, Model: modelSonnet, ModuleVersion: "1.0.0", BillableQuantity: "1"},
+		{AppID: app, ModuleID: sentinel, Metric: "infra.ai.input.tokens", Kind: usage.KindSum, Model: modelSonnet, ModuleVersion: "2.0.0", BillableQuantity: "1"},
+	}
+	store.modelPrices[modelPriceKey("infra.ai.input.tokens", modelSonnet)] = 3000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	require.Len(t, resp.Aggregates, 2)
+	for _, a := range resp.Aggregates {
+		require.Equal(t, modelSonnet, a.Model)
+		require.EqualValues(t, 3000, a.UnitPriceMicros, "module_version never affects the per-model price")
+	}
 }
 
 // --- P1 producer-target catalog seed rollup (migration 020 / infra-metrics PR #4) ---

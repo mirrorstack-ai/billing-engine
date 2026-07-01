@@ -139,14 +139,15 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 	}
 
 	recorded, err := s.store.InsertUsageEvent(ctx, UsageEvent{
-		EventID:    req.EventID,
-		AccountID:  accountID,
-		AppID:      req.AppID,
-		ModuleID:   req.ModuleID,
-		Metric:     req.Metric,
-		Kind:       kind,
-		Value:      req.Value,
-		RecordedAt: recordedAt,
+		EventID:       req.EventID,
+		AccountID:     accountID,
+		AppID:         req.AppID,
+		ModuleID:      req.ModuleID,
+		Metric:        req.Metric,
+		Kind:          kind,
+		Value:         req.Value,
+		RecordedAt:    recordedAt,
+		ModuleVersion: req.ModuleVersion,
 	})
 	if err != nil {
 		return nil, billing.Internal("insert usage event failed", err)
@@ -211,6 +212,7 @@ func (s *Service) GetUsageSummary(ctx context.Context, req GetUsageSummaryReques
 		// The flat 1.2× for platform-infra / built-in metrics is not in this
 		// PR's scope (PR #5/#10).
 		metrics = append(metrics, MetricUsage{
+			ModuleID:        r.ModuleID,
 			Metric:          r.Metric,
 			Kind:            r.Kind,
 			Quantity:        r.Quantity,
@@ -218,12 +220,125 @@ func (s *Service) GetUsageSummary(ctx context.Context, req GetUsageSummaryReques
 			RawCostMicros:   r.RawCostMicros,
 			ChargedMicros:   r.RawCostMicros,
 			Group:           r.Group,
+			Visibility:      r.Visibility,
 		})
 	}
 	return &GetUsageSummaryResponse{
 		PeriodStart: start,
 		PeriodEnd:   end,
 		Metrics:     metrics,
+	}, nil
+}
+
+// GetUsageHistory returns the multi-month ROLLED-UP usage history for an
+// owner — the trend-chart read over the immutable billable record
+// (usage_aggregates), never the raw usage_events. The window is the trailing
+// req.Months CLOSED calendar months (excluding the current, still-open
+// month; GetUsageSummary is the live estimate for that one). No billing
+// account yet → an empty Periods slice and a nil error.
+func (s *Service) GetUsageHistory(ctx context.Context, req GetUsageHistoryRequest) (*GetUsageHistoryResponse, error) {
+	if req.Months <= 0 {
+		return nil, billing.InvalidInput("months must be positive")
+	}
+	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
+	}
+	if req.OwnerUserID != uuid.Nil && req.OwnerOrgID != uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
+	}
+
+	owner := Owner{UserID: req.OwnerUserID, OrgID: req.OwnerOrgID}
+	accountID, found, err := s.store.AccountByOwner(ctx, owner)
+	if err != nil {
+		return nil, billing.Internal("account lookup failed", err)
+	}
+	if !found {
+		return &GetUsageHistoryResponse{Periods: []PeriodUsage{}}, nil
+	}
+
+	// windowEnd is the current (in-progress) month's start — the trailing
+	// window stops there so this RPC never returns a partial current month.
+	// windowStart is Months calendar months before that.
+	windowEnd, _ := currentPeriodWindow(s.nowFn().UTC())
+	windowStart := windowEnd.AddDate(0, -req.Months, 0)
+
+	rows, err := s.store.UsageHistory(ctx, accountID, windowStart, windowEnd)
+	if err != nil {
+		return nil, billing.Internal("usage history query failed", err)
+	}
+
+	// Bucket rows into ordered periods. The store returns rows ordered
+	// (period_start ASC, metric ASC), so a "new period when period_start
+	// changes" scan preserves that order without a re-sort or a map (which
+	// would need one anyway, plus lose ordering).
+	periods := make([]PeriodUsage, 0)
+	var cur *PeriodUsage
+	for _, r := range rows {
+		if cur == nil || !cur.PeriodStart.Equal(r.PeriodStart) {
+			periods = append(periods, PeriodUsage{
+				PeriodStart: r.PeriodStart,
+				PeriodEnd:   r.PeriodEnd,
+				Metrics:     []MetricUsage{},
+			})
+			cur = &periods[len(periods)-1]
+		}
+		cur.Metrics = append(cur.Metrics, MetricUsage{
+			Metric:          r.Metric,
+			Kind:            r.Kind,
+			Quantity:        r.Quantity,
+			UnitPriceMicros: r.UnitPriceMicros,
+			RawCostMicros:   r.RawCostMicros,
+			ChargedMicros:   r.ChargedMicros,
+			Group:           r.Group,
+		})
+	}
+	return &GetUsageHistoryResponse{Periods: periods}, nil
+}
+
+// GetVersionBreakdown returns the per-module_version cost/income breakdown
+// for the CURRENT period — the same calendar-month-to-date window
+// GetUsageSummary resolves. It reads the immutable billable record
+// (usage_aggregates), so Versions is empty until cmd/billing-cycle's
+// RollupPeriod has run for this window (not an error — usage_aggregates is
+// written at rollup, not at ingest). No billing account yet → an empty
+// Versions slice and a nil error.
+func (s *Service) GetVersionBreakdown(ctx context.Context, req GetVersionBreakdownRequest) (*GetVersionBreakdownResponse, error) {
+	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
+	}
+	if req.OwnerUserID != uuid.Nil && req.OwnerOrgID != uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
+	}
+
+	owner := Owner{UserID: req.OwnerUserID, OrgID: req.OwnerOrgID}
+	accountID, found, err := s.store.AccountByOwner(ctx, owner)
+	if err != nil {
+		return nil, billing.Internal("account lookup failed", err)
+	}
+	if !found {
+		return &GetVersionBreakdownResponse{Versions: []ModuleVersionUsage{}}, nil
+	}
+
+	start, end := currentPeriodWindow(s.nowFn().UTC())
+
+	rows, err := s.store.VersionBreakdown(ctx, accountID, start, req.ModuleID)
+	if err != nil {
+		return nil, billing.Internal("version breakdown query failed", err)
+	}
+
+	versions := make([]ModuleVersionUsage, 0, len(rows))
+	for _, r := range rows {
+		versions = append(versions, ModuleVersionUsage{
+			ModuleVersion:    r.ModuleVersion,
+			BillableQuantity: r.BillableQuantity,
+			RawCostMicros:    r.RawCostMicros,
+			ChargedMicros:    r.ChargedMicros,
+		})
+	}
+	return &GetVersionBreakdownResponse{
+		PeriodStart: start,
+		PeriodEnd:   end,
+		Versions:    versions,
 	}, nil
 }
 

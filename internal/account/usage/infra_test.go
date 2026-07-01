@@ -269,6 +269,28 @@ func TestRecordInfraUsage_AIMetricWithoutModelStillAccepted(t *testing.T) {
 	require.Equal(t, "", store.events[req.EventID].Model)
 }
 
+func TestRecordInfraUsage_CarriesModuleVersion(t *testing.T) {
+	// The optional ModuleVersion field (migration 023, attribution only) is
+	// carried onto the usage_events.module_version column. Unlike Model it is
+	// not restricted to infra.ai.* — any registered infra metric may carry one.
+	store := newFakeStore()
+	req := validInfra() // infra.compute.walltime.ms
+	req.ModuleVersion = "1.4.2"
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "1.4.2", store.events[req.EventID].ModuleVersion)
+}
+
+func TestRecordInfraUsage_ModuleVersionEmptyWhenNotCarried(t *testing.T) {
+	store := newFakeStore()
+	req := validInfra() // no ModuleVersion set
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "", store.events[req.EventID].ModuleVersion)
+}
+
 // --- P1 producer-target catalog seed (migration 020 / infra-metrics PR #4) -----
 
 func TestRecordInfraUsage_AcceptsP1CountMetrics(t *testing.T) {
