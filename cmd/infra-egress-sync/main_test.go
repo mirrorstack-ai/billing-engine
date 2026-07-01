@@ -81,6 +81,12 @@ func (f *fakeStore) CurrentPeriodUsage(_ context.Context, _ uuid.UUID, _, _ time
 func (f *fakeStore) UpsertModuleVisibility(_ context.Context, _ uuid.UUID, _ usage.Visibility) error {
 	return nil
 }
+func (f *fakeStore) UsageHistory(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]usage.PeriodMetricUsageRaw, error) {
+	return nil, nil
+}
+func (f *fakeStore) VersionBreakdown(_ context.Context, _ uuid.UUID, _ time.Time, _ uuid.UUID) ([]usage.VersionUsageRaw, error) {
+	return nil, nil
+}
 
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 

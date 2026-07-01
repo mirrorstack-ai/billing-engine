@@ -40,6 +40,12 @@ func (stubUsageStore) CurrentPeriodUsage(context.Context, uuid.UUID, time.Time, 
 func (stubUsageStore) UpsertModuleVisibility(context.Context, uuid.UUID, usage.Visibility) error {
 	return nil
 }
+func (stubUsageStore) UsageHistory(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.PeriodMetricUsageRaw, error) {
+	return nil, nil
+}
+func (stubUsageStore) VersionBreakdown(context.Context, uuid.UUID, time.Time, uuid.UUID) ([]usage.VersionUsageRaw, error) {
+	return nil, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()

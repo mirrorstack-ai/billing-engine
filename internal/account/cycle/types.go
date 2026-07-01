@@ -82,7 +82,13 @@ type MetricAggregate struct {
 	// a roster model id for infra.ai.*. Part of the usage_aggregates idempotency
 	// key so two models on one metric are distinct billable rows.
 	Model string
-	Kind  Kind
+	// ModuleVersion is the version-attribution dimension (migration 023): ''
+	// for a version-less event, the emitting module's version otherwise.
+	// Purely reporting — it never affects price — but it is part of the
+	// usage_aggregates idempotency key so two versions on one metric are
+	// distinct billable rows, exactly like two models are distinct under 018.
+	ModuleVersion string
+	Kind          Kind
 
 	// BillableQuantity is the per-kind aggregate (count/sum → SUM, peak → MAX,
 	// time_weighted → integral). Carried as the exact NUMERIC string so the

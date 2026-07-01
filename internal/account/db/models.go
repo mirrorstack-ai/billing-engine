@@ -471,19 +471,21 @@ type MsBillingUsageAggregate struct {
 	ChargedMicros     int64               `json:"charged_micros"`
 	RolledUpAt        time.Time           `json:"rolled_up_at"`
 	Model             string              `json:"model"`
+	ModuleVersion     string              `json:"module_version"`
 }
 
 type MsBillingUsageEvent struct {
-	EventID    string              `json:"event_id"`
-	AccountID  pgtype.UUID         `json:"account_id"`
-	AppID      string              `json:"app_id"`
-	ModuleID   string              `json:"module_id"`
-	Metric     string              `json:"metric"`
-	Kind       MsBillingMetricKind `json:"kind"`
-	Value      pgtype.Numeric      `json:"value"`
-	RecordedAt time.Time           `json:"recorded_at"`
-	IngestedAt time.Time           `json:"ingested_at"`
-	Model      pgtype.Text         `json:"model"`
+	EventID       string              `json:"event_id"`
+	AccountID     pgtype.UUID         `json:"account_id"`
+	AppID         string              `json:"app_id"`
+	ModuleID      string              `json:"module_id"`
+	Metric        string              `json:"metric"`
+	Kind          MsBillingMetricKind `json:"kind"`
+	Value         pgtype.Numeric      `json:"value"`
+	RecordedAt    time.Time           `json:"recorded_at"`
+	IngestedAt    time.Time           `json:"ingested_at"`
+	Model         pgtype.Text         `json:"model"`
+	ModuleVersion pgtype.Text         `json:"module_version"`
 }
 
 type MsBillingWebhookEventsProcessed struct {

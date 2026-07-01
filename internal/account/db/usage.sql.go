@@ -14,6 +14,7 @@ import (
 
 const currentPeriodUsageSummary = `-- name: CurrentPeriodUsageSummary :many
 SELECT
+    e.module_id                                         AS module_id,
     e.metric                                            AS metric,
     e.kind                                              AS kind,
     COALESCE(SUM(e.value), 0)::numeric                  AS total_quantity,
@@ -26,17 +27,23 @@ SELECT
     -- COALESCE to 'other' so an event whose catalog row is missing (LEFT JOIN
     -- miss) or not-yet-grouped still carries a valid group — the same defensive
     -- default the column itself uses. MAX() picks the single group per
-    -- (metric, kind) group-by; a metric has exactly one display_group, so MAX
-    -- is just "the group" (no aggregation ambiguity).
+    -- (module, metric, kind) group-by; a metric has exactly one display_group,
+    -- so MAX is just "the group" (no aggregation ambiguity).
     COALESCE(MAX(md.display_group), 'other')::ms_billing.metric_group
-                                                        AS display_group
+                                                        AS display_group,
+    -- MAX() picks the single visibility per module_id group-by (module_id is
+    -- module_visibility's PRIMARY KEY, so at most one row per group).
+    COALESCE(MAX(mv.visibility), 'private')::ms_billing.margin_share_class
+                                                        AS visibility
 FROM ms_billing.usage_events e
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric
+LEFT JOIN ms_billing.module_visibility mv
+    ON mv.module_id = e.module_id
 WHERE e.account_id = $1
   AND e.recorded_at >= $2
   AND e.recorded_at <  $3
-GROUP BY e.metric, e.kind
+GROUP BY e.module_id, e.metric, e.kind
 ORDER BY e.metric
 `
 
@@ -47,12 +54,14 @@ type CurrentPeriodUsageSummaryParams struct {
 }
 
 type CurrentPeriodUsageSummaryRow struct {
-	Metric          string               `json:"metric"`
-	Kind            MsBillingMetricKind  `json:"kind"`
-	TotalQuantity   pgtype.Numeric       `json:"total_quantity"`
-	UnitPriceMicros int64                `json:"unit_price_micros"`
-	RawCostMicros   pgtype.Numeric       `json:"raw_cost_micros"`
-	DisplayGroup    MsBillingMetricGroup `json:"display_group"`
+	ModuleID        string                    `json:"module_id"`
+	Metric          string                    `json:"metric"`
+	Kind            MsBillingMetricKind       `json:"kind"`
+	TotalQuantity   pgtype.Numeric            `json:"total_quantity"`
+	UnitPriceMicros int64                     `json:"unit_price_micros"`
+	RawCostMicros   pgtype.Numeric            `json:"raw_cost_micros"`
+	DisplayGroup    MsBillingMetricGroup      `json:"display_group"`
+	Visibility      MsBillingMarginShareClass `json:"visibility"`
 }
 
 // CurrentPeriodUsageSummary is the LIVE current-period fast path used by
@@ -67,6 +76,15 @@ type CurrentPeriodUsageSummaryRow struct {
 // All four kinds are summed here as a coarse running total; the exact
 // per-kind rollup (MAX for peak, integral for time_weighted) is a PR #5
 // concern and does not affect the customer-facing live estimate.
+//
+// GROUP BY now includes e.module_id (widened from PR #3's (metric, kind)
+// only) so the row can carry the emitting module's id + visibility — a
+// consumer previously had to hardcode a 30% platform-take assumption because
+// it could not see the real value. visibility is the module_visibility
+// mirror (migration 010, developer margin-share dimension — NEVER a customer
+// markup); COALESCE to 'private' matches the settlement default (design
+// §7-B: never under-collect on a lagging publish) for a module with no
+// visibility row yet.
 func (q *Queries) CurrentPeriodUsageSummary(ctx context.Context, arg CurrentPeriodUsageSummaryParams) ([]CurrentPeriodUsageSummaryRow, error) {
 	rows, err := q.db.Query(ctx, currentPeriodUsageSummary, arg.AccountID, arg.RecordedAt, arg.RecordedAt_2)
 	if err != nil {
@@ -77,12 +95,14 @@ func (q *Queries) CurrentPeriodUsageSummary(ctx context.Context, arg CurrentPeri
 	for rows.Next() {
 		var i CurrentPeriodUsageSummaryRow
 		if err := rows.Scan(
+			&i.ModuleID,
 			&i.Metric,
 			&i.Kind,
 			&i.TotalQuantity,
 			&i.UnitPriceMicros,
 			&i.RawCostMicros,
 			&i.DisplayGroup,
+			&i.Visibility,
 		); err != nil {
 			return nil, err
 		}
@@ -96,23 +116,24 @@ func (q *Queries) CurrentPeriodUsageSummary(ctx context.Context, arg CurrentPeri
 
 const insertUsageEvent = `-- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
-    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at, model
+    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at, model, module_version
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 )
 ON CONFLICT (event_id) DO NOTHING
 `
 
 type InsertUsageEventParams struct {
-	EventID    string              `json:"event_id"`
-	AccountID  pgtype.UUID         `json:"account_id"`
-	AppID      string              `json:"app_id"`
-	ModuleID   string              `json:"module_id"`
-	Metric     string              `json:"metric"`
-	Kind       MsBillingMetricKind `json:"kind"`
-	Value      pgtype.Numeric      `json:"value"`
-	RecordedAt time.Time           `json:"recorded_at"`
-	Model      pgtype.Text         `json:"model"`
+	EventID       string              `json:"event_id"`
+	AccountID     pgtype.UUID         `json:"account_id"`
+	AppID         string              `json:"app_id"`
+	ModuleID      string              `json:"module_id"`
+	Metric        string              `json:"metric"`
+	Kind          MsBillingMetricKind `json:"kind"`
+	Value         pgtype.Numeric      `json:"value"`
+	RecordedAt    time.Time           `json:"recorded_at"`
+	Model         pgtype.Text         `json:"model"`
+	ModuleVersion pgtype.Text         `json:"module_version"`
 }
 
 // InsertUsageEvent writes one raw metered fact, idempotent on event_id.
@@ -121,7 +142,9 @@ type InsertUsageEventParams struct {
 // can tell a fresh insert (1) from a deduped retry (0). account_id is
 // nullable (lazy account); kind is the declared kind resolved from
 // metric_definitions. model is the per-event AI pricing dimension
-// (migration 018) — NULL for every non-AI event.
+// (migration 018) — NULL for every non-AI event. module_version is the
+// per-event attribution dimension (migration 023, purely reporting — it
+// never affects price) — NULL for every event that carries no version.
 func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertUsageEvent,
 		arg.EventID,
@@ -133,6 +156,7 @@ func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventPara
 		arg.Value,
 		arg.RecordedAt,
 		arg.Model,
+		arg.ModuleVersion,
 	)
 	if err != nil {
 		return 0, err
@@ -262,4 +286,165 @@ type UpsertModuleVisibilityParams struct {
 func (q *Queries) UpsertModuleVisibility(ctx context.Context, arg UpsertModuleVisibilityParams) error {
 	_, err := q.db.Exec(ctx, upsertModuleVisibility, arg.ModuleID, arg.Visibility)
 	return err
+}
+
+const usageHistoryForAccount = `-- name: UsageHistoryForAccount :many
+SELECT
+    bp.period_start                                     AS period_start,
+    bp.period_end                                       AS period_end,
+    ua.metric                                            AS metric,
+    ua.kind                                              AS kind,
+    COALESCE(SUM(ua.billable_quantity), 0)::numeric      AS total_quantity,
+    COALESCE(MAX(ua.unit_price_micros), 0)::bigint       AS unit_price_micros,
+    COALESCE(SUM(ua.raw_cost_micros), 0)::bigint         AS raw_cost_micros,
+    COALESCE(SUM(ua.charged_micros), 0)::bigint          AS charged_micros,
+    COALESCE(MAX(md.display_group), 'other')::ms_billing.metric_group
+                                                         AS display_group
+FROM ms_billing.usage_aggregates ua
+JOIN ms_billing.billing_periods bp
+    ON bp.id = ua.period_id
+LEFT JOIN ms_billing.metric_definitions md
+    ON md.module_id = ua.module_id AND md.metric = ua.metric
+WHERE ua.account_id = $1
+  AND bp.period_start >= $2
+  AND bp.period_start <  $3
+GROUP BY bp.period_start, bp.period_end, ua.metric, ua.kind
+ORDER BY bp.period_start ASC, ua.metric ASC
+`
+
+type UsageHistoryForAccountParams struct {
+	AccountID     string    `json:"account_id"`
+	PeriodStart   time.Time `json:"period_start"`
+	PeriodStart_2 time.Time `json:"period_start_2"`
+}
+
+type UsageHistoryForAccountRow struct {
+	PeriodStart     time.Time            `json:"period_start"`
+	PeriodEnd       time.Time            `json:"period_end"`
+	Metric          string               `json:"metric"`
+	Kind            MsBillingMetricKind  `json:"kind"`
+	TotalQuantity   pgtype.Numeric       `json:"total_quantity"`
+	UnitPriceMicros int64                `json:"unit_price_micros"`
+	RawCostMicros   int64                `json:"raw_cost_micros"`
+	ChargedMicros   int64                `json:"charged_micros"`
+	DisplayGroup    MsBillingMetricGroup `json:"display_group"`
+}
+
+// UsageHistoryForAccount is the multi-month trend-chart read: it reads the
+// IMMUTABLE billable record (usage_aggregates, written by cmd/billing-cycle's
+// rollup — NOT usage_events) joined to its billing_periods row, for every
+// closed period whose period_start falls in the caller-supplied trailing
+// window [window_start, window_end). This table has never been read by any
+// RPC before GetUsageHistory; the live current-period estimate
+// (CurrentPeriodUsageSummary above) stays the only usage_events reader.
+//
+// Grouped at (period, metric, kind) — the SAME granularity GetUsageSummary
+// exposes — by summing across every model (migration 018) and module_version
+// (migration 023) dimension an aggregate row may have split into: a trend
+// chart wants ONE number per metric per period, not one per (metric, model,
+// version) combination (that finer cut is GetVersionBreakdown's job, for the
+// current period only). A period with no usage_aggregates rows yet (rollup
+// hasn't run, or truly zero usage) simply contributes no rows — the caller
+// must not treat a missing month as an error.
+func (q *Queries) UsageHistoryForAccount(ctx context.Context, arg UsageHistoryForAccountParams) ([]UsageHistoryForAccountRow, error) {
+	rows, err := q.db.Query(ctx, usageHistoryForAccount, arg.AccountID, arg.PeriodStart, arg.PeriodStart_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UsageHistoryForAccountRow{}
+	for rows.Next() {
+		var i UsageHistoryForAccountRow
+		if err := rows.Scan(
+			&i.PeriodStart,
+			&i.PeriodEnd,
+			&i.Metric,
+			&i.Kind,
+			&i.TotalQuantity,
+			&i.UnitPriceMicros,
+			&i.RawCostMicros,
+			&i.ChargedMicros,
+			&i.DisplayGroup,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const versionBreakdownForAccount = `-- name: VersionBreakdownForAccount :many
+SELECT
+    ua.module_version                                    AS module_version,
+    COALESCE(SUM(ua.billable_quantity), 0)::numeric      AS total_quantity,
+    COALESCE(SUM(ua.raw_cost_micros), 0)::bigint         AS raw_cost_micros,
+    COALESCE(SUM(ua.charged_micros), 0)::bigint          AS charged_micros
+FROM ms_billing.usage_aggregates ua
+JOIN ms_billing.billing_periods bp
+    ON bp.id = ua.period_id
+WHERE ua.account_id = $1
+  AND bp.period_start = $2
+  AND ($3::boolean = false OR ua.module_id = $4)
+GROUP BY ua.module_version
+ORDER BY ua.module_version
+`
+
+type VersionBreakdownForAccountParams struct {
+	AccountID   string    `json:"account_id"`
+	PeriodStart time.Time `json:"period_start"`
+	Column3     bool      `json:"column_3"`
+	ModuleID    string    `json:"module_id"`
+}
+
+type VersionBreakdownForAccountRow struct {
+	ModuleVersion string         `json:"module_version"`
+	TotalQuantity pgtype.Numeric `json:"total_quantity"`
+	RawCostMicros int64          `json:"raw_cost_micros"`
+	ChargedMicros int64          `json:"charged_micros"`
+}
+
+// VersionBreakdownForAccount is the per-module_version cost/income breakdown
+// read for ONE period: it sums the immutable billable record
+// (usage_aggregates) grouped by module_version ACROSS every metric (and,
+// within a version, across every model split) so a consumer sees which
+// version of a module is driving cost. Summing billable_quantity across
+// metrics with different units (e.g. request count + byte-hours) is
+// dimensionally rough — it is offered as a secondary total alongside the
+// authoritative money columns (raw_cost_micros / charged_micros), which is
+// the actual "cost/income breakdown" this RPC exists for.
+//
+// module_id_filter narrows to one module's versions when has_module_filter is
+// true; when false every one of the owner's modules is included (module_id_filter
+// is then ignored — any well-formed uuid is accepted as a placeholder).
+func (q *Queries) VersionBreakdownForAccount(ctx context.Context, arg VersionBreakdownForAccountParams) ([]VersionBreakdownForAccountRow, error) {
+	rows, err := q.db.Query(ctx, versionBreakdownForAccount,
+		arg.AccountID,
+		arg.PeriodStart,
+		arg.Column3,
+		arg.ModuleID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []VersionBreakdownForAccountRow{}
+	for rows.Next() {
+		var i VersionBreakdownForAccountRow
+		if err := rows.Scan(
+			&i.ModuleVersion,
+			&i.TotalQuantity,
+			&i.RawCostMicros,
+			&i.ChargedMicros,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

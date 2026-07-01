@@ -118,6 +118,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			ModuleID:         raw.ModuleID,
 			Metric:           raw.Metric,
 			Model:            raw.Model,
+			ModuleVersion:    raw.ModuleVersion,
 			Kind:             raw.Kind,
 			BillableQuantity: raw.BillableQuantity,
 			UnitPriceMicros:  priceMicros,

@@ -183,13 +183,14 @@ SELECT
     metric                         AS metric,
     kind                           AS kind,
     COALESCE(model, '')            AS model,
+    COALESCE(module_version, '')   AS module_version,
     COALESCE(MAX(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
   AND recorded_at >= $2
   AND recorded_at <  $3
   AND kind = 'peak'
-GROUP BY app_id, module_id, metric, kind, COALESCE(model, '')
+GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '')
 `
 
 type RollupPeakKindParams struct {
@@ -204,13 +205,15 @@ type RollupPeakKindRow struct {
 	Metric           string              `json:"metric"`
 	Kind             MsBillingMetricKind `json:"kind"`
 	Model            string              `json:"model"`
+	ModuleVersion    string              `json:"module_version"`
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
 }
 
 // RollupPeakKind aggregates the peak kind by MAX(value) — the highest
-// absolute level observed in the window is the billable quantity. model is
-// grouped (COALESCE(model, ”)) for parity with the other rollups; peak AI
-// metrics are not expected today but the dimension stays consistent.
+// absolute level observed in the window is the billable quantity. model and
+// module_version are grouped (COALESCE(…, ”)) for parity with the other
+// rollups; peak AI / versioned metrics are not expected today but the
+// dimensions stay consistent.
 func (q *Queries) RollupPeakKind(ctx context.Context, arg RollupPeakKindParams) ([]RollupPeakKindRow, error) {
 	rows, err := q.db.Query(ctx, rollupPeakKind, arg.AccountID, arg.RecordedAt, arg.RecordedAt_2)
 	if err != nil {
@@ -226,6 +229,7 @@ func (q *Queries) RollupPeakKind(ctx context.Context, arg RollupPeakKindParams) 
 			&i.Metric,
 			&i.Kind,
 			&i.Model,
+			&i.ModuleVersion,
 			&i.BillableQuantity,
 		); err != nil {
 			return nil, err
@@ -245,13 +249,14 @@ SELECT
     metric                         AS metric,
     kind                           AS kind,
     COALESCE(model, '')            AS model,
+    COALESCE(module_version, '')   AS module_version,
     COALESCE(SUM(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
   AND recorded_at >= $2
   AND recorded_at <  $3
   AND kind IN ('count', 'sum')
-GROUP BY app_id, module_id, metric, kind, COALESCE(model, '')
+GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '')
 `
 
 type RollupSumKindsParams struct {
@@ -266,16 +271,21 @@ type RollupSumKindsRow struct {
 	Metric           string              `json:"metric"`
 	Kind             MsBillingMetricKind `json:"kind"`
 	Model            string              `json:"model"`
+	ModuleVersion    string              `json:"module_version"`
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
 }
 
 // RollupSumKinds aggregates the additive kinds (count, sum) by SUM(value)
-// over [period_start, period_end) per (app, module, metric, model). count and
-// sum both roll up by SUM; kind is carried through so the aggregate row
-// snapshots the right accumulation semantics. model is grouped so AI events
-// aggregate PER MODEL (the pricing dimension, migration 018) rather than
-// collapsing models that differ ~15× into one row; COALESCE(model, ”) keys
-// non-AI events (NULL model) under a stable empty string.
+// over [period_start, period_end) per (app, module, metric, model,
+// module_version). count and sum both roll up by SUM; kind is carried
+// through so the aggregate row snapshots the right accumulation semantics.
+// model is grouped so AI events aggregate PER MODEL (the pricing dimension,
+// migration 018) rather than collapsing models that differ ~15× into one
+// row; module_version is grouped so events aggregate PER VERSION (the
+// attribution dimension, migration 023 — never affects price) rather than
+// blending versions into one row. COALESCE(…, ”) keys an event that carries
+// neither dimension (NULL model / NULL module_version) under a stable empty
+// string.
 func (q *Queries) RollupSumKinds(ctx context.Context, arg RollupSumKindsParams) ([]RollupSumKindsRow, error) {
 	rows, err := q.db.Query(ctx, rollupSumKinds, arg.AccountID, arg.RecordedAt, arg.RecordedAt_2)
 	if err != nil {
@@ -291,6 +301,7 @@ func (q *Queries) RollupSumKinds(ctx context.Context, arg RollupSumKindsParams) 
 			&i.Metric,
 			&i.Kind,
 			&i.Model,
+			&i.ModuleVersion,
 			&i.BillableQuantity,
 		); err != nil {
 			return nil, err
@@ -310,6 +321,7 @@ SELECT
     metric,
     kind,
     model,
+    module_version,
     COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity
 FROM (
     SELECT
@@ -318,9 +330,10 @@ FROM (
         metric,
         kind,
         COALESCE(model, '') AS model,
+        COALESCE(module_version, '') AS module_version,
         value * EXTRACT(EPOCH FROM (
             LEAD(recorded_at, 1, $3::timestamptz)
-                OVER (PARTITION BY app_id, module_id, metric, COALESCE(model, '') ORDER BY recorded_at, event_id)
+                OVER (PARTITION BY app_id, module_id, metric, COALESCE(model, ''), COALESCE(module_version, '') ORDER BY recorded_at, event_id)
             - recorded_at
         )) / 3600.0 AS segment_byte_hours
     FROM ms_billing.usage_events
@@ -329,7 +342,7 @@ FROM (
       AND recorded_at <  $3
       AND kind = 'time_weighted'
 ) segments
-GROUP BY app_id, module_id, metric, kind, model
+GROUP BY app_id, module_id, metric, kind, model, module_version
 `
 
 type RollupTimeWeightedKindParams struct {
@@ -344,6 +357,7 @@ type RollupTimeWeightedKindRow struct {
 	Metric           string              `json:"metric"`
 	Kind             MsBillingMetricKind `json:"kind"`
 	Model            string              `json:"model"`
+	ModuleVersion    string              `json:"module_version"`
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
 }
 
@@ -358,7 +372,9 @@ type RollupTimeWeightedKindRow struct {
 // samples produces no row (skipped) — its integral is undefined / 0 (design
 // §8). The window ORDER BY is (recorded_at, event_id): event_id is the TEXT PK,
 // so it breaks recorded_at ties deterministically and the LEAD assigns the
-// remaining duration to a stable last row regardless of plan or vacuum.
+// remaining duration to a stable last row regardless of plan or vacuum. The
+// PARTITION BY carries model + module_version so the step function is held
+// separately per (model, module_version), matching the other two rollups.
 func (q *Queries) RollupTimeWeightedKind(ctx context.Context, arg RollupTimeWeightedKindParams) ([]RollupTimeWeightedKindRow, error) {
 	rows, err := q.db.Query(ctx, rollupTimeWeightedKind, arg.AccountID, arg.RecordedAt, arg.Column3)
 	if err != nil {
@@ -374,6 +390,7 @@ func (q *Queries) RollupTimeWeightedKind(ctx context.Context, arg RollupTimeWeig
 			&i.Metric,
 			&i.Kind,
 			&i.Model,
+			&i.ModuleVersion,
 			&i.BillableQuantity,
 		); err != nil {
 			return nil, err
@@ -436,14 +453,14 @@ func (q *Queries) UpsertDeveloperSettlement(ctx context.Context, arg UpsertDevel
 
 const upsertUsageAggregate = `-- name: UpsertUsageAggregate :exec
 INSERT INTO ms_billing.usage_aggregates (
-    period_id, account_id, app_id, module_id, metric, model, kind,
+    period_id, account_id, app_id, module_id, metric, model, module_version, kind,
     billable_quantity, unit_price_micros,
     customer_markup_num, customer_markup_den,
     raw_cost_micros, charged_micros, rolled_up_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now()
 )
-ON CONFLICT (period_id, app_id, module_id, metric, model)
+ON CONFLICT (period_id, app_id, module_id, metric, model, module_version)
 DO UPDATE SET
     billable_quantity   = EXCLUDED.billable_quantity,
     unit_price_micros   = EXCLUDED.unit_price_micros,
@@ -461,6 +478,7 @@ type UpsertUsageAggregateParams struct {
 	ModuleID          string              `json:"module_id"`
 	Metric            string              `json:"metric"`
 	Model             string              `json:"model"`
+	ModuleVersion     string              `json:"module_version"`
 	Kind              MsBillingMetricKind `json:"kind"`
 	BillableQuantity  pgtype.Numeric      `json:"billable_quantity"`
 	UnitPriceMicros   int64               `json:"unit_price_micros"`
@@ -471,12 +489,15 @@ type UpsertUsageAggregateParams struct {
 }
 
 // UpsertUsageAggregate writes the snapshotted billable record idempotently:
-// a rollup re-run for the same (period, app, module, metric, model) upserts the
-// SAME row (identical values) rather than duplicating it. model is ” for non-AI
-// metrics and the roster model id for infra.ai.* (migration 018) — it is part of
-// the idempotency key so two models on one AI metric are distinct billable rows.
-// Snapshots billable_quantity + unit_price + the markup multiplier + raw/charged
-// so a closed invoice is reproducible.
+// a rollup re-run for the same (period, app, module, metric, model,
+// module_version) upserts the SAME row (identical values) rather than
+// duplicating it. model is ” for non-AI metrics and the roster model id for
+// infra.ai.* (migration 018); module_version is ” for a version-less event
+// and the emitting module's version otherwise (migration 023, attribution
+// only — never priced). Both are part of the idempotency key so two models
+// or two versions on one metric are distinct billable rows. Snapshots
+// billable_quantity + unit_price + the markup multiplier + raw/charged so a
+// closed invoice is reproducible.
 func (q *Queries) UpsertUsageAggregate(ctx context.Context, arg UpsertUsageAggregateParams) error {
 	_, err := q.db.Exec(ctx, upsertUsageAggregate,
 		arg.PeriodID,
@@ -485,6 +506,7 @@ func (q *Queries) UpsertUsageAggregate(ctx context.Context, arg UpsertUsageAggre
 		arg.ModuleID,
 		arg.Metric,
 		arg.Model,
+		arg.ModuleVersion,
 		arg.Kind,
 		arg.BillableQuantity,
 		arg.UnitPriceMicros,
