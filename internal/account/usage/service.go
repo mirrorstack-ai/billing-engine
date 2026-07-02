@@ -283,6 +283,7 @@ func (s *Service) GetUsageHistory(ctx context.Context, req GetUsageHistoryReques
 			cur = &periods[len(periods)-1]
 		}
 		cur.Metrics = append(cur.Metrics, MetricUsage{
+			ModuleID:        r.ModuleID,
 			Metric:          r.Metric,
 			Kind:            r.Kind,
 			Quantity:        r.Quantity,
@@ -290,6 +291,7 @@ func (s *Service) GetUsageHistory(ctx context.Context, req GetUsageHistoryReques
 			RawCostMicros:   r.RawCostMicros,
 			ChargedMicros:   r.ChargedMicros,
 			Group:           r.Group,
+			Visibility:      r.Visibility,
 		})
 	}
 	return &GetUsageHistoryResponse{Periods: periods}, nil
