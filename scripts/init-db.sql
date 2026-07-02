@@ -23,3 +23,14 @@
 \i migrations/billing/016_account_collection.up.sql
 -- 017: platform-infra metric catalog seed (Plane 1, PR #10a).
 \i migrations/billing/017_platform_infra_metrics.up.sql
+-- 018: AI model price catalog (Plane 1, PR #10b).
+\i migrations/billing/018_ai_model_prices.up.sql
+-- 019–022: infra catalog hygiene + P1 seed + display groups + compute-alias drop.
+\i migrations/billing/019_infra_catalog_hygiene.up.sql
+\i migrations/billing/020_p1_infra_catalog_seed.up.sql
+\i migrations/billing/021_metric_display_groups.up.sql
+\i migrations/billing/022_drop_compute_alias.up.sql
+-- 023: module_version usage dimension.
+\i migrations/billing/023_usage_module_version.up.sql
+-- 024: production billing_svc grants (NOTICE-skips locally — no billing_svc role in dev).
+\i migrations/billing/024_billing_svc_grants.up.sql
