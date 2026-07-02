@@ -33,6 +33,8 @@ applying cleanly on a fresh DB.
 | 011–013 | *(reserved)*                      | **RESERVED** for the meter charge-chain PRs — `invoices` / `billing_runs` / `developer_settlements`. Not in the tree yet. |
 | 014     | `014_budgets.up.sql`              | budgets (per-app spending caps + thresholds) |
 | 015     | `015_budget_alerts.up.sql`        | recorded threshold crossings             |
+| 016–023 | collection + infra-metric catalog + display groups + usage `module_version` | shipped |
+| 024     | `024_billing_svc_grants.up.sql`   | production `billing_svc` role grants (RDS-IAM via RDS Proxy); NOTICE-skips when the role is absent (dev/CI) |
 
 ### Reserved slots (011–013)
 
