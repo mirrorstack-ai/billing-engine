@@ -289,3 +289,128 @@ SELECT
 FROM live
 WHERE NOT EXISTS (SELECT 1 FROM rolled)
 ORDER BY module_id, metric, model, module_version;
+
+-- AppBillLines is the FULL per-app bill's line source — the read behind
+-- GetAppBill (the app-owner's 最終費用 bill for ONE app in ONE period). It is
+-- AppUsageSummary widened into the whole pricing structure: it returns EVERY
+-- usage line for the (account, app, period), BOTH the customer-facing module
+-- usage (custom metrics, priced at the declared unit_price with NO markup) AND
+-- the platform-infra plane (reserved infra.* / platform.* metrics, priced at the
+-- 1.2× infra markup). The Go service (GetAppBill) partitions these by name:
+--   * a NON-reserved line → 模組使用量 MODULE USAGE (its own displayed line),
+--   * a reserved infra.* / platform.* line → folded into the 基礎設施
+--     INFRASTRUCTURE total (its own summary line; NOT shown per-metric).
+-- Splitting in Go (not two queries) keeps ONE rolled-up-else-live gate over ONE
+-- scan, and lets the service derive the installed-module proxy (COUNT DISTINCT
+-- non-reserved module_id) from the same rows.
+--
+-- Rolled-up-else-live, identical to AppUsageSummary (see its header): once the
+-- period is rolled into usage_aggregates read the FROZEN billable record, else
+-- estimate LIVE from raw usage_events. The ONE difference from AppUsageSummary is
+-- the LIVE charged_micros: a reserved infra.* / platform.* line applies the
+-- ×12/10 infra markup INLINE so the live infra estimate matches the rolled
+-- usage_aggregates.charged_micros (the rollup snapshots that same 1.2× via
+-- cycle.infraMarkupNum/Den + isReservedMetric — design §4 Axis 3). A custom
+-- metric keeps the identity 1× (declared price, NO customer markup). The rolled
+-- branch already carries the correct markup frozen in charged_micros, so it needs
+-- no CASE. NUMERIC ×12/10 stays exact (÷10 terminates); the store rounds it
+-- half-up ONCE per line through the shared micros decoder.
+--
+-- UNINSTALL-SAFE: like AppUsageSummary, this NEVER joins ms_applications /
+-- module_install (which drops on uninstall) — it reads only the immutable
+-- usage_aggregates / usage_events ledgers, so an uninstalled module's accrued
+-- usage still bills + displays. The module DISPLAY NAME is resolved by the caller
+-- from the module catalog (module_versions), never from an install row; this
+-- query returns module_id only (like every other usage read here).
+-- name: AppBillLines :many
+WITH rolled AS (
+    SELECT
+        ua.module_id                                       AS module_id,
+        ua.metric                                          AS metric,
+        ua.kind                                            AS kind,
+        ua.model                                           AS model,
+        ua.module_version                                  AS module_version,
+        COALESCE(SUM(ua.billable_quantity), 0)::numeric    AS billable_quantity,
+        COALESCE(MAX(ua.unit_price_micros), 0)::bigint     AS unit_price_micros,
+        COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros
+    FROM ms_billing.usage_aggregates ua
+    JOIN ms_billing.billing_periods bp
+        ON bp.id = ua.period_id
+    WHERE ua.account_id   = @account_id::uuid
+      AND ua.app_id       = @app_id::uuid
+      AND bp.period_start = @period_start::timestamptz
+    GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
+),
+live AS (
+    SELECT
+        e.module_id                                        AS module_id,
+        e.metric                                           AS metric,
+        e.kind                                             AS kind,
+        COALESCE(e.model, '')                              AS model,
+        COALESCE(e.module_version, '')                     AS module_version,
+        COALESCE(SUM(e.value), 0)::numeric                 AS billable_quantity,
+        COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
+        -- Custom metric → qty × price (identity 1×). Reserved infra.* / platform.*
+        -- → qty × price × 12/10 (the SAME 1.2× the rollup freezes; mirrors
+        -- cycle.infraMarkupNum/Den). metric is a GROUP BY column, so the CASE is
+        -- constant within each group.
+        CASE
+            WHEN e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%'
+                THEN COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
+            ELSE COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0)
+        END::numeric                                       AS charged_micros
+    FROM ms_billing.usage_events e
+    LEFT JOIN ms_billing.metric_definitions md
+        ON md.module_id = e.module_id AND md.metric = e.metric
+    WHERE e.account_id  = @account_id::uuid
+      AND e.app_id      = @app_id::uuid
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
+    GROUP BY e.module_id, e.metric, e.kind, COALESCE(e.model, ''), COALESCE(e.module_version, '')
+)
+SELECT
+    module_id, metric, kind, model, module_version,
+    billable_quantity, unit_price_micros, charged_micros
+FROM rolled
+UNION ALL
+SELECT
+    module_id, metric, kind, model, module_version,
+    billable_quantity, unit_price_micros, charged_micros
+FROM live
+WHERE NOT EXISTS (SELECT 1 FROM rolled)
+ORDER BY module_id, metric, model, module_version;
+
+-- ListBillingPeriods lists an account's REAL billing_periods rows (the closed,
+-- rolled/invoiced periods) newest-first — the source for the web's top-right 週期
+-- (period) selector on the app bill. Each row carries is_current: true iff its
+-- period_start equals the caller-supplied current calendar-month start
+-- (@current_month_start, = usage.currentPeriodWindow(now).start), so a
+-- (rare) already-open current-month row is flagged rather than duplicated. The
+-- service PREPENDS a synthetic current live period when no row is current yet
+-- (the in-progress month has no billing_periods row until cmd/billing-cycle rolls
+-- it up), so the selector always offers "current" + every past period.
+--
+-- CALENDAR-MONTH ANCHOR (reconciled): billing_periods rows are real
+-- calendar-month windows (cmd/billing-cycle's justClosedCalendarMonth), matching
+-- currentPeriodWindow — the selector lists those real periods, not a derived
+-- signup-anniversary window.
+-- name: ListBillingPeriods :many
+SELECT
+    bp.id                                                 AS id,
+    bp.period_start                                       AS period_start,
+    bp.period_end                                         AS period_end,
+    (bp.period_start = @current_month_start::timestamptz) AS is_current
+FROM ms_billing.billing_periods bp
+WHERE bp.account_id = @account_id::uuid
+ORDER BY bp.period_start DESC;
+
+-- BillingPeriodWindow resolves ONE billing_periods row's [period_start,
+-- period_end) window by its id, GATED on account_id so a caller can only address
+-- its own periods (no cross-account period enumeration). GetAppBill uses it to
+-- turn an optional period-id ref into the window the AppBillLines read runs over;
+-- a past period resolves to a closed window whose usage_aggregates are frozen.
+-- pgx.ErrNoRows (no such id for this account) → the service returns NOT_FOUND.
+-- name: BillingPeriodWindow :one
+SELECT period_start, period_end
+FROM ms_billing.billing_periods
+WHERE id = @period_id::uuid AND account_id = @account_id::uuid;

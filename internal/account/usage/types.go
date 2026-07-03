@@ -292,6 +292,100 @@ type GetAppUsageSummaryResponse struct {
 	Metrics []AppMetricUsage `json:"metrics"`
 }
 
+// GetAppBillRequest is the payload of GetAppBill: the app OWNER principal (the
+// payer — exactly one of OwnerUserID / OwnerOrgID) plus the ONE app whose bill
+// is requested, and an OPTIONAL period reference. This is the read behind the
+// full 最終費用 bill (base fee + module usage + infrastructure − PaaS credit).
+type GetAppBillRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	// AppID scopes the bill to a single app. Required.
+	AppID uuid.UUID `json:"app_id"`
+	// PeriodID selects a PAST billing period (a real billing_periods row id from
+	// GetBillingPeriods). OMIT it (leave zero) for the DEFAULT: the current,
+	// still-open calendar-month period estimated live from usage_events. A set id
+	// resolves to that closed period's frozen usage_aggregates. Do NOT send an
+	// empty string — omit the field entirely to mean "current".
+	PeriodID uuid.UUID `json:"period_id,omitempty"`
+}
+
+// GetAppBillResponse is the app-owner's FULL bill for ONE app in ONE period. The
+// final total is:
+//
+//	TotalMicros = BaseFeeMicros + ModuleUsageTotalMicros + InfraTotalMicros − PaasCreditMicros
+//
+// Every amount is integer micro-dollars. There is NO customer markup by module
+// visibility anywhere (that developer margin-share is settled dev-side, off this
+// bill). When no billing account / usage exists yet the bill still carries the
+// base fee (a per-app/period platform fee), with zero usage / infra / credit.
+type GetAppBillResponse struct {
+	// AppID echoes the requested app (self-describing per-app bill).
+	AppID uuid.UUID `json:"app_id"`
+	// PeriodID echoes the resolved period id — empty ("") for the current live
+	// period (which has no billing_periods row yet), the real id for a past one.
+	PeriodID string `json:"period_id"`
+	// PeriodStart / PeriodEnd bound the billed window.
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+
+	// BaseFeeMicros is 基本費用 — the fixed per-app/period platform fee, PLUS the
+	// per-module surcharge for each installed module beyond IncludedModules (see
+	// the bill.go consts). Bundles the PaaS infra credit surfaced below.
+	BaseFeeMicros int64 `json:"base_fee_micros"`
+
+	// ModuleUsage is 模組使用量 — one line per (module, metric, model,
+	// module_version) of metered CUSTOM usage, quantity × declared unit price with
+	// NO markup. EXCLUDES the reserved infra.* / platform.* metrics (those roll
+	// into InfraTotalMicros). Empty slice (never nil) when the app has no module
+	// usage this period.
+	ModuleUsage []AppMetricUsage `json:"module_usage"`
+	// ModuleUsageTotalMicros is Σ ModuleUsage[].ChargedMicros.
+	ModuleUsageTotalMicros int64 `json:"module_usage_total_micros"`
+
+	// InfraTotalMicros is 基礎設施 — the platform-infra plane charge (reserved
+	// infra.* / platform.* metrics priced at the 1.2× infra markup) for this
+	// app/period, surfaced as its own single line (never per-metric here).
+	InfraTotalMicros int64 `json:"infra_total_micros"`
+
+	// PaasCreditMicros is PaaS 額度 — the infra credit EARNED ONLY through an active
+	// SaaS subscription (PaasCreditPct% of InfraTotalMicros). A NON-NEGATIVE
+	// magnitude SUBTRACTED in TotalMicros. v1 has NO subscription system, so it is
+	// ALWAYS 0 today: the field is retained on the wire for back-compat, and the web
+	// hides the credit line when it is 0. It becomes non-zero once a subscription
+	// resolver lands (see paasCreditMicros).
+	PaasCreditMicros int64 `json:"paas_credit_micros"`
+
+	// TotalMicros is 最終費用 = BaseFee + ModuleUsageTotal + InfraTotal − PaasCredit.
+	TotalMicros int64 `json:"total_micros"`
+}
+
+// GetBillingPeriodsRequest is the payload of GetBillingPeriods: the owner
+// principal whose billing cycles are listed for the web 週期 (period) selector.
+type GetBillingPeriodsRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+}
+
+// BillingPeriodRef is one entry of the period selector: a billing cycle the app
+// bill can be rendered for. PeriodID is the real billing_periods row id for a
+// past period, or "" for the synthetic CURRENT live period (which has no
+// billing_periods row yet — request the current bill by OMITTING period_id).
+type BillingPeriodRef struct {
+	PeriodID    string    `json:"period_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	// IsCurrent marks the in-progress calendar-month period (the default bill).
+	IsCurrent bool `json:"is_current"`
+}
+
+// GetBillingPeriodsResponse lists the account's billing cycles newest-first, the
+// current (live) period always first. It ALWAYS contains at least the current
+// period (synthesized when no closed billing_periods row is current yet), so the
+// selector is never empty even for a brand-new account.
+type GetBillingPeriodsResponse struct {
+	Periods []BillingPeriodRef `json:"periods"`
+}
+
 // SetModuleVisibilityRequest is the payload of SetModuleVisibility, fired
 // by api-platform on a module publish/unpublish. It upserts the developer
 // margin-share mirror; it NEVER affects the customer charge.

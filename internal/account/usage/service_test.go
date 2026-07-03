@@ -20,14 +20,17 @@ func inf() float64 { return math.Inf(1) }
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
-	defs        map[string]usage.MetricDefinition // key: module/metric
-	accounts    map[uuid.UUID]uuid.UUID           // owner userID → accountID
-	events      map[string]usage.UsageEvent       // event_id → event (idempotency)
-	periodRows  []usage.MetricUsageRaw
-	historyRows []usage.PeriodMetricUsageRaw
-	versionRows []usage.VersionUsageRaw
-	appRows     []usage.AppMetricUsageRaw
-	visibility  map[uuid.UUID]usage.Visibility
+	defs           map[string]usage.MetricDefinition // key: module/metric
+	accounts       map[uuid.UUID]uuid.UUID           // owner userID → accountID
+	events         map[string]usage.UsageEvent       // event_id → event (idempotency)
+	periodRows     []usage.MetricUsageRaw
+	historyRows    []usage.PeriodMetricUsageRaw
+	versionRows    []usage.VersionUsageRaw
+	appRows        []usage.AppMetricUsageRaw
+	appBillRows    []usage.AppMetricUsageRaw
+	periodListRows []usage.BillingPeriodRaw
+	periodWindows  map[uuid.UUID]periodWindow // billing_periods id → window
+	visibility     map[uuid.UUID]usage.Visibility
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
@@ -38,15 +41,27 @@ type fakeStore struct {
 	gotAppUsageAccountID uuid.UUID
 	gotAppUsageAppID     uuid.UUID
 
-	errLookup     error
-	errAccount    error
-	errInsert     error
-	errPeriod     error
-	errVisibility error
-	errUpsertDef  error
-	errHistory    error
-	errVersion    error
-	errAppUsage   error
+	// captured AppBill call args (the full bill read gate).
+	gotAppBillAccountID uuid.UUID
+	gotAppBillAppID     uuid.UUID
+
+	errLookup       error
+	errAccount      error
+	errInsert       error
+	errPeriod       error
+	errVisibility   error
+	errUpsertDef    error
+	errHistory      error
+	errVersion      error
+	errAppUsage     error
+	errAppBill      error
+	errPeriodList   error
+	errPeriodWindow error
+}
+
+// periodWindow is a fake billing_periods window for BillingPeriodWindow lookups.
+type periodWindow struct {
+	start, end time.Time
 }
 
 func newFakeStore() *fakeStore {
@@ -143,6 +158,30 @@ func (f *fakeStore) AppUsage(_ context.Context, accountID, appID uuid.UUID, _, _
 		return nil, f.errAppUsage
 	}
 	return f.appRows, nil
+}
+
+func (f *fakeStore) AppBill(_ context.Context, accountID, appID uuid.UUID, _, _ time.Time) ([]usage.AppMetricUsageRaw, error) {
+	f.gotAppBillAccountID = accountID
+	f.gotAppBillAppID = appID
+	if f.errAppBill != nil {
+		return nil, f.errAppBill
+	}
+	return f.appBillRows, nil
+}
+
+func (f *fakeStore) ListBillingPeriods(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.BillingPeriodRaw, error) {
+	if f.errPeriodList != nil {
+		return nil, f.errPeriodList
+	}
+	return f.periodListRows, nil
+}
+
+func (f *fakeStore) BillingPeriodWindow(_ context.Context, _, periodID uuid.UUID) (time.Time, time.Time, bool, error) {
+	if f.errPeriodWindow != nil {
+		return time.Time{}, time.Time{}, false, f.errPeriodWindow
+	}
+	w, ok := f.periodWindows[periodID]
+	return w.start, w.end, ok, nil
 }
 
 // --- helpers --------------------------------------------------------------

@@ -87,6 +87,31 @@ type Store interface {
 	// model / module_version dimensions. There is NO customer markup by module
 	// visibility: charged is the declared unit_price × quantity.
 	AppUsage(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppMetricUsageRaw, error)
+
+	// AppBill reads EVERY usage line for the full-structure app-owner bill for
+	// ONE (account, app, period) — the read behind GetAppBill. It is AppUsage
+	// widened to the WHOLE pricing plane: it returns BOTH the customer module-usage
+	// lines (custom metrics, priced at the declared unit_price with NO markup) AND
+	// the platform-infra lines (reserved infra.* / platform.* metrics, priced at
+	// the 1.2× infra markup — applied inline on the live branch, frozen on the
+	// rolled branch). The service partitions the rows by name (isReservedMetric):
+	// non-reserved → 模組使用量 module usage, reserved → 基礎設施 infrastructure
+	// total. Rolled-up-else-live and uninstall-safe exactly like AppUsage (reads
+	// only the usage_aggregates / usage_events ledgers, NEVER an install table).
+	AppBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppMetricUsageRaw, error)
+
+	// ListBillingPeriods returns an account's real billing_periods rows
+	// newest-first (the closed periods behind the web 週期 selector).
+	// currentMonthStart is the current calendar-month start
+	// (currentPeriodWindow(now).start); a row whose period_start equals it is
+	// flagged IsCurrent. The service prepends a synthetic current live period when
+	// none is flagged (the in-progress month has no billing_periods row yet).
+	ListBillingPeriods(ctx context.Context, accountID uuid.UUID, currentMonthStart time.Time) ([]BillingPeriodRaw, error)
+
+	// BillingPeriodWindow resolves ONE billing_periods row's [start, end) window
+	// by (accountID, periodID). found=false (pgx.ErrNoRows) → the service returns
+	// NOT_FOUND; the account gate prevents cross-account period enumeration.
+	BillingPeriodWindow(ctx context.Context, accountID, periodID uuid.UUID) (start, end time.Time, found bool, err error)
 }
 
 // MetricDefinition is the catalog projection the ingest path resolves
@@ -214,6 +239,16 @@ type AppMetricUsageRaw struct {
 	BillableQuantity float64
 	UnitPriceMicros  int64
 	ChargedMicros    int64
+}
+
+// BillingPeriodRaw is one row of ListBillingPeriods: a real billing_periods
+// window plus whether it is the current calendar month (IsCurrent). It is the
+// per-period entry the web 週期 (period) selector renders.
+type BillingPeriodRaw struct {
+	ID          uuid.UUID
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	IsCurrent   bool
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -439,30 +474,112 @@ func (s *pgxStore) AppUsage(ctx context.Context, accountID, appID uuid.UUID, per
 	}
 	out := make([]AppMetricUsageRaw, 0, len(rows))
 	for _, r := range rows {
-		qty, err := floatFromNumeric(r.BillableQuantity)
+		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros)
 		if err != nil {
-			return nil, fmt.Errorf("decode billable_quantity for metric %q: %w", r.Metric, err)
+			return nil, err
 		}
-		charged, err := microsFromNumeric(r.ChargedMicros)
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+// AppBill reads the full-structure app-owner bill lines for ONE app+period,
+// rolled-up-else-live per the AppBillLines query — BOTH the module-usage lines
+// and the reserved infra.* / platform.* lines (the latter carrying the 1.2× infra
+// markup). The service (GetAppBill) partitions the returned rows by name.
+func (s *pgxStore) AppBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppMetricUsageRaw, error) {
+	rows, err := s.q.AppBillLines(ctx, db.AppBillLinesParams{
+		AccountID:   accountID.String(),
+		AppID:       appID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppMetricUsageRaw, 0, len(rows))
+	for _, r := range rows {
+		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros)
 		if err != nil {
-			return nil, fmt.Errorf("decode charged_micros for metric %q: %w", r.Metric, err)
+			return nil, err
 		}
-		moduleID, err := uuid.Parse(r.ModuleID)
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+// ListBillingPeriods reads an account's real billing_periods rows newest-first,
+// flagging the row whose period_start equals currentMonthStart as IsCurrent.
+func (s *pgxStore) ListBillingPeriods(ctx context.Context, accountID uuid.UUID, currentMonthStart time.Time) ([]BillingPeriodRaw, error) {
+	rows, err := s.q.ListBillingPeriods(ctx, db.ListBillingPeriodsParams{
+		AccountID:         accountID.String(),
+		CurrentMonthStart: currentMonthStart,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]BillingPeriodRaw, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.ID)
 		if err != nil {
-			return nil, fmt.Errorf("decode module_id for metric %q: %w", r.Metric, err)
+			return nil, fmt.Errorf("decode billing period id %q: %w", r.ID, err)
 		}
-		out = append(out, AppMetricUsageRaw{
-			ModuleID:         moduleID,
-			Metric:           r.Metric,
-			Kind:             Kind(r.Kind),
-			Model:            r.Model,
-			ModuleVersion:    r.ModuleVersion,
-			BillableQuantity: qty,
-			UnitPriceMicros:  r.UnitPriceMicros,
-			ChargedMicros:    charged,
+		out = append(out, BillingPeriodRaw{
+			ID:          id,
+			PeriodStart: r.PeriodStart,
+			PeriodEnd:   r.PeriodEnd,
+			IsCurrent:   r.IsCurrent,
 		})
 	}
 	return out, nil
+}
+
+// BillingPeriodWindow resolves one billing_periods row's [start, end) window by
+// (accountID, periodID). pgx.ErrNoRows → found=false (the service maps it to
+// NOT_FOUND); the account gate keeps a caller to its own periods.
+func (s *pgxStore) BillingPeriodWindow(ctx context.Context, accountID, periodID uuid.UUID) (time.Time, time.Time, bool, error) {
+	row, err := s.q.BillingPeriodWindow(ctx, db.BillingPeriodWindowParams{
+		PeriodID:  periodID.String(),
+		AccountID: accountID.String(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, time.Time{}, false, err
+	}
+	return row.PeriodStart, row.PeriodEnd, true, nil
+}
+
+// appMetricUsageRaw decodes one generated app-usage/app-bill row into the
+// AppMetricUsageRaw the service consumes: the NUMERIC billable_quantity as a
+// display float, charged_micros half-up through the shared micros decoder (a
+// no-op on the already-integer rolled branch, the single rounding point on the
+// live SUM(value × unit_price [× markup]) branch), and module_id parsed from its
+// text form. Shared by AppUsage + AppBill (identical generated row shapes).
+func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, quantity, charged pgtype.Numeric, unitPriceMicros int64) (AppMetricUsageRaw, error) {
+	qty, err := floatFromNumeric(quantity)
+	if err != nil {
+		return AppMetricUsageRaw{}, fmt.Errorf("decode billable_quantity for metric %q: %w", metric, err)
+	}
+	chargedMicros, err := microsFromNumeric(charged)
+	if err != nil {
+		return AppMetricUsageRaw{}, fmt.Errorf("decode charged_micros for metric %q: %w", metric, err)
+	}
+	mod, err := uuid.Parse(moduleID)
+	if err != nil {
+		return AppMetricUsageRaw{}, fmt.Errorf("decode module_id for metric %q: %w", metric, err)
+	}
+	return AppMetricUsageRaw{
+		ModuleID:         mod,
+		Metric:           metric,
+		Kind:             Kind(kind),
+		Model:            model,
+		ModuleVersion:    moduleVersion,
+		BillableQuantity: qty,
+		UnitPriceMicros:  unitPriceMicros,
+		ChargedMicros:    chargedMicros,
+	}, nil
 }
 
 func (s *pgxStore) UpsertModuleVisibility(ctx context.Context, moduleID uuid.UUID, vis Visibility) error {
