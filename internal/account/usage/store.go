@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // Store is the persistence interface Service depends on. Narrow on
@@ -46,6 +47,14 @@ type Store interface {
 	// (user or org), or (Nil, false) when none exists yet. Read-only;
 	// missing-account is a normal lazy-state outcome, not an error.
 	AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, bool, error)
+
+	// AccountAnchorDay returns the account's billing-period anchor day (1..31):
+	// the day-of-month it bound its first credit card (activated_at, migration
+	// 025), derived in UTC. An account with no activation yet (NULL activated_at,
+	// or a missing row) falls back to billingperiod.DefaultAnchorDay (1 = the UTC
+	// calendar month, the pre-025 window). Read once per RPC so each read windows
+	// the account's OWN anchored period rather than the calendar month.
+	AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (int, error)
 
 	// CurrentPeriodUsage sums raw usage_events for the account in
 	// [periodStart, periodEnd), joined to metric_definitions, projecting
@@ -102,10 +111,11 @@ type Store interface {
 
 	// ListBillingPeriods returns an account's real billing_periods rows
 	// newest-first (the closed periods behind the web 週期 selector).
-	// currentMonthStart is the current calendar-month start
-	// (currentPeriodWindow(now).start); a row whose period_start equals it is
-	// flagged IsCurrent. The service prepends a synthetic current live period when
-	// none is flagged (the in-progress month has no billing_periods row yet).
+	// currentMonthStart is the current anchored-period start
+	// (billingperiod.AnchoredPeriodWindow(now, anchorDay).start); a row whose
+	// period_start equals it is flagged IsCurrent. The service prepends a synthetic
+	// current live period when none is flagged (the in-progress period has no
+	// billing_periods row yet).
 	ListBillingPeriods(ctx context.Context, accountID uuid.UUID, currentMonthStart time.Time) ([]BillingPeriodRaw, error)
 
 	// BillingPeriodWindow resolves ONE billing_periods row's [start, end) window
@@ -354,6 +364,24 @@ func (s *pgxStore) AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, 
 		return uuid.Nil, false, err
 	}
 	return parsed, true, nil
+}
+
+// AccountAnchorDay reads the account's activated_at and derives its anchor day.
+// A NULL anchor (never activated) or a missing row (defensive; the caller passes
+// an already-resolved account id) falls back to the calendar-month default so the
+// read never fails on an un-activated account.
+func (s *pgxStore) AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (int, error) {
+	at, err := s.q.AccountActivatedAt(ctx, accountID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return billingperiod.DefaultAnchorDay, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !at.Valid {
+		return billingperiod.DefaultAnchorDay, nil
+	}
+	return billingperiod.AnchorDay(at.Time), nil
 }
 
 func (s *pgxStore) CurrentPeriodUsage(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]MetricUsageRaw, error) {

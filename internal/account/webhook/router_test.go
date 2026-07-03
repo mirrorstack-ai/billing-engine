@@ -173,6 +173,9 @@ func TestProcess_PaymentMethodAttached_InsertsMirror(t *testing.T) {
 	require.Equal(t, "4242", s.Inserts[0].Last4)
 	require.Equal(t, 12, s.Inserts[0].ExpMonth)
 	require.Equal(t, 2029, s.Inserts[0].ExpYear)
+	// The attach also freezes the billing-period anchor (migration 025) for the
+	// customer's account — the confirmed first-card-bind moment.
+	require.Equal(t, []string{"cus_x"}, s.ActivatedCustomers)
 }
 
 func TestProcess_PaymentMethodAttached_NoAccountRow_DriftWarning(t *testing.T) {
@@ -185,6 +188,25 @@ func TestProcess_PaymentMethodAttached_NoAccountRow_DriftWarning(t *testing.T) {
 
 	require.Equal(t, 200, res.HTTPStatus)
 	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	// Drift (no accounts row) must NOT stamp an anchor — the handler returns
+	// before the stamp when the mirror insert found no account.
+	require.Empty(t, s.ActivatedCustomers)
+}
+
+// TestProcess_PaymentMethodAttached_StampErrorIsBestEffort proves an
+// activation-stamp failure never fails the attach: the card is still mirrored and
+// the webhook ACKs 200/OK (the next bind re-stamps the still-NULL anchor).
+func TestProcess_PaymentMethodAttached_StampErrorIsBestEffort(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma3", "payment_method.attached", "pm_x", "cus_x", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
+	s.ErrActivate = errors.New("anchor stamp db error")
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.Inserts, 1, "card is still mirrored despite the stamp error")
 }
 
 func TestProcess_PaymentMethodDetached_SoftDeletes(t *testing.T) {

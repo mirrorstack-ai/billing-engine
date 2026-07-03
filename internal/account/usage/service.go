@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // reservedMetricPrefixes are the platform-measured namespaces a module
@@ -158,10 +159,21 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 	// evaluated, so re-evaluating would re-walk the same spend (harmless —
 	// the alert insert is idempotent — but wasteful). BEST-EFFORT: a budget
 	// error must NOT fail the usage ingest, so we log and continue. The
-	// window matches GetUsageSummary's (the calendar month the event fell in)
-	// so the budget is checked against exactly what the user sees.
+	// window matches GetUsageSummary's (the payer account's anchored period the
+	// event fell in) so the budget is checked against exactly what the user
+	// sees. A lazy event (accountID == Nil) has no payer account to anchor on,
+	// so it falls back to the calendar month (DefaultAnchorDay).
 	if recorded && s.budget != nil {
-		start, end := currentPeriodWindow(recordedAt.UTC())
+		anchorDay := billingperiod.DefaultAnchorDay
+		if accountID != uuid.Nil {
+			if d, err := s.store.AccountAnchorDay(ctx, accountID); err != nil {
+				slog.Error("anchor day lookup failed (budget windowed on calendar month)",
+					"app_id", req.AppID, "account_id", accountID, "error", err)
+			} else {
+				anchorDay = d
+			}
+		}
+		start, end := billingperiod.AnchoredPeriodWindow(recordedAt.UTC(), anchorDay)
 		if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, start, end); err != nil {
 			slog.Error("budget evaluation failed (usage still recorded)",
 				"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
@@ -193,12 +205,14 @@ func (s *Service) GetUsageSummary(ctx context.Context, req GetUsageSummaryReques
 		return &GetUsageSummaryResponse{Metrics: []MetricUsage{}}, nil
 	}
 
-	// Live current-period window: the calendar-month-to-date the events
-	// fell in. The authoritative billing_periods row + signup-day
-	// anniversary windowing is a PR #5/#6 concern; this fast-path estimate
-	// uses the current UTC month so a developer can see running usage
-	// before any rollup exists.
-	start, end := currentPeriodWindow(s.nowFn().UTC())
+	// Live current-period window: the account's anchored period (card-binding
+	// day, ADR 0005) containing now — the same window the rollup + charge cycle
+	// close on, so the running estimate lines up with the eventual bill.
+	anchorDay, err := s.store.AccountAnchorDay(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("anchor day lookup failed", err)
+	}
+	start, end := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
 
 	rows, err := s.store.CurrentPeriodUsage(ctx, accountID, start, end)
 	if err != nil {
@@ -256,11 +270,18 @@ func (s *Service) GetUsageHistory(ctx context.Context, req GetUsageHistoryReques
 		return &GetUsageHistoryResponse{Periods: []PeriodUsage{}}, nil
 	}
 
-	// windowEnd is the current (in-progress) month's start — the trailing
-	// window stops there so this RPC never returns a partial current month.
-	// windowStart is Months calendar months before that.
-	windowEnd, _ := currentPeriodWindow(s.nowFn().UTC())
-	windowStart := windowEnd.AddDate(0, -req.Months, 0)
+	// windowEnd is the current (in-progress) anchored period's start — the
+	// trailing window stops there so this RPC never returns a partial current
+	// period. windowStart is Months ANCHORED periods before that (stepped by
+	// month-index arithmetic + re-clamped from the original anchor day via
+	// ShiftPeriods — never AddDate, which would drift a 31-anchor across a short
+	// month).
+	anchorDay, err := s.store.AccountAnchorDay(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("anchor day lookup failed", err)
+	}
+	windowEnd, _ := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
+	windowStart := billingperiod.ShiftPeriods(windowEnd, -req.Months, anchorDay)
 
 	rows, err := s.store.UsageHistory(ctx, accountID, windowStart, windowEnd)
 	if err != nil {
@@ -319,7 +340,11 @@ func (s *Service) GetVersionBreakdown(ctx context.Context, req GetVersionBreakdo
 		return &GetVersionBreakdownResponse{Versions: []ModuleVersionUsage{}}, nil
 	}
 
-	start, end := currentPeriodWindow(s.nowFn().UTC())
+	anchorDay, err := s.store.AccountAnchorDay(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("anchor day lookup failed", err)
+	}
+	start, end := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
 
 	rows, err := s.store.VersionBreakdown(ctx, accountID, start, req.ModuleID)
 	if err != nil {
@@ -372,10 +397,14 @@ func (s *Service) GetAppUsageSummary(ctx context.Context, req GetAppUsageSummary
 		return &GetAppUsageSummaryResponse{AppID: req.AppID, Metrics: []AppMetricUsage{}}, nil
 	}
 
-	// Same live current-period window as GetUsageSummary: the calendar-month-
-	// to-date the events fell in, which also anchors the rolled-up branch's
-	// billing_periods lookup (period_start).
-	start, end := currentPeriodWindow(s.nowFn().UTC())
+	// Same live current-period window as GetUsageSummary: the account's anchored
+	// period (card-binding day) containing now, which also anchors the rolled-up
+	// branch's billing_periods lookup (period_start).
+	anchorDay, err := s.store.AccountAnchorDay(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("anchor day lookup failed", err)
+	}
+	start, end := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
 
 	rows, err := s.store.AppUsage(ctx, accountID, req.AppID, start, end)
 	if err != nil {
@@ -488,13 +517,4 @@ func isReservedMetric(metric string) bool {
 		}
 	}
 	return false
-}
-
-// currentPeriodWindow returns the [start, end) of the UTC calendar month
-// containing t — the live-estimate window for GetUsageSummary before the
-// authoritative billing_periods row exists (PR #5/#6).
-func currentPeriodWindow(t time.Time) (time.Time, time.Time) {
-	start := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
-	end := start.AddDate(0, 1, 0)
-	return start, end
 }

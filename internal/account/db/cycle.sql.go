@@ -136,7 +136,6 @@ func (q *Queries) AccountsWithUnbilledUsage(ctx context.Context, arg AccountsWit
 }
 
 const accountsWithUsageEvents = `-- name: AccountsWithUsageEvents :many
-
 SELECT DISTINCT account_id::uuid AS account_id
 FROM ms_billing.usage_events
 WHERE account_id  IS NOT NULL
@@ -147,6 +146,47 @@ WHERE account_id  IS NOT NULL
 type AccountsWithUsageEventsParams struct {
 	RecordedAt   time.Time `json:"recorded_at"`
 	RecordedAt_2 time.Time `json:"recorded_at_2"`
+}
+
+// AccountsWithUsageEvents returns the distinct accounts with at least one raw
+// usage_events row in the closed window [period_start, period_end) — the ROLLUP
+// (phase 1) work list. cmd/billing-cycle rolls each of these up
+// (RollupPeriod → usage_aggregates) BEFORE the charge phase, so the charge
+// phase's PeriodChargedTotal reads a populated aggregate set rather than 0.
+// account_id is NULLABLE on usage_events (lazy-account metering); IS NOT NULL
+// excludes pre-attribution events that have no account to bill. Half-open
+// [start, end): recorded_at >= start AND recorded_at < end, matching the rollup
+// SELECTs in rollup.sql.
+func (q *Queries) AccountsWithUsageEvents(ctx context.Context, arg AccountsWithUsageEventsParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, accountsWithUsageEvents, arg.RecordedAt, arg.RecordedAt_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var account_id string
+		if err := rows.Scan(&account_id); err != nil {
+			return nil, err
+		}
+		items = append(items, account_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const activatedAccounts = `-- name: ActivatedAccounts :many
+
+SELECT id, activated_at
+FROM ms_billing.accounts
+WHERE activated_at IS NOT NULL
+`
+
+type ActivatedAccountsRow struct {
+	ID          string             `json:"id"`
+	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
 }
 
 // Queries backing the Milestone D PR #6 charge spine (the Stripe charge +
@@ -180,28 +220,25 @@ type AccountsWithUsageEventsParams struct {
 // Money is micro-dollar BIGINT in usage_aggregates; the Go service converts
 // micros → whole cents (round-half-up) at the Stripe boundary. The invoice
 // mirror stores NUMERIC cents.
-// AccountsWithUsageEvents returns the distinct accounts with at least one raw
-// usage_events row in the closed window [period_start, period_end) — the ROLLUP
-// (phase 1) work list. cmd/billing-cycle rolls each of these up
-// (RollupPeriod → usage_aggregates) BEFORE the charge phase, so the charge
-// phase's PeriodChargedTotal reads a populated aggregate set rather than 0.
-// account_id is NULLABLE on usage_events (lazy-account metering); IS NOT NULL
-// excludes pre-attribution events that have no account to bill. Half-open
-// [start, end): recorded_at >= start AND recorded_at < end, matching the rollup
-// SELECTs in rollup.sql.
-func (q *Queries) AccountsWithUsageEvents(ctx context.Context, arg AccountsWithUsageEventsParams) ([]string, error) {
-	rows, err := q.db.Query(ctx, accountsWithUsageEvents, arg.RecordedAt, arg.RecordedAt_2)
+// ActivatedAccounts returns every account that has bound a card (activated_at IS
+// NOT NULL — migration 025), with its anchor instant, for cmd/billing-cycle's
+// per-account close driver. Un-activated accounts (NULL) have no card and nothing
+// to bill, so they are excluded. The cycle derives each account's anchor day from
+// activated_at and closes THAT account's just-ended anchored period — every close
+// day differs, so the batch can no longer share one window.
+func (q *Queries) ActivatedAccounts(ctx context.Context) ([]ActivatedAccountsRow, error) {
+	rows, err := q.db.Query(ctx, activatedAccounts)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []string{}
+	items := []ActivatedAccountsRow{}
 	for rows.Next() {
-		var account_id string
-		if err := rows.Scan(&account_id); err != nil {
+		var i ActivatedAccountsRow
+		if err := rows.Scan(&i.ID, &i.ActivatedAt); err != nil {
 			return nil, err
 		}
-		items = append(items, account_id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -275,6 +312,29 @@ func (q *Queries) InsertBillingRun(ctx context.Context, arg InsertBillingRunPara
 	var id string
 	err := row.Scan(&id)
 	return id, err
+}
+
+const latestClosedPeriodEnd = `-- name: LatestClosedPeriodEnd :one
+SELECT period_end
+FROM ms_billing.billing_periods
+WHERE account_id = $1
+ORDER BY period_end DESC
+LIMIT 1
+`
+
+// LatestClosedPeriodEnd returns the newest billing_periods.period_end for an
+// account; pgx.ErrNoRows when it has no period yet (the Go store maps that to
+// "none"). cmd/billing-cycle uses it to STRADDLE-CLAMP the first anchored run at
+// cutover: if a computed anchored window starts before the last calendar-month
+// period already ended, the run starts at that end instead, producing one clean
+// bridge period (calendar → anchor) with no overlap, gap, or duplicate
+// (account_id, period_start) key. ORDER BY … LIMIT 1 (not MAX) so the result
+// keeps the NOT NULL period_end column type instead of a nullable aggregate.
+func (q *Queries) LatestClosedPeriodEnd(ctx context.Context, accountID string) (time.Time, error) {
+	row := q.db.QueryRow(ctx, latestClosedPeriodEnd, accountID)
+	var period_end time.Time
+	err := row.Scan(&period_end)
+	return period_end, err
 }
 
 const markBillingRun = `-- name: MarkBillingRun :exec

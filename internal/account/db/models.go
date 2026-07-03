@@ -329,6 +329,8 @@ type MsBillingAccount struct {
 	UsageBillingMode   MsBillingUsageBillingMode `json:"usage_billing_mode"`
 	CreditLimitMicros  int64                     `json:"credit_limit_micros"`
 	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
+	// UTC instant the account bound its FIRST credit card (billing-account activation). Immutable, first-bind-wins; billing-period anchor day = activated_at day-of-month (ADR 0005). NULL = never activated -> skipped by cmd/billing-cycle.
+	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
 }
 
 type MsBillingAddCardRequest struct {

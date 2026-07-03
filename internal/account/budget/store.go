@@ -12,6 +12,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // Store is the persistence interface Service depends on. Narrow on purpose —
@@ -44,6 +45,15 @@ type Store interface {
 
 	// ListBudgetAlerts returns a budget's recorded crossings for a period.
 	ListBudgetAlerts(ctx context.Context, budgetID uuid.UUID, periodStart time.Time) ([]BudgetAlert, error)
+
+	// AppAnchorDay returns the billing-period anchor day (1..31) for an
+	// APP-scoped budget: the paying account's card-binding day (activated_at,
+	// migration 025), resolved app → account through the app's own attributed
+	// usage. An app with no attributed usage yet, or a payer with no activation,
+	// falls back to billingperiod.DefaultAnchorDay (1 = the UTC calendar month).
+	// This anchors GetBudgetStatus / GetBudgetAlerts to the SAME period the
+	// ingest-path evaluation uses for that app's payer.
+	AppAnchorDay(ctx context.Context, appID uuid.UUID) (int, error)
 }
 
 // AlertRecord is the raw crossing handed to InsertBudgetAlert.
@@ -146,6 +156,24 @@ func (s *pgxStore) InsertBudgetAlerts(ctx context.Context, records []AlertRecord
 		return nil, err
 	}
 	return fired, nil
+}
+
+// AppAnchorDay resolves the app's payer account's activated_at (via the app's
+// most-recent attributed usage_event) and derives its anchor day. No attributed
+// usage yet (pgx.ErrNoRows) or a NULL anchor falls back to the calendar-month
+// default so a budget read never fails on a brand-new app.
+func (s *pgxStore) AppAnchorDay(ctx context.Context, appID uuid.UUID) (int, error) {
+	at, err := s.q.AppAccountActivatedAt(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return billingperiod.DefaultAnchorDay, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !at.Valid {
+		return billingperiod.DefaultAnchorDay, nil
+	}
+	return billingperiod.AnchorDay(at.Time), nil
 }
 
 func (s *pgxStore) ListBudgetAlerts(ctx context.Context, budgetID uuid.UUID, periodStart time.Time) ([]BudgetAlert, error) {

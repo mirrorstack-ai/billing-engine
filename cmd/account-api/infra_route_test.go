@@ -34,6 +34,9 @@ func (s *stubUsageStore) InsertUsageEvent(_ context.Context, e usage.UsageEvent)
 func (stubUsageStore) AccountByOwner(context.Context, usage.Owner) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil
 }
+func (stubUsageStore) AccountAnchorDay(context.Context, uuid.UUID) (int, error) {
+	return 1, nil
+}
 func (stubUsageStore) CurrentPeriodUsage(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.MetricUsageRaw, error) {
 	return nil, nil
 }
