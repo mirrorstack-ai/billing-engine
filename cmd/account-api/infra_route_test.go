@@ -49,6 +49,15 @@ func (stubUsageStore) VersionBreakdown(context.Context, uuid.UUID, time.Time, uu
 func (stubUsageStore) AppUsage(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time) ([]usage.AppMetricUsageRaw, error) {
 	return nil, nil
 }
+func (stubUsageStore) AppBill(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time) ([]usage.AppMetricUsageRaw, error) {
+	return nil, nil
+}
+func (stubUsageStore) ListBillingPeriods(context.Context, uuid.UUID, time.Time) ([]usage.BillingPeriodRaw, error) {
+	return nil, nil
+}
+func (stubUsageStore) BillingPeriodWindow(context.Context, uuid.UUID, uuid.UUID) (time.Time, time.Time, bool, error) {
+	return time.Time{}, time.Time{}, false, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()

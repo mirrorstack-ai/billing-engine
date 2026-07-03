@@ -151,6 +151,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.GetAppUsageSummary(ctx, req)
 
+	case "GetAppBill":
+		var req usage.GetAppBillRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.GetAppBill(ctx, req)
+
+	case "GetBillingPeriods":
+		var req usage.GetBillingPeriodsRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.GetBillingPeriods(ctx, req)
+
 	case "SetMetricDefinitions":
 		var req usage.SetMetricDefinitionsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -310,6 +324,13 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// over the SAME usage data the other summary reads produce, so it shares
 		// the control-plane credential + route group.
 		r.Post("/v1/billing.GetAppUsageSummary", makeHTTPHandler(d, "GetAppUsageSummary"))
+		// Full app-owner bill (this PR): the whole 最終費用 structure for ONE app in
+		// ONE period — 基本費用 base fee + 模組使用量 module usage + 基礎設施
+		// infrastructure − PaaS 額度 credit — plus the period selector list. Both are
+		// read-only over the SAME usage/aggregate/period data, so they share the
+		// control-plane credential + route group.
+		r.Post("/v1/billing.GetAppBill", makeHTTPHandler(d, "GetAppBill"))
+		r.Post("/v1/billing.GetBillingPeriods", makeHTTPHandler(d, "GetBillingPeriods"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
 		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
 		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of
