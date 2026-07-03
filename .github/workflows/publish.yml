@@ -1,0 +1,69 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ap-northeast-1
+
+      - name: Build Lambda zips
+        run: |
+          mkdir -p dist
+          for pair in \
+            account-api:billing-account-api \
+            account-webhook:billing-webhook \
+            billing-cycle:billing-cycle \
+            infra-egress-sync:billing-egress-sync
+          do
+            cmd="${pair%%:*}"
+            artifact="${pair##*:}"
+            echo "Building ./cmd/$cmd -> $artifact.zip"
+            GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc -ldflags="-s -w" -o bootstrap "./cmd/$cmd"
+            zip -j "dist/$artifact.zip" bootstrap
+            rm bootstrap
+          done
+
+      # ZIP ROOT must contain billing/<files>.sql — this layout is the
+      # contract for api-platform's migrate-runner runtime overlay.
+      - name: Build migrations.zip
+        run: (cd migrations && zip -r ../dist/migrations.zip billing)
+
+      - name: Upload artifacts
+        run: |
+          for f in dist/*.zip; do
+            aws s3 cp "$f" "s3://mirrorstack-artifacts/billing-engine/$GITHUB_SHA/$(basename "$f")"
+          done
+
+      # Only after every artifact for this sha is uploaded do we flip the
+      # latest pointer — consumers resolving the pointer always see a
+      # complete artifact set.
+      - name: Update latest pointer
+        run: |
+          aws ssm put-parameter \
+            --name /mirrorstack/artifacts/billing-engine \
+            --type String \
+            --overwrite \
+            --value "$GITHUB_SHA"
