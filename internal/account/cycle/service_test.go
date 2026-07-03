@@ -47,6 +47,10 @@ type fakeStore struct {
 	unbilledAccounts []uuid.UUID // AccountsWithUnbilledUsage return
 	usageEventAccts  []uuid.UUID // AccountsWithUsageEvents return
 
+	// anchored close-driver inputs (migration 025 / ADR 0005)
+	activatedAccounts []cycle.AccountAnchor   // ActivatedAccounts return
+	latestPeriodEnd   map[uuid.UUID]time.Time // LatestClosedPeriodEnd return (absent → not found)
+
 	// risk-graded collection inputs (PR #9)
 	collection    cycle.AccountCollection // AccountCollection return
 	unpaidInvoice bool                    // HasUnpaidInvoice return (delinquency signal)
@@ -61,24 +65,26 @@ type fakeStore struct {
 	invoices     map[string]cycle.InvoiceMirror       // stripe_invoice_id → mirror
 
 	// injected errors
-	errOpen        error
-	errRaw         error
-	errPrice       error
-	errUpsert      error
-	errIncome      error
-	errVis         error
-	errSettle      error
-	errInsertRun   error
-	errTotal       error
-	errPM          error
-	errCustomer    error
-	errInvoice     error
-	errMarkRun     error
-	errUnbilled    error
-	errUsageEvents error
-	errCollection  error // AccountCollection
-	errUpdateColl  error // UpdateAccountCollection
-	errUnpaid      error // HasUnpaidInvoice
+	errOpen         error
+	errRaw          error
+	errPrice        error
+	errUpsert       error
+	errIncome       error
+	errVis          error
+	errSettle       error
+	errInsertRun    error
+	errTotal        error
+	errPM           error
+	errCustomer     error
+	errInvoice      error
+	errMarkRun      error
+	errUnbilled     error
+	errUsageEvents  error
+	errActivated    error // ActivatedAccounts
+	errLatestPeriod error // LatestClosedPeriodEnd
+	errCollection   error // AccountCollection
+	errUpdateColl   error // UpdateAccountCollection
+	errUnpaid       error // HasUnpaidInvoice
 }
 
 // markedRun records a MarkBillingRun call so a test can assert the terminal
@@ -303,6 +309,21 @@ func (f *fakeStore) AccountsWithUnbilledUsage(_ context.Context, _, _ time.Time)
 		return nil, f.errUnbilled
 	}
 	return f.unbilledAccounts, nil
+}
+
+func (f *fakeStore) ActivatedAccounts(_ context.Context) ([]cycle.AccountAnchor, error) {
+	if f.errActivated != nil {
+		return nil, f.errActivated
+	}
+	return f.activatedAccounts, nil
+}
+
+func (f *fakeStore) LatestClosedPeriodEnd(_ context.Context, accountID uuid.UUID) (time.Time, bool, error) {
+	if f.errLatestPeriod != nil {
+		return time.Time{}, false, f.errLatestPeriod
+	}
+	end, ok := f.latestPeriodEnd[accountID]
+	return end, ok, nil
 }
 
 // --- helpers --------------------------------------------------------------

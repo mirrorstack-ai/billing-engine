@@ -106,6 +106,18 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
 	}
 
+	// Freeze the billing-period ANCHOR (migration 025) on FIRST card bind: this is
+	// the confirmed-bind moment, so activated_at = now() sets the account's
+	// period-anchor day. FIRST-BIND-WINS (the query's WHERE activated_at IS NULL),
+	// so a detach + re-add never moves it. Best-effort: the card is already
+	// mirrored, so a stamp error must not fail the attach — log it and continue
+	// (the next card bind, or a backfill, re-stamps the still-NULL anchor).
+	if firstBind, err := r.store.StampAccountActivated(ctx, pm.Customer.ID); err != nil {
+		r.log.ErrorContext(ctx, "payment_method.attached stamp activation anchor failed (card still mirrored)", "event_id", event.ID, "stripe_customer_id", pm.Customer.ID, "error", err)
+	} else if firstBind {
+		r.log.InfoContext(ctx, "payment_method.attached froze billing-period anchor (first card bind)", "event_id", event.ID, "stripe_customer_id", pm.Customer.ID)
+	}
+
 	// Resolve any pending add-card request keyed on this Stripe PM.
 	// Best-effort: setup_intent.succeeded may not have stamped the
 	// stripe_pm_id yet (event ordering), in which case this is a no-op

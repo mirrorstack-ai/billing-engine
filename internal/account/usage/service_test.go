@@ -23,6 +23,7 @@ type fakeStore struct {
 	defs           map[string]usage.MetricDefinition // key: module/metric
 	accounts       map[uuid.UUID]uuid.UUID           // owner userID → accountID
 	events         map[string]usage.UsageEvent       // event_id → event (idempotency)
+	anchorDays     map[uuid.UUID]int                 // accountID → billing-period anchor day (0/absent → 1)
 	periodRows     []usage.MetricUsageRaw
 	historyRows    []usage.PeriodMetricUsageRaw
 	versionRows    []usage.VersionUsageRaw
@@ -57,6 +58,12 @@ type fakeStore struct {
 	errAppBill      error
 	errPeriodList   error
 	errPeriodWindow error
+	errAnchor       error
+
+	// captured window a read-path RPC resolved from the account's anchor, so a
+	// test can assert the anchored [start, end) reached the store unchanged.
+	gotPeriodStart time.Time
+	gotPeriodEnd   time.Time
 }
 
 // periodWindow is a fake billing_periods window for BillingPeriodWindow lookups.
@@ -69,8 +76,22 @@ func newFakeStore() *fakeStore {
 		defs:       map[string]usage.MetricDefinition{},
 		accounts:   map[uuid.UUID]uuid.UUID{},
 		events:     map[string]usage.UsageEvent{},
+		anchorDays: map[uuid.UUID]int{},
 		visibility: map[uuid.UUID]usage.Visibility{},
 	}
+}
+
+// AccountAnchorDay returns the configured anchor day for an account, defaulting
+// to 1 (the UTC calendar month) so tests that don't set one keep the pre-anchor
+// window behavior.
+func (f *fakeStore) AccountAnchorDay(_ context.Context, accountID uuid.UUID) (int, error) {
+	if f.errAnchor != nil {
+		return 0, f.errAnchor
+	}
+	if d, ok := f.anchorDays[accountID]; ok && d != 0 {
+		return d, nil
+	}
+	return 1, nil
 }
 
 func defKey(moduleID uuid.UUID, metric string) string { return moduleID.String() + "/" + metric }
@@ -121,7 +142,8 @@ func (f *fakeStore) AccountByOwner(_ context.Context, owner usage.Owner) (uuid.U
 	return id, ok, nil
 }
 
-func (f *fakeStore) CurrentPeriodUsage(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]usage.MetricUsageRaw, error) {
+func (f *fakeStore) CurrentPeriodUsage(_ context.Context, _ uuid.UUID, start, end time.Time) ([]usage.MetricUsageRaw, error) {
+	f.gotPeriodStart, f.gotPeriodEnd = start, end
 	if f.errPeriod != nil {
 		return nil, f.errPeriod
 	}
@@ -560,6 +582,50 @@ func TestGetUsageSummary_NoAccountReturnsEmpty(t *testing.T) {
 func TestGetUsageSummary_RequiresOwner(t *testing.T) {
 	_, err := newService(newFakeStore()).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{})
 	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+// TestGetUsageSummary_WindowsOnAccountAnchorDay proves the live-summary window is
+// anchored to the account's card-binding day (ADR 0005), not the 1st, and that
+// the exact anchored [start, end) reaches the store unchanged.
+func TestGetUsageSummary_WindowsOnAccountAnchorDay(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	acct := uuid.New()
+	store.accounts[owner] = acct
+	store.anchorDays[acct] = 17 // bound a card on the 17th
+
+	resp, err := newService(store).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	// Both boundaries fall on the 17th (17 ≤ 28, so no month ever clamps it).
+	require.Equal(t, 17, resp.PeriodStart.Day(), "period starts on the anchor day, not the 1st")
+	require.Equal(t, 17, resp.PeriodEnd.Day(), "period ends on the next anchor boundary")
+	require.Equal(t, time.UTC, resp.PeriodStart.Location())
+	// The resolved window is the one handed to the store (threaded unchanged).
+	require.True(t, resp.PeriodStart.Equal(store.gotPeriodStart), "start threaded to store")
+	require.True(t, resp.PeriodEnd.Equal(store.gotPeriodEnd), "end threaded to store")
+}
+
+// TestGetUsageSummary_DefaultsToCalendarMonthWhenUnactivated proves an account
+// with no card-binding anchor (fake default) windows on the 1st — the pre-025
+// calendar month — so un-activated accounts keep the historical behavior.
+func TestGetUsageSummary_DefaultsToCalendarMonthWhenUnactivated(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New() // no anchorDays entry → default day 1
+	resp, err := newService(store).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.Equal(t, 1, resp.PeriodStart.Day(), "un-activated account windows on the calendar month")
+}
+
+// TestGetUsageSummary_AnchorLookupErrorSurfaces proves an anchor-day lookup error
+// fails the read loud (Internal) rather than silently mis-windowing.
+func TestGetUsageSummary_AnchorLookupErrorSurfaces(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errAnchor = errors.New("anchor db down")
+	_, err := newService(store).GetUsageSummary(context.Background(), usage.GetUsageSummaryRequest{OwnerUserID: owner})
+	requireCode(t, err, billing.CodeInternal)
 }
 
 // --- GetUsageHistory -------------------------------------------------------

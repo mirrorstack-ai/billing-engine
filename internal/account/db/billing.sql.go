@@ -11,6 +11,23 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const accountActivatedAt = `-- name: AccountActivatedAt :one
+SELECT activated_at FROM ms_billing.accounts WHERE id = $1
+`
+
+// AccountActivatedAt returns an account's billing-period ANCHOR instant
+// (migration 025): the UTC time it bound its first credit card, or NULL when it
+// never activated. The Go layer derives the anchor DAY-OF-MONTH from it
+// in-process (activated_at.UTC().Day()); a NULL falls back to anchor day 1 (the
+// UTC calendar month — the pre-025 window). Read once per RPC alongside the
+// resolved account id so every read/charge windows the account's own period.
+func (q *Queries) AccountActivatedAt(ctx context.Context, id string) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, accountActivatedAt, id)
+	var activated_at pgtype.Timestamptz
+	err := row.Scan(&activated_at)
+	return activated_at, err
+}
+
 const accountHasUnpaidInvoice = `-- name: AccountHasUnpaidInvoice :one
 SELECT EXISTS (
     SELECT 1

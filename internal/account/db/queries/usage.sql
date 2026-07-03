@@ -9,10 +9,10 @@
 --   UpsertModuleVisibility     developer margin-share mirror
 --   CurrentPeriodUsageSummary  live charged_micros per metric (fast path)
 --
--- The live summary deliberately uses a calendar-month-to-date window
--- (currentPeriodWindow in service.go), NOT a billing_periods row: the
--- authoritative period anchor (signup-day anniversary) and its writer
--- belong to cmd/billing-cycle, so the OpenPeriodForAccount upsert ships
+-- The live summary deliberately uses the account's live anchored-period window
+-- (billingperiod.AnchoredPeriodWindow, keyed on the card-binding day — ADR
+-- 0005), NOT a billing_periods row: the authoritative period rows and their
+-- writer belong to cmd/billing-cycle, so the OpenPeriodForAccount upsert ships
 -- with its first caller in PR #5/#6 rather than as a dead query here.
 -- Migration 008 still ships the billing_periods table now (the schema
 -- lands clean ahead of its writer), but no query in PR #3 touches it.
@@ -234,9 +234,10 @@ ORDER BY ua.module_version;
 -- uniform; the store rounds it half-up through the shared micros decoder.
 --
 -- OUT OF SCOPE (design docs 15): the single-price re-pricing correction and the
--- never-closed-period reconciliation between the calendar-month live window and
--- the signup-anniversary period anchor — this query uses the current price model
--- and the calendar-month window, matching every other current-period reader.
+-- never-closed-period reconciliation between the live anchored-period window and
+-- the authoritative billing_periods rows — this query uses the current price
+-- model and the account's anchored window, matching every other current-period
+-- reader (the window is resolved caller-side and passed in as [start, end)).
 -- name: AppUsageSummary :many
 WITH rolled AS (
     SELECT
@@ -383,17 +384,18 @@ ORDER BY module_id, metric, model, module_version;
 -- ListBillingPeriods lists an account's REAL billing_periods rows (the closed,
 -- rolled/invoiced periods) newest-first — the source for the web's top-right 週期
 -- (period) selector on the app bill. Each row carries is_current: true iff its
--- period_start equals the caller-supplied current calendar-month start
--- (@current_month_start, = usage.currentPeriodWindow(now).start), so a
--- (rare) already-open current-month row is flagged rather than duplicated. The
--- service PREPENDS a synthetic current live period when no row is current yet
--- (the in-progress month has no billing_periods row until cmd/billing-cycle rolls
+-- period_start equals the caller-supplied current anchored-period start
+-- (@current_month_start = billingperiod.AnchoredPeriodWindow(now, anchorDay).start),
+-- so a (rare) already-open current-period row is flagged rather than duplicated.
+-- The service PREPENDS a synthetic current live period when no row is current yet
+-- (the in-progress period has no billing_periods row until cmd/billing-cycle rolls
 -- it up), so the selector always offers "current" + every past period.
 --
--- CALENDAR-MONTH ANCHOR (reconciled): billing_periods rows are real
--- calendar-month windows (cmd/billing-cycle's justClosedCalendarMonth), matching
--- currentPeriodWindow — the selector lists those real periods, not a derived
--- signup-anniversary window.
+-- ANCHOR (ADR 0005): billing_periods rows are card-binding-day anchored windows
+-- (cmd/billing-cycle closes each account's just-ended AnchoredJustClosed period),
+-- and @current_month_start is the matching anchored start — so the is_current
+-- match holds for anchored (and, for a day-1 anchor, calendar-month) periods
+-- alike. The parameter name is retained for wire compatibility.
 -- name: ListBillingPeriods :many
 SELECT
     bp.id                                                 AS id,

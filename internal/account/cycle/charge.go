@@ -285,6 +285,31 @@ func (s *Service) AccountsWithUnbilledUsage(ctx context.Context, periodStart, pe
 	return accounts, nil
 }
 
+// ActivatedAccounts returns every card-bound account with its billing-period
+// anchor instant — the per-account close driver's work list (each closes on its
+// own card-binding day, ADR 0005). A thin pass-through to the store.
+func (s *Service) ActivatedAccounts(ctx context.Context) ([]AccountAnchor, error) {
+	accounts, err := s.store.ActivatedAccounts(ctx)
+	if err != nil {
+		return nil, billing.Internal("list activated accounts failed", err)
+	}
+	return accounts, nil
+}
+
+// LatestClosedPeriodEnd returns an account's newest billing_periods.period_end
+// and whether one exists — the cutover straddle-clamp input. A thin pass-through
+// to the store.
+func (s *Service) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID) (time.Time, bool, error) {
+	if accountID == uuid.Nil {
+		return time.Time{}, false, billing.InvalidInput("account_id required")
+	}
+	end, found, err := s.store.LatestClosedPeriodEnd(ctx, accountID)
+	if err != nil {
+		return time.Time{}, false, billing.Internal("latest closed period lookup failed", err)
+	}
+	return end, found, nil
+}
+
 // invoiceItemIdemKey / invoiceIdemKey build the deterministic per-run Stripe
 // Idempotency-Keys. The run id is the stable charge identity, so a re-fire
 // (same run row) produces the SAME keys and Stripe returns the original objects

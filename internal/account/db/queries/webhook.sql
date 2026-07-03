@@ -68,6 +68,21 @@ ON CONFLICT (stripe_payment_method_id) DO NOTHING;
 -- name: AccountExistsByStripeCustomer :one
 SELECT EXISTS (SELECT 1 FROM ms_billing.accounts WHERE stripe_customer_id = $1) AS account_exists;
 
+-- StampAccountActivated freezes the billing-period ANCHOR (migration 025): the
+-- UTC instant the account bound its FIRST credit card. Called from
+-- payment_method.attached — the moment Stripe CONFIRMS the card is bound, not the
+-- synchronous StartAddPaymentMethod call. The `WHERE activated_at IS NULL` guard
+-- makes it FIRST-BIND-WINS and idempotent: a detach + re-add (which mints a fresh
+-- pm_* and would move a MIN(attached_at)-derived anchor) never regresses the
+-- already-frozen anchor, and a webhook retry is a no-op. Resolved by
+-- stripe_customer_id (the same key InsertPaymentMethod uses); a missing account is
+-- a no-op (0 rows) that the handler treats as drift, exactly like the mirror
+-- insert. :execrows so the Go layer can log a first-time activation.
+-- name: StampAccountActivated :execrows
+UPDATE ms_billing.accounts
+SET activated_at = now()
+WHERE stripe_customer_id = $1 AND activated_at IS NULL;
+
 -- SoftDeletePaymentMethod marks a mirror row deleted by Stripe PM id.
 -- :execrows → >0 means found.
 -- name: SoftDeletePaymentMethod :execrows

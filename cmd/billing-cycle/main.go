@@ -16,21 +16,26 @@
 // already have their run row and are skipped. The second layer (deterministic
 // Stripe Idempotency-Keys) defends the Stripe calls themselves.
 //
-// Period window: the cycle processes a [periodStart, periodEnd) window and
-// charges every account with unbilled usage_aggregates in it. The window is
-// each account's just-closed SIGNUP-DAY anniversary period (design §4 Axis 4);
-// per the trust boundary, billing-engine does NOT read ms_account.users
-// directly to derive per-account signup days — the upstream trigger
-// (api-platform cron / EventBridge payload) supplies the window. For v1 the
-// window defaults to the just-closed UTC calendar month (a uniform anchor) when
-// no explicit window is provided; the per-account signup-day anchor lands with
-// the subscription/tier PR that also adds the ADVANCE leg.
+// Period window: each account closes on its OWN billing period, anchored to the
+// day-of-month it bound its first credit card (activated_at, migration 025 / ADR
+// 0005) — NOT the UTC calendar month and NOT the signup date. The anchor is a
+// billing event billing-engine already owns, so the driver derives every window
+// in-process from ms_billing.accounts.activated_at with NO cross-schema read into
+// ms_account: it lists the card-bound accounts, derives each one's anchor day,
+// and closes THAT account's just-ended anchored period (billingperiod.
+// AnchoredJustClosed). Because each account's close day differs, the batch can no
+// longer share a single window; the window is computed per account inside the
+// loop. Processing is idempotent (billing_runs UNIQUE(account, period) +
+// deterministic Stripe keys), so re-firing on any day only charges periods that
+// have actually closed and are not yet invoiced — the driver can run daily
+// (EventBridge, once provisioned) or as a local one-shot without double-charging.
 //
 // allowanceMicros is 0 for v1 (the allowance-netting math is implemented in
 // cycle.RunBillingCycle; tier-sourced allowance + the advance leg are DEFERRED
 // to the subscription/tier PR).
 //
-// Spec: docs-temp/milestone-d-meter/design.md §4 Axis 4 / §5 / §6 (PR #6).
+// Spec: docs-temp/milestone-d-meter/design.md §4 Axis 4 / §5 / §6 (PR #6) and
+// mirrorstack-docs/adr/0005-billing-period-anchor.md.
 package main
 
 import (
@@ -44,6 +49,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -63,13 +69,13 @@ func main() {
 		return
 	}
 
-	// Local one-shot run: derive the just-closed window and process it, then
-	// exit. No HTTP listener — the dev cycle is a single batch invocation.
-	start, end := justClosedCalendarMonth(time.Now().UTC())
-	res := runCycle(context.Background(), svc, start, end)
+	// Local one-shot run: close every card-bound account's just-ended anchored
+	// period as of now, then exit. No HTTP listener — the dev cycle is a single
+	// batch invocation.
+	res := runCycle(context.Background(), svc, time.Now().UTC())
 	slog.Info("billing-cycle local run complete",
-		"period_start", start, "period_end", end,
-		"rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
+		"as_of", res.AsOf,
+		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 		"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
 	if res.Failed > 0 {
@@ -86,20 +92,20 @@ func buildService() *cycle.Service {
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The
-// CloudWatchEvent carries no window today (the scheduler fires on a cron), so
-// the handler derives the just-closed UTC calendar-month window from the event
-// time. A future trigger can pass an explicit window in the event detail.
+// CloudWatchEvent carries no window (the scheduler fires on a cron); the handler
+// closes each card-bound account's just-ended ANCHORED period as of the event
+// time. Firing daily is idempotent — an account is only charged on/after its own
+// close day, and never twice for the same period.
 func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) error {
 	return func(ctx context.Context, ev events.CloudWatchEvent) error {
 		at := ev.Time
 		if at.IsZero() {
 			at = time.Now().UTC()
 		}
-		start, end := justClosedCalendarMonth(at.UTC())
-		res := runCycle(ctx, svc, start, end)
+		res := runCycle(ctx, svc, at.UTC())
 		slog.InfoContext(ctx, "billing-cycle lambda run complete",
-			"period_start", start, "period_end", end,
-			"rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
+			"as_of", res.AsOf,
+			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 			"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
 		// A per-account charge failure is recorded (billing_runs status='failed')
@@ -111,8 +117,10 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 
 // cycleResult tallies a batch run for logging / exit code.
 type cycleResult struct {
-	RolledUp    int // accounts rolled up in phase 1
-	Processed   int // accounts processed in the charge phase
+	AsOf        time.Time // the run's evaluation instant (UTC)
+	Activated   int       // card-bound accounts considered
+	RolledUp    int       // accounts whose just-closed window had usage (rolled up)
+	Processed   int       // accounts processed in the charge phase
 	Charged     int
 	SkippedNoPM int
 	ZeroArrears int
@@ -121,58 +129,77 @@ type cycleResult struct {
 	Failed      int // errors (rollup error, charge error, or list error)
 }
 
-// runCycle runs the two-phase cycle for the window:
+// runCycle closes every card-bound account's just-ended ANCHORED period as of
+// `at`. Each account has its own card-binding anchor day, so the window is
+// derived PER ACCOUNT inside the loop — the batch cannot share one window under
+// anchoring. Per account:
 //
-//	Phase 1 (rollup): for every account with raw usage_events in the window,
-//	  RollupPeriod prices the events into usage_aggregates. Without this the
-//	  charge phase's PeriodChargedTotal reads 0 and silently bills nothing.
-//	Phase 2 (charge): for every account whose usage_aggregates have no
-//	  successful (invoiced) run yet, RunBillingCycle nets arrears and charges.
+//  1. window = AnchoredJustClosed(at, anchorDay), straddle-clamped so the FIRST
+//     anchored run after cutover never overlaps the last calendar-month period
+//     (start := max(anchoredStart, lastClosedPeriodEnd)).
+//  2. Rollup — price the window's raw usage_events into usage_aggregates. An
+//     account whose just-closed window had NO usage produces no aggregates and
+//     is skipped (no billing_run, matching the pre-anchor "has usage" gate).
+//  3. Charge — RunBillingCycle nets arrears and charges. Idempotent: a re-fire
+//     only charges periods without a successful (invoiced) run; billing_runs
+//     reclaims non-terminal rows.
 //
-// A single account's error is logged + counted but never aborts the batch
-// (resumable: a fresh re-fire re-rolls + re-charges only what is not yet
-// invoiced; billing_runs reclaims non-terminal rows).
-func runCycle(ctx context.Context, svc *cycle.Service, periodStart, periodEnd time.Time) cycleResult {
-	var res cycleResult
+// A single account's error is logged + counted but never aborts the batch.
+func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult {
+	res := cycleResult{AsOf: at}
 
-	// Phase 1 — rollup. Price raw usage_events into usage_aggregates so the
-	// charge phase has something to read.
-	rollupAccounts, err := svc.AccountsWithUsageEvents(ctx, periodStart, periodEnd)
+	accounts, err := svc.ActivatedAccounts(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx, "list accounts with usage events failed", "error", err)
+		slog.ErrorContext(ctx, "list activated accounts failed", "error", err)
 		res.Failed++
 		return res
 	}
-	for _, accountID := range rollupAccounts {
-		if _, err := svc.RollupPeriod(ctx, accountID, periodStart, periodEnd); err != nil {
-			slog.ErrorContext(ctx, "rollup failed", "account_id", accountID, "error", err)
+	res.Activated = len(accounts)
+
+	for _, a := range accounts {
+		anchorDay := billingperiod.AnchorDay(a.ActivatedAt)
+		start, end := billingperiod.AnchoredJustClosed(at, anchorDay)
+
+		// Cutover straddle-clamp: if the account's last closed period ended AFTER
+		// this anchored window's start (the calendar→anchor transition month), start
+		// the run at that end instead. This yields ONE clean bridge period with no
+		// overlap, gap, or duplicate (account_id, period_start) key. A lookup error
+		// is non-fatal — proceed unclamped (the UNIQUE key still prevents a dup).
+		if lastEnd, found, err := svc.LatestClosedPeriodEnd(ctx, a.ID); err != nil {
+			slog.ErrorContext(ctx, "latest closed period lookup failed (proceeding unclamped)",
+				"account_id", a.ID, "error", err)
+		} else if found && start.Before(lastEnd) && lastEnd.Before(end) {
+			start = lastEnd
+		}
+
+		// Phase 1 — rollup this account's window. No usage → no aggregates → skip
+		// the charge (no billing_run for an empty period).
+		summary, err := svc.RollupPeriod(ctx, a.ID, start, end)
+		if err != nil {
+			slog.ErrorContext(ctx, "rollup failed", "account_id", a.ID,
+				"period_start", start, "period_end", end, "error", err)
 			res.Failed++
 			continue
 		}
+		if len(summary.Aggregates) == 0 {
+			continue
+		}
 		res.RolledUp++
-	}
 
-	// Phase 2 — charge. Bill each account with unbilled priced usage.
-	accounts, err := svc.AccountsWithUnbilledUsage(ctx, periodStart, periodEnd)
-	if err != nil {
-		slog.ErrorContext(ctx, "list unbilled accounts failed", "error", err)
-		res.Failed++
-		return res
-	}
-	for _, accountID := range accounts {
+		// Phase 2 — charge the just-closed window.
 		res.Processed++
-		summary, err := svc.RunBillingCycle(ctx, accountID, periodStart, periodEnd, allowanceMicros)
+		chargeSummary, err := svc.RunBillingCycle(ctx, a.ID, start, end, allowanceMicros)
 		if err != nil {
 			// A charge error already marked the run 'failed' (auditable, retried
 			// next cycle). Count it as both a failed run and a batch error so the
 			// exit code is non-zero, but never abort the batch.
 			slog.ErrorContext(ctx, "account billing cycle failed",
-				"account_id", accountID, "error", err)
+				"account_id", a.ID, "period_start", start, "period_end", end, "error", err)
 			res.FailedRuns++
 			res.Failed++
 			continue
 		}
-		tally(&res, accountID, summary)
+		tally(&res, a.ID, chargeSummary)
 	}
 	return res
 }
@@ -202,14 +229,4 @@ func tally(res *cycleResult, accountID uuid.UUID, s *cycle.ChargeSummary) {
 		"arrears_micros", s.ArrearsMicros,
 		"charged_cents", s.ChargedCents,
 		"stripe_invoice_id", s.StripeInvoiceID)
-}
-
-// justClosedCalendarMonth returns the [start, end) window of the calendar month
-// just BEFORE the month containing `at` (UTC). The v1 uniform anchor; the
-// per-account signup-day anniversary window arrives with the subscription/tier
-// PR. e.g. at=2026-06-19 → [2026-05-01, 2026-06-01).
-func justClosedCalendarMonth(at time.Time) (time.Time, time.Time) {
-	end := time.Date(at.Year(), at.Month(), 1, 0, 0, 0, 0, time.UTC)
-	start := end.AddDate(0, -1, 0)
-	return start, end
 }

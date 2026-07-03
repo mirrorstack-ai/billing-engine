@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // defaultAlertPercents is the threshold set applied when SetBudget is called
@@ -105,7 +106,11 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 		return &GetBudgetStatusResponse{Exists: false, Crossed: []int{}}, nil
 	}
 
-	start, end := currentPeriodWindow(s.nowFn().UTC())
+	anchorDay, err := s.store.AppAnchorDay(ctx, b.ScopeID)
+	if err != nil {
+		return nil, billing.Internal("anchor day lookup failed", err)
+	}
+	start, end := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
 	spend, err := s.store.AppPeriodSpendMicros(ctx, b.ScopeID, start, end)
 	if err != nil {
 		return nil, billing.Internal("budget spend query failed", err)
@@ -145,8 +150,15 @@ func (s *Service) GetBudgetAlerts(ctx context.Context, req GetBudgetAlertsReques
 	periodStart := req.PeriodStart
 	if periodStart.IsZero() {
 		// ListBudgetAlerts keys on period_start only (the idempotency anchor),
-		// so the window END is intentionally discarded here.
-		periodStart, _ = currentPeriodWindow(s.nowFn().UTC())
+		// so the window END is intentionally discarded here. Default to the app's
+		// current ANCHORED period start (card-binding day) — the same value the
+		// ingest-path evaluation records crossings under, so a default-period read
+		// matches the stored alerts.
+		anchorDay, err := s.store.AppAnchorDay(ctx, req.ScopeID)
+		if err != nil {
+			return nil, billing.Internal("anchor day lookup failed", err)
+		}
+		periodStart, _ = billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
 	} else {
 		periodStart = periodStart.UTC()
 	}
@@ -292,13 +304,4 @@ func normalizePercents(percents []int) ([]int, error) {
 	}
 	sort.Ints(out)
 	return out, nil
-}
-
-// currentPeriodWindow returns the [start, end) of the UTC calendar month
-// containing t — the SAME window usage.currentPeriodWindow uses, so a budget
-// is evaluated against exactly what GetUsageSummary shows the user.
-func currentPeriodWindow(t time.Time) (time.Time, time.Time) {
-	start := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
-	end := start.AddDate(0, 1, 0)
-	return start, end
 }
