@@ -46,6 +46,9 @@ func (stubUsageStore) UsageHistory(context.Context, uuid.UUID, time.Time, time.T
 func (stubUsageStore) VersionBreakdown(context.Context, uuid.UUID, time.Time, uuid.UUID) ([]usage.VersionUsageRaw, error) {
 	return nil, nil
 }
+func (stubUsageStore) AppUsage(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time) ([]usage.AppMetricUsageRaw, error) {
+	return nil, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()

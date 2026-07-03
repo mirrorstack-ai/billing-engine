@@ -342,6 +342,67 @@ func (s *Service) GetVersionBreakdown(ctx context.Context, req GetVersionBreakdo
 	}, nil
 }
 
+// GetAppUsageSummary returns the app-owner's bill for ONE app in the current
+// period — the read behind /apps/{appId}/settings/billing. The owner principal
+// selects the PAYER's billing account (account_id gates the payer, same lazy-
+// account resolution as GetUsageSummary); AppID filters to the one app. Each
+// line is a (module, metric, model, module_version)'s billable quantity + the
+// module's declared unit price + the customer charge, read rolled-up-else-live
+// (usage_aggregates once this app+period is rolled up, else live usage_events —
+// the same fast path GetUsageSummary uses). The app owner pays the DECLARED
+// price per metered unit with NO customer markup by visibility, so ChargedMicros
+// = raw cost here. No billing account yet → an empty Metrics slice + nil error.
+func (s *Service) GetAppUsageSummary(ctx context.Context, req GetAppUsageSummaryRequest) (*GetAppUsageSummaryResponse, error) {
+	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
+	}
+	if req.OwnerUserID != uuid.Nil && req.OwnerOrgID != uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
+	}
+	if req.AppID == uuid.Nil {
+		return nil, billing.InvalidInput("app_id required")
+	}
+
+	owner := Owner{UserID: req.OwnerUserID, OrgID: req.OwnerOrgID}
+	accountID, found, err := s.store.AccountByOwner(ctx, owner)
+	if err != nil {
+		return nil, billing.Internal("account lookup failed", err)
+	}
+	if !found {
+		return &GetAppUsageSummaryResponse{AppID: req.AppID, Metrics: []AppMetricUsage{}}, nil
+	}
+
+	// Same live current-period window as GetUsageSummary: the calendar-month-
+	// to-date the events fell in, which also anchors the rolled-up branch's
+	// billing_periods lookup (period_start).
+	start, end := currentPeriodWindow(s.nowFn().UTC())
+
+	rows, err := s.store.AppUsage(ctx, accountID, req.AppID, start, end)
+	if err != nil {
+		return nil, billing.Internal("app usage summary query failed", err)
+	}
+
+	metrics := make([]AppMetricUsage, 0, len(rows))
+	for _, r := range rows {
+		metrics = append(metrics, AppMetricUsage{
+			ModuleID:         r.ModuleID,
+			Metric:           r.Metric,
+			Kind:             r.Kind,
+			Model:            r.Model,
+			ModuleVersion:    r.ModuleVersion,
+			BillableQuantity: r.BillableQuantity,
+			UnitPriceMicros:  r.UnitPriceMicros,
+			ChargedMicros:    r.ChargedMicros,
+		})
+	}
+	return &GetAppUsageSummaryResponse{
+		AppID:       req.AppID,
+		PeriodStart: start,
+		PeriodEnd:   end,
+		Metrics:     metrics,
+	}, nil
+}
+
 // SetMetricDefinitions syncs a module's declared metrics into the catalog
 // (declaration-first — design §1 / §5). It is a platform CONTROL-PLANE
 // call: api-platform reads the manifest's declarations on install/publish
