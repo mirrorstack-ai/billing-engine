@@ -26,11 +26,17 @@ type fakeStore struct {
 	periodRows  []usage.MetricUsageRaw
 	historyRows []usage.PeriodMetricUsageRaw
 	versionRows []usage.VersionUsageRaw
+	appRows     []usage.AppMetricUsageRaw
 	visibility  map[uuid.UUID]usage.Visibility
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
 	gotVersionModuleID uuid.UUID
+
+	// captured AppUsage call args, so a test can assert account_id (payer) and
+	// app_id reached the store unchanged.
+	gotAppUsageAccountID uuid.UUID
+	gotAppUsageAppID     uuid.UUID
 
 	errLookup     error
 	errAccount    error
@@ -40,6 +46,7 @@ type fakeStore struct {
 	errUpsertDef  error
 	errHistory    error
 	errVersion    error
+	errAppUsage   error
 }
 
 func newFakeStore() *fakeStore {
@@ -127,6 +134,15 @@ func (f *fakeStore) VersionBreakdown(_ context.Context, _ uuid.UUID, _ time.Time
 		return nil, f.errVersion
 	}
 	return f.versionRows, nil
+}
+
+func (f *fakeStore) AppUsage(_ context.Context, accountID, appID uuid.UUID, _, _ time.Time) ([]usage.AppMetricUsageRaw, error) {
+	f.gotAppUsageAccountID = accountID
+	f.gotAppUsageAppID = appID
+	if f.errAppUsage != nil {
+		return nil, f.errAppUsage
+	}
+	return f.appRows, nil
 }
 
 // --- helpers --------------------------------------------------------------
@@ -667,6 +683,112 @@ func TestGetVersionBreakdown_InternalOnStoreError(t *testing.T) {
 	store.accounts[owner] = uuid.New()
 	store.errVersion = errors.New("boom")
 	_, err := newService(store).GetVersionBreakdown(context.Background(), usage.GetVersionBreakdownRequest{OwnerUserID: owner})
+	requireCode(t, err, billing.CodeInternal)
+}
+
+// --- GetAppUsageSummary ----------------------------------------------------
+
+func TestGetAppUsageSummary_ReturnsPerModuleVersionLines(t *testing.T) {
+	// The app bill carries one line per (module, metric, model, module_version)
+	// so the UI can render per-version sub-lines (data exists — migration 023).
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	mod := uuid.New()
+	store.appRows = []usage.AppMetricUsageRaw{
+		{ModuleID: mod, Metric: "orders.placed", Kind: usage.KindCount, ModuleVersion: "1.0.0", BillableQuantity: 4, UnitPriceMicros: 100, ChargedMicros: 400},
+		{ModuleID: mod, Metric: "orders.placed", Kind: usage.KindCount, ModuleVersion: "2.0.0", BillableQuantity: 6, UnitPriceMicros: 100, ChargedMicros: 600},
+	}
+
+	resp, err := newService(store).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: owner, AppID: uuid.New()})
+	require.NoError(t, err)
+	require.Len(t, resp.Metrics, 2)
+	require.Equal(t, mod, resp.Metrics[0].ModuleID)
+	require.Equal(t, "1.0.0", resp.Metrics[0].ModuleVersion)
+	require.EqualValues(t, 400, resp.Metrics[0].ChargedMicros)
+	require.Equal(t, "2.0.0", resp.Metrics[1].ModuleVersion)
+	require.EqualValues(t, 600, resp.Metrics[1].ChargedMicros)
+}
+
+func TestGetAppUsageSummary_ChargesDeclaredPriceNoMarkup(t *testing.T) {
+	// The app owner pays the module's declared unit_price per unit with NO
+	// customer markup by visibility — charged == unit_price × quantity, and the
+	// response carries no visibility/markup fields at all.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.appRows = []usage.AppMetricUsageRaw{
+		{Metric: "orders.placed", Kind: usage.KindCount, BillableQuantity: 10, UnitPriceMicros: 100, ChargedMicros: 1000},
+	}
+
+	resp, err := newService(store).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: owner, AppID: uuid.New()})
+	require.NoError(t, err)
+	require.Len(t, resp.Metrics, 1)
+	require.EqualValues(t, 100, resp.Metrics[0].UnitPriceMicros)
+	require.EqualValues(t, 1000, resp.Metrics[0].ChargedMicros)
+}
+
+func TestGetAppUsageSummary_GatesOnPayerAccountAndApp(t *testing.T) {
+	// account_id (resolved from the owner principal) gates the payer; app_id
+	// filters to the one app. Both must reach the store unchanged.
+	store := newFakeStore()
+	owner := uuid.New()
+	acct := uuid.New()
+	store.accounts[owner] = acct
+	app := uuid.New()
+
+	_, err := newService(store).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: owner, AppID: app})
+	require.NoError(t, err)
+	require.Equal(t, acct, store.gotAppUsageAccountID, "the payer account gates the query")
+	require.Equal(t, app, store.gotAppUsageAppID, "the app_id filters to the one app")
+}
+
+func TestGetAppUsageSummary_EchoesAppIDAndWindow(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	app := uuid.New()
+
+	resp, err := newService(store).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: owner, AppID: app})
+	require.NoError(t, err)
+	require.Equal(t, app, resp.AppID)
+	require.False(t, resp.PeriodStart.IsZero())
+	require.True(t, resp.PeriodEnd.After(resp.PeriodStart))
+}
+
+func TestGetAppUsageSummary_NoAccountReturnsEmpty(t *testing.T) {
+	// No billing account yet → empty Metrics slice (not nil) + nil error, and
+	// the requested app is still echoed.
+	app := uuid.New()
+	resp, err := newService(newFakeStore()).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: uuid.New(), AppID: app})
+	require.NoError(t, err)
+	require.Empty(t, resp.Metrics)
+	require.Equal(t, app, resp.AppID)
+}
+
+func TestGetAppUsageSummary_RequiresOwner(t *testing.T) {
+	_, err := newService(newFakeStore()).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{AppID: uuid.New()})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestGetAppUsageSummary_RejectsBothOwners(t *testing.T) {
+	_, err := newService(newFakeStore()).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{
+		OwnerUserID: uuid.New(), OwnerOrgID: uuid.New(), AppID: uuid.New(),
+	})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestGetAppUsageSummary_RequiresAppID(t *testing.T) {
+	_, err := newService(newFakeStore()).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: uuid.New()})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestGetAppUsageSummary_InternalOnStoreError(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errAppUsage = errors.New("boom")
+	_, err := newService(store).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: owner, AppID: uuid.New()})
 	requireCode(t, err, billing.CodeInternal)
 }
 
