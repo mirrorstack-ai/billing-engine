@@ -90,6 +90,15 @@ func (f *fakeStore) VersionBreakdown(_ context.Context, _ uuid.UUID, _ time.Time
 func (f *fakeStore) AppUsage(_ context.Context, _, _ uuid.UUID, _, _ time.Time) ([]usage.AppMetricUsageRaw, error) {
 	return nil, nil
 }
+func (f *fakeStore) AppBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time) ([]usage.AppMetricUsageRaw, error) {
+	return nil, nil
+}
+func (f *fakeStore) ListBillingPeriods(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.BillingPeriodRaw, error) {
+	return nil, nil
+}
+func (f *fakeStore) BillingPeriodWindow(_ context.Context, _, _ uuid.UUID) (time.Time, time.Time, bool, error) {
+	return time.Time{}, time.Time{}, false, nil
+}
 
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 
