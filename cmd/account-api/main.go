@@ -144,6 +144,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.GetVersionBreakdown(ctx, req)
 
+	case "GetAppUsageSummary":
+		var req usage.GetAppUsageSummaryRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.GetAppUsageSummary(ctx, req)
+
 	case "SetMetricDefinitions":
 		var req usage.SetMetricDefinitionsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -298,6 +305,11 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// produce, so they share its control-plane credential and route group.
 		r.Post("/v1/billing.GetUsageHistory", makeHTTPHandler(d, "GetUsageHistory"))
 		r.Post("/v1/billing.GetVersionBreakdown", makeHTTPHandler(d, "GetVersionBreakdown"))
+		// App-owner per-app bill (this PR): the current-period usage the app
+		// owner pays for ONE app (/apps/{appId}/settings/billing). Read-only
+		// over the SAME usage data the other summary reads produce, so it shares
+		// the control-plane credential + route group.
+		r.Post("/v1/billing.GetAppUsageSummary", makeHTTPHandler(d, "GetAppUsageSummary"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
 		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
 		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of

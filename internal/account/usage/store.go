@@ -75,6 +75,18 @@ type Store interface {
 	// versions only. A period not yet rolled up returns no rows (not an
 	// error).
 	VersionBreakdown(ctx context.Context, accountID uuid.UUID, periodStart time.Time, moduleID uuid.UUID) ([]VersionUsageRaw, error)
+
+	// AppUsage is the APP-OWNER's bill for ONE app in the current period:
+	// one row per (module_id, metric, model, module_version) with
+	// billable_quantity + unit_price_micros + charged_micros. accountID gates
+	// the payer; appID filters to the one app. It reads the IMMUTABLE billable
+	// record (usage_aggregates, joined to its billing_periods row by
+	// periodStart) once this app+period is rolled up, else estimates LIVE from
+	// raw usage_events in [periodStart, periodEnd) — the same rolled-up-else-live
+	// fast path CurrentPeriodUsageSummary uses, extended to the app scope and the
+	// model / module_version dimensions. There is NO customer markup by module
+	// visibility: charged is the declared unit_price × quantity.
+	AppUsage(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppMetricUsageRaw, error)
 }
 
 // MetricDefinition is the catalog projection the ingest path resolves
@@ -179,6 +191,28 @@ type VersionUsageRaw struct {
 	ModuleVersion    string
 	BillableQuantity float64
 	RawCostMicros    int64
+	ChargedMicros    int64
+}
+
+// AppMetricUsageRaw is one grouped row from the app-owner bill query
+// (AppUsage): a single app's usage of one (module, metric, model,
+// module_version) in the current period. BillableQuantity decodes the NUMERIC
+// quantity (a display value); ChargedMicros is the customer charge decoded
+// half-up through the shared micros rounding point (a no-op on the already-
+// integer rolled-up branch, the single rounding point on the live SUM(value ×
+// unit_price) branch). No markup: charged == declared unit_price × quantity.
+type AppMetricUsageRaw struct {
+	ModuleID uuid.UUID
+	Metric   string
+	Kind     Kind
+	// Model is the AI pricing dimension (migration 018), '' for every non-AI
+	// row. ModuleVersion is the version-attribution dimension (migration 023),
+	// '' for a version-less row. Both are carried so the UI can split per-model
+	// / per-version sub-lines.
+	Model            string
+	ModuleVersion    string
+	BillableQuantity float64
+	UnitPriceMicros  int64
 	ChargedMicros    int64
 }
 
@@ -384,6 +418,48 @@ func (s *pgxStore) VersionBreakdown(ctx context.Context, accountID uuid.UUID, pe
 			BillableQuantity: qty,
 			RawCostMicros:    r.RawCostMicros,
 			ChargedMicros:    r.ChargedMicros,
+		})
+	}
+	return out, nil
+}
+
+// AppUsage reads the app-owner bill for ONE app in the current period —
+// rolled-up-else-live per the AppUsageSummary query. accountID gates the payer,
+// appID filters to the one app; periodStart doubles as the current period's
+// billing_periods anchor (the rolled branch) and the live events' lower bound.
+func (s *pgxStore) AppUsage(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppMetricUsageRaw, error) {
+	rows, err := s.q.AppUsageSummary(ctx, db.AppUsageSummaryParams{
+		AccountID:   accountID.String(),
+		AppID:       appID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppMetricUsageRaw, 0, len(rows))
+	for _, r := range rows {
+		qty, err := floatFromNumeric(r.BillableQuantity)
+		if err != nil {
+			return nil, fmt.Errorf("decode billable_quantity for metric %q: %w", r.Metric, err)
+		}
+		charged, err := microsFromNumeric(r.ChargedMicros)
+		if err != nil {
+			return nil, fmt.Errorf("decode charged_micros for metric %q: %w", r.Metric, err)
+		}
+		moduleID, err := uuid.Parse(r.ModuleID)
+		if err != nil {
+			return nil, fmt.Errorf("decode module_id for metric %q: %w", r.Metric, err)
+		}
+		out = append(out, AppMetricUsageRaw{
+			ModuleID:         moduleID,
+			Metric:           r.Metric,
+			Kind:             Kind(r.Kind),
+			Model:            r.Model,
+			ModuleVersion:    r.ModuleVersion,
+			BillableQuantity: qty,
+			UnitPriceMicros:  r.UnitPriceMicros,
+			ChargedMicros:    charged,
 		})
 	}
 	return out, nil

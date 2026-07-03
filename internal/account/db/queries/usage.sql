@@ -199,3 +199,93 @@ WHERE ua.account_id = $1
   AND ($3::boolean = false OR ua.module_id = $4)
 GROUP BY ua.module_version
 ORDER BY ua.module_version;
+
+-- AppUsageSummary is the APP-OWNER's bill for ONE app in the CURRENT period —
+-- the read behind /apps/{appId}/settings/billing (what the app owner PAYS for
+-- this one app). It gates on account_id (the payer) and app_id (the one app),
+-- and returns one line per (module_id, metric, model, module_version) so the
+-- billing UI can render per-module, per-version sub-lines. There is NO customer
+-- markup by module visibility on this page: the app owner pays the module's
+-- DECLARED unit_price_micros per metered unit (design: billing_markup_strategy —
+-- the developer margin-share 30/15 by visibility is settled DEV-side, off this
+-- bill, and is deliberately absent here — no visibility / markup columns).
+--
+-- Two sources, "rolled-up-else-live" (mirrors the CurrentPeriodUsageSummary
+-- COALESCE-to-events fast path, extended to the app scope + the model /
+-- module_version dimensions):
+--
+--   * rolled: once cmd/billing-cycle has rolled this app's current period into
+--     the IMMUTABLE billable record (usage_aggregates, joined to its
+--     billing_periods row by period_start), read the frozen
+--     billable_quantity / unit_price_micros / charged_micros directly. This is
+--     the SAME current-period aggregates read GetVersionBreakdown uses.
+--   * live: when no rollup exists yet for this (account, app, period), estimate
+--     LIVE from raw usage_events exactly like CurrentPeriodUsageSummary —
+--     billable_quantity = SUM(value); unit_price_micros = the catalog price;
+--     charged_micros = SUM(value × unit_price) with NO markup (custom-metric
+--     charge == raw cost). model / module_version COALESCE to '' for an event
+--     that carries neither (matching the rollup's own COALESCE keying).
+--
+-- The gate is all-or-nothing per (account, app, period): the rollup writes a
+-- whole period at once, so `WHERE NOT EXISTS (SELECT 1 FROM rolled)` shows the
+-- live estimate ONLY until the first aggregate row for this app+period lands,
+-- then flips to the frozen record. charged_micros is projected ::numeric on
+-- both branches (the aggregate's BIGINT widens losslessly) so the row shape is
+-- uniform; the store rounds it half-up through the shared micros decoder.
+--
+-- OUT OF SCOPE (design docs 15): the single-price re-pricing correction and the
+-- never-closed-period reconciliation between the calendar-month live window and
+-- the signup-anniversary period anchor — this query uses the current price model
+-- and the calendar-month window, matching every other current-period reader.
+-- name: AppUsageSummary :many
+WITH rolled AS (
+    SELECT
+        ua.module_id                                       AS module_id,
+        ua.metric                                          AS metric,
+        ua.kind                                            AS kind,
+        ua.model                                           AS model,
+        ua.module_version                                  AS module_version,
+        COALESCE(SUM(ua.billable_quantity), 0)::numeric    AS billable_quantity,
+        COALESCE(MAX(ua.unit_price_micros), 0)::bigint     AS unit_price_micros,
+        COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros
+    FROM ms_billing.usage_aggregates ua
+    JOIN ms_billing.billing_periods bp
+        ON bp.id = ua.period_id
+    WHERE ua.account_id   = @account_id::uuid
+      AND ua.app_id       = @app_id::uuid
+      AND bp.period_start = @period_start::timestamptz
+    GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
+),
+live AS (
+    SELECT
+        e.module_id                                        AS module_id,
+        e.metric                                           AS metric,
+        e.kind                                             AS kind,
+        COALESCE(e.model, '')                              AS model,
+        COALESCE(e.module_version, '')                     AS module_version,
+        COALESCE(SUM(e.value), 0)::numeric                 AS billable_quantity,
+        COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
+        COALESCE(
+            SUM(e.value * COALESCE(md.unit_price_micros, 0)),
+            0
+        )::numeric                                         AS charged_micros
+    FROM ms_billing.usage_events e
+    LEFT JOIN ms_billing.metric_definitions md
+        ON md.module_id = e.module_id AND md.metric = e.metric
+    WHERE e.account_id  = @account_id::uuid
+      AND e.app_id      = @app_id::uuid
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
+    GROUP BY e.module_id, e.metric, e.kind, COALESCE(e.model, ''), COALESCE(e.module_version, '')
+)
+SELECT
+    module_id, metric, kind, model, module_version,
+    billable_quantity, unit_price_micros, charged_micros
+FROM rolled
+UNION ALL
+SELECT
+    module_id, metric, kind, model, module_version,
+    billable_quantity, unit_price_micros, charged_micros
+FROM live
+WHERE NOT EXISTS (SELECT 1 FROM rolled)
+ORDER BY module_id, metric, model, module_version;

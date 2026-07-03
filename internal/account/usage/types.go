@@ -236,6 +236,62 @@ type GetVersionBreakdownResponse struct {
 	Versions    []ModuleVersionUsage `json:"versions"`
 }
 
+// GetAppUsageSummaryRequest is the payload of GetAppUsageSummary: the app
+// OWNER principal (the payer — same polymorphic shape as GetUsageSummary,
+// exactly one of OwnerUserID / OwnerOrgID set) plus the ONE app whose current-
+// period bill is requested. This is the read behind /apps/{appId}/settings/
+// billing (what the app owner PAYS for this one app).
+type GetAppUsageSummaryRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	// AppID scopes the bill to a single app. Required — this RPC is per-app
+	// (the account-wide read is GetUsageSummary).
+	AppID uuid.UUID `json:"app_id"`
+}
+
+// AppMetricUsage is one line of an app's bill: a single (module, metric,
+// model, module_version)'s current-period quantity and customer charge. The
+// app owner pays the module's DECLARED unit_price per metered unit with NO
+// customer markup by visibility (that developer margin-share is settled
+// dev-side, off this bill), so ChargedMicros = UnitPriceMicros × the billable
+// quantity. Model / ModuleVersion let the UI split per-model / per-version
+// sub-lines; both are "" when the row carries neither dimension.
+type AppMetricUsage struct {
+	// ModuleID is the module that emitted the metric — the app owner pays for
+	// each installed module's metered usage under this app.
+	ModuleID uuid.UUID `json:"module_id"`
+	Metric   string    `json:"metric"`
+	Kind     Kind      `json:"kind"`
+	// Model is the AI pricing dimension (migration 018); omitted for non-AI
+	// rows. ModuleVersion is the attribution dimension (migration 023 — never
+	// priced); omitted for a version-less row. Present so the billing UI can
+	// render per-version sub-lines (data exists).
+	Model         string `json:"model,omitempty"`
+	ModuleVersion string `json:"module_version,omitempty"`
+	// BillableQuantity is a DISPLAY value (the running / rolled-up metered
+	// amount), not a money field — money is carried only in the *_micros int64
+	// fields. Float is deliberate and must not be widened into a money path.
+	BillableQuantity float64 `json:"billable_quantity"`
+	UnitPriceMicros  int64   `json:"unit_price_micros"`
+	// ChargedMicros is what the app owner pays for this line: declared
+	// unit_price × billable quantity, NO markup.
+	ChargedMicros int64 `json:"charged_micros"`
+}
+
+// GetAppUsageSummaryResponse is the app-owner bill for ONE app in the current
+// period. PeriodStart / PeriodEnd bound the live window (zero when no billing
+// account exists yet). Metrics is an empty slice (not nil) — never an error —
+// when the app has no usage yet or the payer has no billing account.
+type GetAppUsageSummaryResponse struct {
+	// AppID echoes the requested app so the response is self-describing (this
+	// is a per-app bill).
+	AppID       uuid.UUID `json:"app_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+
+	Metrics []AppMetricUsage `json:"metrics"`
+}
+
 // SetModuleVisibilityRequest is the payload of SetModuleVisibility, fired
 // by api-platform on a module publish/unpublish. It upserts the developer
 // margin-share mirror; it NEVER affects the customer charge.
