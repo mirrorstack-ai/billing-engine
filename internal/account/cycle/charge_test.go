@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -35,6 +36,14 @@ type fakeStripe struct {
 	// injected errors
 	errItem    error
 	errInvoice error
+
+	// onCreateInvoice, when set, runs INSIDE CreateInvoice right before it
+	// returns success — modeling a concurrent account mutation (e.g. a
+	// threshold edit) that lands while the real Stripe HTTP call is in
+	// flight, i.e. strictly AFTER any pre-charge store read the caller
+	// already did and strictly BEFORE any post-charge store read the caller
+	// does once this call returns. Used by the finding-#2 regression test.
+	onCreateInvoice func()
 }
 
 type itemCall struct {
@@ -71,6 +80,9 @@ func (f *fakeStripe) CreateInvoice(_ context.Context, custID string, autoAdvance
 	f.invoiceCalls = append(f.invoiceCalls, invoiceCall{custID, autoAdvance, idemKey})
 	if f.errInvoice != nil {
 		return billingstripe.Invoice{}, f.errInvoice
+	}
+	if f.onCreateInvoice != nil {
+		f.onCreateInvoice()
 	}
 	return billingstripe.Invoice{
 		ID:         f.invoiceID,
@@ -522,4 +534,112 @@ func TestRunBillingCycle_PerAccountThresholdOverrideRespected(t *testing.T) {
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
 		"$150 < $200 per-account override → not disclosed despite exceeding the default")
+}
+
+// TestRunBillingCycle_SubCentAboveThresholdChargesExactThresholdNotFlagged is
+// the end-to-end regression for finding #1 (collection.IsLargeAutoCollect
+// compared raw pre-rounding micros against the threshold instead of the SAME
+// post-rounding cents Stripe actually charges).
+//
+// FAILS without the fix: arrears = $100.00 + 100 micros ($100.0001) is
+// strictly ABOVE the raw $100,000,000-micro default threshold, so the old
+// `chargedMicros > threshold` comparison flagged the mirror row "large" even
+// though the money that actually hit the card — the SAME
+// centsFromMicros(arrears) conversion this test asserts on the fake Stripe
+// call — is EXACTLY $100.00 (round-half-up rounds 100_000_100/10_000 =
+// 10000.01 DOWN to 10000 cents), identical to what a charge of exactly the
+// threshold itself would produce. Proves the concrete dollar amount, not just
+// "no error": the Stripe invoice item is created for precisely 10000 cents
+// ($100.00), and the mirror is NOT flagged, matching the "exactly at
+// threshold is not large" contract.
+func TestRunBillingCycle_SubCentAboveThresholdChargesExactThresholdNotFlagged(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 100_000_100 // $100.00 + 100 micros ($0.0001) — inside the half-cent gap
+	store.hasPM = true
+	store.stripeCustomer = "cus_subcent"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 10000, sc.itemCalls[0].amountCfg,
+		"Stripe is charged exactly 10000 cents ($100.00), not $100.01 — the same amount charging exactly the threshold would produce")
+	require.EqualValues(t, 10000, resp.ChargedCents)
+
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"a charge that rounds down to EXACTLY the $100 threshold must not be disclosed as large")
+}
+
+// --- regression: finding #2 (threshold resolved at different points relative
+// to the charge in RunBillingCycle vs. RegisterApp) -------------------------
+//
+// Both tests below charge $150 while a concurrent threshold edit ($100
+// default → $200 override) lands DURING the Stripe CreateInvoice HTTP call —
+// i.e. strictly after any pre-charge store read and strictly before any
+// post-charge store read. Both call sites must resolve the SAME way (the
+// edit that landed mid-charge is picked up), matching the "resolved at charge
+// time" contract identically on both legs.
+//
+// FAILS without the fix: RunBillingCycle read `acct` (and its
+// AutoCollectThresholdMicros) at the TOP of the function — before the risk
+// gate, the PM check, and both Stripe HTTP calls — so it never observes the
+// edit and still uses the stale $100 default, flagging the $150 charge as
+// large. RegisterApp, by contrast, already re-resolves the threshold AFTER
+// its Stripe call succeeds, so it picks up the new $200 override and does
+// NOT flag the same $150 charge. That asymmetry — same race, different
+// outcome depending on which leg charged — is exactly what this test
+// forbids.
+
+func TestRunBillingCycle_ConcurrentThresholdEditMidChargeResolvesPostCharge(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 150_000_000 // $150: over the $100 default, under a $200 override
+	store.hasPM = true
+	store.stripeCustomer = "cus_race_boundary"
+	sc := newFakeStripe()
+	sc.onCreateInvoice = func() {
+		// The concurrent edit: an operator (or the account owner) raises the
+		// disclosure threshold to $200 WHILE this charge's Stripe call is in
+		// flight.
+		override := int64(200_000_000)
+		store.collection.AutoCollectThresholdMicros = &override
+	}
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.EqualValues(t, 15000, resp.ChargedCents, "still charges $150 — the edit only affects disclosure, never the amount")
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"the threshold is resolved AFTER the Stripe charge succeeds, so the mid-charge $200 edit governs — $150 is not flagged")
+}
+
+func TestRegisterApp_ConcurrentThresholdEditMidChargeResolvesPostCharge(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	sc.onCreateInvoice = func() {
+		override := int64(200_000_000)
+		store.collection.AutoCollectThresholdMicros = &override
+	}
+	appID := uuid.New()
+
+	// module_count=49 → base = $20 + 44×$3 = $152 (44 = 49 − IncludedModules(5)
+	// over-the-included modules). CreatedAt is exactly the anchored period's
+	// start (June 4, matching registeredAccount's anchor-4 activation), so
+	// ProratedBaseMicros charges the FULL $152 base (no proration dampening),
+	// landing between the $100 stale default and the $200 post-edit override —
+	// the same $100–$200 straddle the RunBillingCycle test above proves.
+	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user,
+		AppID:       appID,
+		ModuleCount: 49,
+		CreatedAt:   time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	require.Equal(t, acct, resp.AccountID)
+	require.NotEmpty(t, resp.ProrationInvoiceID)
+
+	require.False(t, store.invoices[resp.ProrationInvoiceID].IsLargeAutoCollect,
+		"the threshold is resolved AFTER the Stripe charge succeeds on this leg too, so the mid-charge $200 edit governs — matches RunBillingCycle's resolution point")
 }

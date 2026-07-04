@@ -258,9 +258,15 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 
 	// Resolve the account's large-charge disclosure threshold AT CHARGE TIME so
 	// the proration invoice's flag reflects what applied when it fired (migration
-	// 031), the same contract as the RunBillingCycle leg. A prorated app base fee
-	// rarely crosses the $100 default, but the flag is computed uniformly at every
-	// off-session charge call site so no successful large debit escapes disclosure.
+	// 031) — resolved HERE, immediately AFTER the Stripe calls above succeeded,
+	// which is the SAME point relative to the actual charge that RunBillingCycle's
+	// boundary leg now resolves its threshold (charge.go, re-resolved right after
+	// its own Stripe call succeeds rather than reusing a pre-charge snapshot). Both
+	// charge legs agreeing on this point means a threshold edit landing concurrently
+	// with a charge is honored identically by both, not one way here and another on
+	// the boundary leg. A prorated app base fee rarely crosses the $100 default, but
+	// the flag is computed uniformly at every off-session charge call site so no
+	// successful large debit escapes disclosure.
 	acct, err := s.store.AccountCollection(ctx, app.AccountID)
 	if err != nil {
 		return nil, billing.Internal("account collection lookup failed", err)
