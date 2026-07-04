@@ -192,14 +192,13 @@ type Store interface {
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
-// ms_billing.app_base_snapshots row (migration 028): the module_count the
-// charge tiered on and the base amount (integer micros) actually invoiced for
-// the app-period. Source is 'proration' (RegisterApp's creation charge — the
-// prorated partial-window amount) or 'advance' (the boundary leg's full base).
+// ms_billing.app_base_snapshots row (migration 028): the base amount
+// (integer micros) actually invoiced for the app-period. The row's
+// module_count and source ('proration' vs 'advance') matter only to the
+// write-side ON CONFLICT precedence — the display never branches on them,
+// so they are deliberately not projected.
 type AppBaseSnapshotInfo struct {
-	ModuleCount int
-	BaseMicros  int64
-	Source      string
+	BaseMicros int64
 }
 
 // AppMirrorInfo is the display-read projection of a ms_billing.apps roster row
@@ -546,11 +545,7 @@ func (s *pgxStore) AppBaseSnapshot(ctx context.Context, appID uuid.UUID, periodS
 	if err != nil {
 		return AppBaseSnapshotInfo{}, false, err
 	}
-	return AppBaseSnapshotInfo{
-		ModuleCount: int(row.ModuleCount),
-		BaseMicros:  row.BaseMicros,
-		Source:      row.Source,
-	}, true, nil
+	return AppBaseSnapshotInfo{BaseMicros: row.BaseMicros}, true, nil
 }
 
 // AccountAnchorDay reads the account's activated_at and derives its anchor day.

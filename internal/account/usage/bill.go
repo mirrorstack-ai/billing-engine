@@ -302,34 +302,35 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	// the pre-027 flat fee + usage-proxy overage — see the
 	// INSTALLED-MODULE-COUNT note above).
 	var baseFee int64
-	mirror, mirrored, err := s.store.AppMirror(ctx, req.AppID)
-	if err != nil {
-		return nil, billing.Internal("app mirror lookup failed", err)
-	}
 	snap, snapped, err := s.store.AppBaseSnapshot(ctx, req.AppID, periodStart)
 	if err != nil {
 		return nil, billing.Internal("app base snapshot lookup failed", err)
 	}
-	switch {
-	case snapped:
+	if snapped {
 		// This period's base was charged: display EXACTLY what was invoiced.
+		// The snapshot alone decides — the mirror is only read on the
+		// un-snapshotted estimate paths below.
 		baseFee = snap.BaseMicros
-	case mirrored && mirror.Deleted && !mirror.DeletedAt.After(periodStart):
-		// Deleted BEFORE this period opened → no base was (or will be) charged
-		// for it (D1e: deletion stops FUTURE base fees). A deletion DURING the
-		// period leaves that period's base spent, so it falls through below.
-		baseFee = 0
-	case mirrored:
-		// No snapshot → estimate from the mirror's current count, the SAME
-		// AppBaseFeeMicros + ProratedBaseMicros math the charge legs bill.
-		baseFee = ProratedBaseMicros(
-			AppBaseFeeMicros(resolveBaseFeeMicros(plan), mirror.ModuleCount),
-			mirror.CreatedAt, periodStart, periodEnd,
-		)
-	default:
-		baseFee = resolveBaseFeeMicros(plan)
-		if extra := len(installedModules) - IncludedModules; extra > 0 {
-			baseFee += ModuleOverageFeeMicros * int64(extra)
+	} else {
+		mirror, mirrored, err := s.store.AppMirror(ctx, req.AppID)
+		if err != nil {
+			return nil, billing.Internal("app mirror lookup failed", err)
+		}
+		switch {
+		case mirrored && mirror.Deleted && !mirror.DeletedAt.After(periodStart):
+			// Deleted BEFORE this period opened → no base was (or will be) charged
+			// for it (D1e: deletion stops FUTURE base fees). A deletion DURING the
+			// period leaves that period's base spent, so it falls through below.
+			baseFee = 0
+		case mirrored:
+			// No snapshot → estimate from the mirror's current count, the SAME
+			// AppBaseFeeMicros + ProratedBaseMicros math the charge legs bill.
+			baseFee = ProratedBaseMicros(
+				AppBaseFeeMicros(resolveBaseFeeMicros(plan), mirror.ModuleCount),
+				mirror.CreatedAt, periodStart, periodEnd,
+			)
+		default:
+			baseFee = AppBaseFeeMicros(resolveBaseFeeMicros(plan), len(installedModules))
 		}
 	}
 

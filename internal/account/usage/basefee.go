@@ -48,20 +48,35 @@ func AppBaseFeeMicros(baseFeeMicros int64, moduleCount int) int64 {
 // INT column (≤ ~2^31 × $3 ≈ 6.4e15 micros) and day counts by ~31, so
 // base × remain_days stays far inside int64 — plain integer math is exact.
 func ProratedBaseMicros(baseMicros int64, createdAt, periodStart, periodEnd time.Time) int64 {
-	c := createdAt.UTC()
-	creationDay := time.Date(c.Year(), c.Month(), c.Day(), 0, 0, 0, 0, time.UTC)
-	if !creationDay.After(periodStart) {
+	coverageStart := ProrationCoverageStart(createdAt, periodStart)
+	if coverageStart.Equal(periodStart) {
 		return baseMicros // existed for the whole period → full base
 	}
-	if !creationDay.Before(periodEnd) {
+	if !coverageStart.Before(periodEnd) {
 		return 0 // did not exist in the period
 	}
 	periodDays := wholeDaysUTC(periodStart, periodEnd)
-	remainDays := wholeDaysUTC(creationDay, periodEnd)
+	remainDays := wholeDaysUTC(coverageStart, periodEnd)
 	if periodDays <= 0 {
 		return baseMicros // defensive: a malformed window never zero-divides
 	}
 	return (baseMicros*remainDays + periodDays/2) / periodDays
+}
+
+// ProrationCoverageStart is the UTC day the creation proration starts
+// covering: created_at truncated to its UTC date (creation day inclusive),
+// clamped to periodStart so a backdated created_at never widens the window.
+// ProratedBaseMicros derives remain_days from this SAME instant and the
+// proration invoice mirrors it as the partial window's period_start — one
+// home for the rule, so the amount billed and the displayed coverage window
+// can never disagree.
+func ProrationCoverageStart(createdAt, periodStart time.Time) time.Time {
+	c := createdAt.UTC()
+	day := time.Date(c.Year(), c.Month(), c.Day(), 0, 0, 0, 0, time.UTC)
+	if day.Before(periodStart) {
+		return periodStart
+	}
+	return day
 }
 
 // wholeDaysUTC counts the whole UTC days in [from, to). Both inputs are

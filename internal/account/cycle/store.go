@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
@@ -763,19 +764,16 @@ func (s *pgxStore) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUI
 	return end, true, nil
 }
 
-// advisoryLockNamespaceBillingAccountUser mirrors billing.pgxStore's namespace
-// for the SAME per-user EnsureAccount lock — both packages get-or-create the
-// SAME accounts row, so they MUST serialize on the SAME (namespace, key) pair
-// or a concurrent Ensure + RegisterApp could both insert (the accounts table
-// has no owner UNIQUE constraint; the advisory lock IS the uniqueness guard).
-const advisoryLockNamespaceBillingAccountUser int32 = 0x6c627461 // "lbta"
-
 func (s *pgxStore) EnsureAccountForUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
 	var id string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		qtx := s.q.WithTx(tx)
+		// billing.EnsureAccount and this get-or-create insert the SAME
+		// accounts row, so both serialize on the single exported
+		// (namespace, key) pair — the accounts table has no owner UNIQUE
+		// constraint; the advisory lock IS the uniqueness guard.
 		if err := qtx.AcquireBillingAccountUserLock(ctx, db.AcquireBillingAccountUserLockParams{
-			Column1: advisoryLockNamespaceBillingAccountUser,
+			Column1: billing.AdvisoryLockNamespaceBillingAccountUser,
 			Column2: userID.String(),
 		}); err != nil {
 			return err
