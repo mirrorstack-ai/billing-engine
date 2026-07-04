@@ -38,9 +38,13 @@ func appsSvc(store *fakeStore, sc *fakeStripe) *cycle.Service {
 	return cycle.NewService(store, sc).WithNow(func() time.Time { return appsNow })
 }
 
-// --- RegisterApp: proration happy path --------------------------------------
+// --- RegisterApp: mirror-only (creation grace — RegisterApp never charges) ---
 
-func TestRegisterApp_ChargesCreationProration(t *testing.T) {
+func TestRegisterApp_MirrorsRowWithoutCharging(t *testing.T) {
+	// Creation grace: even a FULLY chargeable account (activated + PM + Stripe
+	// customer) is NOT charged at registration — RegisterApp only mirrors the
+	// row. The creation-period base is the sweep's job (see proration_test.go),
+	// so an app charged before it survives grace is impossible.
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	sc := newFakeStripe()
@@ -49,97 +53,68 @@ func TestRegisterApp_ChargesCreationProration(t *testing.T) {
 	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
 		OwnerUserID: user,
 		AppID:       appID,
-		CreatedAt:   time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), // the 1st → days 1–3 of [Jun 4, Jul 4)
+		ModuleCount: 3,
+		CreatedAt:   time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
 	require.Equal(t, acct, resp.AccountID)
 
-	// 20e6 × 3/30 = 2_000_000 micros → 200 cents, one item + one invoice with
-	// the app-scoped deterministic idem keys.
-	require.EqualValues(t, 200, resp.ProrationCents)
-	require.Len(t, sc.itemCalls, 1)
-	require.Len(t, sc.invoiceCalls, 1)
-	require.EqualValues(t, 200, sc.itemCalls[0].amountCfg)
-	require.Equal(t, "cus_apps_1", sc.itemCalls[0].custID)
-	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
-	require.Equal(t, "app-inv-"+appID.String(), sc.invoiceCalls[0].idemKey)
-	require.True(t, sc.invoiceCalls[0].autoAdvance)
+	// NO charge of any kind, guard unarmed, no snapshot, no invoice.
+	require.Empty(t, resp.ProrationInvoiceID)
+	require.Zero(t, resp.ProrationCents)
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.invoiceCalls)
+	require.Empty(t, store.invoices)
+	require.Empty(t, store.baseSnapshots)
 
-	// Mirrored with the PARTIAL window [creation day, period end) and the
-	// one-shot guard armed with the invoice id.
-	require.Equal(t, resp.ProrationInvoiceID, sc.invoiceID)
-	mirror := store.invoices[sc.invoiceID]
-	require.Equal(t, acct, mirror.AccountID)
-	require.Equal(t, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), mirror.PeriodStart)
-	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
-	require.Equal(t, sc.invoiceID, store.apps[appID].ProrationInvoiceID)
-
-	// And the migration-028 snapshot froze EXACTLY what was billed, keyed by
-	// the FULL anchored period start (the display identity), with the
-	// prorated partial-window amount.
-	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}]
-	require.True(t, ok, "the proration leg must freeze its charged base")
-	require.Equal(t, "proration", snap.source)
-	require.EqualValues(t, 2_000_000, snap.snap.BaseMicros)
-	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), snap.snap.PeriodEnd)
-	require.Equal(t, 0, snap.snap.ModuleCount)
-}
-
-func TestRegisterApp_ProrationIncludesModuleOverage(t *testing.T) {
-	// module_count 7 at creation → base_at_creation = 20e6 + 2×3e6 = 26e6;
-	// 15 of 30 remaining days → 13e6 micros → 1300 cents.
-	store := newFakeStore()
-	user, _ := registeredAccount(store)
-	sc := newFakeStripe()
-
-	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user,
-		AppID:       uuid.New(),
-		ModuleCount: 7,
-		CreatedAt:   time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC),
-	})
-	require.NoError(t, err)
-	require.EqualValues(t, 1300, resp.ProrationCents)
+	// But the roster row IS recorded verbatim (created_at / module_count / account)
+	// — the stable anchor the sweep later prices from.
+	app := store.apps[appID]
+	require.Equal(t, acct, app.AccountID)
+	require.Equal(t, 3, app.ModuleCount)
+	require.Equal(t, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), app.CreatedAt)
+	require.Empty(t, app.ProrationInvoiceID)
 }
 
 func TestRegisterApp_DefaultsCreatedAtToNow(t *testing.T) {
-	// Zero CreatedAt → the server's now (appsNow, Jul 1) → the same 3-day
-	// proration as the explicit-timestamp case.
+	// Zero CreatedAt → the server's now (appsNow, Jul 1) is stamped on the mirror
+	// row (the anchor the later sweep prorates from). Still no charge here.
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
+	appID := uuid.New()
 
 	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user, AppID: uuid.New(),
+		OwnerUserID: user, AppID: appID,
 	})
 	require.NoError(t, err)
-	require.EqualValues(t, 200, resp.ProrationCents)
+	require.Empty(t, resp.ProrationInvoiceID)
+	require.Empty(t, sc.itemCalls)
+	require.Equal(t, appsNow, store.apps[appID].CreatedAt)
 }
 
-// --- RegisterApp: idempotency ------------------------------------------------
-
-func TestRegisterApp_RetryNeverChargesTwice(t *testing.T) {
+func TestRegisterApp_EchoesArmedGuardOnRetry(t *testing.T) {
+	// A RegisterApp retry that lands AFTER the sweep already charged echoes the
+	// armed guard's invoice id (idempotent visibility) and still never charges.
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
 	svc := appsSvc(store, sc)
-	req := cycle.RegisterAppRequest{
-		OwnerUserID: user,
-		AppID:       uuid.New(),
-		CreatedAt:   time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
-	}
+	appID := uuid.New()
+	req := cycle.RegisterAppRequest{OwnerUserID: user, AppID: appID, CreatedAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
 
-	first, err := svc.RegisterApp(context.Background(), req)
+	_, err := svc.RegisterApp(context.Background(), req)
 	require.NoError(t, err)
-	second, err := svc.RegisterApp(context.Background(), req)
+	// The sweep charges it (grace elapsed).
+	_, err = svc.SweepCreationProrations(context.Background(), time.Date(2026, 7, 5, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
+	armed := store.apps[appID].ProrationInvoiceID
+	require.NotEmpty(t, armed)
 
-	// The one-shot guard short-circuits the retry: SAME invoice id back, ONE
-	// Stripe item + invoice total, ONE roster row.
-	require.Equal(t, first.ProrationInvoiceID, second.ProrationInvoiceID)
-	require.Len(t, sc.itemCalls, 1, "a retry must never create a second charge")
-	require.Len(t, sc.invoiceCalls, 1)
-	require.Len(t, store.apps, 1)
+	resp, err := svc.RegisterApp(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, armed, resp.ProrationInvoiceID)
+	require.Len(t, sc.itemCalls, 1, "the retry must not add a second charge")
 }
 
 func TestRegisterApp_RetryKeepsFirstRegistrationsAnchor(t *testing.T) {
@@ -165,32 +140,14 @@ func TestRegisterApp_RetryKeepsFirstRegistrationsAnchor(t *testing.T) {
 	require.Equal(t, created, store.apps[appID].CreatedAt)
 }
 
-// --- RegisterApp: activation gate (D1d) ---------------------------------------
-
-func TestRegisterApp_UnactivatedAccountRowButNoInvoice(t *testing.T) {
+func TestRegisterApp_RecordsRowRegardlessOfAccountState(t *testing.T) {
+	// RegisterApp no longer gates on activation / PM (that moved to the charge
+	// sweep). It records the roster row unconditionally — even for an
+	// unactivated account with no PM — so the sweep can price it once the
+	// account becomes chargeable. No charge, ever, in this RPC.
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	delete(store.activation, acct) // never bound a card
-	sc := newFakeStripe()
-	appID := uuid.New()
-
-	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user, AppID: appID,
-	})
-	require.NoError(t, err)
-
-	// The mirror row IS recorded (the boundary leg needs it once the account
-	// activates) but NO invoice exists and the guard stays unarmed.
-	require.Contains(t, store.apps, appID)
-	require.Empty(t, resp.ProrationInvoiceID)
-	require.Empty(t, sc.itemCalls)
-	require.Empty(t, sc.invoiceCalls)
-	require.Empty(t, store.apps[appID].ProrationInvoiceID)
-}
-
-func TestRegisterApp_NoUsablePMRowButNoInvoice(t *testing.T) {
-	store := newFakeStore()
-	user, _ := registeredAccount(store)
 	store.hasPM = false
 	sc := newFakeStripe()
 	appID := uuid.New()
@@ -202,99 +159,7 @@ func TestRegisterApp_NoUsablePMRowButNoInvoice(t *testing.T) {
 	require.Contains(t, store.apps, appID)
 	require.Empty(t, resp.ProrationInvoiceID)
 	require.Empty(t, sc.itemCalls)
-}
-
-func TestRegisterApp_CreatedOnBoundaryChargesNewPeriodFullBase(t *testing.T) {
-	// Created exactly ON the anchor boundary instant (Jul 4 00:00): half-open
-	// windows put the creation in the NEW period [Jul 4, Aug 4), so the
-	// proration leg charges the FULL new-period base ($20 → 2000 cents). This
-	// is the fix direction of the charge-leg overlap review: the Jul-4
-	// boundary's advance leg EXCLUDES apps with created_at ≥ Jul 4, so if
-	// RegisterApp skipped here the app's first period would never be
-	// base-charged (a revenue leak); charging it here bills it exactly once.
-	// (Pre-fix this recomputed 0 remaining days against the OLD window and
-	// charged nothing, leaving the period to the advance leg's roster scan.)
-	store := newFakeStore()
-	user, _ := registeredAccount(store)
-	sc := newFakeStripe()
-	appID := uuid.New()
-
-	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user,
-		AppID:       appID,
-		CreatedAt:   time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC),
-	})
-	require.NoError(t, err)
-	require.EqualValues(t, 2_000, resp.ProrationCents, "creation-day == period start → full base")
-	require.Len(t, sc.itemCalls, 1)
-
-	// Mirrored with the FULL new window (partial start == period start) and
-	// the snapshot frozen for [Jul 4, Aug 4).
-	mirror := store.invoices[sc.invoiceID]
-	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodStart)
-	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
-	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)}]
-	require.True(t, ok, "the proration leg must freeze the charged base")
-	require.Equal(t, "proration", snap.source)
-	require.EqualValues(t, usage.BaseFeeMicros, snap.snap.BaseMicros)
-}
-
-func TestRegisterApp_RetryAfterCreationPeriodClosedNeverCharges(t *testing.T) {
-	// FINDING-1 pin: a RegisterApp retry that lands AFTER the creation period
-	// closed must NOT charge — the proration window is derived from the mirror
-	// row's created_at (May 20 → [May 4, Jun 4)), that window ended before now
-	// (Jul 1), and every later period belongs to the boundary advance leg
-	// (which already billed [Jun 4, Jul 4) for pre-existing apps). Pre-fix the
-	// window was recomputed from NOW, ProratedBaseMicros saw creation-day ≤
-	// period start, and the retry double-charged the FULL current-period base.
-	store := newFakeStore()
-	user, _ := registeredAccount(store)
-	sc := newFakeStripe()
-	svc := appsSvc(store, sc)
-	appID := uuid.New()
-	req := cycle.RegisterAppRequest{
-		OwnerUserID: user,
-		AppID:       appID,
-		CreatedAt:   time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC), // period [May 4, Jun 4) — long closed at appsNow (Jul 1)
-	}
-
-	resp, err := svc.RegisterApp(context.Background(), req)
-	require.NoError(t, err)
-
-	// Row recorded, NO charge, guard UNARMED, no snapshot.
-	require.Contains(t, store.apps, appID)
-	require.Empty(t, resp.ProrationInvoiceID)
-	require.Empty(t, sc.itemCalls, "a closed creation period must never be prorated late")
 	require.Empty(t, sc.invoiceCalls)
-	require.Empty(t, store.apps[appID].ProrationInvoiceID, "guard stays unarmed")
-	require.Empty(t, store.baseSnapshots)
-
-	// Deterministic: every further retry skips identically (never "eventually
-	// charges").
-	resp, err = svc.RegisterApp(context.Background(), req)
-	require.NoError(t, err)
-	require.Empty(t, resp.ProrationInvoiceID)
-	require.Empty(t, sc.itemCalls)
-	require.Empty(t, store.apps[appID].ProrationInvoiceID)
-}
-
-func TestRegisterApp_CurrentPeriodProrationUnchangedByWindowFix(t *testing.T) {
-	// FINDING-1 regression guard: for an app created in a period that is
-	// still CURRENT, deriving the window from created_at instead of now must
-	// change NOTHING — same window, same 3-day proration, snapshot frozen at
-	// the anchored period start with the prorated amount.
-	store := newFakeStore()
-	user, _ := registeredAccount(store)
-	sc := newFakeStripe()
-
-	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user,
-		AppID:       uuid.New(),
-		CreatedAt:   time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), // inside the current [Jun 4, Jul 4)
-	})
-	require.NoError(t, err)
-	require.EqualValues(t, 200, resp.ProrationCents, "3 of 30 days of $20 → 200 cents, exactly as before the fix")
-	require.Len(t, sc.itemCalls, 1)
 }
 
 // --- RegisterApp: account resolution + validation -----------------------------
@@ -607,15 +472,18 @@ func TestRunBillingCycle_ReclaimedRunNoDoubleBase(t *testing.T) {
 	require.Equal(t, cycle.RunStatusSkippedNoPM, first.Status)
 	require.Empty(t, sc.invoiceCalls)
 
-	// PM bound; an app is created Jul 2 (inside the new period [Jul 1, Aug 1))
-	// and RegisterApp prorates it: 30 of 31 days of $20 → 19_354_839 micros.
+	// PM bound; an app is created Jul 2 (inside the new period [Jul 1, Aug 1)).
+	// RegisterApp only mirrors it; the creation-proration charge (the leg the
+	// grace sweep drives) prorates 30 of 31 days of $20 → 19_354_839 micros.
 	store.hasPM = true
 	newApp := uuid.New()
-	reg, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+	_, err = svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
 		OwnerUserID: user,
 		AppID:       newApp,
 		CreatedAt:   time.Date(2026, 7, 2, 10, 0, 0, 0, time.UTC),
 	})
+	require.NoError(t, err)
+	reg, err := svc.ChargeCreationProration(context.Background(), newApp)
 	require.NoError(t, err)
 	require.EqualValues(t, 1_935, reg.ProrationCents)
 	require.Len(t, sc.invoiceCalls, 1)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sort"
 	"testing"
 	"time"
 
@@ -76,36 +77,38 @@ type fakeStore struct {
 	invoices     map[string]cycle.InvoiceMirror       // stripe_invoice_id → mirror
 
 	// injected errors
-	errOpen          error
-	errRaw           error
-	errPrice         error
-	errUpsert        error
-	errIncome        error
-	errVis           error
-	errSettle        error
-	errInsertRun     error
-	errTotal         error
-	errPM            error
-	errCustomer      error
-	errInvoice       error
-	errMarkRun       error
-	errUnbilled      error
-	errUsageEvents   error
-	errActivated     error // ActivatedAccounts
-	errLatestPeriod  error // LatestClosedPeriodEnd
-	errCollection    error // AccountCollection
-	errUpdateColl    error // UpdateAccountCollection
-	errUnpaid        error // HasUnpaidInvoice
-	errEnsureAcct    error // EnsureAccountForUser
-	errActivation    error // AccountActivation
-	errAppInsert     error // InsertAppMirror
-	errAppMirror     error // AppMirror
-	errSetProration  error // SetAppProrationInvoice
-	errSetCount      error // SetAppModuleCount
-	errMarkDeleted   error // MarkAppDeleted
-	errLiveCounts    error // LiveAppsCreatedBefore
-	errProrationSnap error // UpsertProrationBaseSnapshot
-	errAdvanceSnap   error // InsertAdvanceBaseSnapshot
+	errOpen             error
+	errRaw              error
+	errPrice            error
+	errUpsert           error
+	errIncome           error
+	errVis              error
+	errSettle           error
+	errInsertRun        error
+	errTotal            error
+	errPM               error
+	errCustomer         error
+	errInvoice          error
+	errMarkRun          error
+	errUnbilled         error
+	errUsageEvents      error
+	errActivated        error // ActivatedAccounts
+	errLatestPeriod     error // LatestClosedPeriodEnd
+	errCollection       error // AccountCollection
+	errUpdateColl       error // UpdateAccountCollection
+	errUnpaid           error // HasUnpaidInvoice
+	errEnsureAcct       error // EnsureAccountForUser
+	errActivation       error // AccountActivation
+	errAppInsert        error // InsertAppMirror
+	errAppMirror        error // AppMirror
+	errSetProration     error // SetAppProrationInvoice
+	errSetCount         error // SetAppModuleCount
+	errMarkDeleted      error // MarkAppDeleted
+	errLiveCounts       error // LiveAppsCreatedBefore
+	errProrationSnap    error // UpsertProrationBaseSnapshot
+	errAdvanceSnap      error // InsertAdvanceBaseSnapshot
+	errPendingProration error // AppsPendingProration
+	errChargeLocked     error // ChargeProrationLocked
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -438,6 +441,57 @@ func (f *fakeStore) MarkAppDeleted(_ context.Context, appID uuid.UUID) error {
 		f.apps[appID] = app
 	}
 	return nil
+}
+
+func (f *fakeStore) AppsPendingProration(_ context.Context, createdBefore time.Time) ([]uuid.UUID, error) {
+	if f.errPendingProration != nil {
+		return nil, f.errPendingProration
+	}
+	// Mirrors the SQL: created_at <= cutoff AND proration_invoice_id IS NULL AND
+	// deleted_at IS NULL. Sorted by created_at for a deterministic sweep order.
+	var out []uuid.UUID
+	for id, app := range f.apps {
+		if app.ProrationInvoiceID == "" && !app.Deleted && !app.CreatedAt.After(createdBefore) {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return f.apps[out[i]].CreatedAt.Before(f.apps[out[j]].CreatedAt)
+	})
+	return out, nil
+}
+
+// ChargeProrationLocked models the pgxStore's FOR UPDATE-locked charge section:
+// it re-checks the terminal state (the fake's in-memory row is the "locked"
+// read), invokes charge only when still chargeable, and persists the invoice +
+// snapshot + arms the guard on a non-nil payload — exactly what the real tx does
+// atomically.
+func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, charge func(cycle.AppMirror) (*cycle.ProrationCharge, error)) (cycle.ProrationOutcome, string, error) {
+	if f.errChargeLocked != nil {
+		return 0, "", f.errChargeLocked
+	}
+	app, ok := f.apps[appID]
+	if !ok {
+		return cycle.ProrationLockedNotFound, "", nil
+	}
+	if app.Deleted {
+		return cycle.ProrationLockedDeleted, "", nil
+	}
+	if app.ProrationInvoiceID != "" {
+		return cycle.ProrationLockedAlreadyCharged, app.ProrationInvoiceID, nil
+	}
+	pc, err := charge(app)
+	if err != nil {
+		return 0, "", err
+	}
+	if pc == nil {
+		return cycle.ProrationLockedNoCharge, "", nil
+	}
+	f.invoices[pc.Invoice.StripeInvoiceID] = pc.Invoice
+	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}
+	app.ProrationInvoiceID = pc.InvoiceID // first-charge-wins, like WHERE … IS NULL under the lock
+	f.apps[appID] = app
+	return cycle.ProrationLockedCharged, pc.InvoiceID, nil
 }
 
 func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID, createdBefore time.Time) ([]cycle.AppModuleCount, error) {
