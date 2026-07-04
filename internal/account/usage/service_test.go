@@ -20,18 +20,19 @@ func inf() float64 { return math.Inf(1) }
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
-	defs           map[string]usage.MetricDefinition // key: module/metric
-	accounts       map[uuid.UUID]uuid.UUID           // owner userID → accountID
-	events         map[string]usage.UsageEvent       // event_id → event (idempotency)
-	anchorDays     map[uuid.UUID]int                 // accountID → billing-period anchor day (0/absent → 1)
-	periodRows     []usage.MetricUsageRaw
-	historyRows    []usage.PeriodMetricUsageRaw
-	versionRows    []usage.VersionUsageRaw
-	appRows        []usage.AppMetricUsageRaw
-	appBillRows    []usage.AppMetricUsageRaw
-	periodListRows []usage.BillingPeriodRaw
-	periodWindows  map[uuid.UUID]periodWindow // billing_periods id → window
-	visibility     map[uuid.UUID]usage.Visibility
+	defs             map[string]usage.MetricDefinition // key: module/metric
+	accounts         map[uuid.UUID]uuid.UUID           // owner userID → accountID
+	events           map[string]usage.UsageEvent       // event_id → event (idempotency)
+	anchorDays       map[uuid.UUID]int                 // accountID → billing-period anchor day (0/absent → 1)
+	periodRows       []usage.MetricUsageRaw
+	historyRows      []usage.PeriodMetricUsageRaw
+	versionRows      []usage.VersionUsageRaw
+	appRows          []usage.AppMetricUsageRaw
+	appBillRows      []usage.AppMetricUsageRaw
+	appInfraBillRows []usage.AppInfraUsage
+	periodListRows   []usage.BillingPeriodRaw
+	periodWindows    map[uuid.UUID]periodWindow // billing_periods id → window
+	visibility       map[uuid.UUID]usage.Visibility
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
@@ -46,6 +47,10 @@ type fakeStore struct {
 	gotAppBillAccountID uuid.UUID
 	gotAppBillAppID     uuid.UUID
 
+	// captured AppInfraBill call args (the catalog-anchored infra breakdown).
+	gotAppInfraBillAccountID uuid.UUID
+	gotAppInfraBillAppID     uuid.UUID
+
 	errLookup       error
 	errAccount      error
 	errInsert       error
@@ -56,6 +61,7 @@ type fakeStore struct {
 	errVersion      error
 	errAppUsage     error
 	errAppBill      error
+	errAppInfraBill error
 	errPeriodList   error
 	errPeriodWindow error
 	errAnchor       error
@@ -189,6 +195,15 @@ func (f *fakeStore) AppBill(_ context.Context, accountID, appID uuid.UUID, _, _ 
 		return nil, f.errAppBill
 	}
 	return f.appBillRows, nil
+}
+
+func (f *fakeStore) AppInfraBill(_ context.Context, accountID, appID uuid.UUID, _, _ time.Time) ([]usage.AppInfraUsage, error) {
+	f.gotAppInfraBillAccountID = accountID
+	f.gotAppInfraBillAppID = appID
+	if f.errAppInfraBill != nil {
+		return nil, f.errAppInfraBill
+	}
+	return f.appInfraBillRows, nil
 }
 
 func (f *fakeStore) ListBillingPeriods(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.BillingPeriodRaw, error) {
