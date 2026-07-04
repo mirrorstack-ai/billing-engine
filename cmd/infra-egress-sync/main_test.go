@@ -79,6 +79,9 @@ func (f *fakeStore) LookupMetricDefinition(_ context.Context, _ uuid.UUID, _ str
 func (f *fakeStore) UpsertMetricDefinitions(_ context.Context, _ []usage.MetricDeclaration) error {
 	return nil
 }
+func (f *fakeStore) UpsertInfraPriceOverrides(_ context.Context, _ uuid.UUID, _ []usage.InfraPriceOverride) error {
+	return nil
+}
 func (f *fakeStore) CurrentPeriodUsage(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]usage.MetricUsageRaw, error) {
 	return nil, nil
 }

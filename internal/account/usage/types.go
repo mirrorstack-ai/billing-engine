@@ -511,3 +511,41 @@ type SetMetricDefinitionsRequest struct {
 type SetMetricDefinitionsResponse struct {
 	Synced int `json:"synced"`
 }
+
+// InfraPriceOverride is one (metric, price) override in a
+// SetInfraPriceOverrides payload — the wire form of a module's
+// ms.Meter("infra.X", ms.Price(n)) manifest declaration for a RESERVED
+// platform-infra metric. It carries PRICE ONLY: kind + unit are
+// platform-owned and inherited from the SENTINEL base catalog row, never
+// supplied by the caller (the INVERSE of MetricDef, which carries kind/unit
+// for a module's own custom metric). UnitPriceMicros is the raw pre-markup
+// COGS override; 0 is the "full absorb" price (ms.Price(0)), NOT "unpriced"
+// — there is no Priced flag here (an override always carries a price).
+type InfraPriceOverride struct {
+	Metric          string `json:"metric"`
+	UnitPriceMicros int64  `json:"unit_price_micros"`
+}
+
+// SetInfraPriceOverridesRequest is the payload of SetInfraPriceOverrides, a
+// platform CONTROL-PLANE call (gated by the internal secret, NOT the meter
+// secret). api-platform fires it on module publish with every RESERVED
+// infra.* / platform.* metric the module re-priced via
+// ms.Meter("infra.X", ms.Price(n)).
+//
+// It is the INVERSE of SetMetricDefinitions and the control-plane twin of
+// RecordInfraUsage's gate: where SetMetricDefinitions REJECTS reserved names
+// (a module may never DECLARE a platform metric), this call ACCEPTS ONLY
+// reserved names registered in platformInfraKind (a module MAY re-PRICE one).
+// Each override writes a price-only per-(module, metric) metric_definitions
+// row under the REAL module_id (never the sentinel), so the app bill's
+// dual-price resolution (decision 19 §4.2) resolves the module line at the
+// override while the sentinel row stays the platform default.
+type SetInfraPriceOverridesRequest struct {
+	ModuleID  uuid.UUID            `json:"module_id"`
+	Overrides []InfraPriceOverride `json:"overrides"`
+}
+
+// SetInfraPriceOverridesResponse reports how many overrides were synced.
+type SetInfraPriceOverridesResponse struct {
+	Synced int `json:"synced"`
+}
