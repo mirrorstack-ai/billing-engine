@@ -184,10 +184,17 @@ func TestChargeCreationProration_CreatedOnBoundaryChargesFullNewPeriodBase(t *te
 
 func TestChargeCreationProration_DelayedPastPeriodEndStillCharges(t *testing.T) {
 	// Delayed billing (grace point 5): the charge is anchored to the TRUE
-	// created_at, NOT now, so even when grace pushes the charge past the creation
-	// period's end, the creation-period proration STILL fires — that period is
-	// billed by NO other leg (the boundary advance leg only ever bills an app's
-	// SUBSEQUENT periods), so charging it is correct and never double-bills.
+	// created_at, NOT now, so even when grace + ordinary sweep cadence pushes the
+	// charge attempt past the creation period's end, the creation-period
+	// proration STILL fires — that period is billed by NO other leg (the
+	// boundary advance leg only ever bills an app's SUBSEQUENT periods), so
+	// charging it is correct and never double-bills. This is NOT the D1d
+	// retroactive-catch-up case (see TestChargeCreationProration_
+	// SkipsPermanentlyWhenActivatedAfterPeriodClosed below): the account here was
+	// ALREADY activated (May 4, registeredAccount) well before the app's period
+	// even opened — the period-closed check in ChargeCreationProration compares
+	// against activatedAt, not "now", so a healthy already-activated account is
+	// never penalized for a sweep that simply runs late.
 	// App created May 20 → period [May 4, Jun 4), long closed by the sweep in
 	// July: 15 of 31 days of $20 = round_half_up(9_677_419.8) → 968 cents.
 	store := newFakeStore()
@@ -313,4 +320,171 @@ func TestSweep_ChargesOnlyPastGraceLiveUnchargedApps(t *testing.T) {
 	require.NotEmpty(t, store.apps[past].ProrationInvoiceID)
 	require.Empty(t, store.apps[young].ProrationInvoiceID)
 	require.Empty(t, store.apps[gone].ProrationInvoiceID)
+}
+
+// --- FINDING 1: the creation-proration charge must price off the module count
+// FROZEN at RegisterApp time, never whatever module_count SyncAppModules moves
+// it to during (or after) the grace window ----------------------------------
+
+func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceInstall(t *testing.T) {
+	// Reproduces the exact failure scenario: an app registers with 0 modules,
+	// the customer installs 7 MORE modules (via SyncAppModules) DURING the
+	// mandatory grace window — before the sweep ever charges — and the sweep
+	// fires after grace elapses. Pre-fix, the charge priced off the module_count
+	// read FRESH at sweep time (7, live) → 20e6 + 2×3e6 = 26e6 base, 3 of 30 days
+	// → 2_600_000 micros → 260 cents: a HIGHER tier retroactively applied to
+	// days that never had 7 modules installed. Fixed: the charge prices off
+	// created_module_count (frozen at registration, 0) → 20e6 base, 3 of 30 days
+	// → 2_000_000 micros → 200 cents — identical to
+	// TestChargeCreationProration_AmountMatchesLegacyProration's un-synced case.
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), 0)
+
+	// Mid-grace install: the live count jumps to 7 BEFORE the sweep ever runs.
+	_, err := svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{
+		AppID: appID, ModuleCount: intPtr(7),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 7, store.apps[appID].ModuleCount, "the live count DID move")
+	require.Equal(t, 0, store.apps[appID].CreatedModuleCount, "the frozen count must NOT move")
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 200, resp.ProrationCents,
+		"must price off the FROZEN count (0 modules → $20 base), not the live count (7 → $26 base)")
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 200, sc.itemCalls[0].amountCfg)
+
+	// The migration-028 snapshot must also record the FROZEN count/amount — the
+	// display must never show a tier that never applied to those days either.
+	snap := store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}]
+	require.Equal(t, 0, snap.snap.ModuleCount)
+	require.EqualValues(t, 2_000_000, snap.snap.BaseMicros)
+
+	// The LIVE count survives untouched for the boundary advance leg's future
+	// periods — only the historical creation-period charge is frozen.
+	require.Equal(t, 7, store.apps[appID].ModuleCount)
+}
+
+func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceUninstall(t *testing.T) {
+	// The reverse direction: registers with 7 modules (overage tier), the
+	// customer UNINSTALLS all the way down to 0 during grace. Pre-fix this would
+	// retroactively price the creation days at the LOWER tier (200 cents, 0
+	// modules) though they were never at 0 modules on those days. Fixed: prices
+	// off the frozen created_module_count (7) → 1300 cents, matching
+	// TestChargeCreationProration_IncludesModuleOverage's un-synced case exactly.
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
+
+	_, err := svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{
+		AppID: appID, ModuleCount: intPtr(0),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, store.apps[appID].ModuleCount)
+	require.Equal(t, 7, store.apps[appID].CreatedModuleCount, "the frozen count must NOT move")
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1_300, resp.ProrationCents,
+		"must price off the FROZEN count (7 modules → overage tier), not the live count (0 → base only)")
+}
+
+// --- FINDING 2: no retroactive catch-up (D1d) when an account only activates
+// after the app's anchored creation period already closed -------------------
+
+func TestChargeCreationProration_SkipsPermanentlyWhenActivatedAfterPeriodClosed(t *testing.T) {
+	// Reproduces the exact failure scenario: an app is created while its account
+	// is unactivated. Every sweep correctly leaves it unbilled (skipped_
+	// unactivated). MONTHS later the owner finally binds a card — with anchor
+	// day 1 (activated Apr 1), the app's anchored creation period is
+	// [Jan 1, Feb 1), long closed by Apr 1. Pre-fix, the very next charge
+	// attempt would retroactively bill that period in FULL (2000 cents on 0
+	// modules, since Jan 1 == the period start): exactly the retroactive
+	// catch-up D1d forbids. Fixed: the charge is PERMANENTLY skipped — no
+	// Stripe call, ever, and the app never resurfaces on a later sweep (it
+	// would otherwise sit pending forever, since proration_invoice_id never
+	// gets set for a skipped charge).
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	delete(store.activation, acct) // unactivated at creation
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	created := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
+	registerMirror(t, svc, user, appID, created, 0)
+
+	// Past grace, still unactivated → correctly pending, no charge (D1d's
+	// existing unactivated gate — unchanged by this fix).
+	first, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusUnactivated, first.Status)
+	require.Empty(t, sc.itemCalls)
+
+	// MONTHS later: the owner binds a card (anchor day 1) and a PM.
+	store.activation[acct] = time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	store.hasPM = true
+
+	second, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusPeriodClosed, second.Status)
+	require.Empty(t, sc.itemCalls, "no Stripe call — a retroactive catch-up charge must never fire")
+	require.Empty(t, store.apps[appID].ProrationInvoiceID)
+	require.True(t, store.apps[appID].ProrationSkipped, "permanently marked so it is never re-evaluated")
+
+	// A cheap re-evaluation (e.g. a retried RPC) short-circuits on the marker
+	// without even re-reading account activation — still no Stripe call.
+	third, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusPeriodClosed, third.Status)
+	require.Empty(t, sc.itemCalls)
+
+	// A LATER sweep must never resurface it — it would otherwise sit pending
+	// forever (proration_invoice_id stays NULL for a permanently-skipped app).
+	res, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 0, res.Pending, "a permanently-skipped app never resurfaces on a later sweep")
+	require.Empty(t, sc.itemCalls)
+}
+
+func TestChargeCreationProration_ActivatedBeforePeriodClosesStillCharges(t *testing.T) {
+	// Guard against an over-broad fix: an account that activates BEFORE the
+	// app's anchored creation period closes must charge normally — D1d only
+	// blocks a retroactive catch-up when the account was unactivated for the
+	// app's ENTIRE creation period. The anchor day is DERIVED from activatedAt
+	// itself (billingperiod.AnchorDay), so activating the SAME calendar day the
+	// app was created (the common "sign up, create an app, add a card" onboarding
+	// flow) anchors the period at that same day-of-month — putting its END a
+	// full month out, safely after activation.
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	delete(store.activation, acct)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 1, 10, 6, 0, 0, 0, time.UTC), 0)
+
+	first, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusUnactivated, first.Status)
+
+	// Activates a few hours later the SAME day (anchor day 10) → period
+	// [Jan 10, Feb 10) — still wide open — and binds a PM.
+	store.activation[acct] = time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	store.hasPM = true
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2_000, resp.ProrationCents, "created on/after the period start → full base")
+	require.Len(t, sc.itemCalls, 1)
+	require.False(t, store.apps[appID].ProrationSkipped)
 }
