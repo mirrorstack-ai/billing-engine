@@ -478,6 +478,73 @@ func (s *Service) SetMetricDefinitions(ctx context.Context, req SetMetricDefinit
 	return &SetMetricDefinitionsResponse{Synced: len(req.Metrics)}, nil
 }
 
+// SetInfraPriceOverrides writes a module's per-metric price OVERRIDES for the
+// reserved platform-infra metrics it re-priced via ms.Meter("infra.X",
+// ms.Price(n)) (decision 19 §4.3). It is the INVERSE of SetMetricDefinitions
+// and the control-plane twin of RecordInfraUsage's gate:
+//
+//   - SetMetricDefinitions REJECTS reserved names (a module may never DECLARE a
+//     platform metric); this RPC ACCEPTS ONLY reserved names REGISTERED in
+//     platformInfraKind (a module MAY re-PRICE one). The reserved-name guard on
+//     SetMetricDefinitions is deliberately left UNTOUCHED — the custom-metric
+//     plane keeps rejecting reserved names; only this dedicated seam persists an
+//     override (modeled on metric_model_prices / migration 018, the secondary
+//     per-(metric, model) price layered over the sentinel row — this is the same
+//     pattern one axis over, per-(module, metric)).
+//   - The override row carries PRICE ONLY. kind + unit are platform-owned and
+//     INHERITED from the SENTINEL base catalog row (the store copies them in one
+//     INSERT ... SELECT) — never supplied by the caller.
+//   - The row keys (module_id, metric) with the REAL module_id (NOT the
+//     sentinel), so the bill's dual-price resolution (decision 19 §4.2, W1)
+//     finds it via LEFT JOIN on the event's real module_id. ms.Price(0) →
+//     override 0 → full absorb, no special case.
+//
+// Platform CONTROL-PLANE call (internal secret, not the meter secret),
+// all-or-nothing (one transaction in the store), idempotent per
+// (module, metric). No metric_definitions schema change: UNIQUE(module_id,
+// metric) already supports the row.
+func (s *Service) SetInfraPriceOverrides(ctx context.Context, req SetInfraPriceOverridesRequest) (*SetInfraPriceOverridesResponse, error) {
+	if req.ModuleID == uuid.Nil {
+		return nil, billing.InvalidInput("module_id required")
+	}
+	// The override row keys a REAL module_id. The all-zero sentinel is the
+	// platform's BASE infra catalog (seeded by migration 017/018/020, the
+	// authoritative default price + kind + unit + display_group), never
+	// re-priced through this RPC — reject it so a caller can't clobber the base
+	// price here.
+	if req.ModuleID == platformInfraModuleID {
+		return nil, billing.InvalidInput("module_id must be a real module, not the platform-infra sentinel")
+	}
+	// Validate every override BEFORE touching the store (the store upsert is
+	// all-or-nothing, mirroring SetMetricDefinitions): a partial write would
+	// leave the module's override set inconsistent until the next publish.
+	overrides := make([]InfraPriceOverride, 0, len(req.Overrides))
+	for _, o := range req.Overrides {
+		if o.Metric == "" {
+			return nil, billing.InvalidInput("metric required")
+		}
+		// INVERSE gate, mirroring RecordInfraUsage: accept ONLY reserved
+		// infra.* / platform.* names (a custom metric belongs on
+		// SetMetricDefinitions) that are REGISTERED platform infra metrics (an
+		// unregistered reserved name has no platform-owned catalog row to
+		// inherit kind/unit from, and nothing would ever emit it).
+		if !isReservedMetric(o.Metric) {
+			return nil, billing.InvalidInput("metric is not a platform-infra namespace (SetInfraPriceOverrides accepts only infra.* / platform.* metrics): " + o.Metric)
+		}
+		if _, registered := platformInfraKind(o.Metric); !registered {
+			return nil, billing.InvalidInput("unknown platform-infra metric: " + o.Metric)
+		}
+		if o.UnitPriceMicros < 0 {
+			return nil, billing.InvalidInput("unit_price_micros must be non-negative")
+		}
+		overrides = append(overrides, o)
+	}
+	if err := s.store.UpsertInfraPriceOverrides(ctx, req.ModuleID, overrides); err != nil {
+		return nil, billing.Internal("upsert infra price overrides failed", err)
+	}
+	return &SetInfraPriceOverridesResponse{Synced: len(overrides)}, nil
+}
+
 // SetModuleVisibility upserts the developer margin-share mirror. It
 // NEVER affects the customer charge; it governs only the developer
 // settlement rate (PR #5). Fired by api-platform on every
