@@ -295,6 +295,22 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// above) exceeds the account's threshold resolved AT CHARGE TIME (its
 	// per-account override, or the platform default when NULL). Pure disclosure —
 	// it changes NO charging behaviour, only surfaces the already-successful debit.
+	//
+	// The threshold is RE-RESOLVED HERE — immediately after the Stripe call
+	// succeeded — rather than reusing `acct` loaded at the top of this
+	// function (before the risk gate / PM check / the two Stripe HTTP calls
+	// above). Resolving up front would let a threshold edit that lands
+	// CONCURRENTLY with this charge be honored differently than
+	// RegisterApp's creation-proration leg, which resolves its threshold
+	// immediately after ITS Stripe charge succeeds (apps.go). Both charge
+	// legs now resolve at the SAME point relative to the actual charge
+	// (immediately after Stripe confirms success), so a concurrent edit
+	// mid-charge is honored identically by both, never one way on the
+	// boundary leg and another on the proration leg.
+	postChargeAcct, err := s.store.AccountCollection(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("account collection lookup failed (post-charge threshold resolve)", err)
+	}
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
 		AccountID:          accountID,
 		StripeInvoiceID:    inv.ID,
@@ -304,7 +320,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		Currency:           chargeCurrency,
 		PeriodStart:        periodStart,
 		PeriodEnd:          periodEnd,
-		IsLargeAutoCollect: collection.IsLargeAutoCollect(arrears+advanceBase, acct.AutoCollectThresholdMicros),
+		IsLargeAutoCollect: collection.IsLargeAutoCollect(arrears+advanceBase, postChargeAcct.AutoCollectThresholdMicros),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
