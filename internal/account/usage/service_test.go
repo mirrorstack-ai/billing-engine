@@ -20,19 +20,20 @@ func inf() float64 { return math.Inf(1) }
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
-	defs             map[string]usage.MetricDefinition // key: module/metric
-	accounts         map[uuid.UUID]uuid.UUID           // owner userID → accountID
-	events           map[string]usage.UsageEvent       // event_id → event (idempotency)
-	anchorDays       map[uuid.UUID]int                 // accountID → billing-period anchor day (0/absent → 1)
-	periodRows       []usage.MetricUsageRaw
-	historyRows      []usage.PeriodMetricUsageRaw
-	versionRows      []usage.VersionUsageRaw
-	appRows          []usage.AppMetricUsageRaw
-	appBillRows      []usage.AppMetricUsageRaw
-	appInfraBillRows []usage.AppInfraUsage
-	periodListRows   []usage.BillingPeriodRaw
-	periodWindows    map[uuid.UUID]periodWindow // billing_periods id → window
-	visibility       map[uuid.UUID]usage.Visibility
+	defs                   map[string]usage.MetricDefinition // key: module/metric
+	accounts               map[uuid.UUID]uuid.UUID           // owner userID → accountID
+	events                 map[string]usage.UsageEvent       // event_id → event (idempotency)
+	anchorDays             map[uuid.UUID]int                 // accountID → billing-period anchor day (0/absent → 1)
+	periodRows             []usage.MetricUsageRaw
+	historyRows            []usage.PeriodMetricUsageRaw
+	versionRows            []usage.VersionUsageRaw
+	appRows                []usage.AppMetricUsageRaw
+	appBillRows            []usage.AppMetricUsageRaw
+	appInfraBillRows       []usage.AppInfraUsage
+	appModuleInfraBillRows []usage.AppModuleInfraUsage
+	periodListRows         []usage.BillingPeriodRaw
+	periodWindows          map[uuid.UUID]periodWindow // billing_periods id → window
+	visibility             map[uuid.UUID]usage.Visibility
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
@@ -51,20 +52,26 @@ type fakeStore struct {
 	gotAppInfraBillAccountID uuid.UUID
 	gotAppInfraBillAppID     uuid.UUID
 
-	errLookup       error
-	errAccount      error
-	errInsert       error
-	errPeriod       error
-	errVisibility   error
-	errUpsertDef    error
-	errHistory      error
-	errVersion      error
-	errAppUsage     error
-	errAppBill      error
-	errAppInfraBill error
-	errPeriodList   error
-	errPeriodWindow error
-	errAnchor       error
+	// captured AppModuleInfraBill call args (the per-module dual-price infra breakdown).
+	gotAppModuleInfraBillAccountID uuid.UUID
+	gotAppModuleInfraBillAppID     uuid.UUID
+	appModuleInfraBillCalled       bool
+
+	errLookup             error
+	errAccount            error
+	errInsert             error
+	errPeriod             error
+	errVisibility         error
+	errUpsertDef          error
+	errHistory            error
+	errVersion            error
+	errAppUsage           error
+	errAppBill            error
+	errAppInfraBill       error
+	errAppModuleInfraBill error
+	errPeriodList         error
+	errPeriodWindow       error
+	errAnchor             error
 
 	// captured window a read-path RPC resolved from the account's anchor, so a
 	// test can assert the anchored [start, end) reached the store unchanged.
@@ -204,6 +211,16 @@ func (f *fakeStore) AppInfraBill(_ context.Context, accountID, appID uuid.UUID, 
 		return nil, f.errAppInfraBill
 	}
 	return f.appInfraBillRows, nil
+}
+
+func (f *fakeStore) AppModuleInfraBill(_ context.Context, accountID, appID uuid.UUID, _, _ time.Time) ([]usage.AppModuleInfraUsage, error) {
+	f.appModuleInfraBillCalled = true
+	f.gotAppModuleInfraBillAccountID = accountID
+	f.gotAppModuleInfraBillAppID = appID
+	if f.errAppModuleInfraBill != nil {
+		return nil, f.errAppModuleInfraBill
+	}
+	return f.appModuleInfraBillRows, nil
 }
 
 func (f *fakeStore) ListBillingPeriods(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.BillingPeriodRaw, error) {

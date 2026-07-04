@@ -182,6 +182,132 @@ func TestAppInfraBill_Integration_RolledFrozenNotRemarkedUp(t *testing.T) {
 	require.EqualValues(t, 3600, used.ChargedMicros, "frozen charged, not re-marked-up")
 }
 
+// TestAppModuleInfraBill_Integration_DualPriceSentinelFallback: the decision-19
+// per-module infra read resolves (module, metric) → (SENTINEL, metric) at the SQL
+// level. A module with an ms.Price(n) override prices at n; a module with NO override
+// falls back to the SENTINEL default (NO revenue leak); the override price rides the
+// wire as a nullable *int64 (nil ⇔ no override). Sentinel-attributed usage of the SAME
+// metric stays in the RESIDUAL (AppInfraBill), proving the two queries partition the
+// reserved namespace with no double-count.
+func TestAppModuleInfraBill_Integration_DualPriceSentinelFallback(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	metric := "infra.compute.walltime.ms"
+
+	// Pin the SENTINEL default COGS to a known, active 20 µ$/unit for exact assertions
+	// (the metric is migration-seeded under the sentinel).
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.metric_definitions SET unit_price_micros = 20, active = true
+		 WHERE module_id = $1 AND metric = $2`,
+		sentinel.String(), metric)
+	require.NoError(t, err)
+
+	modAbsorb := uuid.New() // ms.Price(0) override → full absorb
+	modPlain := uuid.New()  // NO override row → sentinel-default fallback
+	modMarkup := uuid.New() // override 50 (> default) → module markup
+
+	// Override rows are price-only, keyed (real module_id, metric). These (module,
+	// metric) pairs are not migration-seeded, so the plain INSERT is safe.
+	appSeedMetricDef(t, pool, modAbsorb, metric, usage.KindSum, 0)
+	appSeedMetricDef(t, pool, modMarkup, metric, usage.KindSum, 50)
+	// modPlain: intentionally NO override row (exercises the sentinel fallback).
+
+	// Each attributed module incurs 100 units; a sentinel event of the SAME metric is
+	// the residual, not a per-module line.
+	appSeedEvent(t, pool, acct, app, modAbsorb, metric, usage.KindSum, 100, "2026-06-05T00:00:00Z", "", "")
+	appSeedEvent(t, pool, acct, app, modPlain, metric, usage.KindSum, 100, "2026-06-05T00:00:00Z", "", "")
+	appSeedEvent(t, pool, acct, app, modMarkup, metric, usage.KindSum, 100, "2026-06-05T00:00:00Z", "", "")
+	appSeedEvent(t, pool, acct, app, sentinel, metric, usage.KindSum, 5, "2026-06-05T00:00:00Z", "", "")
+
+	lines, err := store.AppModuleInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	require.Len(t, lines, 3, "only the three ATTRIBUTED modules; the sentinel event is residual")
+
+	byMod := func(mod uuid.UUID) usage.AppModuleInfraUsage {
+		for _, l := range lines {
+			if l.ModuleID == mod {
+				return l
+			}
+		}
+		t.Fatalf("no module_infra line for module %s", mod)
+		return usage.AppModuleInfraUsage{}
+	}
+
+	absorb := byMod(modAbsorb)
+	require.EqualValues(t, 20, absorb.DefaultUnitPriceMicros, "default is the SENTINEL COGS")
+	require.NotNil(t, absorb.ModuleUnitPriceMicros)
+	require.EqualValues(t, 0, *absorb.ModuleUnitPriceMicros, "ms.Price(0) override → non-nil 0")
+	require.Zero(t, absorb.ChargedMicros, "100 × 0 × 1.2 = 0 (full absorb)")
+
+	plain := byMod(modPlain)
+	require.EqualValues(t, 20, plain.DefaultUnitPriceMicros)
+	require.Nil(t, plain.ModuleUnitPriceMicros, "no override row → NULL (plain mode on the wire)")
+	require.EqualValues(t, 2400, plain.ChargedMicros, "SENTINEL FALLBACK: 100 × 20 × 1.2 — NO revenue leak")
+	require.Equal(t, metric, plain.Label, "no friendly-label registry → metric id is the label")
+	require.Equal(t, "compute", plain.Group, "kind/unit/group from the SENTINEL row")
+
+	markup := byMod(modMarkup)
+	require.NotNil(t, markup.ModuleUnitPriceMicros)
+	require.EqualValues(t, 50, *markup.ModuleUnitPriceMicros)
+	require.EqualValues(t, 6000, markup.ChargedMicros, "override applied: 100 × 50 × 1.2")
+
+	// RESIDUAL now excludes the attributed events and keeps ONLY the sentinel usage of
+	// this metric (5 units) — the reconciliation partition, no double-count.
+	residual, err := store.AppInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	resLine, ok := findInfraLine(residual, metric)
+	require.True(t, ok)
+	require.EqualValues(t, 5, resLine.BillableQuantity, "residual = the sentinel event only (5), NOT the 305 total")
+	require.EqualValues(t, 120, resLine.ChargedMicros, "residual: 5 × 20 × 1.2")
+}
+
+// TestAppModuleInfraBill_Integration_RolledFrozen: once rolled up, the per-module read
+// serves the FROZEN usage_aggregates.charged_micros (the override price + 1.2× already
+// snapshotted at rollup), suppressing the in-window live events; the display prices
+// (default + override) are still resolved fresh from the catalog.
+func TestAppModuleInfraBill_Integration_RolledFrozen(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	metric := "infra.compute.walltime.ms"
+	mod := uuid.New()
+
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.metric_definitions SET unit_price_micros = 20, active = true
+		 WHERE module_id = $1 AND metric = $2`,
+		sentinel.String(), metric)
+	require.NoError(t, err)
+	appSeedMetricDef(t, pool, mod, metric, usage.KindSum, 5) // override 5
+
+	// A live event that would show on the live path — suppressed once rolled.
+	appSeedEvent(t, pool, acct, app, mod, metric, usage.KindSum, 999, "2026-06-05T00:00:00Z", "", "")
+	// Frozen record: charged 600 already includes the override price + 1.2× markup.
+	periodID := appSeedPeriod(t, pool, acct, appPeriodStart, appPeriodEnd)
+	appSeedAggregate(t, pool, periodID, acct, app, mod, metric, usage.KindSum, "", "",
+		100, 5, 500, 600)
+
+	lines, err := store.AppModuleInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	require.Len(t, lines, 1, "rolled branch wins; live events suppressed")
+	require.EqualValues(t, 100, lines[0].BillableQuantity, "frozen quantity, not the live 999")
+	require.EqualValues(t, 600, lines[0].ChargedMicros, "frozen charged, not re-marked-up")
+	require.EqualValues(t, 20, lines[0].DefaultUnitPriceMicros, "default resolved fresh from the SENTINEL row")
+	require.NotNil(t, lines[0].ModuleUnitPriceMicros)
+	require.EqualValues(t, 5, *lines[0].ModuleUnitPriceMicros, "override resolved fresh from the catalog")
+}
+
 // TestListBillingPeriods_Integration: an account's real periods list newest-first
 // with is_current flagging the row equal to current_month_start; another
 // account's periods are excluded.

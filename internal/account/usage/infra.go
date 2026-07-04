@@ -177,17 +177,30 @@ func platformInfraKind(metric string) (Kind, bool) {
 // from a module catalog).
 //
 // Only the platform's own measurement chokepoints reach this RPC (gated by the
-// INTERNAL secret, never the meter secret), so AppID/OwnerUserID/OwnerOrgID are
-// the trusted attribution of the call that incurred the infra cost. ModuleID is
-// NOT on the wire — it is always stamped as the platform-infra sentinel.
+// INTERNAL secret, never the meter secret), so AppID/OwnerUserID/OwnerOrgID/ModuleID
+// are the trusted attribution of the call that incurred the infra cost. ModuleID is
+// TRUSTED platform-re-derived attribution (decision 19): the dispatch producer stamps
+// the incurring module UUID; a Nil ModuleID is the explicit "unattributed" signal
+// (platform-agent AI, egress/async producers) and is mapped to the platform-infra
+// sentinel. It is NEVER an SDK hint.
 type RecordInfraUsageRequest struct {
 	// EventID is the producer-minted idempotency key, stable across the
 	// producer's retry. RecordInfraUsage inserts ON CONFLICT(event_id) DO NOTHING.
 	EventID string `json:"event_id"`
 
 	// AppID is the app the infra cost is attributed to (the call's app). The
-	// owner principal anchors the lazy billing account.
+	// owner principal anchors the lazy billing account. Nil is tolerated as the
+	// "unattributed to a single app" signal (platform-agent AI events send it) —
+	// recorded under the zero app_id, which no per-app bill query matches, so it
+	// accrues at the account level only (parallel to the lazy-owner rule).
 	AppID uuid.UUID `json:"app_id"`
+
+	// ModuleID is the incurring module (decision 19): the dispatch producer stamps
+	// the module UUID it already holds so the app bill can attribute this infra line
+	// to that module's card. Nil = unattributed → mapped to the platform-infra
+	// sentinel at insert (prices + rolls up exactly as before). TRUSTED
+	// platform-re-derived attribution, never an SDK-supplied hint.
+	ModuleID uuid.UUID `json:"module_id,omitempty"`
 
 	// Owner principal (polymorphic). Exactly one set, or both Nil for a lazy
 	// (account-less) event — recorded with a NULL account_id, backfilled on
@@ -247,10 +260,17 @@ type RecordInfraUsageResponse struct {
 //     of the SDK gate which rejects reserved names),
 //  3. resolves the accumulation KIND from the platform-owned registry (NOT a
 //     per-module metric_definitions lookup — the platform owns infra semantics),
-//  4. stamps the platform-infra SENTINEL module_id so ingest + rollup resolve
-//     through the seeded catalog rows (migration 017),
+//  4. stamps the incurring module_id (decision 19): req.ModuleID when the producer
+//     supplied a real incurring module, else the platform-infra SENTINEL so an
+//     unattributed event prices + rolls up through the seeded catalog rows
+//     (migrations 017/020) exactly as before,
 //  5. resolves the owner's billing account (Nil = lazy, recorded NULL),
 //  6. inserts ON CONFLICT(event_id) DO NOTHING (idempotent retry).
+//
+// AppID Nil is tolerated (recorded under the zero app_id): the platform-agent AI
+// producer (ai_meter.go) sends Nil AppID for account-level, app-unattributed infra —
+// rejecting it swallowed every such event. It accrues at the account level only (no
+// per-app bill query matches the zero app_id), parallel to the lazy-owner rule.
 //
 // A module can NEVER reach this path: it is gated by the INTERNAL secret (not
 // the meter secret the SDK ingress uses) AND it accepts ONLY reserved names the
@@ -259,9 +279,9 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	if req.EventID == "" {
 		return nil, billing.InvalidInput("event_id required")
 	}
-	if req.AppID == uuid.Nil {
-		return nil, billing.InvalidInput("app_id required")
-	}
+	// AppID Nil is NOT rejected (decision 19): it is the explicit "unattributed to a
+	// single app" signal the platform-agent AI producer sends. Recorded under the zero
+	// app_id — no per-app bill query matches it, so it accrues account-level only.
 	if req.Metric == "" {
 		return nil, billing.InvalidInput("metric required")
 	}
@@ -319,11 +339,21 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		recordedAt = s.nowFn().UTC()
 	}
 
+	// Decision 19 attribution: stamp the producer-supplied incurring module_id, or
+	// the platform-infra sentinel when Nil (genuinely unattributable — platform-agent
+	// AI, egress/async producers). The sentinel keeps the seeded catalog rows as the
+	// price/kind/unit/display_group anchor, so an unattributed event prices + rolls up
+	// identically to before. Trusted platform-re-derived attribution, never an SDK hint.
+	moduleID := req.ModuleID
+	if moduleID == uuid.Nil {
+		moduleID = platformInfraModuleID
+	}
+
 	recorded, err := s.store.InsertUsageEvent(ctx, UsageEvent{
 		EventID:       req.EventID,
 		AccountID:     accountID,
 		AppID:         req.AppID,
-		ModuleID:      platformInfraModuleID, // platform-infra sentinel
+		ModuleID:      moduleID,
 		Metric:        req.Metric,
 		Kind:          kind,
 		Value:         req.Value,
