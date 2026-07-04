@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/collection"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
@@ -255,19 +256,30 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		return nil, billing.StripeError("proration invoice failed", err)
 	}
 
+	// Resolve the account's large-charge disclosure threshold AT CHARGE TIME so
+	// the proration invoice's flag reflects what applied when it fired (migration
+	// 031), the same contract as the RunBillingCycle leg. A prorated app base fee
+	// rarely crosses the $100 default, but the flag is computed uniformly at every
+	// off-session charge call site so no successful large debit escapes disclosure.
+	acct, err := s.store.AccountCollection(ctx, app.AccountID)
+	if err != nil {
+		return nil, billing.Internal("account collection lookup failed", err)
+	}
+
 	// Mirror with the PARTIAL window: [creation day (UTC midnight), period
 	// end) — the SAME coverage-start instant ProratedBaseMicros priced, so
 	// the mirrored window and the charged amount agree by construction.
 	partialStart := usage.ProrationCoverageStart(app.CreatedAt, periodStart)
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:       app.AccountID,
-		StripeInvoiceID: inv.ID,
-		Status:          inv.Status,
-		AmountDueCents:  inv.AmountDue,
-		AmountPaidCents: inv.AmountPaid,
-		Currency:        chargeCurrency,
-		PeriodStart:     partialStart,
-		PeriodEnd:       periodEnd,
+		AccountID:          app.AccountID,
+		StripeInvoiceID:    inv.ID,
+		Status:             inv.Status,
+		AmountDueCents:     inv.AmountDue,
+		AmountPaidCents:    inv.AmountPaid,
+		Currency:           chargeCurrency,
+		PeriodStart:        partialStart,
+		PeriodEnd:          periodEnd,
+		IsLargeAutoCollect: collection.IsLargeAutoCollect(prorated, acct.AutoCollectThresholdMicros),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}

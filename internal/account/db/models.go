@@ -331,6 +331,8 @@ type MsBillingAccount struct {
 	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
 	// UTC instant the account bound its FIRST credit card (billing-account activation). Immutable, first-bind-wins; billing-period anchor day = activated_at day-of-month (ADR 0005). NULL = never activated -> skipped by cmd/billing-cycle.
 	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
+	// Per-account size threshold (micro-USD) above which a SUCCESSFUL off-session charge is disclosed as "large" on the billing page. NULL = platform default ($100 = 100000000 micros). Resolved at charge time; pure disclosure, changes no charging behaviour.
+	AutoCollectThresholdMicros pgtype.Int8 `json:"auto_collect_threshold_micros"`
 }
 
 type MsBillingAddCardRequest struct {
@@ -439,6 +441,8 @@ type MsBillingInvoice struct {
 	HostedInvoiceUrl pgtype.Text `json:"hosted_invoice_url"`
 	// Stripe invoice PDF download URL. Assigned at finalization; NULL = not yet delivered.
 	InvoicePdf pgtype.Text `json:"invoice_pdf"`
+	// Server-computed at invoice-create time: true iff the charged amount (netted arrears + advance base, micros) exceeded the account auto_collect_threshold_micros (or the default when NULL) that applied WHEN THE CHARGE FIRED. Post-hoc disclosure only.
+	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
 }
 
 type MsBillingMetricDefinition struct {

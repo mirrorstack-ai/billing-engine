@@ -200,3 +200,56 @@ func TestTrustRampedCreditLimit_PartialTenureMonthDoesNotCount(t *testing.T) {
 		collection.TrustRampedCreditLimit(0, 29, false),
 		"30 days adds one tenure month")
 }
+
+// --- large auto-collect disclosure ----------------------------------------
+
+func TestResolveAutoCollectThreshold_NilUsesDefault(t *testing.T) {
+	// A nil override models the migration-031 NULL column → the platform default.
+	require.Equal(t, collection.DefaultAutoCollectThresholdMicros,
+		collection.ResolveAutoCollectThreshold(nil))
+	require.EqualValues(t, 100_000_000, collection.DefaultAutoCollectThresholdMicros,
+		"default is $100.00 in micros")
+}
+
+func TestResolveAutoCollectThreshold_OverrideRespected(t *testing.T) {
+	override := int64(250_000_000) // $250.00 per-account override
+	require.Equal(t, override, collection.ResolveAutoCollectThreshold(&override))
+}
+
+func TestIsLargeAutoCollect_BelowDefaultThresholdFalse(t *testing.T) {
+	// $99.99 with the default $100 threshold (nil override) → not large.
+	require.False(t, collection.IsLargeAutoCollect(99_990_000, nil))
+}
+
+func TestIsLargeAutoCollect_AboveDefaultThresholdTrue(t *testing.T) {
+	// $100.01 with the default $100 threshold → large.
+	require.True(t, collection.IsLargeAutoCollect(100_010_000, nil))
+}
+
+func TestIsLargeAutoCollect_ExactlyAtThresholdFalse(t *testing.T) {
+	// JUDGMENT (documented): the comparison is strict-greater-than, so a charge
+	// EXACTLY EQUAL to the threshold is NOT flagged — "large" means ABOVE the
+	// threshold (a $100 threshold discloses charges over $100, not one of exactly
+	// $100). Matches ExceedsSpendCeiling's precise-dollar-cap reading.
+	require.False(t, collection.IsLargeAutoCollect(collection.DefaultAutoCollectThresholdMicros, nil))
+	override := int64(250_000_000)
+	require.False(t, collection.IsLargeAutoCollect(override, &override),
+		"exactly at a custom override is likewise not large")
+}
+
+func TestIsLargeAutoCollect_CustomOverrideRespected(t *testing.T) {
+	// A $250 override: $150 is under the CUSTOM threshold (though over the $100
+	// default), so the per-account override governs and it is NOT large…
+	override := int64(250_000_000)
+	require.False(t, collection.IsLargeAutoCollect(150_000_000, &override))
+	// …while $250.01 crosses the override and IS large.
+	require.True(t, collection.IsLargeAutoCollect(250_010_000, &override))
+}
+
+func TestIsLargeAutoCollect_ZeroOverrideFlagsAnyPositiveCharge(t *testing.T) {
+	// A $0 override (a deliberately-disclose-everything account) flags any
+	// positive charge but not a zero charge (0 is not > 0).
+	zero := int64(0)
+	require.True(t, collection.IsLargeAutoCollect(1, &zero))
+	require.False(t, collection.IsLargeAutoCollect(0, &zero))
+}

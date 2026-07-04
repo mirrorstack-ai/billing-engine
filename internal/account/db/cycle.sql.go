@@ -17,16 +17,18 @@ SELECT
     usage_billing_mode,
     credit_limit_micros,
     spend_ceiling_micros,
+    auto_collect_threshold_micros,
     created_at
 FROM ms_billing.accounts
 WHERE id = $1
 `
 
 type AccountCollectionFieldsRow struct {
-	UsageBillingMode   MsBillingUsageBillingMode `json:"usage_billing_mode"`
-	CreditLimitMicros  int64                     `json:"credit_limit_micros"`
-	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
-	CreatedAt          time.Time                 `json:"created_at"`
+	UsageBillingMode           MsBillingUsageBillingMode `json:"usage_billing_mode"`
+	CreditLimitMicros          int64                     `json:"credit_limit_micros"`
+	SpendCeilingMicros         pgtype.Int8               `json:"spend_ceiling_micros"`
+	AutoCollectThresholdMicros pgtype.Int8               `json:"auto_collect_threshold_micros"`
+	CreatedAt                  time.Time                 `json:"created_at"`
 }
 
 // AccountCollectionFields loads the risk-graded collection controls for the
@@ -35,7 +37,10 @@ type AccountCollectionFieldsRow struct {
 // limit. created_at is returned so the risk-judge can compute account tenure
 // WITHOUT a cross-schema read into ms_account (billing-engine never reads
 // ms_account tables). spend_ceiling_micros is NULL when no ceiling is set; the
-// Go layer carries it as a nullable.
+// Go layer carries it as a nullable. auto_collect_threshold_micros (migration
+// 031) is NULL when the account uses the platform default; the charge leg
+// resolves it to collection.DefaultAutoCollectThresholdMicros AT CHARGE TIME to
+// decide the post-hoc large-charge disclosure flag.
 func (q *Queries) AccountCollectionFields(ctx context.Context, id string) (AccountCollectionFieldsRow, error) {
 	row := q.db.QueryRow(ctx, accountCollectionFields, id)
 	var i AccountCollectionFieldsRow
@@ -43,6 +48,7 @@ func (q *Queries) AccountCollectionFields(ctx context.Context, id string) (Accou
 		&i.UsageBillingMode,
 		&i.CreditLimitMicros,
 		&i.SpendCeilingMicros,
+		&i.AutoCollectThresholdMicros,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -427,35 +433,42 @@ const upsertInvoice = `-- name: UpsertInvoice :exec
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
-    period_start, period_end
+    period_start, period_end, is_large_auto_collect
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8
+    $1, $2, $3, $4, $5, $6, $7, $8, $9
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
-    status       = EXCLUDED.status,
-    amount_due   = EXCLUDED.amount_due,
-    amount_paid  = EXCLUDED.amount_paid,
-    currency     = EXCLUDED.currency,
-    period_start = EXCLUDED.period_start,
-    period_end   = EXCLUDED.period_end
+    status                = EXCLUDED.status,
+    amount_due            = EXCLUDED.amount_due,
+    amount_paid           = EXCLUDED.amount_paid,
+    currency              = EXCLUDED.currency,
+    period_start          = EXCLUDED.period_start,
+    period_end            = EXCLUDED.period_end,
+    is_large_auto_collect = EXCLUDED.is_large_auto_collect
 `
 
 type UpsertInvoiceParams struct {
-	AccountID       string             `json:"account_id"`
-	StripeInvoiceID string             `json:"stripe_invoice_id"`
-	Status          string             `json:"status"`
-	AmountDue       pgtype.Numeric     `json:"amount_due"`
-	AmountPaid      pgtype.Numeric     `json:"amount_paid"`
-	Currency        string             `json:"currency"`
-	PeriodStart     pgtype.Timestamptz `json:"period_start"`
-	PeriodEnd       pgtype.Timestamptz `json:"period_end"`
+	AccountID          string             `json:"account_id"`
+	StripeInvoiceID    string             `json:"stripe_invoice_id"`
+	Status             string             `json:"status"`
+	AmountDue          pgtype.Numeric     `json:"amount_due"`
+	AmountPaid         pgtype.Numeric     `json:"amount_paid"`
+	Currency           string             `json:"currency"`
+	PeriodStart        pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd          pgtype.Timestamptz `json:"period_end"`
+	IsLargeAutoCollect bool               `json:"is_large_auto_collect"`
 }
 
 // UpsertInvoice mirrors a Stripe invoice into ms_billing.invoices, keyed on the
 // UNIQUE stripe_invoice_id so a re-run (deterministic Stripe Idempotency-Key
 // returns the same invoice) upserts the same row rather than duplicating it.
 // Webhook reconciliation (PR #7) later updates status + amount_paid in place.
+// is_large_auto_collect (migration 031) is the server-computed post-hoc
+// disclosure flag, frozen at invoice-create time from the amount charged vs the
+// account threshold that applied WHEN THE CHARGE FIRED. A deterministic re-run
+// (same Stripe idem key → same invoice, same charged amount) re-computes the same
+// value, so carrying it through EXCLUDED on conflict is a no-op refresh.
 func (q *Queries) UpsertInvoice(ctx context.Context, arg UpsertInvoiceParams) error {
 	_, err := q.db.Exec(ctx, upsertInvoice,
 		arg.AccountID,
@@ -466,6 +479,7 @@ func (q *Queries) UpsertInvoice(ctx context.Context, arg UpsertInvoiceParams) er
 		arg.Currency,
 		arg.PeriodStart,
 		arg.PeriodEnd,
+		arg.IsLargeAutoCollect,
 	)
 	return err
 }

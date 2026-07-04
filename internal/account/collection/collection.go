@@ -204,6 +204,47 @@ func tighten(acct Account, reason Reason) Decision {
 	}
 }
 
+// --- large auto-collect disclosure --------------------------------------------
+
+// DefaultAutoCollectThresholdMicros is the platform-default size threshold above
+// which a SUCCESSFUL off-session charge is disclosed as "large" on the billing
+// page: $100.00. An account with no per-account override (NULL
+// auto_collect_threshold_micros, migration 031) uses this. FINANCE-OWNED like
+// the other collection thresholds; kept here (a risk/disclosure concept), not in
+// the pricing consts.
+//
+// This is DISCLOSURE ONLY: unlike the spend ceiling (which SKIPS a charge that
+// would breach it), the threshold changes NO charging behaviour — it only marks,
+// after the fact, that a charge which ALREADY succeeded was large, so the
+// customer isn't surprised by the auto-debit.
+const DefaultAutoCollectThresholdMicros int64 = 100_000_000 // $100.00
+
+// ResolveAutoCollectThreshold resolves the effective per-account disclosure
+// threshold: the account override when set (non-nil), else the platform default.
+// A nil override models the migration-031 NULL column ("use the default"). This
+// MUST be resolved AT CHARGE TIME so the flag reflects the threshold that applied
+// when the charge fired, not one edited afterward.
+func ResolveAutoCollectThreshold(overrideMicros *int64) int64 {
+	if overrideMicros != nil {
+		return *overrideMicros
+	}
+	return DefaultAutoCollectThresholdMicros
+}
+
+// IsLargeAutoCollect reports whether a SUCCESSFUL off-session charge of
+// chargedMicros (netted arrears + advance base, pre-cents-conversion) crosses the
+// account's disclosure threshold (override when non-nil, else the default) and so
+// must be disclosed as "large".
+//
+// The comparison is strict-greater-than (>): a charge EXACTLY EQUAL to the
+// threshold is NOT flagged. "Large" means ABOVE the threshold — a $100 threshold
+// discloses charges over $100, not a charge of exactly $100. This matches
+// ExceedsSpendCeiling's precise-dollar-cap reading (equal-to is not "above") and
+// is intentionally distinct from overCreditLimit's inclusive (>=) trust trigger.
+func IsLargeAutoCollect(chargedMicros int64, overrideMicros *int64) bool {
+	return chargedMicros > ResolveAutoCollectThreshold(overrideMicros)
+}
+
 // ExceedsSpendCeiling reports whether the netted arrears would breach the
 // account's hard per-cycle bill-shock cap. NoCeiling (HasSpendCeiling=false) →
 // never breaches. This is a HARD cap independent of the mode/credit-limit judge:

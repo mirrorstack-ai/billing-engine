@@ -470,3 +470,56 @@ func TestRunBillingCycle_PropagatesStoreErrors(t *testing.T) {
 		})
 	}
 }
+
+// --- large auto-collect disclosure flag (migration 031) -------------------
+
+func TestRunBillingCycle_LargeChargeFlagsMirror(t *testing.T) {
+	// A charge above the default $100 threshold (nil override) freezes
+	// is_large_auto_collect=true on the mirror. $150 arrears → flagged.
+	store := newFakeStore()
+	store.chargedTotal = 150_000_000 // $150 in micros, over the $100 default
+	store.hasPM = true
+	store.stripeCustomer = "cus_large"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.True(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$150 > $100 default threshold → disclosed as large")
+}
+
+func TestRunBillingCycle_SmallChargeDoesNotFlagMirror(t *testing.T) {
+	// A charge below the default threshold leaves the flag false (the historic /
+	// non-disclosed default).
+	store := newFakeStore()
+	store.chargedTotal = 50_000_000 // $50 in micros, under the $100 default
+	store.hasPM = true
+	store.stripeCustomer = "cus_small"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$50 < $100 default threshold → not disclosed")
+}
+
+func TestRunBillingCycle_PerAccountThresholdOverrideRespected(t *testing.T) {
+	// A $200 per-account override governs over the $100 default: a $150 charge is
+	// under the CUSTOM threshold and so is NOT flagged, proving the flag is
+	// resolved against the account's own threshold at charge time.
+	store := newFakeStore()
+	override := int64(200_000_000) // $200 override
+	store.collection.AutoCollectThresholdMicros = &override
+	store.chargedTotal = 150_000_000 // $150, over default but under the override
+	store.hasPM = true
+	store.stripeCustomer = "cus_override"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$150 < $200 per-account override → not disclosed despite exceeding the default")
+}
