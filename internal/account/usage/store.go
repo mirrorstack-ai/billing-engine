@@ -189,6 +189,25 @@ type Store interface {
 	// in-progress creation period not yet prorated) and the caller falls back
 	// to the live-count DISPLAY ESTIMATE.
 	AppBaseSnapshot(ctx context.Context, appID uuid.UUID, periodStart time.Time) (AppBaseSnapshotInfo, bool, error)
+
+	// AppIDsWithUsage enumerates the DISTINCT app_ids with ANY usage for the
+	// account in [periodStart, periodEnd) — the usage half of GetAccountBill's
+	// app roster. It is the enumeration projection of the same rolled-up-else-
+	// live gate AppBill reads through (an app appears iff it has FROZEN
+	// usage_aggregates rows for the period OR live usage_events in the window
+	// — the per-app gate then picks which ledger bills it), ledger-only /
+	// uninstall-safe like every bill read. Deduped; order is the store's scan
+	// order (the service re-sorts after merging the mirror half).
+	AppIDsWithUsage(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+
+	// MirroredAppIDs enumerates the account's ms_billing.apps roster rows
+	// (migration 027) whose [created_at, deleted_at) interval overlaps
+	// [periodStart, periodEnd) — the mirror half of GetAccountBill's app
+	// roster, so a just-created zero-usage app still shows its (prorated) base
+	// and an app deleted DURING the period keeps its spent base (D1e); an app
+	// deleted BEFORE the period opened is excluded (base 0, no new usage —
+	// residual ledger rows still enumerate through AppIDsWithUsage).
+	MirroredAppIDs(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -546,6 +565,51 @@ func (s *pgxStore) AppBaseSnapshot(ctx context.Context, appID uuid.UUID, periodS
 		return AppBaseSnapshotInfo{}, false, err
 	}
 	return AppBaseSnapshotInfo{BaseMicros: row.BaseMicros}, true, nil
+}
+
+// AppIDsWithUsage enumerates the account's app_ids with any usage in the
+// window (frozen aggregates for the period ∪ live events in [start, end)) —
+// see the Store interface doc. The generated query returns text app_ids
+// (sqlc's NOT NULL uuid → string override); parse at this boundary like every
+// other id decode.
+func (s *pgxStore) AppIDsWithUsage(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
+	rows, err := s.q.AppIDsWithUsage(ctx, db.AppIDsWithUsageParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseAppIDs(rows)
+}
+
+// MirroredAppIDs enumerates the account's mirror roster rows overlapping the
+// window — see the Store interface doc.
+func (s *pgxStore) MirroredAppIDs(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
+	rows, err := s.q.MirroredAppIDsOverlappingWindow(ctx, db.MirroredAppIDsOverlappingWindowParams{
+		AccountID:   accountID.String(),
+		PeriodEnd:   periodEnd,
+		PeriodStart: periodStart,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseAppIDs(rows)
+}
+
+// parseAppIDs decodes a generated query's text app_id column into uuid.UUIDs,
+// shared by the two GetAccountBill enumeration reads.
+func parseAppIDs(rows []string) ([]uuid.UUID, error) {
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r)
+		if err != nil {
+			return nil, fmt.Errorf("decode app_id %q: %w", r, err)
+		}
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 // AccountAnchorDay reads the account's activated_at and derives its anchor day.
