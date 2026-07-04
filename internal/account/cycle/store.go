@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
@@ -156,6 +157,106 @@ type Store interface {
 	// account and whether one exists — the cutover STRADDLE-CLAMP input. found=
 	// false (no period yet) means no clamp is needed. Read-only.
 	LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID) (end time.Time, found bool, err error)
+
+	// EnsureAccountForUser resolves the user's billing account, creating the
+	// row if none exists yet — the SAME per-user-advisory-lock get-or-create
+	// billing.Ensure uses (the one established account-creation path; no
+	// Stripe Customer is created here). RegisterApp needs it because the apps
+	// mirror row carries a NOT NULL account FK and app creation must never be
+	// blocked on the user having visited billing first (D1c: the platform
+	// fires RegisterApp fire-and-forget).
+	EnsureAccountForUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
+
+	// AccountActivation returns the account's activated_at anchor (migration
+	// 025) and whether it is set. activated=false → the account never bound a
+	// card and is NEVER charged (D1d — the same posture as the spine's
+	// unactivated skip); RegisterApp then records the mirror row without a
+	// proration invoice.
+	AccountActivation(ctx context.Context, accountID uuid.UUID) (activatedAt time.Time, activated bool, err error)
+
+	// InsertAppMirror registers a ms_billing.apps roster row idempotently
+	// (ON CONFLICT (app_id) DO NOTHING — a retry never rewrites the original
+	// created_at / module_count, which anchor the proration).
+	InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time) error
+
+	// AppMirror reads one roster row (deleted rows included — the caller owns
+	// deletion semantics). found=false → the app was never registered.
+	AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, bool, error)
+
+	// SetAppProrationInvoice arms the ONE-SHOT creation-proration guard: it
+	// records the Stripe invoice id, first-charge-wins (UPDATE … WHERE
+	// proration_invoice_id IS NULL). An already-armed guard is NOT an error —
+	// the write is a no-op and the original invoice id survives.
+	SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, stripeInvoiceID string) error
+
+	// SetAppModuleCount snapshots a new installed-module count. A deleted
+	// app's count is frozen (the UPDATE's WHERE deleted_at IS NULL no-ops —
+	// D1e: no future base, so no tier to move).
+	SetAppModuleCount(ctx context.Context, appID uuid.UUID, moduleCount int) error
+
+	// MarkAppDeleted soft-deletes the roster row out of future advance base
+	// fees. Idempotent — the first deletion instant is kept.
+	MarkAppDeleted(ctx context.Context, appID uuid.UUID) error
+
+	// LiveAppsCreatedBefore returns every LIVE (deleted_at IS NULL) app on the
+	// account created STRICTLY BEFORE createdBefore, with its module_count —
+	// the boundary charge's advance-base input. createdBefore is the NEW
+	// period's start (the closed window's period_end): an app created inside
+	// the new period is EXCLUDED because RegisterApp's creation-proration leg
+	// already owns that period's base (full or prorated) — it joins the
+	// advance leg at the NEXT boundary. Empty for a pre-backfill account →
+	// advance base 0 (pre-027 behavior).
+	LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error)
+
+	// UpsertProrationBaseSnapshot persists the creation-proration leg's
+	// per-app-period base snapshot (migration 028, source='proration'), keyed
+	// (app_id, period_start). Idempotent — a retry overwrites with identical
+	// values — and on a key collision with an 'advance' row the proration row
+	// WINS (the more specific charge for a creation period).
+	UpsertProrationBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error
+
+	// InsertAdvanceBaseSnapshot persists the boundary advance leg's
+	// per-app-period base snapshot (migration 028, source='advance') with
+	// ON CONFLICT (app_id, period_start) DO NOTHING — an existing row (a
+	// proration snapshot, or a prior reclaimed attempt's own row) wins, so a
+	// re-run never rewrites what was already recorded as billed.
+	InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error
+}
+
+// AppModuleCount pairs one live roster app with its module_count snapshot —
+// one advance-base input row. The boundary leg needs the app id (not just the
+// count) to write the per-app-period base snapshot it bills (migration 028).
+type AppModuleCount struct {
+	AppID       uuid.UUID
+	ModuleCount int
+}
+
+// AppBaseSnapshot is the in-memory form of a ms_billing.app_base_snapshots
+// row (migration 028): what one charge leg actually billed one app for one
+// period. PeriodStart/PeriodEnd are the FULL anchored window — period_start
+// is the display lookup key — and for a proration snapshot BaseMicros is the
+// PRORATED partial-window amount actually invoiced. GetAppBill prefers these
+// rows over the live-count math so a later SyncAppModules can never drift the
+// displayed base away from what was invoiced.
+type AppBaseSnapshot struct {
+	AppID       uuid.UUID
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	ModuleCount int
+	BaseMicros  int64
+}
+
+// AppMirror is the in-memory form of a ms_billing.apps roster row (migration
+// 027). ProrationInvoiceID is "" while the one-shot creation-proration guard
+// is unarmed; DeletedAt is meaningful only when Deleted is true.
+type AppMirror struct {
+	AppID              uuid.UUID
+	AccountID          uuid.UUID
+	ModuleCount        int
+	CreatedAt          time.Time
+	ProrationInvoiceID string
+	Deleted            bool
+	DeletedAt          time.Time
 }
 
 // AccountAnchor pairs an account with its billing-period anchor instant (the
@@ -661,6 +762,159 @@ func (s *pgxStore) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUI
 		return time.Time{}, false, err
 	}
 	return end, true, nil
+}
+
+func (s *pgxStore) EnsureAccountForUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	var id string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		// billing.EnsureAccount and this get-or-create insert the SAME
+		// accounts row, so both serialize on the single exported
+		// (namespace, key) pair — the accounts table has no owner UNIQUE
+		// constraint; the advisory lock IS the uniqueness guard.
+		if err := qtx.AcquireBillingAccountUserLock(ctx, db.AcquireBillingAccountUserLockParams{
+			Column1: billing.AdvisoryLockNamespaceBillingAccountUser,
+			Column2: userID.String(),
+		}); err != nil {
+			return err
+		}
+		existing, err := qtx.SelectAccountByUser(ctx, pgtype.UUID{Bytes: userID, Valid: true})
+		if err == nil {
+			id = existing.ID
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		inserted, err := qtx.InsertUserAccount(ctx, pgtype.UUID{Bytes: userID, Valid: true})
+		if err != nil {
+			return err
+		}
+		id = inserted.ID
+		return nil
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return uuid.Parse(id)
+}
+
+func (s *pgxStore) AccountActivation(ctx context.Context, accountID uuid.UUID) (time.Time, bool, error) {
+	at, err := s.q.AccountActivatedAt(ctx, accountID.String())
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !at.Valid {
+		return time.Time{}, false, nil // never bound a card → never charged (D1d)
+	}
+	return at.Time, true, nil
+}
+
+func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time) error {
+	// RowsAffected 0 = a retry hit ON CONFLICT DO NOTHING — success either way.
+	_, err := s.q.InsertAppMirror(ctx, db.InsertAppMirrorParams{
+		AppID:       appID.String(),
+		AccountID:   accountID.String(),
+		ModuleCount: int32(moduleCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
+		CreatedAt:   createdAt,
+	})
+	return err
+}
+
+func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, bool, error) {
+	row, err := s.q.SelectAppMirror(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AppMirror{}, false, nil
+	}
+	if err != nil {
+		return AppMirror{}, false, err
+	}
+	app, err := uuid.Parse(row.AppID)
+	if err != nil {
+		return AppMirror{}, false, err
+	}
+	acct, err := uuid.Parse(row.AccountID)
+	if err != nil {
+		return AppMirror{}, false, err
+	}
+	return AppMirror{
+		AppID:              app,
+		AccountID:          acct,
+		ModuleCount:        int(row.ModuleCount),
+		CreatedAt:          row.CreatedAt,
+		ProrationInvoiceID: row.ProrationInvoiceID.String, // "" when NULL (guard unarmed)
+		Deleted:            row.DeletedAt.Valid,
+		DeletedAt:          row.DeletedAt.Time,
+	}, true, nil
+}
+
+func (s *pgxStore) SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, stripeInvoiceID string) error {
+	// 0 rows = the guard was already armed (first-charge-wins) — not an error:
+	// the deterministic Stripe idem keys guarantee the concurrent charger
+	// created the SAME invoice, so the surviving id is the right one.
+	_, err := s.q.SetAppProrationInvoice(ctx, db.SetAppProrationInvoiceParams{
+		AppID:              appID.String(),
+		ProrationInvoiceID: pgtype.Text{String: stripeInvoiceID, Valid: true},
+	})
+	return err
+}
+
+func (s *pgxStore) SetAppModuleCount(ctx context.Context, appID uuid.UUID, moduleCount int) error {
+	// 0 rows = the app is deleted (count frozen, D1e); existence was already
+	// checked by the service via AppMirror, so this is a legitimate no-op.
+	_, err := s.q.SetAppModuleCount(ctx, db.SetAppModuleCountParams{
+		AppID:       appID.String(),
+		ModuleCount: int32(moduleCount), //nolint:gosec // SyncAppModules validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
+	})
+	return err
+}
+
+func (s *pgxStore) MarkAppDeleted(ctx context.Context, appID uuid.UUID) error {
+	// 0 rows = already deleted — idempotent, the first deletion instant stays.
+	_, err := s.q.MarkAppDeleted(ctx, appID.String())
+	return err
+}
+
+func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error) {
+	rows, err := s.q.LiveAppModuleCountsCreatedBefore(ctx, db.LiveAppModuleCountsCreatedBeforeParams{
+		AccountID: accountID.String(),
+		CreatedAt: createdBefore,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppModuleCount, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount)})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) UpsertProrationBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error {
+	return s.q.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+		AppID:       snap.AppID.String(),
+		PeriodStart: snap.PeriodStart,
+		PeriodEnd:   snap.PeriodEnd,
+		ModuleCount: int32(snap.ModuleCount), //nolint:gosec // count comes from the apps row, whose writers (RegisterApp/SyncAppModules) validate 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
+		BaseMicros:  snap.BaseMicros,
+	})
+}
+
+func (s *pgxStore) InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error {
+	// 0 rows = ON CONFLICT DO NOTHING kept an existing row (a proration
+	// snapshot, or a prior reclaimed attempt's write) — success either way.
+	_, err := s.q.InsertAdvanceBaseSnapshot(ctx, db.InsertAdvanceBaseSnapshotParams{
+		AppID:       snap.AppID.String(),
+		PeriodStart: snap.PeriodStart,
+		PeriodEnd:   snap.PeriodEnd,
+		ModuleCount: int32(snap.ModuleCount), //nolint:gosec // count comes from the apps row, whose writers (RegisterApp/SyncAppModules) validate 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
+		BaseMicros:  snap.BaseMicros,
+	})
+	return err
 }
 
 // parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc

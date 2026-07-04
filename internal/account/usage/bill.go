@@ -34,7 +34,7 @@ const (
 	// BaseFeeMicros is 基本費用 — the fixed per-app/period platform base fee on the
 	// DEFAULT plan. It BUNDLES the PaaS infra credit (surfaced as PaasCreditMicros)
 	// and INCLUDES up to IncludedModules installed modules; each installed module
-	// beyond that adds ExtraModuleMicros. Tunable. Default $20.
+	// beyond that adds ModuleOverageFeeMicros. Tunable. Default $20.
 	BaseFeeMicros int64 = 20_000_000 // $20.00
 
 	// ProBaseFeeMicros is the base fee on the Pro org plan. TODO(plan): wire a real
@@ -44,12 +44,16 @@ const (
 	ProBaseFeeMicros int64 = 50_000_000 // $50.00 (placeholder)
 
 	// IncludedModules is how many installed modules the base fee bundles before the
-	// per-module surcharge kicks in. Tunable ("may change").
+	// per-module surcharge kicks in. Owner spec 2026-07-05 (base-fee v1, DESIGN.md
+	// D1): 5 included. Tunable ("may change"); becomes plan-resolved later.
 	IncludedModules = 5
 
-	// ExtraModuleMicros is the surcharge added to the base fee for EACH installed
-	// module beyond IncludedModules. Tunable. Default $3/module.
-	ExtraModuleMicros int64 = 3_000_000 // $3.00
+	// ModuleOverageFeeMicros is the surcharge added to the base fee for EACH
+	// installed module beyond IncludedModules. Owner spec 2026-07-05 (base-fee v1):
+	// $3.00/module/period. Tunable; becomes plan-resolved later. App base for a
+	// period = BaseFee + Overage × max(0, module_count − IncludedModules) — see
+	// AppBaseFeeMicros, the ONE place that formula lives.
+	ModuleOverageFeeMicros int64 = 3_000_000 // $3.00
 
 	// PaasCreditPct is PaaS 額度 — the percentage of the 基礎設施 InfraTotal credited
 	// back (offsetting infra) as a SaaS-subscription benefit. Tunable. Default 30%.
@@ -123,10 +127,17 @@ func pctMicros(base int64, pct int) (int64, error) {
 //     from the CATALOG (AppInfraBill) so every declared infra metric renders,
 //     including the $0 / unused ones — InfraTotalMicros = Σ InfraLines[].charged
 //     (the 1.2× infra markup applied once, in SQL),
-//  4. computes 基本費用 base fee = resolveBaseFeeMicros(plan) + ExtraModuleMicros ×
-//     max(0, installedModuleCount − IncludedModules), where installedModuleCount
-//     is the DISTINCT non-reserved module_id count with usage this period (see the
-//     proxy note below),
+//  4. computes 基本費用 base fee SNAPSHOT-FIRST: a charged period reads the
+//     frozen per-app-period snapshot the charge leg wrote at billing time
+//     (ms_billing.app_base_snapshots, migration 028 — exact period_start
+//     match), so the displayed base IS what the invoice charged even after
+//     later SyncAppModules count changes. Only an un-snapshotted period
+//     (pre-feature history, unactivated account, in-progress period) falls
+//     back to the live ESTIMATE from the mirror (migration 027):
+//     AppBaseFeeMicros(resolveBaseFeeMicros(plan), module_count), PRORATED via
+//     ProratedBaseMicros when the app's created_at falls inside the period.
+//     An app ABSENT from the mirror (pre-backfill) falls back to the usage-proxy
+//     count below — today's behavior, until the api-platform backfill lands,
 //  5. computes PaaS 額度 credit = PaasCreditPct% of the infra total, but ONLY when
 //     an active SaaS subscription earns it — v1 has no subscription system, so the
 //     credit is subscription-gated OFF and is 0 (the wire field stays for back-compat),
@@ -138,13 +149,12 @@ func pctMicros(base int64, pct int) (int64, error) {
 // module catalog (module_versions), never from module_install; this bill carries
 // module_id.
 //
-// INSTALLED-MODULE-COUNT PROXY (TODO): billing-engine cannot see api-platform's
-// ms_applications.module_install (and MUST NOT join it — it drops on uninstall),
-// so the base-fee tier uses the count of DISTINCT modules with metered usage this
-// period as a documented proxy for "installed modules". TODO: source the true
-// installed count from api-platform (e.g. a synced count on the RPC) so an
-// installed-but-idle module still counts and an uninstalled-but-used one is
-// handled per policy.
+// INSTALLED-MODULE-COUNT: the authoritative count is the ms_billing.apps mirror's
+// module_count (synced by api-platform via SyncAppModules — an installed-but-idle
+// module counts, an uninstalled one stops counting at the next sync). Apps not
+// yet mirrored (pre-backfill) keep the pre-027 documented PROXY: the count of
+// DISTINCT modules with metered usage this period; the api-platform backfill PR
+// retires that path.
 func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAppBillResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -279,9 +289,49 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		infraTotal += l.ChargedMicros
 	}
 
-	baseFee := resolveBaseFeeMicros(plan)
-	if extra := len(installedModules) - IncludedModules; extra > 0 {
-		baseFee += ExtraModuleMicros * int64(extra)
+	// 基本費用: the per-app-period SNAPSHOT (ms_billing.app_base_snapshots,
+	// migration 028) is authoritative whenever this period's base was actually
+	// charged — it freezes the exact amount the charge leg invoiced (advance
+	// full base, or the creation-period proration), so a later SyncAppModules
+	// count change can never drift the displayed base away from the invoice
+	// (the spec's "never disagree"). Only when NO snapshot exists — pre-feature
+	// periods, unactivated accounts (never charged), or an in-progress period
+	// whose boundary hasn't billed yet — does the display fall back to the
+	// live-count math below, which is then a DISPLAY-ONLY ESTIMATE computed
+	// from the mirror's CURRENT module_count (or, with no mirror row at all,
+	// the pre-027 flat fee + usage-proxy overage — see the
+	// INSTALLED-MODULE-COUNT note above).
+	var baseFee int64
+	snap, snapped, err := s.store.AppBaseSnapshot(ctx, req.AppID, periodStart)
+	if err != nil {
+		return nil, billing.Internal("app base snapshot lookup failed", err)
+	}
+	if snapped {
+		// This period's base was charged: display EXACTLY what was invoiced.
+		// The snapshot alone decides — the mirror is only read on the
+		// un-snapshotted estimate paths below.
+		baseFee = snap.BaseMicros
+	} else {
+		mirror, mirrored, err := s.store.AppMirror(ctx, req.AppID)
+		if err != nil {
+			return nil, billing.Internal("app mirror lookup failed", err)
+		}
+		switch {
+		case mirrored && mirror.Deleted && !mirror.DeletedAt.After(periodStart):
+			// Deleted BEFORE this period opened → no base was (or will be) charged
+			// for it (D1e: deletion stops FUTURE base fees). A deletion DURING the
+			// period leaves that period's base spent, so it falls through below.
+			baseFee = 0
+		case mirrored:
+			// No snapshot → estimate from the mirror's current count, the SAME
+			// AppBaseFeeMicros + ProratedBaseMicros math the charge legs bill.
+			baseFee = ProratedBaseMicros(
+				AppBaseFeeMicros(resolveBaseFeeMicros(plan), mirror.ModuleCount),
+				mirror.CreatedAt, periodStart, periodEnd,
+			)
+		default:
+			baseFee = AppBaseFeeMicros(resolveBaseFeeMicros(plan), len(installedModules))
+		}
 	}
 
 	// TODO(subscription): resolve whether this account has an ACTIVE SaaS
