@@ -160,6 +160,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.GetAppBill(ctx, req)
 
+	case "GetAccountBill":
+		var req usage.GetAccountBillRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.GetAccountBill(ctx, req)
+
 	case "GetBillingPeriods":
 		var req usage.GetBillingPeriodsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -366,6 +373,12 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// read-only over the SAME usage/aggregate/period data, so they share the
 		// control-plane credential + route group.
 		r.Post("/v1/billing.GetAppBill", makeHTTPHandler(d, "GetAppBill"))
+		// Full ACCOUNT-owner bill (account-billing-read wire 1): the per-app
+		// GetAppBill math aggregated across the account's apps for one period,
+		// plus the v1 plan stub — the read behind web-account /me/billing's
+		// summary + subscription card. Read-only over the SAME usage/aggregate/
+		// period/mirror data, so it shares the control-plane credential + group.
+		r.Post("/v1/billing.GetAccountBill", makeHTTPHandler(d, "GetAccountBill"))
 		r.Post("/v1/billing.GetBillingPeriods", makeHTTPHandler(d, "GetBillingPeriods"))
 		// Account invoice HISTORY (this PR): the customer's mirrored Stripe
 		// invoices for the web-account billing page — a keyset-paged, read-only

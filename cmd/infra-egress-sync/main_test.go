@@ -122,6 +122,12 @@ func (f *fakeStore) AppMirror(_ context.Context, _ uuid.UUID) (usage.AppMirrorIn
 func (f *fakeStore) AppBaseSnapshot(_ context.Context, _ uuid.UUID, _ time.Time) (usage.AppBaseSnapshotInfo, bool, error) {
 	return usage.AppBaseSnapshotInfo{}, false, nil
 }
+func (f *fakeStore) AppIDsWithUsage(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (f *fakeStore) MirroredAppIDs(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]uuid.UUID, error) {
+	return nil, nil
+}
 
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 

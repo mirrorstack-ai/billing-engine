@@ -446,6 +446,123 @@ type GetAppBillResponse struct {
 	TotalMicros int64 `json:"total_micros"`
 }
 
+// GetAccountBillRequest is the payload of GetAccountBill: the account OWNER
+// principal (the payer — exactly one of OwnerUserID / OwnerOrgID) plus an
+// OPTIONAL period reference. This is the read behind web-account /me/billing's
+// bill summary + subscription card (DESIGN.md account-billing-read, wire 1).
+type GetAccountBillRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	// PeriodID selects a PAST billing period (a real billing_periods row id from
+	// GetBillingPeriods). "" or omitted = the account's CURRENT anchored window
+	// (the in-progress period, estimated live). Unlike GetAppBillRequest.PeriodID
+	// (a uuid that must be omitted for "current") this is a STRING, because the
+	// account proxy forwards the selector value verbatim and the current entry's
+	// period_id IS "" on the wire (BillingPeriodRef). A non-empty value must be a
+	// billing_periods id belonging to this account — unknown / other-account ids
+	// are NOT_FOUND, a malformed (non-uuid) value is INVALID_INPUT.
+	PeriodID string `json:"period_id,omitempty"`
+}
+
+// AccountPlan is the plan stub GetAccountBill serves — billing-engine's consts
+// (PlanStub*) are the SINGLE SOURCE OF TRUTH for the account plan card,
+// replacing api-platform's hardcode (internal/account/service/billing.go
+// GetBillingSummary's "Hobby"/$0/"active"), which retires once the /bill proxy
+// lands. v1 has NO subscriptions table (DESIGN.md D3): every account is on the
+// $0 default tier, so this rides on the bill read instead of a standalone
+// subscription endpoint / CRUD. When paid plans land these fields swap to a
+// real subscription read; the wire shape here is the stable contract.
+type AccountPlan struct {
+	// Name is the human plan label (PlanStubName, "Hobby").
+	Name string `json:"name"`
+	// Status follows the subscription vocabulary; always "active" in v1.
+	Status string `json:"status"`
+	// PriceMicros is the recurring plan price in integer micro-USD ($0 in v1 —
+	// the per-APP base fees are billed separately, see BaseFeeTotalMicros).
+	PriceMicros int64 `json:"price_micros"`
+	// Currency is the ISO code every *_micros amount is denominated in ("usd").
+	Currency string `json:"currency"`
+	// RenewsAt is when the plan (notionally) renews: the resolved period's end —
+	// the next anchored boundary for the current window, the historical close
+	// for a frozen one.
+	RenewsAt time.Time `json:"renews_at"`
+}
+
+// AccountAppBill is one app's roster row on the account bill: the PRE-CREDIT
+// per-app rollup of the SAME per-app pricing path GetAppBill serves (base fee +
+// module usage + infra), collapsed to totals.
+//
+// NO app_name: billing-engine has no app names — the ms_billing.apps mirror
+// stores only existence / module_count / lifecycle (migration 027), never
+// display metadata. The web layer enriches these rows from its own app list by
+// app_id (the same caller-resolves-display-names contract as module_id on the
+// usage lines).
+type AccountAppBill struct {
+	AppID uuid.UUID `json:"app_id"`
+	// BaseFeeMicros is this app's 基本費用 for the period, resolved SNAPSHOT-
+	// FIRST exactly like GetAppBill (charged periods show what was invoiced;
+	// un-charged ones the live mirror estimate, prorated for a creation period).
+	BaseFeeMicros int64 `json:"base_fee_micros"`
+	// ModuleUsageMicros is Σ of the app's non-reserved 模組使用量 line charges.
+	ModuleUsageMicros int64 `json:"module_usage_micros"`
+	// InfraMicros is the app's 基礎設施 total (residual + per-module attributed,
+	// the 1.2× infra markup applied once, in SQL).
+	InfraMicros int64 `json:"infra_micros"`
+	// TotalMicros = BaseFee + ModuleUsage + Infra for THIS app, PRE-CREDIT: the
+	// account-level PaaS credit (GetAccountBillResponse.PaasCreditMicros) is
+	// applied once across the account, never allocated back per-app, so
+	// Σ apps[].total_micros == the response's total_micros + paas_credit_micros.
+	TotalMicros int64 `json:"total_micros"`
+}
+
+// GetAccountBillResponse is the account-owner's FULL bill for ONE period — the
+// account-level aggregate of the per-app GetAppBill math (ONE pricing path,
+// summed — never a second one):
+//
+//	TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal − PaasCredit
+//
+// Every amount is integer micro-USD. Apps enumerates the UNION of (a) apps
+// with usage in the window (the same rolled-up-else-live gate the per-app bill
+// reads through) and (b) ms_billing.apps mirror rows overlapping the window —
+// so a just-created zero-usage app still shows its base and a pre-mirror app
+// with usage still appears — deduped and sorted by app_id (bytewise) for a
+// stable response. A lazy account (no billing account row) gets a ZERO bill on
+// the synthetic current calendar-month window with empty Apps — never an error.
+type GetAccountBillResponse struct {
+	// PeriodID echoes the resolved period id — "" for the current live window,
+	// the real billing_periods id for a frozen one.
+	PeriodID string `json:"period_id"`
+	// PeriodStart / PeriodEnd bound the billed window, half-open [start, end).
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+
+	// Plan is the v1 plan stub (see AccountPlan — billing-engine consts, the
+	// single source of truth replacing api-platform's hardcode).
+	Plan AccountPlan `json:"plan"`
+
+	// Apps is the per-app pre-credit rollup, one row per enumerated app, sorted
+	// by app_id. Empty slice (never nil) for a lazy or app-less account. NO
+	// app_name here — see AccountAppBill.
+	Apps []AccountAppBill `json:"apps"`
+
+	// BaseFeeTotalMicros / ModuleUsageTotalMicros / InfraTotalMicros are the
+	// account-wide sums of the corresponding Apps[] columns.
+	BaseFeeTotalMicros     int64 `json:"base_fee_total_micros"`
+	ModuleUsageTotalMicros int64 `json:"module_usage_total_micros"`
+	InfraTotalMicros       int64 `json:"infra_total_micros"`
+
+	// PaasCreditMicros is the ACCOUNT-level PaaS credit, applied ONCE here
+	// (never per-app): the same ACTIVE-SaaS-subscription gate as GetAppBill's
+	// per-app credit (v1 has no subscription system → always 0), CAPPED at
+	// ModuleUsageTotal + InfraTotal so a credit can never eat the base fees —
+	// the same usage-only offset posture as the charge spine's allowance.
+	PaasCreditMicros int64 `json:"paas_credit_micros"`
+
+	// TotalMicros is 最終費用 = BaseFeeTotal + ModuleUsageTotal + InfraTotal −
+	// PaasCredit, ≥ 0 by the credit cap.
+	TotalMicros int64 `json:"total_micros"`
+}
+
 // GetBillingPeriodsRequest is the payload of GetBillingPeriods: the owner
 // principal whose billing cycles are listed for the web 週期 (period) selector.
 type GetBillingPeriodsRequest struct {
