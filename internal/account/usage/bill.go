@@ -117,9 +117,12 @@ func pctMicros(base int64, pct int) (int64, error) {
 //  2. resolves the period window: the current calendar month (default, live from
 //     usage_events) or a past billing_periods row when PeriodID is set (frozen
 //     usage_aggregates),
-//  3. reads every usage line (AppBill) and PARTITIONS by metric name:
-//     non-reserved → 模組使用量 module usage (declared price, NO markup); reserved
-//     infra.* / platform.* → 基礎設施 infrastructure total (the 1.2× infra plane),
+//  3. reads the module-usage lines (AppBill), keeping ONLY the non-reserved ones
+//     → 模組使用量 module usage (declared price, NO markup); the reserved infra.* /
+//     platform.* lines are dropped here and 基礎設施 is instead sourced per-metric
+//     from the CATALOG (AppInfraBill) so every declared infra metric renders,
+//     including the $0 / unused ones — InfraTotalMicros = Σ InfraLines[].charged
+//     (the 1.2× infra markup applied once, in SQL),
 //  4. computes 基本費用 base fee = resolveBaseFeeMicros(plan) + ExtraModuleMicros ×
 //     max(0, installedModuleCount − IncludedModules), where installedModuleCount
 //     is the DISTINCT non-reserved module_id count with usage this period (see the
@@ -207,15 +210,19 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		}
 	}
 
-	// Partition: non-reserved → module usage (displayed lines); reserved infra.* /
-	// platform.* → the infra total. Count DISTINCT non-reserved modules as the
-	// installed-module proxy for the base-fee tier.
+	// Keep only the non-reserved rows → module usage (displayed lines); the
+	// reserved infra.* / platform.* rows are dropped here (infra is sourced
+	// per-metric from the catalog below). Count DISTINCT non-reserved modules as
+	// the installed-module proxy for the base-fee tier.
 	moduleUsage := make([]AppMetricUsage, 0, len(lines))
 	installedModules := make(map[uuid.UUID]struct{})
-	var moduleUsageTotal, infraTotal int64
+	var moduleUsageTotal int64
 	for _, r := range lines {
 		if isReservedMetric(r.Metric) {
-			infraTotal += r.ChargedMicros
+			// Reserved infra.* / platform.* lines are sourced AUTHORITATIVELY from
+			// the catalog-anchored AppInfraBill query below (so every declared infra
+			// metric renders as its own line, including the $0 / unused ones).
+			// Summing them here too would DOUBLE-COUNT, so skip them on this scan.
 			continue
 		}
 		moduleUsage = append(moduleUsage, AppMetricUsage{
@@ -230,6 +237,24 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		})
 		moduleUsageTotal += r.ChargedMicros
 		installedModules[r.ModuleID] = struct{}{}
+	}
+
+	// 基礎設施: source infra per-metric from the CATALOG (metric_definitions), NOT
+	// the usage ledger — so EVERY active declared infra metric renders as its own
+	// line, including declared-but-unused ones at qty 0 · $0 ("show all"). Run
+	// UNCONDITIONALLY (even with no billing account, accountID == uuid.Nil): the
+	// usage side then matches nothing and every declared metric COALESCEs to $0,
+	// so a lazy/no-account app still shows all 16 infra lines. Each line's
+	// ChargedMicros already carries the ×1.2 infra markup (applied once in SQL);
+	// InfraTotalMicros is their sum, keeping the back-compat scalar exactly
+	// reconcilable (infra_total == Σ infra_lines[].charged).
+	infraLines, err := s.store.AppInfraBill(ctx, accountID, req.AppID, periodStart, periodEnd)
+	if err != nil {
+		return nil, billing.Internal("app infra bill query failed", err)
+	}
+	var infraTotal int64
+	for _, l := range infraLines {
+		infraTotal += l.ChargedMicros
 	}
 
 	baseFee := resolveBaseFeeMicros(plan)
@@ -258,6 +283,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		ModuleUsage:            moduleUsage,
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,
+		InfraLines:             infraLines,
 		PaasCreditMicros:       paasCredit,
 		TotalMicros:            total,
 	}, nil

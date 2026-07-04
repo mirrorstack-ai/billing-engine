@@ -109,6 +109,17 @@ type Store interface {
 	// only the usage_aggregates / usage_events ledgers, NEVER an install table).
 	AppBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppMetricUsageRaw, error)
 
+	// AppInfraBill returns the per-metric 基礎設施 (infrastructure) breakdown for
+	// the app-owner bill — one AppInfraUsage per ACTIVE declared infra metric (the
+	// platform-infra sentinel catalog rows), including declared-but-unused ones at
+	// qty 0 · $0, because the read is CATALOG-anchored (FROM metric_definitions
+	// LEFT JOIN the rolled-else-live infra usage). ChargedMicros already carries the
+	// ×1.2 infra markup applied ONCE in SQL; UnitPriceMicros is the raw catalog COGS.
+	// accountID may be uuid.Nil for a lazy (account-less) app — every declared
+	// metric then resolves to $0 rather than dropping out. Ledger-only /
+	// uninstall-safe exactly like AppBill.
+	AppInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppInfraUsage, error)
+
 	// ListBillingPeriods returns an account's real billing_periods rows
 	// newest-first (the closed periods behind the web 週期 selector).
 	// currentMonthStart is the current anchored-period start
@@ -532,6 +543,46 @@ func (s *pgxStore) AppBill(ctx context.Context, accountID, appID uuid.UUID, peri
 			return nil, err
 		}
 		out = append(out, line)
+	}
+	return out, nil
+}
+
+// AppInfraBill reads the per-metric infrastructure breakdown for ONE app+period,
+// catalog-anchored per the AppInfraBillLines query — one row per active declared
+// infra metric (the platform-infra sentinel catalog), including declared-but-unused
+// metrics at qty 0 · $0. ChargedMicros is decoded half-up through the shared micros
+// decoder (the single per-metric rounding point on the live SUM(value × unit_price)
+// × 12/10 branch; a no-op on the already-integer rolled branch). UnitPriceMicros is
+// the raw catalog COGS (pre-markup) read straight from metric_definitions.
+func (s *pgxStore) AppInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppInfraUsage, error) {
+	rows, err := s.q.AppInfraBillLines(ctx, db.AppInfraBillLinesParams{
+		AccountID:   accountID.String(),
+		AppID:       appID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppInfraUsage, 0, len(rows))
+	for _, r := range rows {
+		qty, err := floatFromNumeric(r.BillableQuantity)
+		if err != nil {
+			return nil, fmt.Errorf("decode billable_quantity for infra metric %q: %w", r.Metric, err)
+		}
+		charged, err := microsFromNumeric(r.ChargedMicros)
+		if err != nil {
+			return nil, fmt.Errorf("decode charged_micros for infra metric %q: %w", r.Metric, err)
+		}
+		out = append(out, AppInfraUsage{
+			Metric:           r.Metric,
+			Kind:             Kind(r.Kind),
+			Unit:             r.Unit,
+			Group:            string(r.DisplayGroup),
+			UnitPriceMicros:  r.UnitPriceMicros,
+			BillableQuantity: qty,
+			ChargedMicros:    charged,
+		})
 	}
 	return out, nil
 }

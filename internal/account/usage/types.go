@@ -278,6 +278,27 @@ type AppMetricUsage struct {
 	ChargedMicros int64 `json:"charged_micros"`
 }
 
+// AppInfraUsage is one declared infra metric's app-level line. Present for
+// EVERY active sentinel metric_definitions row (0 quantity / 0 charged when
+// unused), so the app-bill "顯示全部 / show all" can list every declared infra
+// metric — including the $0 / not-recording ones — in the app-level 基礎設施
+// section. Infra stays APP-level (attributed to the platform-infra sentinel
+// module_id, never a real module).
+//
+// UnitPriceMicros is the RAW catalog COGS (pre-markup); ChargedMicros already
+// includes the ×1.2 infra markup (qty × price × 12/10), applied exactly ONCE
+// server-side in SQL — the wire's shown unit_price × quantity therefore does NOT
+// equal charged_micros by design (the 1.2× lives only in charged_micros).
+type AppInfraUsage struct {
+	Metric           string  `json:"metric"`
+	Kind             Kind    `json:"kind"`
+	Unit             string  `json:"unit"`
+	Group            string  `json:"group"`             // display_group
+	UnitPriceMicros  int64   `json:"unit_price_micros"` // raw COGS (pre-markup)
+	BillableQuantity float64 `json:"billable_quantity"`
+	ChargedMicros    int64   `json:"charged_micros"` // qty × price × 12/10
+}
+
 // GetAppUsageSummaryResponse is the app-owner bill for ONE app in the current
 // period. PeriodStart / PeriodEnd bound the live window (zero when no billing
 // account exists yet). Metrics is an empty slice (not nil) — never an error —
@@ -344,8 +365,18 @@ type GetAppBillResponse struct {
 
 	// InfraTotalMicros is 基礎設施 — the platform-infra plane charge (reserved
 	// infra.* / platform.* metrics priced at the 1.2× infra markup) for this
-	// app/period, surfaced as its own single line (never per-metric here).
+	// app/period. It is Σ of InfraLines[].ChargedMicros; the per-metric
+	// breakdown is InfraLines (kept as this scalar for back-compat).
 	InfraTotalMicros int64 `json:"infra_total_micros"`
+
+	// InfraLines is the per-metric 基礎設施 breakdown: one line for EVERY active
+	// declared infra metric (the platform-infra sentinel catalog rows), including
+	// the ones with zero usage this period (0 quantity / $0), so "show all" can
+	// list every declared infra metric. UnitPriceMicros is raw catalog COGS
+	// (pre-markup); ChargedMicros already includes the ×1.2 infra markup (applied
+	// once, server-side). By construction Σ InfraLines[].ChargedMicros ==
+	// InfraTotalMicros. Empty slice (never nil).
+	InfraLines []AppInfraUsage `json:"infra_lines"`
 
 	// PaasCreditMicros is PaaS 額度 — the infra credit EARNED ONLY through an active
 	// SaaS subscription (PaasCreditPct% of InfraTotalMicros). A NON-NEGATIVE

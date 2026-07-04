@@ -97,6 +97,9 @@ func (f *fakeStore) AppUsage(_ context.Context, _, _ uuid.UUID, _, _ time.Time) 
 func (f *fakeStore) AppBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time) ([]usage.AppMetricUsageRaw, error) {
 	return nil, nil
 }
+func (f *fakeStore) AppInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time) ([]usage.AppInfraUsage, error) {
+	return nil, nil
+}
 func (f *fakeStore) ListBillingPeriods(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.BillingPeriodRaw, error) {
 	return nil, nil
 }
