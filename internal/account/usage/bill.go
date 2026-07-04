@@ -34,7 +34,7 @@ const (
 	// BaseFeeMicros is 基本費用 — the fixed per-app/period platform base fee on the
 	// DEFAULT plan. It BUNDLES the PaaS infra credit (surfaced as PaasCreditMicros)
 	// and INCLUDES up to IncludedModules installed modules; each installed module
-	// beyond that adds ExtraModuleMicros. Tunable. Default $20.
+	// beyond that adds ModuleOverageFeeMicros. Tunable. Default $20.
 	BaseFeeMicros int64 = 20_000_000 // $20.00
 
 	// ProBaseFeeMicros is the base fee on the Pro org plan. TODO(plan): wire a real
@@ -44,12 +44,16 @@ const (
 	ProBaseFeeMicros int64 = 50_000_000 // $50.00 (placeholder)
 
 	// IncludedModules is how many installed modules the base fee bundles before the
-	// per-module surcharge kicks in. Tunable ("may change").
+	// per-module surcharge kicks in. Owner spec 2026-07-05 (base-fee v1, DESIGN.md
+	// D1): 5 included. Tunable ("may change"); becomes plan-resolved later.
 	IncludedModules = 5
 
-	// ExtraModuleMicros is the surcharge added to the base fee for EACH installed
-	// module beyond IncludedModules. Tunable. Default $3/module.
-	ExtraModuleMicros int64 = 3_000_000 // $3.00
+	// ModuleOverageFeeMicros is the surcharge added to the base fee for EACH
+	// installed module beyond IncludedModules. Owner spec 2026-07-05 (base-fee v1):
+	// $3.00/module/period. Tunable; becomes plan-resolved later. App base for a
+	// period = BaseFee + Overage × max(0, module_count − IncludedModules) — see
+	// AppBaseFeeMicros, the ONE place that formula lives.
+	ModuleOverageFeeMicros int64 = 3_000_000 // $3.00
 
 	// PaasCreditPct is PaaS 額度 — the percentage of the 基礎設施 InfraTotal credited
 	// back (offsetting infra) as a SaaS-subscription benefit. Tunable. Default 30%.
@@ -123,10 +127,13 @@ func pctMicros(base int64, pct int) (int64, error) {
 //     from the CATALOG (AppInfraBill) so every declared infra metric renders,
 //     including the $0 / unused ones — InfraTotalMicros = Σ InfraLines[].charged
 //     (the 1.2× infra markup applied once, in SQL),
-//  4. computes 基本費用 base fee = resolveBaseFeeMicros(plan) + ExtraModuleMicros ×
-//     max(0, installedModuleCount − IncludedModules), where installedModuleCount
-//     is the DISTINCT non-reserved module_id count with usage this period (see the
-//     proxy note below),
+//  4. computes 基本費用 base fee from the ms_billing.apps mirror (migration 027)
+//     when the app has a roster row: AppBaseFeeMicros(resolveBaseFeeMicros(plan),
+//     module_count), PRORATED via ProratedBaseMicros when the app's created_at
+//     falls inside the period — exactly what the charge legs (creation proration
+//     + boundary advance) bill, so display and invoice agree by construction.
+//     An app ABSENT from the mirror (pre-backfill) falls back to the usage-proxy
+//     count below — today's behavior, until the api-platform backfill lands,
 //  5. computes PaaS 額度 credit = PaasCreditPct% of the infra total, but ONLY when
 //     an active SaaS subscription earns it — v1 has no subscription system, so the
 //     credit is subscription-gated OFF and is 0 (the wire field stays for back-compat),
@@ -138,13 +145,12 @@ func pctMicros(base int64, pct int) (int64, error) {
 // module catalog (module_versions), never from module_install; this bill carries
 // module_id.
 //
-// INSTALLED-MODULE-COUNT PROXY (TODO): billing-engine cannot see api-platform's
-// ms_applications.module_install (and MUST NOT join it — it drops on uninstall),
-// so the base-fee tier uses the count of DISTINCT modules with metered usage this
-// period as a documented proxy for "installed modules". TODO: source the true
-// installed count from api-platform (e.g. a synced count on the RPC) so an
-// installed-but-idle module still counts and an uninstalled-but-used one is
-// handled per policy.
+// INSTALLED-MODULE-COUNT: the authoritative count is the ms_billing.apps mirror's
+// module_count (synced by api-platform via SyncAppModules — an installed-but-idle
+// module counts, an uninstalled one stops counting at the next sync). Apps not
+// yet mirrored (pre-backfill) keep the pre-027 documented PROXY: the count of
+// DISTINCT modules with metered usage this period; the api-platform backfill PR
+// retires that path.
 func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAppBillResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -279,9 +285,33 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		infraTotal += l.ChargedMicros
 	}
 
-	baseFee := resolveBaseFeeMicros(plan)
-	if extra := len(installedModules) - IncludedModules; extra > 0 {
-		baseFee += ExtraModuleMicros * int64(extra)
+	// 基本費用: authoritative from the ms_billing.apps mirror when this app has a
+	// roster row — the SAME AppBaseFeeMicros + ProratedBaseMicros math the charge
+	// legs bill (creation period → prorated by created_at, overage from the synced
+	// module_count), so the displayed base is what the invoices actually charge.
+	// No mirror row yet (pre-backfill) → the flat fee + usage-proxy overage
+	// exactly as before migration 027 (see the INSTALLED-MODULE-COUNT note above).
+	var baseFee int64
+	mirror, mirrored, err := s.store.AppMirror(ctx, req.AppID)
+	if err != nil {
+		return nil, billing.Internal("app mirror lookup failed", err)
+	}
+	switch {
+	case mirrored && mirror.Deleted && !mirror.DeletedAt.After(periodStart):
+		// Deleted BEFORE this period opened → no base was (or will be) charged
+		// for it (D1e: deletion stops FUTURE base fees). A deletion DURING the
+		// period leaves that period's base spent, so it falls through below.
+		baseFee = 0
+	case mirrored:
+		baseFee = ProratedBaseMicros(
+			AppBaseFeeMicros(resolveBaseFeeMicros(plan), mirror.ModuleCount),
+			mirror.CreatedAt, periodStart, periodEnd,
+		)
+	default:
+		baseFee = resolveBaseFeeMicros(plan)
+		if extra := len(installedModules) - IncludedModules; extra > 0 {
+			baseFee += ModuleOverageFeeMicros * int64(extra)
+		}
 	}
 
 	// TODO(subscription): resolve whether this account has an ACTIVE SaaS

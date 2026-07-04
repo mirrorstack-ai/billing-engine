@@ -37,6 +37,7 @@ type fakeStore struct {
 	periodWindows          map[uuid.UUID]periodWindow // billing_periods id → window
 	visibility             map[uuid.UUID]usage.Visibility
 	invoiceRows            []usage.InvoiceMirrorRaw // unordered; ListInvoices applies the SQL contract
+	appMirrors             map[uuid.UUID]usage.AppMirrorInfo // app_id → ms_billing.apps roster row (migration 027)
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
@@ -82,6 +83,7 @@ type fakeStore struct {
 	// page+1 limit and the decoded cursor reached the store unchanged.
 	gotInvoiceLimit  int32
 	gotInvoiceCursor *usage.InvoiceCursor
+	errAppMirror          error
 
 	// captured window a read-path RPC resolved from the account's anchor, so a
 	// test can assert the anchored [start, end) reached the store unchanged.
@@ -101,7 +103,18 @@ func newFakeStore() *fakeStore {
 		events:     map[string]usage.UsageEvent{},
 		anchorDays: map[uuid.UUID]int{},
 		visibility: map[uuid.UUID]usage.Visibility{},
+		appMirrors: map[uuid.UUID]usage.AppMirrorInfo{},
 	}
+}
+
+// AppMirror returns the fake ms_billing.apps roster row for an app; absent →
+// not mirrored (pre-backfill), so GetAppBill keeps the usage-proxy fallback.
+func (f *fakeStore) AppMirror(_ context.Context, appID uuid.UUID) (usage.AppMirrorInfo, bool, error) {
+	if f.errAppMirror != nil {
+		return usage.AppMirrorInfo{}, false, f.errAppMirror
+	}
+	m, ok := f.appMirrors[appID]
+	return m, ok, nil
 }
 
 // AccountAnchorDay returns the configured anchor day for an account, defaulting

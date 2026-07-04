@@ -33,6 +33,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/budget"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
@@ -63,6 +64,7 @@ type dispatcher struct {
 	svc       *billing.Service
 	usageSvc  *usage.Service
 	budgetSvc *budget.Service
+	cycleSvc  *cycle.Service
 }
 
 func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload json.RawMessage) (any, error) {
@@ -200,6 +202,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.RecordInfraUsage(ctx, req)
 
+	case "RegisterApp":
+		var req cycle.RegisterAppRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.RegisterApp(ctx, req)
+
+	case "SyncAppModules":
+		var req cycle.SyncAppModulesRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.SyncAppModules(ctx, req)
+
 	case "SetBudget":
 		var req budget.SetBudgetRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -302,7 +318,13 @@ func buildDispatcher() *dispatcher {
 	// usage event (design §5 / §10).
 	usageSvc := usage.NewService(usage.NewStore(pool)).WithBudgetEvaluator(budgetSvc)
 
-	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc}
+	// The apps-mirror RPCs (RegisterApp / SyncAppModules) live on the cycle
+	// Service because RegisterApp's creation-proration charge reuses the charge
+	// spine's Stripe invoice plumbing — same client, same micros→cents boundary,
+	// same invoice mirror (base-fee v1, D1c).
+	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient)
+
+	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc}
 }
 
 func buildRouter(d *dispatcher) *chi.Mux {
@@ -360,6 +382,14 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// publish), so it shares the internal secret + route group.
 		r.Post("/v1/billing.SetInfraPriceOverrides", makeHTTPHandler(d, "SetInfraPriceOverrides"))
 		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
+		// Apps-mirror writers (base-fee v1, D1c): applications-service fires
+		// RegisterApp on app create (mirror row + creation-proration charge)
+		// and SyncAppModules on module install/uninstall/app delete
+		// (module_count snapshot / soft delete), fire-and-forget with retry.
+		// Control-plane calls from api-platform → the internal secret + this
+		// route group, same as the other billing writes.
+		r.Post("/v1/billing.RegisterApp", makeHTTPHandler(d, "RegisterApp"))
+		r.Post("/v1/billing.SyncAppModules", makeHTTPHandler(d, "SyncAppModules"))
 		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of
 		// the SDK meter seam: it is called by platform-trusted producers
 		// (dispatch compute, cdn-worker egress — deferred PRs), accepts ONLY
