@@ -55,6 +55,9 @@ func (stubUsageStore) AppUsage(context.Context, uuid.UUID, uuid.UUID, time.Time,
 func (stubUsageStore) AppBill(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time) ([]usage.AppMetricUsageRaw, error) {
 	return nil, nil
 }
+func (stubUsageStore) AppInfraBill(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time) ([]usage.AppInfraUsage, error) {
+	return nil, nil
+}
 func (stubUsageStore) ListBillingPeriods(context.Context, uuid.UUID, time.Time) ([]usage.BillingPeriodRaw, error) {
 	return nil, nil
 }
