@@ -80,6 +80,12 @@ func (stubUsageStore) AppMirror(context.Context, uuid.UUID) (usage.AppMirrorInfo
 func (stubUsageStore) AppBaseSnapshot(context.Context, uuid.UUID, time.Time) (usage.AppBaseSnapshotInfo, bool, error) {
 	return usage.AppBaseSnapshotInfo{}, false, nil
 }
+func (stubUsageStore) AppIDsWithUsage(context.Context, uuid.UUID, time.Time, time.Time) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (stubUsageStore) MirroredAppIDs(context.Context, uuid.UUID, time.Time, time.Time) ([]uuid.UUID, error) {
+	return nil, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()
