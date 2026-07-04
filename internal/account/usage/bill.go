@@ -252,8 +252,30 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	if err != nil {
 		return nil, billing.Internal("app infra bill query failed", err)
 	}
+
+	// 基礎設施, per-MODULE split (decision 19): reserved infra attributed to a real
+	// incurring module renders inside that module's card, dual-priced (SENTINEL default
+	// vs per-module override). This is USAGE-anchored, so — unlike the catalog-anchored
+	// residual above — it is skipped when there is no billing account (no account → no
+	// attributed usage → empty split), mirroring the module-usage read. Non-nil empty
+	// slice otherwise so the wire never carries null.
+	moduleInfraLines := []AppModuleInfraUsage{}
+	if found {
+		moduleInfraLines, err = s.store.AppModuleInfraBill(ctx, accountID, req.AppID, periodStart, periodEnd)
+		if err != nil {
+			return nil, billing.Internal("app module infra bill query failed", err)
+		}
+	}
+
+	// InfraTotalMicros stays the FULL reconciliation scalar: the per-module split is a
+	// pure display re-partition of the same infra total (attributed → moduleInfraLines,
+	// unattributable → infraLines), so it is Σ of BOTH so that base fee / PaaS credit /
+	// TotalMicros math downstream is unchanged.
 	var infraTotal int64
 	for _, l := range infraLines {
+		infraTotal += l.ChargedMicros
+	}
+	for _, l := range moduleInfraLines {
 		infraTotal += l.ChargedMicros
 	}
 
@@ -284,6 +306,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,
 		InfraLines:             infraLines,
+		ModuleInfraLines:       moduleInfraLines,
 		PaasCreditMicros:       paasCredit,
 		TotalMicros:            total,
 	}, nil

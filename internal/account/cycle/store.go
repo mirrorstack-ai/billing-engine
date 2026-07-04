@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
 
 // ErrInactiveModelPrice is returned by MetricPriceMicros when a usage row's
@@ -355,6 +356,33 @@ func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, me
 		Metric:   metric,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
+		// No per-(module, metric) catalog row. For a RESERVED infra.* / platform.*
+		// metric ATTRIBUTED to a real incurring module (module_id <> the sentinel),
+		// fall back to the SENTINEL row that seeds every infra metric's COGS
+		// (migrations 017/020) — the frozen-path half of decision 19's resolution
+		// chain: (module, metric) → (SENTINEL, metric). Without this fallback an
+		// attributed infra event with no per-module override row would resolve to 0
+		// and trip the revenue-leak guard in service.go (which fails the cycle loud
+		// for an unpriced reserved metric). A CUSTOM (non-reserved) metric keeps the
+		// unpriced-→0 behavior (its absence is a legitimate metered-but-unpriced
+		// case). The sentinel itself already looked up its own row above, so guard on
+		// moduleID != the sentinel to avoid a redundant second lookup.
+		if isReservedMetric(metric) && moduleID != usage.PlatformInfraModuleID() {
+			price, err = s.q.LookupMetricPrice(ctx, db.LookupMetricPriceParams{
+				ModuleID: usage.PlatformInfraModuleID().String(),
+				Metric:   metric,
+			})
+			if errors.Is(err, pgx.ErrNoRows) {
+				return 0, false, nil // no seeded sentinel row → unpriced (guard fires loud)
+			}
+			if err != nil {
+				return 0, false, err
+			}
+			if !price.Valid {
+				return 0, false, nil // sentinel row metered-but-unpriced
+			}
+			return price.Int64, true, nil
+		}
 		// No catalog row at rollup time → treat as unpriced (0). An undeclared
 		// metric never reaches usage_events (RecordUsage rejects it), so this
 		// is a defensive guard, not a normal path.

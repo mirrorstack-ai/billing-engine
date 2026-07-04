@@ -43,6 +43,47 @@ func TestRecordInfraUsage_AcceptsComputeWalltimeMS(t *testing.T) {
 	require.Equal(t, "infra.compute.walltime.ms", ev.Metric)
 }
 
+func TestRecordInfraUsage_StampsIncurringModuleID(t *testing.T) {
+	// Decision 19 attribution: a producer-supplied incurring module_id is stamped
+	// onto the event verbatim (was: always the sentinel), so the app bill can
+	// attribute the infra line to that module's card.
+	store := newFakeStore()
+	req := validInfra()
+	mod := uuid.New()
+	req.ModuleID = mod
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, mod, store.events[req.EventID].ModuleID, "real incurring module_id is stamped, not the sentinel")
+}
+
+func TestRecordInfraUsage_NilModuleIDMapsToSentinel(t *testing.T) {
+	// A Nil ModuleID is the explicit "unattributed" signal → mapped to the
+	// platform-infra sentinel so pricing + rollup are unchanged from before.
+	store := newFakeStore()
+	req := validInfra() // no ModuleID set → Nil
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, usage.PlatformInfraModuleID(), store.events[req.EventID].ModuleID)
+}
+
+func TestRecordInfraUsage_AcceptsNilAppID(t *testing.T) {
+	// Decision 19 bug fix: AppID Nil is the "unattributed to a single app" signal the
+	// platform-agent AI producer sends. It must be ACCEPTED (previously rejected,
+	// silently swallowing every agent AI infra event) and recorded under the zero app_id.
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "infra-nil-app"
+	req.AppID = uuid.Nil
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, uuid.Nil, store.events[req.EventID].AppID, "unattributed infra records under the zero app_id")
+}
+
 func TestRecordInfraUsage_AcceptsEgressBytes(t *testing.T) {
 	store := newFakeStore()
 	req := validInfra()
@@ -161,7 +202,6 @@ func TestRecordInfraUsage_Validation(t *testing.T) {
 		mutate func(*usage.RecordInfraUsageRequest)
 	}{
 		{"missing event_id", func(r *usage.RecordInfraUsageRequest) { r.EventID = "" }},
-		{"missing app_id", func(r *usage.RecordInfraUsageRequest) { r.AppID = uuid.Nil }},
 		{"missing metric", func(r *usage.RecordInfraUsageRequest) { r.Metric = "" }},
 		{"negative value", func(r *usage.RecordInfraUsageRequest) { r.Value = -1 }},
 		{"nan value", func(r *usage.RecordInfraUsageRequest) { r.Value = nan() }},

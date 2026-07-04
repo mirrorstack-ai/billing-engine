@@ -381,19 +381,26 @@ FROM live
 WHERE NOT EXISTS (SELECT 1 FROM rolled)
 ORDER BY module_id, metric, model, module_version;
 
--- AppInfraBillLines is the per-metric 基礎設施 (infrastructure) breakdown for the
--- app-owner bill — the CATALOG-ANCHORED read behind GetAppBill's InfraLines. It
--- returns ONE row per ACTIVE platform-infra sentinel metric_definitions row (the
--- 16 declared infra metrics under module_id = the all-zero sentinel), so EVERY
--- declared infra metric renders even when it has zero usage this period (the
--- app-bill "show all" lists declared-but-unused infra metrics at qty 0 · $0). The
--- enumeration source is the CATALOG (metric_definitions), NOT the usage ledger —
--- that FROM metric_definitions … LEFT JOIN usage is the whole reason a $0 metric
--- still appears.
+-- AppInfraBillLines is the per-metric 基礎設施 (infrastructure) RESIDUAL breakdown
+-- for the app-owner bill — the CATALOG-ANCHORED read behind GetAppBill's InfraLines.
+-- It returns ONE row per ACTIVE platform-infra sentinel metric_definitions row (the
+-- declared infra metrics under module_id = the all-zero sentinel), so EVERY declared
+-- infra metric renders even when it has zero usage this period (the app-bill "show
+-- all" lists declared-but-unused infra metrics at qty 0 · $0). The enumeration source
+-- is the CATALOG (metric_definitions), NOT the usage ledger — that FROM
+-- metric_definitions … LEFT JOIN usage is the whole reason a $0 metric still appears.
 --
--- The usage side mirrors AppBillLines' rolled-up-else-live gate, but collapsed to
--- ONE row per metric (SUM across module / model / module_version) and filtered to
--- the reserved infra.* / platform.* namespaces:
+-- RESIDUAL scope (decision 19): the usage side is filtered to the SENTINEL-attributed
+-- events only (module_id = the all-zero sentinel) — the genuinely-unattributable infra
+-- (platform-agent AI tokens, CDN/egress, async producers that send Nil ModuleID). Infra
+-- attributed to a REAL incurring module (module_id <> sentinel) is billed by the sibling
+-- AppModuleInfraBillLines query and rendered inside that module's card. The two partition
+-- the reserved namespace with no overlap, so the reconciliation invariant holds:
+--   infra_total_micros == Σ(AppModuleInfraBillLines.charged) + Σ(AppInfraBillLines.charged).
+--
+-- The usage side mirrors AppBillLines' rolled-up-else-live gate, collapsed to ONE row
+-- per metric (SUM across model / module_version) and filtered to the reserved infra.* /
+-- platform.* namespaces AND the sentinel module_id:
 --   * rolled: once the period is in usage_aggregates read the FROZEN
 --     billable_quantity / charged_micros (the ×1.2 infra markup already
 --     snapshotted at rollup).
@@ -424,6 +431,7 @@ WITH rolled AS (
       AND ua.app_id       = @app_id::uuid
       AND bp.period_start = @period_start::timestamptz
       AND (ua.metric LIKE 'infra.%' OR ua.metric LIKE 'platform.%')
+      AND ua.module_id = '00000000-0000-0000-0000-000000000000'
     GROUP BY ua.metric
 ),
 live AS (
@@ -439,6 +447,7 @@ live AS (
       AND e.recorded_at >= @period_start::timestamptz
       AND e.recorded_at <  @period_end::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
+      AND e.module_id = '00000000-0000-0000-0000-000000000000'
     GROUP BY e.metric
 ),
 usage AS (
@@ -459,6 +468,102 @@ LEFT JOIN usage u ON u.metric = md.metric
 WHERE md.module_id = '00000000-0000-0000-0000-000000000000'
   AND md.active
 ORDER BY md.display_group, md.metric;
+
+-- AppModuleInfraBillLines is the per-MODULE 基礎設施 (infrastructure) breakdown for
+-- the app-owner bill — decision 19's dual-price, sentinel-fallback read behind
+-- GetAppBill's ModuleInfraLines. Unlike the app-level RESIDUAL (AppInfraBillLines,
+-- catalog-anchored, sentinel-attributed), this is USAGE-anchored and returns ONE row
+-- per (module_id, module_version, metric) for reserved infra.* / platform.* usage
+-- ATTRIBUTED to a REAL incurring module (module_id <> the all-zero sentinel) — so only
+-- modules that actually incurred infra appear, grouped into their module card in the UI.
+--
+-- DUAL PRICE (the whole point). metric_definitions is joined TWICE on the same metric:
+--   * md_def — the fixed SENTINEL row (module_id = the all-zero sentinel). AUTHORITATIVE
+--     for kind / unit / display_group and for default_unit_price_micros (the raw
+--     platform-default COGS). The override row is PRICE-ONLY, so semantics come from here.
+--   * md_ovr — a LEFT JOIN on the event's REAL module_id (md_ovr.module_id = module_id
+--     AND md_ovr.metric = metric). module_unit_price_micros is that per-module override
+--     price, or NULL when the module has no override row. NULL is the UI's plain-vs-adjusted
+--     switch — do NOT COALESCE it to the default on the wire (the store decodes it as a
+--     nullable *int64; NULL ⇔ render the plain line at the default price).
+--   * charged_micros = round_half_up(qty × COALESCE(override, default) × 12/10). Markup
+--     (cycle.infraMarkupNum/Den = 12/10) applied EXACTLY ONCE inline; both unit prices are
+--     raw pre-markup COGS. ms.Price(0) → override 0 → charged 0 (full absorb), no special case.
+--
+-- The resolution chain composes decision 15/19: (module,metric,version) → (module,metric)
+-- → (SENTINEL,metric). The live branch resolves it inline via COALESCE(md_ovr, md_def); the
+-- rolled branch reads the FROZEN charged_micros the rollup already snapshotted through the
+-- Go MetricPriceMicros fallback (cycle/store.go), so both branches agree.
+--
+-- Rolled-up-else-live exactly like AppInfraBillLines (its own gate, scoped to the
+-- non-sentinel partition): a whole period rolls at once, so `WHERE NOT EXISTS (SELECT 1
+-- FROM rolled)` shows the live estimate only until this app+period's first aggregate lands.
+-- UNINSTALL-SAFE / ledger-only: never joins an install table. The display prices
+-- (md_def / md_ovr) are resolved in the OUTER query so they reflect the CURRENT catalog
+-- (matching AppInfraBillLines, which also reads current unit_price for its display column).
+-- name: AppModuleInfraBillLines :many
+WITH rolled AS (
+    SELECT ua.module_id                                    AS module_id,
+           ua.module_version                               AS module_version,
+           ua.metric                                       AS metric,
+           COALESCE(SUM(ua.billable_quantity), 0)::numeric AS billable_quantity,
+           COALESCE(SUM(ua.charged_micros), 0)::numeric    AS charged_micros
+    FROM ms_billing.usage_aggregates ua
+    JOIN ms_billing.billing_periods bp
+        ON bp.id = ua.period_id
+    WHERE ua.account_id   = @account_id::uuid
+      AND ua.app_id       = @app_id::uuid
+      AND bp.period_start = @period_start::timestamptz
+      AND (ua.metric LIKE 'infra.%' OR ua.metric LIKE 'platform.%')
+      AND ua.module_id <> '00000000-0000-0000-0000-000000000000'
+    GROUP BY ua.module_id, ua.module_version, ua.metric
+),
+live AS (
+    SELECT e.module_id                                     AS module_id,
+           COALESCE(e.module_version, '')                  AS module_version,
+           e.metric                                        AS metric,
+           COALESCE(SUM(e.value), 0)::numeric              AS billable_quantity,
+           -- COALESCE(override, default) is constant within each (module, metric)
+           -- group, so the SUM reduces to price × Σ value; markup applied once.
+           (COALESCE(SUM(e.value * COALESCE(md_ovr.unit_price_micros, md_def.unit_price_micros, 0)), 0) * 12 / 10)::numeric
+                                                           AS charged_micros
+    FROM ms_billing.usage_events e
+    JOIN ms_billing.metric_definitions md_def
+        ON md_def.module_id = '00000000-0000-0000-0000-000000000000'
+       AND md_def.metric = e.metric
+    LEFT JOIN ms_billing.metric_definitions md_ovr
+        ON md_ovr.module_id = e.module_id AND md_ovr.metric = e.metric
+    WHERE e.account_id  = @account_id::uuid
+      AND e.app_id      = @app_id::uuid
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
+      AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
+      AND e.module_id <> '00000000-0000-0000-0000-000000000000'
+    GROUP BY e.module_id, COALESCE(e.module_version, ''), e.metric
+),
+usage AS (
+    SELECT module_id, module_version, metric, billable_quantity, charged_micros FROM rolled
+    UNION ALL
+    SELECT module_id, module_version, metric, billable_quantity, charged_micros FROM live
+    WHERE NOT EXISTS (SELECT 1 FROM rolled)
+)
+SELECT u.module_id                                     AS module_id,
+       u.module_version                                AS module_version,
+       u.metric                                        AS metric,
+       md_def.kind                                     AS kind,
+       md_def.unit                                     AS unit,
+       md_def.display_group                            AS display_group,
+       COALESCE(md_def.unit_price_micros, 0)::bigint   AS default_unit_price_micros,
+       md_ovr.unit_price_micros                        AS module_unit_price_micros,
+       u.billable_quantity                             AS billable_quantity,
+       u.charged_micros                                AS charged_micros
+FROM usage u
+JOIN ms_billing.metric_definitions md_def
+    ON md_def.module_id = '00000000-0000-0000-0000-000000000000'
+   AND md_def.metric = u.metric
+LEFT JOIN ms_billing.metric_definitions md_ovr
+    ON md_ovr.module_id = u.module_id AND md_ovr.metric = u.metric
+ORDER BY u.module_id, md_def.display_group, u.metric, u.module_version;
 
 -- ListBillingPeriods lists an account's REAL billing_periods rows (the closed,
 -- rolled/invoiced periods) newest-first — the source for the web's top-right 週期

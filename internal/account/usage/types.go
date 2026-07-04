@@ -299,6 +299,49 @@ type AppInfraUsage struct {
 	ChargedMicros    int64   `json:"charged_micros"` // qty × price × 12/10
 }
 
+// AppModuleInfraUsage is one per-MODULE infrastructure line on the app bill
+// (decision 19): reserved infra.* / platform.* usage ATTRIBUTED to a real
+// incurring module (module_id <> the platform-infra sentinel), rendered inside
+// that module's card rather than the app-level 基礎設施 residual. It carries the
+// DUAL price the UI needs to draw the "(default − module) ±delta" line:
+//
+//   - DefaultUnitPriceMicros is the platform-default raw COGS from the SENTINEL
+//     metric_definitions row (pre-markup).
+//   - ModuleUnitPriceMicros is the module's ms.Price(n) override raw COGS
+//     (pre-markup), or NIL when the module declared no override. NIL is the wire
+//     switch between the plain line (render at the default) and the adjusted line
+//     (render "(default − module)"); it is deliberately NOT coalesced to the
+//     default so the UI can tell "no override" from "override happens to equal
+//     the default". ms.Price(0) → a non-nil 0 (full absorb), never nil.
+//   - ChargedMicros is qty × COALESCE(module, default) × 12/10, the ×1.2 infra
+//     markup applied ONCE server-side (same as AppInfraUsage) — the shown unit
+//     prices are raw COGS, so unit_price × qty does NOT equal charged by design.
+//
+// Kind / Unit / Group all come from the SENTINEL row (the override row is
+// price-only). Label is the friendly display name; billing-engine has no
+// friendly-label registry, so it is the metric id itself (the web maps it to a
+// display string exactly as it does for the residual AppInfraUsage lines, which
+// carry no label). ModuleVersion buckets the line into a per-version sub-list
+// when a module ran >1 version in the period; "" collapses to the module flat list.
+type AppModuleInfraUsage struct {
+	ModuleID      uuid.UUID `json:"module_id"`
+	ModuleVersion string    `json:"module_version,omitempty"`
+	Metric        string    `json:"metric"`
+	Label         string    `json:"label"`
+	Kind          Kind      `json:"kind"`
+	Unit          string    `json:"unit"`
+	Group         string    `json:"group"` // display_group, from the SENTINEL row
+	// BillableQuantity is a DISPLAY value (the metered amount), not a money field —
+	// money is carried only in the *_micros int64 fields.
+	BillableQuantity       float64 `json:"billable_quantity"`
+	DefaultUnitPriceMicros int64   `json:"default_unit_price_micros"` // SENTINEL row COGS (pre-markup) → UI unitPrice
+	// ModuleUnitPriceMicros is the per-module override COGS (pre-markup), NIL when
+	// no override row exists → UI renders the plain line. omitempty drops it from
+	// the wire on nil, which the TS mirror reads as "no override" (plain mode).
+	ModuleUnitPriceMicros *int64 `json:"module_unit_price_micros,omitempty"`
+	ChargedMicros         int64  `json:"charged_micros"` // qty × COALESCE(module,default) × 12/10, rounded once
+}
+
 // GetAppUsageSummaryResponse is the app-owner bill for ONE app in the current
 // period. PeriodStart / PeriodEnd bound the live window (zero when no billing
 // account exists yet). Metrics is an empty slice (not nil) — never an error —
@@ -369,14 +412,27 @@ type GetAppBillResponse struct {
 	// breakdown is InfraLines (kept as this scalar for back-compat).
 	InfraTotalMicros int64 `json:"infra_total_micros"`
 
-	// InfraLines is the per-metric 基礎設施 breakdown: one line for EVERY active
-	// declared infra metric (the platform-infra sentinel catalog rows), including
-	// the ones with zero usage this period (0 quantity / $0), so "show all" can
-	// list every declared infra metric. UnitPriceMicros is raw catalog COGS
+	// InfraLines is the per-metric 基礎設施 RESIDUAL breakdown: one line for EVERY
+	// active declared infra metric (the platform-infra sentinel catalog rows),
+	// including the ones with zero usage this period (0 quantity / $0), so "show
+	// all" can list every declared infra metric. Since decision 19 it is the
+	// SENTINEL-attributed residual only (genuinely-unattributable infra —
+	// platform-agent AI, egress, async producers); infra attributed to a real
+	// module moves to ModuleInfraLines below. UnitPriceMicros is raw catalog COGS
 	// (pre-markup); ChargedMicros already includes the ×1.2 infra markup (applied
-	// once, server-side). By construction Σ InfraLines[].ChargedMicros ==
-	// InfraTotalMicros. Empty slice (never nil).
+	// once, server-side). Empty slice (never nil).
 	InfraLines []AppInfraUsage `json:"infra_lines"`
+
+	// ModuleInfraLines is the per-MODULE 基礎設施 breakdown (decision 19): reserved
+	// infra.* / platform.* usage attributed to a real incurring module, one line per
+	// (module_id, module_version, metric), each carrying the dual default/override
+	// price the UI draws "(default − module) ±delta" from. It is a pure DISPLAY
+	// re-partition of the same InfraTotalMicros — attributed infra lives here,
+	// unattributable overhead stays in InfraLines — so the reconciliation invariant
+	// holds: InfraTotalMicros == Σ ModuleInfraLines[].ChargedMicros +
+	// Σ InfraLines[].ChargedMicros (no double count). Empty slice (never nil) when
+	// no module incurred attributed infra this period.
+	ModuleInfraLines []AppModuleInfraUsage `json:"module_infra_lines"`
 
 	// PaasCreditMicros is PaaS 額度 — the infra credit EARNED ONLY through an active
 	// SaaS subscription (PaasCreditPct% of InfraTotalMicros). A NON-NEGATIVE
