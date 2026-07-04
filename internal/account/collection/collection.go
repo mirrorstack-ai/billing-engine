@@ -241,8 +241,44 @@ func ResolveAutoCollectThreshold(overrideMicros *int64) int64 {
 // discloses charges over $100, not a charge of exactly $100. This matches
 // ExceedsSpendCeiling's precise-dollar-cap reading (equal-to is not "above") and
 // is intentionally distinct from overCreditLimit's inclusive (>=) trust trigger.
+//
+// The comparison MUST happen in the SAME unit Stripe actually charges: whole
+// cents, round-half-up (cycle.centsFromMicros — 1 cent = 10_000 micros). chargedMicros
+// is the raw pre-cents-conversion micros value, so a chargedMicros strictly between
+// the threshold and threshold+5,000 micros (half a cent) rounds DOWN to the
+// threshold's own cents value when actually charged — comparing raw micros would
+// flag it "large" even though the money that hit the card is IDENTICAL to the
+// threshold's dollar amount. Rounding BOTH sides to cents before comparing (rather
+// than comparing raw micros) makes the flag agree with the real charge by
+// construction. This package cannot import cycle.centsFromMicros directly (cycle
+// imports collection; that would cycle), so centsRoundHalfUp below duplicates the
+// identical round-half-up rule in plain integer arithmetic.
 func IsLargeAutoCollect(chargedMicros int64, overrideMicros *int64) bool {
-	return chargedMicros > ResolveAutoCollectThreshold(overrideMicros)
+	chargedCents := centsRoundHalfUp(chargedMicros)
+	thresholdCents := centsRoundHalfUp(ResolveAutoCollectThreshold(overrideMicros))
+	return chargedCents > thresholdCents
+}
+
+// microsPerCent is the micro-dollar value of one cent (1e-2 USD = 10_000 ×
+// 1e-6 USD) — mirrors cycle.microsPerCent. Duplicated rather than imported: see
+// the IsLargeAutoCollect doc on the import-cycle constraint.
+const microsPerCent = 10_000
+
+// centsRoundHalfUp converts a non-negative micro-dollar amount to whole cents,
+// round-half-up — the SAME conversion Stripe amounts undergo at the charge
+// boundary (cycle.centsFromMicros, which does the equivalent computation via
+// big.Rat). For non-negative int64 operands and an EVEN divisor (10_000),
+// floor((micros + microsPerCent/2) / microsPerCent) is exactly round-half-up
+// (ties round up), so plain integer arithmetic reproduces that package's
+// rounding without depending on it. Charged amounts and thresholds are
+// non-negative at every call site (a successful charge, a finance-set
+// threshold); a negative input is defensive-clamped to 0 rather than producing
+// a sign-flipped cents value from truncating integer division.
+func centsRoundHalfUp(micros int64) int64 {
+	if micros <= 0 {
+		return 0
+	}
+	return (micros + microsPerCent/2) / microsPerCent
 }
 
 // ExceedsSpendCeiling reports whether the netted arrears would breach the
