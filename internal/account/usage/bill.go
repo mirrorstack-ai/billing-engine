@@ -127,11 +127,15 @@ func pctMicros(base int64, pct int) (int64, error) {
 //     from the CATALOG (AppInfraBill) so every declared infra metric renders,
 //     including the $0 / unused ones — InfraTotalMicros = Σ InfraLines[].charged
 //     (the 1.2× infra markup applied once, in SQL),
-//  4. computes 基本費用 base fee from the ms_billing.apps mirror (migration 027)
-//     when the app has a roster row: AppBaseFeeMicros(resolveBaseFeeMicros(plan),
-//     module_count), PRORATED via ProratedBaseMicros when the app's created_at
-//     falls inside the period — exactly what the charge legs (creation proration
-//     + boundary advance) bill, so display and invoice agree by construction.
+//  4. computes 基本費用 base fee SNAPSHOT-FIRST: a charged period reads the
+//     frozen per-app-period snapshot the charge leg wrote at billing time
+//     (ms_billing.app_base_snapshots, migration 028 — exact period_start
+//     match), so the displayed base IS what the invoice charged even after
+//     later SyncAppModules count changes. Only an un-snapshotted period
+//     (pre-feature history, unactivated account, in-progress period) falls
+//     back to the live ESTIMATE from the mirror (migration 027):
+//     AppBaseFeeMicros(resolveBaseFeeMicros(plan), module_count), PRORATED via
+//     ProratedBaseMicros when the app's created_at falls inside the period.
 //     An app ABSENT from the mirror (pre-backfill) falls back to the usage-proxy
 //     count below — today's behavior, until the api-platform backfill lands,
 //  5. computes PaaS 額度 credit = PaasCreditPct% of the infra total, but ONLY when
@@ -285,24 +289,39 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		infraTotal += l.ChargedMicros
 	}
 
-	// 基本費用: authoritative from the ms_billing.apps mirror when this app has a
-	// roster row — the SAME AppBaseFeeMicros + ProratedBaseMicros math the charge
-	// legs bill (creation period → prorated by created_at, overage from the synced
-	// module_count), so the displayed base is what the invoices actually charge.
-	// No mirror row yet (pre-backfill) → the flat fee + usage-proxy overage
-	// exactly as before migration 027 (see the INSTALLED-MODULE-COUNT note above).
+	// 基本費用: the per-app-period SNAPSHOT (ms_billing.app_base_snapshots,
+	// migration 028) is authoritative whenever this period's base was actually
+	// charged — it freezes the exact amount the charge leg invoiced (advance
+	// full base, or the creation-period proration), so a later SyncAppModules
+	// count change can never drift the displayed base away from the invoice
+	// (the spec's "never disagree"). Only when NO snapshot exists — pre-feature
+	// periods, unactivated accounts (never charged), or an in-progress period
+	// whose boundary hasn't billed yet — does the display fall back to the
+	// live-count math below, which is then a DISPLAY-ONLY ESTIMATE computed
+	// from the mirror's CURRENT module_count (or, with no mirror row at all,
+	// the pre-027 flat fee + usage-proxy overage — see the
+	// INSTALLED-MODULE-COUNT note above).
 	var baseFee int64
 	mirror, mirrored, err := s.store.AppMirror(ctx, req.AppID)
 	if err != nil {
 		return nil, billing.Internal("app mirror lookup failed", err)
 	}
+	snap, snapped, err := s.store.AppBaseSnapshot(ctx, req.AppID, periodStart)
+	if err != nil {
+		return nil, billing.Internal("app base snapshot lookup failed", err)
+	}
 	switch {
+	case snapped:
+		// This period's base was charged: display EXACTLY what was invoiced.
+		baseFee = snap.BaseMicros
 	case mirrored && mirror.Deleted && !mirror.DeletedAt.After(periodStart):
 		// Deleted BEFORE this period opened → no base was (or will be) charged
 		// for it (D1e: deletion stops FUTURE base fees). A deletion DURING the
 		// period leaves that period's base spent, so it falls through below.
 		baseFee = 0
 	case mirrored:
+		// No snapshot → estimate from the mirror's current count, the SAME
+		// AppBaseFeeMicros + ProratedBaseMicros math the charge legs bill.
 		baseFee = ProratedBaseMicros(
 			AppBaseFeeMicros(resolveBaseFeeMicros(plan), mirror.ModuleCount),
 			mirror.CreatedAt, periodStart, periodEnd,

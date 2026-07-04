@@ -38,3 +38,7 @@
 \i migrations/billing/025_account_activated_at.up.sql
 -- 026: Stripe invoice presentment mirror columns (webhook write path requires them).
 \i migrations/billing/026_invoice_presentment.up.sql
+-- 027: ms_billing.apps mirror (base-fee roster, base-fee v1).
+\i migrations/billing/027_apps_mirror.up.sql
+-- 028: per-app-period base snapshots (display == invoice).
+\i migrations/billing/028_app_base_snapshots.up.sql

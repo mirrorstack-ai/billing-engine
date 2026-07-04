@@ -197,10 +197,52 @@ type Store interface {
 	// fees. Idempotent — the first deletion instant is kept.
 	MarkAppDeleted(ctx context.Context, appID uuid.UUID) error
 
-	// LiveAppModuleCounts returns the module_count of every LIVE (deleted_at
-	// IS NULL) app on the account — the boundary charge's advance-base input.
-	// Empty for a pre-backfill account → advance base 0 (pre-027 behavior).
-	LiveAppModuleCounts(ctx context.Context, accountID uuid.UUID) ([]int, error)
+	// LiveAppsCreatedBefore returns every LIVE (deleted_at IS NULL) app on the
+	// account created STRICTLY BEFORE createdBefore, with its module_count —
+	// the boundary charge's advance-base input. createdBefore is the NEW
+	// period's start (the closed window's period_end): an app created inside
+	// the new period is EXCLUDED because RegisterApp's creation-proration leg
+	// already owns that period's base (full or prorated) — it joins the
+	// advance leg at the NEXT boundary. Empty for a pre-backfill account →
+	// advance base 0 (pre-027 behavior).
+	LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error)
+
+	// UpsertProrationBaseSnapshot persists the creation-proration leg's
+	// per-app-period base snapshot (migration 028, source='proration'), keyed
+	// (app_id, period_start). Idempotent — a retry overwrites with identical
+	// values — and on a key collision with an 'advance' row the proration row
+	// WINS (the more specific charge for a creation period).
+	UpsertProrationBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error
+
+	// InsertAdvanceBaseSnapshot persists the boundary advance leg's
+	// per-app-period base snapshot (migration 028, source='advance') with
+	// ON CONFLICT (app_id, period_start) DO NOTHING — an existing row (a
+	// proration snapshot, or a prior reclaimed attempt's own row) wins, so a
+	// re-run never rewrites what was already recorded as billed.
+	InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error
+}
+
+// AppModuleCount pairs one live roster app with its module_count snapshot —
+// one advance-base input row. The boundary leg needs the app id (not just the
+// count) to write the per-app-period base snapshot it bills (migration 028).
+type AppModuleCount struct {
+	AppID       uuid.UUID
+	ModuleCount int
+}
+
+// AppBaseSnapshot is the in-memory form of a ms_billing.app_base_snapshots
+// row (migration 028): what one charge leg actually billed one app for one
+// period. PeriodStart/PeriodEnd are the FULL anchored window — period_start
+// is the display lookup key — and for a proration snapshot BaseMicros is the
+// PRORATED partial-window amount actually invoiced. GetAppBill prefers these
+// rows over the live-count math so a later SyncAppModules can never drift the
+// displayed base away from what was invoiced.
+type AppBaseSnapshot struct {
+	AppID       uuid.UUID
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	ModuleCount int
+	BaseMicros  int64
 }
 
 // AppMirror is the in-memory form of a ms_billing.apps roster row (migration
@@ -775,7 +817,7 @@ func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID uuid.UU
 	_, err := s.q.InsertAppMirror(ctx, db.InsertAppMirrorParams{
 		AppID:       appID.String(),
 		AccountID:   accountID.String(),
-		ModuleCount: int32(moduleCount), //nolint:gosec // service validates 0 ≤ count well below int32
+		ModuleCount: int32(moduleCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
 		CreatedAt:   createdAt,
 	})
 	return err
@@ -824,7 +866,7 @@ func (s *pgxStore) SetAppModuleCount(ctx context.Context, appID uuid.UUID, modul
 	// checked by the service via AppMirror, so this is a legitimate no-op.
 	_, err := s.q.SetAppModuleCount(ctx, db.SetAppModuleCountParams{
 		AppID:       appID.String(),
-		ModuleCount: int32(moduleCount), //nolint:gosec // service validates 0 ≤ count well below int32
+		ModuleCount: int32(moduleCount), //nolint:gosec // SyncAppModules validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
 	})
 	return err
 }
@@ -835,16 +877,46 @@ func (s *pgxStore) MarkAppDeleted(ctx context.Context, appID uuid.UUID) error {
 	return err
 }
 
-func (s *pgxStore) LiveAppModuleCounts(ctx context.Context, accountID uuid.UUID) ([]int, error) {
-	rows, err := s.q.LiveAppModuleCounts(ctx, accountID.String())
+func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error) {
+	rows, err := s.q.LiveAppModuleCountsCreatedBefore(ctx, db.LiveAppModuleCountsCreatedBeforeParams{
+		AccountID: accountID.String(),
+		CreatedAt: createdBefore,
+	})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]int, 0, len(rows))
-	for _, c := range rows {
-		out = append(out, int(c))
+	out := make([]AppModuleCount, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount)})
 	}
 	return out, nil
+}
+
+func (s *pgxStore) UpsertProrationBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error {
+	return s.q.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+		AppID:       snap.AppID.String(),
+		PeriodStart: snap.PeriodStart,
+		PeriodEnd:   snap.PeriodEnd,
+		ModuleCount: int32(snap.ModuleCount), //nolint:gosec // count comes from the apps row, whose writers (RegisterApp/SyncAppModules) validate 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
+		BaseMicros:  snap.BaseMicros,
+	})
+}
+
+func (s *pgxStore) InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error {
+	// 0 rows = ON CONFLICT DO NOTHING kept an existing row (a proration
+	// snapshot, or a prior reclaimed attempt's write) — success either way.
+	_, err := s.q.InsertAdvanceBaseSnapshot(ctx, db.InsertAdvanceBaseSnapshotParams{
+		AppID:       snap.AppID.String(),
+		PeriodStart: snap.PeriodStart,
+		PeriodEnd:   snap.PeriodEnd,
+		ModuleCount: int32(snap.ModuleCount), //nolint:gosec // count comes from the apps row, whose writers (RegisterApp/SyncAppModules) validate 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
+		BaseMicros:  snap.BaseMicros,
+	})
+	return err
 }
 
 // parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc

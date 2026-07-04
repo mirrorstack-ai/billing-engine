@@ -179,6 +179,27 @@ type Store interface {
 	// Deleted rows ARE returned (found=true) — deletion semantics are the
 	// caller's, not the read's.
 	AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInfo, bool, error)
+
+	// AppBaseSnapshot reads the frozen per-app-period base charge written by
+	// the charge legs (ms_billing.app_base_snapshots, migration 028) for the
+	// period starting EXACTLY at periodStart — the AUTHORITATIVE display value
+	// for a charged period's 基本費用: what the invoice actually billed,
+	// immune to later SyncAppModules count drift. found=false → the period was
+	// never base-charged (pre-feature history, an unactivated account, or an
+	// in-progress creation period not yet prorated) and the caller falls back
+	// to the live-count DISPLAY ESTIMATE.
+	AppBaseSnapshot(ctx context.Context, appID uuid.UUID, periodStart time.Time) (AppBaseSnapshotInfo, bool, error)
+}
+
+// AppBaseSnapshotInfo is the display-read projection of a
+// ms_billing.app_base_snapshots row (migration 028): the module_count the
+// charge tiered on and the base amount (integer micros) actually invoiced for
+// the app-period. Source is 'proration' (RegisterApp's creation charge — the
+// prorated partial-window amount) or 'advance' (the boundary leg's full base).
+type AppBaseSnapshotInfo struct {
+	ModuleCount int
+	BaseMicros  int64
+	Source      string
 }
 
 // AppMirrorInfo is the display-read projection of a ms_billing.apps roster row
@@ -511,6 +532,24 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInf
 		CreatedAt:   row.CreatedAt,
 		Deleted:     row.DeletedAt.Valid,
 		DeletedAt:   row.DeletedAt.Time,
+	}, true, nil
+}
+
+func (s *pgxStore) AppBaseSnapshot(ctx context.Context, appID uuid.UUID, periodStart time.Time) (AppBaseSnapshotInfo, bool, error) {
+	row, err := s.q.SelectAppBaseSnapshot(ctx, db.SelectAppBaseSnapshotParams{
+		AppID:       appID.String(),
+		PeriodStart: periodStart,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AppBaseSnapshotInfo{}, false, nil // never base-charged → live estimate
+	}
+	if err != nil {
+		return AppBaseSnapshotInfo{}, false, err
+	}
+	return AppBaseSnapshotInfo{
+		ModuleCount: int(row.ModuleCount),
+		BaseMicros:  row.BaseMicros,
+		Source:      row.Source,
 	}, true, nil
 }
 

@@ -354,6 +354,16 @@ type MsBillingApp struct {
 	UpdatedAt          time.Time          `json:"updated_at"`
 }
 
+type MsBillingAppBaseSnapshot struct {
+	AppID       string    `json:"app_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	ModuleCount int32     `json:"module_count"`
+	BaseMicros  int64     `json:"base_micros"`
+	Source      string    `json:"source"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type MsBillingBillingPeriod struct {
 	ID          string                       `json:"id"`
 	AccountID   string                       `json:"account_id"`

@@ -81,18 +81,33 @@ func TestAppsMirror_Integration_LiveRosterScan(t *testing.T) {
 
 	acct, other := seedAccount(t, pool), seedAccount(t, pool)
 	created := mustTime(t, "2026-06-01T00:00:00Z")
+	newPeriodStart := mustTime(t, "2026-07-01T00:00:00Z")
 
-	live1, live2, dead := uuid.New(), uuid.New(), uuid.New()
+	live1, live2, dead, late := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	require.NoError(t, store.InsertAppMirror(ctx, live1, acct, 0, created))
 	require.NoError(t, store.InsertAppMirror(ctx, live2, acct, 6, created))
 	require.NoError(t, store.InsertAppMirror(ctx, dead, acct, 9, created))
 	require.NoError(t, store.MarkAppDeleted(ctx, dead))
 	require.NoError(t, store.InsertAppMirror(ctx, uuid.New(), other, 3, created)) // another account's app
+	// Created INSIDE the new period (on the cutoff instant is also out — the
+	// comparison is strict): its new-period base belongs to the RegisterApp
+	// proration leg, never this boundary's advance sum.
+	require.NoError(t, store.InsertAppMirror(ctx, late, acct, 4, mustTime(t, "2026-07-01T10:00:00Z")))
 
-	counts, err := store.LiveAppModuleCounts(ctx, acct)
+	apps, err := store.LiveAppsCreatedBefore(ctx, acct, newPeriodStart)
 	require.NoError(t, err)
+	counts := make([]int, 0, len(apps))
+	for _, a := range apps {
+		require.Contains(t, []uuid.UUID{live1, live2}, a.AppID)
+		counts = append(counts, a.ModuleCount)
+	}
 	require.ElementsMatch(t, []int{0, 6}, counts,
-		"deleted apps and other accounts' apps never enter the advance-base sum")
+		"deleted apps, other accounts' apps, and apps created inside the new period never enter the advance-base sum")
+
+	// At the NEXT boundary the late app pre-exists the newer period and joins.
+	apps, err = store.LiveAppsCreatedBefore(ctx, acct, mustTime(t, "2026-08-01T00:00:00Z"))
+	require.NoError(t, err)
+	require.Len(t, apps, 3)
 
 	// EnsureAccountForUser: get-or-create resolves the SAME account twice.
 	userID := uuid.New()

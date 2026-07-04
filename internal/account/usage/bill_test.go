@@ -626,3 +626,76 @@ func TestGetAppBill_InternalOnAppMirrorError(t *testing.T) {
 	_, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
 	requireCode(t, err, billing.CodeInternal)
 }
+
+// --- GetAppBill: charged-period base from app_base_snapshots (migration 028) ---
+
+func TestGetAppBill_SnapshotFreezesChargedPeriodBaseAfterSync(t *testing.T) {
+	// FINDING-3 pin ("display and invoices must never disagree"): the period
+	// was CHARGED at module_count 5 (advance snapshot base = flat $20), then
+	// SyncAppModules moved the mirror to 8. The charged period must still show
+	// the count-5 base the invoice billed — while the NEXT (un-snapshotted)
+	// period's estimate uses the current count 8 (base $20 + 3×$3 = $29).
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store) // frozen [May 1, Jun 1)
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 8, // AFTER the later sync
+		CreatedAt:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+	}
+	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
+		ModuleCount: 5,
+		BaseMicros:  usage.AppBaseFeeMicros(usage.BaseFeeMicros, 5), // what the boundary actually invoiced
+		Source:      "advance",
+	}
+
+	// The charged period displays the frozen count-5 base, NOT a recompute
+	// from the mirror's current count 8.
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
+	require.NoError(t, err)
+	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "charged period shows what was invoiced (count 5 → flat base)")
+
+	// The CURRENT period has no snapshot yet → live ESTIMATE from the synced
+	// count 8.
+	resp, err = newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app})
+	require.NoError(t, err)
+	require.Equal(t, usage.BaseFeeMicros+3*usage.ModuleOverageFeeMicros, resp.BaseFeeMicros,
+		"un-snapshotted period estimates from the current count 8")
+}
+
+func TestGetAppBill_ProrationSnapshotFreezesCreationPeriodBase(t *testing.T) {
+	// FINDING-3 pin, proration flavor: the creation period was charged the
+	// PRORATED base (created May 22 of [May 1, Jun 1) at count 0 →
+	// round_half_up(20e6 × 10/31) = 6_451_613, frozen by RegisterApp). A later
+	// sync to 8 modules must not move the displayed creation-period base —
+	// pre-028 the display recomputed ProratedBaseMicros from the CURRENT count
+	// (→ 9_354_839) and disagreed with the invoice.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 8, // synced up after creation
+		CreatedAt:   time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC),
+	}
+	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
+		ModuleCount: 0,
+		BaseMicros:  6_451_613, // what the proration invoice actually charged
+		Source:      "proration",
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
+	require.NoError(t, err)
+	require.EqualValues(t, 6_451_613, resp.BaseFeeMicros, "creation period keeps the prorated base it was invoiced")
+}
+
+func TestGetAppBill_InternalOnBaseSnapshotError(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errBaseSnapshot = errors.New("boom")
+	_, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
+	requireCode(t, err, billing.CodeInternal)
+}

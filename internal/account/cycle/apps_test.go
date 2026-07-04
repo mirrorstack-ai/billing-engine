@@ -73,6 +73,16 @@ func TestRegisterApp_ChargesCreationProration(t *testing.T) {
 	require.Equal(t, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), mirror.PeriodStart)
 	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
 	require.Equal(t, sc.invoiceID, store.apps[appID].ProrationInvoiceID)
+
+	// And the migration-028 snapshot froze EXACTLY what was billed, keyed by
+	// the FULL anchored period start (the display identity), with the
+	// prorated partial-window amount.
+	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}]
+	require.True(t, ok, "the proration leg must freeze its charged base")
+	require.Equal(t, "proration", snap.source)
+	require.EqualValues(t, 2_000_000, snap.snap.BaseMicros)
+	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), snap.snap.PeriodEnd)
+	require.Equal(t, 0, snap.snap.ModuleCount)
 }
 
 func TestRegisterApp_ProrationIncludesModuleOverage(t *testing.T) {
@@ -194,8 +204,16 @@ func TestRegisterApp_NoUsablePMRowButNoInvoice(t *testing.T) {
 	require.Empty(t, sc.itemCalls)
 }
 
-func TestRegisterApp_ZeroRemainingDaysNoInvoice(t *testing.T) {
-	// Created ON the period end boundary → 0 remaining days → row, no invoice.
+func TestRegisterApp_CreatedOnBoundaryChargesNewPeriodFullBase(t *testing.T) {
+	// Created exactly ON the anchor boundary instant (Jul 4 00:00): half-open
+	// windows put the creation in the NEW period [Jul 4, Aug 4), so the
+	// proration leg charges the FULL new-period base ($20 → 2000 cents). This
+	// is the fix direction of the charge-leg overlap review: the Jul-4
+	// boundary's advance leg EXCLUDES apps with created_at ≥ Jul 4, so if
+	// RegisterApp skipped here the app's first period would never be
+	// base-charged (a revenue leak); charging it here bills it exactly once.
+	// (Pre-fix this recomputed 0 remaining days against the OLD window and
+	// charged nothing, leaving the period to the advance leg's roster scan.)
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
@@ -207,9 +225,76 @@ func TestRegisterApp_ZeroRemainingDaysNoInvoice(t *testing.T) {
 		CreatedAt:   time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
+	require.EqualValues(t, 2_000, resp.ProrationCents, "creation-day == period start → full base")
+	require.Len(t, sc.itemCalls, 1)
+
+	// Mirrored with the FULL new window (partial start == period start) and
+	// the snapshot frozen for [Jul 4, Aug 4).
+	mirror := store.invoices[sc.invoiceID]
+	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodStart)
+	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
+	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)}]
+	require.True(t, ok, "the proration leg must freeze the charged base")
+	require.Equal(t, "proration", snap.source)
+	require.EqualValues(t, usage.BaseFeeMicros, snap.snap.BaseMicros)
+}
+
+func TestRegisterApp_RetryAfterCreationPeriodClosedNeverCharges(t *testing.T) {
+	// FINDING-1 pin: a RegisterApp retry that lands AFTER the creation period
+	// closed must NOT charge — the proration window is derived from the mirror
+	// row's created_at (May 20 → [May 4, Jun 4)), that window ended before now
+	// (Jul 1), and every later period belongs to the boundary advance leg
+	// (which already billed [Jun 4, Jul 4) for pre-existing apps). Pre-fix the
+	// window was recomputed from NOW, ProratedBaseMicros saw creation-day ≤
+	// period start, and the retry double-charged the FULL current-period base.
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	req := cycle.RegisterAppRequest{
+		OwnerUserID: user,
+		AppID:       appID,
+		CreatedAt:   time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC), // period [May 4, Jun 4) — long closed at appsNow (Jul 1)
+	}
+
+	resp, err := svc.RegisterApp(context.Background(), req)
+	require.NoError(t, err)
+
+	// Row recorded, NO charge, guard UNARMED, no snapshot.
 	require.Contains(t, store.apps, appID)
 	require.Empty(t, resp.ProrationInvoiceID)
+	require.Empty(t, sc.itemCalls, "a closed creation period must never be prorated late")
+	require.Empty(t, sc.invoiceCalls)
+	require.Empty(t, store.apps[appID].ProrationInvoiceID, "guard stays unarmed")
+	require.Empty(t, store.baseSnapshots)
+
+	// Deterministic: every further retry skips identically (never "eventually
+	// charges").
+	resp, err = svc.RegisterApp(context.Background(), req)
+	require.NoError(t, err)
+	require.Empty(t, resp.ProrationInvoiceID)
 	require.Empty(t, sc.itemCalls)
+	require.Empty(t, store.apps[appID].ProrationInvoiceID)
+}
+
+func TestRegisterApp_CurrentPeriodProrationUnchangedByWindowFix(t *testing.T) {
+	// FINDING-1 regression guard: for an app created in a period that is
+	// still CURRENT, deriving the window from created_at instead of now must
+	// change NOTHING — same window, same 3-day proration, snapshot frozen at
+	// the anchored period start with the prorated amount.
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+
+	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user,
+		AppID:       uuid.New(),
+		CreatedAt:   time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), // inside the current [Jun 4, Jul 4)
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 200, resp.ProrationCents, "3 of 30 days of $20 → 200 cents, exactly as before the fix")
+	require.Len(t, sc.itemCalls, 1)
 }
 
 // --- RegisterApp: account resolution + validation -----------------------------
@@ -243,6 +328,9 @@ func TestRegisterApp_Validation(t *testing.T) {
 		{"org owner (v1 user-only)", cycle.RegisterAppRequest{OwnerOrgID: uuid.New(), AppID: uuid.New()}},
 		{"nil app", cycle.RegisterAppRequest{OwnerUserID: uuid.New()}},
 		{"negative module count", cycle.RegisterAppRequest{OwnerUserID: uuid.New(), AppID: uuid.New(), ModuleCount: -1}},
+		// FINDING-4 pin: a count past the cap must be rejected loudly, never
+		// silently truncated at the int32 store boundary.
+		{"module count over cap", cycle.RegisterAppRequest{OwnerUserID: uuid.New(), AppID: uuid.New(), ModuleCount: 100_001}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := svc.RegisterApp(context.Background(), tc.req)
@@ -328,16 +416,27 @@ func TestSyncAppModules_UnknownAppNotFound(t *testing.T) {
 
 	_, err = svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: uuid.New(), ModuleCount: intPtr(-2)})
 	requireCode(t, err, billing.CodeInvalidInput)
+
+	// FINDING-4 pin (both RPCs): module_count 100001 → invalid_input, never a
+	// silent int32 truncation.
+	_, err = svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: uuid.New(), ModuleCount: intPtr(100_001)})
+	requireCode(t, err, billing.CodeInvalidInput)
 }
 
 // --- RunBillingCycle: boundary invoice = usage arrears + advance base ---------
 
 // seedApp inserts a roster row directly (the boundary leg reads the roster
-// regardless of how it was written).
+// regardless of how it was written), created well before the test periods so
+// it always counts as pre-existing at the [Jun 1, Jul 1) boundary.
 func seedApp(store *fakeStore, accountID uuid.UUID, moduleCount int, deleted bool) uuid.UUID {
+	return seedAppCreated(store, accountID, moduleCount, deleted, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+}
+
+// seedAppCreated is seedApp with an explicit created_at — the advance leg's
+// created-before-the-new-period cutoff pivots on it.
+func seedAppCreated(store *fakeStore, accountID uuid.UUID, moduleCount int, deleted bool, createdAt time.Time) uuid.UUID {
 	id := uuid.New()
-	app := cycle.AppMirror{AppID: id, AccountID: accountID, ModuleCount: moduleCount,
-		CreatedAt: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)}
+	app := cycle.AppMirror{AppID: id, AccountID: accountID, ModuleCount: moduleCount, CreatedAt: createdAt}
 	if deleted {
 		app.Deleted = true
 		app.DeletedAt = time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
@@ -353,8 +452,8 @@ func TestRunBillingCycle_InvoicesUsagePlusAdvanceBase(t *testing.T) {
 	store.chargedTotal = 1_000_000
 	store.hasPM = true
 	store.stripeCustomer = "cus_base_1"
-	seedApp(store, chargeAccount, 0, false)
-	seedApp(store, chargeAccount, 6, false)
+	flat := seedApp(store, chargeAccount, 0, false)
+	tiered := seedApp(store, chargeAccount, 6, false)
 	sc := newFakeStripe()
 
 	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
@@ -365,6 +464,19 @@ func TestRunBillingCycle_InvoicesUsagePlusAdvanceBase(t *testing.T) {
 	require.EqualValues(t, 4_400, resp.ChargedCents)
 	require.Len(t, sc.itemCalls, 1, "usage + base pool into ONE line on ONE invoice")
 	require.EqualValues(t, 4_400, sc.itemCalls[0].amountCfg)
+
+	// The advance leg froze one migration-028 snapshot per billed app for the
+	// NEW window [Jul 1, Aug 1) — count + base as invoiced, so the display can
+	// never drift after later syncs.
+	fs, ok := store.baseSnapshots[snapKey{flat, periodEnd}]
+	require.True(t, ok)
+	require.Equal(t, "advance", fs.source)
+	require.EqualValues(t, usage.BaseFeeMicros, fs.snap.BaseMicros)
+	require.Equal(t, periodEnd.AddDate(0, 1, 0), fs.snap.PeriodEnd)
+	ts, ok := store.baseSnapshots[snapKey{tiered, periodEnd}]
+	require.True(t, ok)
+	require.EqualValues(t, 23_000_000, ts.snap.BaseMicros)
+	require.Equal(t, 6, ts.snap.ModuleCount)
 }
 
 func TestRunBillingCycle_BaseOnlyInvoiceWhenNoUsage(t *testing.T) {
@@ -436,16 +548,116 @@ func TestRunBillingCycle_OtherAccountsAppsDoNotBill(t *testing.T) {
 	require.Empty(t, sc.invoiceCalls)
 }
 
+func TestRunBillingCycle_ExcludesAppCreatedInsideNewPeriod(t *testing.T) {
+	// FINDING-2 pin (same-day race): the boundary closing [Jun 1, Jul 1) bills
+	// the NEW period [Jul 1, Aug 1) in advance — but ONLY for apps that
+	// existed before Jul 1. An app created Jul 1 10:00 (inside the new period)
+	// already had its new-period base charged by RegisterApp's proration leg,
+	// so the advance leg must NOT add it again; it joins at the NEXT boundary.
+	store := newFakeStore()
+	store.chargedTotal = 0
+	store.hasPM = true
+	store.stripeCustomer = "cus_cutoff_1"
+	seedApp(store, chargeAccount, 0, false)                                               // pre-existing → counts
+	newApp := seedAppCreated(store, chargeAccount, 6, false, periodEnd.Add(10*time.Hour)) // inside the new period → excluded
+	sc := newFakeStripe()
+	svc := chargeSvc(store, sc)
+
+	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, usage.BaseFeeMicros, resp.AdvanceBaseMicros,
+		"only the pre-existing app's base — the new app's new-period base is the proration leg's")
+	require.EqualValues(t, 2_000, resp.ChargedCents)
+
+	// And no advance snapshot was minted for the excluded app (nothing was
+	// billed for it at this boundary).
+	_, ok := store.baseSnapshots[snapKey{newApp, periodEnd}]
+	require.False(t, ok)
+
+	// NEXT boundary (closing [Jul 1, Aug 1)): the app now pre-exists the newer
+	// period and joins the advance leg — billed exactly once, never twice.
+	resp, err = svc.RunBillingCycle(context.Background(), chargeAccount, periodEnd, periodEnd.AddDate(0, 1, 0), 0)
+	require.NoError(t, err)
+	require.EqualValues(t, usage.BaseFeeMicros+usage.AppBaseFeeMicros(usage.BaseFeeMicros, 6), resp.AdvanceBaseMicros,
+		"the new app joins the advance leg at the NEXT boundary")
+}
+
+func TestRunBillingCycle_ReclaimedRunNoDoubleBase(t *testing.T) {
+	// FINDING-2 pin (deterministic reclaim path): boundary run skipped_no_pm →
+	// the owner binds a PM → an app is created MID-NEW-PERIOD and RegisterApp
+	// charges its proration → the skipped run is RECLAIMED. The reclaimed
+	// advance leg must count ONLY the pre-existing app: pre-fix it summed the
+	// whole live roster and re-billed the new app's period on top of the
+	// proration — a guaranteed double charge.
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = false // cycle 1: no PM → skipped_no_pm
+	store.stripeCustomer = "cus_reclaim_base"
+	user, acct := uuid.New(), uuid.New()
+	store.accountsByUser[user] = acct
+	store.activation[acct] = time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC) // anchor day 1 → [Jun 1, Jul 1), [Jul 1, Aug 1)
+	preApp := seedAppCreated(store, acct, 0, false, time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC))
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc).WithNow(func() time.Time {
+		return time.Date(2026, 7, 2, 13, 0, 0, 0, time.UTC)
+	})
+
+	first, err := svc.RunBillingCycle(context.Background(), acct, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusSkippedNoPM, first.Status)
+	require.Empty(t, sc.invoiceCalls)
+
+	// PM bound; an app is created Jul 2 (inside the new period [Jul 1, Aug 1))
+	// and RegisterApp prorates it: 30 of 31 days of $20 → 19_354_839 micros.
+	store.hasPM = true
+	newApp := uuid.New()
+	reg, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user,
+		AppID:       newApp,
+		CreatedAt:   time.Date(2026, 7, 2, 10, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1_935, reg.ProrationCents)
+	require.Len(t, sc.invoiceCalls, 1)
+
+	// Reclaim: the advance leg bills ONLY the pre-existing app's base.
+	second, err := svc.RunBillingCycle(context.Background(), acct, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.True(t, second.FirstRun, "skipped_no_pm is reclaimed")
+	require.Equal(t, cycle.RunStatusInvoiced, second.Status)
+	require.EqualValues(t, usage.BaseFeeMicros, second.AdvanceBaseMicros,
+		"the reclaimed run must NOT re-bill the prorated app's period")
+	require.EqualValues(t, 2_100, second.ChargedCents) // 1e6 arrears + 20e6 base
+
+	// Exactly ONE proration invoice + ONE boundary invoice — never a third.
+	require.Len(t, sc.invoiceCalls, 2)
+
+	// Snapshot ledger for the new period [Jul 1, Aug 1): the proration row for
+	// the new app + the advance row for the pre-existing app — one row per
+	// app-period, each recording exactly what its leg billed.
+	jul1 := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	pro, ok := store.baseSnapshots[snapKey{newApp, jul1}]
+	require.True(t, ok)
+	require.Equal(t, "proration", pro.source)
+	require.EqualValues(t, 19_354_839, pro.snap.BaseMicros)
+	adv, ok := store.baseSnapshots[snapKey{preApp, jul1}]
+	require.True(t, ok)
+	require.Equal(t, "advance", adv.source)
+	require.EqualValues(t, usage.BaseFeeMicros, adv.snap.BaseMicros)
+	require.Len(t, store.baseSnapshots, 2)
+}
+
 func TestAccountHasLiveApps(t *testing.T) {
 	store := newFakeStore()
 	svc := cycle.NewService(store, nil)
+	newPeriodStart := periodEnd // the gate's cutoff is the NEW period's start
 
-	has, err := svc.AccountHasLiveApps(context.Background(), chargeAccount)
+	has, err := svc.AccountHasLiveApps(context.Background(), chargeAccount, newPeriodStart)
 	require.NoError(t, err)
 	require.False(t, has, "empty roster (pre-backfill) → no boundary run for a no-usage period")
 
 	appID := seedApp(store, chargeAccount, 0, false)
-	has, err = svc.AccountHasLiveApps(context.Background(), chargeAccount)
+	has, err = svc.AccountHasLiveApps(context.Background(), chargeAccount, newPeriodStart)
 	require.NoError(t, err)
 	require.True(t, has)
 
@@ -453,7 +665,15 @@ func TestAccountHasLiveApps(t *testing.T) {
 	app := store.apps[appID]
 	app.Deleted = true
 	store.apps[appID] = app
-	has, err = svc.AccountHasLiveApps(context.Background(), chargeAccount)
+	has, err = svc.AccountHasLiveApps(context.Background(), chargeAccount, newPeriodStart)
 	require.NoError(t, err)
 	require.False(t, has)
+
+	// An app created INSIDE the new period does not arm the gate either: its
+	// new-period base is the RegisterApp proration leg's, so a no-usage
+	// account with only such apps keeps the historical skip.
+	seedAppCreated(store, chargeAccount, 0, false, periodEnd.Add(6*time.Hour))
+	has, err = svc.AccountHasLiveApps(context.Background(), chargeAccount, newPeriodStart)
+	require.NoError(t, err)
+	require.False(t, has, "apps created in the new period join at the NEXT boundary")
 }

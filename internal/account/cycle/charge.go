@@ -10,6 +10,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/collection"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -28,14 +29,21 @@ import (
 //  3. ADVANCE base leg (base-fee v1, owner spec 2026-07-05): the NEW period's
 //     base fee, billed in advance on the same invoice = Σ over the account's
 //     LIVE ms_billing.apps rows (deleted_at IS NULL — a deleted app stops
-//     accruing base, D1e, though its usage arrears above still bill) of
-//     AppBaseFeeMicros = BaseFee + Overage × max(0, module_count − included).
-//     module_count is snapshotted AT CHARGE TIME (D1b — mid-period installs /
-//     uninstalls take effect at this boundary, never mid-period). The
-//     allowance nets USAGE only, never the base (it offsets ModuleUsage+Infra
-//     in the display math too). An account with NO mirror rows (pre-backfill)
-//     gets base 0 — exactly the pre-027 arrears-only invoice — until the
-//     api-platform backfill populates the roster.
+//     accruing base, D1e, though its usage arrears above still bill) that
+//     EXISTED BEFORE the new period opened (created_at < the closed window's
+//     period_end) of AppBaseFeeMicros = BaseFee + Overage × max(0,
+//     module_count − included). An app created INSIDE the new period is
+//     excluded — RegisterApp's creation-proration leg already charged its
+//     new-period base (full or prorated); it joins the advance leg at the
+//     NEXT boundary. module_count is snapshotted AT CHARGE TIME (D1b —
+//     mid-period installs / uninstalls take effect at this boundary, never
+//     mid-period), and each billed app-period is frozen into
+//     ms_billing.app_base_snapshots (migration 028) so the display always
+//     shows what was invoiced. The allowance nets USAGE only, never the base
+//     (it offsets ModuleUsage+Infra in the display math too). An account with
+//     NO mirror rows (pre-backfill) gets base 0 — exactly the pre-027
+//     arrears-only invoice — until the api-platform backfill populates the
+//     roster.
 //  4. arrears + base == 0 (BOTH zero) → MarkBillingRun('invoiced') with NO
 //     Stripe call. We NEVER auto-create a Stripe Customer with nothing to
 //     charge (design §4 Axis 4).
@@ -120,16 +128,23 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 
 	// ADVANCE base leg: the NEW period's base fee for every LIVE app on the
-	// roster, snapshotted at charge time (D1b/D1e — see the method comment).
+	// roster that EXISTED BEFORE the new period opened (created_at < periodEnd
+	// — the closed window's end IS the new period's start), snapshotted at
+	// charge time (D1b/D1e — see the method comment). An app created INSIDE
+	// the new period is EXCLUDED: RegisterApp's creation-proration leg already
+	// charged its new-period base (full or prorated), so adding it here would
+	// double-bill the same period — on the same-day cron race, and
+	// deterministically whenever a skipped_no_pm/failed run is reclaimed after
+	// the app registered. It joins the advance leg at the NEXT boundary.
 	// Deleted apps drop out of the base but their usage arrears (already in
 	// `total` above) still bill. Empty roster (pre-backfill) → base 0.
-	counts, err := s.store.LiveAppModuleCounts(ctx, accountID)
+	apps, err := s.store.LiveAppsCreatedBefore(ctx, accountID, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("live app roster read failed", err)
 	}
 	var advanceBase int64
-	for _, c := range counts {
-		advanceBase += usage.AppBaseFeeMicros(usage.BaseFeeMicros, c)
+	for _, a := range apps {
+		advanceBase += usage.AppBaseFeeMicros(usage.BaseFeeMicros, a.ModuleCount)
 	}
 
 	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase}
@@ -234,6 +249,24 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("account has a usable PM but no Stripe customer id", nil)
 	}
 
+	// Resolve the NEW period's window for the base snapshots BEFORE any Stripe
+	// call (fail early on a lookup error). periodEnd is always the anchored
+	// boundary (the straddle-clamp only ever moves the START), so the new
+	// window is AnchoredPeriodWindow(periodEnd, anchorDay) = [periodEnd, next
+	// boundary). The anchor day comes from activated_at (ADR 0005); the
+	// boundary's own day-of-month is the defensive fallback for the
+	// direct-call-on-an-unactivated-account case the cron never produces.
+	var newPeriodEnd time.Time
+	if len(apps) > 0 {
+		anchorDay := billingperiod.AnchorDay(periodEnd)
+		if activatedAt, activated, err := s.store.AccountActivation(ctx, accountID); err != nil {
+			return nil, billing.Internal("account activation lookup failed", err)
+		} else if activated {
+			anchorDay = billingperiod.AnchorDay(activatedAt)
+		}
+		_, newPeriodEnd = billingperiod.AnchoredPeriodWindow(periodEnd, anchorDay)
+	}
+
 	// One invoice, one pooled line: closed period's netted usage arrears + the
 	// new period's advance base, converted micros → whole cents ONCE at the
 	// Stripe boundary (a single deterministic rounding point for the total).
@@ -267,6 +300,25 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		PeriodEnd:       periodEnd,
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
+	}
+
+	// Freeze what this boundary actually billed per app for the NEW window
+	// (migration 028, source='advance'): the display's authoritative base for
+	// the period, so a later SyncAppModules can never drift the shown base
+	// away from this invoice. ON CONFLICT (app_id, period_start) DO NOTHING —
+	// an existing proration row wins. A failure here leaves the run 'pending';
+	// the reclaim re-charges through the SAME Stripe idem keys and re-writes
+	// idempotently, so money and snapshots can never diverge.
+	for _, a := range apps {
+		if err := s.store.InsertAdvanceBaseSnapshot(ctx, AppBaseSnapshot{
+			AppID:       a.AppID,
+			PeriodStart: periodEnd, // the new period opens where the closed one ends
+			PeriodEnd:   newPeriodEnd,
+			ModuleCount: a.ModuleCount,
+			BaseMicros:  usage.AppBaseFeeMicros(usage.BaseFeeMicros, a.ModuleCount),
+		}); err != nil {
+			return nil, billing.Internal("advance base snapshot insert failed", err)
+		}
 	}
 
 	if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, inv.ID, cents); err != nil {
@@ -326,19 +378,24 @@ func (s *Service) AccountsWithUnbilledUsage(ctx context.Context, periodStart, pe
 }
 
 // AccountHasLiveApps reports whether the account has at least one LIVE
-// (non-deleted) ms_billing.apps roster row — cmd/billing-cycle's gate for
-// running the boundary charge on a NO-USAGE period: an account with live apps
-// still owes the advance base fee, while a no-usage, no-apps (pre-backfill)
-// account keeps the historical skip (no billing_run at all).
-func (s *Service) AccountHasLiveApps(ctx context.Context, accountID uuid.UUID) (bool, error) {
+// (non-deleted) ms_billing.apps roster row created BEFORE createdBefore (the
+// NEW period's start, i.e. the closed window's period_end) — cmd/billing-
+// cycle's gate for running the boundary charge on a NO-USAGE period: an
+// account with live pre-existing apps still owes the advance base fee, while
+// a no-usage, no-apps (pre-backfill) account keeps the historical skip (no
+// billing_run at all). Apps created INSIDE the new period don't arm the gate:
+// their new-period base is RegisterApp's proration leg's, and they join the
+// advance leg at the NEXT boundary — running a boundary for them here would
+// only mint a zero-charge run row.
+func (s *Service) AccountHasLiveApps(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) (bool, error) {
 	if accountID == uuid.Nil {
 		return false, billing.InvalidInput("account_id required")
 	}
-	counts, err := s.store.LiveAppModuleCounts(ctx, accountID)
+	apps, err := s.store.LiveAppsCreatedBefore(ctx, accountID, createdBefore)
 	if err != nil {
 		return false, billing.Internal("live app roster read failed", err)
 	}
-	return len(counts) > 0, nil
+	return len(apps) > 0, nil
 }
 
 // ActivatedAccounts returns every card-bound account with its billing-period
