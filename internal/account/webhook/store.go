@@ -254,6 +254,11 @@ func (s *pgxStore) ResolvePendingAddCardRequest(ctx context.Context, stripePayme
 //
 // Amounts are whole cents (Stripe minor units) encoded as the NUMERIC the
 // invoices money columns expect — never float.
+//
+// The presentment fields (number / hosted_invoice_url / invoice_pdf,
+// migration 026) pass through as plain strings: the query's
+// COALESCE(NULLIF(new, ”), old) turns "" into "keep the stored value", so
+// the Go layer never needs a nullable type for them.
 func (s *pgxStore) ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceStatusParams) (bool, error) {
 	paid, err := centsNumeric(params.AmountPaidCents)
 	if err != nil {
@@ -264,10 +269,13 @@ func (s *pgxStore) ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceSt
 		return false, err
 	}
 	rows, err := s.q.ApplyInvoiceStatus(ctx, db.ApplyInvoiceStatusParams{
-		StripeInvoiceID: params.StripeInvoiceID,
-		Status:          params.Status,
-		AmountPaid:      paid,
-		AmountDue:       due,
+		StripeInvoiceID:  params.StripeInvoiceID,
+		Status:           params.Status,
+		AmountPaid:       paid,
+		AmountDue:        due,
+		Number:           params.Number,
+		HostedInvoiceUrl: params.HostedInvoiceURL,
+		InvoicePdf:       params.InvoicePDF,
 	})
 	if err != nil {
 		return false, err

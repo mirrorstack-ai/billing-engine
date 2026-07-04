@@ -355,6 +355,56 @@ func TestPgxStore_ApplyInvoiceStatus_IdempotentReplay(t *testing.T) {
 	require.Equal(t, "paid", readInvoiceStatus(t, pool, "in_replay"))
 }
 
+func TestPgxStore_ApplyInvoiceStatus_PresentmentEnrichment_SetNeverCleared(t *testing.T) {
+	// Migration 026 semantics: the presentment fields land when an event
+	// carries them (finalized) and are NEVER cleared by a later event whose
+	// payload omits them — COALESCE(NULLIF(new,''), old) keeps the stored
+	// values while the status still advances.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_inv_pres")
+	seedInvoice(t, pool, accountID, "in_pres", "draft", 0, 1200)
+	ctx := context.Background()
+
+	// Pre-finalization event: no presentment fields → columns stay NULL.
+	found, err := store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_pres", Status: "draft", AmountPaidCents: 0, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	number, hostedURL, pdf := readInvoicePresentment(t, pool, "in_pres")
+	require.Empty(t, number)
+	require.Empty(t, hostedURL)
+	require.Empty(t, pdf)
+
+	// Finalized: Stripe assigned the fields → they enrich the mirror.
+	found, err = store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_pres", Status: "open", AmountPaidCents: 0, AmountDueCents: 1200,
+		Number:           "813C8918-0001",
+		HostedInvoiceURL: "https://invoice.stripe.com/i/in_pres",
+		InvoicePDF:       "https://pay.stripe.com/invoice/in_pres/pdf",
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	number, hostedURL, pdf = readInvoicePresentment(t, pool, "in_pres")
+	require.Equal(t, "813C8918-0001", number)
+	require.Equal(t, "https://invoice.stripe.com/i/in_pres", hostedURL)
+	require.Equal(t, "https://pay.stripe.com/invoice/in_pres/pdf", pdf)
+
+	// A later event with EMPTY presentment fields advances the status but
+	// must not un-enrich the row.
+	found, err = store.ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: "in_pres", Status: "paid", AmountPaidCents: 1200, AmountDueCents: 1200,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "paid", readInvoiceStatus(t, pool, "in_pres"))
+	number, hostedURL, pdf = readInvoicePresentment(t, pool, "in_pres")
+	require.Equal(t, "813C8918-0001", number, "empty payload value must not clear number")
+	require.Equal(t, "https://invoice.stripe.com/i/in_pres", hostedURL, "empty payload value must not clear hosted_invoice_url")
+	require.Equal(t, "https://pay.stripe.com/invoice/in_pres/pdf", pdf, "empty payload value must not clear invoice_pdf")
+}
+
 func TestPgxStore_ApplyInvoiceStatus_UnknownInvoiceID_NoOp(t *testing.T) {
 	// An event for an invoice the charge spine never mirrored → 0 rows,
 	// found=false, no crash.
@@ -497,6 +547,17 @@ func readInvoiceStatus(t *testing.T, pool *pgxpool.Pool, stripeInvoiceID string)
 		`SELECT status FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
 		stripeInvoiceID).Scan(&status))
 	return status
+}
+
+// readInvoicePresentment reads the migration-026 presentment columns,
+// COALESCEd to "" so NULL and empty assert identically.
+func readInvoicePresentment(t *testing.T, pool *pgxpool.Pool, stripeInvoiceID string) (number, hostedURL, pdf string) {
+	t.Helper()
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT COALESCE(number, ''), COALESCE(hosted_invoice_url, ''), COALESCE(invoice_pdf, '')
+		 FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		stripeInvoiceID).Scan(&number, &hostedURL, &pdf))
+	return number, hostedURL, pdf
 }
 
 func readInvoiceStatusAndPaid(t *testing.T, pool *pgxpool.Pool, stripeInvoiceID string) (string, int64) {

@@ -413,6 +413,12 @@ type MsBillingInvoice struct {
 	PeriodEnd       pgtype.Timestamptz `json:"period_end"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
+	// Stripe customer-facing invoice number, assigned at finalization and immutable afterwards. NULL until a webhook event carrying it lands (drafts + historic pre-026 rows).
+	Number pgtype.Text `json:"number"`
+	// Stripe-hosted invoice page URL (view / pay online). Assigned at finalization; NULL = not yet delivered.
+	HostedInvoiceUrl pgtype.Text `json:"hosted_invoice_url"`
+	// Stripe invoice PDF download URL. Assigned at finalization; NULL = not yet delivered.
+	InvoicePdf pgtype.Text `json:"invoice_pdf"`
 }
 
 type MsBillingMetricDefinition struct {
