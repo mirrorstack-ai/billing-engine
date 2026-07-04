@@ -17,7 +17,22 @@ package cycle
 //
 // An app soft-deleted within grace is thus NEVER charged (the sweep excludes
 // deleted rows), and the charge is race-safe against a concurrent delete via a
-// FOR UPDATE row lock (see ChargeProrationLocked).
+// brief FOR UPDATE row lock that is released BEFORE the Stripe call (see
+// ChargeProrationLocked in store.go).
+//
+// D1d — no retroactive catch-up: an app whose account never activated (or had
+// no usable PM) sits pending on every sweep. If the account only becomes
+// chargeable AFTER the app's anchored creation period has already closed,
+// charging it then would be exactly the retroactive catch-up D1d forbids —
+// ChargeCreationProration detects this (activatedAt at/after the period's end)
+// and PERMANENTLY skips the charge (proration_skipped_at, migration 031)
+// rather than charging it or leaving it pending forever.
+//
+// module_count is a LIVE snapshot SyncAppModules can move at any time,
+// including during grace. The creation-proration charge must never price its
+// historical window off whatever module_count happens to read at sweep time —
+// it prices off created_module_count (migration 030), frozen once at
+// RegisterApp and never touched again.
 
 import (
 	"context"
@@ -59,6 +74,12 @@ const (
 	ProrationStatusNoCharge ProrationStatus = "no_charge"
 	// ProrationStatusNotFound: no roster row for the app id (never registered).
 	ProrationStatusNotFound ProrationStatus = "not_found"
+	// ProrationStatusPeriodClosed: the account only activated at/after the
+	// app's anchored creation period had already closed — charging it now
+	// would be a retroactive catch-up (D1d). PERMANENTLY skipped: the
+	// proration_skipped_at marker is armed so the app never resurfaces on a
+	// later sweep.
+	ProrationStatusPeriodClosed ProrationStatus = "skipped_period_closed"
 )
 
 // ProrationResult reports what ChargeCreationProration did. ProrationInvoiceID is
@@ -111,21 +132,30 @@ type ProrationCharge struct {
 //
 // The amount is the SAME as the pre-grace RegisterApp charge:
 //
-//	ProratedBaseMicros(AppBaseFeeMicros(BaseFeeMicros, module_count),
+//	ProratedBaseMicros(AppBaseFeeMicros(BaseFeeMicros, created_module_count),
 //	                   created_at, the anchored period CONTAINING created_at)
 //
 // anchored to the TRUE created_at (NOT now), so the app pays only for the whole
 // UTC days it existed in its creation period, creation day inclusive — grace
-// only delayed WHEN this fires. It is deliberately NOT gated on whether the
-// creation period has since ended: that period is billed by NO other leg (the
-// boundary advance leg only ever bills an app's SUBSEQUENT periods, never the one
-// containing its creation), so charging it whenever the guard is unarmed is
-// always correct and can never double-bill.
+// only delayed WHEN this fires. created_module_count (migration 030) is the
+// module count FROZEN at RegisterApp time: SyncAppModules can move the LIVE
+// module_count at any point during (or after) grace, but the historical
+// creation-period days billed here must price at the tier that actually
+// applied on those days, never whatever count happens to read at sweep time.
+//
+// It IS gated on whether the account only became chargeable after the
+// creation period had already closed (D1d): that would be a retroactive
+// catch-up charge for time the account was never eligible to be billed for,
+// and is PERMANENTLY skipped rather than charged (see the period-closed check
+// below). Short of that, the creation period is billed by NO other leg (the
+// boundary advance leg only ever bills an app's SUBSEQUENT periods, never the
+// one containing its creation), so charging it whenever the guard is unarmed
+// and the period-closed check passes is correct and can never double-bill.
 //
 // Cheap gates that don't need the row lock (unregistered / already-charged /
-// deleted / unactivated / no-PM) short-circuit first; the actual charge + arm
-// runs under the lock (ChargeProrationLocked), which re-verifies the deleted +
-// guard state authoritatively.
+// deleted / unactivated / period-closed / no-PM) short-circuit first; the
+// actual charge + arm runs under the lock (ChargeProrationLocked), which
+// re-verifies the deleted + guard state authoritatively.
 func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) (*ProrationResult, error) {
 	if appID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
@@ -142,15 +172,19 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	if app.ProrationInvoiceID != "" {
 		return &ProrationResult{AppID: appID, Status: ProrationStatusAlreadyCharged, ProrationInvoiceID: app.ProrationInvoiceID}, nil
 	}
+	// Permanently skipped on a prior sweep (D1d retroactive-catch-up guard,
+	// migration 031) — never re-evaluated.
+	if app.ProrationSkipped {
+		return &ProrationResult{AppID: appID, Status: ProrationStatusPeriodClosed}, nil
+	}
 	// Deleted within grace (or after) → never charged (D1e). The locked section
 	// re-checks this authoritatively; this is the cheap early-out.
 	if app.Deleted {
 		return &ProrationResult{AppID: appID, Status: ProrationStatusDeleted}, nil
 	}
 
-	// Activation + PM gates (D1d), same posture as the boundary spine: an
-	// unactivated account (never bound a card) is never charged, and an activated
-	// one with no usable default PM is skipped and re-attempted next sweep.
+	// Activation gate (D1d), same posture as the boundary spine: an
+	// unactivated account (never bound a card) is never charged.
 	activatedAt, activated, err := s.store.AccountActivation(ctx, app.AccountID)
 	if err != nil {
 		return nil, billing.Internal("account activation lookup failed", err)
@@ -158,6 +192,37 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	if !activated {
 		return &ProrationResult{AppID: appID, Status: ProrationStatusUnactivated}, nil
 	}
+
+	// D1d — no retroactive catch-up: derive the anchored period CONTAINING the
+	// app's created_at from the account's (now-known) activation anchor. If the
+	// account only activated AT OR AFTER that period's end, the account was
+	// unactivated — and therefore never chargeable — for the app's ENTIRE
+	// creation period; charging it now, however late the sweep runs, would be
+	// exactly the retroactive catch-up D1d forbids. Permanently mark it skipped
+	// (never re-evaluated again) rather than charge it, and rather than leaving
+	// it pending forever (proration_invoice_id would stay NULL, so without this
+	// marker AppsPendingProration would resurface it on every future sweep).
+	//
+	// This check deliberately compares against activatedAt, NOT "now": grace +
+	// ordinary sweep cadence can itself push the charge attempt a few days past
+	// this SAME periodEnd for a perfectly healthy, already-activated account
+	// (an app created near its period boundary) — that is expected, intended
+	// delayed billing (still the ONLY leg that ever bills this period), not a
+	// retroactive catch-up, and must still charge normally.
+	_, periodEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
+	if !activatedAt.Before(periodEnd) {
+		if err := s.store.SetAppProrationSkipped(ctx, appID); err != nil {
+			return nil, billing.Internal("mark proration permanently skipped failed", err)
+		}
+		return &ProrationResult{AppID: appID, Status: ProrationStatusPeriodClosed}, nil
+	}
+
+	// PM gate (D1d), same posture as the boundary spine: activated but no
+	// usable default PM is skipped and re-attempted next sweep (unlike the
+	// period-closed case above, "no PM right now" is not itself evidence the
+	// account was ever ineligible for this specific period, so it stays a
+	// transient, retried skip rather than a permanent one — see the judgment
+	// call noted in the PR description for the limits of this).
 	hasPM, err := s.store.HasUsableDefaultPM(ctx, app.AccountID)
 	if err != nil {
 		return nil, billing.Internal("usable PM check failed", err)
@@ -177,17 +242,20 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		return nil, billing.Internal("account has a usable PM but no Stripe customer id", nil)
 	}
 
-	// The charge callback runs INSIDE the locked transaction (ChargeProrationLocked):
-	// the not-deleted re-check, the Stripe charge, and the guard-arm are one atomic
-	// unit so a racing delete and this charge are mutually exclusive (no refund path).
+	// The charge callback runs AFTER the row lock is released (ChargeProrationLocked,
+	// store.go): the not-deleted re-check happens under a brief lock, then the
+	// Stripe charge runs unlocked, then the guard-arm persists the result.
 	var cents int64
 	outcome, invID, err := s.store.ChargeProrationLocked(ctx, appID, func(locked AppMirror) (*ProrationCharge, error) {
 		// Window = the anchored period CONTAINING the app's created_at (ADR 0005
 		// anchor from the activation day). Derived from created_at, NEVER from now,
 		// so the amount is deterministic regardless of when the sweep fires.
 		periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(locked.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
+		// Priced off created_module_count — the count FROZEN at RegisterApp time
+		// — never the live module_count, which SyncAppModules may have moved
+		// during (or since) grace (finding 1: no retroactive tier drift).
 		prorated := usage.ProratedBaseMicros(
-			usage.AppBaseFeeMicros(usage.BaseFeeMicros, locked.ModuleCount),
+			usage.AppBaseFeeMicros(usage.BaseFeeMicros, locked.CreatedModuleCount),
 			locked.CreatedAt, periodStart, periodEnd,
 		)
 		c, err := centsFromMicros(prorated)
@@ -230,7 +298,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				AppID:       locked.AppID,
 				PeriodStart: periodStart,
 				PeriodEnd:   periodEnd,
-				ModuleCount: locked.ModuleCount,
+				ModuleCount: locked.CreatedModuleCount,
 				BaseMicros:  prorated,
 			},
 		}, nil

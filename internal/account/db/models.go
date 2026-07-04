@@ -352,6 +352,10 @@ type MsBillingApp struct {
 	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
 	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
 	UpdatedAt          time.Time          `json:"updated_at"`
+	// Module count frozen at RegisterApp time (immutable — SyncAppModules never writes this column). ChargeCreationProration prices the creation-period window off THIS value, never the live module_count.
+	CreatedModuleCount int32 `json:"created_module_count"`
+	// Set once (never unset) when ChargeCreationProration determines the account only activated at/after this app's anchored creation period had already closed — a would-be retroactive catch-up charge (D1d). The app is permanently excluded from the proration sweep from then on.
+	ProrationSkippedAt pgtype.Timestamptz `json:"proration_skipped_at"`
 }
 
 type MsBillingAppBaseSnapshot struct {

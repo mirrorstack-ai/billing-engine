@@ -5,33 +5,39 @@
 
 -- InsertAppMirror registers an app row idempotently: ON CONFLICT (app_id) DO
 -- NOTHING so a RegisterApp retry (or a concurrent double-fire) never rewrites
--- created_at / module_count / the proration guard of the original insert —
--- the FIRST registration's values are the stable proration anchor. :execrows
--- so the caller can tell a fresh insert (1) from a retry no-op (0), though
--- both are success.
+-- created_at / module_count / created_module_count / the proration guard of
+-- the original insert — the FIRST registration's values are the stable
+-- proration anchor. created_module_count is stamped from the SAME $3 value as
+-- module_count and NEVER written again by any other query (migration 030) —
+-- it is the frozen count ChargeCreationProration prices its historical window
+-- from, immune to a later SyncAppModules install/uninstall during grace.
+-- :execrows so the caller can tell a fresh insert (1) from a retry no-op (0),
+-- though both are success.
 -- name: InsertAppMirror :execrows
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_at)
-VALUES ($1, $2, $3, $4)
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at)
+VALUES ($1, $2, $3, $3, $4)
 ON CONFLICT (app_id) DO NOTHING;
 
 -- SelectAppMirror reads one roster row (deleted or not — the caller decides
 -- what deletion means for its path: SyncAppModules no-ops a count update,
 -- GetAppBill still displays the spent creation-period base).
 -- name: SelectAppMirror :one
-SELECT app_id, account_id, module_count, created_at, proration_invoice_id, deleted_at
+SELECT app_id, account_id, module_count, created_module_count, created_at,
+       proration_invoice_id, proration_skipped_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1;
 
 -- SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
--- the creation-proration charge's race-safety primitive. In ONE transaction the
--- charge locks the row here, re-verifies deleted_at IS NULL and
--- proration_invoice_id IS NULL under the lock, performs the Stripe charge, and
--- arms the guard. A concurrent SyncAppModules soft-delete (MarkAppDeleted) is
--- thereby mutually exclusive: whichever of {delete, charge} commits first wins
--- and the loser blocks on the lock, then sees the winner's write and no-ops — so
--- a within-grace delete can never coincide with a charge (no refund path, D1e).
+-- the creation-proration charge's race-safety primitive. The charge locks the
+-- row here just long enough to re-verify deleted_at IS NULL and
+-- proration_invoice_id IS NULL and read the frozen created_module_count,
+-- releasing the lock immediately after (ChargeProrationLocked runs the actual
+-- Stripe network call OUTSIDE this lock — see store.go); a concurrent
+-- SyncAppModules soft-delete (MarkAppDeleted) only ever contends for the brief
+-- read, never for the duration of a Stripe HTTP call.
 -- name: SelectAppMirrorForUpdate :one
-SELECT app_id, account_id, module_count, created_at, proration_invoice_id, deleted_at
+SELECT app_id, account_id, module_count, created_module_count, created_at,
+       proration_invoice_id, proration_skipped_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE;
@@ -40,15 +46,18 @@ FOR UPDATE;
 -- have survived the grace window ($1 = now() − GraceDays) and were never charged
 -- their creation-period base. proration_invoice_id IS NULL is the one-shot guard
 -- (an already-charged app drops out); deleted_at IS NULL excludes apps
--- soft-deleted within grace (they are NEVER charged). Ordered by created_at so
--- the oldest pending app charges first. Backed by the partial index
--- apps_pending_proration_idx (migration 029).
+-- soft-deleted within grace (they are NEVER charged); proration_skipped_at IS
+-- NULL excludes apps permanently skipped as a would-be retroactive catch-up
+-- (migration 031, D1d). Ordered by created_at so the oldest pending app
+-- charges first. Backed by the partial index apps_pending_proration_idx
+-- (migrations 029/031).
 -- name: AppsPendingProration :many
 SELECT app_id
 FROM ms_billing.apps
 WHERE created_at <= $1
   AND proration_invoice_id IS NULL
   AND deleted_at IS NULL
+  AND proration_skipped_at IS NULL
 ORDER BY created_at;
 
 -- SetAppProrationInvoice arms the ONE-SHOT proration guard: it records the
@@ -60,6 +69,20 @@ ORDER BY created_at;
 UPDATE ms_billing.apps
 SET proration_invoice_id = $2
 WHERE app_id = $1
+  AND proration_invoice_id IS NULL;
+
+-- SetAppProrationSkipped arms the PERMANENT skip marker (migration 031, D1d):
+-- the account only activated at/after this app's anchored creation period had
+-- already closed, so charging it now would be a retroactive catch-up. The
+-- WHERE clause makes it idempotent (a re-evaluation, or a concurrent one,
+-- affects 0 rows once set) and defensively refuses to mark an app that was
+-- somehow already charged in the meantime. :execrows so the caller can
+-- observe (and tolerate) the already-set / already-charged cases.
+-- name: SetAppProrationSkipped :execrows
+UPDATE ms_billing.apps
+SET proration_skipped_at = now()
+WHERE app_id = $1
+  AND proration_skipped_at IS NULL
   AND proration_invoice_id IS NULL;
 
 -- SetAppModuleCount snapshots a new installed-module count (SyncAppModules).

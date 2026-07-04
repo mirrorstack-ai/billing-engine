@@ -102,6 +102,7 @@ type fakeStore struct {
 	errAppInsert        error // InsertAppMirror
 	errAppMirror        error // AppMirror
 	errSetProration     error // SetAppProrationInvoice
+	errSetSkipped       error // SetAppProrationSkipped
 	errSetCount         error // SetAppModuleCount
 	errMarkDeleted      error // MarkAppDeleted
 	errLiveCounts       error // LiveAppsCreatedBefore
@@ -396,7 +397,9 @@ func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUI
 		return nil // ON CONFLICT (app_id) DO NOTHING — the FIRST registration wins
 	}
 	f.apps[appID] = cycle.AppMirror{
-		AppID: appID, AccountID: accountID, ModuleCount: moduleCount, CreatedAt: createdAt,
+		AppID: appID, AccountID: accountID, ModuleCount: moduleCount,
+		CreatedModuleCount: moduleCount, // frozen at insert, mirroring InsertAppMirror's $3/$3 write
+		CreatedAt:          createdAt,
 	}
 	return nil
 }
@@ -415,6 +418,17 @@ func (f *fakeStore) SetAppProrationInvoice(_ context.Context, appID uuid.UUID, s
 	}
 	if app, ok := f.apps[appID]; ok && app.ProrationInvoiceID == "" {
 		app.ProrationInvoiceID = stripeInvoiceID // first-charge-wins, like the WHERE … IS NULL
+		f.apps[appID] = app
+	}
+	return nil
+}
+
+func (f *fakeStore) SetAppProrationSkipped(_ context.Context, appID uuid.UUID) error {
+	if f.errSetSkipped != nil {
+		return f.errSetSkipped
+	}
+	if app, ok := f.apps[appID]; ok && !app.ProrationSkipped && app.ProrationInvoiceID == "" {
+		app.ProrationSkipped = true // first-write-wins, like the WHERE … IS NULL guard
 		f.apps[appID] = app
 	}
 	return nil
@@ -448,10 +462,11 @@ func (f *fakeStore) AppsPendingProration(_ context.Context, createdBefore time.T
 		return nil, f.errPendingProration
 	}
 	// Mirrors the SQL: created_at <= cutoff AND proration_invoice_id IS NULL AND
-	// deleted_at IS NULL. Sorted by created_at for a deterministic sweep order.
+	// deleted_at IS NULL AND proration_skipped_at IS NULL. Sorted by created_at
+	// for a deterministic sweep order.
 	var out []uuid.UUID
 	for id, app := range f.apps {
-		if app.ProrationInvoiceID == "" && !app.Deleted && !app.CreatedAt.After(createdBefore) {
+		if app.ProrationInvoiceID == "" && !app.Deleted && !app.ProrationSkipped && !app.CreatedAt.After(createdBefore) {
 			out = append(out, id)
 		}
 	}
