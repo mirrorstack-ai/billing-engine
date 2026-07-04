@@ -842,9 +842,10 @@ func TestGetUsageHistory_BucketsRowsIntoOrderedPeriods(t *testing.T) {
 	jan := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	feb := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
 	mar := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	mod := uuid.New()
 	store.historyRows = []usage.PeriodMetricUsageRaw{
-		{PeriodStart: jan, PeriodEnd: feb, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 10, RawCostMicros: 1000, ChargedMicros: 1000},
-		{PeriodStart: feb, PeriodEnd: mar, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 20, RawCostMicros: 2000, ChargedMicros: 2000},
+		{PeriodStart: jan, PeriodEnd: feb, ModuleID: mod, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 10, RawCostMicros: 1000, ChargedMicros: 1000, Visibility: usage.VisibilityPublished},
+		{PeriodStart: feb, PeriodEnd: mar, ModuleID: mod, Metric: "orders.placed", Kind: usage.KindCount, Quantity: 20, RawCostMicros: 2000, ChargedMicros: 2000, Visibility: usage.VisibilityPublished},
 	}
 
 	resp, err := newService(store).GetUsageHistory(context.Background(), usage.GetUsageHistoryRequest{OwnerUserID: owner, Months: 6})
@@ -855,6 +856,9 @@ func TestGetUsageHistory_BucketsRowsIntoOrderedPeriods(t *testing.T) {
 	require.Len(t, resp.Periods[0].Metrics, 1)
 	require.EqualValues(t, 1000, resp.Periods[0].Metrics[0].ChargedMicros)
 	require.EqualValues(t, 2000, resp.Periods[1].Metrics[0].ChargedMicros)
+	// Module attribution rides through — the pre-#32 shape dropped both.
+	require.Equal(t, mod, resp.Periods[0].Metrics[0].ModuleID)
+	require.Equal(t, usage.VisibilityPublished, resp.Periods[0].Metrics[0].Visibility)
 }
 
 func TestGetUsageHistory_MultipleMetricsWithinOnePeriod(t *testing.T) {

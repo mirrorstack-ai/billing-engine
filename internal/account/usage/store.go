@@ -308,13 +308,16 @@ type MetricUsageRaw struct {
 }
 
 // PeriodMetricUsageRaw is one grouped row from the multi-month history query:
-// a metric's rolled-up totals within ONE billing period, summed across every
-// model / module_version split. Money fields are already whole int64 micros
-// (unlike MetricUsageRaw's live-estimate NUMERIC decode) because
+// a module-metric's rolled-up totals within ONE billing period, summed across
+// every model / module_version split. Money fields are already whole int64
+// micros (unlike MetricUsageRaw's live-estimate NUMERIC decode) because
 // usage_aggregates snapshots money as BIGINT, so SUM() stays exact.
 type PeriodMetricUsageRaw struct {
-	PeriodStart     time.Time
-	PeriodEnd       time.Time
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	// ModuleID is the module that emitted the metric — same per-module
+	// granularity as MetricUsageRaw so history rows scope to one module.
+	ModuleID        uuid.UUID
 	Metric          string
 	Kind            Kind
 	Quantity        float64
@@ -322,6 +325,10 @@ type PeriodMetricUsageRaw struct {
 	RawCostMicros   int64
 	ChargedMicros   int64
 	Group           string
+	// Visibility is the module's published/private margin-share class
+	// (module_visibility, migration 010), COALESCE'd to 'private' in the
+	// query for a module with no visibility row yet (design §7-B default).
+	Visibility Visibility
 }
 
 // VersionUsageRaw is one grouped row from the version-breakdown query: a
@@ -684,9 +691,14 @@ func (s *pgxStore) UsageHistory(ctx context.Context, accountID uuid.UUID, window
 		if err != nil {
 			return nil, fmt.Errorf("decode total_quantity for metric %q: %w", r.Metric, err)
 		}
+		moduleID, err := uuid.Parse(r.ModuleID)
+		if err != nil {
+			return nil, fmt.Errorf("decode module_id for metric %q: %w", r.Metric, err)
+		}
 		out = append(out, PeriodMetricUsageRaw{
 			PeriodStart:     r.PeriodStart,
 			PeriodEnd:       r.PeriodEnd,
+			ModuleID:        moduleID,
 			Metric:          r.Metric,
 			Kind:            Kind(r.Kind),
 			Quantity:        qty,
@@ -694,6 +706,7 @@ func (s *pgxStore) UsageHistory(ctx context.Context, accountID uuid.UUID, window
 			RawCostMicros:   r.RawCostMicros,
 			ChargedMicros:   r.ChargedMicros,
 			Group:           string(r.DisplayGroup),
+			Visibility:      Visibility(r.Visibility),
 		})
 	}
 	return out, nil

@@ -182,18 +182,22 @@ ORDER BY e.metric;
 -- RPC before GetUsageHistory; the live current-period estimate
 -- (CurrentPeriodUsageSummary above) stays the only usage_events reader.
 --
--- Grouped at (period, metric, kind) — the SAME granularity GetUsageSummary
--- exposes — by summing across every model (migration 018) and module_version
--- (migration 023) dimension an aggregate row may have split into: a trend
--- chart wants ONE number per metric per period, not one per (metric, model,
--- version) combination (that finer cut is GetVersionBreakdown's job, for the
--- current period only). A period with no usage_aggregates rows yet (rollup
--- hasn't run, or truly zero usage) simply contributes no rows — the caller
--- must not treat a missing month as an error.
+-- Grouped at (period, module, metric, kind) — the SAME granularity
+-- GetUsageSummary exposes — by summing across every model (migration 018) and
+-- module_version (migration 023) dimension an aggregate row may have split
+-- into: a trend chart wants ONE number per module-metric per period, not one
+-- per (metric, model, version) combination (that finer cut is
+-- GetVersionBreakdown's job, for the current period only). module_id +
+-- visibility ride along exactly as on CurrentPeriodUsageSummary so a consumer
+-- can scope history to one module and apply the real margin-share class. A
+-- period with no usage_aggregates rows yet (rollup hasn't run, or truly zero
+-- usage) simply contributes no rows — the caller must not treat a missing
+-- month as an error.
 -- name: UsageHistoryForAccount :many
 SELECT
     bp.period_start                                     AS period_start,
     bp.period_end                                       AS period_end,
+    ua.module_id                                         AS module_id,
     ua.metric                                            AS metric,
     ua.kind                                              AS kind,
     COALESCE(SUM(ua.billable_quantity), 0)::numeric      AS total_quantity,
@@ -201,16 +205,23 @@ SELECT
     COALESCE(SUM(ua.raw_cost_micros), 0)::bigint         AS raw_cost_micros,
     COALESCE(SUM(ua.charged_micros), 0)::bigint          AS charged_micros,
     COALESCE(MAX(md.display_group), 'other')::ms_billing.metric_group
-                                                         AS display_group
+                                                         AS display_group,
+    -- MAX() picks the single visibility per module_id group-by (module_id is
+    -- module_visibility's PRIMARY KEY); COALESCE to 'private' is the
+    -- settlement default (§7-B: never under-collect on a lagging publish).
+    COALESCE(MAX(mv.visibility), 'private')::ms_billing.margin_share_class
+                                                         AS visibility
 FROM ms_billing.usage_aggregates ua
 JOIN ms_billing.billing_periods bp
     ON bp.id = ua.period_id
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = ua.module_id AND md.metric = ua.metric
+LEFT JOIN ms_billing.module_visibility mv
+    ON mv.module_id = ua.module_id
 WHERE ua.account_id = $1
   AND bp.period_start >= $2
   AND bp.period_start <  $3
-GROUP BY bp.period_start, bp.period_end, ua.metric, ua.kind
+GROUP BY bp.period_start, bp.period_end, ua.module_id, ua.metric, ua.kind
 ORDER BY bp.period_start ASC, ua.metric ASC;
 
 -- VersionBreakdownForAccount is the per-module_version cost/income breakdown
