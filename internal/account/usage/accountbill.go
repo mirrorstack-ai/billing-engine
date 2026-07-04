@@ -3,6 +3,7 @@ package usage
 import (
 	"bytes"
 	"context"
+	"slices"
 	"sort"
 
 	"github.com/google/uuid"
@@ -135,26 +136,16 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		return nil, billing.Internal("app mirror enumeration failed", err)
 	}
 
-	// Dedup the union, then sort by app_id bytes so the response (and every
-	// downstream diff/cache of it) is deterministic regardless of which half —
-	// or which store scan order — produced an app.
-	seen := make(map[uuid.UUID]struct{}, len(usageApps)+len(mirrorApps))
+	// Union the two halves, sort by app_id bytes, then compact adjacent
+	// duplicates — one pass gives the deterministic deduped roster
+	// regardless of which half (or which store scan order) produced an app.
 	appIDs := make([]uuid.UUID, 0, len(usageApps)+len(mirrorApps))
-	for _, id := range usageApps {
-		if _, dup := seen[id]; !dup {
-			seen[id] = struct{}{}
-			appIDs = append(appIDs, id)
-		}
-	}
-	for _, id := range mirrorApps {
-		if _, dup := seen[id]; !dup {
-			seen[id] = struct{}{}
-			appIDs = append(appIDs, id)
-		}
-	}
+	appIDs = append(appIDs, usageApps...)
+	appIDs = append(appIDs, mirrorApps...)
 	sort.Slice(appIDs, func(i, j int) bool {
 		return bytes.Compare(appIDs[i][:], appIDs[j][:]) < 0
 	})
+	appIDs = slices.Compact(appIDs)
 
 	apps := make([]AccountAppBill, 0, len(appIDs))
 	var baseFeeTotal, moduleUsageTotal, infraTotal int64
