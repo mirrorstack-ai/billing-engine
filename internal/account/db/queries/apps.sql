@@ -22,6 +22,35 @@ SELECT app_id, account_id, module_count, created_at, proration_invoice_id, delet
 FROM ms_billing.apps
 WHERE app_id = $1;
 
+-- SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
+-- the creation-proration charge's race-safety primitive. In ONE transaction the
+-- charge locks the row here, re-verifies deleted_at IS NULL and
+-- proration_invoice_id IS NULL under the lock, performs the Stripe charge, and
+-- arms the guard. A concurrent SyncAppModules soft-delete (MarkAppDeleted) is
+-- thereby mutually exclusive: whichever of {delete, charge} commits first wins
+-- and the loser blocks on the lock, then sees the winner's write and no-ops — so
+-- a within-grace delete can never coincide with a charge (no refund path, D1e).
+-- name: SelectAppMirrorForUpdate :one
+SELECT app_id, account_id, module_count, created_at, proration_invoice_id, deleted_at
+FROM ms_billing.apps
+WHERE app_id = $1
+FOR UPDATE;
+
+-- AppsPendingProration is the creation-proration sweep's work list: apps that
+-- have survived the grace window ($1 = now() − GraceDays) and were never charged
+-- their creation-period base. proration_invoice_id IS NULL is the one-shot guard
+-- (an already-charged app drops out); deleted_at IS NULL excludes apps
+-- soft-deleted within grace (they are NEVER charged). Ordered by created_at so
+-- the oldest pending app charges first. Backed by the partial index
+-- apps_pending_proration_idx (migration 029).
+-- name: AppsPendingProration :many
+SELECT app_id
+FROM ms_billing.apps
+WHERE created_at <= $1
+  AND proration_invoice_id IS NULL
+  AND deleted_at IS NULL
+ORDER BY created_at;
+
 -- SetAppProrationInvoice arms the ONE-SHOT proration guard: it records the
 -- Stripe invoice id of the creation-proration charge, and the WHERE
 -- proration_invoice_id IS NULL makes the write first-charge-wins — a retry or

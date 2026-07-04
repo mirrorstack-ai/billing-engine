@@ -70,17 +70,37 @@ func main() {
 	}
 
 	// Local one-shot run: close every card-bound account's just-ended anchored
-	// period as of now, then exit. No HTTP listener — the dev cycle is a single
-	// batch invocation.
-	res := runCycle(context.Background(), svc, time.Now().UTC())
+	// period as of now AND sweep the creation-proration grace queue, then exit.
+	// No HTTP listener — the dev cycle is a single batch invocation.
+	at := time.Now().UTC()
+	res := runCycle(context.Background(), svc, at)
 	slog.Info("billing-cycle local run complete",
 		"as_of", res.AsOf,
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 		"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
-	if res.Failed > 0 {
+	sweepFailed := runProrationSweep(context.Background(), svc, at)
+	if res.Failed > 0 || sweepFailed {
 		os.Exit(1)
 	}
+}
+
+// runProrationSweep charges the creation-period base for every app that has
+// survived the grace window as of `at` (the second leg of the cycle job,
+// alongside the per-account boundary loop). Reports whether any per-app charge
+// failed so the caller can set a non-zero exit code; a failure is retried on the
+// next sweep and never aborts the batch. Logged here so both transports share
+// the shape.
+func runProrationSweep(ctx context.Context, svc *cycle.Service, at time.Time) bool {
+	sweep, err := svc.SweepCreationProrations(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "creation-proration sweep failed", "as_of", at, "error", err)
+		return true
+	}
+	slog.InfoContext(ctx, "creation-proration sweep complete",
+		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
+		"skipped", sweep.Skipped, "failed", sweep.Failed)
+	return sweep.Failed > 0
 }
 
 // buildService wires the pgxpool + Stripe client into the cycle Service. The
@@ -108,7 +128,9 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 			"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
-		// A per-account charge failure is recorded (billing_runs status='failed')
+		// Sweep the creation-proration grace queue as of the same instant.
+		runProrationSweep(ctx, svc, at.UTC())
+		// A per-account charge failure (or a per-app proration failure) is recorded
 		// and does NOT fail the batch — the next cycle retries it. The handler
 		// returns nil so EventBridge doesn't replay the whole batch.
 		return nil

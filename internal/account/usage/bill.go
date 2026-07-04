@@ -61,6 +61,16 @@ const (
 	// Only reached once a subscription earns it; subscription-gated OFF in v1 (see
 	// paasCreditMicros), so today the credit is always 0.
 	PaasCreditPct = 30
+
+	// GraceDays is the creation grace window (owner spec 2026-07-05, D1e
+	// follow-up). A newly created app is NOT charged its creation-period base
+	// synchronously; a periodic sweep (cmd/billing-cycle) charges it only once it
+	// has SURVIVED this many whole days past created_at, so an app soft-deleted
+	// within the window is NEVER billed. A survivor is charged the SAME
+	// creation-period proration (identical ProratedBaseMicros math, anchored to
+	// the TRUE created_at) — grace delays WHEN the charge fires, never WHAT it
+	// covers. Tunable.
+	GraceDays = 3
 )
 
 // Plan is the account/org billing plan. v1 has NO real plan system — this is the

@@ -12,6 +12,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const appsPendingProration = `-- name: AppsPendingProration :many
+SELECT app_id
+FROM ms_billing.apps
+WHERE created_at <= $1
+  AND proration_invoice_id IS NULL
+  AND deleted_at IS NULL
+ORDER BY created_at
+`
+
+// AppsPendingProration is the creation-proration sweep's work list: apps that
+// have survived the grace window ($1 = now() − GraceDays) and were never charged
+// their creation-period base. proration_invoice_id IS NULL is the one-shot guard
+// (an already-charged app drops out); deleted_at IS NULL excludes apps
+// soft-deleted within grace (they are NEVER charged). Ordered by created_at so
+// the oldest pending app charges first. Backed by the partial index
+// apps_pending_proration_idx (migration 029).
+func (q *Queries) AppsPendingProration(ctx context.Context, createdAt time.Time) ([]string, error) {
+	rows, err := q.db.Query(ctx, appsPendingProration, createdAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var app_id string
+		if err := rows.Scan(&app_id); err != nil {
+			return nil, err
+		}
+		items = append(items, app_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertAdvanceBaseSnapshot = `-- name: InsertAdvanceBaseSnapshot :execrows
 INSERT INTO ms_billing.app_base_snapshots
     (app_id, period_start, period_end, module_count, base_micros, source)
@@ -254,6 +290,44 @@ type SelectAppMirrorRow struct {
 func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppMirrorRow, error) {
 	row := q.db.QueryRow(ctx, selectAppMirror, appID)
 	var i SelectAppMirrorRow
+	err := row.Scan(
+		&i.AppID,
+		&i.AccountID,
+		&i.ModuleCount,
+		&i.CreatedAt,
+		&i.ProrationInvoiceID,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const selectAppMirrorForUpdate = `-- name: SelectAppMirrorForUpdate :one
+SELECT app_id, account_id, module_count, created_at, proration_invoice_id, deleted_at
+FROM ms_billing.apps
+WHERE app_id = $1
+FOR UPDATE
+`
+
+type SelectAppMirrorForUpdateRow struct {
+	AppID              string             `json:"app_id"`
+	AccountID          string             `json:"account_id"`
+	ModuleCount        int32              `json:"module_count"`
+	CreatedAt          time.Time          `json:"created_at"`
+	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
+	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
+}
+
+// SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
+// the creation-proration charge's race-safety primitive. In ONE transaction the
+// charge locks the row here, re-verifies deleted_at IS NULL and
+// proration_invoice_id IS NULL under the lock, performs the Stripe charge, and
+// arms the guard. A concurrent SyncAppModules soft-delete (MarkAppDeleted) is
+// thereby mutually exclusive: whichever of {delete, charge} commits first wins
+// and the loser blocks on the lock, then sees the winner's write and no-ops — so
+// a within-grace delete can never coincide with a charge (no refund path, D1e).
+func (q *Queries) SelectAppMirrorForUpdate(ctx context.Context, appID string) (SelectAppMirrorForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, selectAppMirrorForUpdate, appID)
+	var i SelectAppMirrorForUpdateRow
 	err := row.Scan(
 		&i.AppID,
 		&i.AccountID,

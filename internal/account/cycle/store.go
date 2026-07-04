@@ -183,6 +183,27 @@ type Store interface {
 	// deletion semantics). found=false → the app was never registered.
 	AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, bool, error)
 
+	// AppsPendingProration returns the app ids past the creation grace window
+	// (created_at <= createdBefore = now − GraceDays) that are still LIVE
+	// (deleted_at IS NULL) and NOT yet charged (proration_invoice_id IS NULL) —
+	// the creation-proration sweep's work list. An app deleted within grace, or
+	// already charged, is excluded.
+	AppsPendingProration(ctx context.Context, createdBefore time.Time) ([]uuid.UUID, error)
+
+	// ChargeProrationLocked runs the creation-proration charge for ONE app inside
+	// a single transaction that SELECT ... FOR UPDATE-locks the roster row. Under
+	// the lock it re-verifies the row is still chargeable (deleted_at IS NULL AND
+	// proration_invoice_id IS NULL); only then does it invoke charge — which
+	// performs the Stripe calls and returns the payload to persist — and, STILL
+	// under the same lock, mirrors the invoice, freezes the base snapshot, and
+	// arms the one-shot guard, committing atomically. Holding the lock across the
+	// Stripe call is deliberate: it makes a concurrent soft-delete (MarkAppDeleted)
+	// and this charge mutually exclusive (no refund path, D1e) — whichever commits
+	// first wins and the loser sees the other's write and no-ops. charge returning
+	// (nil, nil) means "nothing to charge" (0 cents) → nothing is persisted. The
+	// returned invoice id is the armed (or pre-armed) guard's.
+	ChargeProrationLocked(ctx context.Context, appID uuid.UUID, charge func(locked AppMirror) (*ProrationCharge, error)) (ProrationOutcome, string, error)
+
 	// SetAppProrationInvoice arms the ONE-SHOT creation-proration guard: it
 	// records the Stripe invoice id, first-charge-wins (UPDATE … WHERE
 	// proration_invoice_id IS NULL). An already-armed guard is NOT an error —
@@ -846,6 +867,109 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 		Deleted:            row.DeletedAt.Valid,
 		DeletedAt:          row.DeletedAt.Time,
 	}, true, nil
+}
+
+func (s *pgxStore) AppsPendingProration(ctx context.Context, createdBefore time.Time) ([]uuid.UUID, error) {
+	rows, err := s.q.AppsPendingProration(ctx, createdBefore)
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+func (s *pgxStore) ChargeProrationLocked(ctx context.Context, appID uuid.UUID, charge func(AppMirror) (*ProrationCharge, error)) (ProrationOutcome, string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
+
+	qtx := s.q.WithTx(tx)
+
+	// Lock the row and re-verify the terminal state UNDER the lock: a soft-delete
+	// that committed before us is now visible; one racing us blocks here until we
+	// commit (charge wins), then no-ops on its own WHERE deleted_at IS NULL.
+	row, err := qtx.SelectAppMirrorForUpdate(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProrationLockedNotFound, "", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	if row.DeletedAt.Valid {
+		return ProrationLockedDeleted, "", nil
+	}
+	if row.ProrationInvoiceID.Valid {
+		return ProrationLockedAlreadyCharged, row.ProrationInvoiceID.String, nil
+	}
+
+	app, err := uuid.Parse(row.AppID)
+	if err != nil {
+		return 0, "", err
+	}
+	acct, err := uuid.Parse(row.AccountID)
+	if err != nil {
+		return 0, "", err
+	}
+	locked := AppMirror{
+		AppID:       app,
+		AccountID:   acct,
+		ModuleCount: int(row.ModuleCount),
+		CreatedAt:   row.CreatedAt,
+	}
+
+	// Stripe charge happens INSIDE the tx (the callback), so the lock spans it —
+	// the not-deleted check, the charge, and the guard-arm are one atomic unit.
+	pc, err := charge(locked)
+	if err != nil {
+		return 0, "", err // rollback; guard unarmed → the next sweep retries (idem keys)
+	}
+	if pc == nil {
+		return ProrationLockedNoCharge, "", nil // 0 cents — nothing to invoice
+	}
+
+	due, err := centsNumeric(pc.Invoice.AmountDueCents)
+	if err != nil {
+		return 0, "", err
+	}
+	paid, err := centsNumeric(pc.Invoice.AmountPaidCents)
+	if err != nil {
+		return 0, "", err
+	}
+	if err := qtx.UpsertInvoice(ctx, db.UpsertInvoiceParams{
+		AccountID:       pc.Invoice.AccountID.String(),
+		StripeInvoiceID: pc.Invoice.StripeInvoiceID,
+		Status:          pc.Invoice.Status,
+		AmountDue:       due,
+		AmountPaid:      paid,
+		Currency:        pc.Invoice.Currency,
+		PeriodStart:     pgtype.Timestamptz{Time: pc.Invoice.PeriodStart, Valid: !pc.Invoice.PeriodStart.IsZero()},
+		PeriodEnd:       pgtype.Timestamptz{Time: pc.Invoice.PeriodEnd, Valid: !pc.Invoice.PeriodEnd.IsZero()},
+	}); err != nil {
+		return 0, "", err
+	}
+	if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+		AppID:       pc.Snapshot.AppID.String(),
+		PeriodStart: pc.Snapshot.PeriodStart,
+		PeriodEnd:   pc.Snapshot.PeriodEnd,
+		ModuleCount: int32(pc.Snapshot.ModuleCount), //nolint:gosec // count comes from the locked apps row, whose writers validate 0 ≤ count ≤ maxModuleCount
+		BaseMicros:  pc.Snapshot.BaseMicros,
+	}); err != nil {
+		return 0, "", err
+	}
+	// Arm the one-shot guard. WHERE proration_invoice_id IS NULL is belt-and-
+	// suspenders — the FOR UPDATE lock already guarantees no concurrent arm.
+	if _, err := qtx.SetAppProrationInvoice(ctx, db.SetAppProrationInvoiceParams{
+		AppID:              appID.String(),
+		ProrationInvoiceID: pgtype.Text{String: pc.InvoiceID, Valid: true},
+	}); err != nil {
+		return 0, "", err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, "", err
+	}
+	return ProrationLockedCharged, pc.InvoiceID, nil
 }
 
 func (s *pgxStore) SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, stripeInvoiceID string) error {
