@@ -641,3 +641,37 @@ ORDER BY bp.period_start DESC;
 SELECT period_start, period_end
 FROM ms_billing.billing_periods
 WHERE id = @period_id::uuid AND account_id = @account_id::uuid;
+
+-- AppIDsWithUsage enumerates the DISTINCT app_ids that have ANY usage for the
+-- account in ONE period — the usage half of GetAccountBill's app roster (the
+-- other half is the ms_billing.apps mirror, MirroredAppIDsOverlappingWindow).
+-- It is the app-ENUMERATION projection of AppBillLines' rolled-up-else-live
+-- gate, faithful to its PER-APP semantics: GetAppBill's gate is all-or-nothing
+-- per (account, app, period) — an app reads its FROZEN usage_aggregates rows
+-- when it has any, else its LIVE usage_events — so an app belongs on the
+-- account bill iff it appears in EITHER ledger for the window. Hence a plain
+-- UNION (dedup) of both branches, NOT a NOT-EXISTS gate: an app whose events
+-- arrived after the account's rollup (no aggregate rows of its own yet) still
+-- enumerates here and still bills through GetAppBill's live branch.
+--
+-- UNINSTALL-SAFE / ledger-only like every bill read: never joins an install or
+-- roster table (a deleted app's accrued usage still bills — D1e), and gated on
+-- account_id so a caller only ever enumerates its own apps. ORDER BY app_id
+-- (bytewise) for a deterministic scan; the service re-sorts after merging the
+-- mirror half anyway.
+-- name: AppIDsWithUsage :many
+SELECT app_id FROM (
+    SELECT ua.app_id AS app_id
+    FROM ms_billing.usage_aggregates ua
+    JOIN ms_billing.billing_periods bp
+        ON bp.id = ua.period_id
+    WHERE ua.account_id   = @account_id::uuid
+      AND bp.period_start = @period_start::timestamptz
+    UNION
+    SELECT e.app_id AS app_id
+    FROM ms_billing.usage_events e
+    WHERE e.account_id  = @account_id::uuid
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
+) apps_with_usage
+ORDER BY app_id;

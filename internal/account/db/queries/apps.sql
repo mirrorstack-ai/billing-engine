@@ -113,3 +113,26 @@ SELECT module_count, base_micros, source
 FROM ms_billing.app_base_snapshots
 WHERE app_id = $1
   AND period_start = $2;
+
+-- MirroredAppIDsOverlappingWindow enumerates the account's ms_billing.apps
+-- roster rows whose existence interval [created_at, deleted_at) overlaps ONE
+-- period window [@period_start, @period_end) — the mirror half of
+-- GetAccountBill's app roster (the usage half is AppIDsWithUsage). The overlap
+-- test is the standard half-open one:
+--
+--   created_at < period_end AND (deleted_at IS NULL OR deleted_at > period_start)
+--
+-- so a just-created zero-usage app still surfaces its (prorated) base on the
+-- account bill, an app deleted DURING the period keeps its spent base visible
+-- (D1e: no refunds), and an app deleted BEFORE the period opened drops out
+-- (its base for the window is 0 and it can have no NEW usage — any residual
+-- ledger rows still enumerate through the usage half). Pre-backfill apps have
+-- no row here at all and are covered by the usage half alone. ORDER BY app_id
+-- (bytewise) for a deterministic scan; the service re-sorts after the merge.
+-- name: MirroredAppIDsOverlappingWindow :many
+SELECT app_id
+FROM ms_billing.apps
+WHERE account_id = @account_id::uuid
+  AND created_at < @period_end::timestamptz
+  AND (deleted_at IS NULL OR deleted_at > @period_start::timestamptz)
+ORDER BY app_id;

@@ -153,6 +153,56 @@ func (q *Queries) MarkAppDeleted(ctx context.Context, appID string) (int64, erro
 	return result.RowsAffected(), nil
 }
 
+const mirroredAppIDsOverlappingWindow = `-- name: MirroredAppIDsOverlappingWindow :many
+SELECT app_id
+FROM ms_billing.apps
+WHERE account_id = $1::uuid
+  AND created_at < $2::timestamptz
+  AND (deleted_at IS NULL OR deleted_at > $3::timestamptz)
+ORDER BY app_id
+`
+
+type MirroredAppIDsOverlappingWindowParams struct {
+	AccountID   string    `json:"account_id"`
+	PeriodEnd   time.Time `json:"period_end"`
+	PeriodStart time.Time `json:"period_start"`
+}
+
+// MirroredAppIDsOverlappingWindow enumerates the account's ms_billing.apps
+// roster rows whose existence interval [created_at, deleted_at) overlaps ONE
+// period window [@period_start, @period_end) — the mirror half of
+// GetAccountBill's app roster (the usage half is AppIDsWithUsage). The overlap
+// test is the standard half-open one:
+//
+//	created_at < period_end AND (deleted_at IS NULL OR deleted_at > period_start)
+//
+// so a just-created zero-usage app still surfaces its (prorated) base on the
+// account bill, an app deleted DURING the period keeps its spent base visible
+// (D1e: no refunds), and an app deleted BEFORE the period opened drops out
+// (its base for the window is 0 and it can have no NEW usage — any residual
+// ledger rows still enumerate through the usage half). Pre-backfill apps have
+// no row here at all and are covered by the usage half alone. ORDER BY app_id
+// (bytewise) for a deterministic scan; the service re-sorts after the merge.
+func (q *Queries) MirroredAppIDsOverlappingWindow(ctx context.Context, arg MirroredAppIDsOverlappingWindowParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, mirroredAppIDsOverlappingWindow, arg.AccountID, arg.PeriodEnd, arg.PeriodStart)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var app_id string
+		if err := rows.Scan(&app_id); err != nil {
+			return nil, err
+		}
+		items = append(items, app_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const selectAppBaseSnapshot = `-- name: SelectAppBaseSnapshot :one
 SELECT module_count, base_micros, source
 FROM ms_billing.app_base_snapshots
