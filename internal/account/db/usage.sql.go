@@ -872,6 +872,62 @@ func (q *Queries) LookupMetricDefinition(ctx context.Context, arg LookupMetricDe
 	return i, err
 }
 
+const upsertInfraPriceOverride = `-- name: UpsertInfraPriceOverride :execrows
+INSERT INTO ms_billing.metric_definitions (
+    module_id, metric, kind, unit, unit_price_micros, active
+)
+SELECT
+    $1::uuid,
+    sentinel.metric,
+    sentinel.kind,
+    sentinel.unit,
+    $2::bigint,
+    true
+FROM ms_billing.metric_definitions sentinel
+WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
+  AND sentinel.metric    = $3::text
+ON CONFLICT (module_id, metric)
+DO UPDATE SET
+    unit_price_micros = EXCLUDED.unit_price_micros,
+    active            = true
+`
+
+type UpsertInfraPriceOverrideParams struct {
+	ModuleID        string `json:"module_id"`
+	UnitPriceMicros int64  `json:"unit_price_micros"`
+	Metric          string `json:"metric"`
+}
+
+// UpsertInfraPriceOverride writes ONE per-(module, metric) price OVERRIDE for a
+// reserved platform-infra metric (decision 19 §4.3): the ms.Meter("infra.X",
+// ms.Price(n)) override a module declared for a platform-MEASURED metric. It is
+// the control-plane twin of RecordInfraUsage's gate and the INVERSE of
+// UpsertMetricDefinition (which syncs a module's OWN custom metrics and rejects
+// reserved names) — the SetMetricDefinitions reserved-name guard therefore stays
+// intact; only this dedicated seam persists a reserved override.
+//
+// PRICE-ONLY: the row carries the caller's unit_price_micros but INHERITS kind +
+// unit from the SENTINEL base catalog row (module_id = the all-zero platform-infra
+// sentinel, seeded by migrations 017/018/020) via INSERT ... SELECT — the caller
+// never supplies kind/unit (the platform owns infra-metric semantics). The written
+// row keys the REAL @module_id, so the app bill's dual-price resolution (decision
+// 19 §4.2) finds it by the event's real module_id while the sentinel row stays the
+// platform default. active is forced true (a declared override is live).
+//
+// :execrows so the store can distinguish a real upsert (1) from a SELECT that
+// matched no sentinel row (0 → a seed drift the store surfaces as an error, rather
+// than a silent no-op). ON CONFLICT (module_id, metric) DO UPDATE keeps it
+// idempotent — a re-publish updates the price in place; kind/unit stay the
+// sentinel's, so the update is price-only (modeled on migration 018's
+// metric_model_prices, a secondary price layered over the same sentinel row).
+func (q *Queries) UpsertInfraPriceOverride(ctx context.Context, arg UpsertInfraPriceOverrideParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertInfraPriceOverride, arg.ModuleID, arg.UnitPriceMicros, arg.Metric)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertMetricDefinition = `-- name: UpsertMetricDefinition :exec
 
 INSERT INTO ms_billing.metric_definitions (

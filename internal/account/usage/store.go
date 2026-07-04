@@ -37,6 +37,18 @@ type Store interface {
 	// updates kind/unit/price/active in place.
 	UpsertMetricDefinitions(ctx context.Context, defs []MetricDeclaration) error
 
+	// UpsertInfraPriceOverrides writes a module's per-metric price OVERRIDES
+	// for the reserved platform-infra metrics (decision 19 §4.3), keyed
+	// (module_id, metric) with the REAL module_id. Each row is PRICE-ONLY:
+	// kind + unit are copied from the SENTINEL base catalog row (the seeded
+	// platform-infra row) in one INSERT ... SELECT, so the caller never
+	// supplies them. All-or-nothing (one transaction); idempotent (a re-sync
+	// updates unit_price_micros in place). A metric with no sentinel catalog
+	// row (a seed drift — the service already gated it as registered) makes
+	// the INSERT ... SELECT affect 0 rows, which the method surfaces as an
+	// error rather than silently writing nothing.
+	UpsertInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, overrides []InfraPriceOverride) error
+
 	// InsertUsageEvent writes one raw metered fact, idempotent on
 	// event_id. recorded=false means ON CONFLICT(event_id) DO NOTHING
 	// deduped an at-least-once retry — NOT an error. accountID is the
@@ -339,6 +351,42 @@ func (s *pgxStore) UpsertMetricDefinitions(ctx context.Context, defs []MetricDec
 			Active:          def.Active,
 		}); err != nil {
 			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// UpsertInfraPriceOverrides upserts each price-only infra override in one
+// transaction (all-or-nothing, mirroring UpsertMetricDefinitions). The
+// generated UpsertInfraPriceOverride copies kind + unit from the sentinel
+// catalog row via INSERT ... SELECT and returns the affected-row count:
+// 0 means the sentinel row was absent (a seed drift the service could not
+// catch — it validates against the in-Go platformInfraKind registry, not the
+// DB), so surface it as an error instead of a silent no-op.
+func (s *pgxStore) UpsertInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, overrides []InfraPriceOverride) error {
+	if len(overrides) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	// Rollback is a no-op after a successful Commit, so the deferred rollback
+	// safely covers every early-return error path without double-handling.
+	defer tx.Rollback(ctx)
+
+	qtx := s.q.WithTx(tx)
+	for _, o := range overrides {
+		affected, err := qtx.UpsertInfraPriceOverride(ctx, db.UpsertInfraPriceOverrideParams{
+			ModuleID:        moduleID.String(),
+			Metric:          o.Metric,
+			UnitPriceMicros: o.UnitPriceMicros,
+		})
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return fmt.Errorf("no sentinel catalog row for infra metric %q (seed drift): cannot inherit kind/unit for the override", o.Metric)
 		}
 	}
 	return tx.Commit(ctx)

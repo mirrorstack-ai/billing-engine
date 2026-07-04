@@ -43,6 +43,47 @@ DO UPDATE SET
     unit_price_micros = EXCLUDED.unit_price_micros,
     active            = EXCLUDED.active;
 
+-- UpsertInfraPriceOverride writes ONE per-(module, metric) price OVERRIDE for a
+-- reserved platform-infra metric (decision 19 §4.3): the ms.Meter("infra.X",
+-- ms.Price(n)) override a module declared for a platform-MEASURED metric. It is
+-- the control-plane twin of RecordInfraUsage's gate and the INVERSE of
+-- UpsertMetricDefinition (which syncs a module's OWN custom metrics and rejects
+-- reserved names) — the SetMetricDefinitions reserved-name guard therefore stays
+-- intact; only this dedicated seam persists a reserved override.
+--
+-- PRICE-ONLY: the row carries the caller's unit_price_micros but INHERITS kind +
+-- unit from the SENTINEL base catalog row (module_id = the all-zero platform-infra
+-- sentinel, seeded by migrations 017/018/020) via INSERT ... SELECT — the caller
+-- never supplies kind/unit (the platform owns infra-metric semantics). The written
+-- row keys the REAL @module_id, so the app bill's dual-price resolution (decision
+-- 19 §4.2) finds it by the event's real module_id while the sentinel row stays the
+-- platform default. active is forced true (a declared override is live).
+--
+-- :execrows so the store can distinguish a real upsert (1) from a SELECT that
+-- matched no sentinel row (0 → a seed drift the store surfaces as an error, rather
+-- than a silent no-op). ON CONFLICT (module_id, metric) DO UPDATE keeps it
+-- idempotent — a re-publish updates the price in place; kind/unit stay the
+-- sentinel's, so the update is price-only (modeled on migration 018's
+-- metric_model_prices, a secondary price layered over the same sentinel row).
+-- name: UpsertInfraPriceOverride :execrows
+INSERT INTO ms_billing.metric_definitions (
+    module_id, metric, kind, unit, unit_price_micros, active
+)
+SELECT
+    @module_id::uuid,
+    sentinel.metric,
+    sentinel.kind,
+    sentinel.unit,
+    @unit_price_micros::bigint,
+    true
+FROM ms_billing.metric_definitions sentinel
+WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
+  AND sentinel.metric    = @metric::text
+ON CONFLICT (module_id, metric)
+DO UPDATE SET
+    unit_price_micros = EXCLUDED.unit_price_micros,
+    active            = true;
+
 -- LookupMetricDefinition returns the authoritative kind + per-unit customer
 -- price for a (module, metric). The ingest path uses it to REJECT an
 -- undeclared metric (no row → INVALID_INPUT) and to snapshot `kind` onto

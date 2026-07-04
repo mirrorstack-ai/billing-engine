@@ -172,6 +172,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.SetMetricDefinitions(ctx, req)
 
+	case "SetInfraPriceOverrides":
+		var req usage.SetInfraPriceOverridesRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.SetInfraPriceOverrides(ctx, req)
+
 	case "SetModuleVisibility":
 		var req usage.SetModuleVisibilityRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -332,6 +339,13 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.GetAppBill", makeHTTPHandler(d, "GetAppBill"))
 		r.Post("/v1/billing.GetBillingPeriods", makeHTTPHandler(d, "GetBillingPeriods"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
+		// Per-module infra price OVERRIDES (decision 19 §4.3) — the INVERSE of
+		// SetMetricDefinitions: it persists a module's ms.Meter("infra.X",
+		// ms.Price(n)) override for a RESERVED platform-infra metric (which
+		// SetMetricDefinitions rejects) as a price-only per-(module, metric)
+		// catalog row. Control-plane (fired by api-platform's metric sync on
+		// publish), so it shares the internal secret + route group.
+		r.Post("/v1/billing.SetInfraPriceOverrides", makeHTTPHandler(d, "SetInfraPriceOverrides"))
 		r.Post("/v1/billing.SetModuleVisibility", makeHTTPHandler(d, "SetModuleVisibility"))
 		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of
 		// the SDK meter seam: it is called by platform-trusted producers
