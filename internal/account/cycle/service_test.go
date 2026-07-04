@@ -60,10 +60,14 @@ type fakeStore struct {
 
 	// apps mirror state (migration 027 / base-fee v1). accountsByUser models
 	// the EnsureAccountForUser get-or-create; activation the activated_at
-	// anchor (absent → unactivated, never charged).
+	// anchor (absent → unactivated, never charged). baseSnapshots models the
+	// migration-028 per-app-period base ledger, keyed (app, period_start) like
+	// the PRIMARY KEY, with the source recorded so tests can assert which
+	// charge leg wrote (and kept) each row.
 	apps           map[uuid.UUID]cycle.AppMirror
 	accountsByUser map[uuid.UUID]uuid.UUID
 	activation     map[uuid.UUID]time.Time
+	baseSnapshots  map[snapKey]fakeBaseSnapshot
 
 	// captured charge writes
 	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
@@ -72,34 +76,48 @@ type fakeStore struct {
 	invoices     map[string]cycle.InvoiceMirror       // stripe_invoice_id → mirror
 
 	// injected errors
-	errOpen         error
-	errRaw          error
-	errPrice        error
-	errUpsert       error
-	errIncome       error
-	errVis          error
-	errSettle       error
-	errInsertRun    error
-	errTotal        error
-	errPM           error
-	errCustomer     error
-	errInvoice      error
-	errMarkRun      error
-	errUnbilled     error
-	errUsageEvents  error
-	errActivated    error // ActivatedAccounts
-	errLatestPeriod error // LatestClosedPeriodEnd
-	errCollection   error // AccountCollection
-	errUpdateColl   error // UpdateAccountCollection
-	errUnpaid       error // HasUnpaidInvoice
-	errEnsureAcct   error // EnsureAccountForUser
-	errActivation   error // AccountActivation
-	errAppInsert    error // InsertAppMirror
-	errAppMirror    error // AppMirror
-	errSetProration error // SetAppProrationInvoice
-	errSetCount     error // SetAppModuleCount
-	errMarkDeleted  error // MarkAppDeleted
-	errLiveCounts   error // LiveAppModuleCounts
+	errOpen          error
+	errRaw           error
+	errPrice         error
+	errUpsert        error
+	errIncome        error
+	errVis           error
+	errSettle        error
+	errInsertRun     error
+	errTotal         error
+	errPM            error
+	errCustomer      error
+	errInvoice       error
+	errMarkRun       error
+	errUnbilled      error
+	errUsageEvents   error
+	errActivated     error // ActivatedAccounts
+	errLatestPeriod  error // LatestClosedPeriodEnd
+	errCollection    error // AccountCollection
+	errUpdateColl    error // UpdateAccountCollection
+	errUnpaid        error // HasUnpaidInvoice
+	errEnsureAcct    error // EnsureAccountForUser
+	errActivation    error // AccountActivation
+	errAppInsert     error // InsertAppMirror
+	errAppMirror     error // AppMirror
+	errSetProration  error // SetAppProrationInvoice
+	errSetCount      error // SetAppModuleCount
+	errMarkDeleted   error // MarkAppDeleted
+	errLiveCounts    error // LiveAppsCreatedBefore
+	errProrationSnap error // UpsertProrationBaseSnapshot
+	errAdvanceSnap   error // InsertAdvanceBaseSnapshot
+}
+
+// snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
+type snapKey struct {
+	app         uuid.UUID
+	periodStart time.Time
+}
+
+// fakeBaseSnapshot is one recorded app_base_snapshots row plus its source.
+type fakeBaseSnapshot struct {
+	snap   cycle.AppBaseSnapshot
+	source string
 }
 
 // markedRun records a MarkBillingRun call so a test can assert the terminal
@@ -126,6 +144,7 @@ func newFakeStore() *fakeStore {
 		apps:                map[uuid.UUID]cycle.AppMirror{},
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
+		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -421,17 +440,44 @@ func (f *fakeStore) MarkAppDeleted(_ context.Context, appID uuid.UUID) error {
 	return nil
 }
 
-func (f *fakeStore) LiveAppModuleCounts(_ context.Context, accountID uuid.UUID) ([]int, error) {
+func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID, createdBefore time.Time) ([]cycle.AppModuleCount, error) {
 	if f.errLiveCounts != nil {
 		return nil, f.errLiveCounts
 	}
-	counts := []int{}
+	apps := []cycle.AppModuleCount{}
 	for _, app := range f.apps {
-		if app.AccountID == accountID && !app.Deleted {
-			counts = append(counts, app.ModuleCount)
+		// Strictly-before cutoff, mirroring the SQL's created_at < $2: an app
+		// created ON or AFTER the new period's start is excluded (its base is
+		// RegisterApp's proration leg's, never the advance leg's).
+		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) {
+			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount})
 		}
 	}
-	return counts, nil
+	return apps, nil
+}
+
+func (f *fakeStore) UpsertProrationBaseSnapshot(_ context.Context, snap cycle.AppBaseSnapshot) error {
+	if f.errProrationSnap != nil {
+		return f.errProrationSnap
+	}
+	// ON CONFLICT DO UPDATE: the proration row always wins / a retry rewrites
+	// identical values.
+	f.baseSnapshots[snapKey{snap.AppID, snap.PeriodStart}] = fakeBaseSnapshot{snap: snap, source: "proration"}
+	return nil
+}
+
+func (f *fakeStore) InsertAdvanceBaseSnapshot(_ context.Context, snap cycle.AppBaseSnapshot) error {
+	if f.errAdvanceSnap != nil {
+		return f.errAdvanceSnap
+	}
+	// ON CONFLICT DO NOTHING: an existing row (proration, or a prior reclaimed
+	// attempt's write) wins.
+	k := snapKey{snap.AppID, snap.PeriodStart}
+	if _, exists := f.baseSnapshots[k]; exists {
+		return nil
+	}
+	f.baseSnapshots[k] = fakeBaseSnapshot{snap: snap, source: "advance"}
+	return nil
 }
 
 // --- helpers --------------------------------------------------------------

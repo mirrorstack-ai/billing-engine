@@ -119,6 +119,9 @@ func (f *fakeStore) ListInvoices(_ context.Context, _ uuid.UUID, _ int32, _ *usa
 func (f *fakeStore) AppMirror(_ context.Context, _ uuid.UUID) (usage.AppMirrorInfo, bool, error) {
 	return usage.AppMirrorInfo{}, false, nil
 }
+func (f *fakeStore) AppBaseSnapshot(_ context.Context, _ uuid.UUID, _ time.Time) (usage.AppBaseSnapshotInfo, bool, error) {
+	return usage.AppBaseSnapshotInfo{}, false, nil
+}
 
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 

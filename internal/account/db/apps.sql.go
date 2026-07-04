@@ -12,6 +12,41 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const insertAdvanceBaseSnapshot = `-- name: InsertAdvanceBaseSnapshot :execrows
+INSERT INTO ms_billing.app_base_snapshots
+    (app_id, period_start, period_end, module_count, base_micros, source)
+VALUES ($1, $2, $3, $4, $5, 'advance')
+ON CONFLICT (app_id, period_start) DO NOTHING
+`
+
+type InsertAdvanceBaseSnapshotParams struct {
+	AppID       string    `json:"app_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	ModuleCount int32     `json:"module_count"`
+	BaseMicros  int64     `json:"base_micros"`
+}
+
+// InsertAdvanceBaseSnapshot records what the boundary advance leg billed one
+// app for the NEW period (migration 028). ON CONFLICT (app_id, period_start)
+// DO NOTHING: an existing row — a proration snapshot, or a prior reclaimed
+// attempt's own row — wins, so a re-run never rewrites what was already
+// recorded as billed. :execrows so the caller can observe the no-op, though
+// both outcomes are success.
+func (q *Queries) InsertAdvanceBaseSnapshot(ctx context.Context, arg InsertAdvanceBaseSnapshotParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertAdvanceBaseSnapshot,
+		arg.AppID,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+		arg.ModuleCount,
+		arg.BaseMicros,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const insertAppMirror = `-- name: InsertAppMirror :execrows
 
 INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_at)
@@ -49,31 +84,50 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 	return result.RowsAffected(), nil
 }
 
-const liveAppModuleCounts = `-- name: LiveAppModuleCounts :many
-SELECT module_count
+const liveAppModuleCountsCreatedBefore = `-- name: LiveAppModuleCountsCreatedBefore :many
+SELECT app_id, module_count
 FROM ms_billing.apps
 WHERE account_id = $1
   AND deleted_at IS NULL
+  AND created_at < $2
 `
 
-// LiveAppModuleCounts returns the module_count of every LIVE (deleted_at IS
-// NULL) app on the account — the boundary charge's advance-base input:
+type LiveAppModuleCountsCreatedBeforeParams struct {
+	AccountID string    `json:"account_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type LiveAppModuleCountsCreatedBeforeRow struct {
+	AppID       string `json:"app_id"`
+	ModuleCount int32  `json:"module_count"`
+}
+
+// LiveAppModuleCountsCreatedBefore returns (app_id, module_count) for every
+// LIVE (deleted_at IS NULL) app on the account created STRICTLY BEFORE the
+// cutoff — the boundary charge's advance-base input:
 // advance base = Σ (BaseFee + Overage × max(0, module_count − included)).
-// Deleted apps are excluded (D1e); an account with no rows (pre-backfill)
-// sums to base 0 and keeps the pre-027 arrears-only invoice.
-func (q *Queries) LiveAppModuleCounts(ctx context.Context, accountID string) ([]int32, error) {
-	rows, err := q.db.Query(ctx, liveAppModuleCounts, accountID)
+// The cutoff is the NEW period's start (the closed window's period_end): an
+// app created INSIDE the new period is excluded, because RegisterApp's
+// creation-proration leg already charged that app's new-period base (full or
+// prorated) — summing it here would double-bill the same period (same-day
+// cron race, and deterministically on reclaimed skipped_no_pm/failed runs).
+// Such an app joins the advance leg at the NEXT boundary. Deleted apps are
+// excluded (D1e); an account with no rows (pre-backfill) sums to base 0 and
+// keeps the pre-027 arrears-only invoice. app_id is returned so the charge
+// leg can write the per-app-period base snapshot (migration 028) it bills.
+func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg LiveAppModuleCountsCreatedBeforeParams) ([]LiveAppModuleCountsCreatedBeforeRow, error) {
+	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []int32{}
+	items := []LiveAppModuleCountsCreatedBeforeRow{}
 	for rows.Next() {
-		var module_count int32
-		if err := rows.Scan(&module_count); err != nil {
+		var i LiveAppModuleCountsCreatedBeforeRow
+		if err := rows.Scan(&i.AppID, &i.ModuleCount); err != nil {
 			return nil, err
 		}
-		items = append(items, module_count)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -97,6 +151,36 @@ func (q *Queries) MarkAppDeleted(ctx context.Context, appID string) (int64, erro
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const selectAppBaseSnapshot = `-- name: SelectAppBaseSnapshot :one
+SELECT module_count, base_micros, source
+FROM ms_billing.app_base_snapshots
+WHERE app_id = $1
+  AND period_start = $2
+`
+
+type SelectAppBaseSnapshotParams struct {
+	AppID       string    `json:"app_id"`
+	PeriodStart time.Time `json:"period_start"`
+}
+
+type SelectAppBaseSnapshotRow struct {
+	ModuleCount int32  `json:"module_count"`
+	BaseMicros  int64  `json:"base_micros"`
+	Source      string `json:"source"`
+}
+
+// SelectAppBaseSnapshot reads the frozen base charge for ONE (app, period) —
+// the display read behind GetAppBill's 基本費用 for a charged period. Exact
+// period_start match (both writers key on the anchored window start); no row
+// means the period was never base-charged and the caller falls back to the
+// live-count display estimate.
+func (q *Queries) SelectAppBaseSnapshot(ctx context.Context, arg SelectAppBaseSnapshotParams) (SelectAppBaseSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, selectAppBaseSnapshot, arg.AppID, arg.PeriodStart)
+	var i SelectAppBaseSnapshotRow
+	err := row.Scan(&i.ModuleCount, &i.BaseMicros, &i.Source)
+	return i, err
 }
 
 const selectAppMirror = `-- name: SelectAppMirror :one
@@ -179,4 +263,42 @@ func (q *Queries) SetAppProrationInvoice(ctx context.Context, arg SetAppProratio
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const upsertProrationBaseSnapshot = `-- name: UpsertProrationBaseSnapshot :exec
+INSERT INTO ms_billing.app_base_snapshots
+    (app_id, period_start, period_end, module_count, base_micros, source)
+VALUES ($1, $2, $3, $4, $5, 'proration')
+ON CONFLICT (app_id, period_start) DO UPDATE
+SET period_end   = EXCLUDED.period_end,
+    module_count = EXCLUDED.module_count,
+    base_micros  = EXCLUDED.base_micros,
+    source       = 'proration'
+`
+
+type UpsertProrationBaseSnapshotParams struct {
+	AppID       string    `json:"app_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	ModuleCount int32     `json:"module_count"`
+	BaseMicros  int64     `json:"base_micros"`
+}
+
+// UpsertProrationBaseSnapshot records what RegisterApp's creation-proration
+// leg billed one app for its creation period (migration 028). Keyed by the
+// FULL anchored period_start (the display identity); base_micros is the
+// PRORATED amount actually invoiced for the partial [creation-day,
+// period_end) window. ON CONFLICT DO UPDATE so a retry is idempotent
+// (identical values) and the proration row WINS over an 'advance' row if
+// both somehow exist — the proration is the more specific charge for a
+// creation period.
+func (q *Queries) UpsertProrationBaseSnapshot(ctx context.Context, arg UpsertProrationBaseSnapshotParams) error {
+	_, err := q.db.Exec(ctx, upsertProrationBaseSnapshot,
+		arg.AppID,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+		arg.ModuleCount,
+		arg.BaseMicros,
+	)
+	return err
 }

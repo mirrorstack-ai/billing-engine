@@ -25,6 +25,14 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
+// maxModuleCount bounds the installed-module count BOTH mirror RPCs accept.
+// It guards the int → int32 narrowing at the store boundary (a count beyond
+// int32 would silently truncate into a wrong — possibly negative — tier) and
+// is orders of magnitude above any real app's module roster. Anything larger
+// is a malformed or hostile payload → billing.InvalidInput, never a truncated
+// write.
+const maxModuleCount = 100_000
+
 // RegisterAppRequest is the payload of the RegisterApp RPC. Owner fields
 // mirror the other owner-keyed RPCs (exactly one set); v1 resolves USER
 // owners only — org billing is out of scope (D6), matching billing.Ensure
@@ -47,8 +55,9 @@ type RegisterAppRequest struct {
 
 // RegisterAppResponse reports the mirror write + what the proration leg did.
 // ProrationInvoiceID is "" when no proration invoice exists (unactivated
-// account, no usable PM, zero remaining days, or the amount rounded to 0
-// cents — all legitimate no-charge outcomes, D1d).
+// account, no usable PM, a creation period that already closed — the boundary
+// advance leg owns every later period — or the amount rounded to 0 cents; all
+// legitimate no-charge outcomes, D1d).
 type RegisterAppResponse struct {
 	AppID              uuid.UUID `json:"app_id"`
 	AccountID          uuid.UUID `json:"account_id"`
@@ -79,26 +88,43 @@ type SyncAppModulesResponse struct {
 //     advisory-locked get-or-create billing.Ensure uses (no Stripe Customer is
 //     created — just the accounts row, so app creation is never blocked on the
 //     user having visited billing);
+//
 //  2. insert the roster row idempotently (ON CONFLICT (app_id) DO NOTHING —
 //     a retry keeps the FIRST registration's created_at / module_count, the
 //     stable proration anchor), then read the row back;
+//
 //  3. proration leg, gated exactly like the spine (D1d): the account must be
 //     ACTIVATED (activated_at set — migration 025) AND have a usable default
 //     PM; otherwise the row is recorded and NO invoice is created (no
 //     retroactive catch-up on activation in v1). The one-shot guard
 //     proration_invoice_id short-circuits a retry that already charged.
 //     Amount = ProratedBaseMicros(AppBaseFeeMicros(base, module_count),
-//     created_at, current anchored period) — whole UTC days, creation day
-//     inclusive, round-half-up — converted micros → whole cents at the Stripe
-//     boundary like every other charge. 0 cents → row recorded, no invoice.
+//     created_at, the anchored period CONTAINING created_at) — whole UTC
+//     days, creation day inclusive, round-half-up — converted micros → whole
+//     cents at the Stripe boundary like every other charge. 0 cents → row
+//     recorded, no invoice.
+//
+//     INVARIANT (charge-leg ownership): the proration window is derived from
+//     the read-back mirror row's created_at (the stable first-registration
+//     anchor), NEVER from "now" — and if that creation period has already
+//     ENDED, the proration charge is SKIPPED entirely (charge 0, guard left
+//     unarmed), deterministically on this and every future retry. Every
+//     period after the creation period belongs to the boundary advance leg
+//     (which bills the apps that existed before the period opened), so a
+//     late retry recomputing against a newer window would double-charge a
+//     period the boundary already billed — and v1 does no retroactive
+//     catch-up either way (D1d).
+//
 //  4. charge via the spine's plumbing with app-scoped deterministic
 //     Idempotency-Keys (app-ii-<app>/app-inv-<app> — the app id is the stable
 //     charge identity here, as the run id is for the boundary leg), mirror the
-//     invoice with the PARTIAL window [creation day, period end), then arm the
-//     one-shot guard.
+//     invoice with the PARTIAL window [creation day, period end), write the
+//     per-app-period base snapshot (migration 028, source='proration' — the
+//     frozen display value for the creation period), then arm the one-shot
+//     guard.
 //
-// A Stripe/mirror failure after the row insert returns an error with the
-// guard UNARMED — the platform's retry re-attempts the charge through the
+// A Stripe/mirror/snapshot failure after the row insert returns an error with
+// the guard UNARMED — the platform's retry re-attempts the charge through the
 // same idem keys, so the failure mode is "retry-safe", never "double-charge".
 func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*RegisterAppResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
@@ -118,6 +144,9 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 	}
 	if req.ModuleCount < 0 {
 		return nil, billing.InvalidInput("module_count must be non-negative")
+	}
+	if req.ModuleCount > maxModuleCount {
+		return nil, billing.InvalidInput("module_count exceeds the maximum supported count (100000)")
 	}
 
 	createdAt := req.CreatedAt
@@ -170,10 +199,27 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		return resp, nil // same skipped_no_pm posture as the spine — row kept, no invoice
 	}
 
-	// The creation period is the account's CURRENT anchored window (ADR 0005);
-	// the proration bills its remaining whole UTC days, creation day inclusive.
+	// The creation period is the anchored window CONTAINING the app's
+	// created_at (ADR 0005 anchor from the activation day) — windowed from the
+	// read-back mirror row's created_at, the stable first-registration anchor,
+	// NEVER from now: a retry landing after the boundary must not recompute
+	// against the NEW period (ProratedBaseMicros would return the FULL base for
+	// a window the boundary advance leg already billed → double charge, and the
+	// legitimate creation-period proration would be lost). The proration bills
+	// the window's remaining whole UTC days, creation day inclusive.
 	// TODO(plan): plan-resolved base once a plan resolver exists (v1 = default).
-	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), billingperiod.AnchorDay(activatedAt))
+	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
+
+	// INVARIANT: the proration leg bills ONLY the creation period. If that
+	// window has already ended, skip the charge entirely — charge 0, guard
+	// left UNARMED — deterministically on this and every future retry. Every
+	// later period is owned by the boundary advance leg (it bills the apps
+	// that existed before the period opened), and v1 does no retroactive
+	// catch-up (D1d), so a late retry must never invoice anything here.
+	if !s.nowFn().UTC().Before(periodEnd) {
+		return resp, nil
+	}
+
 	prorated := usage.ProratedBaseMicros(
 		usage.AppBaseFeeMicros(usage.BaseFeeMicros, app.ModuleCount),
 		app.CreatedAt, periodStart, periodEnd,
@@ -183,8 +229,8 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
 	if cents == 0 {
-		// Zero remaining days / rounded to 0 — nothing to invoice; the row
-		// stands and the boundary leg picks the app up next period.
+		// Rounded to 0 cents — nothing to invoice; the row stands and the
+		// boundary leg picks the app up from the next period on.
 		return resp, nil
 	}
 
@@ -228,6 +274,23 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
 
+	// Freeze what this charge actually billed (migration 028) BEFORE arming the
+	// guard: the snapshot is the display's authoritative base for the creation
+	// period, so a later SyncAppModules can never drift the shown base away
+	// from this invoice. Keyed by the FULL anchored period_start (the display
+	// identity); BaseMicros is the prorated partial-window amount. Idempotent —
+	// a retry that failed between here and the guard re-upserts identical
+	// values through the same Stripe idem keys.
+	if err := s.store.UpsertProrationBaseSnapshot(ctx, AppBaseSnapshot{
+		AppID:       app.AppID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		ModuleCount: app.ModuleCount,
+		BaseMicros:  prorated,
+	}); err != nil {
+		return nil, billing.Internal("proration base snapshot upsert failed", err)
+	}
+
 	if err := s.store.SetAppProrationInvoice(ctx, app.AppID, inv.ID); err != nil {
 		return nil, billing.Internal("arm proration guard failed", err)
 	}
@@ -255,6 +318,9 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 	}
 	if req.ModuleCount != nil && *req.ModuleCount < 0 {
 		return nil, billing.InvalidInput("module_count must be non-negative")
+	}
+	if req.ModuleCount != nil && *req.ModuleCount > maxModuleCount {
+		return nil, billing.InvalidInput("module_count exceeds the maximum supported count (100000)")
 	}
 
 	app, found, err := s.store.AppMirror(ctx, req.AppID)
