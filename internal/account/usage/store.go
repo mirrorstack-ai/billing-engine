@@ -967,10 +967,8 @@ func timePtrFromTimestamptz(ts pgtype.Timestamptz) *time.Time {
 // mirror value rounds half-up through the single shared money rounding point
 // instead of a second ad-hoc conversion path.
 func centsNumericToMicros(n pgtype.Numeric) (int64, error) {
-	if !n.Valid {
-		return 0, nil
-	}
-	// n is a value copy; bumping Exp scales the copy only, and
+	// n is a value copy; bumping Exp scales the copy only (inert when
+	// !n.Valid, which microsFromNumeric already answers with 0), and
 	// microsFromNumeric never mutates the shared *big.Int.
 	n.Exp += 4
 	return microsFromNumeric(n)
