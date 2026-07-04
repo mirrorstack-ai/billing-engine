@@ -63,6 +63,7 @@ type fakeStore struct {
 	errPeriod             error
 	errVisibility         error
 	errUpsertDef          error
+	errUpsertOverride     error
 	errHistory            error
 	errVersion            error
 	errAppUsage           error
@@ -128,6 +129,36 @@ func (f *fakeStore) UpsertMetricDefinitions(_ context.Context, defs []usage.Metr
 			UnitPriceMicros: def.UnitPriceMicros,
 			Priced:          def.Priced,
 			Active:          def.Active,
+		}
+	}
+	return nil
+}
+
+// UpsertInfraPriceOverrides mirrors the real store: all-or-nothing, and each
+// override inherits kind + unit from the SENTINEL catalog row (defKey(sentinel,
+// metric)) — a missing sentinel row errors (the real store's INSERT ... SELECT
+// affects 0 rows → error), never a silent write. The written row keys the REAL
+// moduleID with the override price, so a test can assert f.defs[defKey(module,
+// metric)] carries the override price + the sentinel's kind/unit.
+func (f *fakeStore) UpsertInfraPriceOverrides(_ context.Context, moduleID uuid.UUID, overrides []usage.InfraPriceOverride) error {
+	if f.errUpsertOverride != nil {
+		return f.errUpsertOverride // all-or-nothing: nothing is written on error
+	}
+	sentinel := usage.PlatformInfraModuleID()
+	// Validate the whole batch first so a mid-batch miss writes nothing.
+	for _, o := range overrides {
+		if _, ok := f.defs[defKey(sentinel, o.Metric)]; !ok {
+			return errors.New("no sentinel catalog row for infra metric " + o.Metric)
+		}
+	}
+	for _, o := range overrides {
+		base := f.defs[defKey(sentinel, o.Metric)]
+		f.defs[defKey(moduleID, o.Metric)] = usage.MetricDefinition{
+			Kind:            base.Kind, // inherited from the sentinel row
+			Unit:            base.Unit, // inherited from the sentinel row
+			UnitPriceMicros: o.UnitPriceMicros,
+			Priced:          true,
+			Active:          true,
 		}
 	}
 	return nil
@@ -1016,4 +1047,174 @@ func TestSetMetricDefinitions_InternalOnStoreError(t *testing.T) {
 	})
 	requireCode(t, err, billing.CodeInternal)
 	require.Empty(t, store.defs, "all-or-nothing: nothing synced when the store errors")
+}
+
+// --- SetInfraPriceOverrides (decision 19 §4.3) ----------------------------
+
+// seedSentinelInfra seeds a SENTINEL base infra catalog row into the fake so an
+// override can inherit its kind/unit (the real store's INSERT ... SELECT source).
+func seedSentinelInfra(store *fakeStore, metric string, kind usage.Kind, unit string, priceMicros int64) {
+	store.defs[defKey(usage.PlatformInfraModuleID(), metric)] = usage.MetricDefinition{
+		Kind: kind, Unit: unit, UnitPriceMicros: priceMicros, Priced: true, Active: true,
+	}
+}
+
+func TestSetInfraPriceOverrides_WritesPriceOnlyRowInheritingKindUnit(t *testing.T) {
+	store := newFakeStore()
+	// The sentinel base row (as migration 017 seeds it): sum / millisecond / 1µ$.
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+
+	resp, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, resp.Synced)
+
+	// The override row is keyed by the REAL module id (never the sentinel),
+	// carries the override PRICE, and INHERITS kind + unit from the sentinel row.
+	got := store.defs[defKey(mod, "infra.compute.walltime.ms")]
+	require.Equal(t, int64(5), got.UnitPriceMicros, "override price is written")
+	require.Equal(t, usage.KindSum, got.Kind, "kind inherited from sentinel")
+	require.Equal(t, "millisecond", got.Unit, "unit inherited from sentinel")
+	require.True(t, got.Active)
+
+	// The sentinel base row is untouched (still the platform default price).
+	base := store.defs[defKey(usage.PlatformInfraModuleID(), "infra.compute.walltime.ms")]
+	require.Equal(t, int64(1), base.UnitPriceMicros, "sentinel base price unchanged")
+}
+
+func TestSetInfraPriceOverrides_ZeroPriceIsFullAbsorb(t *testing.T) {
+	// ms.Price(0) → override 0 → full absorb. Zero is a VALID override price
+	// (not "unpriced"), so it must persist as 0, not be rejected.
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+
+	resp, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 0}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, resp.Synced)
+	require.Equal(t, int64(0), store.defs[defKey(mod, "infra.compute.walltime.ms")].UnitPriceMicros)
+}
+
+func TestSetInfraPriceOverrides_RejectsNonReservedMetric(t *testing.T) {
+	// A custom (non-reserved) metric belongs on SetMetricDefinitions — this
+	// RPC is the INVERSE gate and rejects it.
+	store := newFakeStore()
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  uuid.New(),
+		Overrides: []usage.InfraPriceOverride{{Metric: "orders.placed", UnitPriceMicros: 5}},
+	})
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.defs, "non-reserved metric must not be written")
+}
+
+func TestSetInfraPriceOverrides_RejectsUnregisteredReservedMetric(t *testing.T) {
+	// A reserved-prefixed name that is NOT a registered platform infra metric
+	// has no platform-owned catalog row to inherit from → rejected.
+	store := newFakeStore()
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  uuid.New(),
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.not.a.real.metric", UnitPriceMicros: 5}},
+	})
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.defs)
+}
+
+func TestSetInfraPriceOverrides_RejectsSentinelModuleID(t *testing.T) {
+	// The all-zero sentinel is the platform's BASE catalog, seeded by migration
+	// and never re-priced through this RPC.
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  usage.PlatformInfraModuleID(),
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 0}},
+	})
+	requireCode(t, err, billing.CodeInvalidInput)
+	// The sentinel base row is unchanged (only the seeded row exists).
+	require.Len(t, store.defs, 1)
+	require.Equal(t, int64(1), store.defs[defKey(usage.PlatformInfraModuleID(), "infra.compute.walltime.ms")].UnitPriceMicros)
+}
+
+func TestSetInfraPriceOverrides_RequiresModuleID(t *testing.T) {
+	_, err := newService(newFakeStore()).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 0}},
+	})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestSetInfraPriceOverrides_RejectsNegativePrice(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  uuid.New(),
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: -1}},
+	})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestSetInfraPriceOverrides_AllOrNothingRejectsWholeBatch(t *testing.T) {
+	// One invalid override in the batch rejects the whole request BEFORE the
+	// store is touched, so no partial write lands.
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID: mod,
+		Overrides: []usage.InfraPriceOverride{
+			{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5}, // valid
+			{Metric: "orders.placed", UnitPriceMicros: 5},             // invalid (non-reserved)
+		},
+	})
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.defs[defKey(mod, "infra.compute.walltime.ms")].Unit, "no override written when any in the batch is invalid")
+}
+
+func TestSetInfraPriceOverrides_EmptyOverridesNoOp(t *testing.T) {
+	resp, err := newService(newFakeStore()).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID: uuid.New(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, resp.Synced)
+}
+
+func TestSetInfraPriceOverrides_InternalOnStoreError(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	store.errUpsertOverride = errors.New("boom")
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  uuid.New(),
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5}},
+	})
+	requireCode(t, err, billing.CodeInternal)
+}
+
+func TestSetInfraPriceOverrides_AcceptsAllRegisteredInfraMetrics(t *testing.T) {
+	// Every metric RecordInfraUsage accepts is also overridable here (the two
+	// gates share platformInfraKind), including the platform.* namespace door.
+	metrics := []string{
+		"infra.compute.walltime.ms", "infra.ai.input.tokens", "infra.ai.requests",
+		"infra.request.count", "infra.mcp.tool_call.count", "infra.cron.count",
+		"infra.event.count", "infra.event.bytes", "infra.egress.api.bytes",
+		"infra.storage.put.count", "infra.storage.list.count", "infra.storage.gib_hours",
+	}
+	store := newFakeStore()
+	for _, m := range metrics {
+		seedSentinelInfra(store, m, usage.KindSum, "unit", 1)
+	}
+	mod := uuid.New()
+	overrides := make([]usage.InfraPriceOverride, 0, len(metrics))
+	for _, m := range metrics {
+		overrides = append(overrides, usage.InfraPriceOverride{Metric: m, UnitPriceMicros: 0})
+	}
+	resp, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		Overrides: overrides,
+	})
+	require.NoError(t, err)
+	require.Equal(t, len(metrics), resp.Synced)
 }

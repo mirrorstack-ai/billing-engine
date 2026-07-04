@@ -27,6 +27,9 @@ func (stubUsageStore) LookupMetricDefinition(context.Context, uuid.UUID, string)
 func (stubUsageStore) UpsertMetricDefinitions(context.Context, []usage.MetricDeclaration) error {
 	return nil
 }
+func (stubUsageStore) UpsertInfraPriceOverrides(context.Context, uuid.UUID, []usage.InfraPriceOverride) error {
+	return nil
+}
 func (s *stubUsageStore) InsertUsageEvent(_ context.Context, e usage.UsageEvent) (bool, error) {
 	s.last = &e
 	return true, nil
