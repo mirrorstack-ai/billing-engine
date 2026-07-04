@@ -109,16 +109,29 @@ type Store interface {
 	// only the usage_aggregates / usage_events ledgers, NEVER an install table).
 	AppBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppMetricUsageRaw, error)
 
-	// AppInfraBill returns the per-metric 基礎設施 (infrastructure) breakdown for
-	// the app-owner bill — one AppInfraUsage per ACTIVE declared infra metric (the
+	// AppInfraBill returns the per-metric 基礎設施 (infrastructure) RESIDUAL breakdown
+	// for the app-owner bill — one AppInfraUsage per ACTIVE declared infra metric (the
 	// platform-infra sentinel catalog rows), including declared-but-unused ones at
 	// qty 0 · $0, because the read is CATALOG-anchored (FROM metric_definitions
-	// LEFT JOIN the rolled-else-live infra usage). ChargedMicros already carries the
-	// ×1.2 infra markup applied ONCE in SQL; UnitPriceMicros is the raw catalog COGS.
-	// accountID may be uuid.Nil for a lazy (account-less) app — every declared
-	// metric then resolves to $0 rather than dropping out. Ledger-only /
+	// LEFT JOIN the rolled-else-live infra usage). Since decision 19 the usage side is
+	// the SENTINEL-attributed residual only (module_id = the platform-infra sentinel);
+	// infra attributed to a real module is read by AppModuleInfraBill. ChargedMicros
+	// already carries the ×1.2 infra markup applied ONCE in SQL; UnitPriceMicros is the
+	// raw catalog COGS. accountID may be uuid.Nil for a lazy (account-less) app — every
+	// declared metric then resolves to $0 rather than dropping out. Ledger-only /
 	// uninstall-safe exactly like AppBill.
 	AppInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppInfraUsage, error)
+
+	// AppModuleInfraBill returns the per-MODULE 基礎設施 breakdown (decision 19): reserved
+	// infra.* / platform.* usage ATTRIBUTED to a real incurring module (module_id <> the
+	// platform-infra sentinel), one AppModuleInfraUsage per (module_id, module_version,
+	// metric). It is USAGE-anchored (only modules that actually incurred infra appear —
+	// unlike the catalog-anchored residual above) and carries the DUAL price: the SENTINEL
+	// default plus the per-module override (nil when the module has no override row).
+	// ChargedMicros carries the ×1.2 infra markup applied ONCE in SQL. Rolled-up-else-live
+	// / uninstall-safe exactly like AppInfraBill. Together with AppInfraBill it partitions
+	// the reserved namespace with no overlap (residual = sentinel, module = non-sentinel).
+	AppModuleInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppModuleInfraUsage, error)
 
 	// ListBillingPeriods returns an account's real billing_periods rows
 	// newest-first (the closed periods behind the web 週期 selector).
@@ -582,6 +595,63 @@ func (s *pgxStore) AppInfraBill(ctx context.Context, accountID, appID uuid.UUID,
 			UnitPriceMicros:  r.UnitPriceMicros,
 			BillableQuantity: qty,
 			ChargedMicros:    charged,
+		})
+	}
+	return out, nil
+}
+
+// AppModuleInfraBill reads the per-module infrastructure breakdown for ONE
+// app+period, dual-priced per the AppModuleInfraBillLines query — one row per
+// (module_id, module_version, metric) of reserved infra usage attributed to a real
+// incurring module. module_unit_price_micros is decoded as a NULLABLE *int64: NULL
+// (no per-module override row) leaves it nil so the wire carries "no override" (the
+// UI's plain-vs-adjusted switch) rather than zero-filling to the default. charged_micros
+// is decoded half-up through the shared micros decoder (the single per-line rounding
+// point on the live SUM(value × price) × 12/10 branch; a no-op on the already-integer
+// rolled branch); default_unit_price_micros is the raw SENTINEL COGS (pre-markup).
+func (s *pgxStore) AppModuleInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppModuleInfraUsage, error) {
+	rows, err := s.q.AppModuleInfraBillLines(ctx, db.AppModuleInfraBillLinesParams{
+		AccountID:   accountID.String(),
+		AppID:       appID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AppModuleInfraUsage, 0, len(rows))
+	for _, r := range rows {
+		moduleID, err := uuid.Parse(r.ModuleID)
+		if err != nil {
+			return nil, fmt.Errorf("decode module_id for infra metric %q: %w", r.Metric, err)
+		}
+		qty, err := floatFromNumeric(r.BillableQuantity)
+		if err != nil {
+			return nil, fmt.Errorf("decode billable_quantity for infra metric %q: %w", r.Metric, err)
+		}
+		charged, err := microsFromNumeric(r.ChargedMicros)
+		if err != nil {
+			return nil, fmt.Errorf("decode charged_micros for infra metric %q: %w", r.Metric, err)
+		}
+		// NULL module override → leave nil (plain mode on the wire). A non-NULL
+		// value (incl. an explicit 0 = ms.Price(0) full absorb) points to a copy.
+		var modulePrice *int64
+		if r.ModuleUnitPriceMicros.Valid {
+			mp := r.ModuleUnitPriceMicros.Int64
+			modulePrice = &mp
+		}
+		out = append(out, AppModuleInfraUsage{
+			ModuleID:               moduleID,
+			ModuleVersion:          r.ModuleVersion,
+			Metric:                 r.Metric,
+			Label:                  r.Metric, // no friendly-label registry here; metric id is the label
+			Kind:                   Kind(r.Kind),
+			Unit:                   r.Unit,
+			Group:                  string(r.DisplayGroup),
+			BillableQuantity:       qty,
+			DefaultUnitPriceMicros: r.DefaultUnitPriceMicros,
+			ModuleUnitPriceMicros:  modulePrice,
+			ChargedMicros:          charged,
 		})
 	}
 	return out, nil

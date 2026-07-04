@@ -231,6 +231,96 @@ func TestGetAppBill_InternalOnInfraStoreError(t *testing.T) {
 	requireCode(t, err, billing.CodeInternal)
 }
 
+// --- GetAppBill: per-module infra split (decision 19) ---------------------
+
+// moduleInfraLine builds one per-module infra line as AppModuleInfraBill returns it.
+// modulePrice nil models a module with NO override (plain line at the default);
+// a non-nil pointer models an ms.Price(n) override. ChargedMicros is the already
+// ×1.2-marked-up line total (the markup lives in the AppModuleInfraBillLines SQL,
+// exercised by the integration suite, not here).
+func moduleInfraLine(mod uuid.UUID, metric, version string, defaultPrice int64, modulePrice *int64, qty float64, charged int64) usage.AppModuleInfraUsage {
+	return usage.AppModuleInfraUsage{
+		ModuleID: mod, ModuleVersion: version, Metric: metric, Label: metric,
+		Kind: usage.KindSum, Unit: "ms", Group: "compute",
+		BillableQuantity: qty, DefaultUnitPriceMicros: defaultPrice,
+		ModuleUnitPriceMicros: modulePrice, ChargedMicros: charged,
+	}
+}
+
+func i64(v int64) *int64 { return &v }
+
+func TestGetAppBill_ModuleInfraLinesReconcileWithResidual(t *testing.T) {
+	// The per-module split is a pure DISPLAY re-partition of the same infra total:
+	// InfraTotalMicros == Σ module_infra_lines.charged + Σ infra_lines.charged. Both
+	// the residual (sentinel-attributed) and the per-module (attributed) lines feed the
+	// scalar so downstream base-fee / credit / total math is unchanged.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	// Residual: an unattributable sentinel AI line charged 8.
+	store.appInfraBillRows = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 1000, 0.008, 8),
+	}
+	// Per-module: two modules incurred compute. modA absorbed (override 0 → charged 0),
+	// modB has no override → plain at the sentinel default (charged 24).
+	modA, modB := uuid.New(), uuid.New()
+	store.appModuleInfraBillRows = []usage.AppModuleInfraUsage{
+		moduleInfraLine(modA, "infra.compute.walltime.ms", "", 20, i64(0), 100, 0),
+		moduleInfraLine(modB, "infra.compute.walltime.ms", "", 20, nil, 100, 24),
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
+	require.NoError(t, err)
+
+	require.Len(t, resp.ModuleInfraLines, 2, "module_infra_lines forwarded verbatim")
+	require.Len(t, resp.InfraLines, 1, "residual retained")
+	// Reconciliation: 8 (residual) + 0 (modA absorb) + 24 (modB plain) = 32.
+	require.EqualValues(t, 32, resp.InfraTotalMicros)
+	var sum int64
+	for _, l := range resp.InfraLines {
+		sum += l.ChargedMicros
+	}
+	for _, l := range resp.ModuleInfraLines {
+		sum += l.ChargedMicros
+	}
+	require.Equal(t, resp.InfraTotalMicros, sum, "infra_total == Σ module_infra + Σ residual")
+
+	// Dual-price passthrough: modA carries an explicit 0 override (full absorb, NOT nil);
+	// modB carries nil (no override → UI plain mode). No revenue leak — modB with no
+	// override still prices at the sentinel default (charged 24 > 0).
+	require.NotNil(t, resp.ModuleInfraLines[0].ModuleUnitPriceMicros)
+	require.EqualValues(t, 0, *resp.ModuleInfraLines[0].ModuleUnitPriceMicros)
+	require.Nil(t, resp.ModuleInfraLines[1].ModuleUnitPriceMicros, "no override → nil (plain mode)")
+	require.EqualValues(t, 20, resp.ModuleInfraLines[1].DefaultUnitPriceMicros)
+	require.EqualValues(t, 24, resp.ModuleInfraLines[1].ChargedMicros)
+
+	// The total folds the whole infra scalar in: base + 0 module usage + 32 − 0.
+	require.Equal(t, usage.BaseFeeMicros+32, resp.TotalMicros)
+}
+
+func TestGetAppBill_ModuleInfraSkippedForLazyNoAccountApp(t *testing.T) {
+	// AppModuleInfraBill is USAGE-anchored: with no billing account there is no
+	// attributed usage, so it is skipped (unlike the catalog-anchored residual, which
+	// still renders every declared metric at $0). ModuleInfraLines is a non-nil empty slice.
+	store := newFakeStore()
+	store.appInfraBillRows = []usage.AppInfraUsage{appInfraLine("infra.request.count", "requests", 1, 0, 0)}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: uuid.New(), AppID: uuid.New()})
+	require.NoError(t, err)
+	require.False(t, store.appModuleInfraBillCalled, "no account → the per-module infra read is skipped")
+	require.NotNil(t, resp.ModuleInfraLines)
+	require.Empty(t, resp.ModuleInfraLines)
+}
+
+func TestGetAppBill_InternalOnModuleInfraStoreError(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errAppModuleInfraBill = errors.New("boom")
+	_, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
+	requireCode(t, err, billing.CodeInternal)
+}
+
 // --- GetAppBill: per-version lines ----------------------------------------
 
 func TestGetAppBill_KeepsPerModuleVersionLines(t *testing.T) {
