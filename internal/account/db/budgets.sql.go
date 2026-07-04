@@ -12,6 +12,33 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const appAccountActivatedAt = `-- name: AppAccountActivatedAt :one
+SELECT a.activated_at
+FROM ms_billing.accounts a
+WHERE a.id = (
+    SELECT e.account_id
+    FROM ms_billing.usage_events e
+    WHERE e.app_id = $1 AND e.account_id IS NOT NULL
+    ORDER BY e.recorded_at DESC
+    LIMIT 1
+)
+`
+
+// AppAccountActivatedAt resolves the billing-period ANCHOR (migration 025) for an
+// APP-scoped budget: the payer account's activated_at, found via the app's own
+// usage. A budget is keyed by app_id only, but the anchor lives on the paying
+// account, so we resolve app → account through the app's most-recent attributed
+// usage_event (account_id IS NOT NULL) and read that account's activated_at. This
+// agrees with the ingest-path budget window, which anchors on the SAME payer
+// account. No attributed usage yet (or a NULL anchor) → the Go layer falls back to
+// anchor day 1 (UTC calendar month). Returns at most one row.
+func (q *Queries) AppAccountActivatedAt(ctx context.Context, appID string) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, appAccountActivatedAt, appID)
+	var activated_at pgtype.Timestamptz
+	err := row.Scan(&activated_at)
+	return activated_at, err
+}
+
 const appPeriodSpendMicros = `-- name: AppPeriodSpendMicros :one
 SELECT COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
 FROM ms_billing.usage_events e

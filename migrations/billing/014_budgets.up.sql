@@ -30,10 +30,10 @@
 -- DELIBERATE DEFERRALS vs design §4: the spec lists a budget_action
 -- ENUM('alert','cap') column and a period_anchor column. Both are omitted in
 -- v1. action is alert-only (above). period_anchor is unused because evaluation
--- keys on the current UTC calendar month (the SAME window GetUsageSummary
--- shows); the signup-day anniversary period (period_anchor) folds in with the
--- authoritative billing_periods rollup (meter charge PRs #5/#6). Both are
--- additive when those phases land.
+-- keys on the app payer's current ANCHORED period (the card-binding-day window —
+-- ADR 0005 — the SAME window GetUsageSummary shows); the per-scope period_anchor
+-- column folds in with the authoritative billing_periods rollup (meter charge PRs
+-- #5/#6). Both are additive when those phases land.
 --
 -- Money is BIGINT micro-dollars (1e-6 USD), never float (the ms_billing
 -- money convention). limit_micros mirrors the platform-side budget value

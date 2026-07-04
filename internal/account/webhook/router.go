@@ -75,6 +75,14 @@ type Store interface {
 	// (customer.id has no matching accounts row).
 	InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (found bool, err error)
 
+	// StampAccountActivated freezes the billing-period anchor (migration 025):
+	// the first-card-bind instant, keyed by stripe_customer_id. FIRST-BIND-WINS
+	// (WHERE activated_at IS NULL), so a detach + re-add never regresses it and a
+	// webhook retry is a no-op. Returns (firstBind, error): firstBind=true only on
+	// the row that actually set it (0 rows = already activated OR drift). It never
+	// fails the attach path — a stamp error is logged, the mirror insert stands.
+	StampAccountActivated(ctx context.Context, stripeCustomerID string) (firstBind bool, err error)
+
 	// SoftDeletePaymentMethod sets deleted_at=now() on the matching
 	// stripe_payment_method_id row. Returns (found bool, error) where
 	// found=false is a no-op (idempotent on detach).

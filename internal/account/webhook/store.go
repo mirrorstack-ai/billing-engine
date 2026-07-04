@@ -112,6 +112,20 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 	return exists, nil
 }
 
+// StampAccountActivated freezes the account's billing-period anchor (migration
+// 025) — the first-card-bind instant — keyed by stripe_customer_id. The query's
+// `WHERE activated_at IS NULL` makes it first-bind-wins + idempotent (a re-add or
+// a webhook retry updates 0 rows). Returns (firstBind, error): firstBind=true
+// only when THIS call set the anchor; 0 rows (already activated, or no accounts
+// row for the customer) is a benign no-op the caller logs, never an error.
+func (s *pgxStore) StampAccountActivated(ctx context.Context, stripeCustomerID string) (bool, error) {
+	rows, err := s.q.StampAccountActivated(ctx, text(stripeCustomerID))
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // SoftDeletePaymentMethod sets deleted_at=now() on the row matching
 // stripePaymentMethodID. Returns (found, error). found=false is an
 // idempotent no-op (the PM was never mirrored, or was already soft-

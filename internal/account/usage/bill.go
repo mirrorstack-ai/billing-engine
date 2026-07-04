@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // ============================================================================
@@ -182,8 +183,18 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		periodStart, periodEnd = start, end
 		periodID = req.PeriodID.String()
 	} else {
-		// Default: the current calendar-month-to-date window, live from events.
-		periodStart, periodEnd = currentPeriodWindow(s.nowFn().UTC())
+		// Default: the account's current anchored period (card-binding day, ADR
+		// 0005), live from events. No billing account yet → the calendar-month
+		// default (DefaultAnchorDay) so the base-fee-only bill still shows a window.
+		anchorDay := billingperiod.DefaultAnchorDay
+		if found {
+			d, err := s.store.AccountAnchorDay(ctx, accountID)
+			if err != nil {
+				return nil, billing.Internal("anchor day lookup failed", err)
+			}
+			anchorDay = d
+		}
+		periodStart, periodEnd = billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
 	}
 
 	// Read the usage lines (empty when no billing account exists yet — the bill is
@@ -266,19 +277,33 @@ func (s *Service) GetBillingPeriods(ctx context.Context, req GetBillingPeriodsRe
 		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
 	}
 
-	currentStart, currentEnd := currentPeriodWindow(s.nowFn().UTC())
-	syntheticCurrent := BillingPeriodRef{
-		PeriodID:    "", // no billing_periods row for the in-progress month → live
-		PeriodStart: currentStart,
-		PeriodEnd:   currentEnd,
-		IsCurrent:   true,
-	}
-
+	// Resolve the account (and its anchor) BEFORE the window: the synthetic
+	// current period's start is the account's anchored boundary (card-binding
+	// day, ADR 0005), and that SAME value is passed to ListBillingPeriods where
+	// the SQL flags IsCurrent via period_start = currentStart — so it MUST equal
+	// the period_start the rollup/charge cycle writes, or "current" never matches.
 	owner := Owner{UserID: req.OwnerUserID, OrgID: req.OwnerOrgID}
 	accountID, found, err := s.store.AccountByOwner(ctx, owner)
 	if err != nil {
 		return nil, billing.Internal("account lookup failed", err)
 	}
+
+	anchorDay := billingperiod.DefaultAnchorDay
+	if found {
+		d, err := s.store.AccountAnchorDay(ctx, accountID)
+		if err != nil {
+			return nil, billing.Internal("anchor day lookup failed", err)
+		}
+		anchorDay = d
+	}
+	currentStart, currentEnd := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
+	syntheticCurrent := BillingPeriodRef{
+		PeriodID:    "", // no billing_periods row for the in-progress period → live
+		PeriodStart: currentStart,
+		PeriodEnd:   currentEnd,
+		IsCurrent:   true,
+	}
+
 	if !found {
 		// No billing account yet → only the current live period.
 		return &GetBillingPeriodsResponse{Periods: []BillingPeriodRef{syntheticCurrent}}, nil

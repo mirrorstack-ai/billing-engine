@@ -31,8 +31,8 @@ type Store interface {
 	// OpenPeriodForAccount upserts the billing_periods row keyed
 	// (account_id, period_start) and returns its id. Idempotent: a re-run for
 	// the same window returns the existing row's id rather than duplicating it.
-	// period_end is the signup-day anniversary window end (period_start + 1
-	// month), supplied by the caller.
+	// period_end is the anchored-period window end (the next card-binding-day
+	// boundary — ADR 0005), supplied by the caller.
 	OpenPeriodForAccount(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (uuid.UUID, error)
 
 	// RawAggregates aggregates the account's usage_events in [periodStart,
@@ -143,6 +143,27 @@ type Store interface {
 	// in a closed period window [periodStart, periodEnd) with no billing_run yet
 	// — the work list for cmd/billing-cycle.
 	AccountsWithUnbilledUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+
+	// ActivatedAccounts returns every account that has bound a card (a non-NULL
+	// activated_at anchor, migration 025) with its anchor instant. Under
+	// anchoring each account closes on its OWN card-binding day, so cmd/billing-
+	// cycle iterates these and derives a per-account just-closed window rather
+	// than sharing one batch window. Un-activated accounts (no card) are omitted.
+	ActivatedAccounts(ctx context.Context) ([]AccountAnchor, error)
+
+	// LatestClosedPeriodEnd returns the newest billing_periods.period_end for an
+	// account and whether one exists — the cutover STRADDLE-CLAMP input. found=
+	// false (no period yet) means no clamp is needed. Read-only.
+	LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID) (end time.Time, found bool, err error)
+}
+
+// AccountAnchor pairs an account with its billing-period anchor instant (the
+// first-card-bind time, migration 025). cmd/billing-cycle derives the anchor
+// DAY-OF-MONTH from ActivatedAt (billingperiod.AnchorDay) and closes that
+// account's just-ended anchored period.
+type AccountAnchor struct {
+	ID          uuid.UUID
+	ActivatedAt time.Time
 }
 
 // ErrAccountNotFound is returned by UpdateAccountCollection when no accounts row
@@ -579,6 +600,39 @@ func (s *pgxStore) AccountsWithUnbilledUsage(ctx context.Context, periodStart, p
 		return nil, err
 	}
 	return parseUUIDs(rows)
+}
+
+func (s *pgxStore) ActivatedAccounts(ctx context.Context) ([]AccountAnchor, error) {
+	rows, err := s.q.ActivatedAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AccountAnchor, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		// The query filters activated_at IS NOT NULL, so a non-Valid value here
+		// would be a driver anomaly; skip it defensively rather than anchor on the
+		// zero time (which would window January-1).
+		if !r.ActivatedAt.Valid {
+			continue
+		}
+		out = append(out, AccountAnchor{ID: id, ActivatedAt: r.ActivatedAt.Time})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID) (time.Time, bool, error) {
+	end, err := s.q.LatestClosedPeriodEnd(ctx, accountID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return end, true, nil
 }
 
 // parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc

@@ -22,8 +22,8 @@
 -- (account_id, period_start). The rollup needs a stable period row to attach
 -- usage_aggregates to; this returns the existing row's id+status on a re-run
 -- (the DO UPDATE is a no-op SET so RETURNING fires on conflict too) and a
--- fresh 'open' row otherwise. period_end is the signup-day anniversary window
--- end (period_start + 1 month), supplied by the caller.
+-- fresh 'open' row otherwise. period_end is the anchored-period window end (the
+-- next card-binding-day boundary — ADR 0005), supplied by the caller.
 -- name: OpenPeriodForAccount :one
 INSERT INTO ms_billing.billing_periods (account_id, period_start, period_end, status)
 VALUES ($1, $2, $3, 'open')

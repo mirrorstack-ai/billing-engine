@@ -48,6 +48,25 @@ WHERE e.app_id = $1
   AND e.recorded_at >= $2
   AND e.recorded_at <  $3;
 
+-- AppAccountActivatedAt resolves the billing-period ANCHOR (migration 025) for an
+-- APP-scoped budget: the payer account's activated_at, found via the app's own
+-- usage. A budget is keyed by app_id only, but the anchor lives on the paying
+-- account, so we resolve app → account through the app's most-recent attributed
+-- usage_event (account_id IS NOT NULL) and read that account's activated_at. This
+-- agrees with the ingest-path budget window, which anchors on the SAME payer
+-- account. No attributed usage yet (or a NULL anchor) → the Go layer falls back to
+-- anchor day 1 (UTC calendar month). Returns at most one row.
+-- name: AppAccountActivatedAt :one
+SELECT a.activated_at
+FROM ms_billing.accounts a
+WHERE a.id = (
+    SELECT e.account_id
+    FROM ms_billing.usage_events e
+    WHERE e.app_id = $1 AND e.account_id IS NOT NULL
+    ORDER BY e.recorded_at DESC
+    LIMIT 1
+);
+
 -- InsertBudgetAlert records one threshold crossing, idempotent on
 -- (budget_id, period_start, percent). ON CONFLICT DO NOTHING makes a
 -- re-evaluation of the same crossing a no-op. :execrows so the caller can
