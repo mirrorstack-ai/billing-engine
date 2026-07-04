@@ -255,12 +255,10 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		return nil, billing.StripeError("proration invoice failed", err)
 	}
 
-	// Mirror with the PARTIAL window: [creation day (UTC midnight), period end).
-	created := app.CreatedAt.UTC()
-	partialStart := time.Date(created.Year(), created.Month(), created.Day(), 0, 0, 0, 0, time.UTC)
-	if partialStart.Before(periodStart) {
-		partialStart = periodStart // a backdated created_at never widens the window
-	}
+	// Mirror with the PARTIAL window: [creation day (UTC midnight), period
+	// end) — the SAME coverage-start instant ProratedBaseMicros priced, so
+	// the mirrored window and the charged amount agree by construction.
+	partialStart := usage.ProrationCoverageStart(app.CreatedAt, periodStart)
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
 		AccountID:       app.AccountID,
 		StripeInvoiceID: inv.ID,

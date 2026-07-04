@@ -50,9 +50,9 @@ func TestAppBaseSnapshots_Integration_ConflictSemanticsAndRead(t *testing.T) {
 	snap, found, err := usageStore.AppBaseSnapshot(ctx, appID, periodStart)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Equal(t, "proration", snap.Source, "proration wins over a conflicting advance write")
+	// The prorated amount (not the advance's 20_000_000) proves the
+	// proration row wins over a conflicting advance write.
 	require.EqualValues(t, 6_451_613, snap.BaseMicros)
-	require.Equal(t, 5, snap.ModuleCount)
 
 	// A DIFFERENT period inserts cleanly (advance) and a re-run keeps the
 	// FIRST write (DO NOTHING).
@@ -69,7 +69,6 @@ func TestAppBaseSnapshots_Integration_ConflictSemanticsAndRead(t *testing.T) {
 	snap, found, err = usageStore.AppBaseSnapshot(ctx, appID, nextStart)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Equal(t, "advance", snap.Source)
 	require.EqualValues(t, 20_000_000, snap.BaseMicros, "a reclaimed re-run never rewrites the recorded charge")
 
 	// Exact-match read: an unknown period start resolves found=false, never an

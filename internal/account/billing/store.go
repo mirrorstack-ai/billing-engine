@@ -97,17 +97,22 @@ type pgxStore struct {
 	q    *db.Queries
 }
 
-// advisoryLockNamespaceBillingAccountUser is the first argument to
-// pg_advisory_xact_lock(int, int) for EnsureAccount's per-user lock.
-// Using the 2-arg form (namespace, key) means the per-user key occupies
-// a full 32-bit space without colliding with unrelated advisory locks
-// across the codebase — hashtext alone collides at ~65K users (birthday
-// paradox on int32) and would silently serialize unrelated users.
+// AdvisoryLockNamespaceBillingAccountUser is the first argument to
+// pg_advisory_xact_lock(int, int) for the per-user get-or-create account
+// lock. Using the 2-arg form (namespace, key) means the per-user key
+// occupies a full 32-bit space without colliding with unrelated advisory
+// locks across the codebase — hashtext alone collides at ~65K users
+// (birthday paradox on int32) and would silently serialize unrelated users.
 // Explicit int32: pg_advisory_xact_lock(int, int) takes 32-bit args and
 // the generated param field is int32; typing the constant here keeps the
 // value in range and avoids an implicit untyped-const conversion at the
 // call site.
-const advisoryLockNamespaceBillingAccountUser int32 = 0x6c627461 // "lbta" — billing_account, easy to grep
+//
+// Exported because EVERY writer that get-or-creates an accounts row (this
+// package's EnsureAccount, cycle's RegisterApp path) MUST serialize on this
+// SAME (namespace, key) pair — the accounts table has no owner UNIQUE
+// constraint; this lock IS the uniqueness guard.
+const AdvisoryLockNamespaceBillingAccountUser int32 = 0x6c627461 // "lbta" — billing_account, easy to grep
 
 func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UUID, string, error) {
 	var id string
@@ -118,7 +123,7 @@ func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UU
 		// pg_advisory_xact_lock(namespace, key) serializes concurrent
 		// EnsureAccount calls per user. Held for the transaction duration.
 		if err := qtx.AcquireBillingAccountUserLock(ctx, db.AcquireBillingAccountUserLockParams{
-			Column1: advisoryLockNamespaceBillingAccountUser,
+			Column1: AdvisoryLockNamespaceBillingAccountUser,
 			Column2: userID.String(),
 		}); err != nil {
 			return err

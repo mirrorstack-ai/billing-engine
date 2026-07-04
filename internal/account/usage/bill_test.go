@@ -645,9 +645,7 @@ func TestGetAppBill_SnapshotFreezesChargedPeriodBaseAfterSync(t *testing.T) {
 		CreatedAt:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
 	}
 	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
-		ModuleCount: 5,
-		BaseMicros:  usage.AppBaseFeeMicros(usage.BaseFeeMicros, 5), // what the boundary actually invoiced
-		Source:      "advance",
+		BaseMicros: usage.AppBaseFeeMicros(usage.BaseFeeMicros, 5), // what the boundary actually invoiced
 	}
 
 	// The charged period displays the frozen count-5 base, NOT a recompute
@@ -681,9 +679,7 @@ func TestGetAppBill_ProrationSnapshotFreezesCreationPeriodBase(t *testing.T) {
 		CreatedAt:   time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC),
 	}
 	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
-		ModuleCount: 0,
-		BaseMicros:  6_451_613, // what the proration invoice actually charged
-		Source:      "proration",
+		BaseMicros: 6_451_613, // what the proration invoice actually charged
 	}
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
