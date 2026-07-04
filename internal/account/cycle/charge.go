@@ -31,20 +31,24 @@ import (
 //     LIVE ms_billing.apps rows (deleted_at IS NULL — a deleted app stops
 //     accruing base, D1e, though its usage arrears above still bill) that
 //     EXISTED BEFORE the new period opened (created_at < the closed window's
-//     period_end) of AppBaseFeeMicros = BaseFee + Overage × max(0,
-//     module_count − included). An app created INSIDE the new period is
-//     excluded — RegisterApp's creation-proration leg already charged its
-//     new-period base (full or prorated); it joins the advance leg at the
-//     NEXT boundary. module_count is snapshotted AT CHARGE TIME (D1b —
-//     mid-period installs / uninstalls take effect at this boundary, never
-//     mid-period), and each billed app-period is frozen into
-//     ms_billing.app_base_snapshots (migration 028) so the display always
-//     shows what was invoiced. The allowance nets USAGE only, never the base
+//     period_end) of the FLAT BaseFeeMicros (module overage is account-wide
+//     pooled now, migration 030 — no longer a per-app tier here). PLUS a
+//     SEPARATE account-level POOLED overage term for the CLOSING period ($3 ×
+//     max(0, Σ live-app module_count − included)), charged ONCE only when the
+//     mid-period grace sweep did NOT already bill it (no
+//     account_overage_snapshots row for the period — the double-charge guard);
+//     when the boundary does charge it, it writes its own 'advance' snapshot.
+//     An app created INSIDE the new period is excluded — RegisterApp's
+//     creation-proration leg already charged its new-period base (full or
+//     prorated); it joins the advance leg at the NEXT boundary. module_count is
+//     snapshotted AT CHARGE TIME, and each billed app-period is frozen into
+//     ms_billing.app_base_snapshots (migration 028) so the display always shows
+//     what was invoiced. The allowance nets USAGE only, never the base/overage
 //     (it offsets ModuleUsage+Infra in the display math too). An account with
 //     NO mirror rows (pre-backfill) gets base 0 — exactly the pre-027
 //     arrears-only invoice — until the api-platform backfill populates the
 //     roster.
-//  4. arrears + base == 0 (BOTH zero) → MarkBillingRun('invoiced') with NO
+//  4. arrears + base + pooled overage == 0 (ALL zero) → MarkBillingRun('invoiced') with NO
 //     Stripe call. We NEVER auto-create a Stripe Customer with nothing to
 //     charge (design §4 Axis 4).
 //  5. no usable default PM → MarkBillingRun('skipped_no_pm'). The usage is
@@ -142,19 +146,44 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("live app roster read failed", err)
 	}
+	// Each live app contributes ONLY its FLAT base (migration 030 — module
+	// overage is account-wide pooled, no longer a per-app tier). The pooled
+	// module count for the ACCOUNT overage term below is Σ these apps' counts
+	// (the same roster the base bills — apps created inside the new period are
+	// excluded, so the closing period's pool is exact).
 	var advanceBase int64
+	var pooledModuleCount int
 	for _, a := range apps {
-		advanceBase += usage.AppBaseFeeMicros(usage.BaseFeeMicros, a.ModuleCount)
+		advanceBase += usage.BaseFeeMicros
+		pooledModuleCount += a.ModuleCount
 	}
 
-	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase}
+	// SEPARATE account-level POOLED overage term for the closing period, charged
+	// ONCE per account. If this period's pooled overage already has an
+	// account_overage_snapshots row (the mid-period grace sweep billed it), it is
+	// NOT charged again here — the ledger is the double-charge guard. Otherwise
+	// (grace never expired within the period, or overage started too late for the
+	// sweep to run) the boundary charges the FULL pooled overage for the account
+	// and writes its own snapshot (source='advance'), so every over-the-pool
+	// period is billed exactly once.
+	_, overageAlreadyBilled, err := s.store.AccountOverageSnapshot(ctx, accountID, periodStart)
+	if err != nil {
+		return nil, billing.Internal("account overage snapshot lookup failed", err)
+	}
+	var advanceOverage int64
+	overCount := pooledModuleCount - usage.IncludedModules
+	if !overageAlreadyBilled && overCount > 0 {
+		advanceOverage = usage.AccountOverageMicros(pooledModuleCount)
+	}
 
-	// Zero-skip: only when arrears AND base are BOTH zero (empty/zero period
-	// with no live apps) is there nothing to invoice — mark invoiced with NO
-	// Stripe call, never auto-create a Customer with nothing to charge. A zero
-	// total can never breach a limit/ceiling, so this short-circuits ahead of
-	// the risk gate.
-	if arrears == 0 && advanceBase == 0 {
+	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase, AccountOverageMicros: advanceOverage}
+
+	// Zero-skip: only when arrears, base AND pooled overage are ALL zero
+	// (empty/zero period with no live apps) is there nothing to invoice — mark
+	// invoiced with NO Stripe call, never auto-create a Customer with nothing to
+	// charge. A zero total can never breach a limit/ceiling, so this
+	// short-circuits ahead of the risk gate.
+	if arrears == 0 && advanceBase == 0 && advanceOverage == 0 {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
 		}
@@ -268,9 +297,10 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 
 	// One invoice, one pooled line: closed period's netted usage arrears + the
-	// new period's advance base, converted micros → whole cents ONCE at the
-	// Stripe boundary (a single deterministic rounding point for the total).
-	cents, err := centsFromMicros(arrears + advanceBase)
+	// new period's advance base + the closing period's account-wide pooled
+	// overage, converted micros → whole cents ONCE at the Stripe boundary (a
+	// single deterministic rounding point for the total).
+	cents, err := centsFromMicros(arrears + advanceBase + advanceOverage)
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
@@ -278,7 +308,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 
 	// Charge. A failure after the PM gate marks the run 'failed' (auditable) and
 	// returns the error.
-	inv, err := s.charge(ctx, runID, custID, cents, advanceBase > 0)
+	inv, err := s.charge(ctx, runID, custID, cents, advanceBase > 0 || advanceOverage > 0)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is
@@ -315,9 +345,29 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			PeriodStart: periodEnd, // the new period opens where the closed one ends
 			PeriodEnd:   newPeriodEnd,
 			ModuleCount: a.ModuleCount,
-			BaseMicros:  usage.AppBaseFeeMicros(usage.BaseFeeMicros, a.ModuleCount),
+			BaseMicros:  usage.BaseFeeMicros, // FLAT per-app base (overage is pooled, migration 030)
 		}); err != nil {
 			return nil, billing.Internal("advance base snapshot insert failed", err)
+		}
+	}
+
+	// Freeze the account-wide pooled overage this boundary billed for the CLOSING
+	// period (migration 030, source='advance') so the mid-period sweep + display
+	// agree it is already billed — the double-charge guard. Keyed by the closing
+	// period_start; ON CONFLICT DO NOTHING (a mid-period 'grace' row wins if the
+	// race ever writes both). Skipped when nothing was billed (already billed
+	// mid-period, or the account was under the pool).
+	if advanceOverage > 0 {
+		if err := s.store.InsertAccountOverageSnapshot(ctx, AccountOverageSnapshot{
+			AccountID:     accountID,
+			PeriodStart:   periodStart,
+			PeriodEnd:     periodEnd,
+			OverCount:     overCount,
+			ChargedMicros: advanceOverage,
+			Source:        "advance",
+			InvoiceItemID: invoiceItemIdemKey(runID), // the boundary's pooled item id (the run's ii- key)
+		}); err != nil {
+			return nil, billing.Internal("account overage snapshot insert failed", err)
 		}
 	}
 

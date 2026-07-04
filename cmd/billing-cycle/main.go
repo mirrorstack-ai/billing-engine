@@ -77,7 +77,9 @@ func main() {
 		"as_of", res.AsOf,
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 		"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
-		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
+		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
+		"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
+		"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
 	if res.Failed > 0 {
 		os.Exit(1)
 	}
@@ -107,7 +109,9 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			"as_of", res.AsOf,
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 			"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
-			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
+			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
+			"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
+			"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
 		// A per-account charge failure is recorded (billing_runs status='failed')
 		// and does NOT fail the batch — the next cycle retries it. The handler
 		// returns nil so EventBridge doesn't replay the whole batch.
@@ -127,6 +131,12 @@ type cycleResult struct {
 	AlreadyRun  int
 	FailedRuns  int // per-account charge runs that ended status='failed'
 	Failed      int // errors (rollup error, charge error, or list error)
+
+	// Mid-period account-wide overage grace sweep (migration 030).
+	OverageCandidates int // accounts past the grace window this sweep evaluated
+	OverageCharged    int // accounts whose pooled overage was invoiced mid-period
+	OverageSkipped    int // evaluated but not charged (already billed / under pool / no PM / 0 cents)
+	OverageFailed     int // per-account overage-charge errors (counted, never abort)
 }
 
 // runCycle closes every card-bound account's just-ended ANCHORED period as of
@@ -222,7 +232,48 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 		}
 		tally(&res, a.ID, chargeSummary)
 	}
+
+	// Mid-period account-wide overage grace sweep (migration 030): independent of
+	// the boundary close above. Every account whose pooled module overage has
+	// survived the grace window and whose CURRENT period has no pooled-overage
+	// snapshot yet is charged the prorated overage now (a deliberate mid-period
+	// charge). Idempotent per (account, period) via the snapshot ledger + the
+	// deterministic Stripe idem keys, so firing daily never double-charges.
+	runOverageSweep(ctx, svc, at, &res)
 	return res
+}
+
+// runOverageSweep charges the mid-period account-wide pooled overage for every
+// account past the grace window as of `at`. A single account's error is logged +
+// counted but never aborts the sweep (like the boundary loop).
+func runOverageSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *cycleResult) {
+	cands, err := svc.AccountsInOverageGrace(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "list overage-grace accounts failed", "error", err)
+		res.Failed++
+		return
+	}
+	res.OverageCandidates = len(cands)
+	for _, c := range cands {
+		summary, err := svc.ChargeAccountOverage(ctx, c, at)
+		if err != nil {
+			slog.ErrorContext(ctx, "account overage charge failed", "account_id", c.ID, "error", err)
+			res.OverageFailed++
+			res.Failed++
+			continue
+		}
+		if summary.Status == cycle.OverageCharged {
+			res.OverageCharged++
+		} else {
+			res.OverageSkipped++
+		}
+		slog.Info("account overage grace sweep",
+			"account_id", c.ID,
+			"status", string(summary.Status),
+			"over_count", summary.OverCount,
+			"charged_cents", summary.ChargedCents,
+			"stripe_invoice_id", summary.StripeInvoiceID)
+	}
 }
 
 // tally classifies one account's charge summary for the run totals + a

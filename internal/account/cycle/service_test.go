@@ -69,6 +69,13 @@ type fakeStore struct {
 	activation     map[uuid.UUID]time.Time
 	baseSnapshots  map[snapKey]fakeBaseSnapshot
 
+	// account-wide POOLED overage state (migration 030). overageSince models
+	// accounts.overage_since (present → armed at that instant); overageSnaps
+	// models account_overage_snapshots keyed (account, period_start) like the
+	// PRIMARY KEY, recording the row each charge leg froze.
+	overageSince map[uuid.UUID]time.Time
+	overageSnaps map[acctSnapKey]cycle.AccountOverageSnapshot
+
 	// captured charge writes
 	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
 	runStatus    map[uuid.UUID]cycle.BillingRunStatus // run id → current status (models the DB row's terminal state)
@@ -106,6 +113,20 @@ type fakeStore struct {
 	errLiveCounts    error // LiveAppsCreatedBefore
 	errProrationSnap error // UpsertProrationBaseSnapshot
 	errAdvanceSnap   error // InsertAdvanceBaseSnapshot
+
+	errPooledCount       error // PooledModuleCount
+	errStartOverage      error // StartAccountOverage
+	errClearOverage      error // ClearAccountOverage
+	errOverageGrace      error // AccountsInOverageGrace
+	errOverageSnap       error // AccountOverageSnapshot
+	errInsertOverageSnap error // InsertAccountOverageSnapshot
+}
+
+// acctSnapKey mirrors the account_overage_snapshots PRIMARY KEY
+// (account_id, period_start).
+type acctSnapKey struct {
+	account     uuid.UUID
+	periodStart time.Time
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -145,6 +166,8 @@ func newFakeStore() *fakeStore {
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
 		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
+		overageSince:        map[uuid.UUID]time.Time{},
+		overageSnaps:        map[acctSnapKey]cycle.AccountOverageSnapshot{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -477,6 +500,80 @@ func (f *fakeStore) InsertAdvanceBaseSnapshot(_ context.Context, snap cycle.AppB
 		return nil
 	}
 	f.baseSnapshots[k] = fakeBaseSnapshot{snap: snap, source: "advance"}
+	return nil
+}
+
+// --- account-wide POOLED overage fake (migration 030) -----------------------
+
+// PooledModuleCount sums module_count over the account's live apps, mirroring
+// the SQL SUM(module_count) WHERE account_id = ? AND deleted_at IS NULL.
+func (f *fakeStore) PooledModuleCount(_ context.Context, accountID uuid.UUID) (int, error) {
+	if f.errPooledCount != nil {
+		return 0, f.errPooledCount
+	}
+	sum := 0
+	for _, app := range f.apps {
+		if app.AccountID == accountID && !app.Deleted {
+			sum += app.ModuleCount
+		}
+	}
+	return sum, nil
+}
+
+func (f *fakeStore) StartAccountOverage(_ context.Context, accountID uuid.UUID, since time.Time) error {
+	if f.errStartOverage != nil {
+		return f.errStartOverage
+	}
+	if _, armed := f.overageSince[accountID]; !armed {
+		f.overageSince[accountID] = since // first-crossing-wins (WHERE overage_since IS NULL)
+	}
+	return nil
+}
+
+func (f *fakeStore) ClearAccountOverage(_ context.Context, accountID uuid.UUID) error {
+	if f.errClearOverage != nil {
+		return f.errClearOverage
+	}
+	delete(f.overageSince, accountID) // idempotent (WHERE overage_since IS NOT NULL)
+	return nil
+}
+
+func (f *fakeStore) AccountsInOverageGrace(_ context.Context, cutoff time.Time) ([]cycle.OverageGraceCandidate, error) {
+	if f.errOverageGrace != nil {
+		return nil, f.errOverageGrace
+	}
+	out := []cycle.OverageGraceCandidate{}
+	for id, since := range f.overageSince {
+		activatedAt, activated := f.activation[id]
+		if !activated {
+			continue // activated_at IS NOT NULL gate
+		}
+		if since.After(cutoff) {
+			continue // grace still holding (overage_since <= cutoff)
+		}
+		out = append(out, cycle.OverageGraceCandidate{ID: id, OverageSince: since, ActivatedAt: activatedAt})
+	}
+	return out, nil
+}
+
+func (f *fakeStore) AccountOverageSnapshot(_ context.Context, accountID uuid.UUID, periodStart time.Time) (cycle.AccountOverageSnapshot, bool, error) {
+	if f.errOverageSnap != nil {
+		return cycle.AccountOverageSnapshot{}, false, f.errOverageSnap
+	}
+	snap, ok := f.overageSnaps[acctSnapKey{accountID, periodStart}]
+	return snap, ok, nil
+}
+
+func (f *fakeStore) InsertAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) error {
+	if f.errInsertOverageSnap != nil {
+		return f.errInsertOverageSnap
+	}
+	// ON CONFLICT (account_id, period_start) DO NOTHING: an existing row wins.
+	k := acctSnapKey{snap.AccountID, snap.PeriodStart}
+	if _, exists := f.overageSnaps[k]; exists {
+		return nil
+	}
+	f.overageSnaps[k] = snap
 	return nil
 }
 
