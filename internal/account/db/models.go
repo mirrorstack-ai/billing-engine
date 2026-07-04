@@ -344,6 +344,16 @@ type MsBillingAddCardRequest struct {
 	ResolvedAt      pgtype.Timestamptz            `json:"resolved_at"`
 }
 
+type MsBillingApp struct {
+	AppID              string             `json:"app_id"`
+	AccountID          string             `json:"account_id"`
+	ModuleCount        int32              `json:"module_count"`
+	CreatedAt          time.Time          `json:"created_at"`
+	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
+	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+}
+
 type MsBillingBillingPeriod struct {
 	ID          string                       `json:"id"`
 	AccountID   string                       `json:"account_id"`

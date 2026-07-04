@@ -170,6 +170,24 @@ type Store interface {
 	// converted mirror NUMERIC whole cents → int64 micros (×10_000) so micros
 	// stay the only money unit above the store.
 	ListInvoices(ctx context.Context, accountID uuid.UUID, limit int32, cursor *InvoiceCursor) ([]InvoiceMirrorRaw, error)
+	// AppMirror reads the app's ms_billing.apps roster row (migration 027) —
+	// the authoritative base-fee inputs GetAppBill displays: the synced
+	// installed-module count (overage tier), the platform creation instant
+	// (creation-period proration), and the soft-delete state (a pre-period
+	// deletion zeroes the base, D1e). found=false → the app is not mirrored
+	// yet (pre-backfill) and the caller keeps the pre-027 fallback math.
+	// Deleted rows ARE returned (found=true) — deletion semantics are the
+	// caller's, not the read's.
+	AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInfo, bool, error)
+}
+
+// AppMirrorInfo is the display-read projection of a ms_billing.apps roster row
+// (migration 027). DeletedAt is meaningful only when Deleted is true.
+type AppMirrorInfo struct {
+	ModuleCount int
+	CreatedAt   time.Time
+	Deleted     bool
+	DeletedAt   time.Time
 }
 
 // MetricDefinition is the catalog projection the ingest path resolves
@@ -478,6 +496,22 @@ func (s *pgxStore) AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, 
 		return uuid.Nil, false, err
 	}
 	return parsed, true, nil
+}
+
+func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInfo, bool, error) {
+	row, err := s.q.SelectAppMirror(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AppMirrorInfo{}, false, nil // not mirrored yet → pre-027 fallback
+	}
+	if err != nil {
+		return AppMirrorInfo{}, false, err
+	}
+	return AppMirrorInfo{
+		ModuleCount: int(row.ModuleCount),
+		CreatedAt:   row.CreatedAt,
+		Deleted:     row.DeletedAt.Valid,
+		DeletedAt:   row.DeletedAt.Time,
+	}, true, nil
 }
 
 // AccountAnchorDay reads the account's activated_at and derives its anchor day.

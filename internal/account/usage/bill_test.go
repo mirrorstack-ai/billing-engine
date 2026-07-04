@@ -60,7 +60,7 @@ func TestGetAppBill_BaseFeeBundlesUpToIncludedModules(t *testing.T) {
 }
 
 func TestGetAppBill_BaseFeeSurchargesModulesBeyondIncluded(t *testing.T) {
-	// 7 distinct modules → base = BaseFeeMicros + ExtraModuleMicros × (7 − 5).
+	// 7 distinct modules → base = BaseFeeMicros + ModuleOverageFeeMicros × (7 − 5).
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -70,7 +70,7 @@ func TestGetAppBill_BaseFeeSurchargesModulesBeyondIncluded(t *testing.T) {
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
 	require.NoError(t, err)
-	want := usage.BaseFeeMicros + usage.ExtraModuleMicros*2
+	want := usage.BaseFeeMicros + usage.ModuleOverageFeeMicros*2
 	require.Equal(t, want, resp.BaseFeeMicros)
 }
 
@@ -501,5 +501,128 @@ func TestGetBillingPeriods_InternalOnStoreError(t *testing.T) {
 	store.accounts[owner] = uuid.New()
 	store.errPeriodList = errors.New("boom")
 	_, err := newService(store).GetBillingPeriods(context.Background(), usage.GetBillingPeriodsRequest{OwnerUserID: owner})
+	requireCode(t, err, billing.CodeInternal)
+}
+
+// --- GetAppBill: base fee from the ms_billing.apps mirror (migration 027) ---
+
+// mirrorPeriod seeds a frozen [May 1, Jun 1) 31-day window keyed by a period
+// id, so the mirror-driven base-fee display tests are fully deterministic
+// (the current-period path would depend on the wall clock).
+func mirrorPeriod(store *fakeStore) uuid.UUID {
+	pid := uuid.New()
+	store.periodWindows = map[uuid.UUID]periodWindow{pid: {
+		start: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		end:   time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+	}}
+	return pid
+}
+
+func TestGetAppBill_MirroredAppUsesSyncedModuleCount(t *testing.T) {
+	// A mirrored app's overage comes from the SYNCED module_count (7 → +2×$3),
+	// NOT the usage-proxy distinct-module count (only 1 module has usage here
+	// — the proxy would have said "flat base").
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 7,
+		CreatedAt:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC), // long before the period → full base
+	}
+	store.appBillRows = []usage.AppMetricUsageRaw{customLine(uuid.New(), "orders.placed", "", 100)}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
+	require.NoError(t, err)
+	require.Equal(t, usage.BaseFeeMicros+2*usage.ModuleOverageFeeMicros, resp.BaseFeeMicros)
+}
+
+func TestGetAppBill_MirroredAppProratesCreationPeriod(t *testing.T) {
+	// created_at inside the displayed period → the base is PRORATED with the
+	// same remain_days formula the RegisterApp charge used: created May 22 of
+	// [May 1, Jun 1) (31 days) → remain 10 → round_half_up(20e6 × 10/31) =
+	// 6_451_613. Display == what the proration invoice actually charged.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 0,
+		CreatedAt:   time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC),
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
+	require.NoError(t, err)
+	require.EqualValues(t, 6_451_613, resp.BaseFeeMicros)
+	require.EqualValues(t, 6_451_613, resp.TotalMicros, "base-only bill: total == prorated base")
+}
+
+func TestGetAppBill_AppDeletedBeforePeriodShowsZeroBase(t *testing.T) {
+	// Deleted BEFORE the displayed period opened → the boundary never charged
+	// its base for this period, so the display shows 0 (D1e). Usage lines (if
+	// any accrued before deletion sync lag) still render.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 4,
+		CreatedAt:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+		Deleted:     true,
+		DeletedAt:   time.Date(2026, 4, 2, 0, 0, 0, 0, time.UTC), // before May 1
+	}
+	store.appBillRows = []usage.AppMetricUsageRaw{customLine(uuid.New(), "orders.placed", "", 700)}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
+	require.NoError(t, err)
+	require.Zero(t, resp.BaseFeeMicros)
+	require.EqualValues(t, 700, resp.TotalMicros, "usage still renders; only the base zeroes")
+}
+
+func TestGetAppBill_AppDeletedDuringPeriodKeepsSpentBase(t *testing.T) {
+	// Deleted DURING the period → that period's base was already charged in
+	// advance and is spent (no refunds, D1e): the display keeps the full base.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 0,
+		CreatedAt:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+		Deleted:     true,
+		DeletedAt:   time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC), // inside [May 1, Jun 1)
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
+	require.NoError(t, err)
+	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros)
+}
+
+func TestGetAppBill_UnmirroredAppKeepsProxyFallback(t *testing.T) {
+	// No mirror row (pre-backfill) → today's behavior survives verbatim: flat
+	// base + the usage-proxy overage (7 distinct modules with usage → +2×$3).
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	for i := 0; i < 7; i++ {
+		store.appBillRows = append(store.appBillRows, customLine(uuid.New(), "orders.placed", "", 0))
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New(), PeriodID: pid})
+	require.NoError(t, err)
+	require.Equal(t, usage.BaseFeeMicros+2*usage.ModuleOverageFeeMicros, resp.BaseFeeMicros)
+}
+
+func TestGetAppBill_InternalOnAppMirrorError(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errAppMirror = errors.New("boom")
+	_, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
 	requireCode(t, err, billing.CodeInternal)
 }

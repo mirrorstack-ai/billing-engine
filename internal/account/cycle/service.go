@@ -13,19 +13,31 @@ import (
 )
 
 // Service implements the period rollup + developer settlement + the Stripe
-// charge cycle. It composes a Store and (for the charge leg) a Stripe Client.
+// charge cycle + the app base-fee surface (RegisterApp / SyncAppModules). It
+// composes a Store and (for the charge legs) a Stripe Client. nowFn is
+// injectable for deterministic tests (RegisterApp windows "now" into the
+// account's current anchored period).
 type Service struct {
 	store  Store
 	stripe billingstripe.Client
+	nowFn  func() time.Time
 }
 
 // NewService wires a Service. store is required; passing nil panics at the
-// first call site. stripe is required only for RunBillingCycle (the charge
-// leg); RollupPeriod / SettleDevelopers never touch Stripe, so a nil stripe is
-// tolerated for rollup-only wiring (it panics only if RunBillingCycle is then
-// called). Mirrors the billing.Service constructor pattern.
+// first call site. stripe is required only for the charge legs (RunBillingCycle
+// and RegisterApp's creation-proration invoice); RollupPeriod / SettleDevelopers
+// never touch Stripe, so a nil stripe is tolerated for rollup-only wiring (it
+// panics only if a charge leg is then called). Mirrors the billing.Service
+// constructor pattern.
 func NewService(store Store, stripe billingstripe.Client) *Service {
-	return &Service{store: store, stripe: stripe}
+	return &Service{store: store, stripe: stripe, nowFn: time.Now}
+}
+
+// WithNow overrides the Service clock — deterministic-test hook only (mirrors
+// the usage.Service nowFn seam). Returns the Service for chaining.
+func (s *Service) WithNow(now func() time.Time) *Service {
+	s.nowFn = now
+	return s
 }
 
 // RollupPeriod turns the account's raw usage_events for [periodStart,

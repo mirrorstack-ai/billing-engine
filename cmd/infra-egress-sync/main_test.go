@@ -116,6 +116,9 @@ func (f *fakeStore) BillingPeriodWindow(_ context.Context, _, _ uuid.UUID) (time
 func (f *fakeStore) ListInvoices(_ context.Context, _ uuid.UUID, _ int32, _ *usage.InvoiceCursor) ([]usage.InvoiceMirrorRaw, error) {
 	return nil, nil
 }
+func (f *fakeStore) AppMirror(_ context.Context, _ uuid.UUID) (usage.AppMirrorInfo, bool, error) {
+	return usage.AppMirrorInfo{}, false, nil
+}
 
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 

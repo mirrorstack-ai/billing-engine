@@ -58,6 +58,13 @@ type fakeStore struct {
 	// captured collection writes
 	updatedCollection *cycle.AccountCollection // last UpdateAccountCollection arg
 
+	// apps mirror state (migration 027 / base-fee v1). accountsByUser models
+	// the EnsureAccountForUser get-or-create; activation the activated_at
+	// anchor (absent → unactivated, never charged).
+	apps           map[uuid.UUID]cycle.AppMirror
+	accountsByUser map[uuid.UUID]uuid.UUID
+	activation     map[uuid.UUID]time.Time
+
 	// captured charge writes
 	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
 	runStatus    map[uuid.UUID]cycle.BillingRunStatus // run id → current status (models the DB row's terminal state)
@@ -85,6 +92,14 @@ type fakeStore struct {
 	errCollection   error // AccountCollection
 	errUpdateColl   error // UpdateAccountCollection
 	errUnpaid       error // HasUnpaidInvoice
+	errEnsureAcct   error // EnsureAccountForUser
+	errActivation   error // AccountActivation
+	errAppInsert    error // InsertAppMirror
+	errAppMirror    error // AppMirror
+	errSetProration error // SetAppProrationInvoice
+	errSetCount     error // SetAppModuleCount
+	errMarkDeleted  error // MarkAppDeleted
+	errLiveCounts   error // LiveAppModuleCounts
 }
 
 // markedRun records a MarkBillingRun call so a test can assert the terminal
@@ -108,6 +123,9 @@ func newFakeStore() *fakeStore {
 		runStatus:           map[uuid.UUID]cycle.BillingRunStatus{},
 		markedRuns:          map[uuid.UUID]markedRun{},
 		invoices:            map[string]cycle.InvoiceMirror{},
+		apps:                map[uuid.UUID]cycle.AppMirror{},
+		accountsByUser:      map[uuid.UUID]uuid.UUID{},
+		activation:          map[uuid.UUID]time.Time{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -324,6 +342,96 @@ func (f *fakeStore) LatestClosedPeriodEnd(_ context.Context, accountID uuid.UUID
 	}
 	end, ok := f.latestPeriodEnd[accountID]
 	return end, ok, nil
+}
+
+// --- apps mirror fake (migration 027 / base-fee v1) -------------------------
+
+func (f *fakeStore) EnsureAccountForUser(_ context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	if f.errEnsureAcct != nil {
+		return uuid.Nil, f.errEnsureAcct
+	}
+	if id, ok := f.accountsByUser[userID]; ok {
+		return id, nil // get-or-create: the same user always resolves the same account
+	}
+	id := uuid.New()
+	f.accountsByUser[userID] = id
+	return id, nil
+}
+
+func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (time.Time, bool, error) {
+	if f.errActivation != nil {
+		return time.Time{}, false, f.errActivation
+	}
+	at, ok := f.activation[accountID]
+	return at, ok, nil
+}
+
+func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time) error {
+	if f.errAppInsert != nil {
+		return f.errAppInsert
+	}
+	if _, exists := f.apps[appID]; exists {
+		return nil // ON CONFLICT (app_id) DO NOTHING — the FIRST registration wins
+	}
+	f.apps[appID] = cycle.AppMirror{
+		AppID: appID, AccountID: accountID, ModuleCount: moduleCount, CreatedAt: createdAt,
+	}
+	return nil
+}
+
+func (f *fakeStore) AppMirror(_ context.Context, appID uuid.UUID) (cycle.AppMirror, bool, error) {
+	if f.errAppMirror != nil {
+		return cycle.AppMirror{}, false, f.errAppMirror
+	}
+	app, ok := f.apps[appID]
+	return app, ok, nil
+}
+
+func (f *fakeStore) SetAppProrationInvoice(_ context.Context, appID uuid.UUID, stripeInvoiceID string) error {
+	if f.errSetProration != nil {
+		return f.errSetProration
+	}
+	if app, ok := f.apps[appID]; ok && app.ProrationInvoiceID == "" {
+		app.ProrationInvoiceID = stripeInvoiceID // first-charge-wins, like the WHERE … IS NULL
+		f.apps[appID] = app
+	}
+	return nil
+}
+
+func (f *fakeStore) SetAppModuleCount(_ context.Context, appID uuid.UUID, moduleCount int) error {
+	if f.errSetCount != nil {
+		return f.errSetCount
+	}
+	if app, ok := f.apps[appID]; ok && !app.Deleted {
+		app.ModuleCount = moduleCount // deleted rows are frozen (WHERE deleted_at IS NULL)
+		f.apps[appID] = app
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkAppDeleted(_ context.Context, appID uuid.UUID) error {
+	if f.errMarkDeleted != nil {
+		return f.errMarkDeleted
+	}
+	if app, ok := f.apps[appID]; ok && !app.Deleted {
+		app.Deleted = true
+		app.DeletedAt = time.Now().UTC() // first deletion instant is kept
+		f.apps[appID] = app
+	}
+	return nil
+}
+
+func (f *fakeStore) LiveAppModuleCounts(_ context.Context, accountID uuid.UUID) ([]int, error) {
+	if f.errLiveCounts != nil {
+		return nil, f.errLiveCounts
+	}
+	counts := []int{}
+	for _, app := range f.apps {
+		if app.AccountID == accountID && !app.Deleted {
+			counts = append(counts, app.ModuleCount)
+		}
+	}
+	return counts, nil
 }
 
 // --- helpers --------------------------------------------------------------
