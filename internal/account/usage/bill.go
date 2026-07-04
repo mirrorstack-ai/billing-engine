@@ -176,45 +176,116 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	// base fee is the default-plan fee and the PaaS credit applies by default.
 	plan := PlanDefault
 
-	// Resolve the billed window + the echoed period id.
-	periodID := ""
-	var periodStart, periodEnd time.Time
-	if req.PeriodID != uuid.Nil {
-		// A past period is addressed by a real billing_periods row id, which is
-		// account-scoped — an unknown / other-account id is NOT_FOUND. Without a
-		// billing account the caller owns no periods at all.
-		if !found {
-			return nil, billing.NotFound("billing period not found")
-		}
-		start, end, ok, err := s.store.BillingPeriodWindow(ctx, accountID, req.PeriodID)
-		if err != nil {
-			return nil, billing.Internal("billing period lookup failed", err)
-		}
-		if !ok {
-			return nil, billing.NotFound("billing period not found")
-		}
-		periodStart, periodEnd = start, end
-		periodID = req.PeriodID.String()
-	} else {
-		// Default: the account's current anchored period (card-binding day, ADR
-		// 0005), live from events. No billing account yet → the calendar-month
-		// default (DefaultAnchorDay) so the base-fee-only bill still shows a window.
-		anchorDay := billingperiod.DefaultAnchorDay
-		if found {
-			d, err := s.store.AccountAnchorDay(ctx, accountID)
-			if err != nil {
-				return nil, billing.Internal("anchor day lookup failed", err)
-			}
-			anchorDay = d
-		}
-		periodStart, periodEnd = billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
+	periodID, periodStart, periodEnd, err := s.resolveBillPeriod(ctx, accountID, found, req.PeriodID)
+	if err != nil {
+		return nil, err
 	}
 
+	parts, err := s.computeAppBill(ctx, accountID, found, plan, req.AppID, periodStart, periodEnd)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO(subscription): resolve whether this account has an ACTIVE SaaS
+	// subscription — the ONLY thing that earns the PaaS infra credit. v1 has no
+	// subscription system, so the credit is subscription-gated OFF and resolves to
+	// 0; the wire field (paas_credit_micros) is retained at 0 for back-compat.
+	const subscriptionActive = false
+	paasCredit, err := paasCreditMicros(subscriptionActive, parts.InfraTotalMicros)
+	if err != nil {
+		return nil, billing.Internal("compute paas credit failed", err)
+	}
+
+	total := parts.BaseFeeMicros + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros - paasCredit
+
+	return &GetAppBillResponse{
+		AppID:                  req.AppID,
+		PeriodID:               periodID,
+		PeriodStart:            periodStart,
+		PeriodEnd:              periodEnd,
+		BaseFeeMicros:          parts.BaseFeeMicros,
+		ModuleUsage:            parts.ModuleUsage,
+		ModuleUsageTotalMicros: parts.ModuleUsageTotalMicros,
+		InfraTotalMicros:       parts.InfraTotalMicros,
+		InfraLines:             parts.InfraLines,
+		ModuleInfraLines:       parts.ModuleInfraLines,
+		PaasCreditMicros:       paasCredit,
+		TotalMicros:            total,
+	}, nil
+}
+
+// resolveBillPeriod resolves the billed window + the echoed period id for a
+// bill read (GetAppBill / GetAccountBill — ONE resolution for both, so the two
+// bills can never window differently):
+//
+//   - periodID == uuid.Nil → the account's CURRENT anchored period (card-
+//     binding day, ADR 0005), live from events; with no billing account yet
+//     (found=false) the calendar-month default (DefaultAnchorDay), so a lazy
+//     bill still shows a window. Echoed id is "" (the in-progress period has
+//     no billing_periods row).
+//   - periodID set → that account-scoped billing_periods row's frozen [start,
+//     end) window. An unknown / other-account id is NOT_FOUND; without a
+//     billing account the caller owns no periods at all → NOT_FOUND too.
+func (s *Service) resolveBillPeriod(ctx context.Context, accountID uuid.UUID, found bool, periodID uuid.UUID) (string, time.Time, time.Time, error) {
+	if periodID != uuid.Nil {
+		if !found {
+			return "", time.Time{}, time.Time{}, billing.NotFound("billing period not found")
+		}
+		start, end, ok, err := s.store.BillingPeriodWindow(ctx, accountID, periodID)
+		if err != nil {
+			return "", time.Time{}, time.Time{}, billing.Internal("billing period lookup failed", err)
+		}
+		if !ok {
+			return "", time.Time{}, time.Time{}, billing.NotFound("billing period not found")
+		}
+		return periodID.String(), start, end, nil
+	}
+	anchorDay := billingperiod.DefaultAnchorDay
+	if found {
+		d, err := s.store.AccountAnchorDay(ctx, accountID)
+		if err != nil {
+			return "", time.Time{}, time.Time{}, billing.Internal("anchor day lookup failed", err)
+		}
+		anchorDay = d
+	}
+	start, end := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
+	return "", start, end, nil
+}
+
+// appBillParts is the pre-credit bill core for ONE (account, app, window),
+// computed by computeAppBill — the SINGLE per-app pricing path shared by
+// GetAppBill (which wires every part verbatim, then applies the per-app PaaS
+// credit) and GetAccountBill (which sums the totals into one roster row per
+// app, then applies the credit ONCE at the account level). The PaaS credit is
+// deliberately NOT in here: which scope it offsets is the caller's semantic.
+type appBillParts struct {
+	// BaseFeeMicros is 基本費用 resolved SNAPSHOT-FIRST (see computeAppBill).
+	BaseFeeMicros int64
+	// ModuleUsage are the non-reserved 模組使用量 lines; ModuleUsageTotalMicros
+	// is Σ their ChargedMicros.
+	ModuleUsage            []AppMetricUsage
+	ModuleUsageTotalMicros int64
+	// InfraTotalMicros is 基礎設施 = Σ InfraLines + Σ ModuleInfraLines (the
+	// 1.2× infra markup already applied once, in SQL).
+	InfraTotalMicros int64
+	InfraLines       []AppInfraUsage
+	ModuleInfraLines []AppModuleInfraUsage
+}
+
+// computeAppBill computes one app's pre-credit bill parts for the resolved
+// window — steps 3–4 of the GetAppBill contract (see its doc: module-usage
+// partition, catalog-anchored infra residual + per-module infra split, and the
+// snapshot-first 基本費用 resolution with its mirror-estimate and legacy
+// usage-proxy fallbacks). found=false (no billing account yet) yields the
+// base-fee-only bill: no usage/module-infra reads, but the catalog-anchored
+// infra residual still renders every declared metric at $0.
+func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found bool, plan Plan, appID uuid.UUID, periodStart, periodEnd time.Time) (*appBillParts, error) {
 	// Read the usage lines (empty when no billing account exists yet — the bill is
 	// then base-fee-only).
 	var lines []AppMetricUsageRaw
+	var err error
 	if found {
-		lines, err = s.store.AppBill(ctx, accountID, req.AppID, periodStart, periodEnd)
+		lines, err = s.store.AppBill(ctx, accountID, appID, periodStart, periodEnd)
 		if err != nil {
 			return nil, billing.Internal("app bill query failed", err)
 		}
@@ -258,7 +329,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	// ChargedMicros already carries the ×1.2 infra markup (applied once in SQL);
 	// InfraTotalMicros is their sum, keeping the back-compat scalar exactly
 	// reconcilable (infra_total == Σ infra_lines[].charged).
-	infraLines, err := s.store.AppInfraBill(ctx, accountID, req.AppID, periodStart, periodEnd)
+	infraLines, err := s.store.AppInfraBill(ctx, accountID, appID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("app infra bill query failed", err)
 	}
@@ -271,7 +342,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	// slice otherwise so the wire never carries null.
 	moduleInfraLines := []AppModuleInfraUsage{}
 	if found {
-		moduleInfraLines, err = s.store.AppModuleInfraBill(ctx, accountID, req.AppID, periodStart, periodEnd)
+		moduleInfraLines, err = s.store.AppModuleInfraBill(ctx, accountID, appID, periodStart, periodEnd)
 		if err != nil {
 			return nil, billing.Internal("app module infra bill query failed", err)
 		}
@@ -302,7 +373,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	// the pre-027 flat fee + usage-proxy overage — see the
 	// INSTALLED-MODULE-COUNT note above).
 	var baseFee int64
-	snap, snapped, err := s.store.AppBaseSnapshot(ctx, req.AppID, periodStart)
+	snap, snapped, err := s.store.AppBaseSnapshot(ctx, appID, periodStart)
 	if err != nil {
 		return nil, billing.Internal("app base snapshot lookup failed", err)
 	}
@@ -312,7 +383,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		// un-snapshotted estimate paths below.
 		baseFee = snap.BaseMicros
 	} else {
-		mirror, mirrored, err := s.store.AppMirror(ctx, req.AppID)
+		mirror, mirrored, err := s.store.AppMirror(ctx, appID)
 		if err != nil {
 			return nil, billing.Internal("app mirror lookup failed", err)
 		}
@@ -334,31 +405,13 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		}
 	}
 
-	// TODO(subscription): resolve whether this account has an ACTIVE SaaS
-	// subscription — the ONLY thing that earns the PaaS infra credit. v1 has no
-	// subscription system, so the credit is subscription-gated OFF and resolves to
-	// 0; the wire field (paas_credit_micros) is retained at 0 for back-compat.
-	const subscriptionActive = false
-	paasCredit, err := paasCreditMicros(subscriptionActive, infraTotal)
-	if err != nil {
-		return nil, billing.Internal("compute paas credit failed", err)
-	}
-
-	total := baseFee + moduleUsageTotal + infraTotal - paasCredit
-
-	return &GetAppBillResponse{
-		AppID:                  req.AppID,
-		PeriodID:               periodID,
-		PeriodStart:            periodStart,
-		PeriodEnd:              periodEnd,
+	return &appBillParts{
 		BaseFeeMicros:          baseFee,
 		ModuleUsage:            moduleUsage,
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,
 		InfraLines:             infraLines,
 		ModuleInfraLines:       moduleInfraLines,
-		PaasCreditMicros:       paasCredit,
-		TotalMicros:            total,
 	}, nil
 }
 
