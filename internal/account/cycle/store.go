@@ -282,6 +282,11 @@ type AccountCollection struct {
 	HasSpendCeiling    bool
 	SpendCeilingMicros int64
 	CreatedAt          time.Time
+	// AutoCollectThresholdMicros is the per-account large-charge disclosure
+	// threshold (migration 031), nil when the account uses the platform default
+	// (collection.DefaultAutoCollectThresholdMicros). Resolved AT CHARGE TIME by
+	// collection.IsLargeAutoCollect to freeze the post-hoc disclosure flag.
+	AutoCollectThresholdMicros *int64
 }
 
 // BillingMode mirrors ms_billing.usage_billing_mode (and collection.Mode)
@@ -309,6 +314,11 @@ type InvoiceMirror struct {
 	Currency        string
 	PeriodStart     time.Time
 	PeriodEnd       time.Time
+	// IsLargeAutoCollect is the server-computed post-hoc disclosure flag
+	// (migration 031): true iff the charged amount exceeded the account's
+	// resolved auto-collect threshold WHEN THE CHARGE FIRED. Set by every
+	// off-session charge call site; false for anything below the threshold.
+	IsLargeAutoCollect bool
 }
 
 // RawAggregate is one per-kind aggregated row from the rollup SELECTs, before
@@ -604,12 +614,18 @@ func (s *pgxStore) AccountCollection(ctx context.Context, accountID uuid.UUID) (
 	if err != nil {
 		return AccountCollection{}, err
 	}
+	var autoCollectThreshold *int64
+	if row.AutoCollectThresholdMicros.Valid {
+		v := row.AutoCollectThresholdMicros.Int64
+		autoCollectThreshold = &v
+	}
 	return AccountCollection{
-		Mode:               BillingMode(row.UsageBillingMode),
-		CreditLimitMicros:  row.CreditLimitMicros,
-		HasSpendCeiling:    row.SpendCeilingMicros.Valid,
-		SpendCeilingMicros: row.SpendCeilingMicros.Int64,
-		CreatedAt:          row.CreatedAt,
+		Mode:                       BillingMode(row.UsageBillingMode),
+		CreditLimitMicros:          row.CreditLimitMicros,
+		HasSpendCeiling:            row.SpendCeilingMicros.Valid,
+		SpendCeilingMicros:         row.SpendCeilingMicros.Int64,
+		CreatedAt:                  row.CreatedAt,
+		AutoCollectThresholdMicros: autoCollectThreshold,
 	}, nil
 }
 
@@ -685,14 +701,15 @@ func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {
 		return err
 	}
 	return s.q.UpsertInvoice(ctx, db.UpsertInvoiceParams{
-		AccountID:       inv.AccountID.String(),
-		StripeInvoiceID: inv.StripeInvoiceID,
-		Status:          inv.Status,
-		AmountDue:       due,
-		AmountPaid:      paid,
-		Currency:        inv.Currency,
-		PeriodStart:     pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
-		PeriodEnd:       pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
+		AccountID:          inv.AccountID.String(),
+		StripeInvoiceID:    inv.StripeInvoiceID,
+		Status:             inv.Status,
+		AmountDue:          due,
+		AmountPaid:         paid,
+		Currency:           inv.Currency,
+		PeriodStart:        pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
+		PeriodEnd:          pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
+		IsLargeAutoCollect: inv.IsLargeAutoCollect,
 	})
 }
 

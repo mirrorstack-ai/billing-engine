@@ -289,15 +289,22 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.StripeError("charge failed", err)
 	}
 
+	// Post-hoc large-charge disclosure (migration 031): the charge SUCCEEDED
+	// above; flag it as "large" iff the amount just charged (netted usage
+	// arrears + advance base, in micros, the SAME value converted to cents
+	// above) exceeds the account's threshold resolved AT CHARGE TIME (its
+	// per-account override, or the platform default when NULL). Pure disclosure —
+	// it changes NO charging behaviour, only surfaces the already-successful debit.
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:       accountID,
-		StripeInvoiceID: inv.ID,
-		Status:          inv.Status,
-		AmountDueCents:  inv.AmountDue,
-		AmountPaidCents: inv.AmountPaid,
-		Currency:        chargeCurrency,
-		PeriodStart:     periodStart,
-		PeriodEnd:       periodEnd,
+		AccountID:          accountID,
+		StripeInvoiceID:    inv.ID,
+		Status:             inv.Status,
+		AmountDueCents:     inv.AmountDue,
+		AmountPaidCents:    inv.AmountPaid,
+		Currency:           chargeCurrency,
+		PeriodStart:        periodStart,
+		PeriodEnd:          periodEnd,
+		IsLargeAutoCollect: collection.IsLargeAutoCollect(arrears+advanceBase, acct.AutoCollectThresholdMicros),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
