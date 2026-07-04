@@ -40,6 +40,18 @@ type fakeStore struct {
 	appMirrors             map[uuid.UUID]usage.AppMirrorInfo    // app_id → ms_billing.apps roster row (migration 027)
 	baseSnapshots          map[string]usage.AppBaseSnapshotInfo // app_id/period_start → charged-base snapshot (migration 028)
 
+	// usageAppIDs is what AppIDsWithUsage enumerates (the usage half of
+	// GetAccountBill's roster); the mirror half is DERIVED from appMirrors with
+	// the real overlap rule (see MirroredAppIDs).
+	usageAppIDs []uuid.UUID
+
+	// Per-app row sets for the multi-app GetAccountBill reads. When an app has
+	// an entry here it wins; otherwise the flat slices above apply (so the
+	// single-app GetAppBill tests keep their simpler setup).
+	appBillRowsByApp            map[uuid.UUID][]usage.AppMetricUsageRaw
+	appInfraBillRowsByApp       map[uuid.UUID][]usage.AppInfraUsage
+	appModuleInfraBillRowsByApp map[uuid.UUID][]usage.AppModuleInfraUsage
+
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
 	gotVersionModuleID uuid.UUID
@@ -82,10 +94,12 @@ type fakeStore struct {
 
 	// captured ListInvoices call args, so a test can assert the clamped
 	// page+1 limit and the decoded cursor reached the store unchanged.
-	gotInvoiceLimit  int32
-	gotInvoiceCursor *usage.InvoiceCursor
-	errAppMirror     error
-	errBaseSnapshot  error
+	gotInvoiceLimit    int32
+	gotInvoiceCursor   *usage.InvoiceCursor
+	errAppMirror       error
+	errBaseSnapshot    error
+	errAppIDsWithUsage error
+	errMirroredApps    error
 
 	// captured window a read-path RPC resolved from the account's anchor, so a
 	// test can assert the anchored [start, end) reached the store unchanged.
@@ -100,14 +114,47 @@ type periodWindow struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		defs:          map[string]usage.MetricDefinition{},
-		accounts:      map[uuid.UUID]uuid.UUID{},
-		events:        map[string]usage.UsageEvent{},
-		anchorDays:    map[uuid.UUID]int{},
-		visibility:    map[uuid.UUID]usage.Visibility{},
-		appMirrors:    map[uuid.UUID]usage.AppMirrorInfo{},
-		baseSnapshots: map[string]usage.AppBaseSnapshotInfo{},
+		defs:                        map[string]usage.MetricDefinition{},
+		accounts:                    map[uuid.UUID]uuid.UUID{},
+		events:                      map[string]usage.UsageEvent{},
+		anchorDays:                  map[uuid.UUID]int{},
+		visibility:                  map[uuid.UUID]usage.Visibility{},
+		appMirrors:                  map[uuid.UUID]usage.AppMirrorInfo{},
+		baseSnapshots:               map[string]usage.AppBaseSnapshotInfo{},
+		appBillRowsByApp:            map[uuid.UUID][]usage.AppMetricUsageRaw{},
+		appInfraBillRowsByApp:       map[uuid.UUID][]usage.AppInfraUsage{},
+		appModuleInfraBillRowsByApp: map[uuid.UUID][]usage.AppModuleInfraUsage{},
 	}
+}
+
+// AppIDsWithUsage returns the configured usage-half roster (the fake does not
+// re-derive it from events — enumeration SQL is integration-tested).
+func (f *fakeStore) AppIDsWithUsage(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]uuid.UUID, error) {
+	if f.errAppIDsWithUsage != nil {
+		return nil, f.errAppIDsWithUsage
+	}
+	return f.usageAppIDs, nil
+}
+
+// MirroredAppIDs derives the mirror-half roster from appMirrors with the SAME
+// [created_at, deleted_at) ∩ [start, end) overlap rule as the real query —
+// and, being map iteration, returns it in RANDOM order, so tests prove the
+// service's deterministic sort rather than inheriting the fake's.
+func (f *fakeStore) MirroredAppIDs(_ context.Context, _ uuid.UUID, start, end time.Time) ([]uuid.UUID, error) {
+	if f.errMirroredApps != nil {
+		return nil, f.errMirroredApps
+	}
+	out := make([]uuid.UUID, 0, len(f.appMirrors))
+	for id, m := range f.appMirrors {
+		if !m.CreatedAt.Before(end) {
+			continue // created on/after the window end → no overlap
+		}
+		if m.Deleted && !m.DeletedAt.After(start) {
+			continue // deleted before the window opened → no overlap
+		}
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 // baseSnapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -273,6 +320,9 @@ func (f *fakeStore) AppBill(_ context.Context, accountID, appID uuid.UUID, _, _ 
 	if f.errAppBill != nil {
 		return nil, f.errAppBill
 	}
+	if rows, ok := f.appBillRowsByApp[appID]; ok {
+		return rows, nil
+	}
 	return f.appBillRows, nil
 }
 
@@ -281,6 +331,9 @@ func (f *fakeStore) AppInfraBill(_ context.Context, accountID, appID uuid.UUID, 
 	f.gotAppInfraBillAppID = appID
 	if f.errAppInfraBill != nil {
 		return nil, f.errAppInfraBill
+	}
+	if rows, ok := f.appInfraBillRowsByApp[appID]; ok {
+		return rows, nil
 	}
 	return f.appInfraBillRows, nil
 }
@@ -291,6 +344,9 @@ func (f *fakeStore) AppModuleInfraBill(_ context.Context, accountID, appID uuid.
 	f.gotAppModuleInfraBillAppID = appID
 	if f.errAppModuleInfraBill != nil {
 		return nil, f.errAppModuleInfraBill
+	}
+	if rows, ok := f.appModuleInfraBillRowsByApp[appID]; ok {
+		return rows, nil
 	}
 	return f.appModuleInfraBillRows, nil
 }
