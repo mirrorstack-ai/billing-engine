@@ -1,9 +1,11 @@
 package usage_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math"
+	"sort"
 	"testing"
 	"time"
 
@@ -34,6 +36,7 @@ type fakeStore struct {
 	periodListRows         []usage.BillingPeriodRaw
 	periodWindows          map[uuid.UUID]periodWindow // billing_periods id → window
 	visibility             map[uuid.UUID]usage.Visibility
+	invoiceRows            []usage.InvoiceMirrorRaw // unordered; ListInvoices applies the SQL contract
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
@@ -73,6 +76,12 @@ type fakeStore struct {
 	errPeriodList         error
 	errPeriodWindow       error
 	errAnchor             error
+	errListInvoices       error
+
+	// captured ListInvoices call args, so a test can assert the clamped
+	// page+1 limit and the decoded cursor reached the store unchanged.
+	gotInvoiceLimit  int32
+	gotInvoiceCursor *usage.InvoiceCursor
 
 	// captured window a read-path RPC resolved from the account's anchor, so a
 	// test can assert the anchored [start, end) reached the store unchanged.
@@ -267,6 +276,47 @@ func (f *fakeStore) BillingPeriodWindow(_ context.Context, _, periodID uuid.UUID
 	}
 	w, ok := f.periodWindows[periodID]
 	return w.start, w.end, ok, nil
+}
+
+// ListInvoices re-implements the ListInvoicesForAccount SQL contract in
+// memory — drop drafts, keyset-filter strictly past the cursor, order
+// (created_at, id) DESC, LIMIT — so service tests can walk real multi-page
+// flows. The authoritative SQL is exercised by the integration tests.
+func (f *fakeStore) ListInvoices(_ context.Context, _ uuid.UUID, limit int32, cursor *usage.InvoiceCursor) ([]usage.InvoiceMirrorRaw, error) {
+	if f.errListInvoices != nil {
+		return nil, f.errListInvoices
+	}
+	f.gotInvoiceLimit = limit
+	f.gotInvoiceCursor = cursor
+
+	rows := make([]usage.InvoiceMirrorRaw, 0, len(f.invoiceRows))
+	for _, r := range f.invoiceRows {
+		if r.Status == "draft" {
+			continue
+		}
+		if cursor != nil {
+			// Keep only rows strictly BEFORE the cursor tuple in DESC order,
+			// i.e. (created_at, id) < (cursor.CreatedAt, cursor.ID). Postgres
+			// compares uuids bytewise, matched here via bytes.Compare.
+			if r.CreatedAt.After(cursor.CreatedAt) {
+				continue
+			}
+			if r.CreatedAt.Equal(cursor.CreatedAt) && bytes.Compare(r.ID[:], cursor.ID[:]) >= 0 {
+				continue
+			}
+		}
+		rows = append(rows, r)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
+			return rows[i].CreatedAt.After(rows[j].CreatedAt)
+		}
+		return bytes.Compare(rows[i].ID[:], rows[j].ID[:]) > 0
+	})
+	if int32(len(rows)) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
 }
 
 // --- helpers --------------------------------------------------------------

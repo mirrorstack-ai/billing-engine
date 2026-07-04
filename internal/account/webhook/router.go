@@ -107,8 +107,11 @@ type Store interface {
 
 	// ApplyInvoiceStatus reconciles a Stripe invoice.* event onto the
 	// ms_billing.invoices mirror row keyed by stripe_invoice_id. It
-	// updates status + amount_paid + amount_due only; period + currency
-	// are owned by the charge spine's UpsertInvoice. Returns (found, error)
+	// updates status + amount_paid + amount_due, plus the presentment
+	// fields (number / hosted_invoice_url / invoice_pdf, migration 026)
+	// SET-ONLY — a non-empty value lands, an empty one never clears an
+	// enriched column; period + currency are owned by the charge spine's
+	// UpsertInvoice. Returns (found, error)
 	// where found=false means the row was not updated — either no mirror
 	// row exists yet (drift: the invoice was created out-of-band or the
 	// charge spine hasn't mirrored it) OR the monotonic-status guard
@@ -130,11 +133,23 @@ type Store interface {
 // ApplyInvoiceStatusParams carries the columns ApplyInvoiceStatus reconciles
 // onto the invoices mirror row. Money is whole cents (Stripe minor units;
 // Stripe invoice amounts are integer cents) — never float.
+//
+// Number / HostedInvoiceURL / InvoicePDF are the PRESENTMENT fields Stripe
+// assigns at finalization (migration 026), carried verbatim from the event
+// payload — "" when the event predates finalization (invoice.created). The
+// store persists them upsert-style: a non-empty value lands, an empty one
+// NEVER clears an already-enriched column back to NULL (Stripe delivers
+// at-least-once and unordered; a sparse payload must not un-enrich the
+// mirror).
 type ApplyInvoiceStatusParams struct {
 	StripeInvoiceID string
 	Status          string // Stripe invoice status verbatim: draft/open/paid/uncollectible/void
 	AmountPaidCents int64
 	AmountDueCents  int64
+
+	Number           string // Stripe customer-facing invoice number, e.g. 813C8918-0001
+	HostedInvoiceURL string // Stripe-hosted invoice page (view / pay online)
+	InvoicePDF       string // direct PDF download link
 }
 
 // InsertPaymentMethodParams is the row data extracted from a

@@ -238,6 +238,14 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		// Stripe amounts are integer cents (minor units).
 		AmountPaidCents: inv.AmountPaid,
 		AmountDueCents:  inv.AmountDue,
+		// Presentment fields (migration 026): Stripe assigns number /
+		// hosted_invoice_url / invoice_pdf at FINALIZATION, so they ride every
+		// finalized-and-later event and are "" on invoice.created. The store
+		// persists them set-only (an empty value never clears), so the mirror
+		// enriches on the first event that carries them and stays enriched.
+		Number:           inv.Number,
+		HostedInvoiceURL: inv.HostedInvoiceURL,
+		InvoicePDF:       inv.InvoicePDF,
 	})
 	if err != nil {
 		r.log.ErrorContext(ctx, "invoice event apply status failed", "event_id", event.ID, "type", event.Type, "error", err)
