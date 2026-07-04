@@ -120,6 +120,14 @@ type fakeStore struct {
 	errOverageGrace      error // AccountsInOverageGrace
 	errOverageSnap       error // AccountOverageSnapshot
 	errInsertOverageSnap error // InsertAccountOverageSnapshot
+	errMarkOverageSnap   error // MarkAccountOverageSnapshotCharged
+	errTopUpOverageSnap  error // TopUpAccountOverageSnapshot
+
+	// overageClaimLoses, when > 0, makes the NEXT N InsertAccountOverageSnapshot
+	// calls report "lost the race" (inserted=false) WITHOUT actually writing
+	// anything — simulating a concurrent claim that beat this call, so a test
+	// can drive the claim-insert-loses-the-race path deterministically.
+	overageClaimLoses int
 }
 
 // acctSnapKey mirrors the account_overage_snapshots PRIMARY KEY
@@ -564,16 +572,51 @@ func (f *fakeStore) AccountOverageSnapshot(_ context.Context, accountID uuid.UUI
 	return snap, ok, nil
 }
 
-func (f *fakeStore) InsertAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) error {
+func (f *fakeStore) InsertAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) (bool, error) {
 	if f.errInsertOverageSnap != nil {
-		return f.errInsertOverageSnap
+		return false, f.errInsertOverageSnap
+	}
+	if f.overageClaimLoses > 0 {
+		f.overageClaimLoses--
+		return false, nil // simulate a concurrent claim winning the race
 	}
 	// ON CONFLICT (account_id, period_start) DO NOTHING: an existing row wins.
 	k := acctSnapKey{snap.AccountID, snap.PeriodStart}
 	if _, exists := f.overageSnaps[k]; exists {
-		return nil
+		return false, nil
 	}
 	f.overageSnaps[k] = snap
+	return true, nil
+}
+
+func (f *fakeStore) MarkAccountOverageSnapshotCharged(_ context.Context, accountID uuid.UUID, periodStart time.Time, invoiceItemID string) error {
+	if f.errMarkOverageSnap != nil {
+		return f.errMarkOverageSnap
+	}
+	k := acctSnapKey{accountID, periodStart}
+	snap, ok := f.overageSnaps[k]
+	if !ok {
+		return nil // defensive: mirrors the DB's unconditional UPDATE affecting 0 rows
+	}
+	snap.Status = cycle.OverageSnapshotCharged
+	snap.InvoiceItemID = invoiceItemID
+	f.overageSnaps[k] = snap
+	return nil
+}
+
+func (f *fakeStore) TopUpAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) error {
+	if f.errTopUpOverageSnap != nil {
+		return f.errTopUpOverageSnap
+	}
+	k := acctSnapKey{snap.AccountID, snap.PeriodStart}
+	existing, ok := f.overageSnaps[k]
+	if !ok || existing.Status != cycle.OverageSnapshotCharged {
+		return nil // mirrors the DB's WHERE status='charged' guard: a non-match is a no-op
+	}
+	existing.OverCount = snap.OverCount
+	existing.ChargedMicros = snap.ChargedMicros
+	existing.InvoiceItemID = snap.InvoiceItemID
+	f.overageSnaps[k] = existing
 	return nil
 }
 

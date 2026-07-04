@@ -57,27 +57,64 @@ WHERE overage_since IS NOT NULL
   AND activated_at  IS NOT NULL;
 
 -- SelectAccountOverageSnapshot reads the frozen pooled overage a charge leg
--- billed for ONE (account, period) — the double-charge guard for the charge
--- side (a row means "this period's pooled overage was already billed, skip it")
--- AND the authoritative display value for GetAccountBill's pooled-overage line.
--- Exact period_start match (both the grace sweep and the boundary leg key on the
--- anchored window start); no row → never charged → the caller skips (charge
--- side) or falls back to the live pooled estimate (display side).
+-- claimed/billed for ONE (account, period) — the double-charge guard for the
+-- charge side (a row means "this period's pooled overage is claimed — pending
+-- or charged — skip/resume it, never independently charge it") AND the
+-- authoritative display value for GetAccountBill's pooled-overage line. Exact
+-- period_start match (both the grace sweep and the boundary leg key on the
+-- anchored window start); no row → never claimed → the caller charges it
+-- (charge side) or falls back to the live pooled estimate (display side).
 -- name: SelectAccountOverageSnapshot :one
-SELECT over_count, charged_micros, source
+SELECT over_count, charged_micros, source, status
 FROM ms_billing.account_overage_snapshots
 WHERE account_id  = $1
   AND period_start = $2;
 
--- InsertAccountOverageSnapshot records what a charge leg billed the account for
--- one period's pooled overage (migration 030). ON CONFLICT (account_id,
--- period_start) DO NOTHING: an existing row — a prior grace charge, or a prior
--- reclaimed boundary attempt's own row — wins, so a re-run never rewrites what
--- was already recorded as billed. :execrows so the caller can observe the no-op,
--- though both outcomes are success (the Stripe idempotency key on the same
--- (account, period) already deduped the money).
+-- InsertAccountOverageSnapshot claims ONE (account, period)'s pooled overage
+-- charge for a leg — status='pending' is written BEFORE the leg calls Stripe
+-- (see migration 030's status column comment); the leg later calls
+-- MarkAccountOverageSnapshotCharged once Stripe actually succeeds. ON CONFLICT
+-- (account_id, period_start) DO NOTHING: an existing row — a prior grace claim,
+-- or a prior reclaimed boundary attempt's own row — wins, so a re-run never
+-- rewrites what was already claimed. :execrows so the caller can tell whether
+-- ITS insert won the race (rows=1) or lost to a concurrent claim (rows=0) and
+-- must re-read + defer to the winner instead of proceeding to charge Stripe.
 -- name: InsertAccountOverageSnapshot :execrows
 INSERT INTO ms_billing.account_overage_snapshots
-    (account_id, period_start, period_end, over_count, charged_micros, source, invoice_item_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+    (account_id, period_start, period_end, over_count, charged_micros, source, status, invoice_item_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (account_id, period_start) DO NOTHING;
+
+-- MarkAccountOverageSnapshotCharged flips a claimed row to 'charged' once
+-- Stripe actually created the invoice item/invoice, recording the GENUINE
+-- Stripe invoice item id (finding #4 — never the idempotency-key string).
+-- Unconditional on status (not just WHERE status='pending'): a retry that
+-- re-enters this leg after already flipping the row to 'charged' (e.g. the
+-- Stripe call succeeded, the write here committed, but a LATER step in the
+-- caller failed) must still be able to re-affirm the row harmlessly — the
+-- caller only ever calls this with the Stripe values it just confirmed, so
+-- overwriting an already-'charged' row with the same (idempotent) values is
+-- safe by construction (deterministic per-(account,period) Idempotency-Keys
+-- guarantee Stripe returns the SAME object on every re-call).
+-- name: MarkAccountOverageSnapshotCharged :exec
+UPDATE ms_billing.account_overage_snapshots
+SET status          = 'charged',
+    invoice_item_id = $3
+WHERE account_id  = $1
+  AND period_start = $2;
+
+-- TopUpAccountOverageSnapshot records an INCREMENTAL charge against an already-
+-- 'charged' period whose pool grew further before the period closed (finding
+-- #3 — a judgment call, see cycle/overage.go's topUpGraceOverage doc). Only
+-- fires from a 'charged' row (a 'pending' row is a resume-in-progress, never a
+-- top-up target); over_count/charged_micros are overwritten with the NEW
+-- cumulative totals so the ledger + the display always show what was actually
+-- billed in total for the period.
+-- name: TopUpAccountOverageSnapshot :exec
+UPDATE ms_billing.account_overage_snapshots
+SET over_count      = $3,
+    charged_micros  = $4,
+    invoice_item_id = $5
+WHERE account_id  = $1
+  AND period_start = $2
+  AND status       = 'charged';

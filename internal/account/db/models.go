@@ -342,6 +342,7 @@ type MsBillingAccountOverageSnapshot struct {
 	OverCount     int32       `json:"over_count"`
 	ChargedMicros int64       `json:"charged_micros"`
 	Source        string      `json:"source"`
+	Status        string      `json:"status"`
 	InvoiceItemID pgtype.Text `json:"invoice_item_id"`
 	CreatedAt     time.Time   `json:"created_at"`
 }

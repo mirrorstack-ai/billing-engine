@@ -75,8 +75,20 @@ CREATE TABLE IF NOT EXISTS ms_billing.account_overage_snapshots (
     -- grace-end) or the boundary advance leg ('advance', full pooled overage).
     source           TEXT NOT NULL CHECK (source IN ('grace', 'advance')),
 
-    -- The Stripe invoice item id of the overage charge (empty/NULL for a
-    -- 0-cent rounded charge that recorded nothing) — audit trail only.
+    -- CRASH-SAFE claim marker (PR #47 review fix — the cross-leg double-charge
+    -- finding). 'pending' is written BEFORE the leg calls Stripe (the row is the
+    -- durable "I am about to charge this period's overage" claim); 'charged' is
+    -- written only AFTER Stripe actually created the invoice item/invoice. The
+    -- OTHER leg (grace vs boundary) treats ANY row for the period — pending or
+    -- charged — as claimed and must never independently charge it, closing the
+    -- crash window where the ORIGINAL code only wrote this row AFTER Stripe
+    -- succeeded (a crash between the two let the other leg see "no row" and
+    -- double-charge under a disjoint Idempotency-Key namespace).
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'charged')),
+
+    -- The Stripe invoice item id of the overage charge (empty/NULL while
+    -- status='pending', or for a 0-cent rounded charge that recorded nothing)
+    -- — audit trail only.
     invoice_item_id  TEXT NULL,
 
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
