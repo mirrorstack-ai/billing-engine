@@ -381,6 +381,85 @@ FROM live
 WHERE NOT EXISTS (SELECT 1 FROM rolled)
 ORDER BY module_id, metric, model, module_version;
 
+-- AppInfraBillLines is the per-metric 基礎設施 (infrastructure) breakdown for the
+-- app-owner bill — the CATALOG-ANCHORED read behind GetAppBill's InfraLines. It
+-- returns ONE row per ACTIVE platform-infra sentinel metric_definitions row (the
+-- 16 declared infra metrics under module_id = the all-zero sentinel), so EVERY
+-- declared infra metric renders even when it has zero usage this period (the
+-- app-bill "show all" lists declared-but-unused infra metrics at qty 0 · $0). The
+-- enumeration source is the CATALOG (metric_definitions), NOT the usage ledger —
+-- that FROM metric_definitions … LEFT JOIN usage is the whole reason a $0 metric
+-- still appears.
+--
+-- The usage side mirrors AppBillLines' rolled-up-else-live gate, but collapsed to
+-- ONE row per metric (SUM across module / model / module_version) and filtered to
+-- the reserved infra.* / platform.* namespaces:
+--   * rolled: once the period is in usage_aggregates read the FROZEN
+--     billable_quantity / charged_micros (the ×1.2 infra markup already
+--     snapshotted at rollup).
+--   * live: when no infra rollup exists yet, estimate LIVE from usage_events with
+--     the ×12/10 infra markup applied INLINE — the SAME single 1.2× AppBillLines
+--     applies (mirrors cycle.infraMarkupNum/Den), so it is charged exactly ONCE.
+-- The gate is `WHERE NOT EXISTS (SELECT 1 FROM rolled)`, all-or-nothing over the
+-- infra rows, identical in spirit to AppBillLines.
+--
+-- unit_price_micros in the SELECT is the RAW catalog COGS (metric_definitions,
+-- pre-markup); charged_micros carries the post-markup line total. NUMERIC ×12/10
+-- stays exact (÷10 terminates); the store rounds charged_micros half-up ONCE per
+-- metric through the shared micros decoder (do NOT re-sum already-rounded values).
+--
+-- UNINSTALL-SAFE / ledger-only exactly like AppBillLines: never joins an install
+-- table. account_id may be the all-zero UUID for a lazy (account-less) app — the
+-- usage CTEs then match nothing (a lazy event carries NULL account_id, which never
+-- equals the zero UUID) and every declared metric COALESCEs to qty 0 · $0.
+-- name: AppInfraBillLines :many
+WITH rolled AS (
+    SELECT ua.metric                                       AS metric,
+           COALESCE(SUM(ua.billable_quantity), 0)::numeric AS billable_quantity,
+           COALESCE(SUM(ua.charged_micros), 0)::numeric    AS charged_micros
+    FROM ms_billing.usage_aggregates ua
+    JOIN ms_billing.billing_periods bp
+        ON bp.id = ua.period_id
+    WHERE ua.account_id   = @account_id::uuid
+      AND ua.app_id       = @app_id::uuid
+      AND bp.period_start = @period_start::timestamptz
+      AND (ua.metric LIKE 'infra.%' OR ua.metric LIKE 'platform.%')
+    GROUP BY ua.metric
+),
+live AS (
+    SELECT e.metric                                        AS metric,
+           COALESCE(SUM(e.value), 0)::numeric              AS billable_quantity,
+           (COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10)::numeric
+                                                           AS charged_micros
+    FROM ms_billing.usage_events e
+    LEFT JOIN ms_billing.metric_definitions md
+        ON md.module_id = e.module_id AND md.metric = e.metric
+    WHERE e.account_id  = @account_id::uuid
+      AND e.app_id      = @app_id::uuid
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
+      AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
+    GROUP BY e.metric
+),
+usage AS (
+    SELECT metric, billable_quantity, charged_micros FROM rolled
+    UNION ALL
+    SELECT metric, billable_quantity, charged_micros FROM live
+    WHERE NOT EXISTS (SELECT 1 FROM rolled)
+)
+SELECT md.metric                                       AS metric,
+       md.kind                                         AS kind,
+       md.unit                                         AS unit,
+       md.display_group                                AS display_group,
+       COALESCE(md.unit_price_micros, 0)::bigint       AS unit_price_micros,
+       COALESCE(u.billable_quantity, 0)::numeric       AS billable_quantity,
+       COALESCE(u.charged_micros, 0)::numeric          AS charged_micros
+FROM ms_billing.metric_definitions md
+LEFT JOIN usage u ON u.metric = md.metric
+WHERE md.module_id = '00000000-0000-0000-0000-000000000000'
+  AND md.active
+ORDER BY md.display_group, md.metric;
+
 -- ListBillingPeriods lists an account's REAL billing_periods rows (the closed,
 -- rolled/invoiced periods) newest-first — the source for the web's top-right 週期
 -- (period) selector on the app bill. Each row carries is_current: true iff its

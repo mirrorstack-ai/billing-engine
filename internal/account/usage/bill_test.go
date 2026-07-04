@@ -20,12 +20,25 @@ func customLine(mod uuid.UUID, metric, version string, charged int64) usage.AppM
 	}
 }
 
-// infraLine builds one reserved (infrastructure) bill line. Its ChargedMicros is
-// already the 1.2×-marked-up value the store returns (the markup lives in the
-// AppBillLines SQL, exercised by the integration suite, not here).
+// infraLine builds one reserved (infrastructure) row as it would appear on the
+// AppBill (module-usage) read. These are now DROPPED by GetAppBill (infra is
+// sourced from AppInfraBill instead), so a test uses them to prove the reserved
+// rows are ignored on the AppBill scan and never double-counted.
 func infraLine(metric string, charged int64) usage.AppMetricUsageRaw {
 	return usage.AppMetricUsageRaw{
 		ModuleID: uuid.Nil, Metric: metric, Kind: usage.KindSum, ChargedMicros: charged,
+	}
+}
+
+// appInfraLine builds one catalog-anchored infra bill line as AppInfraBill
+// returns it. ChargedMicros is already the 1.2×-marked-up value (the markup lives
+// in the AppInfraBillLines SQL, exercised by the integration suite, not here);
+// UnitPriceMicros is the raw catalog COGS. A zero charged/quantity line models a
+// declared-but-unused infra metric (shown at $0 under "show all").
+func appInfraLine(metric, group string, unitPrice int64, qty float64, charged int64) usage.AppInfraUsage {
+	return usage.AppInfraUsage{
+		Metric: metric, Kind: usage.KindSum, Unit: "unit", Group: group,
+		UnitPriceMicros: unitPrice, BillableQuantity: qty, ChargedMicros: charged,
 	}
 }
 
@@ -87,10 +100,21 @@ func TestGetAppBill_SplitsInfraFromModuleUsage(t *testing.T) {
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
 	mod := uuid.New()
+	// The AppBill (module-usage) read carries a custom line PLUS reserved infra
+	// lines with DELIBERATELY large charges — those reserved rows must be dropped
+	// (never summed) by GetAppBill, so if the double-count guard regressed this
+	// test would blow past the expected 20.
 	store.appBillRows = []usage.AppMetricUsageRaw{
 		customLine(mod, "orders.placed", "", 1000),
-		infraLine("infra.egress.api.bytes", 12),
-		infraLine("platform.tokens", 8),
+		infraLine("infra.egress.api.bytes", 9999),
+		infraLine("platform.tokens", 9999),
+	}
+	// Infra is sourced AUTHORITATIVELY from the catalog-anchored AppInfraBill: two
+	// metrics that charged (12 + 8) plus one declared-but-unused metric at $0.
+	store.appInfraBillRows = []usage.AppInfraUsage{
+		appInfraLine("infra.egress.api.bytes", "network", 90000, 0.0001, 12),
+		appInfraLine("platform.tokens", "ai", 1000, 8, 8),
+		appInfraLine("infra.request.count", "requests", 1, 0, 0), // unused → $0
 	}
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
@@ -101,9 +125,16 @@ func TestGetAppBill_SplitsInfraFromModuleUsage(t *testing.T) {
 	require.Equal(t, "orders.placed", resp.ModuleUsage[0].Metric)
 	require.EqualValues(t, 1000, resp.ModuleUsageTotalMicros)
 
-	// Infra is its own total (12 + 8), the 1.2× already folded into each line's
-	// ChargedMicros by the store — GetAppBill never re-marks-up.
+	// Infra breakdown is the catalog-anchored lines verbatim (incl. the $0 one),
+	// and the scalar total is their sum (12 + 8 + 0) — NOT the 2×9999 reserved rows
+	// on the AppBill read, which are dropped (no double-count).
+	require.Len(t, resp.InfraLines, 3)
 	require.EqualValues(t, 20, resp.InfraTotalMicros)
+	var lineSum int64
+	for _, l := range resp.InfraLines {
+		lineSum += l.ChargedMicros
+	}
+	require.Equal(t, resp.InfraTotalMicros, lineSum, "infra_total == Σ infra_lines[].charged")
 
 	// PaaS credit is subscription-gated OFF (no subscription system in v1) → 0,
 	// NOT a default 30% of infra.
@@ -122,7 +153,7 @@ func TestGetAppBill_PaasCreditSubscriptionGatedOff(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
-	store.appBillRows = []usage.AppMetricUsageRaw{infraLine("infra.request.count", 5)}
+	store.appInfraBillRows = []usage.AppInfraUsage{appInfraLine("infra.request.count", "requests", 1, 5, 5)}
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
 	require.NoError(t, err)
@@ -143,6 +174,61 @@ func TestGetAppBill_NoInfraMeansNoCredit(t *testing.T) {
 	require.Zero(t, resp.InfraTotalMicros)
 	require.Zero(t, resp.PaasCreditMicros)
 	require.Equal(t, usage.BaseFeeMicros+500, resp.TotalMicros)
+}
+
+// --- GetAppBill: catalog-anchored infra breakdown -------------------------
+
+func TestGetAppBill_ForwardsInfraLinesIncludingZero(t *testing.T) {
+	// GetAppBill forwards the catalog-anchored infra breakdown verbatim — one line
+	// per declared infra metric INCLUDING declared-but-unused ones at qty 0 · $0
+	// (the "show all" symmetry with unused module meters) — and the scalar
+	// InfraTotalMicros reconciles as the exact sum of the lines' charged.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.appInfraBillRows = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 1000, 3, 3600), // 3 × 1000 × 1.2
+		appInfraLine("infra.request.count", "requests", 1, 0, 0),   // declared, unused → $0
+		appInfraLine("infra.storage.gib_hours", "storage", 32, 0, 0),
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
+	require.NoError(t, err)
+	require.Len(t, resp.InfraLines, 3, "every declared infra metric appears, incl. the $0 ones")
+	require.Equal(t, "infra.ai.input.tokens", resp.InfraLines[0].Metric)
+	require.EqualValues(t, 1000, resp.InfraLines[0].UnitPriceMicros, "unit price is raw catalog COGS (pre-markup)")
+	require.EqualValues(t, 3600, resp.InfraLines[0].ChargedMicros, "charged includes the ×1.2 markup, once")
+	require.EqualValues(t, 3600, resp.InfraTotalMicros, "infra_total == Σ infra_lines[].charged")
+}
+
+func TestGetAppBill_InfraLinesRenderForLazyNoAccountApp(t *testing.T) {
+	// AppInfraBill is queried UNCONDITIONALLY — even a lazy app with no billing
+	// account still shows every declared infra metric (at $0 in reality; the fake
+	// returns the catalog rows). The store receives uuid.Nil as the account gate.
+	store := newFakeStore()
+	store.appInfraBillRows = []usage.AppInfraUsage{
+		appInfraLine("infra.request.count", "requests", 1, 0, 0),
+		appInfraLine("infra.cron.count", "compute", 1, 0, 0),
+	}
+	app := uuid.New()
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: uuid.New(), AppID: app})
+	require.NoError(t, err)
+	require.Len(t, resp.InfraLines, 2, "declared infra metrics render even with no account")
+	require.Zero(t, resp.InfraTotalMicros)
+	require.Equal(t, uuid.Nil, store.gotAppInfraBillAccountID, "no account → uuid.Nil gates the infra query")
+	require.Equal(t, app, store.gotAppInfraBillAppID)
+	// Still base-fee-only otherwise.
+	require.Equal(t, usage.BaseFeeMicros, resp.TotalMicros)
+}
+
+func TestGetAppBill_InternalOnInfraStoreError(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	store.errAppInfraBill = errors.New("boom")
+	_, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
+	requireCode(t, err, billing.CodeInternal)
 }
 
 // --- GetAppBill: per-version lines ----------------------------------------

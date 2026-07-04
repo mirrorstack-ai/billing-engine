@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
@@ -82,6 +83,103 @@ func TestAppBill_Integration_RolledInfraFrozenNotRemarkedUp(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "rolled branch wins; live events suppressed")
 	require.EqualValues(t, 1200, rows[0].ChargedMicros, "frozen charged, not re-marked-up")
+}
+
+// countActiveSentinelMetrics returns how many ACTIVE platform-infra sentinel
+// metric_definitions rows the migrations seeded — the exact number of rows
+// AppInfraBillLines must return (catalog-anchored, one per declared infra metric).
+func countActiveSentinelMetrics(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM ms_billing.metric_definitions
+		 WHERE module_id = $1 AND active`,
+		usage.PlatformInfraModuleID().String()).Scan(&n)
+	require.NoError(t, err)
+	return n
+}
+
+func findInfraLine(lines []usage.AppInfraUsage, metric string) (usage.AppInfraUsage, bool) {
+	for _, l := range lines {
+		if l.Metric == metric {
+			return l, true
+		}
+	}
+	return usage.AppInfraUsage{}, false
+}
+
+// TestAppInfraBill_Integration_CatalogAnchoredWithZeros: the LIVE branch returns
+// ONE row per active declared infra metric (catalog-anchored) — the used one
+// carries qty × price × 1.2, the unused ones render at qty 0 · $0 — and
+// InfraTotalMicros reconciles as Σ of the lines' charged. Infra events are seeded
+// under the platform-infra SENTINEL module_id (as the real ingest stamps them).
+func TestAppInfraBill_Integration_CatalogAnchoredWithZeros(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+
+	// infra.ai.input.tokens is a seeded sentinel row (catalog COGS 1000 µ$/1k).
+	// 3 units → 3 × 1000 = 3000 raw → ×1.2 = 3600 µ$ charged (markup once, in SQL).
+	appSeedEvent(t, pool, acct, app, sentinel, "infra.ai.input.tokens", usage.KindSum, 3, "2026-06-05T00:00:00Z", "", "")
+
+	lines, err := store.AppInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	require.Len(t, lines, countActiveSentinelMetrics(t, pool),
+		"one line per active declared infra metric — catalog-anchored, unused ones included")
+
+	used, ok := findInfraLine(lines, "infra.ai.input.tokens")
+	require.True(t, ok)
+	require.EqualValues(t, 3, used.BillableQuantity)
+	require.EqualValues(t, 1000, used.UnitPriceMicros, "raw catalog COGS, pre-markup")
+	require.EqualValues(t, 3600, used.ChargedMicros, "3 × 1000 × 1.2, markup once")
+
+	unused, ok := findInfraLine(lines, "infra.cron.count")
+	require.True(t, ok, "a declared-but-unused infra metric still appears")
+	require.Zero(t, unused.BillableQuantity)
+	require.Zero(t, unused.ChargedMicros, "unused metric renders at $0")
+
+	var sum int64
+	for _, l := range lines {
+		sum += l.ChargedMicros
+	}
+	require.EqualValues(t, 3600, sum, "infra_total == Σ infra_lines[].charged")
+}
+
+// TestAppInfraBill_Integration_RolledFrozenNotRemarkedUp: once rolled up, the
+// frozen usage_aggregates.charged_micros is read verbatim — the rolled branch must
+// NOT re-apply the 1.2× (the markup was already snapshotted at rollup), and the
+// live events in-window are suppressed.
+func TestAppInfraBill_Integration_RolledFrozenNotRemarkedUp(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+
+	// A live event that would show on the live path — suppressed once rolled.
+	appSeedEvent(t, pool, acct, app, sentinel, "infra.ai.input.tokens", usage.KindSum, 999, "2026-06-05T00:00:00Z", "", "")
+
+	// Frozen record: charged 3600 already includes the 1.2× markup.
+	periodID := appSeedPeriod(t, pool, acct, appPeriodStart, appPeriodEnd)
+	appSeedAggregate(t, pool, periodID, acct, app, sentinel, "infra.ai.input.tokens", usage.KindSum, "", "",
+		3, 1000, 3000, 3600)
+
+	lines, err := store.AppInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	require.Len(t, lines, countActiveSentinelMetrics(t, pool))
+
+	used, ok := findInfraLine(lines, "infra.ai.input.tokens")
+	require.True(t, ok)
+	require.EqualValues(t, 3, used.BillableQuantity, "frozen quantity, not the live 999")
+	require.EqualValues(t, 3600, used.ChargedMicros, "frozen charged, not re-marked-up")
 }
 
 // TestListBillingPeriods_Integration: an account's real periods list newest-first
