@@ -71,6 +71,9 @@ func (stubUsageStore) ListBillingPeriods(context.Context, uuid.UUID, time.Time) 
 func (stubUsageStore) BillingPeriodWindow(context.Context, uuid.UUID, uuid.UUID) (time.Time, time.Time, bool, error) {
 	return time.Time{}, time.Time{}, false, nil
 }
+func (stubUsageStore) ListInvoices(context.Context, uuid.UUID, int32, *usage.InvoiceCursor) ([]usage.InvoiceMirrorRaw, error) {
+	return nil, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()

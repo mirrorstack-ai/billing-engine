@@ -34,3 +34,7 @@
 \i migrations/billing/023_usage_module_version.up.sql
 -- 024: production billing_svc grants (NOTICE-skips locally — no billing_svc role in dev).
 \i migrations/billing/024_billing_svc_grants.up.sql
+-- 025: account activation timestamp (was missing here — pre-existing drift).
+\i migrations/billing/025_account_activated_at.up.sql
+-- 026: Stripe invoice presentment mirror columns (webhook write path requires them).
+\i migrations/billing/026_invoice_presentment.up.sql

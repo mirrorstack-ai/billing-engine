@@ -308,6 +308,59 @@ func TestProcess_InvoiceFinalized_AppliesOpen(t *testing.T) {
 	require.Equal(t, "open", s.AppliedInvoices[0].Status)
 }
 
+// TestProcess_InvoiceFinalized_CarriesPresentmentFields: the handler forwards
+// number / hosted_invoice_url / invoice_pdf (migration 026) from the event
+// payload into ApplyInvoiceStatusParams verbatim — Stripe assigns them at
+// finalization, so this event is the first one that can enrich the mirror.
+// The set-only (never-clear) semantics live in the SQL, exercised by the
+// store integration test; here we pin the decode → params plumbing.
+func TestProcess_InvoiceFinalized_CarriesPresentmentFields(t *testing.T) {
+	payload := map[string]any{
+		"id":                 "in_1",
+		"status":             "open",
+		"amount_paid":        int64(0),
+		"amount_due":         int64(1200),
+		"number":             "813C8918-0001",
+		"hosted_invoice_url": "https://invoice.stripe.com/i/in_1",
+		"invoice_pdf":        "https://pay.stripe.com/invoice/in_1/pdf",
+	}
+	raw, _ := json.Marshal(payload)
+	v := &webhooktest.FakeVerifier{Event: stripego.Event{
+		ID:   "evt_inv_f_pres",
+		Type: stripego.EventType("invoice.finalized"),
+		Data: &stripego.EventData{Raw: raw},
+	}}
+	s := webhooktest.NewFakeStore()
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.AppliedInvoices, 1)
+	applied := s.AppliedInvoices[0]
+	require.Equal(t, "813C8918-0001", applied.Number)
+	require.Equal(t, "https://invoice.stripe.com/i/in_1", applied.HostedInvoiceURL)
+	require.Equal(t, "https://pay.stripe.com/invoice/in_1/pdf", applied.InvoicePDF)
+}
+
+// TestProcess_InvoiceCreated_EmptyPresentmentFields: invoice.created predates
+// finalization, so the payload carries none of the presentment fields and the
+// params must pass "" through (which the store treats as "keep stored").
+func TestProcess_InvoiceCreated_EmptyPresentmentFields(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_inv_c_pres", "invoice.created", "in_1", "draft", 0, 1200)}
+	s := webhooktest.NewFakeStore()
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Len(t, s.AppliedInvoices, 1)
+	require.Empty(t, s.AppliedInvoices[0].Number)
+	require.Empty(t, s.AppliedInvoices[0].HostedInvoiceURL)
+	require.Empty(t, s.AppliedInvoices[0].InvoicePDF)
+}
+
 func TestProcess_InvoicePaid_RecordsAmountPaid(t *testing.T) {
 	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_inv_p", "invoice.paid", "in_1", "paid", 1200, 1200)}
 	s := webhooktest.NewFakeStore()

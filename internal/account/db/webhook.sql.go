@@ -26,13 +26,16 @@ func (q *Queries) AccountExistsByStripeCustomer(ctx context.Context, stripeCusto
 
 const applyInvoiceStatus = `-- name: ApplyInvoiceStatus :execrows
 UPDATE ms_billing.invoices AS i
-SET status      = $2,
-    amount_paid = $3,
-    amount_due  = $4
-WHERE i.stripe_invoice_id = $1
+SET status             = $1,
+    amount_paid        = $2,
+    amount_due         = $3,
+    number             = COALESCE(NULLIF($4::text, ''), i.number),
+    hosted_invoice_url = COALESCE(NULLIF($5::text, ''), i.hosted_invoice_url),
+    invoice_pdf        = COALESCE(NULLIF($6::text, ''), i.invoice_pdf)
+WHERE i.stripe_invoice_id = $7
   AND (
         -- forward transition: incoming rank strictly above the stored rank …
-        (CASE $2::text
+        (CASE $1::text
             WHEN 'draft' THEN 0 WHEN 'open' THEN 1
             WHEN 'paid' THEN 2 WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2
             ELSE -1 END)
@@ -42,21 +45,33 @@ WHERE i.stripe_invoice_id = $1
             WHEN 'paid' THEN 2 WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2
             ELSE -1 END)
         -- … OR an identical re-apply (idempotent amount refresh on replay).
-        OR i.status = $2
+        OR i.status = $1
       )
 `
 
 type ApplyInvoiceStatusParams struct {
-	StripeInvoiceID string         `json:"stripe_invoice_id"`
-	Status          string         `json:"status"`
-	AmountPaid      pgtype.Numeric `json:"amount_paid"`
-	AmountDue       pgtype.Numeric `json:"amount_due"`
+	Status           string         `json:"status"`
+	AmountPaid       pgtype.Numeric `json:"amount_paid"`
+	AmountDue        pgtype.Numeric `json:"amount_due"`
+	Number           string         `json:"number"`
+	HostedInvoiceUrl string         `json:"hosted_invoice_url"`
+	InvoicePdf       string         `json:"invoice_pdf"`
+	StripeInvoiceID  string         `json:"stripe_invoice_id"`
 }
 
 // ApplyInvoiceStatus reconciles a Stripe invoice.* event onto the mirror row
 // keyed by stripe_invoice_id. It updates status + amount_paid + amount_due
-// ONLY (period_start/end + currency belong to the charge spine's UpsertInvoice
-// and must not be clobbered by a webhook). updated_at is trigger-maintained.
+// plus the PRESENTMENT columns below (period_start/end + currency belong to
+// the charge spine's UpsertInvoice and must not be clobbered by a webhook).
+// updated_at is trigger-maintained.
+//
+// Presentment enrichment (migration 026): number / hosted_invoice_url /
+// invoice_pdf are Stripe-assigned at FINALIZATION and immutable afterwards, so
+// they ride every finalized-and-later event payload and are absent before
+// that. Each lands upsert-style via COALESCE(NULLIF(new, ”), old): a
+// non-empty value overwrites, an empty one KEEPS the stored value — an event
+// that predates finalization (or a sparse replay) can never clear an
+// already-enriched column back to NULL.
 //
 // Out-of-order + at-least-once safety: Stripe delivers webhooks at-least-once
 // and NOT in guaranteed order, so a late invoice.finalized (open) can arrive
@@ -79,10 +94,13 @@ type ApplyInvoiceStatusParams struct {
 // never an error.
 func (q *Queries) ApplyInvoiceStatus(ctx context.Context, arg ApplyInvoiceStatusParams) (int64, error) {
 	result, err := q.db.Exec(ctx, applyInvoiceStatus,
-		arg.StripeInvoiceID,
 		arg.Status,
 		arg.AmountPaid,
 		arg.AmountDue,
+		arg.Number,
+		arg.HostedInvoiceUrl,
+		arg.InvoicePdf,
+		arg.StripeInvoiceID,
 	)
 	if err != nil {
 		return 0, err

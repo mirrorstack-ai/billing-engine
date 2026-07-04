@@ -165,6 +165,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.GetBillingPeriods(ctx, req)
 
+	case "ListInvoices":
+		var req usage.ListInvoicesRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.ListInvoices(ctx, req)
+
 	case "SetMetricDefinitions":
 		var req usage.SetMetricDefinitionsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -338,6 +345,12 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// control-plane credential + route group.
 		r.Post("/v1/billing.GetAppBill", makeHTTPHandler(d, "GetAppBill"))
 		r.Post("/v1/billing.GetBillingPeriods", makeHTTPHandler(d, "GetBillingPeriods"))
+		// Account invoice HISTORY (this PR): the customer's mirrored Stripe
+		// invoices for the web-account billing page — a keyset-paged, read-only
+		// surface over ms_billing.invoices (the mirror this service already
+		// owns; NO Stripe round-trip), so it shares the control-plane
+		// credential + route group with the other account-billing reads.
+		r.Post("/v1/billing.ListInvoices", makeHTTPHandler(d, "ListInvoices"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
 		// Per-module infra price OVERRIDES (decision 19 §4.3) — the INVERSE of
 		// SetMetricDefinitions: it persists a module's ms.Meter("infra.X",
