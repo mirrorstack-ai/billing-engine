@@ -158,6 +158,18 @@ type Store interface {
 	// by (accountID, periodID). found=false (pgx.ErrNoRows) → the service returns
 	// NOT_FOUND; the account gate prevents cross-account period enumeration.
 	BillingPeriodWindow(ctx context.Context, accountID, periodID uuid.UUID) (start, end time.Time, found bool, err error)
+
+	// ListInvoices reads ONE keyset page of the account's mirrored Stripe
+	// invoices (ms_billing.invoices) ordered (created_at, id) DESC, EXCLUDING
+	// status='draft' rows (a draft was never billed to the customer and can
+	// still mutate Stripe-side — the SQL owns that filter so the LIMIT counts
+	// only renderable rows). cursor==nil starts at the newest invoice; a
+	// non-nil cursor resumes strictly AFTER that position in DESC order.
+	// limit passes through verbatim — the service clamps the page size and
+	// asks for page+1 rows to detect a further page. Money comes back already
+	// converted mirror NUMERIC whole cents → int64 micros (×10_000) so micros
+	// stay the only money unit above the store.
+	ListInvoices(ctx context.Context, accountID uuid.UUID, limit int32, cursor *InvoiceCursor) ([]InvoiceMirrorRaw, error)
 }
 
 // MetricDefinition is the catalog projection the ingest path resolves
@@ -295,6 +307,36 @@ type BillingPeriodRaw struct {
 	PeriodStart time.Time
 	PeriodEnd   time.Time
 	IsCurrent   bool
+}
+
+// InvoiceCursor is a DECODED keyset position in the (created_at, id) DESC
+// invoice ordering: the last row of the previous page. On the wire it travels
+// only as the opaque base64 token ListInvoices mints and parses (see
+// invoices.go) — the store sees the decoded tuple, never the token.
+type InvoiceCursor struct {
+	CreatedAt time.Time
+	ID        uuid.UUID
+}
+
+// InvoiceMirrorRaw is one decoded ms_billing.invoices row (the Stripe invoice
+// mirror, 011 + 026). Money is int64 micro-USD — the mirror's NUMERIC whole
+// cents ×10_000, converted at the store boundary so micros stay the only
+// money unit above it. Number / HostedInvoiceURL / InvoicePDF are "" until
+// the finalization webhook enriched the row (historic pre-026 rows stay
+// empty); PeriodStart / PeriodEnd are nil for a non-period (manual) invoice.
+type InvoiceMirrorRaw struct {
+	ID               uuid.UUID
+	StripeInvoiceID  string
+	Number           string
+	Status           string
+	AmountDueMicros  int64
+	AmountPaidMicros int64
+	Currency         string
+	PeriodStart      *time.Time
+	PeriodEnd        *time.Time
+	CreatedAt        time.Time
+	HostedInvoiceURL string
+	InvoicePDF       string
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -748,6 +790,62 @@ func (s *pgxStore) BillingPeriodWindow(ctx context.Context, accountID, periodID 
 	return row.PeriodStart, row.PeriodEnd, true, nil
 }
 
+// ListInvoices reads one keyset page of the invoices mirror — see the Store
+// interface doc. The cursor arrives pre-decoded; hasCursor=false makes the
+// SQL gate short-circuit, so the zero cursor values are inert well-formed
+// placeholders (the VersionBreakdown gate pattern). The mirror's money
+// columns are NUMERIC whole cents (Stripe minor units, 011): each decodes
+// through centsNumericToMicros so the ×10_000 cents→micros conversion happens
+// exactly once, at this boundary.
+func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit int32, cursor *InvoiceCursor) ([]InvoiceMirrorRaw, error) {
+	params := db.ListInvoicesForAccountParams{
+		AccountID: accountID.String(),
+		RowLimit:  limit,
+		CursorID:  uuid.Nil.String(), // inert placeholder; gated off by HasCursor
+	}
+	if cursor != nil {
+		params.HasCursor = true
+		params.CursorCreatedAt = cursor.CreatedAt
+		params.CursorID = cursor.ID.String()
+	}
+	rows, err := s.q.ListInvoicesForAccount(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]InvoiceMirrorRaw, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.ID)
+		if err != nil {
+			return nil, fmt.Errorf("decode id for invoice %q: %w", r.StripeInvoiceID, err)
+		}
+		due, err := centsNumericToMicros(r.AmountDue)
+		if err != nil {
+			return nil, fmt.Errorf("decode amount_due for invoice %q: %w", r.StripeInvoiceID, err)
+		}
+		paid, err := centsNumericToMicros(r.AmountPaid)
+		if err != nil {
+			return nil, fmt.Errorf("decode amount_paid for invoice %q: %w", r.StripeInvoiceID, err)
+		}
+		out = append(out, InvoiceMirrorRaw{
+			ID:              id,
+			StripeInvoiceID: r.StripeInvoiceID,
+			// pgtype.Text zero-values String to "" when NULL, which is exactly
+			// the "not enriched yet" contract InvoiceMirrorRaw documents.
+			Number:           r.Number.String,
+			Status:           r.Status,
+			AmountDueMicros:  due,
+			AmountPaidMicros: paid,
+			Currency:         r.Currency,
+			PeriodStart:      timePtrFromTimestamptz(r.PeriodStart),
+			PeriodEnd:        timePtrFromTimestamptz(r.PeriodEnd),
+			CreatedAt:        r.CreatedAt,
+			HostedInvoiceURL: r.HostedInvoiceUrl.String,
+			InvoicePDF:       r.InvoicePdf.String,
+		})
+	}
+	return out, nil
+}
+
 // appMetricUsageRaw decodes one generated app-usage/app-bill row into the
 // AppMetricUsageRaw the service consumes: the NUMERIC billable_quantity as a
 // display float, charged_micros half-up through the shared micros decoder (a
@@ -850,6 +948,32 @@ func floatFromNumeric(n pgtype.Numeric) (float64, error) {
 		return 0, err
 	}
 	return fv.Float64, nil
+}
+
+// timePtrFromTimestamptz maps a nullable timestamptz to *time.Time: NULL →
+// nil (so the wire's omitempty drops the field), else a pointer to the value.
+func timePtrFromTimestamptz(ts pgtype.Timestamptz) *time.Time {
+	if !ts.Valid {
+		return nil
+	}
+	t := ts.Time
+	return &t
+}
+
+// centsNumericToMicros converts a mirror NUMERIC whole-cent amount (Stripe
+// minor units — the invoices money columns, 011) to int64 micro-dollars:
+// cents × 10_000. Implemented by shifting the NUMERIC's decimal exponent by
+// +4 and reusing microsFromNumeric, so even a (theoretical) fractional-cent
+// mirror value rounds half-up through the single shared money rounding point
+// instead of a second ad-hoc conversion path.
+func centsNumericToMicros(n pgtype.Numeric) (int64, error) {
+	if !n.Valid {
+		return 0, nil
+	}
+	// n is a value copy; bumping Exp scales the copy only, and
+	// microsFromNumeric never mutates the shared *big.Int.
+	n.Exp += 4
+	return microsFromNumeric(n)
 }
 
 // MicrosFromNumeric is the exported entry to microsFromNumeric so sibling
