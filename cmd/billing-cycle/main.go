@@ -139,7 +139,12 @@ type cycleResult struct {
 //     (start := max(anchoredStart, lastClosedPeriodEnd)).
 //  2. Rollup — price the window's raw usage_events into usage_aggregates. An
 //     account whose just-closed window had NO usage produces no aggregates and
-//     is skipped (no billing_run, matching the pre-anchor "has usage" gate).
+//     is skipped (no billing_run) UNLESS it has live ms_billing.apps roster
+//     rows created before the new period opened — base-fee v1 still owes the
+//     NEW period's advance base at this boundary, so the charge phase runs
+//     anyway. A no-usage account with no such apps (pre-backfill, or apps
+//     created inside the new period whose base RegisterApp's proration leg
+//     already owns) keeps the historical skip.
 //  3. Charge — RunBillingCycle nets arrears and charges. Idempotent: a re-fire
 //     only charges periods without a successful (invoiced) run; billing_runs
 //     reclaims non-terminal rows.
@@ -172,8 +177,15 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 			start = lastEnd
 		}
 
-		// Phase 1 — rollup this account's window. No usage → no aggregates → skip
-		// the charge (no billing_run for an empty period).
+		// Phase 1 — rollup this account's window. No usage → no aggregates →
+		// skip the charge (no billing_run for an empty period) UNLESS the
+		// account has live apps on the ms_billing.apps roster created BEFORE
+		// the new period opened (created_at < end): base-fee v1 bills the NEW
+		// period's base fee in advance at this boundary even when the closed
+		// period metered nothing. Pre-backfill accounts (empty roster) keep
+		// the historical no-usage skip, and so does an account whose only
+		// apps were created inside the new period — their base is the
+		// RegisterApp proration leg's; they join at the NEXT boundary.
 		summary, err := svc.RollupPeriod(ctx, a.ID, start, end)
 		if err != nil {
 			slog.ErrorContext(ctx, "rollup failed", "account_id", a.ID,
@@ -182,9 +194,18 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 			continue
 		}
 		if len(summary.Aggregates) == 0 {
-			continue
+			hasApps, err := svc.AccountHasLiveApps(ctx, a.ID, end)
+			if err != nil {
+				slog.ErrorContext(ctx, "live app roster check failed", "account_id", a.ID, "error", err)
+				res.Failed++
+				continue
+			}
+			if !hasApps {
+				continue
+			}
+		} else {
+			res.RolledUp++
 		}
-		res.RolledUp++
 
 		// Phase 2 — charge the just-closed window.
 		res.Processed++
@@ -217,7 +238,10 @@ func tally(res *cycleResult, accountID uuid.UUID, s *cycle.ChargeSummary) {
 		res.SkippedNoPM++
 	case s.Status == cycle.RunStatusFailed:
 		res.FailedRuns++
-	case s.Status == cycle.RunStatusInvoiced && s.ArrearsMicros == 0:
+	case s.Status == cycle.RunStatusInvoiced && s.ChargedCents == 0:
+		// Nothing was actually invoiced: usage arrears AND advance base both 0
+		// (ChargedCents, not ArrearsMicros — a base-only boundary invoice has
+		// zero arrears but IS a real charge and must count as Charged below).
 		res.ZeroArrears++
 	case s.Status == cycle.RunStatusInvoiced:
 		res.Charged++

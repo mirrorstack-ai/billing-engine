@@ -36,7 +36,9 @@ type fakeStore struct {
 	periodListRows         []usage.BillingPeriodRaw
 	periodWindows          map[uuid.UUID]periodWindow // billing_periods id → window
 	visibility             map[uuid.UUID]usage.Visibility
-	invoiceRows            []usage.InvoiceMirrorRaw // unordered; ListInvoices applies the SQL contract
+	invoiceRows            []usage.InvoiceMirrorRaw             // unordered; ListInvoices applies the SQL contract
+	appMirrors             map[uuid.UUID]usage.AppMirrorInfo    // app_id → ms_billing.apps roster row (migration 027)
+	baseSnapshots          map[string]usage.AppBaseSnapshotInfo // app_id/period_start → charged-base snapshot (migration 028)
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
@@ -82,6 +84,8 @@ type fakeStore struct {
 	// page+1 limit and the decoded cursor reached the store unchanged.
 	gotInvoiceLimit  int32
 	gotInvoiceCursor *usage.InvoiceCursor
+	errAppMirror     error
+	errBaseSnapshot  error
 
 	// captured window a read-path RPC resolved from the account's anchor, so a
 	// test can assert the anchored [start, end) reached the store unchanged.
@@ -96,12 +100,40 @@ type periodWindow struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		defs:       map[string]usage.MetricDefinition{},
-		accounts:   map[uuid.UUID]uuid.UUID{},
-		events:     map[string]usage.UsageEvent{},
-		anchorDays: map[uuid.UUID]int{},
-		visibility: map[uuid.UUID]usage.Visibility{},
+		defs:          map[string]usage.MetricDefinition{},
+		accounts:      map[uuid.UUID]uuid.UUID{},
+		events:        map[string]usage.UsageEvent{},
+		anchorDays:    map[uuid.UUID]int{},
+		visibility:    map[uuid.UUID]usage.Visibility{},
+		appMirrors:    map[uuid.UUID]usage.AppMirrorInfo{},
+		baseSnapshots: map[string]usage.AppBaseSnapshotInfo{},
 	}
+}
+
+// baseSnapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
+func baseSnapKey(appID uuid.UUID, periodStart time.Time) string {
+	return appID.String() + "/" + periodStart.UTC().Format(time.RFC3339Nano)
+}
+
+// AppMirror returns the fake ms_billing.apps roster row for an app; absent →
+// not mirrored (pre-backfill), so GetAppBill keeps the usage-proxy fallback.
+func (f *fakeStore) AppMirror(_ context.Context, appID uuid.UUID) (usage.AppMirrorInfo, bool, error) {
+	if f.errAppMirror != nil {
+		return usage.AppMirrorInfo{}, false, f.errAppMirror
+	}
+	m, ok := f.appMirrors[appID]
+	return m, ok, nil
+}
+
+// AppBaseSnapshot returns the fake migration-028 charged-base row for one
+// (app, period_start); absent → the period was never base-charged, so
+// GetAppBill falls back to the live-count display estimate.
+func (f *fakeStore) AppBaseSnapshot(_ context.Context, appID uuid.UUID, periodStart time.Time) (usage.AppBaseSnapshotInfo, bool, error) {
+	if f.errBaseSnapshot != nil {
+		return usage.AppBaseSnapshotInfo{}, false, f.errBaseSnapshot
+	}
+	s, ok := f.baseSnapshots[baseSnapKey(appID, periodStart)]
+	return s, ok, nil
 }
 
 // AccountAnchorDay returns the configured anchor day for an account, defaulting

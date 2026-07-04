@@ -74,6 +74,12 @@ func (stubUsageStore) BillingPeriodWindow(context.Context, uuid.UUID, uuid.UUID)
 func (stubUsageStore) ListInvoices(context.Context, uuid.UUID, int32, *usage.InvoiceCursor) ([]usage.InvoiceMirrorRaw, error) {
 	return nil, nil
 }
+func (stubUsageStore) AppMirror(context.Context, uuid.UUID) (usage.AppMirrorInfo, bool, error) {
+	return usage.AppMirrorInfo{}, false, nil
+}
+func (stubUsageStore) AppBaseSnapshot(context.Context, uuid.UUID, time.Time) (usage.AppBaseSnapshotInfo, bool, error) {
+	return usage.AppBaseSnapshotInfo{}, false, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()

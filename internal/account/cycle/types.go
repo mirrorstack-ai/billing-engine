@@ -201,12 +201,19 @@ type ChargeSummary struct {
 	// FirstRun is false (no status was set this call).
 	Status BillingRunStatus
 
-	// ArrearsMicros is the netted arrears = max(0, Σ charged_micros −
-	// allowanceMicros) the cycle computed. 0 → no Stripe call.
+	// ArrearsMicros is the netted USAGE arrears = max(0, Σ charged_micros −
+	// allowanceMicros) the cycle computed for the CLOSED period.
 	ArrearsMicros int64
 
+	// AdvanceBaseMicros is the NEW period's advance base fee (base-fee v1):
+	// Σ over the account's live apps of BaseFee + Overage × max(0,
+	// module_count − IncludedModules). 0 for a pre-backfill account (no
+	// mirror rows). The invoice total is ArrearsMicros + AdvanceBaseMicros;
+	// only when BOTH are 0 is the Stripe call skipped.
+	AdvanceBaseMicros int64
+
 	// ChargedCents is the whole-cent amount sent to Stripe (micros → cents
-	// round-half-up). 0 when no charge happened.
+	// round-half-up over arrears + advance base). 0 when no charge happened.
 	ChargedCents int64
 
 	// StripeInvoiceID is the created Stripe invoice id, empty when no charge
