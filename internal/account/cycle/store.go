@@ -247,18 +247,34 @@ type Store interface {
 	// (grace anchor) and activated_at (period anchor).
 	AccountsInOverageGrace(ctx context.Context, cutoff time.Time) ([]OverageGraceCandidate, error)
 
-	// AccountOverageSnapshot reads the frozen pooled overage a charge leg billed
-	// for ONE (account, period) — the double-charge guard both the grace sweep
-	// and the boundary consult (found=true → this period's pooled overage was
-	// already billed, skip it). found=false → never charged.
+	// AccountOverageSnapshot reads the frozen pooled overage a charge leg
+	// claimed/billed for ONE (account, period) — the double-charge guard both
+	// the grace sweep and the boundary consult (found=true → this period's
+	// pooled overage is CLAIMED — status 'pending' or 'charged' — the OTHER leg
+	// must never independently charge it; the claiming leg resumes/reuses it).
+	// found=false → never claimed.
 	AccountOverageSnapshot(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (snap AccountOverageSnapshot, found bool, err error)
 
-	// InsertAccountOverageSnapshot freezes what a charge leg billed the account
-	// for one period's pooled overage (migration 030) with ON CONFLICT
-	// (account_id, period_start) DO NOTHING — an existing row (a prior grace
-	// charge, or a reclaimed boundary attempt's own row) wins, so a re-run never
-	// rewrites what was already recorded as billed.
-	InsertAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) error
+	// InsertAccountOverageSnapshot CLAIMS one period's pooled overage charge for
+	// a leg — callers write status="pending" BEFORE calling Stripe (the
+	// crash-safe marker; see migration 030's status column doc) — with
+	// ON CONFLICT (account_id, period_start) DO NOTHING. inserted=false means
+	// the row already existed (a prior claim by this leg or the other one) and
+	// the caller MUST re-read AccountOverageSnapshot and defer to the winner
+	// rather than proceed to charge Stripe under its own claim.
+	InsertAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) (inserted bool, err error)
+
+	// MarkAccountOverageSnapshotCharged flips a claimed row to status="charged"
+	// once Stripe actually created the invoice item/invoice, recording the
+	// GENUINE Stripe invoice item id (never an idempotency-key string).
+	MarkAccountOverageSnapshotCharged(ctx context.Context, accountID uuid.UUID, periodStart time.Time, invoiceItemID string) error
+
+	// TopUpAccountOverageSnapshot records an incremental charge against an
+	// already-'charged' period whose pool grew further before the period closed
+	// (the mid-period sweep's top-up leg, a judgment call — see
+	// cycle/overage.go's topUpGraceOverage doc). snap.OverCount/ChargedMicros
+	// are the NEW cumulative totals for the period.
+	TopUpAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) error
 }
 
 // OverageGraceCandidate is one account the mid-period grace sweep evaluates: its
@@ -273,11 +289,14 @@ type OverageGraceCandidate struct {
 
 // AccountOverageSnapshot is the in-memory form of a
 // ms_billing.account_overage_snapshots row (migration 030): what one charge leg
-// billed one account for one period's POOLED module overage. PeriodStart is the
-// display + double-charge lookup key; ChargedMicros is the exact overage the
-// invoice billed (prorated for a 'grace' row, full for an 'advance' row);
-// OverCount is the pooled over-count it tiered on; Source is 'grace' or
-// 'advance'; InvoiceItemID is the Stripe item id (empty for a 0-cent charge).
+// claimed/billed one account for one period's POOLED module overage.
+// PeriodStart is the display + double-charge lookup key; ChargedMicros is the
+// exact overage the invoice billed (prorated for a 'grace' row, full for an
+// 'advance' row, or the cumulative total after a top-up); OverCount is the
+// pooled over-count it tiered on; Source is 'grace' or 'advance'; Status is
+// 'pending' (claimed, Stripe not yet confirmed — the crash-safe marker) or
+// 'charged' (Stripe confirmed); InvoiceItemID is the genuine Stripe item id
+// (empty while Status=="pending", or for a 0-cent charge).
 type AccountOverageSnapshot struct {
 	AccountID     uuid.UUID
 	PeriodStart   time.Time
@@ -285,8 +304,15 @@ type AccountOverageSnapshot struct {
 	OverCount     int
 	ChargedMicros int64
 	Source        string
+	Status        string
 	InvoiceItemID string
 }
+
+// Account overage snapshot status values (migration 030's status column).
+const (
+	OverageSnapshotPending = "pending"
+	OverageSnapshotCharged = "charged"
+)
 
 // AppModuleCount pairs one live roster app with its module_count snapshot —
 // one advance-base input row. The boundary leg needs the app id (not just the
@@ -1050,22 +1076,46 @@ func (s *pgxStore) AccountOverageSnapshot(ctx context.Context, accountID uuid.UU
 		OverCount:     int(row.OverCount),
 		ChargedMicros: row.ChargedMicros,
 		Source:        row.Source,
+		Status:        row.Status,
 	}, true, nil
 }
 
-func (s *pgxStore) InsertAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) error {
-	// 0 rows = ON CONFLICT DO NOTHING kept an existing row (a prior grace charge,
-	// or a reclaimed boundary attempt's write) — success either way.
-	_, err := s.q.InsertAccountOverageSnapshot(ctx, db.InsertAccountOverageSnapshotParams{
+func (s *pgxStore) InsertAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) (bool, error) {
+	// rows=0 = ON CONFLICT DO NOTHING kept an existing row (a prior claim by
+	// this leg or the other one) — the caller must re-read and defer to it,
+	// never proceed to charge Stripe under its own (lost) claim.
+	rows, err := s.q.InsertAccountOverageSnapshot(ctx, db.InsertAccountOverageSnapshotParams{
 		AccountID:     snap.AccountID.String(),
 		PeriodStart:   snap.PeriodStart,
 		PeriodEnd:     snap.PeriodEnd,
 		OverCount:     int32(snap.OverCount), //nolint:gosec // over_count = pooled sum − IncludedModules; the pool is Σ validated module_counts (each ≤ maxModuleCount), far below int32 max
 		ChargedMicros: snap.ChargedMicros,
 		Source:        snap.Source,
+		Status:        snap.Status,
 		InvoiceItemID: pgtype.Text{String: snap.InvoiceItemID, Valid: snap.InvoiceItemID != ""},
 	})
-	return err
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (s *pgxStore) MarkAccountOverageSnapshotCharged(ctx context.Context, accountID uuid.UUID, periodStart time.Time, invoiceItemID string) error {
+	return s.q.MarkAccountOverageSnapshotCharged(ctx, db.MarkAccountOverageSnapshotChargedParams{
+		AccountID:     accountID.String(),
+		PeriodStart:   periodStart,
+		InvoiceItemID: pgtype.Text{String: invoiceItemID, Valid: invoiceItemID != ""},
+	})
+}
+
+func (s *pgxStore) TopUpAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) error {
+	return s.q.TopUpAccountOverageSnapshot(ctx, db.TopUpAccountOverageSnapshotParams{
+		AccountID:     snap.AccountID.String(),
+		PeriodStart:   snap.PeriodStart,
+		OverCount:     int32(snap.OverCount), //nolint:gosec // over_count = pooled sum − IncludedModules; the pool is Σ validated module_counts (each ≤ maxModuleCount), far below int32 max
+		ChargedMicros: snap.ChargedMicros,
+		InvoiceItemID: pgtype.Text{String: snap.InvoiceItemID, Valid: snap.InvoiceItemID != ""},
+	})
 }
 
 // parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc

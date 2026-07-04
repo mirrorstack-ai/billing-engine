@@ -262,7 +262,9 @@ func runOverageSweep(ctx context.Context, svc *cycle.Service, at time.Time, res 
 			res.Failed++
 			continue
 		}
-		if summary.Status == cycle.OverageCharged {
+		if summary.Status == cycle.OverageCharged || summary.Status == cycle.OverageToppedUp {
+			// A top-up (finding #3 — an ALREADY-charged period whose pool grew
+			// further before the period closed) is also money charged, not a skip.
 			res.OverageCharged++
 		} else {
 			res.OverageSkipped++
