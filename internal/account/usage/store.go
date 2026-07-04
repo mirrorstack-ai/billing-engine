@@ -208,6 +208,21 @@ type Store interface {
 	// deleted BEFORE the period opened is excluded (base 0, no new usage —
 	// residual ledger rows still enumerate through AppIDsWithUsage).
 	MirroredAppIDs(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+
+	// PooledModuleCount returns the account-wide POOLED installed-module count:
+	// SUM(module_count) over the account's LIVE apps (migration 030). It is the
+	// live input to GetAccountBill's account-wide overage ESTIMATE when the
+	// current period has no frozen account_overage_snapshots row yet.
+	PooledModuleCount(ctx context.Context, accountID uuid.UUID) (int, error)
+
+	// AccountOverageSnapshot reads the frozen pooled overage a charge leg billed
+	// for ONE (account, period) — the AUTHORITATIVE display value for
+	// GetAccountBill's account-wide overage line (what the grace sweep or the
+	// boundary actually invoiced). found=false → the period's pooled overage was
+	// never charged (pre-030 history, an account under the pool, or an
+	// in-progress period no leg has billed yet) and the caller falls back to the
+	// live pooled ESTIMATE.
+	AccountOverageSnapshot(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (chargedMicros int64, found bool, err error)
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -603,6 +618,33 @@ func (s *pgxStore) MirroredAppIDs(ctx context.Context, accountID uuid.UUID, peri
 		return nil, err
 	}
 	return parseAppIDs(rows)
+}
+
+// PooledModuleCount sums module_count over the account's live apps (migration
+// 030) — the live input to GetAccountBill's account-wide overage estimate.
+func (s *pgxStore) PooledModuleCount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	sum, err := s.q.SumLiveModuleCount(ctx, accountID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(sum), nil
+}
+
+// AccountOverageSnapshot reads the frozen pooled overage charged for one
+// (account, period) — pgx.ErrNoRows → found=false (the service falls back to
+// the live pooled estimate).
+func (s *pgxStore) AccountOverageSnapshot(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (int64, bool, error) {
+	row, err := s.q.SelectAccountOverageSnapshot(ctx, db.SelectAccountOverageSnapshotParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil // never overage-charged → live estimate
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return row.ChargedMicros, true, nil
 }
 
 // parseAppIDs decodes a generated query's text app_id column into uuid.UUIDs,

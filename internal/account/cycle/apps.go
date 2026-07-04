@@ -98,11 +98,14 @@ type SyncAppModulesResponse struct {
 //     PM; otherwise the row is recorded and NO invoice is created (no
 //     retroactive catch-up on activation in v1). The one-shot guard
 //     proration_invoice_id short-circuits a retry that already charged.
-//     Amount = ProratedBaseMicros(AppBaseFeeMicros(base, module_count),
-//     created_at, the anchored period CONTAINING created_at) — whole UTC
-//     days, creation day inclusive, round-half-up — converted micros → whole
-//     cents at the Stripe boundary like every other charge. 0 cents → row
-//     recorded, no invoice.
+//     Amount = ProratedBaseMicros(BaseFeeMicros, created_at, the anchored
+//     period CONTAINING created_at) — the FLAT per-app base only (module
+//     overage is account-wide pooled, migration 030), whole UTC days, creation
+//     day inclusive, round-half-up — converted micros → whole cents at the
+//     Stripe boundary like every other charge. 0 cents → row recorded, no
+//     invoice. The insert ALSO recomputes the account's pooled-overage grace
+//     timer (recomputeAccountOverage) so a creation that pushes the account
+//     over IncludedModules arms accounts.overage_since.
 //
 //     INVARIANT (charge-leg ownership): the proration window is derived from
 //     the read-back mirror row's created_at (the stable first-registration
@@ -175,6 +178,16 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 	}
 	resp := &RegisterAppResponse{AppID: app.AppID, AccountID: app.AccountID}
 
+	// Recompute the account-wide pooled overage timer (migration 030) after the
+	// insert: the new app's module_count may push the account's pool over
+	// IncludedModules (arming accounts.overage_since) — independent of the
+	// per-app creation-proration charge below, which only ever bills the FLAT
+	// base. Idempotent (Start/Clear are first-crossing-wins / no-op), so a retry
+	// re-runs it harmlessly.
+	if err := s.recomputeAccountOverage(ctx, app.AccountID); err != nil {
+		return nil, err
+	}
+
 	// One-shot guard: a prior attempt already charged (or a concurrent one
 	// won). Idempotent success — NEVER a second invoice.
 	if app.ProrationInvoiceID != "" {
@@ -220,10 +233,10 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		return resp, nil
 	}
 
-	prorated := usage.ProratedBaseMicros(
-		usage.AppBaseFeeMicros(usage.BaseFeeMicros, app.ModuleCount),
-		app.CreatedAt, periodStart, periodEnd,
-	)
+	// The creation-proration charge is the FLAT per-app base only (migration
+	// 030 — module overage is account-wide pooled, billed by the grace sweep /
+	// boundary at the account level, never folded into this per-app proration).
+	prorated := usage.ProratedBaseMicros(usage.BaseFeeMicros, app.CreatedAt, periodStart, periodEnd)
 	cents, err := centsFromMicros(prorated)
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
@@ -308,8 +321,14 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 //     — there is no future base for the tier to move);
 //   - an unknown app_id is NOT_FOUND (the platform must RegisterApp first).
 //
-// Count changes take effect at the NEXT boundary charge (D1b — no mid-period
-// micro-invoices for module #6, no mid-period refunds for uninstalls).
+// After any module_count / delete write it recomputes the account's pooled-
+// overage grace timer (recomputeAccountOverage). The per-app FLAT base still
+// takes effect at the NEXT boundary (no mid-period base micro-invoice / refund),
+// but the ACCOUNT-WIDE pooled overage is now the DELIBERATE exception to the old
+// D1b "no mid-period charges" rule: crossing the pooled IncludedModules arms a
+// grace timer, and the mid-period sweep charges the pooled overage once the
+// grace window elapses (migration 030). Dropping back under the pool clears the
+// timer (no refund of anything already charged, D1e).
 func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest) (*SyncAppModulesResponse, error) {
 	if req.AppID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
@@ -343,6 +362,14 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 			return nil, billing.Internal("set app module count failed", err)
 		}
 		app.ModuleCount = *req.ModuleCount
+	}
+
+	// Recompute the account-wide pooled-overage grace timer (migration 030) after
+	// the write: a count bump or delete can push the pool over IncludedModules
+	// (arm overage_since) or drop it back under (clear it). Idempotent, so a
+	// pure-delete-of-an-already-deleted-app retry re-runs it harmlessly.
+	if err := s.recomputeAccountOverage(ctx, app.AccountID); err != nil {
+		return nil, err
 	}
 
 	return &SyncAppModulesResponse{

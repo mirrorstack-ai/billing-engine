@@ -221,6 +221,71 @@ type Store interface {
 	// proration snapshot, or a prior reclaimed attempt's own row) wins, so a
 	// re-run never rewrites what was already recorded as billed.
 	InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error
+
+	// --- account-wide POOLED module overage (migration 030) -----------------
+
+	// PooledModuleCount returns the account-wide pooled installed-module count:
+	// SUM(module_count) over the account's LIVE apps. The overage timer recompute
+	// and the mid-period grace sweep tier on it (overage = $3 × max(0, this −
+	// IncludedModules)).
+	PooledModuleCount(ctx context.Context, accountID uuid.UUID) (int, error)
+
+	// StartAccountOverage stamps the account's grace-timer anchor (overage_since)
+	// the FIRST time its pool crosses IncludedModules — WHERE overage_since IS
+	// NULL, so it is first-crossing-wins/idempotent (a later recompute that finds
+	// it already armed is a no-op).
+	StartAccountOverage(ctx context.Context, accountID uuid.UUID, since time.Time) error
+
+	// ClearAccountOverage disarms the grace timer (overage_since → NULL) when the
+	// pool drops back to ≤ IncludedModules — WHERE overage_since IS NOT NULL, so
+	// it is idempotent. No refund (D1e): clearing only stops FUTURE accrual.
+	ClearAccountOverage(ctx context.Context, accountID uuid.UUID) error
+
+	// AccountsInOverageGrace returns every account whose grace timer has EXPIRED
+	// as of cutoff (overage_since <= cutoff) and that is chargeable (activated) —
+	// the mid-period grace sweep's work list, with each account's overage_since
+	// (grace anchor) and activated_at (period anchor).
+	AccountsInOverageGrace(ctx context.Context, cutoff time.Time) ([]OverageGraceCandidate, error)
+
+	// AccountOverageSnapshot reads the frozen pooled overage a charge leg billed
+	// for ONE (account, period) — the double-charge guard both the grace sweep
+	// and the boundary consult (found=true → this period's pooled overage was
+	// already billed, skip it). found=false → never charged.
+	AccountOverageSnapshot(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (snap AccountOverageSnapshot, found bool, err error)
+
+	// InsertAccountOverageSnapshot freezes what a charge leg billed the account
+	// for one period's pooled overage (migration 030) with ON CONFLICT
+	// (account_id, period_start) DO NOTHING — an existing row (a prior grace
+	// charge, or a reclaimed boundary attempt's own row) wins, so a re-run never
+	// rewrites what was already recorded as billed.
+	InsertAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) error
+}
+
+// OverageGraceCandidate is one account the mid-period grace sweep evaluates: its
+// id plus the two anchors the sweep needs — OverageSince (the grace timer's
+// start; grace ends at OverageSince + the grace window) and ActivatedAt (the
+// billing-period anchor, ADR 0005, used to resolve the current window).
+type OverageGraceCandidate struct {
+	ID           uuid.UUID
+	OverageSince time.Time
+	ActivatedAt  time.Time
+}
+
+// AccountOverageSnapshot is the in-memory form of a
+// ms_billing.account_overage_snapshots row (migration 030): what one charge leg
+// billed one account for one period's POOLED module overage. PeriodStart is the
+// display + double-charge lookup key; ChargedMicros is the exact overage the
+// invoice billed (prorated for a 'grace' row, full for an 'advance' row);
+// OverCount is the pooled over-count it tiered on; Source is 'grace' or
+// 'advance'; InvoiceItemID is the Stripe item id (empty for a 0-cent charge).
+type AccountOverageSnapshot struct {
+	AccountID     uuid.UUID
+	PeriodStart   time.Time
+	PeriodEnd     time.Time
+	OverCount     int
+	ChargedMicros int64
+	Source        string
+	InvoiceItemID string
 }
 
 // AppModuleCount pairs one live roster app with its module_count snapshot —
@@ -913,6 +978,92 @@ func (s *pgxStore) InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSn
 		PeriodEnd:   snap.PeriodEnd,
 		ModuleCount: int32(snap.ModuleCount), //nolint:gosec // count comes from the apps row, whose writers (RegisterApp/SyncAppModules) validate 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
 		BaseMicros:  snap.BaseMicros,
+	})
+	return err
+}
+
+// --- account-wide POOLED module overage (migration 030) --------------------
+
+func (s *pgxStore) PooledModuleCount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	sum, err := s.q.SumLiveModuleCount(ctx, accountID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(sum), nil
+}
+
+func (s *pgxStore) StartAccountOverage(ctx context.Context, accountID uuid.UUID, since time.Time) error {
+	// 0 rows = already armed (first-crossing-wins, WHERE overage_since IS NULL) —
+	// a no-op, not an error: the original anchor survives.
+	_, err := s.q.StartAccountOverage(ctx, db.StartAccountOverageParams{
+		ID:           accountID.String(),
+		OverageSince: pgtype.Timestamptz{Time: since, Valid: true},
+	})
+	return err
+}
+
+func (s *pgxStore) ClearAccountOverage(ctx context.Context, accountID uuid.UUID) error {
+	// 0 rows = already clear (WHERE overage_since IS NOT NULL) — idempotent no-op.
+	_, err := s.q.ClearAccountOverage(ctx, accountID.String())
+	return err
+}
+
+func (s *pgxStore) AccountsInOverageGrace(ctx context.Context, cutoff time.Time) ([]OverageGraceCandidate, error) {
+	rows, err := s.q.AccountsInOverageGrace(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]OverageGraceCandidate, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		// The query filters both columns NOT NULL, so a non-Valid value here is a
+		// driver anomaly; skip it defensively rather than anchor on the zero time.
+		if !r.OverageSince.Valid || !r.ActivatedAt.Valid {
+			continue
+		}
+		out = append(out, OverageGraceCandidate{
+			ID:           id,
+			OverageSince: r.OverageSince.Time,
+			ActivatedAt:  r.ActivatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) AccountOverageSnapshot(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (AccountOverageSnapshot, bool, error) {
+	row, err := s.q.SelectAccountOverageSnapshot(ctx, db.SelectAccountOverageSnapshotParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AccountOverageSnapshot{}, false, nil
+	}
+	if err != nil {
+		return AccountOverageSnapshot{}, false, err
+	}
+	return AccountOverageSnapshot{
+		AccountID:     accountID,
+		PeriodStart:   periodStart,
+		OverCount:     int(row.OverCount),
+		ChargedMicros: row.ChargedMicros,
+		Source:        row.Source,
+	}, true, nil
+}
+
+func (s *pgxStore) InsertAccountOverageSnapshot(ctx context.Context, snap AccountOverageSnapshot) error {
+	// 0 rows = ON CONFLICT DO NOTHING kept an existing row (a prior grace charge,
+	// or a reclaimed boundary attempt's write) — success either way.
+	_, err := s.q.InsertAccountOverageSnapshot(ctx, db.InsertAccountOverageSnapshotParams{
+		AccountID:     snap.AccountID.String(),
+		PeriodStart:   snap.PeriodStart,
+		PeriodEnd:     snap.PeriodEnd,
+		OverCount:     int32(snap.OverCount), //nolint:gosec // over_count = pooled sum − IncludedModules; the pool is Σ validated module_counts (each ≤ maxModuleCount), far below int32 max
+		ChargedMicros: snap.ChargedMicros,
+		Source:        snap.Source,
+		InvoiceItemID: pgtype.Text{String: snap.InvoiceItemID, Valid: snap.InvoiceItemID != ""},
 	})
 	return err
 }
