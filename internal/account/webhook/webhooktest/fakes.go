@@ -39,12 +39,13 @@ func (f *FakeVerifier) Verify(_ []byte, _ string) (stripego.Event, error) {
 // true, the Processed map initialized, no errors.
 type FakeStore struct {
 	// Recording
-	Processed   map[string]bool                     // event IDs seen by MarkEventProcessed
-	DefaultsSet []string                            // "customerID=defaultPM" pairs from SetDefaultPaymentMethod
-	Inserts     []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
-	SoftDeletes []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
-	StampedPMs  []string                            // "setupIntentID=stripePMID" from SetAddCardRequestStripePM
-	ResolvedPMs []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
+	Processed          map[string]bool                     // event IDs seen by MarkEventProcessed
+	DefaultsSet        []string                            // "customerID=defaultPM" pairs from SetDefaultPaymentMethod
+	Inserts            []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
+	SoftDeletes        []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
+	StampedPMs         []string                            // "setupIntentID=stripePMID" from SetAddCardRequestStripePM
+	ResolvedPMs        []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
+	ActivatedCustomers []string                            // stripe_customer_id values from StampAccountActivated
 
 	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
 	RelaxedInvoices []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
@@ -55,6 +56,7 @@ type FakeStore struct {
 	SoftDelFound bool // returned by SoftDeletePaymentMethod
 	InvoiceFound bool // returned by ApplyInvoiceStatus
 	Relaxed      bool // returned by RelaxCollectionOnPaidInvoice
+	ActivatedNew bool // returned by StampAccountActivated (firstBind)
 
 	// Error injection
 	ErrMark         error // from MarkEventProcessed
@@ -66,6 +68,7 @@ type FakeStore struct {
 	ErrResolve      error // from ResolvePendingAddCardRequest
 	ErrApplyInvoice error // from ApplyInvoiceStatus
 	ErrRelax        error // from RelaxCollectionOnPaidInvoice
+	ErrActivate     error // from StampAccountActivated
 }
 
 // NewFakeStore returns a FakeStore configured for happy-path tests:
@@ -78,6 +81,7 @@ func NewFakeStore() *FakeStore {
 		InsertFound:  true,
 		SoftDelFound: true,
 		InvoiceFound: true,
+		ActivatedNew: true,
 	}
 }
 
@@ -116,6 +120,14 @@ func (s *FakeStore) InsertPaymentMethod(_ context.Context, _ string, params webh
 	}
 	s.Inserts = append(s.Inserts, params)
 	return s.InsertFound, nil
+}
+
+func (s *FakeStore) StampAccountActivated(_ context.Context, customerID string) (bool, error) {
+	if s.ErrActivate != nil {
+		return false, s.ErrActivate
+	}
+	s.ActivatedCustomers = append(s.ActivatedCustomers, customerID)
+	return s.ActivatedNew, nil
 }
 
 func (s *FakeStore) SoftDeletePaymentMethod(_ context.Context, stripePMID string) (bool, error) {

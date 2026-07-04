@@ -22,15 +22,22 @@ type alertKey struct {
 }
 
 type fakeStore struct {
-	budgets map[string]budget.Budget        // key: scope/scope_id
-	spend   int64                           // current AppPeriodSpendMicros result
-	alerts  map[alertKey]budget.BudgetAlert // recorded crossings (idempotency)
+	budgets   map[string]budget.Budget        // key: scope/scope_id
+	spend     int64                           // current AppPeriodSpendMicros result
+	alerts    map[alertKey]budget.BudgetAlert // recorded crossings (idempotency)
+	anchorDay int                             // AppAnchorDay result (0 → 1, calendar month)
+
+	// captured window AppPeriodSpendMicros was called with, so a test can assert
+	// the anchored [start, end) reached the store unchanged.
+	gotSpendStart time.Time
+	gotSpendEnd   time.Time
 
 	errGet    error
 	errUpsert error
 	errSpend  error
 	errInsert error
 	errList   error
+	errAnchor error
 }
 
 func newFakeStore() *fakeStore {
@@ -63,11 +70,24 @@ func (f *fakeStore) GetBudget(_ context.Context, scope budget.Scope, scopeID uui
 	return b, ok, nil
 }
 
-func (f *fakeStore) AppPeriodSpendMicros(_ context.Context, _ uuid.UUID, _, _ time.Time) (int64, error) {
+func (f *fakeStore) AppPeriodSpendMicros(_ context.Context, _ uuid.UUID, start, end time.Time) (int64, error) {
+	f.gotSpendStart, f.gotSpendEnd = start, end
 	if f.errSpend != nil {
 		return 0, f.errSpend
 	}
 	return f.spend, nil
+}
+
+// AppAnchorDay returns the configured app anchor day, defaulting to 1 (the UTC
+// calendar month) so tests that don't set one keep the pre-anchor window.
+func (f *fakeStore) AppAnchorDay(_ context.Context, _ uuid.UUID) (int, error) {
+	if f.errAnchor != nil {
+		return 0, f.errAnchor
+	}
+	if f.anchorDay != 0 {
+		return f.anchorDay, nil
+	}
+	return 1, nil
 }
 
 func (f *fakeStore) InsertBudgetAlerts(_ context.Context, records []budget.AlertRecord) ([]int, error) {
@@ -428,6 +448,42 @@ func TestGetBudgetStatus_WithNow_DrivesDefaultPeriod(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC), resp.PeriodStart)
 	require.Equal(t, time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), resp.PeriodEnd)
+}
+
+// TestGetBudgetStatus_WindowsOnAppAnchorDay proves the budget status window is
+// anchored to the app payer's card-binding day (ADR 0005), not the 1st, and that
+// the anchored [start, end) reaches the spend query unchanged.
+func TestGetBudgetStatus_WindowsOnAppAnchorDay(t *testing.T) {
+	store := newFakeStore()
+	appID := uuid.New()
+	seedBudget(store, appID, 1_000_000, []int{80})
+	store.anchorDay = 17 // the app's payer bound a card on the 17th
+
+	at := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	svc := newService(store).WithNow(func() time.Time { return at })
+
+	resp, err := svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{
+		Scope: budget.ScopeApp, ScopeID: appID,
+	})
+	require.NoError(t, err)
+	require.Equal(t, time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC), resp.PeriodStart)
+	require.Equal(t, time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC), resp.PeriodEnd)
+	// The same anchored window reached AppPeriodSpendMicros (threaded unchanged).
+	require.Equal(t, resp.PeriodStart, store.gotSpendStart)
+	require.Equal(t, resp.PeriodEnd, store.gotSpendEnd)
+}
+
+// TestGetBudgetStatus_AnchorLookupErrorSurfaces proves an app-anchor lookup error
+// fails the read loud (Internal) rather than silently mis-windowing the budget.
+func TestGetBudgetStatus_AnchorLookupErrorSurfaces(t *testing.T) {
+	store := newFakeStore()
+	appID := uuid.New()
+	seedBudget(store, appID, 1_000_000, []int{80})
+	store.errAnchor = errors.New("anchor db down")
+	_, err := newService(store).GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{
+		Scope: budget.ScopeApp, ScopeID: appID,
+	})
+	requireCode(t, err, billing.CodeInternal)
 }
 
 // --- GetBudgetAlerts ------------------------------------------------------

@@ -29,6 +29,32 @@
 -- micros → whole cents (round-half-up) at the Stripe boundary. The invoice
 -- mirror stores NUMERIC cents.
 
+-- ActivatedAccounts returns every account that has bound a card (activated_at IS
+-- NOT NULL — migration 025), with its anchor instant, for cmd/billing-cycle's
+-- per-account close driver. Un-activated accounts (NULL) have no card and nothing
+-- to bill, so they are excluded. The cycle derives each account's anchor day from
+-- activated_at and closes THAT account's just-ended anchored period — every close
+-- day differs, so the batch can no longer share one window.
+-- name: ActivatedAccounts :many
+SELECT id, activated_at
+FROM ms_billing.accounts
+WHERE activated_at IS NOT NULL;
+
+-- LatestClosedPeriodEnd returns the newest billing_periods.period_end for an
+-- account; pgx.ErrNoRows when it has no period yet (the Go store maps that to
+-- "none"). cmd/billing-cycle uses it to STRADDLE-CLAMP the first anchored run at
+-- cutover: if a computed anchored window starts before the last calendar-month
+-- period already ended, the run starts at that end instead, producing one clean
+-- bridge period (calendar → anchor) with no overlap, gap, or duplicate
+-- (account_id, period_start) key. ORDER BY … LIMIT 1 (not MAX) so the result
+-- keeps the NOT NULL period_end column type instead of a nullable aggregate.
+-- name: LatestClosedPeriodEnd :one
+SELECT period_end
+FROM ms_billing.billing_periods
+WHERE account_id = $1
+ORDER BY period_end DESC
+LIMIT 1;
+
 -- AccountsWithUsageEvents returns the distinct accounts with at least one raw
 -- usage_events row in the closed window [period_start, period_end) — the ROLLUP
 -- (phase 1) work list. cmd/billing-cycle rolls each of these up

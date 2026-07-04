@@ -33,6 +33,15 @@ UPDATE ms_billing.accounts SET stripe_customer_id = $2 WHERE id = $1;
 SELECT id FROM ms_billing.accounts
 WHERE owner_kind = 'user' AND owner_user_id = $1;
 
+-- AccountActivatedAt returns an account's billing-period ANCHOR instant
+-- (migration 025): the UTC time it bound its first credit card, or NULL when it
+-- never activated. The Go layer derives the anchor DAY-OF-MONTH from it
+-- in-process (activated_at.UTC().Day()); a NULL falls back to anchor day 1 (the
+-- UTC calendar month — the pre-025 window). Read once per RPC alongside the
+-- resolved account id so every read/charge windows the account's own period.
+-- name: AccountActivatedAt :one
+SELECT activated_at FROM ms_billing.accounts WHERE id = $1;
+
 -- HasUsablePaymentMethod is the hot-path Ensure predicate: at least one
 -- active (not soft-deleted) and not-expired mirror row on the account.
 -- name: HasUsablePaymentMethod :one
