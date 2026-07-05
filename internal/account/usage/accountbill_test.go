@@ -35,9 +35,11 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	//          half; base = legacy flat + usage-proxy overage (1 module → flat).
 	//   appB — mirror-only, ZERO usage (just created, nothing metered): must
 	//          still appear with its full base (created long before the period).
-	//   appC — both halves: synced count 7 → base $20 + 2×$3; usage + module-
-	//          attributed infra.
-	// Every per-app number is exactly what GetAppBill would return for that app.
+	//   appC — both halves: synced count 7 → FLAT $20 base (overage is pooled,
+	//          migration 032); usage + module-attributed infra.
+	// The account-wide pool is 0 (appB) + 7 (appC) = 7 → 2 over → $6 pooled
+	// overage on the ACCOUNT (not on any app). Every per-app number is exactly
+	// what GetAppBill would return for that app.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -79,26 +81,33 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.EqualValues(t, 200, resp.Apps[1].InfraMicros)
 	require.Equal(t, usage.BaseFeeMicros+1200, resp.Apps[1].TotalMicros)
 
-	// appC: synced count 7 → base + 2 × overage; module-attributed infra folds in.
-	wantBaseC := usage.BaseFeeMicros + 2*usage.ModuleOverageFeeMicros
-	require.Equal(t, wantBaseC, resp.Apps[2].BaseFeeMicros)
+	// appC: synced count 7 → FLAT base (overage is pooled, not per-app);
+	// module-attributed infra folds in.
+	require.Equal(t, usage.BaseFeeMicros, resp.Apps[2].BaseFeeMicros)
 	require.EqualValues(t, 500, resp.Apps[2].ModuleUsageMicros)
 	require.EqualValues(t, 24, resp.Apps[2].InfraMicros)
-	require.Equal(t, wantBaseC+524, resp.Apps[2].TotalMicros)
+	require.Equal(t, usage.BaseFeeMicros+524, resp.Apps[2].TotalMicros)
 
-	// Account totals are the column sums; credit is gated off (v1) → total is
-	// the plain sum and apps[].total_micros (pre-credit) reconcile exactly.
-	require.Equal(t, 2*usage.BaseFeeMicros+wantBaseC, resp.BaseFeeTotalMicros)
+	// Account totals are the column sums plus the account-wide POOLED overage.
+	// All three apps are flat, so BaseFeeTotal = 3 × $20. Pool 7 → 2 over → $6.
+	require.Equal(t, 3*usage.BaseFeeMicros, resp.BaseFeeTotalMicros)
 	require.EqualValues(t, 1500, resp.ModuleUsageTotalMicros)
 	require.EqualValues(t, 224, resp.InfraTotalMicros)
+	require.Equal(t, usage.AccountOverageMicros(7), resp.AccountOverageMicros)
+	require.EqualValues(t, 6_000_000, resp.AccountOverageMicros) // 2 over × $3
 	require.Zero(t, resp.PaasCreditMicros)
-	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, resp.TotalMicros)
-	var preCredit int64
+	require.Equal(t,
+		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+resp.AccountOverageMicros,
+		resp.TotalMicros)
+	// apps[].total_micros are PRE-credit AND exclude the account-level pooled
+	// overage (it is never allocated per-app), so Σ apps == account total −
+	// overage + credit.
+	var perApp int64
 	for _, a := range resp.Apps {
-		preCredit += a.TotalMicros
+		perApp += a.TotalMicros
 	}
-	require.Equal(t, resp.TotalMicros+resp.PaasCreditMicros, preCredit,
-		"Σ apps[].total (pre-credit) == account total + credit")
+	require.Equal(t, resp.TotalMicros-resp.AccountOverageMicros+resp.PaasCreditMicros, perApp,
+		"Σ apps[].total (pre-credit) == account total − pooled overage + credit")
 }
 
 func TestGetAccountBill_DeterministicAppOrdering(t *testing.T) {
@@ -171,10 +180,11 @@ func TestGetAccountBill_MirrorLifecycleAcrossTheWindow(t *testing.T) {
 // --- snapshot-first base ----------------------------------------------------
 
 func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
-	// The account bill inherits GetAppBill's snapshot-first base: the May
-	// period was CHARGED at count 5 (flat $20 snapshot), then SyncAppModules
-	// moved the mirror to 8. The frozen period must show the snapshot base;
-	// the CURRENT (un-snapshotted) period estimates from the live count 8.
+	// The account bill inherits GetAppBill's snapshot-first PER-APP base: the May
+	// period was CHARGED at a flat $20 snapshot, then SyncAppModules moved the
+	// mirror to 8. The per-app base is flat in both periods (overage is pooled).
+	// The CURRENT (un-snapshotted) period's account-wide overage estimates from
+	// the live pool 8 → 3 over → $9.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -182,7 +192,7 @@ func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 	app := seqUUID(1)
 	store.appMirrors[app] = usage.AppMirrorInfo{ModuleCount: 8, CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
 	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
-		BaseMicros: usage.AppBaseFeeMicros(usage.BaseFeeMicros, 5),
+		BaseMicros: usage.BaseFeeMicros,
 	}
 
 	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
@@ -190,13 +200,14 @@ func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, resp.Apps, 1)
-	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "charged period shows the invoiced snapshot, not the resynced count")
+	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "charged period shows the invoiced flat snapshot")
 
 	resp, err = newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
 	require.NoError(t, err)
 	require.Len(t, resp.Apps, 1)
-	require.Equal(t, usage.BaseFeeMicros+3*usage.ModuleOverageFeeMicros, resp.Apps[0].BaseFeeMicros,
-		"un-snapshotted current period estimates from the synced count 8")
+	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "per-app base is flat regardless of count")
+	require.EqualValues(t, 9_000_000, resp.AccountOverageMicros,
+		"un-snapshotted current period estimates the pooled overage from the live pool 8 → 3 over → $9")
 }
 
 // --- period resolution --------------------------------------------------------

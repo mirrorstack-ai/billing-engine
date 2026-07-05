@@ -331,6 +331,20 @@ type MsBillingAccount struct {
 	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
 	// UTC instant the account bound its FIRST credit card (billing-account activation). Immutable, first-bind-wins; billing-period anchor day = activated_at day-of-month (ADR 0005). NULL = never activated -> skipped by cmd/billing-cycle.
 	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
+	// UTC instant the account-wide pooled SUM(module_count) over live apps first crossed the included 5 (account-wide overage grace anchor, owner spec 2026-07-05). NULL = not currently over the pool. Recomputed by RegisterApp / SyncAppModules; arms one 3-day grace timer per account.
+	OverageSince pgtype.Timestamptz `json:"overage_since"`
+}
+
+type MsBillingAccountOverageSnapshot struct {
+	AccountID     string      `json:"account_id"`
+	PeriodStart   time.Time   `json:"period_start"`
+	PeriodEnd     time.Time   `json:"period_end"`
+	OverCount     int32       `json:"over_count"`
+	ChargedMicros int64       `json:"charged_micros"`
+	Source        string      `json:"source"`
+	Status        string      `json:"status"`
+	InvoiceItemID pgtype.Text `json:"invoice_item_id"`
+	CreatedAt     time.Time   `json:"created_at"`
 }
 
 type MsBillingAddCardRequest struct {

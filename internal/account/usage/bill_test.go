@@ -59,8 +59,11 @@ func TestGetAppBill_BaseFeeBundlesUpToIncludedModules(t *testing.T) {
 	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "5 modules is within the bundle → no surcharge")
 }
 
-func TestGetAppBill_BaseFeeSurchargesModulesBeyondIncluded(t *testing.T) {
-	// 7 distinct modules → base = BaseFeeMicros + ModuleOverageFeeMicros × (7 − 5).
+func TestGetAppBill_PerAppBaseIsFlatEvenWithManyModules(t *testing.T) {
+	// Migration 032: module overage is ACCOUNT-WIDE POOLED, so the PER-APP base
+	// is the FLAT $20 regardless of how many modules the app uses — 7 distinct
+	// modules no longer surcharge THIS app's base (the pooled overage surfaces on
+	// GetAccountBill instead).
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -70,8 +73,7 @@ func TestGetAppBill_BaseFeeSurchargesModulesBeyondIncluded(t *testing.T) {
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
 	require.NoError(t, err)
-	want := usage.BaseFeeMicros + usage.ModuleOverageFeeMicros*2
-	require.Equal(t, want, resp.BaseFeeMicros)
+	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "per-app base is flat; overage is pooled at the account")
 }
 
 func TestGetAppBill_ModuleCountIsDistinctModulesNotLines(t *testing.T) {
@@ -518,10 +520,10 @@ func mirrorPeriod(store *fakeStore) uuid.UUID {
 	return pid
 }
 
-func TestGetAppBill_MirroredAppUsesSyncedModuleCount(t *testing.T) {
-	// A mirrored app's overage comes from the SYNCED module_count (7 → +2×$3),
-	// NOT the usage-proxy distinct-module count (only 1 module has usage here
-	// — the proxy would have said "flat base").
+func TestGetAppBill_MirroredAppShowsFlatBase(t *testing.T) {
+	// Migration 032: a mirrored app's per-app base is the FLAT $20 regardless of
+	// its synced module_count (7 here) — module overage is account-wide pooled,
+	// no longer part of the per-app base.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -535,7 +537,7 @@ func TestGetAppBill_MirroredAppUsesSyncedModuleCount(t *testing.T) {
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
 	require.NoError(t, err)
-	require.Equal(t, usage.BaseFeeMicros+2*usage.ModuleOverageFeeMicros, resp.BaseFeeMicros)
+	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "per-app base is flat (overage is pooled)")
 }
 
 func TestGetAppBill_MirroredAppProratesCreationPeriod(t *testing.T) {
@@ -602,9 +604,10 @@ func TestGetAppBill_AppDeletedDuringPeriodKeepsSpentBase(t *testing.T) {
 	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros)
 }
 
-func TestGetAppBill_UnmirroredAppKeepsProxyFallback(t *testing.T) {
-	// No mirror row (pre-backfill) → today's behavior survives verbatim: flat
-	// base + the usage-proxy overage (7 distinct modules with usage → +2×$3).
+func TestGetAppBill_UnmirroredAppShowsFlatBase(t *testing.T) {
+	// No mirror row (pre-backfill) → the FLAT per-app base. Migration 032 retired
+	// the pre-032 usage-proxy overage: overage is account-wide pooled, never
+	// estimated per app, so even 7 distinct modules with usage show flat $20 here.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -615,7 +618,7 @@ func TestGetAppBill_UnmirroredAppKeepsProxyFallback(t *testing.T) {
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New(), PeriodID: pid})
 	require.NoError(t, err)
-	require.Equal(t, usage.BaseFeeMicros+2*usage.ModuleOverageFeeMicros, resp.BaseFeeMicros)
+	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros)
 }
 
 func TestGetAppBill_InternalOnAppMirrorError(t *testing.T) {
@@ -645,21 +648,22 @@ func TestGetAppBill_SnapshotFreezesChargedPeriodBaseAfterSync(t *testing.T) {
 		CreatedAt:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
 	}
 	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
-		BaseMicros: usage.AppBaseFeeMicros(usage.BaseFeeMicros, 5), // what the boundary actually invoiced
+		BaseMicros: usage.BaseFeeMicros, // what the boundary actually invoiced (flat base)
 	}
 
-	// The charged period displays the frozen count-5 base, NOT a recompute
-	// from the mirror's current count 8.
+	// The charged period displays the frozen snapshot base, NOT a recompute from
+	// the mirror's current count 8.
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
 	require.NoError(t, err)
-	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "charged period shows what was invoiced (count 5 → flat base)")
+	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "charged period shows what was invoiced (flat base)")
 
-	// The CURRENT period has no snapshot yet → live ESTIMATE from the synced
-	// count 8.
+	// The CURRENT period has no snapshot yet → live ESTIMATE, which is the FLAT
+	// per-app base (migration 032 — overage is pooled, not per-app), unaffected
+	// by the synced count 8.
 	resp, err = newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app})
 	require.NoError(t, err)
-	require.Equal(t, usage.BaseFeeMicros+3*usage.ModuleOverageFeeMicros, resp.BaseFeeMicros,
-		"un-snapshotted period estimates from the current count 8")
+	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros,
+		"un-snapshotted period estimates the flat per-app base regardless of count")
 }
 
 func TestGetAppBill_ProrationSnapshotFreezesCreationPeriodBase(t *testing.T) {

@@ -32,9 +32,10 @@ import (
 
 const (
 	// BaseFeeMicros is 基本費用 — the fixed per-app/period platform base fee on the
-	// DEFAULT plan. It BUNDLES the PaaS infra credit (surfaced as PaasCreditMicros)
-	// and INCLUDES up to IncludedModules installed modules; each installed module
-	// beyond that adds ModuleOverageFeeMicros. Tunable. Default $20.
+	// DEFAULT plan. It BUNDLES the PaaS infra credit (surfaced as PaasCreditMicros).
+	// It is FLAT per app: the IncludedModules allowance + the ModuleOverageFeeMicros
+	// surcharge are ACCOUNT-WIDE POOLED (migration 032 — see AccountOverageMicros),
+	// NOT folded into this per-app fee. Tunable. Default $20.
 	BaseFeeMicros int64 = 20_000_000 // $20.00
 
 	// ProBaseFeeMicros is the base fee on the Pro org plan. TODO(plan): wire a real
@@ -43,16 +44,17 @@ const (
 	// value — tune with the real Pro plan.
 	ProBaseFeeMicros int64 = 50_000_000 // $50.00 (placeholder)
 
-	// IncludedModules is how many installed modules the base fee bundles before the
-	// per-module surcharge kicks in. Owner spec 2026-07-05 (base-fee v1, DESIGN.md
-	// D1): 5 included. Tunable ("may change"); becomes plan-resolved later.
+	// IncludedModules is the ACCOUNT-WIDE POOL of installed modules the base fee
+	// bundles before the per-module surcharge kicks in (migration 032 — ONE pool
+	// of 5 for the whole account, summed over its live apps, NOT 5 per app). Owner
+	// spec 2026-07-05. Tunable ("may change"); becomes plan-resolved later.
 	IncludedModules = 5
 
-	// ModuleOverageFeeMicros is the surcharge added to the base fee for EACH
-	// installed module beyond IncludedModules. Owner spec 2026-07-05 (base-fee v1):
-	// $3.00/module/period. Tunable; becomes plan-resolved later. App base for a
-	// period = BaseFee + Overage × max(0, module_count − IncludedModules) — see
-	// AppBaseFeeMicros, the ONE place that formula lives.
+	// ModuleOverageFeeMicros is the surcharge for EACH installed module beyond the
+	// account-wide pooled IncludedModules. Owner spec 2026-07-05: $3.00/module/
+	// period. Account overage for a period = Overage × max(0, Σ live-app
+	// module_count − IncludedModules) — see AccountOverageMicros, the ONE place
+	// that formula lives. Tunable; becomes plan-resolved later.
 	ModuleOverageFeeMicros int64 = 3_000_000 // $3.00
 
 	// PaasCreditPct is PaaS 額度 — the percentage of the 基礎設施 InfraTotal credited
@@ -143,11 +145,12 @@ func pctMicros(base int64, pct int) (int64, error) {
 //     match), so the displayed base IS what the invoice charged even after
 //     later SyncAppModules count changes. Only an un-snapshotted period
 //     (pre-feature history, unactivated account, in-progress period) falls
-//     back to the live ESTIMATE from the mirror (migration 027):
-//     AppBaseFeeMicros(resolveBaseFeeMicros(plan), module_count), PRORATED via
+//     back to the live ESTIMATE from the mirror (migration 027): the FLAT
+//     plan-resolved base (resolveBaseFeeMicros(plan)), PRORATED via
 //     ProratedBaseMicros when the app's created_at falls inside the period.
-//     An app ABSENT from the mirror (pre-backfill) falls back to the usage-proxy
-//     count below — today's behavior, until the api-platform backfill lands,
+//     Module overage is NOT in the per-app base anymore — it is account-wide
+//     pooled (migration 032, surfaced on GetAccountBill). An app ABSENT from
+//     the mirror (pre-backfill) falls back to the flat plan base below,
 //  5. computes PaaS 額度 credit = PaasCreditPct% of the infra total, but ONLY when
 //     an active SaaS subscription earns it — v1 has no subscription system, so the
 //     credit is subscription-gated OFF and is 0 (the wire field stays for back-compat),
@@ -303,10 +306,10 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 
 	// Keep only the non-reserved rows → module usage (displayed lines); the
 	// reserved infra.* / platform.* rows are dropped here (infra is sourced
-	// per-metric from the catalog below). Count DISTINCT non-reserved modules as
-	// the installed-module proxy for the base-fee tier.
+	// per-metric from the catalog below). Module overage is now account-wide
+	// pooled (migration 032), so the per-app base no longer needs a
+	// distinct-module proxy count here.
 	moduleUsage := make([]AppMetricUsage, 0, len(lines))
-	installedModules := make(map[uuid.UUID]struct{})
 	var moduleUsageTotal int64
 	for _, r := range lines {
 		if isReservedMetric(r.Metric) {
@@ -327,7 +330,6 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 			ChargedMicros:    r.ChargedMicros,
 		})
 		moduleUsageTotal += r.ChargedMicros
-		installedModules[r.ModuleID] = struct{}{}
 	}
 
 	// 基礎設施: source infra per-metric from the CATALOG (metric_definitions), NOT
@@ -404,14 +406,16 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 			// period leaves that period's base spent, so it falls through below.
 			baseFee = 0
 		case mirrored:
-			// No snapshot → estimate from the mirror's current count, the SAME
-			// AppBaseFeeMicros + ProratedBaseMicros math the charge legs bill.
-			baseFee = ProratedBaseMicros(
-				AppBaseFeeMicros(resolveBaseFeeMicros(plan), mirror.ModuleCount),
-				mirror.CreatedAt, periodStart, periodEnd,
-			)
+			// No snapshot → estimate the FLAT per-app base from the plan (module
+			// overage is now account-wide pooled, migration 032 — never folded
+			// into the per-app base here), the SAME ProratedBaseMicros math the
+			// charge legs bill, prorated when created_at falls inside the period.
+			baseFee = ProratedBaseMicros(resolveBaseFeeMicros(plan), mirror.CreatedAt, periodStart, periodEnd)
 		default:
-			baseFee = AppBaseFeeMicros(resolveBaseFeeMicros(plan), len(installedModules))
+			// No mirror row (pre-backfill): the flat per-app base. The pre-032
+			// usage-proxy overage is gone — overage is pooled at the account
+			// level, so a per-app read never estimates it.
+			baseFee = resolveBaseFeeMicros(plan)
 		}
 	}
 

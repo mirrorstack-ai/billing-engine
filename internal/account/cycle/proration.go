@@ -130,18 +130,19 @@ type ProrationCharge struct {
 // invokes per pending app. It is idempotent (the one-shot proration_invoice_id
 // guard) and race-safe against a concurrent soft-delete (the FOR UPDATE section).
 //
-// The amount is the SAME as the pre-grace RegisterApp charge:
+// The amount is the FLAT per-app base, prorated to the creation window:
 //
-//	ProratedBaseMicros(AppBaseFeeMicros(BaseFeeMicros, created_module_count),
-//	                   created_at, the anchored period CONTAINING created_at)
+//	ProratedBaseMicros(BaseFeeMicros, created_at,
+//	                   the anchored period CONTAINING created_at)
 //
 // anchored to the TRUE created_at (NOT now), so the app pays only for the whole
 // UTC days it existed in its creation period, creation day inclusive — grace
-// only delayed WHEN this fires. created_module_count (migration 030) is the
-// module count FROZEN at RegisterApp time: SyncAppModules can move the LIVE
-// module_count at any point during (or after) grace, but the historical
-// creation-period days billed here must price at the tier that actually
-// applied on those days, never whatever count happens to read at sweep time.
+// only delayed WHEN this fires. Module overage is NO LONGER folded into this
+// base (migration 032): it is billed per module instance on its own grace timer,
+// and modules co-created with the app (install date == created_at) are added as
+// a SEPARATE overage line on this SAME invoice (scenario 3). created_module_count
+// stays frozen at RegisterApp time and is recorded on the base snapshot for
+// display, but no longer moves the base amount.
 //
 // It IS gated on whether the account only became chargeable after the
 // creation period had already closed (D1d): that would be a retroactive
@@ -251,13 +252,14 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		// anchor from the activation day). Derived from created_at, NEVER from now,
 		// so the amount is deterministic regardless of when the sweep fires.
 		periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(locked.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
-		// Priced off created_module_count — the count FROZEN at RegisterApp time
-		// — never the live module_count, which SyncAppModules may have moved
-		// during (or since) grace (finding 1: no retroactive tier drift).
-		prorated := usage.ProratedBaseMicros(
-			usage.AppBaseFeeMicros(usage.BaseFeeMicros, locked.CreatedModuleCount),
-			locked.CreatedAt, periodStart, periodEnd,
-		)
+		// The creation proration is the FLAT per-app base only (migration 032 —
+		// module overage is no longer a per-app tier; it is billed per module
+		// instance via its own grace timer, and co-created over-modules are added
+		// as a SEPARATE line on this same invoice by the module-overage grace
+		// leg). created_module_count is still frozen at RegisterApp time and
+		// recorded on the snapshot for display, but it no longer moves the base
+		// amount — a create with 0 or 50 modules prorates the identical flat base.
+		prorated := usage.ProratedBaseMicros(usage.BaseFeeMicros, locked.CreatedAt, periodStart, periodEnd)
 		c, err := centsFromMicros(prorated)
 		if err != nil {
 			return nil, billing.Internal("micros to cents conversion failed", err)

@@ -70,6 +70,13 @@ type fakeStore struct {
 	activation     map[uuid.UUID]time.Time
 	baseSnapshots  map[snapKey]fakeBaseSnapshot
 
+	// account-wide POOLED overage state (migration 032). overageSince models
+	// accounts.overage_since (present → armed at that instant); overageSnaps
+	// models account_overage_snapshots keyed (account, period_start) like the
+	// PRIMARY KEY, recording the row each charge leg froze.
+	overageSince map[uuid.UUID]time.Time
+	overageSnaps map[acctSnapKey]cycle.AccountOverageSnapshot
+
 	// captured charge writes
 	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
 	runStatus    map[uuid.UUID]cycle.BillingRunStatus // run id → current status (models the DB row's terminal state)
@@ -110,6 +117,28 @@ type fakeStore struct {
 	errAdvanceSnap      error // InsertAdvanceBaseSnapshot
 	errPendingProration error // AppsPendingProration
 	errChargeLocked     error // ChargeProrationLocked
+
+	errPooledCount       error // PooledModuleCount
+	errStartOverage      error // StartAccountOverage
+	errClearOverage      error // ClearAccountOverage
+	errOverageGrace      error // AccountsInOverageGrace
+	errOverageSnap       error // AccountOverageSnapshot
+	errInsertOverageSnap error // InsertAccountOverageSnapshot
+	errMarkOverageSnap   error // MarkAccountOverageSnapshotCharged
+	errTopUpOverageSnap  error // TopUpAccountOverageSnapshot
+
+	// overageClaimLoses, when > 0, makes the NEXT N InsertAccountOverageSnapshot
+	// calls report "lost the race" (inserted=false) WITHOUT actually writing
+	// anything — simulating a concurrent claim that beat this call, so a test
+	// can drive the claim-insert-loses-the-race path deterministically.
+	overageClaimLoses int
+}
+
+// acctSnapKey mirrors the account_overage_snapshots PRIMARY KEY
+// (account_id, period_start).
+type acctSnapKey struct {
+	account     uuid.UUID
+	periodStart time.Time
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -149,6 +178,8 @@ func newFakeStore() *fakeStore {
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
 		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
+		overageSince:        map[uuid.UUID]time.Time{},
+		overageSnaps:        map[acctSnapKey]cycle.AccountOverageSnapshot{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -546,6 +577,115 @@ func (f *fakeStore) InsertAdvanceBaseSnapshot(_ context.Context, snap cycle.AppB
 		return nil
 	}
 	f.baseSnapshots[k] = fakeBaseSnapshot{snap: snap, source: "advance"}
+	return nil
+}
+
+// --- account-wide POOLED overage fake (migration 032) -----------------------
+
+// PooledModuleCount sums module_count over the account's live apps, mirroring
+// the SQL SUM(module_count) WHERE account_id = ? AND deleted_at IS NULL.
+func (f *fakeStore) PooledModuleCount(_ context.Context, accountID uuid.UUID) (int, error) {
+	if f.errPooledCount != nil {
+		return 0, f.errPooledCount
+	}
+	sum := 0
+	for _, app := range f.apps {
+		if app.AccountID == accountID && !app.Deleted {
+			sum += app.ModuleCount
+		}
+	}
+	return sum, nil
+}
+
+func (f *fakeStore) StartAccountOverage(_ context.Context, accountID uuid.UUID, since time.Time) error {
+	if f.errStartOverage != nil {
+		return f.errStartOverage
+	}
+	if _, armed := f.overageSince[accountID]; !armed {
+		f.overageSince[accountID] = since // first-crossing-wins (WHERE overage_since IS NULL)
+	}
+	return nil
+}
+
+func (f *fakeStore) ClearAccountOverage(_ context.Context, accountID uuid.UUID) error {
+	if f.errClearOverage != nil {
+		return f.errClearOverage
+	}
+	delete(f.overageSince, accountID) // idempotent (WHERE overage_since IS NOT NULL)
+	return nil
+}
+
+func (f *fakeStore) AccountsInOverageGrace(_ context.Context, cutoff time.Time) ([]cycle.OverageGraceCandidate, error) {
+	if f.errOverageGrace != nil {
+		return nil, f.errOverageGrace
+	}
+	out := []cycle.OverageGraceCandidate{}
+	for id, since := range f.overageSince {
+		activatedAt, activated := f.activation[id]
+		if !activated {
+			continue // activated_at IS NOT NULL gate
+		}
+		if since.After(cutoff) {
+			continue // grace still holding (overage_since <= cutoff)
+		}
+		out = append(out, cycle.OverageGraceCandidate{ID: id, OverageSince: since, ActivatedAt: activatedAt})
+	}
+	return out, nil
+}
+
+func (f *fakeStore) AccountOverageSnapshot(_ context.Context, accountID uuid.UUID, periodStart time.Time) (cycle.AccountOverageSnapshot, bool, error) {
+	if f.errOverageSnap != nil {
+		return cycle.AccountOverageSnapshot{}, false, f.errOverageSnap
+	}
+	snap, ok := f.overageSnaps[acctSnapKey{accountID, periodStart}]
+	return snap, ok, nil
+}
+
+func (f *fakeStore) InsertAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) (bool, error) {
+	if f.errInsertOverageSnap != nil {
+		return false, f.errInsertOverageSnap
+	}
+	if f.overageClaimLoses > 0 {
+		f.overageClaimLoses--
+		return false, nil // simulate a concurrent claim winning the race
+	}
+	// ON CONFLICT (account_id, period_start) DO NOTHING: an existing row wins.
+	k := acctSnapKey{snap.AccountID, snap.PeriodStart}
+	if _, exists := f.overageSnaps[k]; exists {
+		return false, nil
+	}
+	f.overageSnaps[k] = snap
+	return true, nil
+}
+
+func (f *fakeStore) MarkAccountOverageSnapshotCharged(_ context.Context, accountID uuid.UUID, periodStart time.Time, invoiceItemID string) error {
+	if f.errMarkOverageSnap != nil {
+		return f.errMarkOverageSnap
+	}
+	k := acctSnapKey{accountID, periodStart}
+	snap, ok := f.overageSnaps[k]
+	if !ok {
+		return nil // defensive: mirrors the DB's unconditional UPDATE affecting 0 rows
+	}
+	snap.Status = cycle.OverageSnapshotCharged
+	snap.InvoiceItemID = invoiceItemID
+	f.overageSnaps[k] = snap
+	return nil
+}
+
+func (f *fakeStore) TopUpAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) error {
+	if f.errTopUpOverageSnap != nil {
+		return f.errTopUpOverageSnap
+	}
+	k := acctSnapKey{snap.AccountID, snap.PeriodStart}
+	existing, ok := f.overageSnaps[k]
+	if !ok || existing.Status != cycle.OverageSnapshotCharged {
+		return nil // mirrors the DB's WHERE status='charged' guard: a non-match is a no-op
+	}
+	existing.OverCount = snap.OverCount
+	existing.ChargedMicros = snap.ChargedMicros
+	existing.InvoiceItemID = snap.InvoiceItemID
+	f.overageSnaps[k] = existing
 	return nil
 }
 

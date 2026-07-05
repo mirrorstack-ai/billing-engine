@@ -74,6 +74,37 @@ func TestRegisterApp_MirrorsRowWithoutCharging(t *testing.T) {
 	require.Equal(t, 3, app.ModuleCount)
 	require.Equal(t, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), app.CreatedAt)
 	require.Empty(t, app.ProrationInvoiceID)
+
+	// 3 modules ≤ the pooled 5 → the overage grace timer stays disarmed.
+	require.NotContains(t, store.overageSince, acct)
+}
+
+func TestRegisterApp_ArmsOverageTimerWhenPoolCrossesButNeverCharges(t *testing.T) {
+	// Creation grace + account-wide pool (migration 032): a create whose
+	// module_count pushes the account pool over IncludedModules ARMS the pooled
+	// overage grace timer (accounts.overage_since) but still charges NOTHING at
+	// registration — both the flat base AND the pooled overage are the grace
+	// sweep's job once the app survives.
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	sc := newFakeStripe()
+
+	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user,
+		AppID:       uuid.New(),
+		ModuleCount: 7,
+		CreatedAt:   time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+
+	// No charge of any kind at registration (creation grace).
+	require.Empty(t, resp.ProrationInvoiceID)
+	require.Zero(t, resp.ProrationCents)
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.invoiceCalls)
+
+	// But the 7-module create pushed the account pool over 5, arming the timer.
+	require.Contains(t, store.overageSince, acct, "crossing the pooled 5 arms overage_since")
 }
 
 func TestRegisterApp_DefaultsCreatedAtToNow(t *testing.T) {
@@ -310,9 +341,11 @@ func seedAppCreated(store *fakeStore, accountID uuid.UUID, moduleCount int, dele
 	return id
 }
 
-func TestRunBillingCycle_InvoicesUsagePlusAdvanceBase(t *testing.T) {
-	// arrears 1e6 (usage) + base (20e6 flat + [20e6 + 1×3e6] for a 6-module
-	// app) = 44e6 total → 4400 cents on ONE invoice.
+func TestRunBillingCycle_InvoicesUsagePlusAdvanceBasePlusPooledOverage(t *testing.T) {
+	// Migration 032: arrears 1e6 (usage) + FLAT base (2 × 20e6 = 40e6) + the
+	// account-wide POOLED overage (pool = 0 + 6 = 6 → 1 over → $3 = 3e6) = 44e6
+	// total → 4400 cents on ONE invoice. Same total as the pre-032 per-app tier
+	// for this single-account case, but split base-vs-overage differently.
 	store := newFakeStore()
 	store.chargedTotal = 1_000_000
 	store.hasPM = true
@@ -325,14 +358,14 @@ func TestRunBillingCycle_InvoicesUsagePlusAdvanceBase(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.EqualValues(t, 1_000_000, resp.ArrearsMicros)
-	require.EqualValues(t, 43_000_000, resp.AdvanceBaseMicros) // 20e6 + 23e6
+	require.EqualValues(t, 40_000_000, resp.AdvanceBaseMicros)   // 2 × flat $20 (no per-app overage)
+	require.EqualValues(t, 3_000_000, resp.AccountOverageMicros) // pool 6 → 1 over → $3
 	require.EqualValues(t, 4_400, resp.ChargedCents)
-	require.Len(t, sc.itemCalls, 1, "usage + base pool into ONE line on ONE invoice")
+	require.Len(t, sc.itemCalls, 1, "usage + base + pooled overage pool into ONE line on ONE invoice")
 	require.EqualValues(t, 4_400, sc.itemCalls[0].amountCfg)
 
-	// The advance leg froze one migration-028 snapshot per billed app for the
-	// NEW window [Jul 1, Aug 1) — count + base as invoiced, so the display can
-	// never drift after later syncs.
+	// The advance leg froze one migration-028 base snapshot per billed app for
+	// the NEW window [Jul 1, Aug 1) — now the FLAT base (overage is pooled).
 	fs, ok := store.baseSnapshots[snapKey{flat, periodEnd}]
 	require.True(t, ok)
 	require.Equal(t, "advance", fs.source)
@@ -340,8 +373,16 @@ func TestRunBillingCycle_InvoicesUsagePlusAdvanceBase(t *testing.T) {
 	require.Equal(t, periodEnd.AddDate(0, 1, 0), fs.snap.PeriodEnd)
 	ts, ok := store.baseSnapshots[snapKey{tiered, periodEnd}]
 	require.True(t, ok)
-	require.EqualValues(t, 23_000_000, ts.snap.BaseMicros)
+	require.EqualValues(t, usage.BaseFeeMicros, ts.snap.BaseMicros, "per-app base is flat now")
 	require.Equal(t, 6, ts.snap.ModuleCount)
+
+	// And ONE account_overage_snapshots row (source='advance') for the closing
+	// period, so the mid-period sweep + display agree it is already billed.
+	ov, ok := store.overageSnaps[acctSnapKey{chargeAccount, periodStart}]
+	require.True(t, ok, "the boundary must freeze the pooled overage it billed")
+	require.Equal(t, "advance", ov.Source)
+	require.Equal(t, 1, ov.OverCount)
+	require.EqualValues(t, 3_000_000, ov.ChargedMicros)
 }
 
 func TestRunBillingCycle_BaseOnlyInvoiceWhenNoUsage(t *testing.T) {
@@ -440,11 +481,14 @@ func TestRunBillingCycle_ExcludesAppCreatedInsideNewPeriod(t *testing.T) {
 	require.False(t, ok)
 
 	// NEXT boundary (closing [Jul 1, Aug 1)): the app now pre-exists the newer
-	// period and joins the advance leg — billed exactly once, never twice.
+	// period and joins the advance leg — billed exactly once, never twice. Both
+	// apps contribute the FLAT $20 base (2 × 20e6); the account pool is now 0 + 6
+	// = 6 → 1 over → the pooled overage ($3) is charged at the account level.
 	resp, err = svc.RunBillingCycle(context.Background(), chargeAccount, periodEnd, periodEnd.AddDate(0, 1, 0), 0)
 	require.NoError(t, err)
-	require.EqualValues(t, usage.BaseFeeMicros+usage.AppBaseFeeMicros(usage.BaseFeeMicros, 6), resp.AdvanceBaseMicros,
-		"the new app joins the advance leg at the NEXT boundary")
+	require.EqualValues(t, 2*usage.BaseFeeMicros, resp.AdvanceBaseMicros,
+		"the new app joins the advance leg at the NEXT boundary (flat base)")
+	require.EqualValues(t, 3_000_000, resp.AccountOverageMicros, "pool 6 → 1 over → $3 pooled overage")
 }
 
 func TestRunBillingCycle_ReclaimedRunNoDoubleBase(t *testing.T) {

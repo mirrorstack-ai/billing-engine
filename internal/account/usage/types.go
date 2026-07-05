@@ -392,9 +392,10 @@ type GetAppBillResponse struct {
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
 
-	// BaseFeeMicros is 基本費用 — the fixed per-app/period platform fee, PLUS the
-	// per-module surcharge for each installed module beyond IncludedModules (see
-	// the bill.go consts). Bundles the PaaS infra credit surfaced below.
+	// BaseFeeMicros is 基本費用 — the FLAT fixed per-app/period platform fee (see
+	// the bill.go consts). Module overage is NO LONGER folded in here: it is
+	// account-wide pooled (migration 032) and surfaced on GetAccountBill's
+	// AccountOverageMicros. Bundles the PaaS infra credit surfaced below.
 	BaseFeeMicros int64 `json:"base_fee_micros"`
 
 	// ModuleUsage is 模組使用量 — one line per (module, metric, model,
@@ -551,6 +552,16 @@ type GetAccountBillResponse struct {
 	ModuleUsageTotalMicros int64 `json:"module_usage_total_micros"`
 	InfraTotalMicros       int64 `json:"infra_total_micros"`
 
+	// AccountOverageMicros is the account-wide POOLED module overage for the
+	// period (migration 032): $3 × max(0, Σ live-app module_count −
+	// IncludedModules), charged ONCE per account (NOT per app, NOT folded into
+	// any Apps[].base_fee_micros). It is snapshot-first like the per-app base:
+	// the current period's account_overage_snapshots row when a charge leg
+	// billed it (the grace sweep or the boundary), else a live estimate from the
+	// CURRENT pooled sum. Additive field (pre-032 consumers that ignore it read
+	// an unchanged response shape); included in TotalMicros below.
+	AccountOverageMicros int64 `json:"account_overage_micros"`
+
 	// PaasCreditMicros is the ACCOUNT-level PaaS credit, applied ONCE here
 	// (never per-app): the same ACTIVE-SaaS-subscription gate as GetAppBill's
 	// per-app credit (v1 has no subscription system → always 0), CAPPED at
@@ -558,8 +569,8 @@ type GetAccountBillResponse struct {
 	// the same usage-only offset posture as the charge spine's allowance.
 	PaasCreditMicros int64 `json:"paas_credit_micros"`
 
-	// TotalMicros is 最終費用 = BaseFeeTotal + ModuleUsageTotal + InfraTotal −
-	// PaasCredit, ≥ 0 by the credit cap.
+	// TotalMicros is 最終費用 = BaseFeeTotal + ModuleUsageTotal + InfraTotal +
+	// AccountOverage − PaasCredit, ≥ 0 by the credit cap.
 	TotalMicros int64 `json:"total_micros"`
 }
 

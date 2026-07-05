@@ -128,6 +128,12 @@ func (f *fakeStore) AppIDsWithUsage(_ context.Context, _ uuid.UUID, _, _ time.Ti
 func (f *fakeStore) MirroredAppIDs(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]uuid.UUID, error) {
 	return nil, nil
 }
+func (f *fakeStore) PooledModuleCount(_ context.Context, _ uuid.UUID) (int, error) {
+	return 0, nil
+}
+func (f *fakeStore) AccountOverageSnapshot(_ context.Context, _ uuid.UUID, _ time.Time) (int64, bool, error) {
+	return 0, false, nil
+}
 
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 

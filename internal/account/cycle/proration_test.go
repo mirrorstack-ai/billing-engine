@@ -144,9 +144,13 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	require.Equal(t, 0, snap.snap.ModuleCount)
 }
 
-func TestChargeCreationProration_IncludesModuleOverage(t *testing.T) {
-	// module_count 7 → base 20e6 + 2×3e6 = 26e6; 15 of 30 remaining days →
-	// 13e6 micros → 1300 cents. Identical to the pre-grace math.
+func TestChargeCreationProration_ChargesFlatBaseNotFoldedOverage(t *testing.T) {
+	// Migration 032: module overage is NO LONGER folded into the per-app base —
+	// the creation proration is the FLAT $20 base regardless of module_count (a
+	// 7-module app prorates EXACTLY like a 0-module app). 15 of 30 remaining days
+	// → 20e6 × 15/30 = 10e6 micros → 1000 cents (NOT the pre-032 26e6 → 1300).
+	// Overage for the modules co-created with the app is a SEPARATE line, added
+	// by the module-overage grace leg (see overage tests).
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
@@ -156,7 +160,9 @@ func TestChargeCreationProration_IncludesModuleOverage(t *testing.T) {
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.EqualValues(t, 1300, resp.ProrationCents)
+	require.EqualValues(t, 1000, resp.ProrationCents, "flat base only — overage is billed per module instance, not folded here")
+	// The frozen created_module_count (7) is still recorded on the snapshot for
+	// display, even though it no longer moves the base amount.
 	require.Equal(t, 7, store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}].snap.ModuleCount)
 }
 
@@ -371,13 +377,12 @@ func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceInsta
 	require.Equal(t, 7, store.apps[appID].ModuleCount)
 }
 
-func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceUninstall(t *testing.T) {
-	// The reverse direction: registers with 7 modules (overage tier), the
-	// customer UNINSTALLS all the way down to 0 during grace. Pre-fix this would
-	// retroactively price the creation days at the LOWER tier (200 cents, 0
-	// modules) though they were never at 0 modules on those days. Fixed: prices
-	// off the frozen created_module_count (7) → 1300 cents, matching
-	// TestChargeCreationProration_IncludesModuleOverage's un-synced case exactly.
+func TestChargeCreationProration_FlatBaseUnaffectedByMidGraceUninstall(t *testing.T) {
+	// Migration 032: the creation base is FLAT, so a mid-grace uninstall (7 → 0
+	// modules) cannot move it — it prorates the flat $20 either way: 15 of 30
+	// remaining days → 10e6 micros → 1000 cents. The frozen created_module_count
+	// (7) is still preserved for display (the snapshot ModuleCount), it just no
+	// longer drives the base amount now that overage is a separate per-module leg.
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
@@ -394,8 +399,9 @@ func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceUnins
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.EqualValues(t, 1_300, resp.ProrationCents,
-		"must price off the FROZEN count (7 modules → overage tier), not the live count (0 → base only)")
+	require.EqualValues(t, 1_000, resp.ProrationCents, "flat base — unaffected by the module count or its mid-grace change")
+	// The frozen count is still recorded on the snapshot for display.
+	require.Equal(t, 7, store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}].snap.ModuleCount)
 }
 
 // --- FINDING 2: no retroactive catch-up (D1d) when an account only activates

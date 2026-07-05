@@ -40,6 +40,13 @@ type fakeStore struct {
 	appMirrors             map[uuid.UUID]usage.AppMirrorInfo    // app_id → ms_billing.apps roster row (migration 027)
 	baseSnapshots          map[string]usage.AppBaseSnapshotInfo // app_id/period_start → charged-base snapshot (migration 028)
 
+	// account-wide POOLED overage (migration 032): PooledModuleCount sums the
+	// appMirrors' module_count (like the SQL over ms_billing.apps); overageSnaps
+	// keys account_id/period_start → the frozen pooled-overage charged_micros.
+	overageSnaps   map[string]int64
+	errPooledCount error
+	errOverageSnap error
+
 	// usageAppIDs is what AppIDsWithUsage enumerates (the usage half of
 	// GetAccountBill's roster); the mirror half is DERIVED from appMirrors with
 	// the real overlap rule (see MirroredAppIDs).
@@ -121,6 +128,7 @@ func newFakeStore() *fakeStore {
 		visibility:                  map[uuid.UUID]usage.Visibility{},
 		appMirrors:                  map[uuid.UUID]usage.AppMirrorInfo{},
 		baseSnapshots:               map[string]usage.AppBaseSnapshotInfo{},
+		overageSnaps:                map[string]int64{},
 		appBillRowsByApp:            map[uuid.UUID][]usage.AppMetricUsageRaw{},
 		appInfraBillRowsByApp:       map[uuid.UUID][]usage.AppInfraUsage{},
 		appModuleInfraBillRowsByApp: map[uuid.UUID][]usage.AppModuleInfraUsage{},
@@ -181,6 +189,40 @@ func (f *fakeStore) AppBaseSnapshot(_ context.Context, appID uuid.UUID, periodSt
 	}
 	s, ok := f.baseSnapshots[baseSnapKey(appID, periodStart)]
 	return s, ok, nil
+}
+
+// overageSnapKey mirrors the account_overage_snapshots PRIMARY KEY
+// (account_id, period_start).
+func overageSnapKey(accountID uuid.UUID, periodStart time.Time) string {
+	return accountID.String() + "/" + periodStart.UTC().Format(time.RFC3339Nano)
+}
+
+// PooledModuleCount returns the account's live pooled module count (migration
+// 030): Σ module_count over the non-deleted appMirrors, mirroring the SQL over
+// ms_billing.apps. The single-account usage fake holds one account's roster, so
+// it sums every live mirror row.
+func (f *fakeStore) PooledModuleCount(_ context.Context, _ uuid.UUID) (int, error) {
+	if f.errPooledCount != nil {
+		return 0, f.errPooledCount
+	}
+	sum := 0
+	for _, m := range f.appMirrors {
+		if !m.Deleted {
+			sum += m.ModuleCount
+		}
+	}
+	return sum, nil
+}
+
+// AccountOverageSnapshot returns the fake migration-030 pooled-overage charge
+// for one (account, period_start); absent → never charged, so GetAccountBill
+// falls back to the live pooled estimate.
+func (f *fakeStore) AccountOverageSnapshot(_ context.Context, accountID uuid.UUID, periodStart time.Time) (int64, bool, error) {
+	if f.errOverageSnap != nil {
+		return 0, false, f.errOverageSnap
+	}
+	m, ok := f.overageSnaps[overageSnapKey(accountID, periodStart)]
+	return m, ok, nil
 }
 
 // AccountAnchorDay returns the configured anchor day for an account, defaulting

@@ -98,6 +98,15 @@ type SyncAppModulesResponse struct {
 // the sweep already charged — the armed guard's invoice id (idempotent
 // visibility). ProrationCents is never set here (no charge happens in this RPC).
 // api-platform fires this fire-and-forget with retry; every step is idempotent.
+//
+//  3. AFTER the mirror insert, recompute the account's pooled-overage grace
+//     timer (recomputeAccountOverage): a creation whose module_count pushes the
+//     account's live pool over IncludedModules arms accounts.overage_since
+//     (migration 032). This is independent of the deferred creation-proration
+//     base charge (which the grace sweep fires later, and which bills the FLAT
+//     base only — module overage is account-wide pooled, migration 032).
+//     Idempotent (Start/Clear are first-crossing-wins / no-op), so a retry
+//     re-runs it harmlessly.
 func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*RegisterAppResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -145,11 +154,23 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 	if !found {
 		return nil, billing.Internal("app mirror row missing immediately after insert", nil)
 	}
-	return &RegisterAppResponse{
+	resp := &RegisterAppResponse{
 		AppID:              app.AppID,
 		AccountID:          app.AccountID,
 		ProrationInvoiceID: app.ProrationInvoiceID, // "" until the sweep charges
-	}, nil
+	}
+
+	// Recompute the account's pooled overage timer (migration 032) after the
+	// insert: the new app's module_count may push the account's live pool over
+	// IncludedModules (arming accounts.overage_since). RegisterApp charges
+	// NOTHING here (creation grace) — the FLAT-base creation proration is the
+	// grace sweep's job (proration.go), and the module overage rides the same
+	// grace mechanism. Idempotent (Start/Clear are first-crossing-wins / no-op),
+	// so a retry re-runs it harmlessly.
+	if err := s.recomputeAccountOverage(ctx, app.AccountID); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // SyncAppModules updates an app's roster row: a new installed-module-count
@@ -162,8 +183,14 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 //     — there is no future base for the tier to move);
 //   - an unknown app_id is NOT_FOUND (the platform must RegisterApp first).
 //
-// Count changes take effect at the NEXT boundary charge (D1b — no mid-period
-// micro-invoices for module #6, no mid-period refunds for uninstalls).
+// After any module_count / delete write it recomputes the account's pooled-
+// overage grace timer (recomputeAccountOverage). The per-app FLAT base still
+// takes effect at the NEXT boundary (no mid-period base micro-invoice / refund),
+// but the ACCOUNT-WIDE pooled overage is now the DELIBERATE exception to the old
+// D1b "no mid-period charges" rule: crossing the pooled IncludedModules arms a
+// grace timer, and the mid-period sweep charges the pooled overage once the
+// grace window elapses (migration 032). Dropping back under the pool clears the
+// timer (no refund of anything already charged, D1e).
 func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest) (*SyncAppModulesResponse, error) {
 	if req.AppID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
@@ -197,6 +224,14 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 			return nil, billing.Internal("set app module count failed", err)
 		}
 		app.ModuleCount = *req.ModuleCount
+	}
+
+	// Recompute the account-wide pooled-overage grace timer (migration 032) after
+	// the write: a count bump or delete can push the pool over IncludedModules
+	// (arm overage_since) or drop it back under (clear it). Idempotent, so a
+	// pure-delete-of-an-already-deleted-app retry re-runs it harmlessly.
+	if err := s.recomputeAccountOverage(ctx, app.AccountID); err != nil {
+		return nil, err
 	}
 
 	return &SyncAppModulesResponse{
