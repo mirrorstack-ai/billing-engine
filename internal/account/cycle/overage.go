@@ -74,6 +74,16 @@ const (
 	// cents (unreachable for a real ≥1-day over module at $3) — resolved with no
 	// charge so it never re-sweeps forever.
 	ModuleOverageSkippedZeroCents ModuleOverageStatus = "zero_cents"
+	// ModuleOveragePeriodClosed: "over" but the account only activated AT OR AFTER
+	// this install's anchored period had already closed — charging now would be a
+	// retroactive catch-up (D1d), so it is resolved terminally WITH NO charge (the
+	// per-module analogue of ProrationStatusPeriodClosed on the creation leg).
+	ModuleOveragePeriodClosed ModuleOverageStatus = "period_closed"
+	// ModuleOverageDeferredToCombined: "over" AND co-created with an app whose
+	// creation proration has not yet resolved — this timer's overage belongs on the
+	// app's ONE combined creation invoice (scenario 3), not a separate Leg 1 one, so
+	// it is DEFERRED (left unresolved) for the proration sweep to charge and mark.
+	ModuleOverageDeferredToCombined ModuleOverageStatus = "deferred_to_combined"
 )
 
 // ModuleOverageResult reports what one ChargeModuleOverage call did.
@@ -130,6 +140,56 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// precharge's job (scenario 6, Stage B), which would otherwise double-bill it.
 	anchorDay := billingperiod.AnchorDay(cand.ActivatedAt)
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(cand.InstalledAt.UTC(), anchorDay)
+
+	// D1d — no retroactive catch-up (the SAME posture ChargeCreationProration
+	// enforces on the creation leg, proration.go). RegisterApp synthesizes an app's
+	// timers at install time regardless of whether the owning account has activated
+	// yet, and the work-list only gates on activation at CHARGE time — so a timer
+	// can sit installed + past-grace for arbitrarily long while unactivated, then
+	// get swept the instant the account finally binds a card. If the account only
+	// activated AT OR AFTER this install's anchored period had already closed, the
+	// account was never chargeable for that whole period; charging its overage now
+	// — however late the sweep runs — is exactly the retroactive catch-up D1d
+	// forbids. Resolve the timer terminally WITHOUT charging (grace_resolved,
+	// first-write-wins via MarkModuleTimerIncluded) so it never resurfaces, rather
+	// than minting a historical, never-chargeable invoice. Compared against
+	// ActivatedAt, NOT `at`: an ordinary late sweep on a HEALTHY already-activated
+	// account (grace pushing the charge a few days past periodEnd) still charges,
+	// exactly like the creation leg's ActivatedBeforePeriodCloses case.
+	if !cand.ActivatedAt.Before(periodEnd) {
+		if err := s.store.MarkModuleTimerIncluded(ctx, cand.ID); err != nil {
+			return nil, billing.Internal("mark module timer resolved (period closed) failed", err)
+		}
+		res.Status = ModuleOveragePeriodClosed
+		return res, nil
+	}
+
+	// Scenario 3 combined-invoice ownership guard. A co-created over-module timer
+	// (installed AT the app's created_at) whose app's creation proration is still
+	// UNRESOLVED is the COMBINED-invoice path's responsibility (proration.go), NOT
+	// Leg 1's: the creation-proration charge folds this timer's overage onto the
+	// app's ONE creation invoice (app-inv-<appID>) using the SHARED per-timer item
+	// key. cmd/billing-cycle runs the proration sweep BEFORE this one so the happy
+	// path resolves these timers first (they never reach here). But if that sweep's
+	// persist phase FAILED after its Stripe calls already landed the overage item on
+	// the combined invoice, the timer is still unresolved when this sweep runs in
+	// the SAME process — and minting our OWN invoice (mod-overage-inv-<timerID>)
+	// here would mis-attribute money Stripe already pooled onto the combined invoice
+	// to a second, stray invoice (or conflict outright). So DEFER (skip WITHOUT
+	// resolving): the proration sweep retries every cycle and converges on the SAME
+	// combined invoice via the deterministic keys, then marks this timer resolved,
+	// dropping it from this work list. A LATER install (installed_at != created_at)
+	// is never co-created, so it charges here normally.
+	app, found, err := s.store.AppMirror(ctx, cand.AppID)
+	if err != nil {
+		return nil, billing.Internal("app mirror lookup failed", err)
+	}
+	if found && cand.InstalledAt.Equal(app.CreatedAt) &&
+		app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.Deleted {
+		res.Status = ModuleOverageDeferredToCombined
+		return res, nil
+	}
+
 	proratedMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, cand.InstalledAt, periodStart, periodEnd)
 	cents, err := centsFromMicros(proratedMicros)
 	if err != nil {

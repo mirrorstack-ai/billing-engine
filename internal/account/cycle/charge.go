@@ -301,20 +301,52 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
+	withBase := advanceBase+advanceOverage > 0
+
+	// FREEZE-OR-REUSE the boundary Stripe request (crash-safe idempotency,
+	// migration 035). The idem keys ii-<run>/inv-<run> are STABLE across a reclaim
+	// of this run, so the request sent under them must be stable too. A prior
+	// attempt that already reached Stripe froze its computed (cents, withBase);
+	// REUSE those frozen values rather than the ones just recomputed from LIVE
+	// state — drift between the crash and this retry (a module uninstalled flipping
+	// an over-module to included, an app deleted) could have moved the live total,
+	// and re-sending the same idem key with a different amount/description is the
+	// permanent Stripe idempotency-conflict stall this guards against (the bug
+	// ee5043c fixed once for the account-wide model, whose freeze migration 033
+	// dropped). Reconciled BEFORE the cents==0 short-circuit so a retry whose live
+	// total collapsed to 0 still re-charges — and records — the non-zero amount the
+	// crashed attempt already put through Stripe.
+	if frozen, ok, err := s.store.BillingRunFrozenCharge(ctx, runID); err != nil {
+		return nil, billing.Internal("frozen boundary charge lookup failed", err)
+	} else if ok {
+		cents = frozen.Cents
+		withBase = frozen.WithBase
+	}
+
 	if cents == 0 {
 		// A sub-half-cent arrears total (an advance base/overage, when present, is
-		// always ≥ $3 and can never round to 0) — never call Stripe for $0.
+		// always ≥ $3 and can never round to 0) — never call Stripe for $0. The
+		// reuse above found no prior frozen charge (it would have set cents > 0), so
+		// nothing was ever put through Stripe for this run.
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (zero cents) failed", err)
 		}
 		summary.Status = RunStatusInvoiced
 		return summary, nil
 	}
+
+	// Freeze the amount + description this run will charge BEFORE the first Stripe
+	// call. First-write-wins (a reclaim that already froze is a no-op — the reuse
+	// above already adopted its values), so a crash after Stripe succeeds but before
+	// MarkBillingRun commits leaves the frozen request durable for the retry.
+	if err := s.store.FreezeBillingRunCharge(ctx, runID, FrozenBoundaryCharge{Cents: cents, WithBase: withBase}); err != nil {
+		return nil, billing.Internal("freeze boundary charge failed", err)
+	}
 	summary.ChargedCents = cents
 
 	// Charge. A failure after the PM gate marks the run 'failed' (auditable) and
 	// returns the error.
-	inv, err := s.charge(ctx, runID, custID, cents, advanceBase+advanceOverage > 0)
+	inv, err := s.charge(ctx, runID, custID, cents, withBase)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is

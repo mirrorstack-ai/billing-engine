@@ -77,10 +77,11 @@ type fakeStore struct {
 	timers map[uuid.UUID]*fakeTimer
 
 	// captured charge writes
-	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
-	runStatus    map[uuid.UUID]cycle.BillingRunStatus // run id → current status (models the DB row's terminal state)
-	markedRuns   map[uuid.UUID]markedRun              // run id → terminal mark
-	invoices     map[string]cycle.InvoiceMirror       // stripe_invoice_id → mirror
+	insertedRuns  map[string]uuid.UUID                     // (account/start/end) → run id (the idempotency gate state)
+	runStatus     map[uuid.UUID]cycle.BillingRunStatus     // run id → current status (models the DB row's terminal state)
+	markedRuns    map[uuid.UUID]markedRun                  // run id → terminal mark
+	invoices      map[string]cycle.InvoiceMirror           // stripe_invoice_id → mirror
+	frozenCharges map[uuid.UUID]cycle.FrozenBoundaryCharge // run id → frozen boundary charge (migration 035); survives a reclaim
 
 	// injected errors
 	errOpen             error
@@ -116,6 +117,13 @@ type fakeStore struct {
 	errAdvanceSnap      error // InsertAdvanceBaseSnapshot
 	errPendingProration error // AppsPendingProration
 	errChargeLocked     error // ChargeProrationLocked
+	// errPersistAfterStripe fails ChargeProrationLocked's persist phase (Phase 3)
+	// AFTER the charge callback's Stripe calls already succeeded — modeling a
+	// combined-invoice charge whose guard/timer marks fail to commit (deadlock /
+	// transient tx error) even though Stripe already moved the money.
+	errPersistAfterStripe error
+	errFreezeCharge       error // FreezeBillingRunCharge
+	errFrozenCharge       error // BillingRunFrozenCharge
 
 	errLiveTimerCount   error // LiveModuleTimerCountForApp
 	errInsertTimers     error // InsertModuleOverageTimers
@@ -178,6 +186,7 @@ func newFakeStore() *fakeStore {
 		runStatus:           map[uuid.UUID]cycle.BillingRunStatus{},
 		markedRuns:          map[uuid.UUID]markedRun{},
 		invoices:            map[string]cycle.InvoiceMirror{},
+		frozenCharges:       map[uuid.UUID]cycle.FrozenBoundaryCharge{},
 		apps:                map[uuid.UUID]cycle.AppMirror{},
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
@@ -372,6 +381,28 @@ func (f *fakeStore) MarkBillingRun(_ context.Context, runID uuid.UUID, status cy
 	return nil
 }
 
+// FreezeBillingRunCharge records the run's frozen boundary charge (migration 035).
+// First-write-wins, mirroring the SQL's WHERE frozen_charge_cents IS NULL: a
+// reclaim that already froze keeps the ORIGINAL values, so a retry can never
+// overwrite the amount a crashed attempt already put through Stripe.
+func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, charge cycle.FrozenBoundaryCharge) error {
+	if f.errFreezeCharge != nil {
+		return f.errFreezeCharge
+	}
+	if _, exists := f.frozenCharges[runID]; !exists {
+		f.frozenCharges[runID] = charge
+	}
+	return nil
+}
+
+func (f *fakeStore) BillingRunFrozenCharge(_ context.Context, runID uuid.UUID) (cycle.FrozenBoundaryCharge, bool, error) {
+	if f.errFrozenCharge != nil {
+		return cycle.FrozenBoundaryCharge{}, false, f.errFrozenCharge
+	}
+	c, ok := f.frozenCharges[runID]
+	return c, ok, nil
+}
+
 func (f *fakeStore) AccountsWithUsageEvents(_ context.Context, _, _ time.Time) ([]uuid.UUID, error) {
 	if f.errUsageEvents != nil {
 		return nil, f.errUsageEvents
@@ -535,6 +566,13 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 	}
 	if pc == nil {
 		return cycle.ProrationLockedNoCharge, "", nil
+	}
+	// Phase 3 failure AFTER the callback's Stripe calls already succeeded: the
+	// money moved, but the guard-arm + timer marks never commit. Models a
+	// deadlock/transient tx error so a test can prove the co-created over-module
+	// timers stay unresolved (and are NOT independently re-invoiced by Leg 1).
+	if f.errPersistAfterStripe != nil {
+		return 0, "", f.errPersistAfterStripe
 	}
 	f.invoices[pc.Invoice.StripeInvoiceID] = pc.Invoice
 	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}

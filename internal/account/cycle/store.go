@@ -141,6 +141,20 @@ type Store interface {
 	// (empty → NULL), and the charged total in whole cents.
 	MarkBillingRun(ctx context.Context, runID uuid.UUID, status BillingRunStatus, stripeInvoiceID string, totalCents int64) error
 
+	// FreezeBillingRunCharge records — BEFORE the boundary run's first Stripe
+	// charge — the exact amount + base/overage description determinant it will send
+	// under the deterministic idem keys ii-<run>/inv-<run> (migration 035).
+	// First-write-wins: a reclaimed run that already froze keeps the ORIGINAL
+	// values, so a retry recomputing a different LIVE total never sends Stripe a
+	// mismatched request under the same idem key (the boundary analogue of the
+	// account_overage_snapshots freeze migration 033 dropped).
+	FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) error
+
+	// BillingRunFrozenCharge reads a run's frozen boundary charge; ok=false when no
+	// prior attempt reached the Stripe call (a fresh run). On a reclaim it is the
+	// amount already charged, which the retry REUSES verbatim.
+	BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) (charge FrozenBoundaryCharge, ok bool, err error)
+
 	// AccountsWithUnbilledUsage returns the accounts that have usage_aggregates
 	// in a closed period window [periodStart, periodEnd) with no billing_run yet
 	// — the work list for cmd/billing-cycle.
@@ -390,6 +404,17 @@ type AppMirror struct {
 type AccountAnchor struct {
 	ID          uuid.UUID
 	ActivatedAt time.Time
+}
+
+// FrozenBoundaryCharge is the boundary run's Stripe request FROZEN before its
+// first charge (migration 035): the whole-cent amount and whether the line
+// includes advance base/overage (the description determinant). Both feed the
+// deterministic idem keys ii-<run>/inv-<run>, so a reclaimed run reuses this
+// frozen tuple verbatim rather than re-deriving a possibly-drifted live total —
+// keeping every retry's Stripe request byte-identical under the stable key.
+type FrozenBoundaryCharge struct {
+	Cents    int64
+	WithBase bool
 }
 
 // ErrAccountNotFound is returned by UpdateAccountCollection when no accounts row
@@ -848,6 +873,32 @@ func (s *pgxStore) MarkBillingRun(ctx context.Context, runID uuid.UUID, status B
 		StripeInvoiceID: pgtype.Text{String: stripeInvoiceID, Valid: stripeInvoiceID != ""},
 		TotalAmount:     total,
 	})
+}
+
+func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) error {
+	// WHERE frozen_charge_cents IS NULL (in the query) makes this first-write-wins:
+	// a reclaimed run that already froze affects 0 rows and keeps its ORIGINAL
+	// frozen amount, which the caller reads back via BillingRunFrozenCharge first
+	// and reuses — so this only ever writes on the genuine first attempt.
+	return s.q.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
+		ID:                   runID.String(),
+		FrozenChargeCents:    pgtype.Int8{Int64: charge.Cents, Valid: true},
+		FrozenChargeWithBase: pgtype.Bool{Bool: charge.WithBase, Valid: true},
+	})
+}
+
+func (s *pgxStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) (FrozenBoundaryCharge, bool, error) {
+	row, err := s.q.BillingRunFrozenCharge(ctx, runID.String())
+	if err != nil {
+		return FrozenBoundaryCharge{}, false, err
+	}
+	if !row.FrozenChargeCents.Valid {
+		return FrozenBoundaryCharge{}, false, nil // fresh run — no prior attempt froze
+	}
+	return FrozenBoundaryCharge{
+		Cents:    row.FrozenChargeCents.Int64,
+		WithBase: row.FrozenChargeWithBase.Bool,
+	}, true, nil
 }
 
 func (s *pgxStore) AccountsWithUsageEvents(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {

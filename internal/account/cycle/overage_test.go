@@ -230,6 +230,86 @@ func TestModuleOverage_UnactivatedAccountNeverSwept(t *testing.T) {
 	require.False(t, store.timers[over].graceResolved)
 }
 
+// --- FINDING 1: no retroactive catch-up (D1d) when an account only activates
+// after an over-module's anchored install period already closed ---------------
+
+func TestModuleOverage_NoRetroactiveCatchUpWhenActivatedAfterPeriodClosed(t *testing.T) {
+	// Reproduces the exact failure scenario. An account installs 8 modules on an
+	// app while UNACTIVATED (RegisterApp synthesizes the timers regardless of
+	// activation). They sit installed + past-grace for months. Then the owner
+	// finally binds a card — with anchor day 1 (activated Apr 1), the timers'
+	// install-anchored period [Jan 1, Feb 1) is long closed. Pre-fix, the very next
+	// sweep charged the 3 "over" timers (ranks 5-7) a REAL Stripe invoice for that
+	// historical, never-chargeable January period — exactly the retroactive
+	// catch-up D1d forbids. Fixed: the over timers are resolved terminally WITH NO
+	// charge (period_closed), never resurface, and Stripe is never called; the 5
+	// included ones resolve as included as usual.
+	store := newFakeStore()
+	_, acct := registeredAccount(store)
+	delete(store.activation, acct) // unactivated at install time
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+	app := uuid.New()
+
+	installed := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
+	var ids []uuid.UUID
+	for i := 0; i < 8; i++ {
+		ids = append(ids, seedTimer(store, acct, app, installed))
+	}
+
+	// While unactivated the sweep never even lists them (activated_at IS NULL gate).
+	res0, err := svc.SweepModuleOverage(ctx, time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 0, res0.Pending, "unactivated → excluded from the work list")
+
+	// MONTHS later: the owner binds a card (anchor day 1, Apr 1) + a PM. The 8
+	// timers' install period [Jan 1, Feb 1) closed long before Apr 1.
+	store.activation[acct] = time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 4, 2, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 8, res.Pending, "now activated, all 8 past-grace timers are listed")
+	require.Equal(t, 0, res.Charged, "no retroactive catch-up charge for a closed period (D1d)")
+	require.Equal(t, 5, res.Included, "the 5 earliest installs resolve as included")
+	require.Equal(t, 3, res.Skipped, "the 3 over installs resolve period_closed (counted as skipped)")
+	require.Empty(t, sc.itemCalls, "no Stripe call for a period the account was never chargeable in")
+	for _, id := range ids {
+		require.True(t, store.timers[id].graceResolved, "every timer reached a terminal verdict")
+		require.False(t, store.timers[id].graceCharged, "none charged")
+	}
+
+	// A later sweep never resurfaces them (permanently resolved, never re-swept).
+	res2, err := svc.SweepModuleOverage(ctx, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 0, res2.Pending, "resolved timers never resurface")
+	require.Empty(t, sc.itemCalls)
+}
+
+func TestModuleOverage_ActivatedBeforePeriodClosesStillCharges(t *testing.T) {
+	// Guard against an over-broad fix: an over-module whose account activated
+	// BEFORE its install-anchored period closes must still charge normally. The
+	// period-closed check compares against ActivatedAt (not the sweep instant), so
+	// an account activated well before the install (registeredAccount: May 4) that
+	// is swept a few days late is NOT treated as a retroactive catch-up.
+	store := newFakeStore()
+	_, acct := registeredAccount(store) // activated 2026-05-04, anchor day 4
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	// 5 included + one over-module installed Jun 10 → period [Jun 4, Jul 4), which
+	// opened AFTER activation, so the account was chargeable for the whole window.
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 9, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged, "an over-module whose period opened after activation charges normally")
+	require.Len(t, sc.itemCalls, 1)
+	require.True(t, store.timers[over].graceCharged)
+}
+
 // --- SyncAppModules timer synthesis (grow + LIFO shrink + delete) -------------
 
 func TestSyncAppModules_GrowsAndLIFOShrinksTimers(t *testing.T) {

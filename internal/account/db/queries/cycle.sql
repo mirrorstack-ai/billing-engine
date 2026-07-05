@@ -162,6 +162,31 @@ SET status            = $2,
     total_amount      = $4
 WHERE id = $1;
 
+-- FreezeBillingRunCharge records, BEFORE the boundary Stripe charge, the exact
+-- whole-cent amount AND the base/overage description determinant this run will
+-- send Stripe under the deterministic idem keys ii-<run> / inv-<run> (migration
+-- 035). First-write-wins (WHERE frozen_charge_cents IS NULL): a reclaimed run that
+-- already froze keeps its ORIGINAL values, so a retry that recomputed a different
+-- LIVE total can never send Stripe a mismatched request under the same idem key.
+-- InsertBillingRun's ON CONFLICT DO UPDATE deliberately leaves these columns
+-- untouched, so the freeze survives the reclaim.
+-- name: FreezeBillingRunCharge :exec
+UPDATE ms_billing.billing_runs
+SET frozen_charge_cents     = $2,
+    frozen_charge_with_base = $3
+WHERE id = $1
+  AND frozen_charge_cents IS NULL;
+
+-- BillingRunFrozenCharge reads a run's frozen boundary-charge amount + description
+-- determinant (set by a prior attempt's FreezeBillingRunCharge). Both are NULL
+-- when no prior attempt reached the Stripe charge (a fresh run), so the caller
+-- freezes the freshly-computed values and charges them; on a reclaim they are the
+-- amount already charged, which the retry REUSES verbatim.
+-- name: BillingRunFrozenCharge :one
+SELECT frozen_charge_cents, frozen_charge_with_base
+FROM ms_billing.billing_runs
+WHERE id = $1;
+
 -- UpsertInvoice mirrors a Stripe invoice into ms_billing.invoices, keyed on the
 -- UNIQUE stripe_invoice_id so a re-run (deterministic Stripe Idempotency-Key
 -- returns the same invoice) upserts the same row rather than duplicating it.

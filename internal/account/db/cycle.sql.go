@@ -252,6 +252,56 @@ func (q *Queries) ActivatedAccounts(ctx context.Context) ([]ActivatedAccountsRow
 	return items, nil
 }
 
+const billingRunFrozenCharge = `-- name: BillingRunFrozenCharge :one
+SELECT frozen_charge_cents, frozen_charge_with_base
+FROM ms_billing.billing_runs
+WHERE id = $1
+`
+
+type BillingRunFrozenChargeRow struct {
+	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+}
+
+// BillingRunFrozenCharge reads a run's frozen boundary-charge amount + description
+// determinant (set by a prior attempt's FreezeBillingRunCharge). Both are NULL
+// when no prior attempt reached the Stripe charge (a fresh run), so the caller
+// freezes the freshly-computed values and charges them; on a reclaim they are the
+// amount already charged, which the retry REUSES verbatim.
+func (q *Queries) BillingRunFrozenCharge(ctx context.Context, id string) (BillingRunFrozenChargeRow, error) {
+	row := q.db.QueryRow(ctx, billingRunFrozenCharge, id)
+	var i BillingRunFrozenChargeRow
+	err := row.Scan(&i.FrozenChargeCents, &i.FrozenChargeWithBase)
+	return i, err
+}
+
+const freezeBillingRunCharge = `-- name: FreezeBillingRunCharge :exec
+UPDATE ms_billing.billing_runs
+SET frozen_charge_cents     = $2,
+    frozen_charge_with_base = $3
+WHERE id = $1
+  AND frozen_charge_cents IS NULL
+`
+
+type FreezeBillingRunChargeParams struct {
+	ID                   string      `json:"id"`
+	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+}
+
+// FreezeBillingRunCharge records, BEFORE the boundary Stripe charge, the exact
+// whole-cent amount AND the base/overage description determinant this run will
+// send Stripe under the deterministic idem keys ii-<run> / inv-<run> (migration
+// 035). First-write-wins (WHERE frozen_charge_cents IS NULL): a reclaimed run that
+// already froze keeps its ORIGINAL values, so a retry that recomputed a different
+// LIVE total can never send Stripe a mismatched request under the same idem key.
+// InsertBillingRun's ON CONFLICT DO UPDATE deliberately leaves these columns
+// untouched, so the freeze survives the reclaim.
+func (q *Queries) FreezeBillingRunCharge(ctx context.Context, arg FreezeBillingRunChargeParams) error {
+	_, err := q.db.Exec(ctx, freezeBillingRunCharge, arg.ID, arg.FrozenChargeCents, arg.FrozenChargeWithBase)
+	return err
+}
+
 const hasUsableDefaultPM = `-- name: HasUsableDefaultPM :one
 SELECT EXISTS (
     SELECT 1

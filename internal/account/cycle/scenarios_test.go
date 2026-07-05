@@ -18,6 +18,7 @@ package cycle_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -157,6 +158,90 @@ func TestScenario3_PoolOverFromDayZeroOneCombinedInvoice(t *testing.T) {
 	}
 	require.Equal(t, 2, charged, "exactly the 2 over-modules were charged")
 	require.Equal(t, 7, resolved, "all 7 co-created timers reached a terminal verdict")
+}
+
+// --- FINDING 2: a combined-invoice Phase-3 failure must not let Leg 1 mint a
+// SECOND overage invoice for the co-created over-modules ------------------------
+
+func TestScenario3_ProrationPhase3FailureDoesNotMintSecondOverageInvoice(t *testing.T) {
+	// Reproduces the exact failure scenario. App A is created with 7 co-created
+	// modules (5 included + 2 over). The combined creation charge's Stripe calls
+	// succeed (base + 2 overage items on ONE invoice), but its persist phase
+	// (Phase 3 — arm the guard + mark the co-created timers resolved) FAILS
+	// (deadlock / transient tx error) even though the money already moved. cmd/
+	// billing-cycle then runs the overage sweep in the SAME process. Pre-fix, Leg 1
+	// found the 2 still-unresolved over timers and minted a SECOND invoice for them
+	// (a fresh mod-overage-inv-<id> key), mis-attributing money Stripe already
+	// pooled onto the combined invoice. Fixed: Leg 1 DEFERS them (they belong to the
+	// combined invoice), so the proration sweep's next retry converges on the SAME
+	// combined invoice and marks them — exactly ONE invoice, ever.
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	ctx := context.Background()
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, scenarioCreatedAt, 7)
+
+	// The combined charge's Stripe calls land; Phase 3 fails after they succeed.
+	store.errPersistAfterStripe = errors.New("serialization failure (deadlock)")
+	pro, err := svc.SweepCreationProrations(ctx, scenarioSweepAt)
+	require.NoError(t, err, "a per-app charge failure never aborts the sweep")
+	require.Equal(t, 1, pro.Failed, "App A's combined charge failed at Phase 3")
+	require.Equal(t, 0, pro.Charged)
+	require.Empty(t, store.apps[appID].ProrationInvoiceID, "guard unarmed after Phase 3 failure")
+
+	// Stripe DID fire: base + 2 overage items on ONE combined invoice.
+	require.Len(t, sc.itemCalls, 3, "base + 2 co-created overage items")
+	require.Len(t, sc.invoiceCalls, 1)
+	combinedInvoiceIdem := sc.invoiceCalls[0].idemKey
+	require.Equal(t, "app-inv-"+appID.String(), combinedInvoiceIdem)
+	// Every timer is still unresolved — Phase 3 rolled back its marks.
+	for _, tm := range store.timers {
+		require.False(t, tm.graceResolved, "no timer resolved — Phase 3 rolled back")
+	}
+
+	// The SAME-process overage sweep must NOT mint a second overage invoice for the
+	// co-created over-modules. It resolves the 5 included (harmless) and DEFERS the
+	// 2 over ones back to the combined-invoice path.
+	over, err := svc.SweepModuleOverage(ctx, scenarioSweepAt)
+	require.NoError(t, err)
+	require.Equal(t, 0, over.Charged, "co-created over-modules are NOT re-charged by Leg 1")
+	require.Equal(t, 5, over.Included, "the 5 included co-created timers resolve with no charge")
+	require.Equal(t, 2, over.Skipped, "the 2 over co-created timers are deferred to the combined invoice")
+	for _, ic := range sc.invoiceCalls {
+		require.NotContains(t, ic.idemKey, "mod-overage-inv-",
+			"Leg 1 must never mint a separate invoice for a co-created over-module")
+	}
+	// The 2 over timers stay unresolved, awaiting the proration retry.
+	unresolvedOver := 0
+	for _, tm := range store.timers {
+		if !tm.graceResolved {
+			unresolvedOver++
+		}
+	}
+	require.Equal(t, 2, unresolvedOver, "the 2 over timers wait for the combined-invoice retry")
+
+	// Clear the transient failure: the proration sweep's retry converges on the
+	// SAME combined invoice (deterministic idem keys) and marks the 2 over timers.
+	store.errPersistAfterStripe = nil
+	pro2, err := svc.SweepCreationProrations(ctx, scenarioSweepAt)
+	require.NoError(t, err)
+	require.Equal(t, 1, pro2.Charged, "the retry finally lands the combined charge")
+	armed := store.apps[appID].ProrationInvoiceID
+	require.NotEmpty(t, armed)
+
+	charged := 0
+	for _, tm := range store.timers {
+		if tm.graceCharged {
+			charged++
+			require.Equal(t, armed, tm.graceInvoiceID,
+				"overage landed on the combined creation invoice, not a stray second one")
+		}
+		require.True(t, tm.graceResolved, "all 7 timers now terminally resolved")
+	}
+	require.Equal(t, 2, charged, "exactly the 2 over-modules were charged")
+	require.Len(t, store.invoices, 1, "exactly ONE invoice ever — the combined creation invoice")
 }
 
 // --- Scenario 4: pool crosses 5 later → two independent prorated charges -------

@@ -394,14 +394,16 @@ type MsBillingBillingPeriod struct {
 }
 
 type MsBillingBillingRun struct {
-	ID              string         `json:"id"`
-	AccountID       string         `json:"account_id"`
-	PeriodStart     time.Time      `json:"period_start"`
-	PeriodEnd       time.Time      `json:"period_end"`
-	Status          string         `json:"status"`
-	StripeInvoiceID pgtype.Text    `json:"stripe_invoice_id"`
-	TotalAmount     pgtype.Numeric `json:"total_amount"`
-	CreatedAt       time.Time      `json:"created_at"`
+	ID                   string         `json:"id"`
+	AccountID            string         `json:"account_id"`
+	PeriodStart          time.Time      `json:"period_start"`
+	PeriodEnd            time.Time      `json:"period_end"`
+	Status               string         `json:"status"`
+	StripeInvoiceID      pgtype.Text    `json:"stripe_invoice_id"`
+	TotalAmount          pgtype.Numeric `json:"total_amount"`
+	CreatedAt            time.Time      `json:"created_at"`
+	FrozenChargeCents    pgtype.Int8    `json:"frozen_charge_cents"`
+	FrozenChargeWithBase pgtype.Bool    `json:"frozen_charge_with_base"`
 }
 
 type MsBillingBudget struct {
