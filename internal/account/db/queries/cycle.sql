@@ -166,22 +166,28 @@ WHERE id = $1;
 -- UNIQUE stripe_invoice_id so a re-run (deterministic Stripe Idempotency-Key
 -- returns the same invoice) upserts the same row rather than duplicating it.
 -- Webhook reconciliation (PR #7) later updates status + amount_paid in place.
+-- is_large_auto_collect (migration 034) is the server-computed post-hoc
+-- disclosure flag, frozen at invoice-create time from the amount charged vs the
+-- account threshold that applied WHEN THE CHARGE FIRED. A deterministic re-run
+-- (same Stripe idem key → same invoice, same charged amount) re-computes the same
+-- value, so carrying it through EXCLUDED on conflict is a no-op refresh.
 -- name: UpsertInvoice :exec
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
-    period_start, period_end
+    period_start, period_end, is_large_auto_collect
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8
+    $1, $2, $3, $4, $5, $6, $7, $8, $9
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
-    status       = EXCLUDED.status,
-    amount_due   = EXCLUDED.amount_due,
-    amount_paid  = EXCLUDED.amount_paid,
-    currency     = EXCLUDED.currency,
-    period_start = EXCLUDED.period_start,
-    period_end   = EXCLUDED.period_end;
+    status                = EXCLUDED.status,
+    amount_due            = EXCLUDED.amount_due,
+    amount_paid           = EXCLUDED.amount_paid,
+    currency              = EXCLUDED.currency,
+    period_start          = EXCLUDED.period_start,
+    period_end            = EXCLUDED.period_end,
+    is_large_auto_collect = EXCLUDED.is_large_auto_collect;
 
 -- HasUsableDefaultPM is the no-PM charge gate: true iff the account has at
 -- least one active (not soft-deleted), not-expired payment_methods_mirror row.
@@ -217,12 +223,16 @@ WHERE id = $1;
 -- limit. created_at is returned so the risk-judge can compute account tenure
 -- WITHOUT a cross-schema read into ms_account (billing-engine never reads
 -- ms_account tables). spend_ceiling_micros is NULL when no ceiling is set; the
--- Go layer carries it as a nullable.
+-- Go layer carries it as a nullable. auto_collect_threshold_micros (migration
+-- 031) is NULL when the account uses the platform default; the charge leg
+-- resolves it to collection.DefaultAutoCollectThresholdMicros AT CHARGE TIME to
+-- decide the post-hoc large-charge disclosure flag.
 -- name: AccountCollectionFields :one
 SELECT
     usage_billing_mode,
     credit_limit_micros,
     spend_ceiling_micros,
+    auto_collect_threshold_micros,
     created_at
 FROM ms_billing.accounts
 WHERE id = $1;

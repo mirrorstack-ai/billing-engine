@@ -333,6 +333,8 @@ type MsBillingAccount struct {
 	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
 	// UTC instant the account-wide pooled SUM(module_count) over live apps first crossed the included 5 (account-wide overage grace anchor, owner spec 2026-07-05). NULL = not currently over the pool. Recomputed by RegisterApp / SyncAppModules; arms one 3-day grace timer per account.
 	OverageSince pgtype.Timestamptz `json:"overage_since"`
+	// Per-account size threshold (micro-USD) above which a SUCCESSFUL off-session charge is disclosed as "large" on the billing page. NULL = platform default ($100 = 100000000 micros). Resolved at charge time; pure disclosure, changes no charging behaviour.
+	AutoCollectThresholdMicros pgtype.Int8 `json:"auto_collect_threshold_micros"`
 }
 
 type MsBillingAccountOverageSnapshot struct {
@@ -457,6 +459,8 @@ type MsBillingInvoice struct {
 	HostedInvoiceUrl pgtype.Text `json:"hosted_invoice_url"`
 	// Stripe invoice PDF download URL. Assigned at finalization; NULL = not yet delivered.
 	InvoicePdf pgtype.Text `json:"invoice_pdf"`
+	// Server-computed at invoice-create time: true iff the charged amount (netted arrears + advance base, micros) exceeded the account auto_collect_threshold_micros (or the default when NULL) that applied WHEN THE CHARGE FIRED. Post-hoc disclosure only.
+	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
 }
 
 type MsBillingMetricDefinition struct {

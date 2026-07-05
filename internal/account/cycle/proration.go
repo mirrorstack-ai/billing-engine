@@ -43,6 +43,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/collection"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
@@ -277,6 +278,20 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, billing.StripeError("proration invoice failed", err)
 		}
 
+		// Resolve the account's large-charge disclosure threshold AT CHARGE TIME,
+		// immediately AFTER the Stripe calls above succeeded — the SAME point
+		// relative to the actual charge that RunBillingCycle's boundary leg
+		// resolves its own threshold (charge.go). Both charge legs agreeing on
+		// this point means a threshold edit landing concurrently with a charge is
+		// honored identically by both. A prorated app base fee rarely crosses the
+		// $100 default, but the flag is computed uniformly at every off-session
+		// charge call site (migration 034) so no successful large debit escapes
+		// disclosure.
+		acct, err := s.store.AccountCollection(ctx, locked.AccountID)
+		if err != nil {
+			return nil, billing.Internal("account collection lookup failed", err)
+		}
+
 		// Mirror the PARTIAL window [creation day, period end) — the same coverage
 		// start ProratedBaseMicros priced, so mirror and amount agree by construction.
 		partialStart := usage.ProrationCoverageStart(locked.CreatedAt, periodStart)
@@ -285,14 +300,15 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			InvoiceID: inv.ID,
 			Cents:     c,
 			Invoice: InvoiceMirror{
-				AccountID:       locked.AccountID,
-				StripeInvoiceID: inv.ID,
-				Status:          inv.Status,
-				AmountDueCents:  inv.AmountDue,
-				AmountPaidCents: inv.AmountPaid,
-				Currency:        chargeCurrency,
-				PeriodStart:     partialStart,
-				PeriodEnd:       periodEnd,
+				AccountID:          locked.AccountID,
+				StripeInvoiceID:    inv.ID,
+				Status:             inv.Status,
+				AmountDueCents:     inv.AmountDue,
+				AmountPaidCents:    inv.AmountPaid,
+				Currency:           chargeCurrency,
+				PeriodStart:        partialStart,
+				PeriodEnd:          periodEnd,
+				IsLargeAutoCollect: collection.IsLargeAutoCollect(prorated, acct.AutoCollectThresholdMicros),
 			},
 			// Freeze what was billed keyed by the FULL anchored period_start (the
 			// display identity, migration 028); BaseMicros is the prorated amount.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -35,6 +36,14 @@ type fakeStripe struct {
 	// injected errors
 	errItem    error
 	errInvoice error
+
+	// onCreateInvoice, when set, runs INSIDE CreateInvoice right before it
+	// returns success — modeling a concurrent account mutation (e.g. a
+	// threshold edit) that lands while the real Stripe HTTP call is in
+	// flight, i.e. strictly AFTER any pre-charge store read the caller
+	// already did and strictly BEFORE any post-charge store read the caller
+	// does once this call returns. Used by the finding-#2 regression test.
+	onCreateInvoice func()
 }
 
 type itemCall struct {
@@ -71,6 +80,9 @@ func (f *fakeStripe) CreateInvoice(_ context.Context, custID string, autoAdvance
 	f.invoiceCalls = append(f.invoiceCalls, invoiceCall{custID, autoAdvance, idemKey})
 	if f.errInvoice != nil {
 		return billingstripe.Invoice{}, f.errInvoice
+	}
+	if f.onCreateInvoice != nil {
+		f.onCreateInvoice()
 	}
 	return billingstripe.Invoice{
 		ID:         f.invoiceID,
@@ -469,4 +481,172 @@ func TestRunBillingCycle_PropagatesStoreErrors(t *testing.T) {
 			requireCode(t, err, billing.CodeInternal)
 		})
 	}
+}
+
+// --- large auto-collect disclosure flag (migration 034) -------------------
+
+func TestRunBillingCycle_LargeChargeFlagsMirror(t *testing.T) {
+	// A charge above the default $100 threshold (nil override) freezes
+	// is_large_auto_collect=true on the mirror. $150 arrears → flagged.
+	store := newFakeStore()
+	store.chargedTotal = 150_000_000 // $150 in micros, over the $100 default
+	store.hasPM = true
+	store.stripeCustomer = "cus_large"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.True(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$150 > $100 default threshold → disclosed as large")
+}
+
+func TestRunBillingCycle_SmallChargeDoesNotFlagMirror(t *testing.T) {
+	// A charge below the default threshold leaves the flag false (the historic /
+	// non-disclosed default).
+	store := newFakeStore()
+	store.chargedTotal = 50_000_000 // $50 in micros, under the $100 default
+	store.hasPM = true
+	store.stripeCustomer = "cus_small"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$50 < $100 default threshold → not disclosed")
+}
+
+func TestRunBillingCycle_PerAccountThresholdOverrideRespected(t *testing.T) {
+	// A $200 per-account override governs over the $100 default: a $150 charge is
+	// under the CUSTOM threshold and so is NOT flagged, proving the flag is
+	// resolved against the account's own threshold at charge time.
+	store := newFakeStore()
+	override := int64(200_000_000) // $200 override
+	store.collection.AutoCollectThresholdMicros = &override
+	store.chargedTotal = 150_000_000 // $150, over default but under the override
+	store.hasPM = true
+	store.stripeCustomer = "cus_override"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$150 < $200 per-account override → not disclosed despite exceeding the default")
+}
+
+// TestRunBillingCycle_SubCentAboveThresholdChargesExactThresholdNotFlagged is
+// the end-to-end regression for finding #1 (collection.IsLargeAutoCollect
+// compared raw pre-rounding micros against the threshold instead of the SAME
+// post-rounding cents Stripe actually charges).
+//
+// FAILS without the fix: arrears = $100.00 + 100 micros ($100.0001) is
+// strictly ABOVE the raw $100,000,000-micro default threshold, so the old
+// `chargedMicros > threshold` comparison flagged the mirror row "large" even
+// though the money that actually hit the card — the SAME
+// centsFromMicros(arrears) conversion this test asserts on the fake Stripe
+// call — is EXACTLY $100.00 (round-half-up rounds 100_000_100/10_000 =
+// 10000.01 DOWN to 10000 cents), identical to what a charge of exactly the
+// threshold itself would produce. Proves the concrete dollar amount, not just
+// "no error": the Stripe invoice item is created for precisely 10000 cents
+// ($100.00), and the mirror is NOT flagged, matching the "exactly at
+// threshold is not large" contract.
+func TestRunBillingCycle_SubCentAboveThresholdChargesExactThresholdNotFlagged(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 100_000_100 // $100.00 + 100 micros ($0.0001) — inside the half-cent gap
+	store.hasPM = true
+	store.stripeCustomer = "cus_subcent"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 10000, sc.itemCalls[0].amountCfg,
+		"Stripe is charged exactly 10000 cents ($100.00), not $100.01 — the same amount charging exactly the threshold would produce")
+	require.EqualValues(t, 10000, resp.ChargedCents)
+
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"a charge that rounds down to EXACTLY the $100 threshold must not be disclosed as large")
+}
+
+// --- regression: finding #2 (threshold resolved at different points relative
+// to the charge in RunBillingCycle vs. RegisterApp) -------------------------
+//
+// Both tests below charge $150 while a concurrent threshold edit ($100
+// default → $200 override) lands DURING the Stripe CreateInvoice HTTP call —
+// i.e. strictly after any pre-charge store read and strictly before any
+// post-charge store read. Both call sites must resolve the SAME way (the
+// edit that landed mid-charge is picked up), matching the "resolved at charge
+// time" contract identically on both legs.
+//
+// FAILS without the fix: RunBillingCycle read `acct` (and its
+// AutoCollectThresholdMicros) at the TOP of the function — before the risk
+// gate, the PM check, and both Stripe HTTP calls — so it never observes the
+// edit and still uses the stale $100 default, flagging the $150 charge as
+// large. RegisterApp, by contrast, already re-resolves the threshold AFTER
+// its Stripe call succeeds, so it picks up the new $200 override and does
+// NOT flag the same $150 charge. That asymmetry — same race, different
+// outcome depending on which leg charged — is exactly what this test
+// forbids.
+
+func TestRunBillingCycle_ConcurrentThresholdEditMidChargeResolvesPostCharge(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 150_000_000 // $150: over the $100 default, under a $200 override
+	store.hasPM = true
+	store.stripeCustomer = "cus_race_boundary"
+	sc := newFakeStripe()
+	sc.onCreateInvoice = func() {
+		// The concurrent edit: an operator (or the account owner) raises the
+		// disclosure threshold to $200 WHILE this charge's Stripe call is in
+		// flight.
+		override := int64(200_000_000)
+		store.collection.AutoCollectThresholdMicros = &override
+	}
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.EqualValues(t, 15000, resp.ChargedCents, "still charges $150 — the edit only affects disclosure, never the amount")
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"the threshold is resolved AFTER the Stripe charge succeeds, so the mid-charge $200 edit governs — $150 is not flagged")
+}
+
+func TestChargeCreationProration_ConcurrentThresholdEditMidChargeResolvesPostCharge(t *testing.T) {
+	// The creation-proration leg (the grace-sweep charge, proration.go) resolves
+	// its large-charge disclosure threshold at the SAME point relative to the
+	// actual charge as the boundary leg above: immediately AFTER the Stripe call
+	// succeeds, never from a pre-charge snapshot. Under the unified model this
+	// leg bills the FLAT per-app base only ($20 — module overage is no longer
+	// folded in), so the straddle here is a $20 charge between a $10 pre-charge
+	// threshold and a $30 mid-charge override.
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	// Pre-charge threshold $10: were it resolved BEFORE the charge, the $20 base
+	// would flag "large" ($20 > $10).
+	stale := int64(10_000_000)
+	store.collection.AutoCollectThresholdMicros = &stale
+	sc := newFakeStripe()
+	sc.onCreateInvoice = func() {
+		// The concurrent edit lands WHILE the Stripe call is in flight, raising
+		// the threshold to $30 — above the $20 base.
+		override := int64(30_000_000)
+		store.collection.AutoCollectThresholdMicros = &override
+	}
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	// CreatedAt on the anchored period boundary (day 4, matching registeredAccount's
+	// May-4 activation) → the FULL flat $20 base, no proration dampening.
+	registerMirror(t, svc, user, appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), 3)
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2000, resp.ProrationCents, "flat $20 base, charged in full")
+	require.NotEmpty(t, resp.ProrationInvoiceID)
+
+	require.False(t, store.invoices[resp.ProrationInvoiceID].IsLargeAutoCollect,
+		"the threshold is resolved AFTER the Stripe charge succeeds on this leg too, so the mid-charge $30 edit governs — $20 is not flagged")
 }

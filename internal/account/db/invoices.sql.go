@@ -17,7 +17,7 @@ const listInvoicesForAccount = `-- name: ListInvoicesForAccount :many
 SELECT id, stripe_invoice_id, number, status,
        amount_due, amount_paid, currency,
        period_start, period_end, created_at,
-       hosted_invoice_url, invoice_pdf
+       hosted_invoice_url, invoice_pdf, is_large_auto_collect
 FROM ms_billing.invoices
 WHERE account_id = $1::uuid
   AND status <> 'draft'
@@ -36,18 +36,19 @@ type ListInvoicesForAccountParams struct {
 }
 
 type ListInvoicesForAccountRow struct {
-	ID               string             `json:"id"`
-	StripeInvoiceID  string             `json:"stripe_invoice_id"`
-	Number           pgtype.Text        `json:"number"`
-	Status           string             `json:"status"`
-	AmountDue        pgtype.Numeric     `json:"amount_due"`
-	AmountPaid       pgtype.Numeric     `json:"amount_paid"`
-	Currency         string             `json:"currency"`
-	PeriodStart      pgtype.Timestamptz `json:"period_start"`
-	PeriodEnd        pgtype.Timestamptz `json:"period_end"`
-	CreatedAt        time.Time          `json:"created_at"`
-	HostedInvoiceUrl pgtype.Text        `json:"hosted_invoice_url"`
-	InvoicePdf       pgtype.Text        `json:"invoice_pdf"`
+	ID                 string             `json:"id"`
+	StripeInvoiceID    string             `json:"stripe_invoice_id"`
+	Number             pgtype.Text        `json:"number"`
+	Status             string             `json:"status"`
+	AmountDue          pgtype.Numeric     `json:"amount_due"`
+	AmountPaid         pgtype.Numeric     `json:"amount_paid"`
+	Currency           string             `json:"currency"`
+	PeriodStart        pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd          pgtype.Timestamptz `json:"period_end"`
+	CreatedAt          time.Time          `json:"created_at"`
+	HostedInvoiceUrl   pgtype.Text        `json:"hosted_invoice_url"`
+	InvoicePdf         pgtype.Text        `json:"invoice_pdf"`
+	IsLargeAutoCollect bool               `json:"is_large_auto_collect"`
 }
 
 // Account-scoped READS over the ms_billing.invoices Stripe mirror (011 + 026)
@@ -106,6 +107,7 @@ func (q *Queries) ListInvoicesForAccount(ctx context.Context, arg ListInvoicesFo
 			&i.CreatedAt,
 			&i.HostedInvoiceUrl,
 			&i.InvoicePdf,
+			&i.IsLargeAutoCollect,
 		); err != nil {
 			return nil, err
 		}

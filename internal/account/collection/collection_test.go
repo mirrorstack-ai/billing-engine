@@ -200,3 +200,92 @@ func TestTrustRampedCreditLimit_PartialTenureMonthDoesNotCount(t *testing.T) {
 		collection.TrustRampedCreditLimit(0, 29, false),
 		"30 days adds one tenure month")
 }
+
+// --- large auto-collect disclosure ----------------------------------------
+
+func TestResolveAutoCollectThreshold_NilUsesDefault(t *testing.T) {
+	// A nil override models the migration-031 NULL column → the platform default.
+	require.Equal(t, collection.DefaultAutoCollectThresholdMicros,
+		collection.ResolveAutoCollectThreshold(nil))
+	require.EqualValues(t, 100_000_000, collection.DefaultAutoCollectThresholdMicros,
+		"default is $100.00 in micros")
+}
+
+func TestResolveAutoCollectThreshold_OverrideRespected(t *testing.T) {
+	override := int64(250_000_000) // $250.00 per-account override
+	require.Equal(t, override, collection.ResolveAutoCollectThreshold(&override))
+}
+
+func TestIsLargeAutoCollect_BelowDefaultThresholdFalse(t *testing.T) {
+	// $99.99 with the default $100 threshold (nil override) → not large.
+	require.False(t, collection.IsLargeAutoCollect(99_990_000, nil))
+}
+
+func TestIsLargeAutoCollect_AboveDefaultThresholdTrue(t *testing.T) {
+	// $100.01 with the default $100 threshold → large.
+	require.True(t, collection.IsLargeAutoCollect(100_010_000, nil))
+}
+
+func TestIsLargeAutoCollect_ExactlyAtThresholdFalse(t *testing.T) {
+	// JUDGMENT (documented): the comparison is strict-greater-than, so a charge
+	// EXACTLY EQUAL to the threshold is NOT flagged — "large" means ABOVE the
+	// threshold (a $100 threshold discloses charges over $100, not one of exactly
+	// $100). Matches ExceedsSpendCeiling's precise-dollar-cap reading.
+	require.False(t, collection.IsLargeAutoCollect(collection.DefaultAutoCollectThresholdMicros, nil))
+	override := int64(250_000_000)
+	require.False(t, collection.IsLargeAutoCollect(override, &override),
+		"exactly at a custom override is likewise not large")
+}
+
+func TestIsLargeAutoCollect_CustomOverrideRespected(t *testing.T) {
+	// A $250 override: $150 is under the CUSTOM threshold (though over the $100
+	// default), so the per-account override governs and it is NOT large…
+	override := int64(250_000_000)
+	require.False(t, collection.IsLargeAutoCollect(150_000_000, &override))
+	// …while $250.01 crosses the override and IS large.
+	require.True(t, collection.IsLargeAutoCollect(250_010_000, &override))
+}
+
+func TestIsLargeAutoCollect_ZeroOverrideFlagsAnyPositiveCharge(t *testing.T) {
+	// A $0 override (a deliberately-disclose-everything account) flags any
+	// charge that rounds to a REAL, non-zero cent at the Stripe boundary — NOT
+	// any nonzero micro value. JUDGMENT (corrected alongside the #1 fix below):
+	// the previous version of this test asserted IsLargeAutoCollect(1, &zero)
+	// == true, i.e. "any positive micros is flagged" — but 1 micro rounds DOWN
+	// to $0.00 when actually charged (centsFromMicros(1) == 0), so flagging it
+	// as a "large" disclosure over a $0.00 threshold contradicted the very
+	// charge that fired. That assertion baked in the SAME raw-micros-vs-
+	// charged-cents mismatch as the near-$100-threshold bug; the fix corrects
+	// both call sites of the same root cause. 5,000 micros (exactly half a
+	// cent) round-half-up to $0.01 charged, which correctly IS flagged.
+	zero := int64(0)
+	require.True(t, collection.IsLargeAutoCollect(5_000, &zero),
+		"half a cent rounds up to a real $0.01 charge over the $0 threshold")
+	require.False(t, collection.IsLargeAutoCollect(4_999, &zero),
+		"just under half a cent rounds DOWN to $0.00 actually charged — nothing to disclose")
+	require.False(t, collection.IsLargeAutoCollect(0, &zero))
+}
+
+// --- regression: finding #1 (sub-cent-above-threshold false positive) ------
+
+func TestIsLargeAutoCollect_SubCentAboveDefaultThresholdNotFlagged(t *testing.T) {
+	// FAILS without the fix: a charge of $100.00 + 100 micros ($0.0001) is
+	// strictly ABOVE the raw $100.00 threshold in micros, so the old
+	// `chargedMicros > threshold` comparison flagged it "large". But Stripe
+	// only ever charges whole cents (round-half-up, 1 cent = 10,000 micros):
+	// centsFromMicros(100_000_100) == round_half_up(10000.01) == 10000 cents,
+	// i.e. the SAME $100.00 that centsFromMicros(100_000_000) (the threshold
+	// itself) produces. The money that actually hits the card is IDENTICAL to
+	// the threshold's dollar amount, so the "exactly at threshold is not
+	// large" contract requires this NOT be flagged.
+	chargedMicros := collection.DefaultAutoCollectThresholdMicros + 100 // $100.0001
+	require.Less(t, chargedMicros-collection.DefaultAutoCollectThresholdMicros, int64(5_000),
+		"fixture must stay within the half-a-cent gap the bug lived in")
+	require.False(t, collection.IsLargeAutoCollect(chargedMicros, nil),
+		"$100.0001 charges as exactly $100.00 (rounds down) — must not be flagged")
+
+	// Sanity: once chargedMicros crosses the half-cent tie (5,000 micros above
+	// the threshold), it rounds up to a REAL $100.01 charge and must be flagged.
+	require.True(t, collection.IsLargeAutoCollect(collection.DefaultAutoCollectThresholdMicros+5_000, nil),
+		"$100.01 actually charged (rounds up at the tie) — must be flagged")
+}

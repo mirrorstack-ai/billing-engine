@@ -416,6 +416,11 @@ type InvoiceMirrorRaw struct {
 	CreatedAt        time.Time
 	HostedInvoiceURL string
 	InvoicePDF       string
+	// IsLargeAutoCollect is the server-computed post-hoc disclosure flag
+	// (migration 034): true when this invoice's off-session charge exceeded the
+	// account's auto-collect threshold that applied when it fired. Read-through
+	// from the mirror for the billing page's large-charge disclosure surface.
+	IsLargeAutoCollect bool
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -1018,16 +1023,17 @@ func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit 
 			StripeInvoiceID: r.StripeInvoiceID,
 			// pgtype.Text zero-values String to "" when NULL, which is exactly
 			// the "not enriched yet" contract InvoiceMirrorRaw documents.
-			Number:           r.Number.String,
-			Status:           r.Status,
-			AmountDueMicros:  due,
-			AmountPaidMicros: paid,
-			Currency:         r.Currency,
-			PeriodStart:      timePtrFromTimestamptz(r.PeriodStart),
-			PeriodEnd:        timePtrFromTimestamptz(r.PeriodEnd),
-			CreatedAt:        r.CreatedAt,
-			HostedInvoiceURL: r.HostedInvoiceUrl.String,
-			InvoicePDF:       r.InvoicePdf.String,
+			Number:             r.Number.String,
+			Status:             r.Status,
+			AmountDueMicros:    due,
+			AmountPaidMicros:   paid,
+			Currency:           r.Currency,
+			PeriodStart:        timePtrFromTimestamptz(r.PeriodStart),
+			PeriodEnd:          timePtrFromTimestamptz(r.PeriodEnd),
+			CreatedAt:          r.CreatedAt,
+			HostedInvoiceURL:   r.HostedInvoiceUrl.String,
+			InvoicePDF:         r.InvoicePdf.String,
+			IsLargeAutoCollect: r.IsLargeAutoCollect,
 		})
 	}
 	return out, nil

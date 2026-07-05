@@ -204,6 +204,83 @@ func tighten(acct Account, reason Reason) Decision {
 	}
 }
 
+// --- large auto-collect disclosure --------------------------------------------
+
+// DefaultAutoCollectThresholdMicros is the platform-default size threshold above
+// which a SUCCESSFUL off-session charge is disclosed as "large" on the billing
+// page: $100.00. An account with no per-account override (NULL
+// auto_collect_threshold_micros, migration 034) uses this. FINANCE-OWNED like
+// the other collection thresholds; kept here (a risk/disclosure concept), not in
+// the pricing consts.
+//
+// This is DISCLOSURE ONLY: unlike the spend ceiling (which SKIPS a charge that
+// would breach it), the threshold changes NO charging behaviour — it only marks,
+// after the fact, that a charge which ALREADY succeeded was large, so the
+// customer isn't surprised by the auto-debit.
+const DefaultAutoCollectThresholdMicros int64 = 100_000_000 // $100.00
+
+// ResolveAutoCollectThreshold resolves the effective per-account disclosure
+// threshold: the account override when set (non-nil), else the platform default.
+// A nil override models the migration-031 NULL column ("use the default"). This
+// MUST be resolved AT CHARGE TIME so the flag reflects the threshold that applied
+// when the charge fired, not one edited afterward.
+func ResolveAutoCollectThreshold(overrideMicros *int64) int64 {
+	if overrideMicros != nil {
+		return *overrideMicros
+	}
+	return DefaultAutoCollectThresholdMicros
+}
+
+// IsLargeAutoCollect reports whether a SUCCESSFUL off-session charge of
+// chargedMicros (netted arrears + advance base, pre-cents-conversion) crosses the
+// account's disclosure threshold (override when non-nil, else the default) and so
+// must be disclosed as "large".
+//
+// The comparison is strict-greater-than (>): a charge EXACTLY EQUAL to the
+// threshold is NOT flagged. "Large" means ABOVE the threshold — a $100 threshold
+// discloses charges over $100, not a charge of exactly $100. This matches
+// ExceedsSpendCeiling's precise-dollar-cap reading (equal-to is not "above") and
+// is intentionally distinct from overCreditLimit's inclusive (>=) trust trigger.
+//
+// The comparison MUST happen in the SAME unit Stripe actually charges: whole
+// cents, round-half-up (cycle.centsFromMicros — 1 cent = 10_000 micros). chargedMicros
+// is the raw pre-cents-conversion micros value, so a chargedMicros strictly between
+// the threshold and threshold+5,000 micros (half a cent) rounds DOWN to the
+// threshold's own cents value when actually charged — comparing raw micros would
+// flag it "large" even though the money that hit the card is IDENTICAL to the
+// threshold's dollar amount. Rounding BOTH sides to cents before comparing (rather
+// than comparing raw micros) makes the flag agree with the real charge by
+// construction. This package cannot import cycle.centsFromMicros directly (cycle
+// imports collection; that would cycle), so centsRoundHalfUp below duplicates the
+// identical round-half-up rule in plain integer arithmetic.
+func IsLargeAutoCollect(chargedMicros int64, overrideMicros *int64) bool {
+	chargedCents := centsRoundHalfUp(chargedMicros)
+	thresholdCents := centsRoundHalfUp(ResolveAutoCollectThreshold(overrideMicros))
+	return chargedCents > thresholdCents
+}
+
+// microsPerCent is the micro-dollar value of one cent (1e-2 USD = 10_000 ×
+// 1e-6 USD) — mirrors cycle.microsPerCent. Duplicated rather than imported: see
+// the IsLargeAutoCollect doc on the import-cycle constraint.
+const microsPerCent = 10_000
+
+// centsRoundHalfUp converts a non-negative micro-dollar amount to whole cents,
+// round-half-up — the SAME conversion Stripe amounts undergo at the charge
+// boundary (cycle.centsFromMicros, which does the equivalent computation via
+// big.Rat). For non-negative int64 operands and an EVEN divisor (10_000),
+// floor((micros + microsPerCent/2) / microsPerCent) is exactly round-half-up
+// (ties round up), so plain integer arithmetic reproduces that package's
+// rounding without depending on it. Charged amounts and thresholds are
+// non-negative at every call site (a successful charge, a finance-set
+// threshold); a negative input is defensive-clamped to 0 rather than producing
+// a sign-flipped cents value from truncating integer division.
+func centsRoundHalfUp(micros int64) int64 {
+	if micros <= 0 {
+		return 0
+	}
+	return (micros + microsPerCent/2) / microsPerCent
+}
+
 // ExceedsSpendCeiling reports whether the netted arrears would breach the
 // account's hard per-cycle bill-shock cap. NoCeiling (HasSpendCeiling=false) →
 // never breaches. This is a HARD cap independent of the mode/credit-limit judge:
