@@ -41,7 +41,6 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
-	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // moduleOverageGraceWindow is the per-install grace window: a module's own timer
@@ -138,8 +137,7 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// strictly within the install period, so a grace that straddles a period
 	// boundary never charges the NEXT period here — that period is the boundary
 	// precharge's job (scenario 6, Stage B), which would otherwise double-bill it.
-	anchorDay := billingperiod.AnchorDay(cand.ActivatedAt)
-	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(cand.InstalledAt.UTC(), anchorDay)
+	periodStart, periodEnd, closed := periodClosedByActivation(cand.InstalledAt, cand.ActivatedAt)
 
 	// D1d — no retroactive catch-up (the SAME posture ChargeCreationProration
 	// enforces on the creation leg, proration.go). RegisterApp synthesizes an app's
@@ -156,7 +154,7 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// ActivatedAt, NOT `at`: an ordinary late sweep on a HEALTHY already-activated
 	// account (grace pushing the charge a few days past periodEnd) still charges,
 	// exactly like the creation leg's ActivatedBeforePeriodCloses case.
-	if !cand.ActivatedAt.Before(periodEnd) {
+	if closed {
 		if err := s.store.MarkModuleTimerIncluded(ctx, cand.ID); err != nil {
 			return nil, billing.Internal("mark module timer resolved (period closed) failed", err)
 		}
@@ -208,21 +206,13 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 
 	// PM gate (same posture as the proration leg): no usable PM → skip WITHOUT
 	// resolving, re-attempted next sweep (the per-timer idem keys stay stable).
-	hasPM, err := s.store.HasUsableDefaultPM(ctx, cand.AccountID)
+	custID, ok, err := s.resolveChargeableCustomer(ctx, cand.AccountID)
 	if err != nil {
-		return nil, billing.Internal("usable PM check failed", err)
+		return nil, err
 	}
-	if !hasPM {
+	if !ok {
 		res.Status = ModuleOverageSkippedNoPM
 		return res, nil
-	}
-	custID, err := s.store.AccountStripeCustomer(ctx, cand.AccountID)
-	if err != nil {
-		return nil, billing.Internal("stripe customer lookup failed", err)
-	}
-	if custID == "" {
-		// A usable PM implies a Customer (same anomaly posture as the spine).
-		return nil, billing.Internal("account has a usable PM but no Stripe customer id", nil)
 	}
 
 	// Charge via a per-timer invoice with deterministic idem keys derived from the

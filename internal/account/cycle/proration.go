@@ -227,8 +227,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// (an app created near its period boundary) — that is expected, intended
 	// delayed billing (still the ONLY leg that ever bills this period), not a
 	// retroactive catch-up, and must still charge normally.
-	_, periodEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
-	if !activatedAt.Before(periodEnd) {
+	if _, _, closed := periodClosedByActivation(app.CreatedAt, activatedAt); closed {
 		if err := s.store.SetAppProrationSkipped(ctx, appID); err != nil {
 			return nil, billing.Internal("mark proration permanently skipped failed", err)
 		}
@@ -241,23 +240,15 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// account was ever ineligible for this specific period, so it stays a
 	// transient, retried skip rather than a permanent one — see the judgment
 	// call noted in the PR description for the limits of this).
-	hasPM, err := s.store.HasUsableDefaultPM(ctx, app.AccountID)
-	if err != nil {
-		return nil, billing.Internal("usable PM check failed", err)
-	}
-	if !hasPM {
-		return &ProrationResult{AppID: appID, Status: ProrationStatusNoPM}, nil
-	}
 	if s.stripe == nil {
 		return nil, billing.Internal("ChargeCreationProration requires a Stripe client", nil)
 	}
-	custID, err := s.store.AccountStripeCustomer(ctx, app.AccountID)
+	custID, ok, err := s.resolveChargeableCustomer(ctx, app.AccountID)
 	if err != nil {
-		return nil, billing.Internal("stripe customer lookup failed", err)
+		return nil, err
 	}
-	if custID == "" {
-		// A usable PM implies a Customer (same anomaly posture as the spine).
-		return nil, billing.Internal("account has a usable PM but no Stripe customer id", nil)
+	if !ok {
+		return &ProrationResult{AppID: appID, Status: ProrationStatusNoPM}, nil
 	}
 
 	// The charge callback runs AFTER the row lock is released (ChargeProrationLocked,

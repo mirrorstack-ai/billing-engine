@@ -252,28 +252,18 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return summary, nil
 	}
 
-	// No usable default PM: skip (usage RETAINED), re-attempt next cycle.
-	hasPM, err := s.store.HasUsableDefaultPM(ctx, accountID)
+	// No usable default PM (or the usable-PM-implies-Customer anomaly): skip
+	// (usage RETAINED), re-attempt next cycle.
+	custID, ok, err := s.resolveChargeableCustomer(ctx, accountID)
 	if err != nil {
-		return nil, billing.Internal("usable PM check failed", err)
+		return nil, err
 	}
-	if !hasPM {
+	if !ok {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedNoPM, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (skipped_no_pm) failed", err)
 		}
 		summary.Status = RunStatusSkippedNoPM
 		return summary, nil
-	}
-
-	custID, err := s.store.AccountStripeCustomer(ctx, accountID)
-	if err != nil {
-		return nil, billing.Internal("stripe customer lookup failed", err)
-	}
-	if custID == "" {
-		// A usable PM implies a Stripe Customer (a card can't attach without
-		// one). An empty id here is an anomaly — surface it; never auto-create a
-		// Customer on the charge path.
-		return nil, billing.Internal("account has a usable PM but no Stripe customer id", nil)
 	}
 
 	// Resolve the NEW period's window for the base snapshots BEFORE any Stripe
