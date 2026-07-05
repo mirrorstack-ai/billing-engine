@@ -125,6 +125,8 @@ type fakeStore struct {
 	errTimerRank        error // LiveModuleTimerRankBefore
 	errMarkIncluded     error // MarkModuleTimerIncluded
 	errMarkTimerCharged error // MarkModuleTimerCharged
+	errCountOngoingOver error // CountOngoingOverModuleTimers
+	errCoCreatedOver    error // CoCreatedOverModuleTimers
 }
 
 // fakeTimer models one ms_billing.app_module_overage_timers row (migration 033).
@@ -538,6 +540,18 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}
 	app.ProrationInvoiceID = pc.InvoiceID // first-charge-wins, like WHERE … IS NULL under the lock
 	f.apps[appID] = app
+	// Scenario 3 — mark the co-created over-module timers billed on this combined
+	// invoice terminally charged, in the SAME "transaction" (first-write-wins on
+	// grace_resolved, like the real MarkModuleTimerCharged WHERE grace_resolved = false).
+	for _, tc := range pc.TimerCharges {
+		if t, ok := f.timers[tc.TimerID]; ok && !t.graceResolved {
+			t.graceResolved = true
+			t.graceCharged = true
+			t.graceChargedAt = tc.ChargedAt
+			t.graceInvoiceID = tc.InvoiceID
+			t.graceInvoiceItemID = tc.InvoiceItemID
+		}
+	}
 	return cycle.ProrationLockedCharged, pc.InvoiceID, nil
 }
 
@@ -728,6 +742,52 @@ func (f *fakeStore) MarkModuleTimerCharged(_ context.Context, timerID uuid.UUID,
 		t.graceInvoiceItemID = invoiceItemID
 	}
 	return nil
+}
+
+// liveTimersForAccountFIFO returns the account's live timers ordered (installed_at
+// ASC, id ASC) — the FIFO order the rank/over predicates read.
+func (f *fakeStore) liveTimersForAccountFIFO(accountID uuid.UUID) []*fakeTimer {
+	var out []*fakeTimer
+	for _, t := range f.timers {
+		if t.accountID == accountID && !t.removed {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].installedAt.Equal(out[j].installedAt) {
+			return out[i].installedAt.Before(out[j].installedAt)
+		}
+		return out[i].id.String() < out[j].id.String()
+	})
+	return out
+}
+
+func (f *fakeStore) CountOngoingOverModuleTimers(_ context.Context, accountID uuid.UUID, includedModules int) (int, error) {
+	if f.errCountOngoingOver != nil {
+		return 0, f.errCountOngoingOver
+	}
+	// Live FIFO: the first includedModules are "included"; the rest are "over".
+	// Count the "over" tail that has already been charged at least once.
+	n := 0
+	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
+		if rank >= includedModules && t.graceCharged {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *fakeStore) CoCreatedOverModuleTimers(_ context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error) {
+	if f.errCoCreatedOver != nil {
+		return nil, f.errCoCreatedOver
+	}
+	var out []uuid.UUID
+	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
+		if rank >= includedModules && t.appID == appID && !t.graceResolved && t.installedAt.Equal(createdAt) {
+			out = append(out, t.id)
+		}
+	}
+	return out, nil
 }
 
 // --- helpers --------------------------------------------------------------

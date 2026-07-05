@@ -31,10 +31,7 @@ import (
 //     LIVE ms_billing.apps rows (deleted_at IS NULL — a deleted app stops
 //     accruing base, D1e, though its usage arrears above still bill) that
 //     EXISTED BEFORE the new period opened (created_at < the closed window's
-//     period_end) of the FLAT BaseFeeMicros. Module overage is NO longer billed
-//     here — it rides per-module-instance grace timers (migration 033, Leg 1 in
-//     cycle/overage.go); the boundary per-module overage precharge for ongoing
-//     modules (scenario 6) is a Stage B follow-up. An app created INSIDE the new
+//     period_end) of the FLAT BaseFeeMicros. An app created INSIDE the new
 //     period is excluded — RegisterApp's creation-proration leg already charged
 //     its new-period base (full or prorated); it joins the advance leg at the
 //     NEXT boundary. module_count is snapshotted AT CHARGE TIME, and each billed
@@ -44,7 +41,13 @@ import (
 //     account with NO mirror rows (pre-backfill) gets base 0 — exactly the
 //     pre-027 arrears-only invoice — until the api-platform backfill populates
 //     the roster.
-//  4. arrears + base == 0 (both zero) → MarkBillingRun('invoiced') with NO
+//     3b. ADVANCE overage leg (scenario 6, Leg 2): the NEW period's FULL $3-per-
+//     module precharge for every ONGOING over-module — a live install timer that
+//     is "over" per the live FIFO AND already charged at least once (survived its
+//     grace in an earlier period, continuing into the new one). On the SAME
+//     invoice, guarded by the SAME billing_run idempotency. A timer still inside
+//     its own grace stays purely on Leg 1's timer and is never double-counted here.
+//  4. arrears + base + overage == 0 → MarkBillingRun('invoiced') with NO
 //     Stripe call. We NEVER auto-create a Stripe Customer with nothing to
 //     charge (design §4 Axis 4).
 //  5. no usable default PM → MarkBillingRun('skipped_no_pm'). The usage is
@@ -142,22 +145,43 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("live app roster read failed", err)
 	}
-	// Each live app contributes ONLY its FLAT base. Module overage is NO longer
-	// billed here — it rides per-module-instance grace timers (migration 033,
-	// Leg 1 in cycle/overage.go); the boundary per-module overage precharge for
-	// ongoing modules (scenario 6) is a Stage B follow-up.
+	// Each live app contributes ONLY its FLAT base. Module overage is billed
+	// SEPARATELY below (the advance-overage / Leg 2 precharge), not folded into an
+	// app's base — it rides per-module-instance grace timers (migration 033).
 	var advanceBase int64
 	for range apps {
 		advanceBase += usage.BaseFeeMicros
 	}
 
-	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase}
+	// ADVANCE OVERAGE leg (scenario 6, Leg 2): the NEW period's $3-per-module
+	// precharge for every ONGOING over-module — a live install timer that is both
+	// "over" per the live FIFO AND already charged at least once (grace_charged_at
+	// set), i.e. a module that survived its own grace in an earlier period and
+	// continues into the new one. It is billed FULL (not prorated — the module
+	// exists for the whole new period), on the SAME boundary invoice as arrears +
+	// base, guarded by the SAME billing_run idempotency (keyed per-run, decided
+	// per-module-row now). A timer still inside its OWN grace (grace_charged_at
+	// NULL) is EXCLUDED here — it stays purely on Leg 1's independent timer and is
+	// never double-counted at the boundary. Empty/pre-backfill → 0.
+	overCount, err := s.store.CountOngoingOverModuleTimers(ctx, accountID, usage.IncludedModules)
+	if err != nil {
+		return nil, billing.Internal("ongoing over-module timer count failed", err)
+	}
+	advanceOverage := usage.ModuleOverageFeeMicros * int64(overCount)
 
-	// Zero-skip: only when arrears AND base are both zero (empty/zero period with
-	// no live apps) is there nothing to invoice — mark invoiced with NO Stripe
-	// call, never auto-create a Customer with nothing to charge. A zero total can
-	// never breach a limit/ceiling, so this short-circuits ahead of the risk gate.
-	if arrears == 0 && advanceBase == 0 {
+	// The whole boundary invoice: closed period's netted usage arrears + the new
+	// period's advance base + the new period's advance overage. The allowance nets
+	// USAGE only (never base or overage — both ride ON TOP, matching bill.go).
+	boundaryTotal := arrears + advanceBase + advanceOverage
+
+	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase, AdvanceOverageMicros: advanceOverage}
+
+	// Zero-skip: only when arrears, base AND overage are all zero (empty/zero
+	// period with no live apps or ongoing over-modules) is there nothing to
+	// invoice — mark invoiced with NO Stripe call, never auto-create a Customer
+	// with nothing to charge. A zero total can never breach a limit/ceiling, so
+	// this short-circuits ahead of the risk gate.
+	if boundaryTotal == 0 {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
 		}
@@ -169,11 +193,11 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// must NEVER auto-charge accrued arrears above the customer-set per-cycle
 	// ceiling. A breach skips the charge (usage RETAINED) rather than charging a
 	// shocking amount — checked against the NETTED USAGE arrears only, so the
-	// allowance is credited first and the predictable, customer-visible base fee
-	// never trips a cap that exists to guard against USAGE surprises. (When a
-	// breach skips, the whole invoice — base included — waits for the re-attempt,
-	// keeping one-invoice-per-boundary.) Independent of mode/credit-limit (a hard
-	// cap, not a trust judgment).
+	// allowance is credited first and the predictable, customer-visible base fee +
+	// overage never trip a cap that exists to guard against USAGE surprises. (When
+	// a breach skips, the whole invoice — base + overage included — waits for the
+	// re-attempt, keeping one-invoice-per-boundary.) Independent of mode/credit-
+	// limit (a hard cap, not a trust judgment).
 	if collection.ExceedsSpendCeiling(toCollectionAccount(acct), arrears) {
 		// skipped_ceiling, NOT skipped_prepaid: the ceiling is a per-cycle cap, not
 		// a mode transition — the account stays in arrears mode and the next cycle
@@ -271,15 +295,15 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 
 	// One invoice: closed period's netted usage arrears + the new period's advance
-	// base, converted micros → whole cents ONCE at the Stripe boundary (a single
-	// deterministic rounding point for the total).
-	cents, err := centsFromMicros(arrears + advanceBase)
+	// base + the new period's advance overage, converted micros → whole cents ONCE
+	// at the Stripe boundary (a single deterministic rounding point for the total).
+	cents, err := centsFromMicros(boundaryTotal)
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
 	if cents == 0 {
-		// A sub-half-cent arrears total (an advance base, when present, is always ≥
-		// $20 and can never round to 0) — never call Stripe for $0.
+		// A sub-half-cent arrears total (an advance base/overage, when present, is
+		// always ≥ $3 and can never round to 0) — never call Stripe for $0.
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (zero cents) failed", err)
 		}
@@ -290,7 +314,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 
 	// Charge. A failure after the PM gate marks the run 'failed' (auditable) and
 	// returns the error.
-	inv, err := s.charge(ctx, runID, custID, cents, advanceBase > 0)
+	inv, err := s.charge(ctx, runID, custID, cents, advanceBase+advanceOverage > 0)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is
@@ -301,12 +325,13 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.StripeError("charge failed", err)
 	}
 
-	// Post-hoc large-charge disclosure (migration 034): the charge SUCCEEDED
-	// above; flag it as "large" iff the amount just charged (netted usage
-	// arrears + advance base, in micros, the SAME value converted to cents
-	// above) exceeds the account's threshold resolved AT CHARGE TIME (its
-	// per-account override, or the platform default when NULL). Pure disclosure —
-	// it changes NO charging behaviour, only surfaces the already-successful debit.
+	// Post-hoc large-charge disclosure (migration 034, scenario 5): the charge
+	// SUCCEEDED above; flag it as "large" iff the amount just charged (netted
+	// usage arrears + advance base + advance overage, in micros — the SAME
+	// boundaryTotal converted to cents above) exceeds the account's threshold
+	// resolved AT CHARGE TIME (its per-account override, or the platform default
+	// when NULL) via the shared flagLargeAutoCollect helper. Pure disclosure — it
+	// changes NO charging behaviour, only surfaces the already-successful debit.
 	//
 	// The threshold is RE-RESOLVED HERE — immediately after the Stripe call
 	// succeeded — rather than reusing `acct` loaded at the top of this
@@ -332,7 +357,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		Currency:           chargeCurrency,
 		PeriodStart:        periodStart,
 		PeriodEnd:          periodEnd,
-		IsLargeAutoCollect: collection.IsLargeAutoCollect(arrears+advanceBase, postChargeAcct.AutoCollectThresholdMicros),
+		IsLargeAutoCollect: flagLargeAutoCollect(boundaryTotal, postChargeAcct),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
@@ -366,11 +391,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 }
 
 // charge creates the Stripe invoice item + draft invoice for the boundary total
-// (usage arrears + advance base), with the two deterministic Idempotency-Keys
-// (ii-<run>, inv-<run>) so a re-run reuses the same Stripe objects. withBase only
-// widens the line DESCRIPTION when the total includes an advance base fee — a
-// pure-usage invoice keeps the historical line text. Returns the created invoice
-// projection (id/status/amounts) for the mirror upsert.
+// (usage arrears + advance base + advance overage), with the two deterministic
+// Idempotency-Keys (ii-<run>, inv-<run>) so a re-run reuses the same Stripe
+// objects. withBase only widens the line DESCRIPTION when the total includes an
+// advance base fee and/or ongoing-module overage — a pure-usage invoice keeps the
+// historical line text. Returns the created invoice projection (id/status/amounts)
+// for the mirror upsert.
 func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool) (billingstripe.Invoice, error) {
 	desc := fmt.Sprintf("MirrorStack usage — run %s", runID)
 	if withBase {
@@ -465,6 +491,20 @@ func (s *Service) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID
 // per-metric) — matching the single combined invoice item this leg creates.
 func invoiceItemIdemKey(runID uuid.UUID) string { return "ii-" + runID.String() }
 func invoiceIdemKey(runID uuid.UUID) string     { return "inv-" + runID.String() }
+
+// flagLargeAutoCollect is the ONE large-charge disclosure resolver (scenario 5,
+// migration 034), called from EVERY off-session charge site — the boundary leg
+// (charge.go), the creation/combined leg (proration.go), and the per-module grace
+// leg (overage.go / Leg 1) — so the "large auto-collect" flag on a mirrored
+// invoice row is computed identically everywhere and never reimplemented per leg.
+// chargedMicros is the RAW pre-cents-conversion amount that just successfully
+// charged; acct MUST be the account state read immediately AFTER the Stripe call
+// succeeded (its per-account threshold override, or the platform default when
+// nil), so a threshold edit landing concurrently with the charge is honored the
+// same way at every site.
+func flagLargeAutoCollect(chargedMicros int64, acct AccountCollection) bool {
+	return collection.IsLargeAutoCollect(chargedMicros, acct.AutoCollectThresholdMicros)
+}
 
 // toCollectionAccount maps the cycle store's AccountCollection to the pure-policy
 // collection.Account the risk-judge reasons over. Kept here so the collection

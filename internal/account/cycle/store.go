@@ -306,6 +306,20 @@ type Store interface {
 	// the GENUINE Stripe invoice / invoice-item ids (never idempotency-key
 	// strings). WHERE grace_resolved IS false keeps a crash-retry idempotent.
 	MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error
+
+	// CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario
+	// 6): the count of the account's live timers that are BOTH "over" (live-FIFO
+	// rank >= includedModules) AND already charged at least once (an ongoing
+	// over-module continuing into the new period). A timer still in its own grace
+	// (never charged) is excluded — it stays on Leg 1's timer, never double-counted.
+	CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int) (int, error)
+
+	// CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
+	// ids of an app's live, unresolved install timers whose install instant equals
+	// the app's createdAt (co-created at app creation) AND that are "over" (live-FIFO
+	// rank >= includedModules) — the co-created over-modules folded onto the app's
+	// own creation-proration invoice, priced from the same day-0 window.
+	CoCreatedOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error)
 }
 
 // ModuleOverageCandidate is one per-module-instance install timer the Leg 1
@@ -1108,6 +1122,22 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 		return 0, "", err
 	}
 
+	// Scenario 3 — stamp the co-created over-module timers billed on this SAME
+	// combined invoice as terminally charged, in the SAME transaction as the guard
+	// arm (all-or-nothing: an over-module and the app base are marked together).
+	// WHERE grace_resolved = false is first-write-wins — a Leg 1 sweep that already
+	// resolved a timer (its own invoice) affects 0 rows here, keeping the winner's ids.
+	for _, tc := range pc.TimerCharges {
+		if err := qtx.MarkModuleTimerCharged(ctx, db.MarkModuleTimerChargedParams{
+			TimerID:            tc.TimerID.String(),
+			GraceChargedAt:     tc.ChargedAt,
+			GraceInvoiceID:     pgtype.Text{String: tc.InvoiceID, Valid: tc.InvoiceID != ""},
+			GraceInvoiceItemID: pgtype.Text{String: tc.InvoiceItemID, Valid: tc.InvoiceItemID != ""},
+		}); err != nil {
+			return 0, "", err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return 0, "", err
 	}
@@ -1314,6 +1344,30 @@ func (s *pgxStore) MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID
 		GraceInvoiceID:     pgtype.Text{String: invoiceID, Valid: invoiceID != ""},
 		GraceInvoiceItemID: pgtype.Text{String: invoiceItemID, Valid: invoiceItemID != ""},
 	})
+}
+
+func (s *pgxStore) CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int) (int, error) {
+	n, err := s.q.CountOngoingOverModuleTimers(ctx, db.CountOngoingOverModuleTimersParams{
+		AccountID:       accountID.String(),
+		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is the small IncludedModules const (5)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (s *pgxStore) CoCreatedOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error) {
+	ids, err := s.q.CoCreatedOverModuleTimers(ctx, db.CoCreatedOverModuleTimersParams{
+		AccountID:       accountID.String(),
+		AppID:           appID.String(),
+		CreatedAt:       createdAt,
+		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is the small IncludedModules const (5)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(ids)
 }
 
 // parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc

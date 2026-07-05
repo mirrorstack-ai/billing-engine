@@ -5,7 +5,6 @@ import (
 	"context"
 	"slices"
 	"sort"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -173,14 +172,16 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	}
 
 	// Account overage line (migration 033): the steady-state monthly estimate
-	// from the CURRENT live pool — $3 × max(0, pooled − IncludedModules). Under
-	// the per-module-instance model overage is billed per install on its own
-	// grace timer (Leg 1); the display shows the live steady-state figure (the
-	// display doesn't prorate; the charge legs own proration) rather than a
-	// per-period frozen snapshot (a faithful per-period display from the timer
-	// rows is a Stage B follow-up). It is an ACCOUNT line, never allocated back
-	// per app.
-	accountOverage, err := s.accountOverageMicros(ctx, accountID, periodStart)
+	// from the CURRENT live install timers — $3 × max(0, live − IncludedModules).
+	// Under the per-module-instance model overage is billed per install on its own
+	// grace timer (Leg 1) / at the boundary (Leg 2); the display sums the live
+	// "over" timer rows and prices them at the steady-state $3 each — the timer
+	// table is the overage model's source of truth. The display does not prorate
+	// (the charge legs own proration), so this is an estimate of the period's
+	// overage, not a per-line replay of the exact prorated amounts invoiced (that
+	// would need a per-timer charged-micros column — a follow-up). It is an
+	// ACCOUNT line, never allocated back per app.
+	accountOverage, err := s.accountOverageMicros(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -209,19 +210,19 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 }
 
 // accountOverageMicros resolves the account overage shown on the bill: the
-// steady-state monthly estimate AccountOverageMicros(current pooled sum) = $3 ×
-// max(0, pooled − IncludedModules). Under the per-module-instance overage model
-// (migration 033) overage is billed per install on its own grace timer (Leg 1,
-// cycle/overage.go); the display shows the live steady-state figure rather than a
-// per-period frozen snapshot (a faithful per-period display from the timer rows
-// is a Stage B follow-up). The PaaS credit never offsets it (overage rides ON
-// TOP, like the base fee), so it is resolved outside the credit math.
-func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID, _ time.Time) (int64, error) {
-	pooled, err := s.store.PooledModuleCount(ctx, accountID)
+// steady-state monthly estimate AccountOverageMicros(live timer count) = $3 ×
+// max(0, live − IncludedModules), where `live` is the count of the account's
+// currently-live install timers (migration 033) — the overage model's source of
+// truth. The first IncludedModules live timers (by FIFO) are "included"; the rest
+// are "over", so max(0, live − included) is exactly the live over-count the charge
+// legs tier on. The PaaS credit never offsets it (overage rides ON TOP, like the
+// base fee), so it is resolved outside the credit math.
+func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID) (int64, error) {
+	live, err := s.store.LiveModuleTimerCountForAccount(ctx, accountID)
 	if err != nil {
-		return 0, billing.Internal("pooled module count lookup failed", err)
+		return 0, billing.Internal("live module timer count lookup failed", err)
 	}
-	return AccountOverageMicros(pooled), nil
+	return AccountOverageMicros(live), nil
 }
 
 // accountPaasCreditMicros is the ACCOUNT-level PaaS credit: the same

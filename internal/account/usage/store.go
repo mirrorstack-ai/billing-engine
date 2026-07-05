@@ -209,12 +209,14 @@ type Store interface {
 	// residual ledger rows still enumerate through AppIDsWithUsage).
 	MirroredAppIDs(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
 
-	// PooledModuleCount returns the account-wide installed-module count:
-	// SUM(module_count) over the account's LIVE apps. Under the per-module-
-	// instance overage model (migration 033) it is the sole input to
-	// GetAccountBill's account-overage line, shown as the steady-state estimate
-	// $3 × max(0, pooled − IncludedModules) (usage.AccountOverageMicros).
-	PooledModuleCount(ctx context.Context, accountID uuid.UUID) (int, error)
+	// LiveModuleTimerCountForAccount returns the account's currently-live install-
+	// timer count (removed_at IS NULL) — the DISPLAY input to GetAccountBill's
+	// account-overage line under the per-module-instance overage model (migration
+	// 033), shown as the steady-state estimate $3 × max(0, live − IncludedModules)
+	// (usage.AccountOverageMicros). Reads the timer table (the overage model's
+	// source of truth) rather than SUM(apps.module_count), so the shown overage
+	// stays tied to the exact rows the charge legs tier on.
+	LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -617,17 +619,18 @@ func (s *pgxStore) MirroredAppIDs(ctx context.Context, accountID uuid.UUID, peri
 	return parseAppIDs(rows)
 }
 
-// PooledModuleCount sums module_count over the account's live apps — the live
-// input to GetAccountBill's steady-state account-overage estimate ($3 × max(0,
-// pooled − IncludedModules)). Under the per-module-instance overage model
-// (migration 033) the display no longer reads a per-period frozen snapshot; the
-// live pooled estimate IS the shown account-overage line.
-func (s *pgxStore) PooledModuleCount(ctx context.Context, accountID uuid.UUID) (int, error) {
-	sum, err := s.q.SumLiveModuleCount(ctx, accountID.String())
+// LiveModuleTimerCountForAccount counts the account's currently-live install
+// timers (removed_at IS NULL) — the live input to GetAccountBill's steady-state
+// account-overage estimate ($3 × max(0, live − IncludedModules)). Under the
+// per-module-instance overage model (migration 033) the display reads the timer
+// table (the model's source of truth) instead of SUM(apps.module_count), so the
+// shown overage stays tied to the exact rows the charge legs tier on.
+func (s *pgxStore) LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	n, err := s.q.CountLiveModuleTimersForAccount(ctx, accountID.String())
 	if err != nil {
 		return 0, err
 	}
-	return int(sum), nil
+	return int(n), nil
 }
 
 // parseAppIDs decodes a generated query's text app_id column into uuid.UUIDs,

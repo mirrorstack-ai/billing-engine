@@ -94,3 +94,67 @@ func TestModuleOverageTimers_Integration_SynthesisFIFOAndSweep(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, n)
 }
+
+// Stage B: the row_number()-windowed reads backing scenario 3 (CoCreatedOverModuleTimers),
+// scenario 6 / Leg 2 (CountOngoingOverModuleTimers), and the display
+// (CountLiveModuleTimersForAccount) — validated against real Postgres, since the
+// unit fakes only approximate the FIFO window function in Go.
+func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	_, err := pool.Exec(ctx, `UPDATE ms_billing.accounts SET activated_at = $2 WHERE id = $1`,
+		acct.String(), mustTime(t, "2026-05-04T00:00:00Z"))
+	require.NoError(t, err)
+
+	appA, appB := uuid.New(), uuid.New()
+	created := mustTime(t, "2026-06-19T12:00:00Z")
+	require.NoError(t, store.InsertAppMirror(ctx, appA, acct, 7, created))
+	require.NoError(t, store.InsertAppMirror(ctx, appB, acct, 0, created))
+
+	// appA: 7 co-created install timers at created_at → FIFO ranks 0-6, so 2 are
+	// "over" (rank ≥ IncludedModules=5).
+	require.NoError(t, store.InsertModuleOverageTimers(ctx, acct, appA, created, created.AddDate(0, 0, 3), 7))
+
+	// CountLiveModuleTimersForAccount (via the usage store, the display's real
+	// consumer) = the account-overage over-count input (7 live).
+	usageStore := usage.NewStore(pool)
+	liveN, err := usageStore.LiveModuleTimerCountForAccount(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, 7, liveN)
+
+	// CoCreatedOverModuleTimers: the 2 co-created over-modules (rank ≥ 5), unresolved.
+	over, err := store.CoCreatedOverModuleTimers(ctx, acct, appA, created, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Len(t, over, 2, "7 co-created → 2 over the included 5")
+
+	// Before any charge, none are "ongoing" (grace_charged_at all NULL).
+	ongoing, err := store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Zero(t, ongoing, "nothing charged yet → no ongoing over-module")
+
+	// Charge the 2 co-created over-modules (scenario 3) → they become "ongoing".
+	for _, id := range over {
+		require.NoError(t, store.MarkModuleTimerCharged(ctx, id, created.AddDate(0, 0, 3), "in_x", "ii_x"))
+	}
+	ongoing, err = store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Equal(t, 2, ongoing, "the 2 charged over-modules are ongoing")
+	// And they're no longer co-created candidates (grace_resolved now true).
+	over, err = store.CoCreatedOverModuleTimers(ctx, acct, appA, created, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Empty(t, over)
+
+	// appB adds one LATER over-module (rank 7) still in its own grace (uncharged):
+	// live count rises to 8, but the ongoing count stays 2 (uncharged excluded).
+	late := mustTime(t, "2026-06-28T00:00:00Z")
+	require.NoError(t, store.InsertModuleOverageTimers(ctx, acct, appB, late, late.AddDate(0, 0, 3), 1))
+	liveN, err = usageStore.LiveModuleTimerCountForAccount(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, 8, liveN)
+	ongoing, err = store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Equal(t, 2, ongoing, "the in-grace (uncharged) over-module is NOT ongoing")
+}

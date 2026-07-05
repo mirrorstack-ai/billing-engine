@@ -43,7 +43,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
-	"github.com/mirrorstack-ai/billing-engine/internal/account/collection"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
@@ -119,11 +118,28 @@ const (
 // snapshot to freeze (migration 028, source='proration'), and the invoice id
 // that arms the one-shot guard. Cents is echoed to the caller. A nil return from
 // the callback means "nothing to charge" (0 cents) — the store persists nothing.
+//
+// TimerCharges (scenario 3) are the co-created over-module install timers billed
+// as ADDITIONAL line items on this SAME invoice. persistProrationCharge stamps
+// each grace_resolved/grace_charged in the SAME transaction that arms the app
+// guard, so the combined charge is all-or-nothing: a co-created over-module and
+// the app base fee are billed and marked together, never one without the other.
 type ProrationCharge struct {
-	InvoiceID string
-	Cents     int64
-	Invoice   InvoiceMirror
-	Snapshot  AppBaseSnapshot
+	InvoiceID    string
+	Cents        int64
+	Invoice      InvoiceMirror
+	Snapshot     AppBaseSnapshot
+	TimerCharges []ModuleTimerCharge
+}
+
+// ModuleTimerCharge is one co-created over-module install timer's terminal
+// "over and charged" mark (scenario 3): the timer id + the REAL Stripe
+// invoice/invoice-item ids of the line it rode on the combined creation invoice.
+type ModuleTimerCharge struct {
+	TimerID       uuid.UUID
+	ChargedAt     time.Time
+	InvoiceID     string
+	InvoiceItemID string
 }
 
 // ChargeCreationProration charges (once) the creation-period base proration for
@@ -253,13 +269,11 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		// anchor from the activation day). Derived from created_at, NEVER from now,
 		// so the amount is deterministic regardless of when the sweep fires.
 		periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(locked.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
-		// The creation proration is the FLAT per-app base only (migration 032 —
-		// module overage is no longer a per-app tier; it is billed per module
-		// instance via its own grace timer, and co-created over-modules are added
-		// as a SEPARATE line on this same invoice by the module-overage grace
-		// leg). created_module_count is still frozen at RegisterApp time and
-		// recorded on the snapshot for display, but it no longer moves the base
-		// amount — a create with 0 or 50 modules prorates the identical flat base.
+		// The creation proration is the FLAT per-app base (migration 032 — module
+		// overage is no longer a per-app tier; it is billed per module instance via
+		// its own grace timer). created_module_count is still frozen at RegisterApp
+		// time and recorded on the snapshot for display, but it no longer moves the
+		// base amount — a create with 0 or 50 modules prorates the identical flat base.
 		prorated := usage.ProratedBaseMicros(usage.BaseFeeMicros, locked.CreatedAt, periodStart, periodEnd)
 		c, err := centsFromMicros(prorated)
 		if err != nil {
@@ -273,20 +287,60 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		if _, err := s.stripe.CreateInvoiceItem(ctx, custID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
 			return nil, billing.StripeError("proration invoice item failed", err)
 		}
+
+		// Scenario 3 — the combined creation invoice. Modules co-created with the
+		// app (install date == created_at) that are "over" per the live FIFO have
+		// their OWN grace elapse at this SAME instant (same GraceDays anchor), so
+		// bill them as ADDITIONAL line items on this SAME invoice rather than minting
+		// a second one. Each is $3 prorated over the IDENTICAL day-0 → period-end
+		// window as the base (same created_at, so every co-created module is the
+		// same amount). They use the SAME per-timer idem keys (mod-overage-ii-<id>)
+		// Leg 1 would use, so if Leg 1 races and charges one first, this
+		// CreateInvoiceItem returns the already-consumed item and the money lands
+		// exactly once; the grace_resolved guard (persistProrationCharge) records the
+		// winner. Priced/marked BEFORE the invoice is created so all lines pool onto it.
+		overTimers, err := s.store.CoCreatedOverModuleTimers(ctx, locked.AccountID, locked.AppID, locked.CreatedAt, usage.IncludedModules)
+		if err != nil {
+			return nil, billing.Internal("co-created over-module timers lookup failed", err)
+		}
+		overageMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, locked.CreatedAt, periodStart, periodEnd)
+		overageCents, err := centsFromMicros(overageMicros)
+		if err != nil {
+			return nil, billing.Internal("overage micros to cents conversion failed", err)
+		}
+		var timerCharges []ModuleTimerCharge
+		var overageTotalMicros int64
+		if overageCents > 0 {
+			overDesc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", locked.AppID)
+			for _, timerID := range overTimers {
+				item, err := s.stripe.CreateInvoiceItem(ctx, custID, overageCents, chargeCurrency, overDesc, moduleOverageItemIdemKey(timerID))
+				if err != nil {
+					return nil, billing.StripeError("combined module overage invoice item failed", err)
+				}
+				timerCharges = append(timerCharges, ModuleTimerCharge{
+					TimerID:       timerID,
+					ChargedAt:     s.nowFn().UTC(),
+					InvoiceItemID: item.ID,
+				})
+				overageTotalMicros += overageMicros
+			}
+		}
+
 		inv, err := s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, appProrationInvoiceIdemKey(locked.AppID))
 		if err != nil {
 			return nil, billing.StripeError("proration invoice failed", err)
 		}
+		// Stamp the (single) combined-invoice id onto each co-created overage mark.
+		for i := range timerCharges {
+			timerCharges[i].InvoiceID = inv.ID
+		}
 
 		// Resolve the account's large-charge disclosure threshold AT CHARGE TIME,
-		// immediately AFTER the Stripe calls above succeeded — the SAME point
-		// relative to the actual charge that RunBillingCycle's boundary leg
-		// resolves its own threshold (charge.go). Both charge legs agreeing on
-		// this point means a threshold edit landing concurrently with a charge is
-		// honored identically by both. A prorated app base fee rarely crosses the
-		// $100 default, but the flag is computed uniformly at every off-session
-		// charge call site (migration 034) so no successful large debit escapes
-		// disclosure.
+		// immediately AFTER the Stripe calls above succeeded — the SAME point (via
+		// the shared flagLargeAutoCollect helper, scenario 5) every off-session
+		// charge site uses, so a threshold edit landing concurrently with a charge is
+		// honored identically everywhere. The flag reflects the FULL combined debit
+		// (base + every co-created overage line).
 		acct, err := s.store.AccountCollection(ctx, locked.AccountID)
 		if err != nil {
 			return nil, billing.Internal("account collection lookup failed", err)
@@ -308,10 +362,11 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				Currency:           chargeCurrency,
 				PeriodStart:        partialStart,
 				PeriodEnd:          periodEnd,
-				IsLargeAutoCollect: collection.IsLargeAutoCollect(prorated, acct.AutoCollectThresholdMicros),
+				IsLargeAutoCollect: flagLargeAutoCollect(prorated+overageTotalMicros, acct),
 			},
 			// Freeze what was billed keyed by the FULL anchored period_start (the
-			// display identity, migration 028); BaseMicros is the prorated amount.
+			// display identity, migration 028); BaseMicros is the prorated BASE amount
+			// (the co-created overage rides the per-module timers, not the base snapshot).
 			Snapshot: AppBaseSnapshot{
 				AppID:       locked.AppID,
 				PeriodStart: periodStart,
@@ -319,6 +374,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				ModuleCount: locked.CreatedModuleCount,
 				BaseMicros:  prorated,
 			},
+			TimerCharges: timerCharges,
 		}, nil
 	})
 	if err != nil {

@@ -126,21 +126,3 @@ func TestProratedBaseMicros_ClampedAnchorMonth(t *testing.T) {
 	got = usage.ProratedBaseMicros(usage.BaseFeeMicros, day(2026, 3, 1), day(2026, 2, 28), day(2026, 3, 31))
 	require.EqualValues(t, 19_354_839, got)
 }
-
-func TestProratedOverageMicros_ProratesPooledOverageFromGraceEnd(t *testing.T) {
-	// Migration 032: the mid-period sweep prorates the account-wide POOLED
-	// overage from grace-end to the period end with the SAME day-count math as
-	// ProratedBaseMicros. Pool of 7 → 2 over → $6/period; grace ends mid-period
-	// (Jun 19 → 15 of a 30-day [Jun 4, Jul 4) period) → half → $3.
-	overage := usage.AccountOverageMicros(7)
-	require.EqualValues(t, 6_000_000, overage)
-	got := usage.ProratedOverageMicros(overage, day(2026, 6, 19), day(2026, 6, 4), day(2026, 7, 4))
-	require.EqualValues(t, 3_000_000, got)
-
-	// grace-end on/before the period start → the FULL pooled overage (over the
-	// whole period).
-	require.EqualValues(t, overage, usage.ProratedOverageMicros(overage, day(2026, 6, 4), day(2026, 6, 4), day(2026, 7, 4)))
-
-	// grace-end on/after the period end → 0 (grace ends after this period).
-	require.EqualValues(t, 0, usage.ProratedOverageMicros(overage, day(2026, 7, 4), day(2026, 6, 4), day(2026, 7, 4)))
-}

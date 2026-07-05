@@ -2,50 +2,38 @@ package usage
 
 import "time"
 
-// This file is the SINGLE home of the base-fee + pooled-overage math (owner
-// spec 2026-07-05, DESIGN.md "Base fee — v1 spec"; account-wide overage
-// reversal, migration 032). Both consumers — the display read (GetAppBill /
-// GetAccountBill, this package) and the charge spine (cycle: the RegisterApp
-// creation-proration charge, the boundary advance leg, the mid-period grace
-// sweep) — compute the per-app FLAT base and the account-wide pooled overage
-// through these functions, so the bill page, the invoice, and the mirror can
-// never disagree by construction. All money is integer micro-dollars; the
-// arithmetic here is pure int64 (no big.Rat needed: the operands are bounded —
-// see ProratedBaseMicros).
+// This file is the SINGLE home of the base-fee + overage display math (owner
+// spec 2026-07-05, DESIGN.md "Base fee — v2: creation grace + per-module overage
+// timers"). Both consumers — the display read (GetAppBill / GetAccountBill, this
+// package) and the charge spine (cycle: the creation/combined charge, the
+// boundary advance leg, the per-module grace sweep) — compute the per-app FLAT
+// base and the account overage through these functions, so the bill page, the
+// invoice, and the mirror can never disagree by construction. All money is
+// integer micro-dollars; the arithmetic here is pure int64 (no big.Rat needed:
+// the operands are bounded — see ProratedBaseMicros).
 //
-// Overage moved from PER-APP to ACCOUNT-WIDE POOLED (migration 032): the flat
-// $20/app base is per-app and unchanged, but the $3/module surcharge now
-// applies ONCE per account to max(0, Σ live-app module_count − IncludedModules)
-// — see AccountOverageMicros. There is deliberately NO per-app overage helper
-// anymore: an app's base is just the flat (plan-resolved) fee.
+// The flat $20/app base is per-app; the $3/module surcharge applies to the
+// account's over-count, max(0, live module count − IncludedModules). Under the
+// per-module-instance model (migration 033) the charge legs tier per install
+// TIMER (each on its own grace), while the DISPLAY reads the live timer count
+// through AccountOverageMicros. There is deliberately NO per-app overage helper:
+// an app's base is just the flat (plan-resolved) fee.
 
-// AccountOverageMicros is the account-wide POOLED module overage for one
-// period:
+// AccountOverageMicros is the account's module overage shown for one period:
 //
-//	ModuleOverageFeeMicros × max(0, pooledModuleCount − IncludedModules)
+//	ModuleOverageFeeMicros × max(0, liveModuleCount − IncludedModules)
 //
-// pooledModuleCount is SUM(module_count) over the account's LIVE apps (one pool
-// of IncludedModules for the WHOLE account, not per app). A pooledModuleCount
-// ≤ IncludedModules yields 0 (the max(0, …) clamp makes the function total;
-// a negative count cannot occur — the sum of non-negative DB-CHECKed counts).
-func AccountOverageMicros(pooledModuleCount int) int64 {
-	if extra := pooledModuleCount - IncludedModules; extra > 0 {
+// liveModuleCount is the account's live installed-module count (the count of live
+// install timers, migration 033 — one pool of IncludedModules for the WHOLE
+// account, not per app). The first IncludedModules live installs (by FIFO) are
+// "included"; the rest are "over", so max(0, live − included) is exactly the live
+// over-count. A liveModuleCount ≤ IncludedModules yields 0 (the max(0, …) clamp
+// makes the function total; a negative count cannot occur — a live-row count).
+func AccountOverageMicros(liveModuleCount int) int64 {
+	if extra := liveModuleCount - IncludedModules; extra > 0 {
 		return ModuleOverageFeeMicros * int64(extra)
 	}
 	return 0
-}
-
-// ProratedOverageMicros prorates an account-wide pooled overage amount for the
-// period [periodStart, periodEnd), covering [grace-end day, periodEnd): the
-// SAME day-count round-half-up math as ProratedBaseMicros (the overage amount
-// is prorated exactly like a base amount), but ANCHORED on the grace-end
-// instant instead of an app's creation instant. graceEnd on/before periodStart
-// → the FULL overage (the account was over for the whole period); graceEnd
-// on/after periodEnd → 0 (grace ends after this period — nothing to charge
-// yet). Kept as a named wrapper so the semantic ("prorate FROM grace-end") is
-// legible at the mid-period grace sweep's call site.
-func ProratedOverageMicros(overageMicros int64, graceEnd, periodStart, periodEnd time.Time) int64 {
-	return ProratedBaseMicros(overageMicros, graceEnd, periodStart, periodEnd)
 }
 
 // ProratedBaseMicros prorates an app's per-period base fee for the period

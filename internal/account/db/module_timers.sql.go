@@ -12,6 +12,121 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const coCreatedOverModuleTimers = `-- name: CoCreatedOverModuleTimers :many
+SELECT id
+FROM (
+    SELECT id, app_id, installed_at, grace_resolved,
+           row_number() OVER (ORDER BY installed_at, id) AS rn
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = $1::uuid
+      AND removed_at IS NULL
+) ranked
+WHERE app_id = $2::uuid
+  AND installed_at = $3::timestamptz
+  AND grace_resolved = false
+  AND rn > $4::int
+ORDER BY installed_at, id
+`
+
+type CoCreatedOverModuleTimersParams struct {
+	AccountID       string    `json:"account_id"`
+	AppID           string    `json:"app_id"`
+	CreatedAt       time.Time `json:"created_at"`
+	IncludedModules int32     `json:"included_modules"`
+}
+
+// CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
+// ids of the app's live, unresolved install timers whose install instant IS the
+// app's created_at (co-created at app creation) AND that are "over" (live-FIFO
+// rank >= included). Their grace elapses at the SAME instant as the app's own
+// creation grace, so the creation-proration charge folds them onto ONE invoice.
+// The rank window spans ALL the account's live timers (an included module still
+// occupies a FIFO slot), so rn > @included_modules is the 0-based rank >= included
+// "over" predicate; the outer filter keeps only this app's co-created, still-
+// unresolved rows. Ordered (installed_at, id) for a deterministic charge order.
+func (q *Queries) CoCreatedOverModuleTimers(ctx context.Context, arg CoCreatedOverModuleTimersParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, coCreatedOverModuleTimers,
+		arg.AccountID,
+		arg.AppID,
+		arg.CreatedAt,
+		arg.IncludedModules,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const countLiveModuleTimersForAccount = `-- name: CountLiveModuleTimersForAccount :one
+SELECT COALESCE(count(*), 0)::bigint AS live_count
+FROM ms_billing.app_module_overage_timers
+WHERE account_id = $1
+  AND removed_at IS NULL
+`
+
+// CountLiveModuleTimersForAccount returns the account's currently-live
+// (removed_at IS NULL) install-timer count — the DISPLAY read behind
+// GetAccountBill's account-overage line under the per-module-instance model
+// (migration 033). The steady-state estimate $3 × max(0, live − included) counts
+// the live "over" rows (the FIFO tail past the included 5); reading the timer
+// table (the overage model's source of truth) rather than SUM(apps.module_count)
+// keeps the shown overage tied to the rows the charge legs actually tier on.
+// ::bigint keeps the aggregate a non-nullable scalar.
+func (q *Queries) CountLiveModuleTimersForAccount(ctx context.Context, accountID string) (int64, error) {
+	row := q.db.QueryRow(ctx, countLiveModuleTimersForAccount, accountID)
+	var live_count int64
+	err := row.Scan(&live_count)
+	return live_count, err
+}
+
+const countOngoingOverModuleTimers = `-- name: CountOngoingOverModuleTimers :one
+SELECT COALESCE(count(*), 0)::bigint AS over_count
+FROM (
+    SELECT grace_charged_at,
+           row_number() OVER (ORDER BY installed_at, id) AS rn
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = $1::uuid
+      AND removed_at IS NULL
+) ranked
+WHERE rn > $2::int
+  AND grace_charged_at IS NOT NULL
+`
+
+type CountOngoingOverModuleTimersParams struct {
+	AccountID       string `json:"account_id"`
+	IncludedModules int32  `json:"included_modules"`
+}
+
+// CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario 6):
+// the count of the account's currently-live install timers that are BOTH "over"
+// (live-FIFO rank >= included) AND already charged at least once (grace_charged_at
+// IS NOT NULL) — i.e. ongoing over-modules continuing into the new period, each
+// owed a FULL $3 precharge on the boundary invoice. row_number() over the whole
+// live set gives every live timer its 1-based FIFO rank; rn > @included_modules is
+// exactly the 0-based rank >= included ("over") predicate. A timer whose grace has
+// not elapsed yet (grace_charged_at IS NULL) is EXCLUDED — it stays on Leg 1's own
+// timer and is never double-counted here. "over" is re-derived LIVE, so a charged
+// timer that has since flipped to "included" (an earlier install removed) is not
+// counted.
+func (q *Queries) CountOngoingOverModuleTimers(ctx context.Context, arg CountOngoingOverModuleTimersParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOngoingOverModuleTimers, arg.AccountID, arg.IncludedModules)
+	var over_count int64
+	err := row.Scan(&over_count)
+	return over_count, err
+}
+
 const insertModuleOverageTimers = `-- name: InsertModuleOverageTimers :exec
 INSERT INTO ms_billing.app_module_overage_timers
     (account_id, app_id, installed_at, grace_expires_at)

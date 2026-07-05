@@ -40,10 +40,12 @@ type fakeStore struct {
 	appMirrors             map[uuid.UUID]usage.AppMirrorInfo    // app_id → ms_billing.apps roster row (migration 027)
 	baseSnapshots          map[string]usage.AppBaseSnapshotInfo // app_id/period_start → charged-base snapshot (migration 028)
 
-	// per-module overage display (migration 033): PooledModuleCount sums the
-	// appMirrors' module_count (like the SQL over ms_billing.apps) — the sole
-	// input to GetAccountBill's steady-state account-overage estimate.
-	errPooledCount error
+	// per-module overage display (migration 033): LiveModuleTimerCountForAccount
+	// counts the account's live install timers — the sole input to
+	// GetAccountBill's steady-state account-overage estimate. The single-account
+	// usage fake models it as Σ module_count over its live appMirrors (one live
+	// timer per installed module), so display tests set counts on appMirrors.
+	errLiveTimerCount error
 
 	// usageAppIDs is what AppIDsWithUsage enumerates (the usage half of
 	// GetAccountBill's roster); the mirror half is DERIVED from appMirrors with
@@ -188,14 +190,14 @@ func (f *fakeStore) AppBaseSnapshot(_ context.Context, appID uuid.UUID, periodSt
 	return s, ok, nil
 }
 
-// PooledModuleCount returns the account's live pooled module count: Σ
-// module_count over the non-deleted appMirrors, mirroring the SQL over
-// ms_billing.apps — the sole input to GetAccountBill's steady-state
-// account-overage estimate (migration 033). The single-account usage fake holds
-// one account's roster, so it sums every live mirror row.
-func (f *fakeStore) PooledModuleCount(_ context.Context, _ uuid.UUID) (int, error) {
-	if f.errPooledCount != nil {
-		return 0, f.errPooledCount
+// LiveModuleTimerCountForAccount returns the account's live install-timer count
+// — the sole input to GetAccountBill's steady-state account-overage estimate
+// (migration 033). The single-account usage fake models one live timer per
+// installed module, so it sums module_count over the non-deleted appMirrors
+// (numerically identical to counting live timer rows).
+func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, _ uuid.UUID) (int, error) {
+	if f.errLiveTimerCount != nil {
+		return 0, f.errLiveTimerCount
 	}
 	sum := 0
 	for _, m := range f.appMirrors {

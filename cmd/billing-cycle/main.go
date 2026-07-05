@@ -70,10 +70,17 @@ func main() {
 	}
 
 	// Local one-shot run: close every card-bound account's just-ended anchored
-	// period as of now AND sweep the creation-proration grace queue, then exit.
-	// No HTTP listener — the dev cycle is a single batch invocation.
+	// period as of now, sweep the creation-proration grace queue (scenario 3 —
+	// combined creation invoice), then sweep the per-module overage grace queue
+	// (Leg 1), then exit. No HTTP listener — the dev cycle is a single batch.
 	at := time.Now().UTC()
 	res := runCycle(context.Background(), svc, at)
+	// Proration BEFORE the overage sweep: the creation-proration charge folds an
+	// app's co-created over-modules onto ONE combined invoice (scenario 3), then
+	// the overage sweep (Leg 1) finds them already resolved and skips them — so a
+	// co-created over-module is billed on the combined invoice, not a second one.
+	sweepFailed := runProrationSweep(context.Background(), svc, at)
+	runOverageSweep(context.Background(), svc, at, &res)
 	slog.Info("billing-cycle local run complete",
 		"as_of", res.AsOf,
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
@@ -81,7 +88,6 @@ func main() {
 		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
 		"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
 		"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
-	sweepFailed := runProrationSweep(context.Background(), svc, at)
 	if res.Failed > 0 || sweepFailed {
 		os.Exit(1)
 	}
@@ -125,6 +131,11 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			at = time.Now().UTC()
 		}
 		res := runCycle(ctx, svc, at.UTC())
+		// Proration BEFORE the overage sweep (see main()): the combined creation
+		// invoice (scenario 3) resolves an app's co-created over-modules first, so
+		// the overage sweep (Leg 1) skips them — one combined invoice, not two.
+		runProrationSweep(ctx, svc, at.UTC())
+		runOverageSweep(ctx, svc, at.UTC(), &res)
 		slog.InfoContext(ctx, "billing-cycle lambda run complete",
 			"as_of", res.AsOf,
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
@@ -132,8 +143,6 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
 			"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
 			"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
-		// Sweep the creation-proration grace queue as of the same instant.
-		runProrationSweep(ctx, svc, at.UTC())
 		// A per-account charge failure (or a per-app proration failure) is recorded
 		// (billing_runs status='failed')
 		// and does NOT fail the batch — the next cycle retries it. The handler
@@ -255,15 +264,6 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 		}
 		tally(&res, a.ID, chargeSummary)
 	}
-
-	// Mid-period PER-MODULE overage grace sweep (migration 033, Leg 1):
-	// independent of the boundary close above. Every per-module install timer
-	// whose OWN 3-day grace has elapsed is evaluated LIVE by FIFO — the "over"
-	// installs are charged $3 prorated from their install date (a deliberate
-	// mid-period charge), the "included" ones resolved permanently. Idempotent per
-	// timer via the grace_resolved guard + the deterministic per-timer Stripe idem
-	// keys, so firing daily never double-charges.
-	runOverageSweep(ctx, svc, at, &res)
 	return res
 }
 

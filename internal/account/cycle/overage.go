@@ -40,7 +40,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
-	"github.com/mirrorstack-ai/billing-engine/internal/account/collection"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
@@ -199,7 +198,7 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		// charged amount agree by construction.
 		PeriodStart:        usage.ProrationCoverageStart(cand.InstalledAt, periodStart),
 		PeriodEnd:          periodEnd,
-		IsLargeAutoCollect: collection.IsLargeAutoCollect(proratedMicros, acct.AutoCollectThresholdMicros),
+		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}

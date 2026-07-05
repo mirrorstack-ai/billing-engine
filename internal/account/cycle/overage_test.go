@@ -54,70 +54,11 @@ func seedIncluded(store *fakeStore, accountID, appID uuid.UUID, installedAt time
 	}
 }
 
-// --- Scenario 4: two modules a day apart → two independent prorated charges ---
-
-func TestModuleOverage_Scenario4_TwoModulesTwoDaysTwoAmounts(t *testing.T) {
-	// registeredAccount activates on the 4th → anchor day 4 → the period
-	// CONTAINING a mid-June install is [June 4, July 4) = 30 days. The account
-	// already has 5 included modules, so two NEW modules installed a day apart are
-	// both "over" and each gets its OWN independently-anchored grace charge,
-	// prorated from ITS OWN install date to the period end:
-	//   * module A installed June 10 → grace ends June 13 → charge $3 × 24/30 =
-	//     $2.40 (240¢); remain_days = whole UTC days in [June 10, July 4) = 24.
-	//   * module B installed June 11 → grace ends June 14 → charge $3 × 23/30 =
-	//     $2.30 (230¢); remain_days = [June 11, July 4) = 23.
-	store := newFakeStore()
-	_, acct := registeredAccount(store)
-	sc := newFakeStripe()
-	svc := cycle.NewService(store, sc)
-	ctx := context.Background()
-
-	// 5 pre-existing included modules (installed back on the anchor day), so the
-	// two newcomers land in the "over" bucket.
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
-
-	appAB := uuid.New()
-	timerA := seedTimer(store, acct, appAB, time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
-	timerB := seedTimer(store, acct, appAB, time.Date(2026, 6, 11, 0, 0, 0, 0, time.UTC))
-
-	// Sweep on June 13 (A's grace elapsed, B's has not) → charges A only.
-	resA, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC))
-	require.NoError(t, err)
-	require.Equal(t, 1, resA.Pending, "only A is past grace on June 13")
-	require.Equal(t, 1, resA.Charged)
-	require.Equal(t, 0, resA.Failed)
-	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg, "A: $3 × 24/30 = $2.40")
-	require.Equal(t, "mod-overage-ii-"+timerA.String(), sc.itemCalls[0].idemKey)
-	require.Equal(t, "mod-overage-inv-"+timerA.String(), sc.invoiceCalls[0].idemKey)
-
-	ta := store.timers[timerA]
-	require.True(t, ta.graceResolved)
-	require.True(t, ta.graceCharged)
-	require.Equal(t, time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC), ta.graceChargedAt)
-	// The stored item id is the GENUINE Stripe object id, NOT the idempotency-key
-	// string (a prior-PR bug this guards against).
-	require.Contains(t, ta.graceInvoiceItemID, "ii_test_")
-	require.NotEqual(t, "mod-overage-ii-"+timerA.String(), ta.graceInvoiceItemID)
-	require.Contains(t, ta.graceInvoiceID, "in_test_")
-
-	// B untouched so far.
-	require.False(t, store.timers[timerB].graceResolved)
-
-	// Sweep on June 14 (B's grace now elapsed) → charges B, a DIFFERENT amount on
-	// a DIFFERENT day; A is already resolved and never re-charged.
-	resB, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 9, 0, 0, 0, time.UTC))
-	require.NoError(t, err)
-	require.Equal(t, 1, resB.Pending, "only B remains past grace on June 14 (A resolved)")
-	require.Equal(t, 1, resB.Charged)
-	require.Len(t, sc.itemCalls, 2, "A must not be charged a second time")
-	require.EqualValues(t, 230, sc.itemCalls[1].amountCfg, "B: $3 × 23/30 = $2.30")
-	require.Equal(t, "mod-overage-ii-"+timerB.String(), sc.itemCalls[1].idemKey)
-
-	tb := store.timers[timerB]
-	require.True(t, tb.graceCharged)
-	require.Contains(t, tb.graceInvoiceItemID, "ii_test_")
-}
+// Scenario 4 (pool crosses 5 later, one module at a time → two independent
+// prorated charges on different days) lives in the end-to-end scenario suite
+// (scenarios_test.go, TestScenario4_PoolCrossesFiveLaterPerModuleTimers). This
+// file keeps the Leg-1 PROPERTY tests (FIFO monotonicity, over→included flips,
+// removed-in-grace, no-PM retry, unactivated) the scenario suite doesn't repeat.
 
 // --- FIFO monotonicity: an included module is a PERMANENT verdict -------------
 
