@@ -552,14 +552,12 @@ type GetAccountBillResponse struct {
 	ModuleUsageTotalMicros int64 `json:"module_usage_total_micros"`
 	InfraTotalMicros       int64 `json:"infra_total_micros"`
 
-	// AccountOverageMicros is the account-wide POOLED module overage for the
-	// period (migration 032): $3 × max(0, Σ live-app module_count −
-	// IncludedModules), charged ONCE per account (NOT per app, NOT folded into
-	// any Apps[].base_fee_micros). It is snapshot-first like the per-app base:
-	// the current period's account_overage_snapshots row when a charge leg
-	// billed it (the grace sweep or the boundary), else a live estimate from the
-	// CURRENT pooled sum. Additive field (pre-032 consumers that ignore it read
-	// an unchanged response shape); included in TotalMicros below.
+	// AccountOverageMicros is the account's module overage for the period
+	// (migration 033): $3 × max(0, Σ live-app module_count − IncludedModules),
+	// an ACCOUNT line (NOT per app, NOT folded into any Apps[].base_fee_micros).
+	// Under the per-module-instance model overage is billed per install on its
+	// own grace timer (Leg 1); this display value is the steady-state estimate
+	// from the CURRENT live pool. Included in TotalMicros below.
 	AccountOverageMicros int64 `json:"account_overage_micros"`
 
 	// PaasCreditMicros is the ACCOUNT-level PaaS credit, applied ONCE here

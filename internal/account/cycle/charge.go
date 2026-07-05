@@ -31,24 +31,20 @@ import (
 //     LIVE ms_billing.apps rows (deleted_at IS NULL — a deleted app stops
 //     accruing base, D1e, though its usage arrears above still bill) that
 //     EXISTED BEFORE the new period opened (created_at < the closed window's
-//     period_end) of the FLAT BaseFeeMicros (module overage is account-wide
-//     pooled now, migration 032 — no longer a per-app tier here). PLUS a
-//     SEPARATE account-level POOLED overage term for the CLOSING period ($3 ×
-//     max(0, Σ live-app module_count − included)), charged ONCE only when the
-//     mid-period grace sweep did NOT already bill it (no
-//     account_overage_snapshots row for the period — the double-charge guard);
-//     when the boundary does charge it, it writes its own 'advance' snapshot.
-//     An app created INSIDE the new period is excluded — RegisterApp's
-//     creation-proration leg already charged its new-period base (full or
-//     prorated); it joins the advance leg at the NEXT boundary. module_count is
-//     snapshotted AT CHARGE TIME, and each billed app-period is frozen into
-//     ms_billing.app_base_snapshots (migration 028) so the display always shows
-//     what was invoiced. The allowance nets USAGE only, never the base/overage
-//     (it offsets ModuleUsage+Infra in the display math too). An account with
-//     NO mirror rows (pre-backfill) gets base 0 — exactly the pre-027
-//     arrears-only invoice — until the api-platform backfill populates the
-//     roster.
-//  4. arrears + base + pooled overage == 0 (ALL zero) → MarkBillingRun('invoiced') with NO
+//     period_end) of the FLAT BaseFeeMicros. Module overage is NO longer billed
+//     here — it rides per-module-instance grace timers (migration 033, Leg 1 in
+//     cycle/overage.go); the boundary per-module overage precharge for ongoing
+//     modules (scenario 6) is a Stage B follow-up. An app created INSIDE the new
+//     period is excluded — RegisterApp's creation-proration leg already charged
+//     its new-period base (full or prorated); it joins the advance leg at the
+//     NEXT boundary. module_count is snapshotted AT CHARGE TIME, and each billed
+//     app-period is frozen into ms_billing.app_base_snapshots (migration 028) so
+//     the display always shows what was invoiced. The allowance nets USAGE only,
+//     never the base (it offsets ModuleUsage+Infra in the display math too). An
+//     account with NO mirror rows (pre-backfill) gets base 0 — exactly the
+//     pre-027 arrears-only invoice — until the api-platform backfill populates
+//     the roster.
+//  4. arrears + base == 0 (both zero) → MarkBillingRun('invoiced') with NO
 //     Stripe call. We NEVER auto-create a Stripe Customer with nothing to
 //     charge (design §4 Axis 4).
 //  5. no usable default PM → MarkBillingRun('skipped_no_pm'). The usage is
@@ -146,70 +142,22 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("live app roster read failed", err)
 	}
-	// Each live app contributes ONLY its FLAT base (migration 032 — module
-	// overage is account-wide pooled, no longer a per-app tier). The pooled
-	// module count for the ACCOUNT overage term below is Σ these apps' counts
-	// (the same roster the base bills — apps created inside the new period are
-	// excluded, so the closing period's pool is exact).
+	// Each live app contributes ONLY its FLAT base. Module overage is NO longer
+	// billed here — it rides per-module-instance grace timers (migration 033,
+	// Leg 1 in cycle/overage.go); the boundary per-module overage precharge for
+	// ongoing modules (scenario 6) is a Stage B follow-up.
 	var advanceBase int64
-	var pooledModuleCount int
-	for _, a := range apps {
+	for range apps {
 		advanceBase += usage.BaseFeeMicros
-		pooledModuleCount += a.ModuleCount
 	}
 
-	// SEPARATE account-level POOLED overage term for the closing period, charged
-	// ONCE per account. If this period's pooled overage already has an
-	// account_overage_snapshots row, its SOURCE decides how the boundary treats
-	// it — the cross-leg double-charge guard (PR #47 review):
-	//
-	//   - source='grace': the mid-period sweep already CLAIMED it (pending or
-	//     charged — a crash between Stripe succeeding and the row flipping to
-	//     'charged' must NOT let the boundary independently charge it too, so
-	//     ANY row, not just a settled one, excludes it here);
-	//   - source='advance': THIS boundary run's OWN prior attempt (a crash
-	//     between claiming the period and MarkBillingRun succeeding reclaims the
-	//     SAME run id) — reuse the FROZEN over_count/charged_micros so the retry
-	//     recomputes the IDENTICAL combined total and the deterministic
-	//     ii-<run>/inv-<run> Idempotency-Keys never see a different amount
-	//     (finding #2 — the boundary retry livelock).
-	//
-	// No row yet (grace never expired within the period, or overage started too
-	// late for the sweep to run): compute the FULL pooled overage for the
-	// account; it is CLAIMED (a 'pending' row written BEFORE Stripe is called)
-	// further down, right before the charge — so every over-the-pool period is
-	// billed exactly once, crash-safe.
-	existingOverage, overageFound, err := s.store.AccountOverageSnapshot(ctx, accountID, periodStart)
-	if err != nil {
-		return nil, billing.Internal("account overage snapshot lookup failed", err)
-	}
-	var (
-		advanceOverage        int64
-		overCount             int
-		overageAlreadyClaimed bool // true → no fresh claim-insert needed before charging
-	)
-	switch {
-	case overageFound && existingOverage.Source == "grace":
-		overageAlreadyClaimed = true
-	case overageFound && existingOverage.Source == "advance":
-		advanceOverage = existingOverage.ChargedMicros
-		overCount = existingOverage.OverCount
-		overageAlreadyClaimed = true
-	default:
-		overCount = pooledModuleCount - usage.IncludedModules
-		if overCount > 0 {
-			advanceOverage = usage.AccountOverageMicros(pooledModuleCount)
-		}
-	}
+	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase}
 
-	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase, AccountOverageMicros: advanceOverage}
-
-	// Zero-skip: only when arrears, base AND pooled overage are ALL zero
-	// (empty/zero period with no live apps) is there nothing to invoice — mark
-	// invoiced with NO Stripe call, never auto-create a Customer with nothing to
-	// charge. A zero total can never breach a limit/ceiling, so this
-	// short-circuits ahead of the risk gate.
-	if arrears == 0 && advanceBase == 0 && advanceOverage == 0 {
+	// Zero-skip: only when arrears AND base are both zero (empty/zero period with
+	// no live apps) is there nothing to invoice — mark invoiced with NO Stripe
+	// call, never auto-create a Customer with nothing to charge. A zero total can
+	// never breach a limit/ceiling, so this short-circuits ahead of the risk gate.
+	if arrears == 0 && advanceBase == 0 {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
 		}
@@ -322,53 +270,18 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		_, newPeriodEnd = billingperiod.AnchoredPeriodWindow(periodEnd, anchorDay)
 	}
 
-	// CLAIM the boundary's pooled-overage line BEFORE calling Stripe (the
-	// crash-safe marker — cycle/overage.go's header). Skipped when there is no
-	// overage to charge, or it is already claimed (source='grace' owns it, or
-	// this run's own reclaimed retry is reusing its own prior 'advance' claim).
-	if advanceOverage > 0 && !overageAlreadyClaimed {
-		inserted, err := s.store.InsertAccountOverageSnapshot(ctx, AccountOverageSnapshot{
-			AccountID:     accountID,
-			PeriodStart:   periodStart,
-			PeriodEnd:     periodEnd,
-			OverCount:     overCount,
-			ChargedMicros: advanceOverage,
-			Source:        "advance",
-			Status:        OverageSnapshotPending,
-		})
-		if err != nil {
-			return nil, billing.Internal("account overage snapshot claim failed", err)
-		}
-		if !inserted {
-			// Lost the race to a concurrent claim (almost certainly the mid-period
-			// grace sweep) — re-read and defer to the winner: never charge an
-			// overage amount someone else already claimed.
-			winning, _, err := s.store.AccountOverageSnapshot(ctx, accountID, periodStart)
-			if err != nil {
-				return nil, billing.Internal("account overage snapshot lookup failed", err)
-			}
-			advanceOverage, overCount = 0, 0
-			if winning.Source == "advance" {
-				advanceOverage, overCount = winning.ChargedMicros, winning.OverCount
-			}
-			overageAlreadyClaimed = true
-		}
-	}
-	summary.AccountOverageMicros = advanceOverage
-
-	// One invoice, one pooled line: closed period's netted usage arrears + the
-	// new period's advance base + the closing period's account-wide pooled
-	// overage, converted micros → whole cents ONCE at the Stripe boundary (a
-	// single deterministic rounding point for the total).
-	cents, err := centsFromMicros(arrears + advanceBase + advanceOverage)
+	// One invoice: closed period's netted usage arrears + the new period's advance
+	// base, converted micros → whole cents ONCE at the Stripe boundary (a single
+	// deterministic rounding point for the total).
+	cents, err := centsFromMicros(arrears + advanceBase)
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
 	if cents == 0 {
-		// The claim-race adjustment above dropped the combined total to zero (a
-		// narrow concurrent-invocation edge case) — never call Stripe for $0.
+		// A sub-half-cent arrears total (an advance base, when present, is always ≥
+		// $20 and can never round to 0) — never call Stripe for $0.
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
-			return nil, billing.Internal("mark billing run (zero after overage claim race) failed", err)
+			return nil, billing.Internal("mark billing run (zero cents) failed", err)
 		}
 		summary.Status = RunStatusInvoiced
 		return summary, nil
@@ -377,7 +290,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 
 	// Charge. A failure after the PM gate marks the run 'failed' (auditable) and
 	// returns the error.
-	inv, item, err := s.charge(ctx, runID, custID, cents, advanceBase > 0 || advanceOverage > 0)
+	inv, err := s.charge(ctx, runID, custID, cents, advanceBase > 0)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is
@@ -424,17 +337,6 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
 
-	// Flip the overage claim to 'charged' now that Stripe confirmed it, using
-	// the GENUINE Stripe invoice item id `item.ID` — never the ii-<run>
-	// idempotency-key string (finding #4). Covers both a fresh claim (won
-	// above) and a reused prior 'advance' claim (a reclaimed retry) — both
-	// need the row settled once this combined charge succeeds.
-	if advanceOverage > 0 {
-		if err := s.store.MarkAccountOverageSnapshotCharged(ctx, accountID, periodStart, item.ID); err != nil {
-			return nil, billing.Internal("account overage snapshot mark-charged failed", err)
-		}
-	}
-
 	// Freeze what this boundary actually billed per app for the NEW window
 	// (migration 028, source='advance'): the display's authoritative base for
 	// the period, so a later SyncAppModules can never drift the shown base
@@ -448,7 +350,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			PeriodStart: periodEnd, // the new period opens where the closed one ends
 			PeriodEnd:   newPeriodEnd,
 			ModuleCount: a.ModuleCount,
-			BaseMicros:  usage.BaseFeeMicros, // FLAT per-app base (overage is pooled, migration 032)
+			BaseMicros:  usage.BaseFeeMicros, // FLAT per-app base (module overage rides per-module timers, migration 033)
 		}); err != nil {
 			return nil, billing.Internal("advance base snapshot insert failed", err)
 		}
@@ -463,27 +365,21 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	return summary, nil
 }
 
-// charge creates the Stripe invoice item + draft invoice for the boundary
-// total (usage arrears + advance base + pooled overage), with the two
-// deterministic Idempotency-Keys (ii-<run>, inv-<run>) so a re-run reuses the
-// same Stripe objects. withBase only widens the line DESCRIPTION when the
-// total includes an advance base fee — a pure-usage invoice keeps the
-// historical line text. Returns the created invoice projection (id/status/
-// amounts) for the mirror upsert AND the created invoice item (the caller
-// needs its GENUINE id to freeze into account_overage_snapshots when the
-// combined line includes pooled overage — finding #4 — rather than the
-// idempotency-key string the item was created with).
-func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool) (billingstripe.Invoice, billingstripe.InvoiceItem, error) {
+// charge creates the Stripe invoice item + draft invoice for the boundary total
+// (usage arrears + advance base), with the two deterministic Idempotency-Keys
+// (ii-<run>, inv-<run>) so a re-run reuses the same Stripe objects. withBase only
+// widens the line DESCRIPTION when the total includes an advance base fee — a
+// pure-usage invoice keeps the historical line text. Returns the created invoice
+// projection (id/status/amounts) for the mirror upsert.
+func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool) (billingstripe.Invoice, error) {
 	desc := fmt.Sprintf("MirrorStack usage — run %s", runID)
 	if withBase {
 		desc = fmt.Sprintf("MirrorStack usage + app base fees — run %s", runID)
 	}
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, cents, chargeCurrency, desc, invoiceItemIdemKey(runID))
-	if err != nil {
-		return billingstripe.Invoice{}, billingstripe.InvoiceItem{}, err
+	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, cents, chargeCurrency, desc, invoiceItemIdemKey(runID)); err != nil {
+		return billingstripe.Invoice{}, err
 	}
-	inv, err := s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, invoiceIdemKey(runID))
-	return inv, item, err
+	return s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, invoiceIdemKey(runID))
 }
 
 // AccountsWithUsageEvents returns the accounts with raw usage_events in the

@@ -99,14 +99,14 @@ type SyncAppModulesResponse struct {
 // visibility). ProrationCents is never set here (no charge happens in this RPC).
 // api-platform fires this fire-and-forget with retry; every step is idempotent.
 //
-//  3. AFTER the mirror insert, recompute the account's pooled-overage grace
-//     timer (recomputeAccountOverage): a creation whose module_count pushes the
-//     account's live pool over IncludedModules arms accounts.overage_since
-//     (migration 032). This is independent of the deferred creation-proration
-//     base charge (which the grace sweep fires later, and which bills the FLAT
-//     base only — module overage is account-wide pooled, migration 032).
-//     Idempotent (Start/Clear are first-crossing-wins / no-op), so a retry
-//     re-runs it harmlessly.
+// Finally, AFTER the mirror insert, it synthesizes K per-module install timers
+// (migration 033) anchored at created_at — one row per co-created module, each on
+// its own independent overage grace timer. Reconcile-to-target (insert only the
+// deficit vs. the app's live timer count) keeps it idempotent across
+// fire-and-forget retries and self-heals a crashed first attempt. The timers are
+// charged (if "over") only later, by the Leg 1 sweep (overage.go), and only after
+// each survives its OWN grace — independent of the deferred creation-proration
+// base charge (proration.go).
 func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*RegisterAppResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -160,17 +160,34 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		ProrationInvoiceID: app.ProrationInvoiceID, // "" until the sweep charges
 	}
 
-	// Recompute the account's pooled overage timer (migration 032) after the
-	// insert: the new app's module_count may push the account's live pool over
-	// IncludedModules (arming accounts.overage_since). RegisterApp charges
-	// NOTHING here (creation grace) — the FLAT-base creation proration is the
-	// grace sweep's job (proration.go), and the module overage rides the same
-	// grace mechanism. Idempotent (Start/Clear are first-crossing-wins / no-op),
-	// so a retry re-runs it harmlessly.
-	if err := s.recomputeAccountOverage(ctx, app.AccountID); err != nil {
+	// Synthesize the app's per-module install timers (migration 033), all anchored
+	// at the app's created_at (the read-back mirror's stable first-registration
+	// value) — the RPC carries only an integer module_count, so K identical timer
+	// rows stand in for the K co-created module instances. Insert-only reconcile
+	// makes a fire-and-forget retry a no-op once the first registration already
+	// synthesized them.
+	if err := s.ensureModuleTimers(ctx, app.AccountID, app.AppID, app.CreatedAt, app.ModuleCount); err != nil {
 		return nil, err
 	}
 	return resp, nil
+}
+
+// ensureModuleTimers brings an app's live install-timer set UP to targetCount by
+// inserting the deficit, all anchored at installedAt (RegisterApp: created_at).
+// Insert-only (never removes): reconcile-to-target so a fire-and-forget retry
+// that re-runs after the first registration already synthesized the timers
+// inserts 0, and a crashed first attempt self-heals on the retry.
+func (s *Service) ensureModuleTimers(ctx context.Context, accountID, appID uuid.UUID, installedAt time.Time, targetCount int) error {
+	live, err := s.store.LiveModuleTimerCountForApp(ctx, appID)
+	if err != nil {
+		return billing.Internal("live module timer count lookup failed", err)
+	}
+	if deficit := targetCount - live; deficit > 0 {
+		if err := s.store.InsertModuleOverageTimers(ctx, accountID, appID, installedAt, moduleGraceExpiry(installedAt), deficit); err != nil {
+			return billing.Internal("insert module overage timers failed", err)
+		}
+	}
+	return nil
 }
 
 // SyncAppModules updates an app's roster row: a new installed-module-count
@@ -183,14 +200,15 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 //     — there is no future base for the tier to move);
 //   - an unknown app_id is NOT_FOUND (the platform must RegisterApp first).
 //
-// After any module_count / delete write it recomputes the account's pooled-
-// overage grace timer (recomputeAccountOverage). The per-app FLAT base still
-// takes effect at the NEXT boundary (no mid-period base micro-invoice / refund),
-// but the ACCOUNT-WIDE pooled overage is now the DELIBERATE exception to the old
-// D1b "no mid-period charges" rule: crossing the pooled IncludedModules arms a
-// grace timer, and the mid-period sweep charges the pooled overage once the
-// grace window elapses (migration 032). Dropping back under the pool clears the
-// timer (no refund of anything already charged, D1e).
+// After any module_count / delete write it synthesizes the app's per-module
+// install timers (migration 033): a grow (M>N) inserts M−N new timers anchored
+// at now (each a genuine new install on its OWN overage grace timer); a shrink
+// (M<N) LIFO-soft-removes N−M timers (the newest installs first — the customer
+// presumably removed what they added most recently); a delete soft-removes ALL
+// the app's still-live timers. A removed timer never charges (matching the
+// delete-in-grace = never-charged posture), and no refund is issued for a timer
+// already charged this period (D1e). The per-app FLAT base still takes effect at
+// the NEXT boundary (no mid-period base micro-invoice / refund).
 func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest) (*SyncAppModulesResponse, error) {
 	if req.AppID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
@@ -210,11 +228,19 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 		return nil, billing.NotFound("app not registered (RegisterApp must run first)")
 	}
 
+	now := s.nowFn().UTC()
+
 	if req.Deleted && !app.Deleted {
 		if err := s.store.MarkAppDeleted(ctx, req.AppID); err != nil {
 			return nil, billing.Internal("mark app deleted failed", err)
 		}
 		app.Deleted = true
+		// Deletion soft-removes ALL the app's still-live install timers — they drop
+		// out of the FIFO and the Leg 1 sweep, so a module deleted with its app is
+		// never charged its overage (no refund of anything already charged, D1e).
+		if err := s.store.SoftRemoveAllModuleTimersForApp(ctx, req.AppID, now); err != nil {
+			return nil, billing.Internal("soft-remove app module timers failed", err)
+		}
 	}
 
 	// Count update — no-op once deleted (frozen tier, D1e). req.Deleted in the
@@ -224,14 +250,11 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 			return nil, billing.Internal("set app module count failed", err)
 		}
 		app.ModuleCount = *req.ModuleCount
-	}
-
-	// Recompute the account-wide pooled-overage grace timer (migration 032) after
-	// the write: a count bump or delete can push the pool over IncludedModules
-	// (arm overage_since) or drop it back under (clear it). Idempotent, so a
-	// pure-delete-of-an-already-deleted-app retry re-runs it harmlessly.
-	if err := s.recomputeAccountOverage(ctx, app.AccountID); err != nil {
-		return nil, err
+		// Reconcile the app's live install timers to the new count: grow inserts
+		// (anchored at now — genuine new installs), shrink LIFO-removes the newest.
+		if err := s.syncModuleTimers(ctx, app.AccountID, req.AppID, now, *req.ModuleCount); err != nil {
+			return nil, err
+		}
 	}
 
 	return &SyncAppModulesResponse{
@@ -239,4 +262,28 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 		ModuleCount: app.ModuleCount,
 		Deleted:     app.Deleted,
 	}, nil
+}
+
+// syncModuleTimers reconciles an app's live install-timer set to targetCount: a
+// grow inserts the deficit anchored at `now` (each a genuine new install on its
+// own grace timer), a shrink LIFO-soft-removes the surplus (newest installs
+// first). Reconciling against the LIVE timer count (not the app's prior
+// module_count) makes it idempotent across SyncAppModules retries and
+// self-healing after a crash between the count write and the timer write.
+func (s *Service) syncModuleTimers(ctx context.Context, accountID, appID uuid.UUID, now time.Time, targetCount int) error {
+	live, err := s.store.LiveModuleTimerCountForApp(ctx, appID)
+	if err != nil {
+		return billing.Internal("live module timer count lookup failed", err)
+	}
+	switch {
+	case targetCount > live:
+		if err := s.store.InsertModuleOverageTimers(ctx, accountID, appID, now, moduleGraceExpiry(now), targetCount-live); err != nil {
+			return billing.Internal("insert module overage timers failed", err)
+		}
+	case targetCount < live:
+		if err := s.store.SoftRemoveNewestModuleTimers(ctx, appID, live-targetCount, now); err != nil {
+			return billing.Internal("soft-remove module overage timers failed", err)
+		}
+	}
+	return nil
 }

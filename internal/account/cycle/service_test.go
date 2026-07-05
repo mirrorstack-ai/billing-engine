@@ -70,12 +70,11 @@ type fakeStore struct {
 	activation     map[uuid.UUID]time.Time
 	baseSnapshots  map[snapKey]fakeBaseSnapshot
 
-	// account-wide POOLED overage state (migration 032). overageSince models
-	// accounts.overage_since (present → armed at that instant); overageSnaps
-	// models account_overage_snapshots keyed (account, period_start) like the
-	// PRIMARY KEY, recording the row each charge leg froze.
-	overageSince map[uuid.UUID]time.Time
-	overageSnaps map[acctSnapKey]cycle.AccountOverageSnapshot
+	// per-module install-timer state (migration 033). timers models
+	// ms_billing.app_module_overage_timers keyed by surrogate id; each row's
+	// removed/graceResolved/graceCharged* fields mirror the columns the FIFO +
+	// Leg 1 sweep read and write.
+	timers map[uuid.UUID]*fakeTimer
 
 	// captured charge writes
 	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
@@ -118,27 +117,30 @@ type fakeStore struct {
 	errPendingProration error // AppsPendingProration
 	errChargeLocked     error // ChargeProrationLocked
 
-	errPooledCount       error // PooledModuleCount
-	errStartOverage      error // StartAccountOverage
-	errClearOverage      error // ClearAccountOverage
-	errOverageGrace      error // AccountsInOverageGrace
-	errOverageSnap       error // AccountOverageSnapshot
-	errInsertOverageSnap error // InsertAccountOverageSnapshot
-	errMarkOverageSnap   error // MarkAccountOverageSnapshotCharged
-	errTopUpOverageSnap  error // TopUpAccountOverageSnapshot
-
-	// overageClaimLoses, when > 0, makes the NEXT N InsertAccountOverageSnapshot
-	// calls report "lost the race" (inserted=false) WITHOUT actually writing
-	// anything — simulating a concurrent claim that beat this call, so a test
-	// can drive the claim-insert-loses-the-race path deterministically.
-	overageClaimLoses int
+	errLiveTimerCount   error // LiveModuleTimerCountForApp
+	errInsertTimers     error // InsertModuleOverageTimers
+	errRemoveNewest     error // SoftRemoveNewestModuleTimers
+	errRemoveAllTimers  error // SoftRemoveAllModuleTimersForApp
+	errTimersPastGrace  error // ModuleOverageTimersPastGrace
+	errTimerRank        error // LiveModuleTimerRankBefore
+	errMarkIncluded     error // MarkModuleTimerIncluded
+	errMarkTimerCharged error // MarkModuleTimerCharged
 }
 
-// acctSnapKey mirrors the account_overage_snapshots PRIMARY KEY
-// (account_id, period_start).
-type acctSnapKey struct {
-	account     uuid.UUID
-	periodStart time.Time
+// fakeTimer models one ms_billing.app_module_overage_timers row (migration 033).
+type fakeTimer struct {
+	id                 uuid.UUID
+	accountID          uuid.UUID
+	appID              uuid.UUID
+	installedAt        time.Time
+	graceExpiresAt     time.Time
+	removed            bool
+	removedAt          time.Time
+	graceResolved      bool
+	graceCharged       bool
+	graceChargedAt     time.Time
+	graceInvoiceID     string
+	graceInvoiceItemID string
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -178,8 +180,7 @@ func newFakeStore() *fakeStore {
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
 		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
-		overageSince:        map[uuid.UUID]time.Time{},
-		overageSnaps:        map[acctSnapKey]cycle.AccountOverageSnapshot{},
+		timers:              map[uuid.UUID]*fakeTimer{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -580,112 +581,152 @@ func (f *fakeStore) InsertAdvanceBaseSnapshot(_ context.Context, snap cycle.AppB
 	return nil
 }
 
-// --- account-wide POOLED overage fake (migration 032) -----------------------
+// --- per-module install-timer fake (migration 033) --------------------------
 
-// PooledModuleCount sums module_count over the account's live apps, mirroring
-// the SQL SUM(module_count) WHERE account_id = ? AND deleted_at IS NULL.
-func (f *fakeStore) PooledModuleCount(_ context.Context, accountID uuid.UUID) (int, error) {
-	if f.errPooledCount != nil {
-		return 0, f.errPooledCount
+func (f *fakeStore) LiveModuleTimerCountForApp(_ context.Context, appID uuid.UUID) (int, error) {
+	if f.errLiveTimerCount != nil {
+		return 0, f.errLiveTimerCount
 	}
-	sum := 0
-	for _, app := range f.apps {
-		if app.AccountID == accountID && !app.Deleted {
-			sum += app.ModuleCount
+	n := 0
+	for _, t := range f.timers {
+		if t.appID == appID && !t.removed {
+			n++
 		}
 	}
-	return sum, nil
+	return n, nil
 }
 
-func (f *fakeStore) StartAccountOverage(_ context.Context, accountID uuid.UUID, since time.Time) error {
-	if f.errStartOverage != nil {
-		return f.errStartOverage
+func (f *fakeStore) InsertModuleOverageTimers(_ context.Context, accountID, appID uuid.UUID, installedAt, graceExpiresAt time.Time, n int) error {
+	if f.errInsertTimers != nil {
+		return f.errInsertTimers
 	}
-	if _, armed := f.overageSince[accountID]; !armed {
-		f.overageSince[accountID] = since // first-crossing-wins (WHERE overage_since IS NULL)
+	for i := 0; i < n; i++ {
+		id := uuid.New()
+		f.timers[id] = &fakeTimer{
+			id:             id,
+			accountID:      accountID,
+			appID:          appID,
+			installedAt:    installedAt,
+			graceExpiresAt: graceExpiresAt,
+		}
 	}
 	return nil
 }
 
-func (f *fakeStore) ClearAccountOverage(_ context.Context, accountID uuid.UUID) error {
-	if f.errClearOverage != nil {
-		return f.errClearOverage
+// liveTimersForApp returns the app's live timers sorted (installed_at DESC, id
+// DESC) — the LIFO removal order.
+func (f *fakeStore) liveTimersForApp(appID uuid.UUID) []*fakeTimer {
+	var out []*fakeTimer
+	for _, t := range f.timers {
+		if t.appID == appID && !t.removed {
+			out = append(out, t)
+		}
 	}
-	delete(f.overageSince, accountID) // idempotent (WHERE overage_since IS NOT NULL)
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].installedAt.Equal(out[j].installedAt) {
+			return out[i].installedAt.After(out[j].installedAt)
+		}
+		return out[i].id.String() > out[j].id.String()
+	})
+	return out
+}
+
+func (f *fakeStore) SoftRemoveNewestModuleTimers(_ context.Context, appID uuid.UUID, n int, removedAt time.Time) error {
+	if f.errRemoveNewest != nil {
+		return f.errRemoveNewest
+	}
+	live := f.liveTimersForApp(appID)
+	for i := 0; i < n && i < len(live); i++ {
+		live[i].removed = true
+		live[i].removedAt = removedAt
+	}
 	return nil
 }
 
-func (f *fakeStore) AccountsInOverageGrace(_ context.Context, cutoff time.Time) ([]cycle.OverageGraceCandidate, error) {
-	if f.errOverageGrace != nil {
-		return nil, f.errOverageGrace
+func (f *fakeStore) SoftRemoveAllModuleTimersForApp(_ context.Context, appID uuid.UUID, removedAt time.Time) error {
+	if f.errRemoveAllTimers != nil {
+		return f.errRemoveAllTimers
 	}
-	out := []cycle.OverageGraceCandidate{}
-	for id, since := range f.overageSince {
-		activatedAt, activated := f.activation[id]
+	for _, t := range f.timers {
+		if t.appID == appID && !t.removed {
+			t.removed = true
+			t.removedAt = removedAt
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) ModuleOverageTimersPastGrace(_ context.Context, at time.Time) ([]cycle.ModuleOverageCandidate, error) {
+	if f.errTimersPastGrace != nil {
+		return nil, f.errTimersPastGrace
+	}
+	var out []cycle.ModuleOverageCandidate
+	for _, t := range f.timers {
+		if t.removed || t.graceResolved || t.graceExpiresAt.After(at) {
+			continue
+		}
+		activatedAt, activated := f.activation[t.accountID]
 		if !activated {
 			continue // activated_at IS NOT NULL gate
 		}
-		if since.After(cutoff) {
-			continue // grace still holding (overage_since <= cutoff)
-		}
-		out = append(out, cycle.OverageGraceCandidate{ID: id, OverageSince: since, ActivatedAt: activatedAt})
+		out = append(out, cycle.ModuleOverageCandidate{
+			ID:             t.id,
+			AccountID:      t.accountID,
+			AppID:          t.appID,
+			InstalledAt:    t.installedAt,
+			GraceExpiresAt: t.graceExpiresAt,
+			ActivatedAt:    activatedAt,
+		})
 	}
+	// Ordered (installed_at, id) like the query, so the sweep charges oldest-first
+	// deterministically.
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].InstalledAt.Equal(out[j].InstalledAt) {
+			return out[i].InstalledAt.Before(out[j].InstalledAt)
+		}
+		return out[i].ID.String() < out[j].ID.String()
+	})
 	return out, nil
 }
 
-func (f *fakeStore) AccountOverageSnapshot(_ context.Context, accountID uuid.UUID, periodStart time.Time) (cycle.AccountOverageSnapshot, bool, error) {
-	if f.errOverageSnap != nil {
-		return cycle.AccountOverageSnapshot{}, false, f.errOverageSnap
+func (f *fakeStore) LiveModuleTimerRankBefore(_ context.Context, accountID, timerID uuid.UUID, installedAt time.Time) (int, error) {
+	if f.errTimerRank != nil {
+		return 0, f.errTimerRank
 	}
-	snap, ok := f.overageSnaps[acctSnapKey{accountID, periodStart}]
-	return snap, ok, nil
+	rank := 0
+	for _, t := range f.timers {
+		if t.accountID != accountID || t.removed {
+			continue
+		}
+		if t.installedAt.Before(installedAt) ||
+			(t.installedAt.Equal(installedAt) && t.id.String() < timerID.String()) {
+			rank++
+		}
+	}
+	return rank, nil
 }
 
-func (f *fakeStore) InsertAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) (bool, error) {
-	if f.errInsertOverageSnap != nil {
-		return false, f.errInsertOverageSnap
+func (f *fakeStore) MarkModuleTimerIncluded(_ context.Context, timerID uuid.UUID) error {
+	if f.errMarkIncluded != nil {
+		return f.errMarkIncluded
 	}
-	if f.overageClaimLoses > 0 {
-		f.overageClaimLoses--
-		return false, nil // simulate a concurrent claim winning the race
+	if t, ok := f.timers[timerID]; ok && !t.graceResolved {
+		t.graceResolved = true
 	}
-	// ON CONFLICT (account_id, period_start) DO NOTHING: an existing row wins.
-	k := acctSnapKey{snap.AccountID, snap.PeriodStart}
-	if _, exists := f.overageSnaps[k]; exists {
-		return false, nil
-	}
-	f.overageSnaps[k] = snap
-	return true, nil
-}
-
-func (f *fakeStore) MarkAccountOverageSnapshotCharged(_ context.Context, accountID uuid.UUID, periodStart time.Time, invoiceItemID string) error {
-	if f.errMarkOverageSnap != nil {
-		return f.errMarkOverageSnap
-	}
-	k := acctSnapKey{accountID, periodStart}
-	snap, ok := f.overageSnaps[k]
-	if !ok {
-		return nil // defensive: mirrors the DB's unconditional UPDATE affecting 0 rows
-	}
-	snap.Status = cycle.OverageSnapshotCharged
-	snap.InvoiceItemID = invoiceItemID
-	f.overageSnaps[k] = snap
 	return nil
 }
 
-func (f *fakeStore) TopUpAccountOverageSnapshot(_ context.Context, snap cycle.AccountOverageSnapshot) error {
-	if f.errTopUpOverageSnap != nil {
-		return f.errTopUpOverageSnap
+func (f *fakeStore) MarkModuleTimerCharged(_ context.Context, timerID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error {
+	if f.errMarkTimerCharged != nil {
+		return f.errMarkTimerCharged
 	}
-	k := acctSnapKey{snap.AccountID, snap.PeriodStart}
-	existing, ok := f.overageSnaps[k]
-	if !ok || existing.Status != cycle.OverageSnapshotCharged {
-		return nil // mirrors the DB's WHERE status='charged' guard: a non-match is a no-op
+	if t, ok := f.timers[timerID]; ok && !t.graceResolved {
+		t.graceResolved = true
+		t.graceCharged = true
+		t.graceChargedAt = chargedAt
+		t.graceInvoiceID = invoiceID
+		t.graceInvoiceItemID = invoiceItemID
 	}
-	existing.OverCount = snap.OverCount
-	existing.ChargedMicros = snap.ChargedMicros
-	existing.InvoiceItemID = snap.InvoiceItemID
-	f.overageSnaps[k] = existing
 	return nil
 }
 

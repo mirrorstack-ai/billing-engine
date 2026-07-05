@@ -172,16 +172,14 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		infraTotal += parts.InfraTotalMicros
 	}
 
-	// Account-wide POOLED module overage (migration 032), SNAPSHOT-FIRST exactly
-	// like the per-app base: a charged period reads the frozen
-	// account_overage_snapshots row (what the grace sweep or the boundary
-	// actually invoiced), so the displayed overage IS what was billed even after
-	// later SyncAppModules pool changes. An un-charged period (pre-032 history,
-	// an account under the pool, or an in-progress period no leg has billed yet)
-	// falls back to the LIVE estimate from the CURRENT pooled sum — the full
-	// monthly overage the account would owe at steady state (the display doesn't
-	// prorate the estimate; the charge legs own proration). It is an ACCOUNT
-	// line, never allocated back per app.
+	// Account overage line (migration 033): the steady-state monthly estimate
+	// from the CURRENT live pool — $3 × max(0, pooled − IncludedModules). Under
+	// the per-module-instance model overage is billed per install on its own
+	// grace timer (Leg 1); the display shows the live steady-state figure (the
+	// display doesn't prorate; the charge legs own proration) rather than a
+	// per-period frozen snapshot (a faithful per-period display from the timer
+	// rows is a Stage B follow-up). It is an ACCOUNT line, never allocated back
+	// per app.
 	accountOverage, err := s.accountOverageMicros(ctx, accountID, periodStart)
 	if err != nil {
 		return nil, err
@@ -210,19 +208,15 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	}, nil
 }
 
-// accountOverageMicros resolves the account-wide pooled overage for the display,
-// snapshot-first: the frozen account_overage_snapshots charge for the period if
-// a leg billed it, else the live estimate AccountOverageMicros(current pooled
-// sum). The PaaS credit never offsets it (overage rides ON TOP, like the base
-// fee) so it is resolved outside the credit math.
-func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (int64, error) {
-	charged, snapped, err := s.store.AccountOverageSnapshot(ctx, accountID, periodStart)
-	if err != nil {
-		return 0, billing.Internal("account overage snapshot lookup failed", err)
-	}
-	if snapped {
-		return charged, nil
-	}
+// accountOverageMicros resolves the account overage shown on the bill: the
+// steady-state monthly estimate AccountOverageMicros(current pooled sum) = $3 ×
+// max(0, pooled − IncludedModules). Under the per-module-instance overage model
+// (migration 033) overage is billed per install on its own grace timer (Leg 1,
+// cycle/overage.go); the display shows the live steady-state figure rather than a
+// per-period frozen snapshot (a faithful per-period display from the timer rows
+// is a Stage B follow-up). The PaaS credit never offsets it (overage rides ON
+// TOP, like the base fee), so it is resolved outside the credit math.
+func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID, _ time.Time) (int64, error) {
 	pooled, err := s.store.PooledModuleCount(ctx, accountID)
 	if err != nil {
 		return 0, billing.Internal("pooled module count lookup failed", err)

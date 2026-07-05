@@ -206,23 +206,15 @@ type ChargeSummary struct {
 	ArrearsMicros int64
 
 	// AdvanceBaseMicros is the NEW period's advance base fee: Σ over the
-	// account's live apps of the FLAT BaseFeeMicros (module overage is
-	// account-wide pooled, migration 032 — no longer a per-app tier here). 0 for
-	// a pre-backfill account (no mirror rows).
+	// account's live apps of the FLAT BaseFeeMicros. Module overage is NO longer
+	// billed at the boundary in this leg — it rides per-module-instance grace
+	// timers (migration 033, Leg 1 in cycle/overage.go); the boundary
+	// per-module overage precharge (scenario 6) is a Stage B follow-up. 0 for a
+	// pre-backfill account (no mirror rows).
 	AdvanceBaseMicros int64
 
-	// AccountOverageMicros is the CLOSING period's account-wide POOLED module
-	// overage (migration 032): $3 × max(0, Σ live-app module_count −
-	// IncludedModules), charged ONCE at the boundary only when the mid-period
-	// grace sweep did NOT already bill it (no account_overage_snapshots row for
-	// the period). 0 when already billed mid-period or the account is under the
-	// pool. The invoice total is ArrearsMicros + AdvanceBaseMicros +
-	// AccountOverageMicros; only when ALL are 0 is the Stripe call skipped.
-	AccountOverageMicros int64
-
 	// ChargedCents is the whole-cent amount sent to Stripe (micros → cents
-	// round-half-up over arrears + advance base + pooled overage). 0 when no
-	// charge happened.
+	// round-half-up over arrears + advance base). 0 when no charge happened.
 	ChargedCents int64
 
 	// StripeInvoiceID is the created Stripe invoice id, empty when no charge

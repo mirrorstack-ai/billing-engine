@@ -155,11 +155,11 @@ type cycleResult struct {
 	FailedRuns  int // per-account charge runs that ended status='failed'
 	Failed      int // errors (rollup error, charge error, or list error)
 
-	// Mid-period account-wide overage grace sweep (migration 030).
-	OverageCandidates int // accounts past the grace window this sweep evaluated
-	OverageCharged    int // accounts whose pooled overage was invoiced mid-period
-	OverageSkipped    int // evaluated but not charged (already billed / under pool / no PM / 0 cents)
-	OverageFailed     int // per-account overage-charge errors (counted, never abort)
+	// Mid-period per-module overage grace sweep (migration 033, Leg 1).
+	OverageCandidates int // install timers past their grace window this sweep evaluated
+	OverageCharged    int // "over" installs whose overage was invoiced mid-period
+	OverageSkipped    int // evaluated but not charged (resolved-included / no PM / 0 cents)
+	OverageFailed     int // per-timer overage-charge errors (counted, never abort)
 }
 
 // runCycle closes every card-bound account's just-ended ANCHORED period as of
@@ -256,49 +256,37 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 		tally(&res, a.ID, chargeSummary)
 	}
 
-	// Mid-period account-wide overage grace sweep (migration 030): independent of
-	// the boundary close above. Every account whose pooled module overage has
-	// survived the grace window and whose CURRENT period has no pooled-overage
-	// snapshot yet is charged the prorated overage now (a deliberate mid-period
-	// charge). Idempotent per (account, period) via the snapshot ledger + the
-	// deterministic Stripe idem keys, so firing daily never double-charges.
+	// Mid-period PER-MODULE overage grace sweep (migration 033, Leg 1):
+	// independent of the boundary close above. Every per-module install timer
+	// whose OWN 3-day grace has elapsed is evaluated LIVE by FIFO — the "over"
+	// installs are charged $3 prorated from their install date (a deliberate
+	// mid-period charge), the "included" ones resolved permanently. Idempotent per
+	// timer via the grace_resolved guard + the deterministic per-timer Stripe idem
+	// keys, so firing daily never double-charges.
 	runOverageSweep(ctx, svc, at, &res)
 	return res
 }
 
-// runOverageSweep charges the mid-period account-wide pooled overage for every
-// account past the grace window as of `at`. A single account's error is logged +
-// counted but never aborts the sweep (like the boundary loop).
+// runOverageSweep runs Leg 1's per-module overage grace sweep as of `at`. A
+// single timer's error is logged + counted inside the sweep but never aborts the
+// batch (the next sweep retries it through the same deterministic Stripe keys).
 func runOverageSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *cycleResult) {
-	cands, err := svc.AccountsInOverageGrace(ctx, at)
+	sweep, err := svc.SweepModuleOverage(ctx, at)
 	if err != nil {
-		slog.ErrorContext(ctx, "list overage-grace accounts failed", "error", err)
+		slog.ErrorContext(ctx, "module overage sweep failed", "as_of", at, "error", err)
 		res.Failed++
 		return
 	}
-	res.OverageCandidates = len(cands)
-	for _, c := range cands {
-		summary, err := svc.ChargeAccountOverage(ctx, c, at)
-		if err != nil {
-			slog.ErrorContext(ctx, "account overage charge failed", "account_id", c.ID, "error", err)
-			res.OverageFailed++
-			res.Failed++
-			continue
-		}
-		if summary.Status == cycle.OverageCharged || summary.Status == cycle.OverageToppedUp {
-			// A top-up (finding #3 — an ALREADY-charged period whose pool grew
-			// further before the period closed) is also money charged, not a skip.
-			res.OverageCharged++
-		} else {
-			res.OverageSkipped++
-		}
-		slog.Info("account overage grace sweep",
-			"account_id", c.ID,
-			"status", string(summary.Status),
-			"over_count", summary.OverCount,
-			"charged_cents", summary.ChargedCents,
-			"stripe_invoice_id", summary.StripeInvoiceID)
-	}
+	res.OverageCandidates = sweep.Pending
+	res.OverageCharged = sweep.Charged
+	// "Skipped" folds the resolved-as-included verdicts and the transient no-PM /
+	// zero-cent skips — everything evaluated but not charged this sweep.
+	res.OverageSkipped = sweep.Included + sweep.Skipped
+	res.OverageFailed = sweep.Failed
+	res.Failed += sweep.Failed
+	slog.InfoContext(ctx, "module overage sweep complete",
+		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
+		"included", sweep.Included, "skipped", sweep.Skipped, "failed", sweep.Failed)
 }
 
 // tally classifies one account's charge summary for the run totals + a

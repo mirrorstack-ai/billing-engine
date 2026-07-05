@@ -1,481 +1,277 @@
 package cycle
 
-// Account-wide POOLED module overage (migration 032, owner spec 2026-07-05,
-// confirmed reversal of the per-app overage tier). Overage moved from PER-APP
-// to a single ACCOUNT-WIDE POOL of IncludedModules: overage = $3 × max(0,
-// Σ live-app module_count − IncludedModules), charged ONCE per account per
-// period. This file owns:
+// Per-module-instance overage — Leg 1: the per-module grace charge (migration
+// 033, DESIGN.md "Base fee — v2: creation grace + per-module overage timers").
+// This REPLACES the account-wide single-timer pooled overage sweep entirely.
 //
-//   - recomputeAccountOverage: after any module_count write (RegisterApp /
-//     SyncAppModules) it re-derives the pool and arms/clears the account's ONE
-//     grace timer (accounts.overage_since);
-//   - the mid-period GRACE SWEEP (ChargeAccountOverage + AccountsInOverageGrace):
-//     when the pool has been over for the full grace window, it charges the
-//     pooled overage prorated from grace-end to the period end — a DELIBERATE
-//     mid-period charge (the D1b "no mid-period charges" rule is now stale for
-//     the OVERAGE leg specifically; base-fee mid-period behavior is unchanged).
+// The model: overage is no longer ONE account-level grace timer tiering on
+// SUM(module_count); it is ONE independently-anchored 3-day grace timer per
+// module INSTALL EVENT (ms_billing.app_module_overage_timers), each priced from
+// its OWN install date. RegisterApp / SyncAppModules synthesize the timer rows
+// (the RPC layer carries only an integer module_count); this file owns the
+// mid-period sweep that charges them:
 //
-// The boundary advance leg's pooled-overage term lives in charge.go alongside
-// the base leg. Both legs guard against double-charging the same period through
-// the account_overage_snapshots ledger (keyed (account_id, period_start)) plus
-// the deterministic per-(account, period) Stripe Idempotency-Keys below — the
-// same money-safety pattern app_base_snapshots gives the per-app base.
+//   - SweepModuleOverage lists the live, unresolved timers whose grace has
+//     elapsed (ModuleOverageTimersPastGrace) and runs ChargeModuleOverage on each.
+//   - ChargeModuleOverage determines, LIVE and fresh at every grace-check (never
+//     cached), whether the install is "included" or "over": across the account's
+//     currently-live timers ordered (installed_at ASC, id ASC), the first
+//     IncludedModules (5) are included, the rest are over.
+//       * included → mark grace_resolved, never charge. Monotonicity (a new
+//         install always gets the latest installed_at, so an existing row's rank
+//         can only improve over→included, never included→over) makes this a
+//         PERMANENT verdict — the row is never re-evaluated.
+//       * over → charge ModuleOverageFeeMicros ($3) prorated from the install's
+//         UTC day to the install period's end (install-anchored — the correction
+//         vs. the prior account-wide attempt, which anchored to grace-elapse),
+//         via a per-timer Stripe invoice with deterministic idem keys derived
+//         from the timer id, then stamp grace_charged_at / grace_resolved and the
+//         GENUINE Stripe ids.
 //
-// CRASH-SAFETY (PR #47 review — the cross-leg double-charge finding): the
-// ledger row is written as a claim BEFORE either leg calls Stripe
-// (status='pending'; see migration 032), not only after Stripe succeeds. A
-// crash between "Stripe succeeded" and "the row committed" used to leave NO
-// row for the OTHER leg to see, so it would independently charge the SAME
-// period's overage under a completely disjoint Idempotency-Key namespace — a
-// real double charge. Now the claim is visible to both legs the instant it is
-// written, before any money moves, so a crash anywhere in the sequence leaves
-// evidence the other leg (and the same leg's own retry) can see and must
-// respect: ANY row for the period — pending or charged — means "claimed,
-// never independently charge it".
+// The boundary per-module overage precharge for ongoing modules (scenario 6) and
+// the combined creation-invoice overage line (scenario 3) are Stage B follow-ups.
 
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/collection"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
-// overageGraceWindow is the ONE grace timer per account: when the pooled module
-// count first crosses IncludedModules the timer starts (accounts.overage_since),
-// and only after this window elapses does the mid-period sweep charge the
-// overage. If the pool drops back to ≤ IncludedModules before it elapses the
-// timer is cleared and nothing is charged. Owner spec 2026-07-05: 3 days.
-const overageGraceWindow = 3 * 24 * time.Hour
+// moduleOverageGraceWindow is the per-install grace window: a module's own timer
+// starts at its install instant and its overage is only charged once this window
+// has elapsed (owner spec 2026-07-05: 3 days, the SAME GraceDays as the creation
+// grace). A module removed before its own grace elapses is never charged.
+const moduleOverageGraceWindow = usage.GraceDays * 24 * time.Hour
 
-// OverageChargeStatus is the terminal classification of a ChargeAccountOverage
-// attempt, for the cron sweep's tally + logging.
-type OverageChargeStatus string
+// moduleGraceExpiry is the single home of the "grace_expires_at = installed_at +
+// window" rule, used by RegisterApp / SyncAppModules when they synthesize timer
+// rows and (implicitly, via the stored column) by the sweep's work-list.
+func moduleGraceExpiry(installedAt time.Time) time.Time {
+	return installedAt.Add(moduleOverageGraceWindow)
+}
+
+// ModuleOverageStatus is the terminal classification of one ChargeModuleOverage
+// attempt, for the sweep's tally + per-timer log line.
+type ModuleOverageStatus string
 
 const (
-	// OverageCharged: the pooled overage was invoiced for the period.
-	OverageCharged OverageChargeStatus = "charged"
-	// OverageSkippedAlreadyCharged: this period's pooled overage already has an
-	// account_overage_snapshots row (a prior sweep or the boundary billed it).
-	OverageSkippedAlreadyCharged OverageChargeStatus = "already_charged"
-	// OverageSkippedUnderPool: the pool dropped back to ≤ IncludedModules by the
-	// time the sweep ran — nothing to charge; the timer is cleared.
-	OverageSkippedUnderPool OverageChargeStatus = "under_pool"
-	// OverageSkippedGraceHolding: the grace window has not elapsed yet (defensive
-	// — the work-list query already excludes these).
-	OverageSkippedGraceHolding OverageChargeStatus = "grace_holding"
-	// OverageSkippedZeroCents: the prorated overage rounded to 0 cents (grace-end
-	// lands at/after the period end, or a sub-cent remainder) — nothing to
-	// invoice this period; a later period picks it up.
-	OverageSkippedZeroCents OverageChargeStatus = "zero_cents"
-	// OverageSkippedNoPM: no usable default payment method — retained, re-attempted
-	// on the next sweep (the SAME per-(account, period) Stripe idem key stays
-	// stable), never a failure.
-	OverageSkippedNoPM OverageChargeStatus = "skipped_no_pm"
-	// OverageToppedUp: an ALREADY-charged period's pool grew further while the
-	// period was still open, and the sweep charged the incremental delta
-	// (finding #3, a judgment call — see topUpGraceOverage's doc).
-	OverageToppedUp OverageChargeStatus = "topped_up"
+	// ModuleOverageCharged: the install was "over" and its overage was invoiced.
+	ModuleOverageCharged ModuleOverageStatus = "charged"
+	// ModuleOverageIncluded: the live FIFO put the install within the included
+	// IncludedModules — resolved permanently, never charged.
+	ModuleOverageIncluded ModuleOverageStatus = "included"
+	// ModuleOverageSkippedNoPM: "over" but no usable default PM — left unresolved,
+	// re-attempted on the next sweep through the SAME per-timer idem keys.
+	ModuleOverageSkippedNoPM ModuleOverageStatus = "skipped_no_pm"
+	// ModuleOverageSkippedZeroCents: "over" but the prorated overage rounded to 0
+	// cents (unreachable for a real ≥1-day over module at $3) — resolved with no
+	// charge so it never re-sweeps forever.
+	ModuleOverageSkippedZeroCents ModuleOverageStatus = "zero_cents"
 )
 
-// OverageChargeSummary reports what one ChargeAccountOverage call did.
-type OverageChargeSummary struct {
-	Status       OverageChargeStatus
-	PeriodStart  time.Time
-	OverCount    int
+// ModuleOverageResult reports what one ChargeModuleOverage call did.
+type ModuleOverageResult struct {
+	TimerID      uuid.UUID
+	Status       ModuleOverageStatus
 	ChargedCents int64
-	// StripeInvoiceID is set only when Status == OverageCharged.
+	// StripeInvoiceID is set only when Status == ModuleOverageCharged.
 	StripeInvoiceID string
 }
 
-// AccountsInOverageGrace returns the accounts whose grace timer has EXPIRED as
-// of `at` (overage_since <= at − overageGraceWindow) and are chargeable — the
-// mid-period sweep's work list. A thin pass-through to the store.
-func (s *Service) AccountsInOverageGrace(ctx context.Context, at time.Time) ([]OverageGraceCandidate, error) {
-	cands, err := s.store.AccountsInOverageGrace(ctx, at.Add(-overageGraceWindow))
-	if err != nil {
-		return nil, billing.Internal("list overage-grace accounts failed", err)
-	}
-	return cands, nil
-}
-
-// recomputeAccountOverage re-derives the account's pooled module count after a
-// module_count write and arms/clears its ONE grace timer accordingly: pool >
-// IncludedModules and not yet armed → stamp overage_since (StartAccountOverage
-// is first-crossing-wins); pool ≤ IncludedModules → clear it (ClearAccountOverage
-// is idempotent). No refund on the clear (D1e) — it only stops FUTURE accrual;
-// overage already charged this period stays billed via its snapshot row. Called
-// by RegisterApp (after the initial insert) and SyncAppModules (after any count
-// / delete write) so the timer always reflects the live pool.
-func (s *Service) recomputeAccountOverage(ctx context.Context, accountID uuid.UUID) error {
-	pooled, err := s.store.PooledModuleCount(ctx, accountID)
-	if err != nil {
-		return billing.Internal("pooled module count lookup failed", err)
-	}
-	if pooled > usage.IncludedModules {
-		if err := s.store.StartAccountOverage(ctx, accountID, s.nowFn().UTC()); err != nil {
-			return billing.Internal("start account overage timer failed", err)
-		}
-		return nil
-	}
-	if err := s.store.ClearAccountOverage(ctx, accountID); err != nil {
-		return billing.Internal("clear account overage timer failed", err)
-	}
-	return nil
-}
-
-// ChargeAccountOverage is the mid-period grace charge for ONE account whose
-// pooled overage has survived the grace window. It:
-//
-//  1. resolves the account's CURRENT anchored period (from activated_at) and the
-//     grace-end instant (overage_since + overageGraceWindow);
-//  2. reads this period's account_overage_snapshots row, if any (the
-//     double-charge guard):
-//     - source='advance' (the boundary claimed it, pending or charged) →
-//     skip, never independently charge it;
-//     - source='grace', status='charged' → already settled; the only further
-//     work is a possible TOP-UP if the pool grew further within this SAME
-//     still-open period (topUpGraceOverage, finding #3);
-//     - source='grace', status='pending' → THIS leg's own attempt died
-//     between claiming the period and Stripe confirming (or before Stripe
-//     was ever called) — resume it, reusing the FROZEN over_count /
-//     charged_micros so the retry recomputes the IDENTICAL amount and the
-//     deterministic Idempotency-Key stays valid;
-//  3. otherwise (no row): reads the CURRENT pool — ≤ IncludedModules clears the
-//     timer and skips (no refund of anything already charged, D1e); prices the
-//     pooled overage PRORATED from grace-end to the period end
-//     (ProratedOverageMicros) → whole cents; a 0-cent result skips (grace ends
-//     at/after the period end);
-//  4. CLAIMS the period (a 'pending' account_overage_snapshots row) BEFORE
-//     calling Stripe — the crash-safe marker described in this file's header —
-//     then charges via the SAME Stripe plumbing as the other legs with the
-//     deterministic per-(account, period) Idempotency-Keys, mirrors the
-//     invoice, and flips the row to 'charged' with the genuine Stripe item id.
-//
-// Gated on a usable default PM exactly like the spine (the candidate is already
-// activated). A failure after the claim leaves the row 'pending'; the next
-// sweep resumes through the SAME idem key (Stripe dedupes) — retry-safe, never
-// a double charge.
-func (s *Service) ChargeAccountOverage(ctx context.Context, cand OverageGraceCandidate, at time.Time) (*OverageChargeSummary, error) {
+// ChargeModuleOverage evaluates + (if "over") charges ONE per-module install
+// timer whose grace has elapsed. Gated on a usable default PM exactly like the
+// proration leg (the candidate account is already activated — the work-list
+// query filters activated_at IS NOT NULL). Idempotent + race-safe WITHOUT a lock:
+// the deterministic per-timer Stripe Idempotency-Keys dedupe the charge across
+// retries, and the grace_resolved first-write-wins guard records the terminal
+// verdict — a crash between Stripe succeeding and the mark committing resumes on
+// the next sweep through the SAME keys (Stripe returns the same objects) and then
+// marks. Unlike the superseded account-wide model there is exactly ONE charge leg
+// and ONE key namespace per timer, so no pending-claim ledger is needed.
+func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCandidate, at time.Time) (*ModuleOverageResult, error) {
 	if cand.ID == uuid.Nil {
-		return nil, billing.InvalidInput("account_id required")
+		return nil, billing.InvalidInput("timer id required")
 	}
 	if s.stripe == nil {
-		return nil, billing.Internal("ChargeAccountOverage requires a Stripe client", nil)
+		return nil, billing.Internal("ChargeModuleOverage requires a Stripe client", nil)
+	}
+	res := &ModuleOverageResult{TimerID: cand.ID}
+
+	// LIVE FIFO determination, computed fresh (never cached): this install's rank
+	// among the account's currently-live timers ordered (installed_at, id).
+	rank, err := s.store.LiveModuleTimerRankBefore(ctx, cand.AccountID, cand.ID, cand.InstalledAt)
+	if err != nil {
+		return nil, billing.Internal("module timer FIFO rank lookup failed", err)
+	}
+	if rank < usage.IncludedModules {
+		// Included → PERMANENT verdict (monotonicity: an existing row's rank only
+		// ever improves over→included, never the reverse). Mark resolved, never
+		// charge, never re-check.
+		if err := s.store.MarkModuleTimerIncluded(ctx, cand.ID); err != nil {
+			return nil, billing.Internal("mark module timer included failed", err)
+		}
+		res.Status = ModuleOverageIncluded
+		return res, nil
 	}
 
-	graceEnd := cand.OverageSince.Add(overageGraceWindow)
-	if at.UTC().Before(graceEnd) {
-		// Defensive: the work-list query already excludes still-in-grace accounts.
-		return &OverageChargeSummary{Status: OverageSkippedGraceHolding}, nil
-	}
-
+	// "Over": price $3 prorated from the install's UTC day to the end of the
+	// anchored period CONTAINING the install (ADR 0005 anchor from activation) —
+	// install-anchored, NOT grace-elapse-anchored and NOT now-anchored. Anchoring
+	// on the install's own period (rather than now's) keeps this leg's coverage
+	// strictly within the install period, so a grace that straddles a period
+	// boundary never charges the NEXT period here — that period is the boundary
+	// precharge's job (scenario 6, Stage B), which would otherwise double-bill it.
 	anchorDay := billingperiod.AnchorDay(cand.ActivatedAt)
-	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(at.UTC(), anchorDay)
-
-	existing, found, err := s.store.AccountOverageSnapshot(ctx, cand.ID, periodStart)
-	if err != nil {
-		return nil, billing.Internal("account overage snapshot lookup failed", err)
-	}
-	if found {
-		if existing.Source == "advance" {
-			// The boundary claimed (pending or charged) this period's overage —
-			// the mid-period sweep must NEVER independently charge it, crash
-			// window or not (the cross-leg double-charge guard, PR #47 review).
-			return &OverageChargeSummary{Status: OverageSkippedAlreadyCharged, PeriodStart: periodStart, OverCount: existing.OverCount}, nil
-		}
-		if existing.Status == OverageSnapshotCharged {
-			return s.topUpGraceOverage(ctx, cand, existing, at, periodStart, periodEnd)
-		}
-		// existing.Status == pending, existing.Source == "grace": resume OUR
-		// own crashed attempt, reusing the frozen amount.
-		return s.completeGraceCharge(ctx, cand, existing.OverCount, existing.ChargedMicros, graceEnd, periodStart, periodEnd, true /* alreadyClaimed */)
-	}
-
-	pooled, err := s.store.PooledModuleCount(ctx, cand.ID)
-	if err != nil {
-		return nil, billing.Internal("pooled module count lookup failed", err)
-	}
-	overCount := pooled - usage.IncludedModules
-	if overCount <= 0 {
-		// Dropped back under the pool since the timer was read — clear the stale
-		// timer and charge nothing (no refund of anything already billed, D1e).
-		if err := s.store.ClearAccountOverage(ctx, cand.ID); err != nil {
-			return nil, billing.Internal("clear account overage timer failed", err)
-		}
-		return &OverageChargeSummary{Status: OverageSkippedUnderPool, PeriodStart: periodStart}, nil
-	}
-
-	// Prorate the pooled overage from grace-end to the period end. A 0-cent
-	// result (grace ends at/after this period's end) means nothing to bill this
-	// period — a later period picks it up; leave the timer armed, no snapshot.
-	proratedMicros := usage.ProratedOverageMicros(usage.AccountOverageMicros(pooled), graceEnd, periodStart, periodEnd)
+	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(cand.InstalledAt.UTC(), anchorDay)
+	proratedMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, cand.InstalledAt, periodStart, periodEnd)
 	cents, err := centsFromMicros(proratedMicros)
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
 	if cents == 0 {
-		return &OverageChargeSummary{Status: OverageSkippedZeroCents, PeriodStart: periodStart, OverCount: overCount}, nil
+		// Rounds to 0 cents — resolve with no charge so the sweep never revisits it
+		// forever (grace_resolved would otherwise stay false).
+		if err := s.store.MarkModuleTimerIncluded(ctx, cand.ID); err != nil {
+			return nil, billing.Internal("mark module timer resolved (zero cents) failed", err)
+		}
+		res.Status = ModuleOverageSkippedZeroCents
+		return res, nil
 	}
+	res.ChargedCents = cents
 
-	return s.completeGraceCharge(ctx, cand, overCount, proratedMicros, graceEnd, periodStart, periodEnd, false /* alreadyClaimed */)
-}
-
-// completeGraceCharge runs the PM/customer gate + the actual Stripe charge for
-// the mid-period grace leg, given an already-resolved (overCount,
-// chargedMicros) — either freshly computed (alreadyClaimed=false: this call
-// still needs to CLAIM the period before Stripe) or reused from an existing
-// 'pending' row (alreadyClaimed=true: THIS leg already claimed it on a prior
-// attempt; resume straight to the PM/Stripe steps with the SAME frozen amount
-// so the deterministic Idempotency-Key never sees a different total).
-func (s *Service) completeGraceCharge(ctx context.Context, cand OverageGraceCandidate, overCount int, chargedMicros int64, graceEnd, periodStart, periodEnd time.Time, alreadyClaimed bool) (*OverageChargeSummary, error) {
-	summary := &OverageChargeSummary{PeriodStart: periodStart, OverCount: overCount}
-	cents, err := centsFromMicros(chargedMicros)
-	if err != nil {
-		return nil, billing.Internal("micros to cents conversion failed", err)
-	}
-	summary.ChargedCents = cents
-
-	hasPM, err := s.store.HasUsableDefaultPM(ctx, cand.ID)
+	// PM gate (same posture as the proration leg): no usable PM → skip WITHOUT
+	// resolving, re-attempted next sweep (the per-timer idem keys stay stable).
+	hasPM, err := s.store.HasUsableDefaultPM(ctx, cand.AccountID)
 	if err != nil {
 		return nil, billing.Internal("usable PM check failed", err)
 	}
 	if !hasPM {
-		summary.Status = OverageSkippedNoPM
-		return summary, nil // retained; re-attempted next sweep through the same idem key
+		res.Status = ModuleOverageSkippedNoPM
+		return res, nil
 	}
-	custID, err := s.store.AccountStripeCustomer(ctx, cand.ID)
+	custID, err := s.store.AccountStripeCustomer(ctx, cand.AccountID)
 	if err != nil {
 		return nil, billing.Internal("stripe customer lookup failed", err)
 	}
 	if custID == "" {
+		// A usable PM implies a Customer (same anomaly posture as the spine).
 		return nil, billing.Internal("account has a usable PM but no Stripe customer id", nil)
 	}
 
-	if !alreadyClaimed {
-		// CLAIM the period BEFORE calling Stripe (the crash-safe marker — see
-		// this file's header). inserted=false means we lost a race to a
-		// concurrent claim (another sweep invocation, or the boundary) — defer
-		// to the winner instead of charging under our own stale claim.
-		inserted, err := s.store.InsertAccountOverageSnapshot(ctx, AccountOverageSnapshot{
-			AccountID:     cand.ID,
-			PeriodStart:   periodStart,
-			PeriodEnd:     periodEnd,
-			OverCount:     overCount,
-			ChargedMicros: chargedMicros,
-			Source:        "grace",
-			Status:        OverageSnapshotPending,
-		})
+	// Charge via a per-timer invoice with deterministic idem keys derived from the
+	// timer id (the stable charge identity — each install charges at most once,
+	// the grace_resolved guard), so a crash-retry reuses the SAME Stripe objects.
+	desc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", cand.AppID)
+	item, err := s.stripe.CreateInvoiceItem(ctx, custID, cents, chargeCurrency, desc, moduleOverageItemIdemKey(cand.ID))
+	if err != nil {
+		return nil, billing.StripeError("module overage invoice item failed", err)
+	}
+	inv, err := s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, moduleOverageInvoiceIdemKey(cand.ID))
+	if err != nil {
+		return nil, billing.StripeError("module overage invoice failed", err)
+	}
+
+	// Resolve the large-charge disclosure threshold AT CHARGE TIME, immediately
+	// after Stripe confirms (scenario 5 / migration 034) — the SAME resolution
+	// point every off-session charge site uses.
+	acct, err := s.store.AccountCollection(ctx, cand.AccountID)
+	if err != nil {
+		return nil, billing.Internal("account collection lookup failed", err)
+	}
+
+	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
+		AccountID:       cand.AccountID,
+		StripeInvoiceID: inv.ID,
+		Status:          inv.Status,
+		AmountDueCents:  inv.AmountDue,
+		AmountPaidCents: inv.AmountPaid,
+		Currency:        chargeCurrency,
+		// Partial coverage window [install day (UTC midnight), period end) — the
+		// SAME instant ProratedBaseMicros priced, so the mirrored window and the
+		// charged amount agree by construction.
+		PeriodStart:        usage.ProrationCoverageStart(cand.InstalledAt, periodStart),
+		PeriodEnd:          periodEnd,
+		IsLargeAutoCollect: collection.IsLargeAutoCollect(proratedMicros, acct.AutoCollectThresholdMicros),
+	}); err != nil {
+		return nil, billing.Internal("invoice mirror upsert failed", err)
+	}
+
+	// Stamp the terminal "over and charged" verdict with the GENUINE Stripe ids
+	// (item.ID — never the idempotency-key string).
+	if err := s.store.MarkModuleTimerCharged(ctx, cand.ID, at.UTC(), inv.ID, item.ID); err != nil {
+		return nil, billing.Internal("mark module timer charged failed", err)
+	}
+
+	res.Status = ModuleOverageCharged
+	res.StripeInvoiceID = inv.ID
+	return res, nil
+}
+
+// SweepModuleOverageResult tallies one SweepModuleOverage batch for the
+// cmd/billing-cycle log line + exit code.
+type SweepModuleOverageResult struct {
+	Pending  int // live unresolved timers past grace (the work-list size)
+	Charged  int // over-modules invoiced this sweep
+	Included int // resolved-as-included (no charge)
+	Skipped  int // no-PM / 0-cent (left for next sweep, or resolved zero)
+	Failed   int // per-timer errors — retried next sweep, never abort the batch
+}
+
+// SweepModuleOverage charges (or resolves) every per-module install timer whose
+// grace has elapsed as of `at`. Idempotent + resumable: a resolved timer drops
+// out of the work list (grace_resolved), and a per-timer failure is counted but
+// never aborts the batch (the next sweep retries it through the same
+// deterministic Stripe keys).
+func (s *Service) SweepModuleOverage(ctx context.Context, at time.Time) (*SweepModuleOverageResult, error) {
+	if at.IsZero() {
+		return nil, billing.InvalidInput("sweep instant required")
+	}
+	cands, err := s.store.ModuleOverageTimersPastGrace(ctx, at.UTC())
+	if err != nil {
+		return nil, billing.Internal("list module overage timers past grace failed", err)
+	}
+	res := &SweepModuleOverageResult{Pending: len(cands)}
+	for _, c := range cands {
+		r, err := s.ChargeModuleOverage(ctx, c, at)
 		if err != nil {
-			return nil, billing.Internal("account overage snapshot claim failed", err)
+			slog.ErrorContext(ctx, "module overage charge failed",
+				"timer_id", c.ID, "app_id", c.AppID, "error", err)
+			res.Failed++
+			continue
 		}
-		if !inserted {
-			return s.resumeClaimedOverage(ctx, cand, graceEnd, periodStart, periodEnd)
+		switch r.Status {
+		case ModuleOverageCharged:
+			res.Charged++
+		case ModuleOverageIncluded:
+			res.Included++
+		default:
+			res.Skipped++
 		}
+		slog.InfoContext(ctx, "module overage grace sweep",
+			"timer_id", c.ID, "app_id", c.AppID, "status", string(r.Status),
+			"charged_cents", r.ChargedCents, "stripe_invoice_id", r.StripeInvoiceID)
 	}
-
-	desc := fmt.Sprintf("MirrorStack module overage (account pool, %d over) — account %s", overCount, cand.ID)
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, cents, chargeCurrency, desc, accountOverageItemIdemKey(cand.ID, periodStart))
-	if err != nil {
-		return nil, billing.StripeError("overage invoice item failed", err)
-	}
-	inv, err := s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, accountOverageInvoiceIdemKey(cand.ID, periodStart))
-	if err != nil {
-		return nil, billing.StripeError("overage invoice failed", err)
-	}
-
-	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:       cand.ID,
-		StripeInvoiceID: inv.ID,
-		Status:          inv.Status,
-		AmountDueCents:  inv.AmountDue,
-		AmountPaidCents: inv.AmountPaid,
-		Currency:        chargeCurrency,
-		// The mirrored window is the PARTIAL coverage [grace-end day, period end),
-		// the SAME instant ProratedOverageMicros priced, so the shown window and
-		// the charged amount agree by construction.
-		PeriodStart: usage.ProrationCoverageStart(graceEnd, periodStart),
-		PeriodEnd:   periodEnd,
-	}); err != nil {
-		return nil, billing.Internal("invoice mirror upsert failed", err)
-	}
-
-	// Flip the claim to 'charged' now that Stripe confirmed it, recording the
-	// GENUINE Stripe invoice item id (never an idempotency-key string).
-	if err := s.store.MarkAccountOverageSnapshotCharged(ctx, cand.ID, periodStart, item.ID); err != nil {
-		return nil, billing.Internal("account overage snapshot mark-charged failed", err)
-	}
-
-	summary.Status = OverageCharged
-	summary.StripeInvoiceID = inv.ID
-	return summary, nil
+	return res, nil
 }
 
-// resumeClaimedOverage handles the (rare, only-possible-under-true-concurrency)
-// case where completeGraceCharge's own claim-insert LOST a race: by the time it
-// tried to claim the period, some OTHER caller (a concurrent sweep invocation,
-// or the boundary) had already inserted a row first. Re-reads the winning row
-// and defers to it — an 'advance' winner means the boundary owns this period
-// (skip); a 'grace' winner that is already 'charged' means another sweep
-// invocation finished first (skip); a 'grace' winner still 'pending' means
-// another invocation is mid-flight — resume IT (same frozen amount).
-func (s *Service) resumeClaimedOverage(ctx context.Context, cand OverageGraceCandidate, graceEnd, periodStart, periodEnd time.Time) (*OverageChargeSummary, error) {
-	existing, found, err := s.store.AccountOverageSnapshot(ctx, cand.ID, periodStart)
-	if err != nil {
-		return nil, billing.Internal("account overage snapshot lookup failed", err)
-	}
-	if !found {
-		// The conflict that sent us here proves a row exists; a missing read
-		// immediately after is a driver/consistency anomaly.
-		return nil, billing.Internal("account overage snapshot claim lost but no row found on re-read", nil)
-	}
-	if existing.Source == "advance" || existing.Status == OverageSnapshotCharged {
-		return &OverageChargeSummary{Status: OverageSkippedAlreadyCharged, PeriodStart: periodStart, OverCount: existing.OverCount}, nil
-	}
-	return s.completeGraceCharge(ctx, cand, existing.OverCount, existing.ChargedMicros, graceEnd, periodStart, periodEnd, true)
+// moduleOverageItemIdemKey / moduleOverageInvoiceIdemKey build the deterministic
+// per-timer Stripe Idempotency-Keys for the Leg 1 overage charge. The timer id is
+// the stable charge identity (each install charges at most once — the
+// grace_resolved guard), so a re-attempt (a retried sweep after a crash between
+// the Stripe call and the mark) reuses the SAME Stripe objects and can never
+// double-charge even before the row is marked resolved.
+func moduleOverageItemIdemKey(timerID uuid.UUID) string {
+	return "mod-overage-ii-" + timerID.String()
 }
 
-// topUpGraceOverage is finding #3's fix — A JUDGMENT CALL (PR #47 review): no
-// product decision was available on the exact top-up policy, so this
-// implements the safest technically-correct interpretation, flagged here and
-// in the PR description. recomputeAccountOverage only ever arms/clears the
-// grace timer; it never re-evaluates an ALREADY-CHARGED period's snapshot, so
-// pooled-module growth after the period's first grace charge went permanently
-// unbilled for that period (and the display, which is snapshot-first, never
-// reflected it either). Because the timer stays armed until the pool drops
-// back under the pool (recomputeAccountOverage), the sweep keeps re-invoking
-// ChargeAccountOverage for this account on every pass — so THIS function now
-// re-checks a 'charged' period's current pool against what was billed and, if
-// it grew, charges the INCREMENTAL delta, conservatively prorated from THIS
-// sweep's instant (`at`) to the period end — never retroactively for time
-// before this sweep noticed the growth (the safest, never-overcharge
-// interpretation; it may under-bill by the gap between the actual install and
-// the next sweep tick, which is bounded by the sweep's cron interval).
-//
-// A pool that merely dropped (or stayed the same) since the last charge is
-// D1e (no refund) — this only ever ADDS to what is billed, never subtracts.
-// The top-up's own Idempotency-Keys are derived from the TARGET cumulative
-// over-count, so a crash-and-retry of the SAME top-up (pool unchanged since)
-// reuses the SAME Stripe objects; if the pool grows AGAIN before this one
-// resolves, the next pass computes a NEW target and a NEW (legitimately
-// different) key — never a collision with the one still in flight.
-func (s *Service) topUpGraceOverage(ctx context.Context, cand OverageGraceCandidate, existing AccountOverageSnapshot, at, periodStart, periodEnd time.Time) (*OverageChargeSummary, error) {
-	pooled, err := s.store.PooledModuleCount(ctx, cand.ID)
-	if err != nil {
-		return nil, billing.Internal("pooled module count lookup failed", err)
-	}
-	overCount := pooled - usage.IncludedModules
-	if overCount <= existing.OverCount {
-		if overCount <= 0 {
-			if err := s.store.ClearAccountOverage(ctx, cand.ID); err != nil {
-				return nil, billing.Internal("clear account overage timer failed", err)
-			}
-		}
-		return &OverageChargeSummary{Status: OverageSkippedAlreadyCharged, PeriodStart: periodStart, OverCount: existing.OverCount}, nil
-	}
-
-	deltaOverCount := overCount - existing.OverCount
-	deltaFullMicros := usage.ModuleOverageFeeMicros * int64(deltaOverCount)
-	deltaMicros := usage.ProratedOverageMicros(deltaFullMicros, at, periodStart, periodEnd)
-	deltaCents, err := centsFromMicros(deltaMicros)
-	if err != nil {
-		return nil, billing.Internal("micros to cents conversion failed", err)
-	}
-	summary := &OverageChargeSummary{PeriodStart: periodStart, OverCount: overCount}
-	if deltaCents == 0 {
-		summary.Status = OverageSkippedZeroCents
-		return summary, nil
-	}
-	summary.ChargedCents = deltaCents
-
-	hasPM, err := s.store.HasUsableDefaultPM(ctx, cand.ID)
-	if err != nil {
-		return nil, billing.Internal("usable PM check failed", err)
-	}
-	if !hasPM {
-		summary.Status = OverageSkippedNoPM
-		return summary, nil // retained; re-attempted next sweep through the same idem key
-	}
-	custID, err := s.store.AccountStripeCustomer(ctx, cand.ID)
-	if err != nil {
-		return nil, billing.Internal("stripe customer lookup failed", err)
-	}
-	if custID == "" {
-		return nil, billing.Internal("account has a usable PM but no Stripe customer id", nil)
-	}
-
-	desc := fmt.Sprintf("MirrorStack module overage top-up (account pool, %d over, +%d) — account %s", overCount, deltaOverCount, cand.ID)
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, deltaCents, chargeCurrency, desc, accountOverageTopUpItemIdemKey(cand.ID, periodStart, overCount))
-	if err != nil {
-		return nil, billing.StripeError("overage top-up invoice item failed", err)
-	}
-	inv, err := s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, accountOverageTopUpInvoiceIdemKey(cand.ID, periodStart, overCount))
-	if err != nil {
-		return nil, billing.StripeError("overage top-up invoice failed", err)
-	}
-
-	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:       cand.ID,
-		StripeInvoiceID: inv.ID,
-		Status:          inv.Status,
-		AmountDueCents:  inv.AmountDue,
-		AmountPaidCents: inv.AmountPaid,
-		Currency:        chargeCurrency,
-		// The incremental coverage starts at THIS sweep's instant (the
-		// conservative proration basis above), never retroactively.
-		PeriodStart: usage.ProrationCoverageStart(at, periodStart),
-		PeriodEnd:   periodEnd,
-	}); err != nil {
-		return nil, billing.Internal("invoice mirror upsert failed", err)
-	}
-
-	if err := s.store.TopUpAccountOverageSnapshot(ctx, AccountOverageSnapshot{
-		AccountID:     cand.ID,
-		PeriodStart:   periodStart,
-		PeriodEnd:     periodEnd,
-		OverCount:     overCount,
-		ChargedMicros: existing.ChargedMicros + deltaMicros, // cumulative total actually billed for the period
-		Source:        "grace",
-		InvoiceItemID: item.ID,
-	}); err != nil {
-		return nil, billing.Internal("account overage snapshot top-up failed", err)
-	}
-
-	summary.Status = OverageToppedUp
-	summary.StripeInvoiceID = inv.ID
-	return summary, nil
-}
-
-// accountOverageItemIdemKey / accountOverageInvoiceIdemKey build the
-// deterministic per-(account, period) Stripe Idempotency-Keys for the pooled
-// overage charge. The (account, period_start) pair is the stable charge
-// identity — each account's pooled overage bills at most once per period (the
-// account_overage_snapshots guard) — so both the mid-period grace sweep and the
-// boundary leg, if they ever target the SAME period, reuse the SAME Stripe
-// objects and can never double-charge. Mirrors the app-ii-/app-inv- pattern.
-func accountOverageItemIdemKey(accountID uuid.UUID, periodStart time.Time) string {
-	return "acct-overage-ii-" + accountID.String() + "-" + strconv.FormatInt(periodStart.UTC().Unix(), 10)
-}
-
-func accountOverageInvoiceIdemKey(accountID uuid.UUID, periodStart time.Time) string {
-	return "acct-overage-inv-" + accountID.String() + "-" + strconv.FormatInt(periodStart.UTC().Unix(), 10)
-}
-
-// accountOverageTopUpItemIdemKey / accountOverageTopUpInvoiceIdemKey build the
-// deterministic Stripe Idempotency-Keys for an INCREMENTAL top-up charge
-// (finding #3), keyed additionally by the TARGET cumulative over-count so a
-// retry of the SAME top-up (pool unchanged since) reuses the SAME Stripe
-// objects, while a further pool change before it resolves computes a NEW
-// (legitimately distinct) key rather than colliding with the one in flight.
-func accountOverageTopUpItemIdemKey(accountID uuid.UUID, periodStart time.Time, targetOverCount int) string {
-	return accountOverageItemIdemKey(accountID, periodStart) + "-topup-" + strconv.Itoa(targetOverCount)
-}
-
-func accountOverageTopUpInvoiceIdemKey(accountID uuid.UUID, periodStart time.Time, targetOverCount int) string {
-	return accountOverageInvoiceIdemKey(accountID, periodStart) + "-topup-" + strconv.Itoa(targetOverCount)
+func moduleOverageInvoiceIdemKey(timerID uuid.UUID) string {
+	return "mod-overage-inv-" + timerID.String()
 }

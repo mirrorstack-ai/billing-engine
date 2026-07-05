@@ -331,22 +331,8 @@ type MsBillingAccount struct {
 	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
 	// UTC instant the account bound its FIRST credit card (billing-account activation). Immutable, first-bind-wins; billing-period anchor day = activated_at day-of-month (ADR 0005). NULL = never activated -> skipped by cmd/billing-cycle.
 	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
-	// UTC instant the account-wide pooled SUM(module_count) over live apps first crossed the included 5 (account-wide overage grace anchor, owner spec 2026-07-05). NULL = not currently over the pool. Recomputed by RegisterApp / SyncAppModules; arms one 3-day grace timer per account.
-	OverageSince pgtype.Timestamptz `json:"overage_since"`
 	// Per-account size threshold (micro-USD) above which a SUCCESSFUL off-session charge is disclosed as "large" on the billing page. NULL = platform default ($100 = 100000000 micros). Resolved at charge time; pure disclosure, changes no charging behaviour.
 	AutoCollectThresholdMicros pgtype.Int8 `json:"auto_collect_threshold_micros"`
-}
-
-type MsBillingAccountOverageSnapshot struct {
-	AccountID     string      `json:"account_id"`
-	PeriodStart   time.Time   `json:"period_start"`
-	PeriodEnd     time.Time   `json:"period_end"`
-	OverCount     int32       `json:"over_count"`
-	ChargedMicros int64       `json:"charged_micros"`
-	Source        string      `json:"source"`
-	Status        string      `json:"status"`
-	InvoiceItemID pgtype.Text `json:"invoice_item_id"`
-	CreatedAt     time.Time   `json:"created_at"`
 }
 
 type MsBillingAddCardRequest struct {
@@ -382,6 +368,20 @@ type MsBillingAppBaseSnapshot struct {
 	BaseMicros  int64     `json:"base_micros"`
 	Source      string    `json:"source"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type MsBillingAppModuleOverageTimer struct {
+	ID                 string             `json:"id"`
+	AccountID          string             `json:"account_id"`
+	AppID              string             `json:"app_id"`
+	InstalledAt        time.Time          `json:"installed_at"`
+	GraceExpiresAt     time.Time          `json:"grace_expires_at"`
+	RemovedAt          pgtype.Timestamptz `json:"removed_at"`
+	GraceChargedAt     pgtype.Timestamptz `json:"grace_charged_at"`
+	GraceResolved      bool               `json:"grace_resolved"`
+	GraceInvoiceID     pgtype.Text        `json:"grace_invoice_id"`
+	GraceInvoiceItemID pgtype.Text        `json:"grace_invoice_item_id"`
+	CreatedAt          time.Time          `json:"created_at"`
 }
 
 type MsBillingBillingPeriod struct {
