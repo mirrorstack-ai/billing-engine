@@ -43,7 +43,7 @@ func TestChargeProrationLocked_Integration_LockNotHeldAcrossStripeCall(t *testin
 
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 
 	insideCallback := make(chan struct{})
 	release := make(chan struct{})
@@ -96,7 +96,7 @@ func TestChargeProrationLocked_Integration_ConcurrentDeleteDoesNotBlockOnLock(t 
 
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 
 	insideCallback := make(chan struct{})
 	release := make(chan struct{})
@@ -155,7 +155,7 @@ func TestChargeProrationLocked_Integration_PersistsLargeAutoCollectFlag(t *testi
 
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 
 	pc := mkProrationCharge(acct, appID, "in_large_flag", mustTime(t, "2026-07-04T00:00:00Z"))
 	pc.Invoice.IsLargeAutoCollect = true

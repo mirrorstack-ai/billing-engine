@@ -32,7 +32,11 @@ const (
 // Each requested capability is checked independently; the union of
 // unmet ones appears in EnsureResponse.Missing.
 type EnsureRequest struct {
-	UserID  uuid.UUID    `json:"user_id"`
+	// Exactly one of UserID / OrgID — the payer principal. An org resolves
+	// through its funding designation (migration 041): not designated / not
+	// activated → Missing: ["billing_account"].
+	UserID  uuid.UUID    `json:"user_id,omitempty"`
+	OrgID   uuid.UUID    `json:"org_id,omitempty"`
 	Require []Capability `json:"require,omitempty"`
 }
 
@@ -66,7 +70,11 @@ const (
 
 // PrepareAddPaymentMethodRequest is the payload of PrepareAddPaymentMethod.
 type PrepareAddPaymentMethodRequest struct {
-	UserID uuid.UUID `json:"user_id"`
+	// Exactly one of UserID / OrgID. The org leg get-or-creates the ORG
+	// account row (regardless of designation state) so the card can bind
+	// before a funding='org' designation completes.
+	UserID uuid.UUID `json:"user_id,omitempty"`
+	OrgID  uuid.UUID `json:"org_id,omitempty"`
 	// Email is the account email, set on the Stripe Customer so a
 	// setup-mode Checkout Session can be confirmed (Stripe requires one)
 	// and for receipts/dunning. api-platform supplies it from the
@@ -92,7 +100,9 @@ type PrepareAddPaymentMethodResponse struct {
 
 // DetachPaymentMethodRequest is the payload of DetachPaymentMethod.
 type DetachPaymentMethodRequest struct {
-	UserID          uuid.UUID `json:"user_id"`
+	// Exactly one of UserID / OrgID — the PM must belong to that owner's account.
+	UserID          uuid.UUID `json:"user_id,omitempty"`
+	OrgID           uuid.UUID `json:"org_id,omitempty"`
 	PaymentMethodID uuid.UUID `json:"payment_method_id"`
 }
 
@@ -102,7 +112,9 @@ type DetachPaymentMethodResponse struct{}
 
 // SetDefaultPaymentMethodRequest is the payload of SetDefaultPaymentMethod.
 type SetDefaultPaymentMethodRequest struct {
-	UserID          uuid.UUID `json:"user_id"`
+	// Exactly one of UserID / OrgID — the PM must belong to that owner's account.
+	UserID          uuid.UUID `json:"user_id,omitempty"`
+	OrgID           uuid.UUID `json:"org_id,omitempty"`
 	PaymentMethodID uuid.UUID `json:"payment_method_id"`
 }
 
@@ -119,7 +131,9 @@ type SetDefaultPaymentMethodResponse struct{}
 // be confirmed against the setup-mode Checkout Session. Empty tolerated
 // but blocks confirm.
 type StartAddPaymentMethodRequest struct {
-	UserID uuid.UUID `json:"user_id"`
+	// Exactly one of UserID / OrgID (org leg: see PrepareAddPaymentMethodRequest).
+	UserID uuid.UUID `json:"user_id,omitempty"`
+	OrgID  uuid.UUID `json:"org_id,omitempty"`
 	Email  string    `json:"email,omitempty"`
 }
 
@@ -139,7 +153,9 @@ type StartAddPaymentMethodResponse struct {
 // the polling half of the add-card RPC. The frontend retries until
 // status is no longer "pending".
 type FinishAddPaymentMethodRequest struct {
-	UserID    uuid.UUID `json:"user_id"`
+	// Exactly one of UserID / OrgID — must match the Start call's owner.
+	UserID    uuid.UUID `json:"user_id,omitempty"`
+	OrgID     uuid.UUID `json:"org_id,omitempty"`
 	RequestID uuid.UUID `json:"request_id"`
 }
 
@@ -171,7 +187,10 @@ type FinishAddPaymentMethodResponse struct {
 
 // GetPaymentMethodsRequest is the payload of GetPaymentMethods.
 type GetPaymentMethodsRequest struct {
-	UserID uuid.UUID `json:"user_id"`
+	// Exactly one of UserID / OrgID. A sponsor-funded org account owns no PM
+	// rows (the sponsor's account does) — an empty list is its normal state.
+	UserID uuid.UUID `json:"user_id,omitempty"`
+	OrgID  uuid.UUID `json:"org_id,omitempty"`
 }
 
 // GetPaymentMethodsResponse is the body of the success envelope.

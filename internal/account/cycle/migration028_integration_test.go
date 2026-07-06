@@ -28,7 +28,7 @@ func TestAppBaseSnapshots_Integration_ConflictSemanticsAndRead(t *testing.T) {
 
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 5, mustTime(t, "2026-06-10T08:00:00Z"), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 5, mustTime(t, "2026-06-10T08:00:00Z"), ""))
 
 	periodStart := mustTime(t, "2026-06-01T00:00:00Z")
 	periodEnd := mustTime(t, "2026-07-01T00:00:00Z")

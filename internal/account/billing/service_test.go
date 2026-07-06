@@ -25,6 +25,16 @@ type fakeStore struct {
 	// PM-target lookups for detach / set-default, keyed by payment method id.
 	pmTargets map[uuid.UUID]pmTarget
 
+	// org-billing state (migration 041). accountsByOrg models the org account
+	// rows (existence — AccountByOrg / EnsureOrgAccount); fundedOrgs the
+	// designation+activation gate AccountByOrgFunded reads; fundingOf the
+	// sponsor funding hop (absent → identity); orgPMTargets the org twin of
+	// pmTargets (PaymentMethodTargetForOrg).
+	accountsByOrg map[uuid.UUID]fakeAccount
+	fundedOrgs    map[uuid.UUID]bool
+	fundingOf     map[uuid.UUID]uuid.UUID
+	orgPMTargets  map[uuid.UUID]pmTarget
+
 	// Injected failures (set per-test as needed).
 	errEnsureAccount        error
 	errSetStripeCustomer    error
@@ -64,6 +74,10 @@ func newFakeStore() *fakeStore {
 		paymentMethodsBy: map[uuid.UUID][]billing.PaymentMethod{},
 		pmTargets:        map[uuid.UUID]pmTarget{},
 		addCardRequests:  map[uuid.UUID]*fakeAddCardRequest{},
+		accountsByOrg:    map[uuid.UUID]fakeAccount{},
+		fundedOrgs:       map[uuid.UUID]bool{},
+		fundingOf:        map[uuid.UUID]uuid.UUID{},
+		orgPMTargets:     map[uuid.UUID]pmTarget{},
 	}
 }
 
@@ -122,7 +136,10 @@ func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) (
 	if s.errListPaymentMethods != nil {
 		return nil, s.errListPaymentMethods
 	}
-	return s.paymentMethodsBy[accountID], nil
+	if pms, ok := s.paymentMethodsBy[accountID]; ok {
+		return pms, nil
+	}
+	return []billing.PaymentMethod{}, nil // Store contract: empty slice, never nil
 }
 
 func (s *fakeStore) PaymentMethodTarget(_ context.Context, _ uuid.UUID, paymentMethodID uuid.UUID) (string, string, bool, bool, error) {
@@ -167,6 +184,52 @@ func (s *fakeStore) GetAddCardRequest(_ context.Context, requestID, accountID uu
 		return nil, nil
 	}
 	return &billing.AddCardRequestStatus{Status: r.status, PaymentMethod: r.paymentMethod}, nil
+}
+
+func (s *fakeStore) EnsureOrgAccount(_ context.Context, orgID uuid.UUID) (uuid.UUID, string, error) {
+	if a, ok := s.accountsByOrg[orgID]; ok {
+		return a.id, a.stripeCustomerID, nil
+	}
+	a := fakeAccount{id: uuid.New()}
+	s.accountsByOrg[orgID] = a
+	return a.id, "", nil
+}
+
+func (s *fakeStore) AccountByOrg(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	a, ok := s.accountsByOrg[orgID]
+	if !ok {
+		return uuid.Nil, false, nil
+	}
+	return a.id, true, nil
+}
+
+func (s *fakeStore) AccountByOrgFunded(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	// Row EXISTENCE is not enough — the funded gate (designation + activation)
+	// is modeled as an explicit flag.
+	a, ok := s.accountsByOrg[orgID]
+	if !ok || !s.fundedOrgs[orgID] {
+		return uuid.Nil, false, nil
+	}
+	return a.id, true, nil
+}
+
+func (s *fakeStore) ChargeFundingAccount(_ context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	// Identity unless a sponsor funding mapping is configured (org D1 hop).
+	if funding, ok := s.fundingOf[accountID]; ok {
+		return funding, nil
+	}
+	return accountID, nil
+}
+
+func (s *fakeStore) PaymentMethodTargetForOrg(_ context.Context, _, paymentMethodID uuid.UUID) (string, string, bool, bool, error) {
+	if s.errPaymentMethodTarget != nil {
+		return "", "", false, false, s.errPaymentMethodTarget
+	}
+	t, ok := s.orgPMTargets[paymentMethodID]
+	if !ok {
+		return "", "", false, false, nil
+	}
+	return t.stripePMID, t.stripeCustomerID, t.isDefault, true, nil
 }
 
 // --- in-memory Stripe Client fake ----------------------------------------
@@ -491,6 +554,74 @@ func TestEnsure_UnknownRequire_InvalidInput(t *testing.T) {
 	require.Equal(t, billing.CodeInvalidInput, be.Code)
 }
 
+func TestEnsure_UnfundedOrg_MissingBillingAccount(t *testing.T) {
+	// The org leg resolves through the FUNDING gate (designation + activation),
+	// not row existence: an org whose account row exists but never funded still
+	// has no billing capability.
+	store := newFakeStore()
+	org := uuid.New()
+	store.accountsByOrg[org] = fakeAccount{id: uuid.New()} // row exists, NOT funded
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{OrgID: org})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{billing.MissingBillingAccount}, resp.Missing)
+}
+
+func TestEnsure_SponsorFundedOrg_PMSatisfiedThroughFundingHop(t *testing.T) {
+	// A sponsor-funded org account owns NO PM rows itself — the payment_method
+	// capability checks the FUNDING account (org-billing D1 hop).
+	store := newFakeStore()
+	org := uuid.New()
+	orgAcct, sponsorAcct := uuid.New(), uuid.New()
+	store.accountsByOrg[org] = fakeAccount{id: orgAcct}
+	store.fundedOrgs[org] = true
+	store.fundingOf[orgAcct] = sponsorAcct
+	store.hasUsablePM[sponsorAcct] = true // hasUsablePM[orgAcct] stays false
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.Ensure(context.Background(), billing.EnsureRequest{OrgID: org})
+
+	require.NoError(t, err)
+	require.True(t, resp.Ready())
+	require.Empty(t, resp.Missing)
+}
+
+func TestEnsure_UserAndOrgBothSet_InvalidInput(t *testing.T) {
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
+
+	_, err := svc.Ensure(context.Background(), billing.EnsureRequest{UserID: uuid.New(), OrgID: uuid.New()})
+
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInvalidInput, be.Code)
+}
+
+func TestStartAddPaymentMethod_OwnerValidation(t *testing.T) {
+	// The exactly-one owner-principal contract (user XOR org) gates every
+	// payment-method RPC, not just Ensure.
+	store := newFakeStore()
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake, "")
+	for _, tc := range []struct {
+		name string
+		req  billing.StartAddPaymentMethodRequest
+	}{
+		{"neither owner", billing.StartAddPaymentMethodRequest{}},
+		{"both owners", billing.StartAddPaymentMethodRequest{UserID: uuid.New(), OrgID: uuid.New()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := svc.StartAddPaymentMethod(context.Background(), tc.req)
+			var be *billing.Error
+			require.ErrorAs(t, err, &be)
+			require.Equal(t, billing.CodeInvalidInput, be.Code)
+			require.Empty(t, stripeFake.createdCustomers, "rejected up-front, before any Stripe call")
+			require.Empty(t, store.addCardRequests)
+		})
+	}
+}
+
 func TestPrepareAddPaymentMethod_FirstTime_CreatesCustomerAndSetupIntent(t *testing.T) {
 	store := newFakeStore()
 	stripeFake := &fakeStripe{}
@@ -603,6 +734,22 @@ func TestGetPaymentMethods_NoAccount_EmptySlice(t *testing.T) {
 	require.Empty(t, resp.PaymentMethods)
 }
 
+func TestGetPaymentMethods_OrgAccountNoCards_EmptySlice(t *testing.T) {
+	// The org read resolves by row EXISTENCE (cards are manageable while a
+	// funding='org' designation awaits its first bind); a card-less org
+	// account lists empty, exactly like the user leg.
+	store := newFakeStore()
+	org := uuid.New()
+	store.accountsByOrg[org] = fakeAccount{id: uuid.New(), stripeCustomerID: "cus_org"}
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.GetPaymentMethods(context.Background(), billing.GetPaymentMethodsRequest{OrgID: org})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp.PaymentMethods)
+	require.Empty(t, resp.PaymentMethods)
+}
+
 func TestGetPaymentMethods_HasMethods_ReturnsAll(t *testing.T) {
 	store := newFakeStore()
 	userID := uuid.New()
@@ -701,4 +848,41 @@ func TestSetDefaultPaymentMethod_NotOwned_ReturnsNotFound(t *testing.T) {
 	var be *billing.Error
 	require.ErrorAs(t, err, &be)
 	require.Equal(t, billing.CodeNotFound, be.Code)
+}
+
+func TestDetachPaymentMethod_OrgOwnedPM_ResolvesThroughOrgTarget(t *testing.T) {
+	// An org-scoped detach dispatches to PaymentMethodTargetForOrg: the PM must
+	// belong to the ORG account — a user-owned PM is invisible through the org
+	// gate (404, not a cross-owner detach).
+	store := newFakeStore()
+	orgPM, userPM := uuid.New(), uuid.New()
+	store.orgPMTargets[orgPM] = pmTarget{stripePMID: "pm_org", stripeCustomerID: "cus_org"}
+	store.pmTargets[userPM] = pmTarget{stripePMID: "pm_user", stripeCustomerID: "cus_u"}
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake, "")
+
+	_, err := svc.DetachPaymentMethod(context.Background(),
+		billing.DetachPaymentMethodRequest{OrgID: uuid.New(), PaymentMethodID: orgPM})
+	require.NoError(t, err)
+	require.Equal(t, []string{"pm_org"}, stripeFake.detached)
+
+	_, err = svc.DetachPaymentMethod(context.Background(),
+		billing.DetachPaymentMethodRequest{OrgID: uuid.New(), PaymentMethodID: userPM})
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeNotFound, be.Code)
+}
+
+func TestSetDefaultPaymentMethod_OrgOwnedPM_SetsOrgCustomerDefault(t *testing.T) {
+	store := newFakeStore()
+	pmID := uuid.New()
+	store.orgPMTargets[pmID] = pmTarget{stripePMID: "pm_org", stripeCustomerID: "cus_org"}
+	stripeFake := &fakeStripe{}
+	svc := billing.NewService(store, stripeFake, "")
+
+	_, err := svc.SetDefaultPaymentMethod(context.Background(),
+		billing.SetDefaultPaymentMethodRequest{OrgID: uuid.New(), PaymentMethodID: pmID})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"cus_org=pm_org"}, stripeFake.defaultsSet)
 }

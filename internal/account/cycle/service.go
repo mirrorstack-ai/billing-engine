@@ -72,15 +72,26 @@ func (s *Service) offSessionChargePermitted(ctx context.Context, accountID uuid.
 // skip status, transient/retried); a usable PM implies a Stripe Customer (a
 // card can't attach without one) -> an empty custID here is an anomaly,
 // surfaced as an error rather than silently auto-creating a Customer.
+//
+// The FUNDING HOP (org-billing D1): an org account whose designation names a
+// sponsor gates on — and charges — the SPONSOR's default PM + Stripe
+// customer; every other account funds itself. Resolved here, at charge time,
+// so a designation switch re-routes only future charges; everything else
+// (run rows, invoice mirror, ms_charge_ref) stays keyed to accountID, and a
+// sponsor revoke degrades to the ordinary transient no_pm skip.
 func (s *Service) resolveChargeableCustomer(ctx context.Context, accountID uuid.UUID) (custID string, ok bool, err error) {
-	hasPM, err := s.store.HasUsableDefaultPM(ctx, accountID)
+	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
+	if err != nil {
+		return "", false, billing.Internal("funding account lookup failed", err)
+	}
+	hasPM, err := s.store.HasUsableDefaultPM(ctx, fundingID)
 	if err != nil {
 		return "", false, billing.Internal("usable PM check failed", err)
 	}
 	if !hasPM {
 		return "", false, nil
 	}
-	custID, err = s.store.AccountStripeCustomer(ctx, accountID)
+	custID, err = s.store.AccountStripeCustomer(ctx, fundingID)
 	if err != nil {
 		return "", false, billing.Internal("stripe customer lookup failed", err)
 	}
