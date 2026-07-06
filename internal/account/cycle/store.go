@@ -322,11 +322,14 @@ type Store interface {
 	MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error
 
 	// CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario
-	// 6): the count of the account's live timers that are BOTH "over" (live-FIFO
-	// rank >= includedModules) AND already charged at least once (an ongoing
-	// over-module continuing into the new period). A timer still in its own grace
-	// (never charged) is excluded — it stays on Leg 1's timer, never double-counted.
-	CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int) (int, error)
+	// 6): the count of the account's live timers that are "over" (live-FIFO rank
+	// >= includedModules) AND owed a full precharge for the NEW period opening at
+	// periodEnd — installed before it, grace elapsed before it (a straddling
+	// grace's new period is Leg 1's coverage), and grace terminally resolved
+	// (charged, OR resolved-uncharged via the D1d period-closed posture — those
+	// still owe every post-activation period). See the query comment for the full
+	// coverage contract.
+	CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error)
 
 	// CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
 	// ids of an app's live, unresolved install timers whose install instant equals
@@ -1401,10 +1404,11 @@ func (s *pgxStore) MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID
 	})
 }
 
-func (s *pgxStore) CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int) (int, error) {
+func (s *pgxStore) CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
 	n, err := s.q.CountOngoingOverModuleTimers(ctx, db.CountOngoingOverModuleTimersParams{
 		AccountID:       accountID.String(),
 		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is the small IncludedModules const (5)
+		PeriodEnd:       periodEnd,
 	})
 	if err != nil {
 		return 0, err

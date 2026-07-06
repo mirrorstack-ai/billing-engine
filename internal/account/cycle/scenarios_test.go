@@ -393,3 +393,80 @@ func TestScenario6_BoundaryPrechargesOngoingOverModulesOnly(t *testing.T) {
 	require.EqualValues(t, 2_700, resp.ChargedCents)
 	require.EqualValues(t, 2_700, sc.itemCalls[0].amountCfg)
 }
+
+// Regression (review 2026-07-06, H1): a module installed INSIDE the new period
+// whose own grace already elapsed and was charged by Leg 1 (install-anchored,
+// covering that same new period) must NOT be precharged again by a late/reclaimed
+// boundary run — the advance-overage leg needs the same installed_at < periodEnd
+// cutoff the advance-base leg has always had.
+func TestScenario6_ReclaimedBoundaryNeverPrechargesInsidePeriodModule(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_h1"
+	app := seedApp(store, chargeAccount, 0, false)
+
+	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 5)
+	// Installed Jul 2 — INSIDE the new period [Jul 1, Aug 1) — grace elapsed Jul 5
+	// and Leg 1 charged it (prorated Jul 2 → Aug 1, i.e. covering the new period).
+	inside := seedTimer(store, chargeAccount, app, timeUTC(2026, 7, 2, 0))
+	store.timers[inside].graceResolved = true
+	store.timers[inside].graceCharged = true
+
+	// The delayed/reclaimed [Jun 1, Jul 1) boundary run executes on Jul 6.
+	sc := newFakeStripe()
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Zero(t, resp.AdvanceOverageMicros,
+		"a module installed inside the new period was already covered by its own grace charge — precharging it again double-bills the period")
+}
+
+// Regression (review 2026-07-06, C1): an over-module resolved WITHOUT charge
+// under the D1d period-closed posture (installed pre-activation, so its own
+// install period is forgiven) still owes overage for every post-activation
+// period. The old grace_charged_at IS NOT NULL predicate exempted such modules
+// from ALL boundary precharges, forever.
+func TestScenario6_D1dResolvedUnchargedOverModuleStillPrecharged(t *testing.T) {
+	store := newFakeStore()
+	store.hasPM = true
+	store.stripeCustomer = "cus_c1"
+	app := seedApp(store, chargeAccount, 0, false)
+
+	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 5)
+	// Over-rank timer resolved terminally with NO charge (the D1d posture):
+	// grace_resolved = true, grace_charged_at never set.
+	d1d := seedTimer(store, chargeAccount, app, timeUTC(2026, 5, 10, 0))
+	store.timers[d1d].graceResolved = true
+
+	sc := newFakeStripe()
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, usage.ModuleOverageFeeMicros, resp.AdvanceOverageMicros,
+		"a D1d resolved-uncharged over-module is ongoing — only its pre-activation install period is forgiven, not every period after")
+}
+
+// Regression (review 2026-07-06, M1 boundary side): a charged over-module whose
+// grace STRADDLES the boundary is excluded from the precharge — its own Leg 1
+// charge covers through the END of the period its grace elapses into, so the
+// precharge counting it would double-bill, and Leg 1's coverage means skipping
+// it leaves no gap.
+func TestScenario6_StraddlingGraceExcludedFromPrecharge(t *testing.T) {
+	store := newFakeStore()
+	store.hasPM = true
+	store.stripeCustomer = "cus_m1"
+	app := seedApp(store, chargeAccount, 0, false)
+
+	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 5)
+	// Installed Jun 29 → grace expires Jul 2, past the Jul 1 boundary. Already
+	// charged by (a delayed) Leg 1 covering install → end of the period the grace
+	// elapsed into.
+	straddle := seedTimer(store, chargeAccount, app, timeUTC(2026, 6, 29, 0))
+	store.timers[straddle].graceResolved = true
+	store.timers[straddle].graceCharged = true
+
+	sc := newFakeStripe()
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Zero(t, resp.AdvanceOverageMicros,
+		"a boundary-straddling grace is Leg 1's coverage — the precharge must not double-bill the new period")
+}

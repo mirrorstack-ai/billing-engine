@@ -160,10 +160,17 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// continues into the new one. It is billed FULL (not prorated — the module
 	// exists for the whole new period), on the SAME boundary invoice as arrears +
 	// base, guarded by the SAME billing_run idempotency (keyed per-run, decided
-	// per-module-row now). A timer still inside its OWN grace (grace_charged_at
-	// NULL) is EXCLUDED here — it stays purely on Leg 1's independent timer and is
-	// never double-counted at the boundary. Empty/pre-backfill → 0.
-	overCount, err := s.store.CountOngoingOverModuleTimers(ctx, accountID, usage.IncludedModules)
+	// per-module-row now). The coverage contract with the grace legs (review
+	// 2026-07-06) — a timer counts iff installed_at < periodEnd (installed before
+	// the new period opened; the same cutoff the advance-base leg applies, without
+	// which a reclaimed skipped_no_pm/failed run double-bills a module whose own
+	// grace charge already covered the new period), grace_expires_at < periodEnd
+	// (a boundary-straddling grace's new period is Leg 1's coverage, never this
+	// precharge's), and grace_resolved (charged — or resolved-uncharged under the
+	// D1d period-closed posture, which forgives only the pre-activation install
+	// period, never the periods after; the old grace_charged_at proxy exempted
+	// those modules from ALL overage billing forever). Empty/pre-backfill → 0.
+	overCount, err := s.store.CountOngoingOverModuleTimers(ctx, accountID, usage.IncludedModules, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("ongoing over-module timer count failed", err)
 	}

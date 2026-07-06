@@ -800,15 +800,18 @@ func (f *fakeStore) liveTimersForAccountFIFO(accountID uuid.UUID) []*fakeTimer {
 	return out
 }
 
-func (f *fakeStore) CountOngoingOverModuleTimers(_ context.Context, accountID uuid.UUID, includedModules int) (int, error) {
+func (f *fakeStore) CountOngoingOverModuleTimers(_ context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
 	if f.errCountOngoingOver != nil {
 		return 0, f.errCountOngoingOver
 	}
 	// Live FIFO: the first includedModules are "included"; the rest are "over".
-	// Count the "over" tail that has already been charged at least once.
+	// Count the "over" tail owed a precharge for the new period opening at
+	// periodEnd: installed before it, grace elapsed before it, verdict resolved
+	// (charged or D1d resolved-uncharged) — mirroring the SQL predicate.
 	n := 0
 	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
-		if rank >= includedModules && t.graceCharged {
+		if rank >= includedModules && t.graceResolved &&
+			t.installedAt.Before(periodEnd) && t.graceExpiresAt.Before(periodEnd) {
 			n++
 		}
 	}

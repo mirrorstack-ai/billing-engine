@@ -108,27 +108,44 @@ WHERE id = @timer_id::uuid
   AND grace_resolved = false;
 
 -- CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario 6):
--- the count of the account's currently-live install timers that are BOTH "over"
--- (live-FIFO rank >= included) AND already charged at least once (grace_charged_at
--- IS NOT NULL) — i.e. ongoing over-modules continuing into the new period, each
--- owed a FULL $3 precharge on the boundary invoice. row_number() over the whole
--- live set gives every live timer its 1-based FIFO rank; rn > @included_modules is
--- exactly the 0-based rank >= included ("over") predicate. A timer whose grace has
--- not elapsed yet (grace_charged_at IS NULL) is EXCLUDED — it stays on Leg 1's own
--- timer and is never double-counted here. "over" is re-derived LIVE, so a charged
--- timer that has since flipped to "included" (an earlier install removed) is not
--- counted.
+-- the count of the account's currently-live install timers that are "over"
+-- (live-FIFO rank >= included) AND owed a FULL $3 precharge for the NEW period
+-- [@period_end, next boundary) — ongoing over-modules continuing into it.
+-- row_number() over the whole live set gives every live timer its 1-based FIFO
+-- rank; rn > @included_modules is exactly the 0-based rank >= included ("over")
+-- predicate. "over" is re-derived LIVE, so a charged timer that has since flipped
+-- to "included" (an earlier install removed) is not counted.
+--
+-- The coverage contract with the grace legs (review 2026-07-06) — a timer is
+-- "ongoing" for the new period iff ALL of:
+--   * installed_at < @period_end — it existed before the new period opened. A
+--     module installed INSIDE the new period had that period covered by its OWN
+--     grace charge (Leg 1 / scenario 3), exactly the same cutoff the advance-base
+--     leg applies via LiveAppsCreatedBefore; without it a reclaimed
+--     skipped_no_pm/failed boundary run double-bills the period.
+--   * grace_expires_at < @period_end — its grace elapsed BEFORE the new period
+--     opened. Every grace charge covers install → the END of the period its grace
+--     elapses into, so a boundary-straddling timer's new period belongs to Leg 1,
+--     not this precharge (counting it would double-bill; skipping the NEXT
+--     boundary would leave a gap — this predicate does neither).
+--   * grace_resolved — its grace verdict is terminal. Resolved-WITHOUT-charge
+--     rows (the D1d period-closed posture: installed pre-activation, so the
+--     install period itself is forgiven) still owe every period from the first
+--     post-activation boundary onward; the previous grace_charged_at IS NOT NULL
+--     proxy silently exempted them from ALL overage billing, forever.
 -- name: CountOngoingOverModuleTimers :one
 SELECT COALESCE(count(*), 0)::bigint AS over_count
 FROM (
-    SELECT grace_charged_at,
+    SELECT installed_at, grace_expires_at, grace_resolved,
            row_number() OVER (ORDER BY installed_at, id) AS rn
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = @account_id::uuid
       AND removed_at IS NULL
 ) ranked
 WHERE rn > @included_modules::int
-  AND grace_charged_at IS NOT NULL;
+  AND grace_resolved = true
+  AND installed_at < @period_end::timestamptz
+  AND grace_expires_at < @period_end::timestamptz;
 
 -- CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
 -- ids of the app's live, unresolved install timers whose install instant IS the
