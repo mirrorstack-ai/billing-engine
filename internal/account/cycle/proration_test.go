@@ -73,6 +73,51 @@ func TestSweep_NeverChargesAppDeletedWithinGrace(t *testing.T) {
 	require.Empty(t, store.apps[appID].ProrationInvoiceID)
 }
 
+// Regression (wave 2, D4): an app created pre-activation whose creation grace
+// straddles into the first post-activation period used to be PERMANENTLY
+// skipped (period_closed) — forgiving the straddled, fully-chargeable period.
+// D1d forgives the creation period only; the straddled period is billed in
+// full, and a fully pre-activation app stays forgiven.
+func TestChargeCreationProration_D1dStraddleChargesThePostActivationPeriod(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store) // activated 2026-05-04 09:00 → anchor day 4
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	// Created May 2 — pre-activation (creation period [Apr 4, May 4) closes at
+	// activation) — grace expires May 5, inside [May 4, Jun 4).
+	registerMirror(t, svc, user, appID, time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC), 0)
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2000, resp.ProrationCents, "the straddled period's FULL $20 base — the creation period is forgiven")
+	mirror := store.invoices[sc.invoiceID]
+	require.Equal(t, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodStart, "window narrowed to the straddled period")
+	require.Equal(t, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
+	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)}]
+	require.True(t, ok, "the straddled period gets the snapshot")
+	require.EqualValues(t, 20_000_000, snap.snap.BaseMicros)
+	_, forgiven := store.baseSnapshots[snapKey{appID, time.Date(2026, 4, 4, 0, 0, 0, 0, time.UTC)}]
+	require.False(t, forgiven, "the forgiven creation period gets no snapshot")
+}
+
+func TestChargeCreationProration_D1dFullyPreActivationStaysSkipped(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store) // activated 2026-05-04 09:00
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	// Created Apr 10 — grace expired Apr 13, entirely pre-activation.
+	registerMirror(t, svc, user, appID, time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC), 0)
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusPeriodClosed, resp.Status)
+	require.Empty(t, sc.itemCalls, "fully pre-activation coverage stays forgiven and permanently skipped")
+	require.True(t, store.apps[appID].ProrationSkipped)
+}
+
 // Regression (review 2026-07-06, H5): a creation-proration retry past Stripe's
 // ~24h idempotency-key window reconciles by the app's ms_charge_ref anchor —
 // a crashed attempt's finalized combined invoice is adopted (guard armed with

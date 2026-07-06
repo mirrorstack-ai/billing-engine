@@ -237,11 +237,24 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// (an app created near its period boundary) — that is expected, intended
 	// delayed billing (still the ONLY leg that ever bills this period), not a
 	// retroactive catch-up, and must still charge normally.
-	if _, _, closed := periodClosedByActivation(app.CreatedAt, activatedAt); closed {
-		if err := s.store.SetAppProrationSkipped(ctx, appID); err != nil {
-			return nil, billing.Internal("mark proration permanently skipped failed", err)
+	// A creation grace that straddles into a period the account WAS activated
+	// during is NOT fully forgiven (wave 2, D4): D1d forgives the pre-activation
+	// creation period only — the straddled post-activation period is owed in
+	// full (the charge callback narrows the amount + window to it), and the
+	// advance leg only picks the app up from the NEXT boundary.
+	if _, periodEnd, closed := periodClosedByActivation(app.CreatedAt, activatedAt); closed {
+		graceExpiry := moduleGraceExpiry(app.CreatedAt.UTC())
+		straddleChargeable := false
+		if !graceExpiry.Before(periodEnd) {
+			_, coverageEnd := billingperiod.AnchoredPeriodWindow(graceExpiry, billingperiod.AnchorDay(activatedAt))
+			straddleChargeable = activatedAt.Before(coverageEnd)
 		}
-		return &ProrationResult{AppID: appID, Status: ProrationStatusPeriodClosed}, nil
+		if !straddleChargeable {
+			if err := s.store.SetAppProrationSkipped(ctx, appID); err != nil {
+				return nil, billing.Internal("mark proration permanently skipped failed", err)
+			}
+			return &ProrationResult{AppID: appID, Status: ProrationStatusPeriodClosed}, nil
+		}
 	}
 
 	if s.stripe == nil {
@@ -324,6 +337,18 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			_, coverageEnd = billingperiod.AnchoredPeriodWindow(moduleGraceExpiry(locked.CreatedAt.UTC()), billingperiod.AnchorDay(activatedAt))
 			prorated += usage.BaseFeeMicros
 		}
+		// D1d straddle narrowing (wave 2, D4). With a pre-activation-closed
+		// creation period this point is only reachable when the grace straddles
+		// into a post-activation period (the outer period-closed gate permanently
+		// skips every other closed case): forgive the creation period, bill the
+		// straddled one in full, and narrow the mirror window to it.
+		coverageStart := usage.ProrationCoverageStart(locked.CreatedAt, periodStart)
+		creationPeriodClosed := !activatedAt.Before(periodEnd)
+		if creationPeriodClosed {
+			creationPeriodMicros = 0
+			prorated = usage.BaseFeeMicros
+			coverageStart = periodEnd
+		}
 		c, err := centsFromMicros(prorated)
 		if err != nil {
 			return nil, billing.Internal("micros to cents conversion failed", err)
@@ -353,6 +378,10 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		overageMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, locked.CreatedAt, periodStart, periodEnd)
 		if straddle {
 			overageMicros += usage.ModuleOverageFeeMicros
+		}
+		if creationPeriodClosed {
+			// Same D1d narrowing as the base: only the straddled period is owed.
+			overageMicros = usage.ModuleOverageFeeMicros
 		}
 		overageCents, err := centsFromMicros(overageMicros)
 		if err != nil {
@@ -481,11 +510,9 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, billing.Internal("account collection lookup failed", err)
 		}
 
-		// Mirror the PARTIAL window [creation day, coverage end) — the same window
-		// the amount priced (coverage end extends past the creation period only
-		// when the grace straddles the boundary), so mirror and amount agree by
-		// construction.
-		partialStart := usage.ProrationCoverageStart(locked.CreatedAt, periodStart)
+		// Mirror the window the amount priced — [creation day, coverage end)
+		// normally; narrowed to the straddled period alone under the D1d straddle
+		// rule — so mirror and amount agree by construction.
 		cents = c
 		pc := &ProrationCharge{
 			InvoiceID: inv.ID,
@@ -497,7 +524,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				AmountDueCents:     inv.AmountDue,
 				AmountPaidCents:    inv.AmountPaid,
 				Currency:           chargeCurrency,
-				PeriodStart:        partialStart,
+				PeriodStart:        coverageStart,
 				PeriodEnd:          coverageEnd,
 				IsLargeAutoCollect: flagLargeAutoCollect(prorated+overageTotalMicros, acct),
 			},
@@ -514,7 +541,18 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			},
 			TimerCharges: timerCharges,
 		}
-		if straddle {
+		if creationPeriodClosed {
+			// D1d straddle (wave 2, D4): only the straddled period was billed —
+			// its snapshot is the primary one; the forgiven creation period gets
+			// no row (nothing was charged for it).
+			pc.Snapshot = AppBaseSnapshot{
+				AppID:       locked.AppID,
+				PeriodStart: periodEnd,
+				PeriodEnd:   coverageEnd,
+				ModuleCount: locked.CreatedModuleCount,
+				BaseMicros:  usage.BaseFeeMicros,
+			}
+		} else if straddle {
 			// The straddled period was billed IN FULL on this same invoice — freeze
 			// its own snapshot row so the display shows that period's base as
 			// charged (the boundary leg excluded the app there and writes nothing).

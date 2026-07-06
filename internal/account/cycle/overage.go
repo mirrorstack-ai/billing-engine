@@ -104,23 +104,38 @@ type ModuleOverageResult struct {
 	StripeInvoiceID string
 }
 
-// moduleOverageCoverage resolves the deterministic coverage + amount for one
-// timer under the 2026-07-06 coverage contract — install day → the END of the
-// period the grace elapses into (install period prorated + the straddled
-// period in full when the grace crosses the boundary). Every input
-// (installed_at, grace_expires_at, activation anchor) is immutable, so the
-// SAME amount is recomputed by a fresh charge, an idem-key replay, and the
-// post-idem-key-window recovery path — one home for the math keeps the three
-// from drifting.
-func moduleOverageCoverage(cand ModuleOverageCandidate) (proratedMicros int64, periodStart, periodEnd, coverageEnd time.Time, closed bool) {
-	periodStart, periodEnd, closed = periodClosedByActivation(cand.InstalledAt, cand.ActivatedAt)
+// moduleOverageChargeShape resolves the deterministic charge for one timer
+// under the 2026-07-06 coverage contract — install day → the END of the period
+// the grace elapses into (install period prorated + the straddled period in
+// full when the grace crosses the boundary) — INCLUDING the D1d decision
+// (wave 2, D4): the pre-activation install period is forgiven, but a grace
+// that straddles into a period the account WAS activated during leaves that
+// straddled period chargeable — it is billed in full with the coverage window
+// narrowed to it; only when the ENTIRE coverage is pre-activation-closed is
+// the timer fully forgiven. Every input (installed_at, grace_expires_at,
+// activation anchor) is immutable, so a fresh charge, an idem-key replay, and
+// the post-idem-key-window recovery path all recompute the identical shape —
+// one home for the math keeps the three from drifting.
+func moduleOverageChargeShape(cand ModuleOverageCandidate) (proratedMicros int64, coverageStart, coverageEnd time.Time, fullyForgiven bool) {
+	periodStart, periodEnd, closed := periodClosedByActivation(cand.InstalledAt, cand.ActivatedAt)
+	coverageStart = usage.ProrationCoverageStart(cand.InstalledAt, periodStart)
 	coverageEnd = periodEnd
 	proratedMicros = usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, cand.InstalledAt, periodStart, periodEnd)
 	if !cand.GraceExpiresAt.Before(periodEnd) {
 		_, coverageEnd = billingperiod.AnchoredPeriodWindow(cand.GraceExpiresAt.UTC(), billingperiod.AnchorDay(cand.ActivatedAt))
 		proratedMicros += usage.ModuleOverageFeeMicros
 	}
-	return proratedMicros, periodStart, periodEnd, coverageEnd, closed
+	if closed {
+		if coverageEnd.After(periodEnd) && cand.ActivatedAt.Before(coverageEnd) {
+			// D1d forgives only the install period; the straddled period is
+			// post-activation and owed in full.
+			proratedMicros = usage.ModuleOverageFeeMicros
+			coverageStart = periodEnd
+			return proratedMicros, coverageStart, coverageEnd, false
+		}
+		return 0, time.Time{}, time.Time{}, true
+	}
+	return proratedMicros, coverageStart, coverageEnd, false
 }
 
 // ChargeModuleOverage evaluates + (if "over") charges ONE per-module install
@@ -201,11 +216,11 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// anchored period (ADR 0005 anchor from activation) — install-anchored, NOT
 	// grace-elapse-anchored and NOT now-anchored — plus, for a grace that
 	// STRADDLES the period boundary, the full fee for the period the grace
-	// elapses into (moduleOverageCoverage; the boundary precharge deliberately
+	// elapses into (moduleOverageChargeShape; the boundary precharge deliberately
 	// excludes straddlers via its grace_expires_at < period_end cutoff, so that
 	// period is THIS leg's to bill, and only from the boundary after that does
 	// the precharge take over).
-	proratedMicros, periodStart, _, coverageEnd, closed := moduleOverageCoverage(cand)
+	proratedMicros, coverageStart, coverageEnd, fullyForgiven := moduleOverageChargeShape(cand)
 
 	// D1d — no retroactive catch-up (the SAME posture ChargeCreationProration
 	// enforces on the creation leg, proration.go). RegisterApp synthesizes an app's
@@ -213,16 +228,18 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// yet, and the work-list only gates on activation at CHARGE time — so a timer
 	// can sit installed + past-grace for arbitrarily long while unactivated, then
 	// get swept the instant the account finally binds a card. If the account only
-	// activated AT OR AFTER this install's anchored period had already closed, the
-	// account was never chargeable for that whole period; charging its overage now
-	// — however late the sweep runs — is exactly the retroactive catch-up D1d
-	// forbids. Resolve the timer terminally WITHOUT charging (grace_resolved,
-	// first-write-wins via MarkModuleTimerIncluded) so it never resurfaces, rather
-	// than minting a historical, never-chargeable invoice. Compared against
-	// ActivatedAt, NOT `at`: an ordinary late sweep on a HEALTHY already-activated
-	// account (grace pushing the charge a few days past periodEnd) still charges,
-	// exactly like the creation leg's ActivatedBeforePeriodCloses case.
-	if closed {
+	// activated AT OR AFTER the timer's ENTIRE coverage had already closed, the
+	// account was never chargeable for any of it; charging now — however late the
+	// sweep runs — is exactly the retroactive catch-up D1d forbids. Resolve the
+	// timer terminally WITHOUT charging (grace_resolved, first-write-wins via
+	// MarkModuleTimerIncluded) so it never resurfaces, rather than minting a
+	// historical, never-chargeable invoice. Compared against ActivatedAt, NOT
+	// `at`: an ordinary late sweep on a HEALTHY already-activated account (grace
+	// pushing the charge a few days past periodEnd) still charges. A grace that
+	// straddles into a post-activation period is NOT fully forgiven (wave 2, D4)
+	// — the shape narrows the charge to that straddled period in full; only the
+	// pre-activation install period is ever forgiven.
+	if fullyForgiven {
 		if err := s.store.MarkModuleTimerIncluded(ctx, cand.ID); err != nil {
 			return nil, billing.Internal("mark module timer resolved (period closed) failed", err)
 		}
@@ -341,11 +358,11 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		AmountDueCents:  inv.AmountDue,
 		AmountPaidCents: inv.AmountPaid,
 		Currency:        chargeCurrency,
-		// Partial coverage window [install day (UTC midnight), coverage end) — the
-		// SAME window the amount above priced (coverage end extends past the install
-		// period only for a boundary-straddling grace), so the mirrored window and
-		// the charged amount agree by construction.
-		PeriodStart:        usage.ProrationCoverageStart(cand.InstalledAt, periodStart),
+		// The coverage window the shape priced — [install day, coverage end) in
+		// the normal case; narrowed to the straddled period alone under the D1d
+		// straddle rule — so the mirrored window and the charged amount agree by
+		// construction.
+		PeriodStart:        coverageStart,
 		PeriodEnd:          coverageEnd,
 		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
 	}); err != nil {
@@ -452,7 +469,13 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 			found.ID, moduleOverageChargeRef(cand.ID), cand.ID), nil)
 	}
 
-	proratedMicros, periodStart, _, coverageEnd, _ := moduleOverageCoverage(cand)
+	proratedMicros, coverageStart, coverageEnd, fullyForgiven := moduleOverageChargeShape(cand)
+	if fullyForgiven {
+		// The shape is deterministic, so an attempted timer can only be fully
+		// forgiven if the attempt itself would have been — nothing chargeable to
+		// recover; the caller's fresh path resolves it period_closed.
+		return false, nil
+	}
 	cents, err := centsFromMicros(proratedMicros)
 	if err != nil {
 		return false, billing.Internal("micros to cents conversion failed", err)
@@ -498,7 +521,7 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 		AmountDueCents:     inv.AmountDue,
 		AmountPaidCents:    inv.AmountPaid,
 		Currency:           chargeCurrency,
-		PeriodStart:        usage.ProrationCoverageStart(cand.InstalledAt, periodStart),
+		PeriodStart:        coverageStart,
 		PeriodEnd:          coverageEnd,
 		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
 	}); err != nil {

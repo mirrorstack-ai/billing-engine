@@ -180,6 +180,61 @@ func TestModuleOverage_RemovedWithinGraceNeverCharged(t *testing.T) {
 	require.False(t, store.timers[over].graceCharged)
 }
 
+// Regression (wave 2, D4): D1d forgives the PRE-ACTIVATION install period only.
+// A pre-activation install whose grace straddles into the first post-activation
+// period used to be resolved period_closed uncharged — forgiving the straddled,
+// fully-chargeable period along with the install period (and the boundary
+// predicate excludes it there too, so nobody billed it). The charge is now
+// narrowed to the straddled period in full.
+func TestModuleOverage_D1dStraddleChargesThePostActivationPeriod(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store) // activated 2026-05-04 09:00 → anchor day 4
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), 5)
+	// Installed May 2 (rank 5, over) — pre-activation, install period
+	// [Apr 4, May 4) closed by the May 4 activation — but its grace expires
+	// May 5, INSIDE the first post-activation period [May 4, Jun 4).
+	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC))
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged, "the straddled post-activation period is owed — only the install period is forgiven")
+	require.True(t, store.timers[over].graceCharged)
+	// Full $3 for the straddled period alone, window narrowed to it.
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 300, sc.itemCalls[0].amountCfg)
+	require.Len(t, store.invoices, 1)
+	for _, inv := range store.invoices {
+		require.Equal(t, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), inv.PeriodStart)
+		require.Equal(t, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd)
+	}
+}
+
+// The complement: a pre-activation install whose ENTIRE coverage (install
+// period AND grace) closed before activation stays fully forgiven (D1d).
+func TestModuleOverage_D1dFullyPreActivationStaysForgiven(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store) // activated 2026-05-04 09:00 → anchor day 4
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), 5)
+	// Installed Apr 10 (rank 5, over) — grace expired Apr 13, both inside the
+	// pre-activation [Apr 4, May 4) period.
+	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC))
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Zero(t, res.Charged)
+	require.Empty(t, sc.itemCalls, "a fully pre-activation coverage is never retroactively billed")
+	require.True(t, store.timers[over].graceResolved, "resolved terminally (period_closed)")
+	require.False(t, store.timers[over].graceCharged)
+}
+
 // --- grace straddling a period boundary: Leg 1 covers the straddled period ----
 
 // Regression (review 2026-07-06, M1): a grace window that straddles a period
