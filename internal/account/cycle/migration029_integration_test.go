@@ -5,6 +5,7 @@ package cycle_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -25,22 +26,30 @@ func TestAppsPendingProration_Integration_Filter(t *testing.T) {
 	ctx := context.Background()
 
 	acct := seedAccount(t, pool)
-	cutoff := mustTime(t, "2026-06-27T00:00:00Z") // now − GraceDays for a sweep on Jun 30
+	// MarkAppDeleted stamps the DB's now(), so the deleted fixtures' created_at
+	// must be RELATIVE to the real clock for the D11 within-/after-grace split
+	// to be what each case intends.
+	now := time.Now().UTC()
+	cutoff := now.Add(time.Hour) // a sweep cutoff admitting everything created up to now
 
-	pending := uuid.New() // created before cutoff, live, unarmed → returned
-	young := uuid.New()   // created after cutoff (within grace) → excluded
-	deleted := uuid.New() // before cutoff but soft-deleted → excluded
-	charged := uuid.New() // before cutoff but guard armed → excluded
-	require.NoError(t, store.InsertAppMirror(ctx, pending, acct, 0, mustTime(t, "2026-06-20T08:00:00Z")))
-	require.NoError(t, store.InsertAppMirror(ctx, young, acct, 0, mustTime(t, "2026-06-29T08:00:00Z")))
-	require.NoError(t, store.InsertAppMirror(ctx, deleted, acct, 0, mustTime(t, "2026-06-20T08:00:00Z")))
-	require.NoError(t, store.InsertAppMirror(ctx, charged, acct, 0, mustTime(t, "2026-06-20T08:00:00Z")))
-	require.NoError(t, store.MarkAppDeleted(ctx, deleted))
+	pending := uuid.New()      // past cutoff, live, unarmed → returned
+	young := uuid.New()        // created after cutoff → excluded
+	deletedIn := uuid.New()    // deleted WITHIN its grace → excluded (never charged)
+	deletedAfter := uuid.New() // deleted AFTER its grace elapsed → returned (D11: survived, still owes)
+	charged := uuid.New()      // guard armed → excluded
+	require.NoError(t, store.InsertAppMirror(ctx, pending, acct, 0, now.Add(-10*24*time.Hour)))
+	require.NoError(t, store.InsertAppMirror(ctx, young, acct, 0, now.Add(2*time.Hour)))
+	require.NoError(t, store.InsertAppMirror(ctx, deletedIn, acct, 0, now.Add(-time.Hour)))
+	require.NoError(t, store.InsertAppMirror(ctx, deletedAfter, acct, 0, now.Add(-9*24*time.Hour)))
+	require.NoError(t, store.InsertAppMirror(ctx, charged, acct, 0, now.Add(-8*24*time.Hour)))
+	require.NoError(t, store.MarkAppDeleted(ctx, deletedIn))
+	require.NoError(t, store.MarkAppDeleted(ctx, deletedAfter))
 	require.NoError(t, store.SetAppProrationInvoice(ctx, charged, "in_already"))
 
 	ids, err := store.AppsPendingProration(ctx, cutoff)
 	require.NoError(t, err)
-	require.Equal(t, []uuid.UUID{pending}, ids, "only the past-grace, live, unarmed app is pending")
+	require.Equal(t, []uuid.UUID{pending, deletedAfter}, ids,
+		"past-grace live unarmed apps are pending — including one deleted AFTER its grace (D11); a within-grace delete stays excluded")
 }
 
 func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
@@ -99,10 +108,12 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 	require.Equal(t, cycle.ProrationLockedAlreadyCharged, outcome)
 	require.Equal(t, "in_live", invID)
 
-	// Deleted app → Deleted, callback NOT invoked (a within-grace delete is never
-	// charged, and a delete that won the race no-ops the charge).
+	// App deleted WITHIN its grace → Deleted, callback NOT invoked (never
+	// charged; a delete that won the race no-ops the charge). created_at is
+	// relative to the real clock because MarkAppDeleted stamps now() — a fixed
+	// past date would make this a post-grace delete, which D11 charges.
 	deleted := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, deleted, acct, 0, mustTime(t, "2026-07-01T08:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, deleted, acct, 0, time.Now().UTC().Add(-time.Hour)))
 	require.NoError(t, store.MarkAppDeleted(ctx, deleted))
 	called = false
 	outcome, _, err = store.ChargeProrationLocked(ctx, deleted, func(cycle.AppMirror) (*cycle.ProrationCharge, error) {

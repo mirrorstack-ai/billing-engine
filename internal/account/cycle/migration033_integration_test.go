@@ -217,8 +217,10 @@ func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, ongoing, "a module installed inside the new period is never precharged for it")
 
-	// appB adds one LATER over-module (rank 7) still in its own grace (unresolved):
-	// live count rises to 8, but the ongoing count stays 2 (unresolved excluded).
+	// appB adds one LATER over-module (rank 7) whose grace ELAPSED before the
+	// Jul 4 boundary (installed Jun 28, expires Jul 1): under the wave-2 D1
+	// predicate (immutable cutoffs only) it is ongoing even while UNRESOLVED —
+	// resolution state is deliberately not part of the count.
 	late := mustTime(t, "2026-06-28T00:00:00Z")
 	require.NoError(t, store.InsertModuleOverageTimers(ctx, acct, appB, late, late.AddDate(0, 0, 3), 1))
 	liveN, err = usageStore.LiveModuleTimerCountForAccount(ctx, acct)
@@ -226,12 +228,12 @@ func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
 	require.Equal(t, 8, liveN)
 	ongoing, err = store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules, newPeriodStart)
 	require.NoError(t, err)
-	require.Equal(t, 2, ongoing, "the in-grace (unresolved) over-module is NOT ongoing")
+	require.Equal(t, 3, ongoing, "an expired-but-unresolved over-module IS ongoing (D1 — the count never depends on sweep ordering)")
 
 	// D1d resolved-WITHOUT-charge (review 2026-07-06, C1): resolving the rank-7
-	// timer uncharged (the period-closed posture) must still make it "ongoing"
-	// from the next boundary on — the old grace_charged_at IS NOT NULL proxy
-	// exempted such modules from ALL overage billing forever.
+	// timer uncharged (the period-closed posture) keeps it "ongoing" — the old
+	// grace_charged_at IS NOT NULL proxy exempted such modules from ALL overage
+	// billing forever.
 	lateCands, err := store.ModuleOverageTimersPastGrace(ctx, mustTime(t, "2026-07-02T00:00:00Z"))
 	require.NoError(t, err)
 	var rank7 cycle.ModuleOverageCandidate
@@ -246,23 +248,13 @@ func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, ongoing, "a resolved-uncharged (D1d) over-module still owes every later period")
 
-	// grace_expires_at < period_end cutoff (review 2026-07-06, M1): a charged
-	// over-module whose grace STRADDLES the boundary (installed Jul 2, expiry
-	// Jul 5 >= Jul 4) is excluded — its own Leg 1 charge covers the new period
+	// grace_expires_at < period_end cutoff (review 2026-07-06, M1): an
+	// over-module whose grace STRADDLES the boundary (installed Jul 3, expiry
+	// Jul 6 >= Jul 4) is excluded — its own Leg 1 charge covers the new period
 	// (coverage runs through the END of the period its grace elapses into).
-	straddle := mustTime(t, "2026-07-02T00:00:00Z")
+	straddle := mustTime(t, "2026-07-03T00:00:00Z")
 	require.NoError(t, store.InsertModuleOverageTimers(ctx, acct, appB, straddle, straddle.AddDate(0, 0, 3), 1))
-	straddleCands, err := store.ModuleOverageTimersPastGrace(ctx, mustTime(t, "2026-07-06T00:00:00Z"))
-	require.NoError(t, err)
-	var straddleTimer cycle.ModuleOverageCandidate
-	for _, c := range straddleCands {
-		if c.InstalledAt.Equal(straddle) {
-			straddleTimer = c
-		}
-	}
-	require.NotEqual(t, uuid.Nil, straddleTimer.ID, "the Jul-2 straddle timer is in the late work list")
-	require.NoError(t, store.MarkModuleTimerCharged(ctx, straddleTimer.ID, mustTime(t, "2026-07-05T00:00:00Z"), "in_straddle", "ii_straddle"))
 	ongoing, err = store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules, newPeriodStart)
 	require.NoError(t, err)
-	require.Equal(t, 3, ongoing, "a boundary-straddling grace is Leg 1's coverage, never the precharge's")
+	require.Equal(t, 3, ongoing, "a boundary-straddling grace is Leg 1's coverage, never the precharge's — resolved or not")
 }
