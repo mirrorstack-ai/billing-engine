@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/eligibility"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -296,6 +297,78 @@ func (s *Service) GetPaymentMethods(ctx context.Context, req GetPaymentMethodsRe
 		return nil, Internal("list payment methods failed", err)
 	}
 	return &GetPaymentMethodsResponse{PaymentMethods: methods}, nil
+}
+
+// GetServiceStatus is the read behind the platform's service-block gate: it
+// returns whether the account's services should be BLOCKED on payment standing
+// (no usable non-fraud card, a failed first charge, or a failed-charge streak
+// >= 2), per internal/account/eligibility. Read-only; never touches Stripe.
+//
+// A user with no billing account yet has no card on file, so the gate blocks on
+// the card requirement (ReasonNoUsableCard) rather than 404-ing — the caller
+// reads one Blocked flag and never has to special-case "not set up". A real
+// account gathers the three signals in one store read and hands them to the
+// pure Evaluate.
+func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequest) (*GetServiceStatusResponse, error) {
+	if req.UserID == uuid.Nil {
+		return nil, InvalidInput("user_id required")
+	}
+
+	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
+	if err != nil {
+		return nil, Internal("account lookup failed", err)
+	}
+	if !found {
+		// No account ⇒ no card ⇒ blocked on the (unconditional) card gate.
+		return serviceStatusResponse(eligibility.Verdict{
+			Blocked: true,
+			Reason:  eligibility.ReasonNoUsableCard,
+			Reasons: []eligibility.Reason{eligibility.ReasonNoUsableCard},
+		}), nil
+	}
+
+	sig, err := s.store.ServiceBlockSignals(ctx, accountID)
+	if err != nil {
+		return nil, Internal("service-block signals read failed", err)
+	}
+	verdict := eligibility.Evaluate(eligibility.Signals{
+		UsableNonFraudCardCount: sig.UsableCardCount,
+		FirstCharge:             firstChargeState(sig.FirstChargeStatus),
+		FailedChargeStreak:      sig.FailedChargeStreak,
+	})
+	return serviceStatusResponse(verdict), nil
+}
+
+// firstChargeState maps the earliest real invoice's Stripe status (from
+// ServiceBlockSignals) to the eligibility enum. The query already excludes
+// draft/void, so only paid/open/uncollectible/"" reach here; "" (no charge yet)
+// and any unrecognized status fall through to FirstChargeNone (graced).
+func firstChargeState(status string) eligibility.FirstChargeState {
+	switch status {
+	case "paid":
+		return eligibility.FirstChargeSucceeded
+	case "open":
+		return eligibility.FirstChargePending
+	case "uncollectible":
+		return eligibility.FirstChargeFailed
+	default:
+		return eligibility.FirstChargeNone
+	}
+}
+
+// serviceStatusResponse serializes an eligibility.Verdict into the wire
+// response, stringifying the Reason codes. An eligible verdict carries an empty
+// Reasons slice, which the omitempty tag drops from the JSON.
+func serviceStatusResponse(v eligibility.Verdict) *GetServiceStatusResponse {
+	reasons := make([]string, len(v.Reasons))
+	for i, r := range v.Reasons {
+		reasons[i] = string(r)
+	}
+	return &GetServiceStatusResponse{
+		Blocked: v.Blocked,
+		Reason:  string(v.Reason),
+		Reasons: reasons,
+	}
 }
 
 // DetachPaymentMethod detaches a saved card from the user's Stripe

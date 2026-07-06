@@ -49,6 +49,7 @@ type FakeStore struct {
 
 	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
 	RelaxedInvoices []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
+	FailedInvoices  []string                           // stripe_invoice_id values from MarkInvoiceFailed
 
 	// Found-flag knobs
 	TouchedFound bool // returned by TouchAccountByStripeCustomer
@@ -68,6 +69,7 @@ type FakeStore struct {
 	ErrResolve      error // from ResolvePendingAddCardRequest
 	ErrApplyInvoice error // from ApplyInvoiceStatus
 	ErrRelax        error // from RelaxCollectionOnPaidInvoice
+	ErrMarkFailed   error // from MarkInvoiceFailed
 	ErrActivate     error // from StampAccountActivated
 }
 
@@ -168,6 +170,14 @@ func (s *FakeStore) RelaxCollectionOnPaidInvoice(_ context.Context, stripeInvoic
 	}
 	s.RelaxedInvoices = append(s.RelaxedInvoices, stripeInvoiceID)
 	return s.Relaxed, nil
+}
+
+func (s *FakeStore) MarkInvoiceFailed(_ context.Context, stripeInvoiceID string) error {
+	if s.ErrMarkFailed != nil {
+		return s.ErrMarkFailed
+	}
+	s.FailedInvoices = append(s.FailedInvoices, stripeInvoiceID)
+	return nil
 }
 
 // SilentLogger returns a slog.Logger that discards all output. Useful

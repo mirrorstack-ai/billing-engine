@@ -54,3 +54,9 @@
 \i migrations/billing/035_billing_run_frozen_charge.up.sql
 \i migrations/billing/036_charge_attempt_markers.up.sql
 \i migrations/billing/037_apps_name.up.sql
+
+-- 038–039: service-block eligibility gate — card fraud flag + sticky per-invoice
+-- failure marker (the failed-charge streak is DERIVED at read time from these
+-- facts in ServiceBlockSignals, so it needs no stored column).
+\i migrations/billing/038_payment_method_fraud.up.sql
+\i migrations/billing/039_invoice_ever_failed.up.sql

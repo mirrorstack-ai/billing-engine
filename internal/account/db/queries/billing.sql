@@ -80,3 +80,72 @@ SELECT EXISTS (
     WHERE account_id = $1
       AND status IN ('open', 'uncollectible')
 ) AS has_unpaid;
+
+-- ServiceBlockSignals reads, in ONE round-trip, the three inputs the
+-- service-block eligibility gate (internal/account/eligibility) reasons over,
+-- all scoped to one already-resolved account id:
+--
+--   usable_card_count   — active (deleted_at IS NULL), non-fraud
+--                         (NOT fraud_blocked, migration 038), NOT-expired cards.
+--                         Reuses HasUsablePaymentMethod's expiry predicate,
+--                         COUNT instead of EXISTS. The gate blocks at 0.
+--   failed_charge_streak — the account's consecutive failed-charge count,
+--                         DERIVED at read time from the timestamped invoice
+--                         mirror: the number of distinct FAILED invoices
+--                         (ever_failed, migration 039, OR currently
+--                         'uncollectible') created AFTER the account's most-
+--                         recent PAID invoice. The gate blocks at >= 2.
+--                         Deriving it (vs a stored counter mutated by two
+--                         out-of-transaction webhook UPDATEs in Stripe DELIVERY
+--                         order) makes it immune to at-least-once + out-of-order
+--                         delivery: reorder the paid/failed events however you
+--                         like, the count over the immutable (status, ever_failed,
+--                         created_at) facts is the same. "Reset on the next
+--                         successful charge" falls out for free — a newer paid
+--                         invoice moves the cutoff forward, excluding older
+--                         failures. A failed-then-paid invoice is excluded (its
+--                         created_at is not AFTER its own paid instant).
+--   first_charge_status  — the status of the account's EARLIEST real charge:
+--                         the oldest invoice that is not 'draft' (never
+--                         finalized) or 'void' (cancelled, never a real charge
+--                         attempt), by (created_at, id) ASC. '' when the account
+--                         has no such invoice yet (brand new — the gate graces
+--                         it as long as a card is present). The Go layer maps
+--                         '' / paid / open / uncollectible → the FirstChargeState
+--                         enum (none / succeeded / pending / failed).
+--
+-- Scalar subqueries (not JOINs) so each signal is independent and a NULL card
+-- count is impossible (COUNT is 0, not NULL); first_charge_status COALESCEs the
+-- no-invoice case to ''. One row per account id (or none → caller maps to the
+-- not-found verdict).
+-- name: ServiceBlockSignals :one
+SELECT
+    (SELECT COUNT(*)
+       FROM ms_billing.payment_methods_mirror pmm
+       WHERE pmm.account_id = a.id
+         AND pmm.deleted_at IS NULL
+         AND NOT pmm.fraud_blocked
+         AND (pmm.exp_year, pmm.exp_month) >= (
+             EXTRACT(YEAR  FROM current_date)::INT,
+             EXTRACT(MONTH FROM current_date)::INT
+         ))::int AS usable_card_count,
+    (SELECT COUNT(*)
+       FROM ms_billing.invoices f
+       WHERE f.account_id = a.id
+         AND (f.ever_failed OR f.status = 'uncollectible')
+         AND f.created_at > COALESCE(
+             (SELECT MAX(p.created_at)
+                FROM ms_billing.invoices p
+                WHERE p.account_id = a.id AND p.status = 'paid'),
+             '-infinity'::timestamptz
+         ))::int AS failed_charge_streak,
+    COALESCE((
+        SELECT inv.status
+        FROM ms_billing.invoices inv
+        WHERE inv.account_id = a.id
+          AND inv.status NOT IN ('draft', 'void')
+        ORDER BY inv.created_at ASC, inv.id ASC
+        LIMIT 1
+    ), '')::text AS first_charge_status
+FROM ms_billing.accounts a
+WHERE a.id = $1;

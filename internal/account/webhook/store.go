@@ -295,6 +295,22 @@ func (s *pgxStore) RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoi
 	return rows > 0, nil
 }
 
+// MarkInvoiceFailed latches the sticky ever_failed flag on an invoice that
+// failed a payment (invoice.payment_failed / marked_uncollectible). It is a
+// single set-only UPDATE — NO account counter, NO transaction: the failed-charge
+// streak is DERIVED at read time by ServiceBlockSignals from ever_failed +
+// status + created_at, so there is nothing to increment atomically and nothing
+// a reordered/duplicate delivery can double-count. The rows-affected count is
+// irrelevant (a repeat failure event for the same invoice is a harmless 0-row
+// no-op), so the method returns only an error. A no-op when the mirror row has
+// not landed yet (keyed on the invoice) — the currently-'uncollectible' case is
+// counted by status regardless, and an 'open'-after-failure invoice is remarked
+// by the next payment_failed once the row exists.
+func (s *pgxStore) MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string) error {
+	_, err := s.q.MarkInvoiceFailed(ctx, stripeInvoiceID)
+	return err
+}
+
 // text wraps a non-null Go string in the pgtype.Text the generated
 // queries expect for nullable TEXT columns.
 func text(s string) pgtype.Text {

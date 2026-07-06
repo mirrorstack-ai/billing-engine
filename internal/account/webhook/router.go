@@ -128,6 +128,16 @@ type Store interface {
 	// no-op (the account was not prepaid, is still delinquent, or has no mirror
 	// row), never an error. It NEVER charges — relax and charge are decoupled.
 	RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoiceID string) (relaxed bool, err error)
+
+	// MarkInvoiceFailed latches the sticky ever_failed flag (migration 039) on an
+	// invoice that failed a payment (invoice.payment_failed / marked_uncollectible),
+	// so ServiceBlockSignals' read-time streak derivation counts an invoice still
+	// 'open' after a failed charge. Set-only + invoice-keyed, so it is idempotent
+	// under Stripe's at-least-once + out-of-order delivery and a safe no-op when
+	// the mirror row has not landed. The failed-charge STREAK is DERIVED at read
+	// time (not a maintained counter), so there is no account write and nothing to
+	// reset on invoice.paid.
+	MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string) error
 }
 
 // ApplyInvoiceStatusParams carries the columns ApplyInvoiceStatus reconciles

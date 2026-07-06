@@ -469,6 +469,8 @@ type MsBillingInvoice struct {
 	InvoicePdf pgtype.Text `json:"invoice_pdf"`
 	// Server-computed at invoice-create time: true iff the charged amount (netted arrears + advance base, micros) exceeded the account auto_collect_threshold_micros (or the default when NULL) that applied WHEN THE CHARGE FIRED. Post-hoc disclosure only.
 	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
+	// Sticky, set-only: true once this invoice failed a payment (payment_failed / marked_uncollectible), never cleared. Lets the service-block gate DERIVE the failed-charge streak at read time — counting (ever_failed OR uncollectible) invoices created after the last paid one — so it survives a later flip to paid and is immune to webhook delivery order.
+	EverFailed bool `json:"ever_failed"`
 }
 
 type MsBillingMetricDefinition struct {
@@ -511,6 +513,12 @@ type MsBillingPaymentMethodsMirror struct {
 	AttachedAt            time.Time          `json:"attached_at"`
 	DeletedAt             pgtype.Timestamptz `json:"deleted_at"`
 	Fingerprint           pgtype.Text        `json:"fingerprint"`
+	// True once Stripe flags this card as fraud/dispute risk (set by the radar.early_fraud_warning / charge.dispute webhook — follow-up PR). The service-block gate EXCLUDES fraud_blocked cards from the usable-card count. Defaults false so every existing card is treated non-fraud.
+	FraudBlocked bool `json:"fraud_blocked"`
+	// Audit: the signal that set fraud_blocked (e.g. early_fraud_warning, dispute). NULL until flagged.
+	FraudReason pgtype.Text `json:"fraud_reason"`
+	// Audit: when fraud_blocked was set. NULL until flagged.
+	FraudFlaggedAt pgtype.Timestamptz `json:"fraud_flagged_at"`
 }
 
 type MsBillingUsageAggregate struct {
