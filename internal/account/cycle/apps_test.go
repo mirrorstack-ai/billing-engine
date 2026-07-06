@@ -116,6 +116,75 @@ func TestRegisterApp_SynthesizesPerModuleTimersButNeverCharges(t *testing.T) {
 	}
 }
 
+// Regression (review 2026-07-06, H4): a late RegisterApp retry — or a
+// billing-backfill re-registration — that lands AFTER the app was deleted must
+// not resurrect live timers. Deletion freezes module_count (it is not zeroed)
+// and soft-removes all timers, so the pre-fix reconcile saw live=0 against the
+// frozen count and re-inserted K phantom timers for a DELETED app, which then
+// occupied FIFO slots and charged at every boundary with no removal path.
+func TestRegisterApp_RetryAfterDeletionDoesNotResurrectTimers(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+
+	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user, AppID: appID, ModuleCount: 4, CreatedAt: created,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, liveTimerCount(store, appID))
+
+	// The app is deleted (timers soft-removed, module_count frozen at 4).
+	_, err = svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: appID, Deleted: true})
+	require.NoError(t, err)
+	require.Zero(t, liveTimerCount(store, appID))
+
+	// The fire-and-forget RegisterApp RETRY lands late.
+	_, err = svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user, AppID: appID, ModuleCount: 4, CreatedAt: created,
+	})
+	require.NoError(t, err)
+	require.Zero(t, liveTimerCount(store, appID),
+		"a deleted app's timers must never be resurrected by a late retry")
+}
+
+// Regression (review 2026-07-06, H4): SyncAppModules deletion is two
+// non-transactional writes (MarkAppDeleted, then the timer soft-remove). A
+// crash between them leaves the app deleted with live orphaned timers — and
+// the pre-fix retry guard (`req.Deleted && !app.Deleted`) skipped the
+// soft-remove forever on the re-fire, leaving the orphans in the account FIFO
+// (demoting other apps' modules to "over") and chargeable. The delete signal
+// now re-fires the idempotent soft-remove every time.
+func TestSyncAppModules_DeleteRetrySelfHealsOrphanedTimers(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+
+	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user, AppID: appID, ModuleCount: 3,
+		CreatedAt: time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, liveTimerCount(store, appID))
+
+	// Simulate the crash window: the app row was marked deleted, but the timer
+	// soft-remove never committed.
+	app := store.apps[appID]
+	app.Deleted = true
+	store.apps[appID] = app
+	require.Equal(t, 3, liveTimerCount(store, appID), "orphaned live timers of a deleted app")
+
+	// The fire-and-forget delete RETRY must self-heal the orphans.
+	_, err = svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: appID, Deleted: true})
+	require.NoError(t, err)
+	require.Zero(t, liveTimerCount(store, appID),
+		"the delete re-fire soft-removes the orphaned timers instead of skipping on !app.Deleted")
+}
+
 func TestRegisterApp_DefaultsCreatedAtToNow(t *testing.T) {
 	// Zero CreatedAt → the server's now (appsNow, Jul 1) is stamped on the mirror
 	// row (the anchor the later sweep prorates from). Still no charge here.

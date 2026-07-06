@@ -95,6 +95,45 @@ func TestModuleOverageTimers_Integration_SynthesisFIFOAndSweep(t *testing.T) {
 	require.Zero(t, n)
 }
 
+// Regression (review 2026-07-06, H7): timer synthesis is a count-then-insert
+// reconcile in a fire-and-forget-with-retry RPC environment — two CONCURRENT
+// executions for the same app used to both read the same live count and both
+// insert the full deficit, minting phantom timers wrongfully charged $3 each at
+// every boundary. ReconcileModuleTimersToTarget serializes per app under a
+// pg_advisory_xact_lock; hammer it concurrently and assert the invariant.
+func TestModuleOverageTimers_Integration_ConcurrentReconcileNeverDoubleInserts(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	app := uuid.New()
+	created := mustTime(t, "2026-06-19T12:00:00Z")
+	require.NoError(t, store.InsertAppMirror(ctx, app, acct, 7, created))
+
+	const workers = 8
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			errs <- store.ReconcileModuleTimersToTarget(ctx, acct, app, 7, created, created.AddDate(0, 0, 3), created)
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		require.NoError(t, <-errs)
+	}
+
+	n, err := store.LiveModuleTimerCountForApp(ctx, app)
+	require.NoError(t, err)
+	require.Equal(t, 7, n, "concurrent reconciles must never double-insert the deficit")
+
+	// And a concurrent grow/shrink mix still converges to the LAST target
+	// applied — each reconcile is atomic, so no interleaving can overshoot.
+	require.NoError(t, store.ReconcileModuleTimersToTarget(ctx, acct, app, 3, created, created.AddDate(0, 0, 3), mustTime(t, "2026-06-20T00:00:00Z")))
+	n, err = store.LiveModuleTimerCountForApp(ctx, app)
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+}
+
 // Stage B: the row_number()-windowed reads backing scenario 3 (CoCreatedOverModuleTimers),
 // scenario 6 / Leg 2 (CountOngoingOverModuleTimers), and the display
 // (CountLiveModuleTimersForAccount) — validated against real Postgres, since the

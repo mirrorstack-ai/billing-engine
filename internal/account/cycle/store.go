@@ -302,6 +302,17 @@ type Store interface {
 	// for an app — the app-deletion path. Idempotent (WHERE removed_at IS NULL).
 	SoftRemoveAllModuleTimersForApp(ctx context.Context, appID uuid.UUID, removedAt time.Time) error
 
+	// ReconcileModuleTimersToTarget brings an app's live install-timer set to
+	// exactly target, ATOMICALLY under a per-app advisory transaction lock
+	// (review 2026-07-06, H7): a grow inserts the deficit anchored at
+	// installedAt/graceExpiresAt, a shrink LIFO-soft-removes the surplus at
+	// removedAt. The lock is what makes the count-then-write reconcile safe
+	// against the fire-and-forget-with-retry RPC environment — two concurrent
+	// RegisterApp/SyncAppModules executions for the same app used to both read
+	// the same live count and both insert the full deficit, minting phantom
+	// timers that were then wrongfully charged $3 each at every boundary.
+	ReconcileModuleTimersToTarget(ctx context.Context, accountID, appID uuid.UUID, target int, installedAt, graceExpiresAt, removedAt time.Time) error
+
 	// ModuleOverageTimersPastGrace is Leg 1's work list: live, unresolved install
 	// timers whose grace window has elapsed as of `at`, on chargeable (activated)
 	// accounts — each with the account's activation anchor so the sweep resolves
@@ -1355,6 +1366,49 @@ func (s *pgxStore) InsertModuleOverageTimers(ctx context.Context, accountID, app
 		GraceExpiresAt: graceExpiresAt,
 		Count:          int32(n), //nolint:gosec // n = a module_count delta, bounded by maxModuleCount (100000), far below int32 max
 	})
+}
+
+// ReconcileModuleTimersToTarget — count + write in ONE transaction serialized
+// by a per-app advisory xact lock, so concurrent RegisterApp/SyncAppModules
+// retries can never both observe the same live count and double-insert (H7).
+// The lock key is derived from the app id; pg_advisory_xact_lock releases on
+// commit/rollback automatically.
+func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, accountID, appID uuid.UUID, target int, installedAt, graceExpiresAt, removedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "module-timers:"+appID.String()); err != nil {
+		return err
+	}
+	live, err := qtx.LiveModuleTimerCountForApp(ctx, appID.String())
+	if err != nil {
+		return err
+	}
+	switch {
+	case int64(target) > live:
+		if err := qtx.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
+			AccountID:      accountID.String(),
+			AppID:          appID.String(),
+			InstalledAt:    installedAt,
+			GraceExpiresAt: graceExpiresAt,
+			Count:          int32(int64(target) - live), //nolint:gosec // bounded by maxModuleCount (100000)
+		}); err != nil {
+			return err
+		}
+	case int64(target) < live:
+		if err := qtx.SoftRemoveNewestModuleTimers(ctx, db.SoftRemoveNewestModuleTimersParams{
+			AppID:      appID.String(),
+			RemovedAt:  removedAt,
+			LimitCount: int32(live - int64(target)), //nolint:gosec // bounded by maxModuleCount (100000)
+		}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *pgxStore) SoftRemoveNewestModuleTimers(ctx context.Context, appID uuid.UUID, n int, removedAt time.Time) error {

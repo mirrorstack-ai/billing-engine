@@ -130,6 +130,7 @@ type fakeStore struct {
 
 	errLiveTimerCount   error // LiveModuleTimerCountForApp
 	errInsertTimers     error // InsertModuleOverageTimers
+	errReconcileTimers  error // ReconcileModuleTimersToTarget
 	errRemoveNewest     error // SoftRemoveNewestModuleTimers
 	errRemoveAllTimers  error // SoftRemoveAllModuleTimersForApp
 	errTimersPastGrace  error // ModuleOverageTimersPastGrace
@@ -709,6 +710,27 @@ func (f *fakeStore) SoftRemoveNewestModuleTimers(_ context.Context, appID uuid.U
 	for i := 0; i < n && i < len(live); i++ {
 		live[i].removed = true
 		live[i].removedAt = removedAt
+	}
+	return nil
+}
+
+func (f *fakeStore) ReconcileModuleTimersToTarget(ctx context.Context, accountID, appID uuid.UUID, target int, installedAt, graceExpiresAt, removedAt time.Time) error {
+	if f.errReconcileTimers != nil {
+		return f.errReconcileTimers
+	}
+	// Mirrors the pgx locked reconcile: count live, insert the deficit anchored
+	// at installedAt/graceExpiresAt, or LIFO-remove the surplus at removedAt.
+	// (Unit tests are single-threaded; the advisory-lock serialization itself is
+	// exercised by the integration test.)
+	live, err := f.LiveModuleTimerCountForApp(ctx, appID)
+	if err != nil {
+		return err
+	}
+	switch {
+	case target > live:
+		return f.InsertModuleOverageTimers(ctx, accountID, appID, installedAt, graceExpiresAt, target-live)
+	case target < live:
+		return f.SoftRemoveNewestModuleTimers(ctx, appID, live-target, removedAt)
 	}
 	return nil
 }
