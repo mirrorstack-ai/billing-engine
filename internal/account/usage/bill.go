@@ -213,6 +213,8 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 
 	return &GetAppBillResponse{
 		AppID:                  req.AppID,
+		Name:                   parts.Name,
+		IsDeleted:              parts.IsDeleted,
 		PeriodID:               periodID,
 		PeriodStart:            periodStart,
 		PeriodEnd:              periodEnd,
@@ -283,6 +285,12 @@ type appBillParts struct {
 	InfraTotalMicros int64
 	InfraLines       []AppInfraUsage
 	ModuleInfraLines []AppModuleInfraUsage
+	// Name is the frozen app display name (migration 037) — "" when the app was
+	// never mirrored or was registered pre-037. IsDeleted is the server-
+	// authoritative removal flag; the bill page reads it to show a deleted app's
+	// charges in a dialog instead of linking to the (gone) app page.
+	Name      string
+	IsDeleted bool
 }
 
 // computeAppBill computes one app's pre-credit bill parts for the resolved
@@ -384,6 +392,17 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	// from the mirror's CURRENT module_count (or, with no mirror row at all,
 	// the pre-027 flat fee + usage-proxy overage — see the
 	// INSTALLED-MODULE-COUNT note above).
+	//
+	// The mirror is read UNCONDITIONALLY (migration 037): it carries the frozen
+	// name + the deleted flag, which the bill must surface on EVERY period —
+	// including already-charged (snapshotted) periods — so a deleted app's
+	// historical rows still show its name. (Pre-037 this read was nested in the
+	// un-snapshotted estimate branch only.) The base-fee resolution below still
+	// prefers the snapshot; the mirror only drives the estimate fallbacks.
+	mirror, mirrored, err := s.store.AppMirror(ctx, appID)
+	if err != nil {
+		return nil, billing.Internal("app mirror lookup failed", err)
+	}
 	var baseFee int64
 	snap, snapped, err := s.store.AppBaseSnapshot(ctx, appID, periodStart)
 	if err != nil {
@@ -391,14 +410,9 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	}
 	if snapped {
 		// This period's base was charged: display EXACTLY what was invoiced.
-		// The snapshot alone decides — the mirror is only read on the
-		// un-snapshotted estimate paths below.
+		// The snapshot alone decides — the mirror only drives the estimate paths.
 		baseFee = snap.BaseMicros
 	} else {
-		mirror, mirrored, err := s.store.AppMirror(ctx, appID)
-		if err != nil {
-			return nil, billing.Internal("app mirror lookup failed", err)
-		}
 		switch {
 		case mirrored && mirror.Deleted && !mirror.DeletedAt.After(periodStart):
 			// Deleted BEFORE this period opened → no base was (or will be) charged
@@ -426,6 +440,8 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		InfraTotalMicros:       infraTotal,
 		InfraLines:             infraLines,
 		ModuleInfraLines:       moduleInfraLines,
+		Name:                   mirror.Name, // "" when not mirrored / pre-037
+		IsDeleted:              mirrored && mirror.Deleted,
 	}, nil
 }
 

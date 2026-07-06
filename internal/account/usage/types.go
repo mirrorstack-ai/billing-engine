@@ -385,6 +385,11 @@ type GetAppBillRequest struct {
 type GetAppBillResponse struct {
 	// AppID echoes the requested app (self-describing per-app bill).
 	AppID uuid.UUID `json:"app_id"`
+	// Name is the app's frozen display name (migration 037), "" for pre-037 /
+	// unnamed rows. IsDeleted is the server-authoritative removal flag — a
+	// deleted app's bill still resolves (base spent, D1e) and carries its name.
+	Name      string `json:"name,omitempty"`
+	IsDeleted bool   `json:"is_deleted"`
 	// PeriodID echoes the resolved period id — empty ("") for the current live
 	// period (which has no billing_periods row yet), the real id for a past one.
 	PeriodID string `json:"period_id"`
@@ -500,6 +505,15 @@ type AccountPlan struct {
 // usage lines).
 type AccountAppBill struct {
 	AppID uuid.UUID `json:"app_id"`
+	// Name is the app's frozen display name (migration 037), "" for pre-037 /
+	// unnamed rows (the frontend then falls back to its own registry lookup).
+	// Freezing it in billing is what lets a DELETED app's row still show its
+	// name instead of "unknown app".
+	Name string `json:"name,omitempty"`
+	// IsDeleted is the server-authoritative removal flag — the bill page reads
+	// it to show this app's charges in a dialog rather than linking to the
+	// (now-gone) app page.
+	IsDeleted bool `json:"is_deleted"`
 	// BaseFeeMicros is this app's 基本費用 for the period, resolved SNAPSHOT-
 	// FIRST exactly like GetAppBill (charged periods show what was invoiced;
 	// un-charged ones the live mirror estimate, prorated for a creation period).

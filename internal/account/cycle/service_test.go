@@ -479,7 +479,7 @@ func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (t
 	return at, ok, nil
 }
 
-func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time) error {
+func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
 	if f.errAppInsert != nil {
 		return f.errAppInsert
 	}
@@ -490,6 +490,15 @@ func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUI
 		AppID: appID, AccountID: accountID, ModuleCount: moduleCount,
 		CreatedModuleCount: moduleCount, // frozen at insert, mirroring InsertAppMirror's $3/$3 write
 		CreatedAt:          createdAt,
+		Name:               name, // frozen on first registration (migration 037)
+	}
+	return nil
+}
+
+func (f *fakeStore) SetAppName(_ context.Context, appID uuid.UUID, name string) error {
+	if app, ok := f.apps[appID]; ok && !app.Deleted { // no-op once deleted (WHERE deleted_at IS NULL)
+		app.Name = name
+		f.apps[appID] = app
 	}
 	return nil
 }

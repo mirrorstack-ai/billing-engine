@@ -31,7 +31,7 @@ func TestModuleOverageTimers_Integration_SynthesisFIFOAndSweep(t *testing.T) {
 	require.NoError(t, err)
 
 	app := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, app, acct, 0, mustTime(t, "2026-06-01T00:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, app, acct, 0, mustTime(t, "2026-06-01T00:00:00Z"), ""))
 
 	// 5 "included" installs anchored early + 1 "over" install anchored June 10.
 	early := mustTime(t, "2026-05-04T00:00:00Z")
@@ -109,7 +109,7 @@ func TestModuleOverageTimers_Integration_ConcurrentReconcileNeverDoubleInserts(t
 	acct := seedAccount(t, pool)
 	app := uuid.New()
 	created := mustTime(t, "2026-06-19T12:00:00Z")
-	require.NoError(t, store.InsertAppMirror(ctx, app, acct, 7, created))
+	require.NoError(t, store.InsertAppMirror(ctx, app, acct, 7, created, ""))
 
 	const workers = 8
 	errs := make(chan error, workers)
@@ -164,8 +164,8 @@ func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
 
 	appA, appB := uuid.New(), uuid.New()
 	created := mustTime(t, "2026-06-19T12:00:00Z")
-	require.NoError(t, store.InsertAppMirror(ctx, appA, acct, 7, created))
-	require.NoError(t, store.InsertAppMirror(ctx, appB, acct, 0, created))
+	require.NoError(t, store.InsertAppMirror(ctx, appA, acct, 7, created, ""))
+	require.NoError(t, store.InsertAppMirror(ctx, appB, acct, 0, created, ""))
 
 	// appA: 7 co-created install timers at created_at → FIFO ranks 0-6, so 2 are
 	// "over" (rank ≥ IncludedModules=5).

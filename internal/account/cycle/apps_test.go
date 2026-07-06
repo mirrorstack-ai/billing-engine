@@ -40,6 +40,40 @@ func appsSvc(store *fakeStore, sc *fakeStripe) *cycle.Service {
 
 // --- RegisterApp: mirror-only (creation grace — RegisterApp never charges) ---
 
+// Migration 037: RegisterApp freezes the app name; SyncAppModules renames it
+// while live; a rename AFTER deletion is a no-op (the last-known name survives
+// so a deleted app's bill still shows it).
+func TestRegisterApp_FreezesNameThatSurvivesDeletion(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	ctx := context.Background()
+	appID := uuid.New()
+
+	_, err := svc.RegisterApp(ctx, cycle.RegisterAppRequest{
+		OwnerUserID: user, AppID: appID, CreatedAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
+		Name: "影音教育平台",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "影音教育平台", store.apps[appID].Name, "name frozen on registration")
+
+	// Rename while live → mirror tracks it.
+	newName := "影音學習平台"
+	syncResp, err := svc.SyncAppModules(ctx, cycle.SyncAppModulesRequest{AppID: appID, Name: &newName})
+	require.NoError(t, err)
+	require.Equal(t, newName, syncResp.Name)
+	require.Equal(t, newName, store.apps[appID].Name, "live rename updates the frozen name")
+
+	// Delete, then attempt a rename → frozen (no-op), last-known name kept.
+	_, err = svc.SyncAppModules(ctx, cycle.SyncAppModulesRequest{AppID: appID, Deleted: true})
+	require.NoError(t, err)
+	frozen := "should-not-apply"
+	_, err = svc.SyncAppModules(ctx, cycle.SyncAppModulesRequest{AppID: appID, Name: &frozen})
+	require.NoError(t, err)
+	require.Equal(t, newName, store.apps[appID].Name, "a rename after deletion is a no-op — the last-known name is frozen for the bill")
+}
+
 func TestRegisterApp_MirrorsRowWithoutCharging(t *testing.T) {
 	// Creation grace: even a FULLY chargeable account (activated + PM + Stripe
 	// customer) is NOT charged at registration — RegisterApp only mirrors the

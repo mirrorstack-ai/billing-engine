@@ -97,16 +97,17 @@ func (q *Queries) InsertAdvanceBaseSnapshot(ctx context.Context, arg InsertAdvan
 
 const insertAppMirror = `-- name: InsertAppMirror :execrows
 
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at)
-VALUES ($1, $2, $3, $3, $4)
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name)
+VALUES ($1, $2, $3, $3, $4, $5)
 ON CONFLICT (app_id) DO NOTHING
 `
 
 type InsertAppMirrorParams struct {
-	AppID       string    `json:"app_id"`
-	AccountID   string    `json:"account_id"`
-	ModuleCount int32     `json:"module_count"`
-	CreatedAt   time.Time `json:"created_at"`
+	AppID       string      `json:"app_id"`
+	AccountID   string      `json:"account_id"`
+	ModuleCount int32       `json:"module_count"`
+	CreatedAt   time.Time   `json:"created_at"`
+	Name        pgtype.Text `json:"name"`
 }
 
 // Queries backing the ms_billing.apps mirror (migration 027) — the base-fee
@@ -123,12 +124,16 @@ type InsertAppMirrorParams struct {
 // from, immune to a later SyncAppModules install/uninstall during grace.
 // :execrows so the caller can tell a fresh insert (1) from a retry no-op (0),
 // though both are success.
+// name ($5) is frozen from the FIRST registration like created_at /
+// module_count (ON CONFLICT DO NOTHING keeps the first value across retries);
+// SyncAppModules updates it while the app is live (SetAppName).
 func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertAppMirror,
 		arg.AppID,
 		arg.AccountID,
 		arg.ModuleCount,
 		arg.CreatedAt,
+		arg.Name,
 	)
 	if err != nil {
 		return 0, err
@@ -325,7 +330,7 @@ func (q *Queries) SelectAppBaseSnapshot(ctx context.Context, arg SelectAppBaseSn
 }
 
 const selectAppMirror = `-- name: SelectAppMirror :one
-SELECT app_id, account_id, module_count, created_module_count, created_at,
+SELECT app_id, account_id, module_count, created_module_count, created_at, name,
        proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
@@ -337,6 +342,7 @@ type SelectAppMirrorRow struct {
 	ModuleCount          int32              `json:"module_count"`
 	CreatedModuleCount   int32              `json:"created_module_count"`
 	CreatedAt            time.Time          `json:"created_at"`
+	Name                 pgtype.Text        `json:"name"`
 	ProrationInvoiceID   pgtype.Text        `json:"proration_invoice_id"`
 	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
@@ -355,6 +361,7 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 		&i.ModuleCount,
 		&i.CreatedModuleCount,
 		&i.CreatedAt,
+		&i.Name,
 		&i.ProrationInvoiceID,
 		&i.ProrationSkippedAt,
 		&i.ProrationAttemptedAt,
@@ -364,7 +371,7 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 }
 
 const selectAppMirrorForUpdate = `-- name: SelectAppMirrorForUpdate :one
-SELECT app_id, account_id, module_count, created_module_count, created_at,
+SELECT app_id, account_id, module_count, created_module_count, created_at, name,
        proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
@@ -377,6 +384,7 @@ type SelectAppMirrorForUpdateRow struct {
 	ModuleCount          int32              `json:"module_count"`
 	CreatedModuleCount   int32              `json:"created_module_count"`
 	CreatedAt            time.Time          `json:"created_at"`
+	Name                 pgtype.Text        `json:"name"`
 	ProrationInvoiceID   pgtype.Text        `json:"proration_invoice_id"`
 	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
@@ -400,6 +408,7 @@ func (q *Queries) SelectAppMirrorForUpdate(ctx context.Context, appID string) (S
 		&i.ModuleCount,
 		&i.CreatedModuleCount,
 		&i.CreatedAt,
+		&i.Name,
 		&i.ProrationInvoiceID,
 		&i.ProrationSkippedAt,
 		&i.ProrationAttemptedAt,
@@ -427,6 +436,30 @@ type SetAppModuleCountParams struct {
 // check it already performed (unknown app → NOT_FOUND, deleted app → no-op).
 func (q *Queries) SetAppModuleCount(ctx context.Context, arg SetAppModuleCountParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setAppModuleCount, arg.AppID, arg.ModuleCount)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setAppName = `-- name: SetAppName :execrows
+UPDATE ms_billing.apps
+SET name = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL
+`
+
+type SetAppNameParams struct {
+	AppID string      `json:"app_id"`
+	Name  pgtype.Text `json:"name"`
+}
+
+// SetAppName updates the frozen display name (SyncAppModules rename path).
+// WHERE deleted_at IS NULL freezes the name once deleted — the same
+// freeze-on-delete posture as SetAppModuleCount, so a rename after deletion is
+// a documented no-op (0 rows), keeping the last-known name for the bill.
+func (q *Queries) SetAppName(ctx context.Context, arg SetAppNameParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setAppName, arg.AppID, arg.Name)
 	if err != nil {
 		return 0, err
 	}

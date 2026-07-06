@@ -26,7 +26,7 @@ func TestCreatedModuleCount_Integration_FrozenAcrossSetAppModuleCount(t *testing
 
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 2, mustTime(t, "2026-07-01T08:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 2, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 
 	app, found, err := store.AppMirror(ctx, appID)
 	require.NoError(t, err)
@@ -64,8 +64,8 @@ func TestCreatedModuleCount_Integration_RetryKeepsFirstRegistrationsFrozenCount(
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
 	created := mustTime(t, "2026-07-01T08:00:00Z")
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 3, created))
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 12, created)) // retry, different count
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 3, created, ""))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 12, created, "")) // retry, different count
 
 	app, _, err := store.AppMirror(ctx, appID)
 	require.NoError(t, err)
