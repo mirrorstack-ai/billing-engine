@@ -30,9 +30,13 @@ import (
 const maxModuleCount = 100_000
 
 // RegisterAppRequest is the payload of the RegisterApp RPC. Owner fields
-// mirror the other owner-keyed RPCs (exactly one set); v1 resolves USER
-// owners only — org billing is out of scope (D6), matching billing.Ensure
-// (the one account-creation path, user-keyed).
+// mirror the other owner-keyed RPCs (exactly one set). A USER owner resolves
+// through the advisory-locked get-or-create as always. An ORG owner resolves
+// through the org's funding designation (migration 041): funded → the org
+// account; not designated / not activated → an UNBILLED roster row (NULL
+// account_id, owner_org_id stamped) that the RepointOrgUsage sweep attaches
+// once funding lands. Org owners are never rejected anymore (the old D6 rule
+// is retired by the org-billing wave).
 type RegisterAppRequest struct {
 	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
 	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
@@ -125,12 +129,6 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 	if req.OwnerUserID != uuid.Nil && req.OwnerOrgID != uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
 	}
-	if req.OwnerOrgID != uuid.Nil {
-		// v1 has no org-owned billing accounts (D6); the ONE account-creation
-		// path (billing.Ensure / EnsureAccountForUser) is user-keyed. Loud
-		// rather than silently dropping the mirror row.
-		return nil, billing.InvalidInput("org-owned billing accounts are not supported yet (v1 resolves user owners only)")
-	}
 	if req.AppID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
 	}
@@ -146,12 +144,28 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		createdAt = s.nowFn().UTC()
 	}
 
-	accountID, err := s.store.EnsureAccountForUser(ctx, req.OwnerUserID)
-	if err != nil {
-		return nil, billing.Internal("ensure billing account failed", err)
+	var accountID uuid.UUID
+	if req.OwnerUserID != uuid.Nil {
+		id, err := s.store.EnsureAccountForUser(ctx, req.OwnerUserID)
+		if err != nil {
+			return nil, billing.Internal("ensure billing account failed", err)
+		}
+		accountID = id
+	} else {
+		// Org leg: resolve the org's funded account through its designation.
+		// Not designated / not activated → accountID stays Nil and the roster
+		// row registers UNBILLED (owner_org_id stamped for the later attach
+		// sweep). Never an error — app creation must not block on billing.
+		id, funded, err := s.store.ResolveOrgFundedAccount(ctx, req.OwnerOrgID)
+		if err != nil {
+			return nil, billing.Internal("org account resolution failed", err)
+		}
+		if funded {
+			accountID = id
+		}
 	}
 
-	if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.ModuleCount, createdAt, req.Name); err != nil {
+	if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, createdAt, req.Name); err != nil {
 		return nil, billing.Internal("insert app mirror failed", err)
 	}
 

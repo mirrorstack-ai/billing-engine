@@ -44,8 +44,8 @@ func NewService(store Store, stripe billingstripe.Client, returnURL string) *Ser
 // UUID, Ensure simply returns Missing: ["billing_account"]. api-platform
 // is responsible for resolving the user before invoking Ensure.
 func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResponse, error) {
-	if req.UserID == uuid.Nil {
-		return nil, InvalidInput("user_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
 
 	// Default + validate the Require list. Capability is a typed string,
@@ -64,8 +64,17 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 
 	resp := &EnsureResponse{Missing: []string{}}
 
-	// Missing billing account short-circuits: per-capability checks need account_id.
-	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
+	// Missing billing account short-circuits: per-capability checks need
+	// account_id. The org leg resolves through the FUNDING gate (designation +
+	// activation) — an org that never designated has no billing capability.
+	var accountID uuid.UUID
+	var found bool
+	var err error
+	if req.OrgID != uuid.Nil {
+		accountID, found, err = s.store.ResolveOrgFundedAccount(ctx, req.OrgID)
+	} else {
+		accountID, found, err = s.store.AccountByUser(ctx, req.UserID)
+	}
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
 	}
@@ -77,7 +86,18 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 	// Per-capability checks. Order is fixed (PM before subscription) so
 	// the Missing slice is deterministic regardless of Require ordering.
 	if slices.Contains(require, RequirePaymentMethod) {
-		hasPM, err := s.store.HasUsablePaymentMethod(ctx, accountID)
+		// The payment_method capability checks the FUNDING account (org-billing
+		// D1): a sponsor-funded org account owns no PM rows — the sponsor's
+		// does. User principals fund themselves, so they skip the hop (the SQL
+		// is provably identity for a non-org account).
+		fundingID := accountID
+		if req.OrgID != uuid.Nil {
+			fundingID, err = s.store.ChargeFundingAccount(ctx, accountID)
+			if err != nil {
+				return nil, Internal("funding account lookup failed", err)
+			}
+		}
+		hasPM, err := s.store.HasUsablePaymentMethod(ctx, fundingID)
 		if err != nil {
 			return nil, Internal("payment-method lookup failed", err)
 		}
@@ -118,11 +138,11 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 // via Stripe metadata reconciliation (metadata.billing_account_id is
 // stable); not addressed in the v1 handler.
 func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPaymentMethodRequest) (*PrepareAddPaymentMethodResponse, error) {
-	if req.UserID == uuid.Nil {
-		return nil, InvalidInput("user_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
 
-	accountID, stripeCustomerID, err := s.store.EnsureAccount(ctx, req.UserID)
+	accountID, stripeCustomerID, err := s.ensureOwnerAccount(ctx, req.UserID, req.OrgID)
 	if err != nil {
 		return nil, Internal("ensure account failed", err)
 	}
@@ -181,11 +201,11 @@ func (s *Service) PrepareAddPaymentMethod(ctx context.Context, req PrepareAddPay
 //     pending until the 24h TTL purge picks it up) but a retry would
 //     create a fresh request, which is fine.
 func (s *Service) StartAddPaymentMethod(ctx context.Context, req StartAddPaymentMethodRequest) (*StartAddPaymentMethodResponse, error) {
-	if req.UserID == uuid.Nil {
-		return nil, InvalidInput("user_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
 
-	accountID, stripeCustomerID, err := s.store.EnsureAccount(ctx, req.UserID)
+	accountID, stripeCustomerID, err := s.ensureOwnerAccount(ctx, req.UserID, req.OrgID)
 	if err != nil {
 		return nil, Internal("ensure account failed", err)
 	}
@@ -247,14 +267,14 @@ func (s *Service) StartAddPaymentMethod(ctx context.Context, req StartAddPayment
 // that doesn't belong to the caller (or doesn't exist) returns 404
 // rather than leaking existence to a different user.
 func (s *Service) FinishAddPaymentMethod(ctx context.Context, req FinishAddPaymentMethodRequest) (*FinishAddPaymentMethodResponse, error) {
-	if req.UserID == uuid.Nil {
-		return nil, InvalidInput("user_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
 	if req.RequestID == uuid.Nil {
 		return nil, InvalidInput("request_id required")
 	}
 
-	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
+	accountID, found, err := s.ownerAccount(ctx, req.UserID, req.OrgID)
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
 	}
@@ -280,11 +300,11 @@ func (s *Service) FinishAddPaymentMethod(ctx context.Context, req FinishAddPayme
 // Returns an empty slice (not nil, not an error) when the user has
 // no accounts row or no methods attached.
 func (s *Service) GetPaymentMethods(ctx context.Context, req GetPaymentMethodsRequest) (*GetPaymentMethodsResponse, error) {
-	if req.UserID == uuid.Nil {
-		return nil, InvalidInput("user_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
 
-	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
+	accountID, found, err := s.ownerAccount(ctx, req.UserID, req.OrgID)
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
 	}
@@ -383,10 +403,13 @@ func serviceStatusResponse(v eligibility.Verdict) *GetServiceStatusResponse {
 // authoritative against direct API callers too. To remove the current
 // default, set another card as default first.
 func (s *Service) DetachPaymentMethod(ctx context.Context, req DetachPaymentMethodRequest) (*DetachPaymentMethodResponse, error) {
-	if req.UserID == uuid.Nil || req.PaymentMethodID == uuid.Nil {
-		return nil, InvalidInput("user_id and payment_method_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
-	stripePMID, _, isDefault, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
+	if req.PaymentMethodID == uuid.Nil {
+		return nil, InvalidInput("payment_method_id required")
+	}
+	stripePMID, _, isDefault, found, err := s.paymentMethodTarget(ctx, req.UserID, req.OrgID, req.PaymentMethodID)
 	if err != nil {
 		return nil, Internal("payment method lookup failed", err)
 	}
@@ -406,10 +429,13 @@ func (s *Service) DetachPaymentMethod(ctx context.Context, req DetachPaymentMeth
 // invoice-settings default at the given card. Ownership-checked as above;
 // is_default is synced asynchronously by the customer.updated webhook.
 func (s *Service) SetDefaultPaymentMethod(ctx context.Context, req SetDefaultPaymentMethodRequest) (*SetDefaultPaymentMethodResponse, error) {
-	if req.UserID == uuid.Nil || req.PaymentMethodID == uuid.Nil {
-		return nil, InvalidInput("user_id and payment_method_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
-	stripePMID, stripeCustomerID, _, found, err := s.store.PaymentMethodTarget(ctx, req.UserID, req.PaymentMethodID)
+	if req.PaymentMethodID == uuid.Nil {
+		return nil, InvalidInput("payment_method_id required")
+	}
+	stripePMID, stripeCustomerID, _, found, err := s.paymentMethodTarget(ctx, req.UserID, req.OrgID, req.PaymentMethodID)
 	if err != nil {
 		return nil, Internal("payment method lookup failed", err)
 	}
@@ -420,4 +446,45 @@ func (s *Service) SetDefaultPaymentMethod(ctx context.Context, req SetDefaultPay
 		return nil, StripeError("set default payment method failed", err)
 	}
 	return &SetDefaultPaymentMethodResponse{}, nil
+}
+
+// validateOwner enforces the exactly-one owner-principal contract shared by
+// Ensure and every payment-method RPC: a user XOR an org.
+func validateOwner(userID, orgID uuid.UUID) error {
+	if userID == uuid.Nil && orgID == uuid.Nil {
+		return InvalidInput("user_id or org_id required")
+	}
+	if userID != uuid.Nil && orgID != uuid.Nil {
+		return InvalidInput("user_id and org_id are mutually exclusive")
+	}
+	return nil
+}
+
+// ownerAccount resolves the EXISTING account for a (user XOR org) principal —
+// the read-path twin of ensureOwnerAccount. The org leg resolves by row
+// EXISTENCE (AccountByOrg), not by funding: cards are manageable while a
+// funding='org' designation awaits its first bind.
+func (s *Service) ownerAccount(ctx context.Context, userID, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	if orgID != uuid.Nil {
+		return s.store.AccountByOrg(ctx, orgID)
+	}
+	return s.store.AccountByUser(ctx, userID)
+}
+
+// ensureOwnerAccount get-or-creates the account for a (user XOR org)
+// principal — the write-path resolution the add-card flows use.
+func (s *Service) ensureOwnerAccount(ctx context.Context, userID, orgID uuid.UUID) (uuid.UUID, string, error) {
+	if orgID != uuid.Nil {
+		return s.store.EnsureOrgAccount(ctx, orgID)
+	}
+	return s.store.EnsureAccount(ctx, userID)
+}
+
+// paymentMethodTarget dispatches the detach / set-default ownership gate to
+// the user or org twin.
+func (s *Service) paymentMethodTarget(ctx context.Context, userID, orgID, paymentMethodID uuid.UUID) (stripePMID, stripeCustomerID string, isDefault, found bool, err error) {
+	if orgID != uuid.Nil {
+		return s.store.PaymentMethodTargetForOrg(ctx, orgID, paymentMethodID)
+	}
+	return s.store.PaymentMethodTarget(ctx, userID, paymentMethodID)
 }

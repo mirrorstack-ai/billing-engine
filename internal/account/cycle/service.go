@@ -72,15 +72,26 @@ func (s *Service) offSessionChargePermitted(ctx context.Context, accountID uuid.
 // skip status, transient/retried); a usable PM implies a Stripe Customer (a
 // card can't attach without one) -> an empty custID here is an anomaly,
 // surfaced as an error rather than silently auto-creating a Customer.
+//
+// The FUNDING HOP (org-billing D1): an org account whose designation names a
+// sponsor gates on — and charges — the SPONSOR's default PM + Stripe
+// customer; every other account funds itself. Resolved here, at charge time,
+// so a designation switch re-routes only future charges; everything else
+// (run rows, invoice mirror, ms_charge_ref) stays keyed to accountID, and a
+// sponsor revoke degrades to the ordinary transient no_pm skip.
 func (s *Service) resolveChargeableCustomer(ctx context.Context, accountID uuid.UUID) (custID string, ok bool, err error) {
-	hasPM, err := s.store.HasUsableDefaultPM(ctx, accountID)
+	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
+	if err != nil {
+		return "", false, billing.Internal("funding account lookup failed", err)
+	}
+	hasPM, err := s.store.HasUsableDefaultPM(ctx, fundingID)
 	if err != nil {
 		return "", false, billing.Internal("usable PM check failed", err)
 	}
 	if !hasPM {
 		return "", false, nil
 	}
-	custID, err = s.store.AccountStripeCustomer(ctx, accountID)
+	custID, err = s.store.AccountStripeCustomer(ctx, fundingID)
 	if err != nil {
 		return "", false, billing.Internal("stripe customer lookup failed", err)
 	}
@@ -88,6 +99,30 @@ func (s *Service) resolveChargeableCustomer(ctx context.Context, accountID uuid.
 		return "", false, billing.Internal("account has a usable PM but no Stripe customer id", nil)
 	}
 	return custID, true, nil
+}
+
+// recoveryCustomer resolves the Stripe customer a CRASHED charge attempt's
+// invoice is searched under (FindInvoiceByRef) — through the SAME funding hop
+// the fresh-charge path applied when it created the invoice, so recovery and
+// charge always look at the same customer. For a sponsor-funded org account
+// the attribution account usually has NO Stripe customer at all; searching it
+// would turn every recovery into a loud error, or a false "nothing" that
+// re-charges fresh. Deliberately NOT PM-gated, matching each recovery leg's
+// reconcile-before-gates posture.
+//
+// Known narrow gap: a funding SWITCH between the crashed attempt and this
+// recovery resolves the NEW instrument, so the old instrument's invoice is
+// invisible here — the deterministic idempotency keys (~24h) then return the
+// ORIGINAL invoice on the re-charge attempt, the same backstop the Search-lag
+// note in RunBillingCycle already relies on. The recorded-instrument
+// hardening (stamping the funding account onto the attempt markers) travels
+// with the org-billing W2 transfer wave.
+func (s *Service) recoveryCustomer(ctx context.Context, accountID uuid.UUID) (string, error) {
+	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	return s.store.AccountStripeCustomer(ctx, fundingID)
 }
 
 // WithNow overrides the Service clock — deterministic-test hook only (mirrors

@@ -216,6 +216,15 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		return &ProrationResult{AppID: appID, Status: ProrationStatusDeleted}, nil
 	}
 
+	// UNBILLED org roster row (NULL account, migration 041): no payer exists
+	// yet. The sweep's work list (AppsPendingProration) already excludes these;
+	// this guards the direct path. Same transient posture as the unactivated
+	// skip — the RepointOrgUsage attach sweep backfills account_id and a later
+	// sweep evaluates the app normally.
+	if app.AccountID == uuid.Nil {
+		return &ProrationResult{AppID: appID, Status: ProrationStatusUnactivated}, nil
+	}
+
 	// Activation gate (D1d), same posture as the boundary spine: an
 	// unactivated account (never bound a card) is never charged.
 	activatedAt, activated, err := s.store.AccountActivation(ctx, app.AccountID)
@@ -279,12 +288,12 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	var recoveredInv *billingstripe.Invoice
 	moneyMayHaveMoved := false
 	if app.ProrationAttempted {
-		custID, err = s.store.AccountStripeCustomer(ctx, app.AccountID)
+		custID, err = s.recoveryCustomer(ctx, app.AccountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
 		if custID == "" {
-			return nil, billing.Internal("app has an attempted proration charge but the account has no Stripe customer id", nil)
+			return nil, billing.Internal("app has an attempted proration charge but the funding account has no Stripe customer id", nil)
 		}
 		if found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, appProrationChargeRef(appID)); err != nil {
 			return nil, billing.StripeError("proration recovery lookup failed", err)
