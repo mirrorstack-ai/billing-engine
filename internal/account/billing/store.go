@@ -52,6 +52,13 @@ type Store interface {
 	// none exist.
 	ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error)
 
+	// ServiceBlockSignals reads, in one round-trip, the three inputs the
+	// service-block eligibility gate reasons over for an account: the usable
+	// non-fraud card count, the consecutive failed-charge streak, and the
+	// earliest real charge's status ("" when the account has none yet). See
+	// db.ServiceBlockSignals.
+	ServiceBlockSignals(ctx context.Context, accountID uuid.UUID) (ServiceSignals, error)
+
 	// PaymentMethodTarget resolves an active payment method owned by the
 	// user, returning its Stripe PM id, the account's Stripe customer
 	// id, and whether the row is currently the default. found=false when
@@ -203,6 +210,18 @@ func (s *pgxStore) HasUsablePaymentMethod(ctx context.Context, accountID uuid.UU
 // override: the generated query takes the account id as a plain string.
 func (s *pgxStore) HasUnpaidInvoice(ctx context.Context, accountID uuid.UUID) (bool, error) {
 	return s.q.AccountHasUnpaidInvoice(ctx, accountID.String())
+}
+
+func (s *pgxStore) ServiceBlockSignals(ctx context.Context, accountID uuid.UUID) (ServiceSignals, error) {
+	row, err := s.q.ServiceBlockSignals(ctx, accountID.String())
+	if err != nil {
+		return ServiceSignals{}, err
+	}
+	return ServiceSignals{
+		UsableCardCount:    int(row.UsableCardCount),
+		FailedChargeStreak: int(row.FailedChargeStreak),
+		FirstChargeStatus:  row.FirstChargeStatus,
+	}, nil
 }
 
 func (s *pgxStore) ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error) {

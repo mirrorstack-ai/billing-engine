@@ -179,6 +179,32 @@ type GetPaymentMethodsResponse struct {
 	PaymentMethods []PaymentMethod `json:"payment_methods"`
 }
 
+// ServiceSignals are the raw service-block gate inputs read for one account
+// (db.ServiceBlockSignals). The service maps these into eligibility.Signals:
+// FirstChargeStatus is the earliest real invoice's Stripe status ("" when the
+// account has no charge yet), mapped to the FirstChargeState enum.
+type ServiceSignals struct {
+	UsableCardCount    int
+	FailedChargeStreak int
+	FirstChargeStatus  string
+}
+
+// GetServiceStatusRequest is the payload of GetServiceStatus — the account is
+// addressed by owner, the same as Ensure / GetPaymentMethods.
+type GetServiceStatusRequest struct {
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// GetServiceStatusResponse is the service-block verdict for the account. Blocked
+// is the single field a caller must read to gate service; Reason is the primary
+// machine-readable cause (eligibility.Reason, "ELIGIBLE" when not blocked);
+// Reasons lists every failing gate (omitted when eligible).
+type GetServiceStatusResponse struct {
+	Blocked bool     `json:"blocked"`
+	Reason  string   `json:"reason"`
+	Reasons []string `json:"reasons,omitempty"`
+}
+
 // PaymentMethod is the projection of a payment_methods_mirror row
 // returned to UI consumers. Card-only in v1.
 type PaymentMethod struct {

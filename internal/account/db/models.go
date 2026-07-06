@@ -333,6 +333,8 @@ type MsBillingAccount struct {
 	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
 	// Per-account size threshold (micro-USD) above which a SUCCESSFUL off-session charge is disclosed as "large" on the billing page. NULL = platform default ($100 = 100000000 micros). Resolved at charge time; pure disclosure, changes no charging behaviour.
 	AutoCollectThresholdMicros pgtype.Int8 `json:"auto_collect_threshold_micros"`
+	// Consecutive distinct failed invoices, maintained by the invoice webhook (+1 on the first payment_failed of a row via invoices.ever_failed, reset to 0 on invoice.paid). The service-block gate blocks at >= 2. Recoverable — self-heals to 0 on the next successful charge.
+	FailedChargeStreak int32 `json:"failed_charge_streak"`
 }
 
 type MsBillingAddCardRequest struct {
@@ -469,6 +471,8 @@ type MsBillingInvoice struct {
 	InvoicePdf pgtype.Text `json:"invoice_pdf"`
 	// Server-computed at invoice-create time: true iff the charged amount (netted arrears + advance base, micros) exceeded the account auto_collect_threshold_micros (or the default when NULL) that applied WHEN THE CHARGE FIRED. Post-hoc disclosure only.
 	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
+	// Sticky: set true on the FIRST invoice.payment_failed for this row and never cleared. The service-block gate uses it to count DISTINCT failed invoices (not per-retry events) into accounts.failed_charge_streak. Independent of the current status — survives a later flip to paid.
+	EverFailed bool `json:"ever_failed"`
 }
 
 type MsBillingMetricDefinition struct {
@@ -511,6 +515,12 @@ type MsBillingPaymentMethodsMirror struct {
 	AttachedAt            time.Time          `json:"attached_at"`
 	DeletedAt             pgtype.Timestamptz `json:"deleted_at"`
 	Fingerprint           pgtype.Text        `json:"fingerprint"`
+	// True once Stripe flags this card as fraud/dispute risk (set by the radar.early_fraud_warning / charge.dispute webhook — follow-up PR). The service-block gate EXCLUDES fraud_blocked cards from the usable-card count. Defaults false so every existing card is treated non-fraud.
+	FraudBlocked bool `json:"fraud_blocked"`
+	// Audit: the signal that set fraud_blocked (e.g. early_fraud_warning, dispute). NULL until flagged.
+	FraudReason pgtype.Text `json:"fraud_reason"`
+	// Audit: when fraud_blocked was set. NULL until flagged.
+	FraudFlaggedAt pgtype.Timestamptz `json:"fraud_flagged_at"`
 }
 
 type MsBillingUsageAggregate struct {

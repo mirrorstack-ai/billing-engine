@@ -460,6 +460,106 @@ func TestProcess_InvoicePaymentFailed_StaysOpen(t *testing.T) {
 	require.Equal(t, int64(0), s.AppliedInvoices[0].AmountPaidCents)
 }
 
+// --- service-block failed-charge streak (migrations 039/040) --------------
+
+func TestProcess_InvoicePaymentFailed_RecordsFailedCharge(t *testing.T) {
+	// payment_failed drives the service-block streak: the handler calls
+	// RecordFailedCharge with the invoice id (the store's ever_failed latch does
+	// the distinct-invoice dedup). paid is NOT involved, so no streak reset.
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_pf_streak", "invoice.payment_failed", "in_1", "open", 0, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.FailCounted = true
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Equal(t, []string{"in_1"}, s.FailedInvoices, "payment_failed must record the failed charge")
+	require.Empty(t, s.ResetInvoices, "payment_failed must not reset the streak")
+}
+
+func TestProcess_InvoicePaid_ResetsFailedChargeStreak(t *testing.T) {
+	// invoice.paid is the auto-cure: it resets the failed-charge streak (and never
+	// records a failure).
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_paid_reset", "invoice.paid", "in_1", "paid", 1200, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.StreakReset = true
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Equal(t, []string{"in_1"}, s.ResetInvoices, "invoice.paid must reset the failed-charge streak")
+	require.Empty(t, s.FailedInvoices, "invoice.paid must not record a failure")
+}
+
+func TestProcess_NonFailureInvoiceEvent_DoesNotRecordFailure(t *testing.T) {
+	// Only invoice.payment_failed feeds the streak. Every other invoice.* event
+	// lands the mirror but never touches RecordFailedCharge.
+	for _, ev := range []struct{ name, typ, status string }{
+		{"created", "invoice.created", "draft"},
+		{"finalized", "invoice.finalized", "open"},
+		{"paid", "invoice.paid", "paid"},
+		{"voided", "invoice.voided", "void"},
+		{"uncollectible", "invoice.marked_uncollectible", "uncollectible"},
+	} {
+		t.Run(ev.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_nf_"+ev.name, ev.typ, "in_x", ev.status, 0, 1200)}
+			s := webhooktest.NewFakeStore()
+			r := newRouter(v, s)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, webhook.StatusOK, res.Status)
+			require.Empty(t, s.FailedInvoices, "only payment_failed records a failed charge")
+		})
+	}
+}
+
+func TestProcess_InvoicePaymentFailed_DriftMirror_DoesNotRecord(t *testing.T) {
+	// No mirror row (drift) short-circuits at the found guard, before the streak
+	// step — a payment_failed for an unmirrored invoice never advances the streak.
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_pf_drift", "invoice.payment_failed", "in_orphan", "open", 0, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Empty(t, s.FailedInvoices, "drift short-circuits before the streak step")
+}
+
+func TestProcess_InvoicePaymentFailed_RecordError_Internal(t *testing.T) {
+	// A streak-store error surfaces as 500 so Stripe retries; the ever_failed
+	// latch makes the retry idempotent (no double count).
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_pf_err", "invoice.payment_failed", "in_1", "open", 0, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.ErrRecordFailed = errors.New("db down")
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+}
+
+func TestProcess_InvoicePaid_ResetError_Internal(t *testing.T) {
+	// A streak-reset store error on invoice.paid surfaces as 500 so Stripe
+	// retries (the reset is idempotent once the streak is 0).
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_paid_rst_err", "invoice.paid", "in_1", "paid", 1200, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.ErrResetStreak = errors.New("db down")
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+}
+
 func TestProcess_InvoiceVoided_AppliesVoid(t *testing.T) {
 	// An admin/Stripe void (invoice.voided, status 'void') MUST reach the
 	// reconciler so the mirror leaves 'open' and the delinquency signal clears.

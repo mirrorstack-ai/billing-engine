@@ -256,9 +256,28 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
 	}
 
-	// RELAX driver — invoice.paid only. A failure here is surfaced (500) so Stripe
-	// retries: the relax UPDATE is idempotent (a no-op once the account is already
-	// arrears), so a retry after the mirror already advanced is safe.
+	// SERVICE-BLOCK streak — invoice.payment_failed advances the account's
+	// consecutive failed-charge streak (migration 040), gated so a single
+	// invoice's Stripe retries count once (RecordFailedCharge's ever_failed
+	// latch). Reached only past the found guard above, so a late payment_failed
+	// against an already-terminal invoice (rejected by the monotonic guard) never
+	// counts. A failure here is surfaced (500) so Stripe retries; the latch makes
+	// the retry idempotent (no double increment).
+	if event.Type == stripego.EventTypeInvoicePaymentFailed {
+		counted, err := r.store.RecordFailedCharge(ctx, inv.ID)
+		if err != nil {
+			r.log.ErrorContext(ctx, "invoice.payment_failed record failed-charge streak failed", "event_id", event.ID, "stripe_invoice_id", inv.ID, "error", err)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		if counted {
+			r.log.InfoContext(ctx, "invoice.payment_failed advanced failed-charge streak", "event_id", event.ID, "stripe_invoice_id", inv.ID)
+		}
+	}
+
+	// RELAX + streak auto-cure — invoice.paid only. A failure here is surfaced
+	// (500) so Stripe retries: both UPDATEs are idempotent (relax is a no-op once
+	// arrears; reset is a no-op once the streak is already 0), so a retry after
+	// the mirror already advanced is safe.
 	if event.Type == stripego.EventTypeInvoicePaid {
 		relaxed, err := r.store.RelaxCollectionOnPaidInvoice(ctx, inv.ID)
 		if err != nil {
@@ -267,6 +286,15 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		}
 		if relaxed {
 			r.log.InfoContext(ctx, "invoice.paid relaxed account prepaid → arrears", "event_id", event.ID, "stripe_invoice_id", inv.ID)
+		}
+
+		reset, err := r.store.ResetFailedChargeStreak(ctx, inv.ID)
+		if err != nil {
+			r.log.ErrorContext(ctx, "invoice.paid reset failed-charge streak failed", "event_id", event.ID, "stripe_invoice_id", inv.ID, "error", err)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		if reset {
+			r.log.InfoContext(ctx, "invoice.paid cleared failed-charge streak (service-block auto-cure)", "event_id", event.ID, "stripe_invoice_id", inv.ID)
 		}
 	}
 	return Result{HTTPStatus: 200, Status: StatusOK}
