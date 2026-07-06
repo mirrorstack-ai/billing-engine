@@ -15,6 +15,7 @@ import (
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // FakeVerifier implements billingstripe.Verifier. Configure Event for
@@ -50,6 +51,7 @@ type FakeStore struct {
 	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
 	RelaxedInvoices []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
 	FailedInvoices  []string                           // stripe_invoice_id values from MarkInvoiceFailed
+	FraudFlags      []FraudFlag                        // captured calls to FlagPaymentMethodFraud
 
 	// Found-flag knobs
 	TouchedFound bool // returned by TouchAccountByStripeCustomer
@@ -57,10 +59,12 @@ type FakeStore struct {
 	SoftDelFound bool // returned by SoftDeletePaymentMethod
 	InvoiceFound bool // returned by ApplyInvoiceStatus
 	Relaxed      bool // returned by RelaxCollectionOnPaidInvoice
+	FraudFound   bool // returned by FlagPaymentMethodFraud
 	ActivatedNew bool // returned by StampAccountActivated (firstBind)
 
 	// Error injection
 	ErrMark         error // from MarkEventProcessed
+	ErrUnmark       error // from UnmarkEventProcessed
 	ErrTouch        error // from TouchAccountByStripeCustomer
 	ErrSetDefault   error // from SetDefaultPaymentMethod
 	ErrInsert       error // from InsertPaymentMethod
@@ -70,7 +74,16 @@ type FakeStore struct {
 	ErrApplyInvoice error // from ApplyInvoiceStatus
 	ErrRelax        error // from RelaxCollectionOnPaidInvoice
 	ErrMarkFailed   error // from MarkInvoiceFailed
+	ErrFlagFraud    error // from FlagPaymentMethodFraud
 	ErrActivate     error // from StampAccountActivated
+}
+
+// FraudFlag records one FlagPaymentMethodFraud call.
+type FraudFlag struct {
+	StripeCustomerID      string
+	Fingerprint           string
+	StripePaymentMethodID string
+	Reason                string
 }
 
 // NewFakeStore returns a FakeStore configured for happy-path tests:
@@ -83,6 +96,7 @@ func NewFakeStore() *FakeStore {
 		InsertFound:  true,
 		SoftDelFound: true,
 		InvoiceFound: true,
+		FraudFound:   true,
 		ActivatedNew: true,
 	}
 }
@@ -99,6 +113,14 @@ func (s *FakeStore) MarkEventProcessed(_ context.Context, eventID, _ string) (bo
 	}
 	s.Processed[eventID] = true
 	return true, nil
+}
+
+func (s *FakeStore) UnmarkEventProcessed(_ context.Context, eventID string) error {
+	if s.ErrUnmark != nil {
+		return s.ErrUnmark
+	}
+	delete(s.Processed, eventID)
+	return nil
 }
 
 func (s *FakeStore) TouchAccountByStripeCustomer(_ context.Context, _ string) (bool, error) {
@@ -178,6 +200,35 @@ func (s *FakeStore) MarkInvoiceFailed(_ context.Context, stripeInvoiceID string)
 	}
 	s.FailedInvoices = append(s.FailedInvoices, stripeInvoiceID)
 	return nil
+}
+
+func (s *FakeStore) FlagPaymentMethodFraud(_ context.Context, stripeCustomerID, fingerprint, stripePaymentMethodID, reason string) (bool, error) {
+	if s.ErrFlagFraud != nil {
+		return false, s.ErrFlagFraud
+	}
+	s.FraudFlags = append(s.FraudFlags, FraudFlag{
+		StripeCustomerID:      stripeCustomerID,
+		Fingerprint:           fingerprint,
+		StripePaymentMethodID: stripePaymentMethodID,
+		Reason:                reason,
+	})
+	return s.FraudFound, nil
+}
+
+// FakeChargeRetriever implements webhook.ChargeRetriever. Refs maps a charge id
+// to the card ref it resolves to; Err forces a retrieve failure. A charge id
+// absent from Refs resolves to the zero ChargeCardRef (empty pm+fingerprint —
+// the non-card / drift path).
+type FakeChargeRetriever struct {
+	Refs map[string]billingstripe.ChargeCardRef
+	Err  error
+}
+
+func (f *FakeChargeRetriever) RetrieveCharge(_ context.Context, chargeID string) (billingstripe.ChargeCardRef, error) {
+	if f.Err != nil {
+		return billingstripe.ChargeCardRef{}, f.Err
+	}
+	return f.Refs[chargeID], nil
 }
 
 // SilentLogger returns a slog.Logger that discards all output. Useful

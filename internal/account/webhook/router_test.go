@@ -11,6 +11,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook/webhooktest"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // --- event builders -------------------------------------------------------
@@ -67,8 +68,20 @@ func invoiceEvent(id, eventType, invoiceID, status string, amountPaid, amountDue
 	}
 }
 
+// fraudEvent builds a charge.dispute.created / radar.early_fraud_warning.created
+// event carrying a bare charge id (Stripe delivers `charge` unexpanded, so it
+// arrives as a "ch_…" string that decodes into Charge{ID}).
+func fraudEvent(id, eventType, chargeID string) stripego.Event {
+	raw, _ := json.Marshal(map[string]any{"id": "obj_" + id, "charge": chargeID})
+	return stripego.Event{ID: id, Type: stripego.EventType(eventType), Data: &stripego.EventData{Raw: raw}}
+}
+
 func newRouter(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore) *webhook.Router {
-	return webhook.NewRouter(v, s, webhooktest.SilentLogger())
+	return newRouterWithCharges(v, s, &webhooktest.FakeChargeRetriever{})
+}
+
+func newRouterWithCharges(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore, c webhook.ChargeRetriever) *webhook.Router {
+	return webhook.NewRouter(v, s, c, webhooktest.SilentLogger())
 }
 
 // --- tests ----------------------------------------------------------------
@@ -535,6 +548,153 @@ func TestProcess_FailureLatchError_Internal(t *testing.T) {
 
 	require.Equal(t, 500, res.HTTPStatus)
 	require.Equal(t, webhook.StatusInternal, res.Status)
+}
+
+// --- fraud webhook (charge.dispute.created / radar.early_fraud_warning.created) ---
+
+func fraudRetriever(chargeID string, ref billingstripe.ChargeCardRef) *webhooktest.FakeChargeRetriever {
+	return &webhooktest.FakeChargeRetriever{Refs: map[string]billingstripe.ChargeCardRef{chargeID: ref}}
+}
+
+func TestProcess_ChargeDisputeCreated_FlagsCard(t *testing.T) {
+	// dispute → retrieve the charge → flag the card with reason "dispute".
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_disp", "charge.dispute.created", "ch_1")}
+	s := webhooktest.NewFakeStore()
+	c := fraudRetriever("ch_1", billingstripe.ChargeCardRef{PaymentMethodID: "pm_1", Fingerprint: "fp_1", StripeCustomerID: "cus_1"})
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.FraudFlags, 1)
+	require.Equal(t, webhooktest.FraudFlag{StripeCustomerID: "cus_1", Fingerprint: "fp_1", StripePaymentMethodID: "pm_1", Reason: "dispute"}, s.FraudFlags[0])
+}
+
+func TestProcess_EarlyFraudWarningCreated_FlagsCard(t *testing.T) {
+	// EFW → same resolve+flag with reason "early_fraud_warning".
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_efw", "radar.early_fraud_warning.created", "ch_2")}
+	s := webhooktest.NewFakeStore()
+	c := fraudRetriever("ch_2", billingstripe.ChargeCardRef{PaymentMethodID: "pm_2", Fingerprint: "fp_2", StripeCustomerID: "cus_2"})
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.FraudFlags, 1)
+	require.Equal(t, "early_fraud_warning", s.FraudFlags[0].Reason)
+}
+
+func TestProcess_Fraud_NoMirrorMatch_DriftWarning(t *testing.T) {
+	// The card isn't in our mirror (or is already flagged): store reports 0 rows
+	// → drift_warning 200, no error. The store WAS consulted.
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_disp_drift", "charge.dispute.created", "ch_3")}
+	s := webhooktest.NewFakeStore()
+	s.FraudFound = false
+	c := fraudRetriever("ch_3", billingstripe.ChargeCardRef{PaymentMethodID: "pm_3", Fingerprint: "fp_3", StripeCustomerID: "cus_3"})
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Len(t, s.FraudFlags, 1)
+}
+
+func TestProcess_Fraud_NonCardCharge_DriftNoStoreCall(t *testing.T) {
+	// A charge with no card ref (empty pm + fingerprint) → drift_warning, and the
+	// store is never consulted.
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_disp_noncard", "charge.dispute.created", "ch_4")}
+	s := webhooktest.NewFakeStore()
+	c := fraudRetriever("ch_4", billingstripe.ChargeCardRef{StripeCustomerID: "cus_4"}) // no pm, no fingerprint
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Empty(t, s.FraudFlags, "non-card charge must not reach the store")
+}
+
+func TestProcess_Fraud_MissingChargeID_BadRequest(t *testing.T) {
+	// A dispute event with no charge → 400, retriever never called.
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_disp_nocharge", "charge.dispute.created", "")}
+	s := webhooktest.NewFakeStore()
+	c := &webhooktest.FakeChargeRetriever{} // any charge id resolves to zero ref
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 400, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInvalidBody, res.Status)
+	require.Empty(t, s.FraudFlags)
+}
+
+func TestProcess_Fraud_RetrieveError_Internal(t *testing.T) {
+	// A Stripe retrieve failure → 500 so Stripe redelivers; the store is never
+	// reached (the flag is idempotent, so the redelivery is safe).
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_disp_rerr", "charge.dispute.created", "ch_5")}
+	s := webhooktest.NewFakeStore()
+	c := &webhooktest.FakeChargeRetriever{Err: errors.New("stripe down")}
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+	require.Empty(t, s.FraudFlags)
+}
+
+func TestProcess_Fraud_FlagStoreError_Internal(t *testing.T) {
+	// A store error while flagging → 500 so Stripe redelivers.
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_disp_serr", "charge.dispute.created", "ch_6")}
+	s := webhooktest.NewFakeStore()
+	s.ErrFlagFraud = errors.New("db down")
+	c := fraudRetriever("ch_6", billingstripe.ChargeCardRef{PaymentMethodID: "pm_6", Fingerprint: "fp_6", StripeCustomerID: "cus_6"})
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+}
+
+// --- 5xx idempotency compensation (redelivery recovery) -------------------
+
+func TestProcess_5xxDispatch_UnmarksSoRedeliveryReRuns(t *testing.T) {
+	// A 5xx dispatch outcome must DROP the idempotency row, so Stripe's
+	// redelivery of the same event re-enters the handler instead of being deduped
+	// forever (the "500 → Stripe retries" recovery the handlers document).
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_retry", "charge.dispute.created", "ch_1")}
+	s := webhooktest.NewFakeStore()
+	c := &webhooktest.FakeChargeRetriever{Err: errors.New("stripe 503")}
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, 500, res.HTTPStatus)
+	require.False(t, s.Processed["evt_retry"], "a 5xx must unmark the event for redelivery")
+
+	// Redelivery with a now-healthy retriever actually applies the flag.
+	c.Err = nil
+	c.Refs = map[string]billingstripe.ChargeCardRef{"ch_1": {PaymentMethodID: "pm_1", Fingerprint: "fp_1", StripeCustomerID: "cus_1"}}
+	res = r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.FraudFlags, 1, "redelivery re-ran the handler and flagged the card")
+}
+
+func TestProcess_2xxDispatch_StaysDedupedOnRedelivery(t *testing.T) {
+	// A successful (2xx) event stays recorded, so a redelivery is deduped — the
+	// compensation must fire ONLY on 5xx.
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_ok", "charge.dispute.created", "ch_1")}
+	s := webhooktest.NewFakeStore()
+	c := fraudRetriever("ch_1", billingstripe.ChargeCardRef{PaymentMethodID: "pm_1", Fingerprint: "fp_1", StripeCustomerID: "cus_1"})
+	r := newRouterWithCharges(v, s, c)
+
+	require.Equal(t, webhook.StatusOK, r.Process(context.Background(), []byte(`{}`), "sig").Status)
+	require.True(t, s.Processed["evt_ok"], "a 2xx stays recorded")
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, webhook.StatusDuplicate, res.Status)
+	require.Len(t, s.FraudFlags, 1, "a deduped redelivery must not re-flag")
 }
 
 func TestProcess_InvoiceVoided_AppliesVoid(t *testing.T) {

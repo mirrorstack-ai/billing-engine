@@ -840,3 +840,132 @@ func TestPgxStore_ApplyInvoiceStatus_UncollectibleToPaid_Cures(t *testing.T) {
 	require.False(t, found, "a late uncollectible must not overwrite paid")
 	require.Equal(t, "paid", readInvoiceStatus(t, pool, "in_unc"))
 }
+
+// --- fraud flag (migration 038) + gate exclusion -------------------------
+
+func seedCardFP(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, pmID, fingerprint string) {
+	t.Helper()
+	var fp any
+	if fingerprint != "" {
+		fp = fingerprint
+	}
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO ms_billing.payment_methods_mirror
+		   (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, fingerprint)
+		 VALUES ($1, $2, 'visa', '4242', 12, 2999, $3)`,
+		accountID, pmID, fp,
+	)
+	require.NoError(t, err)
+}
+
+func readFraud(t *testing.T, pool *pgxpool.Pool, pmID string) (blocked bool, reason string, flaggedSet bool) {
+	t.Helper()
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT fraud_blocked, COALESCE(fraud_reason, ''), fraud_flagged_at IS NOT NULL
+		   FROM ms_billing.payment_methods_mirror WHERE stripe_payment_method_id = $1`,
+		pmID).Scan(&blocked, &reason, &flaggedSet))
+	return
+}
+
+func TestPgxStore_FlagPaymentMethodFraud_ByFingerprint_FlipsAndExcludesFromGate(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	bstore := billing.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_fraud")
+	seedCardFP(t, pool, accountID, "pm_fraud", "fp_x")
+	ctx := context.Background()
+
+	// Before: the card counts as usable.
+	sig, err := bstore.ServiceBlockSignals(ctx, accountID)
+	require.NoError(t, err)
+	require.Equal(t, 1, sig.UsableCardCount)
+
+	found, err := store.FlagPaymentMethodFraud(ctx, "cus_fraud", "fp_x", "", "dispute")
+	require.NoError(t, err)
+	require.True(t, found)
+
+	blocked, reason, flaggedSet := readFraud(t, pool, "pm_fraud")
+	require.True(t, blocked)
+	require.Equal(t, "dispute", reason)
+	require.True(t, flaggedSet, "fraud_flagged_at must be stamped")
+
+	// After: the gate no longer counts the flagged card.
+	sig, err = bstore.ServiceBlockSignals(ctx, accountID)
+	require.NoError(t, err)
+	require.Equal(t, 0, sig.UsableCardCount, "fraud-blocked card is excluded from the gate")
+
+	// Idempotent replay: already flagged → 0 rows.
+	found, err = store.FlagPaymentMethodFraud(ctx, "cus_fraud", "fp_x", "", "dispute")
+	require.NoError(t, err)
+	require.False(t, found)
+}
+
+func TestPgxStore_FlagPaymentMethodFraud_AllRowsSameFingerprint_AccountScoped(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	ctx := context.Background()
+
+	// Same physical card (fp_shared) added twice on account A (pre-collapse), and
+	// once on a DIFFERENT account B.
+	accountA := seedAccount(t, pool, "cus_A")
+	seedCardFP(t, pool, accountA, "pm_A1", "fp_shared")
+	seedCardFP(t, pool, accountA, "pm_A2", "fp_shared")
+	accountB := seedAccount(t, pool, "cus_B")
+	seedCardFP(t, pool, accountB, "pm_B1", "fp_shared")
+
+	found, err := store.FlagPaymentMethodFraud(ctx, "cus_A", "fp_shared", "", "dispute")
+	require.NoError(t, err)
+	require.True(t, found)
+
+	// Both of A's copies flip; B's card with the same fingerprint is untouched.
+	for _, pm := range []string{"pm_A1", "pm_A2"} {
+		blocked, _, _ := readFraud(t, pool, pm)
+		require.True(t, blocked, pm+" (account A) must be flagged")
+	}
+	blockedB, _, _ := readFraud(t, pool, "pm_B1")
+	require.False(t, blockedB, "the same fingerprint on a DIFFERENT account must not be flagged")
+}
+
+func TestPgxStore_FlagPaymentMethodFraud_FingerprintFallbackToPMID(t *testing.T) {
+	// A legacy card with a NULL fingerprint: resolution falls back to the pm id.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_legacy")
+	seedCardFP(t, pool, accountID, "pm_legacy", "") // NULL fingerprint
+	ctx := context.Background()
+
+	found, err := store.FlagPaymentMethodFraud(ctx, "cus_legacy", "", "pm_legacy", "early_fraud_warning")
+	require.NoError(t, err)
+	require.True(t, found)
+	blocked, reason, _ := readFraud(t, pool, "pm_legacy")
+	require.True(t, blocked)
+	require.Equal(t, "early_fraud_warning", reason)
+}
+
+func TestPgxStore_FlagPaymentMethodFraud_UnknownCard_Drift(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	_ = seedAccount(t, pool, "cus_none")
+	ctx := context.Background()
+
+	found, err := store.FlagPaymentMethodFraud(ctx, "cus_none", "fp_absent", "", "dispute")
+	require.NoError(t, err)
+	require.False(t, found, "no matching mirror row → drift no-op")
+}
+
+func TestPgxStore_FlagPaymentMethodFraud_NullFingerprintRow_MatchedByPMID(t *testing.T) {
+	// A legacy/wallet mirror row with a NULL fingerprint, but the disputed charge
+	// DID carry a fingerprint — the row must still be flagged via its exact pm id
+	// (the additive pm-id arm), not silently missed (F2).
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_wallet")
+	seedCardFP(t, pool, accountID, "pm_wallet", "") // NULL fingerprint
+	ctx := context.Background()
+
+	found, err := store.FlagPaymentMethodFraud(ctx, "cus_wallet", "fp_charge", "pm_wallet", "dispute")
+	require.NoError(t, err)
+	require.True(t, found, "a NULL-fingerprint row must be flagged by exact pm id even when the charge carries a fingerprint")
+	blocked, _, _ := readFraud(t, pool, "pm_wallet")
+	require.True(t, blocked)
+}

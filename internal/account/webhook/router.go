@@ -56,6 +56,14 @@ type Store interface {
 	// MUST NOT execute the side effect.
 	MarkEventProcessed(ctx context.Context, eventID, eventType string) (firstTime bool, err error)
 
+	// UnmarkEventProcessed deletes the idempotency row for an event. The router
+	// calls it ONLY when dispatch returned a 5xx, so Stripe's redelivery of the
+	// same event re-runs the handler instead of being deduped as a duplicate —
+	// the mark-before-dispatch ordering (which serializes concurrent duplicate
+	// deliveries) would otherwise make the "500 → Stripe retries" recovery a
+	// permanent no-op. Handler writes are replay-idempotent, so re-running is safe.
+	UnmarkEventProcessed(ctx context.Context, eventID string) error
+
 	// TouchAccountByStripeCustomer updates accounts.updated_at for the
 	// account matching stripeCustomerID. Used by customer.updated.
 	// Returns (found bool, error): missing account is logged as a drift
@@ -138,6 +146,15 @@ type Store interface {
 	// time (not a maintained counter), so there is no account write and nothing to
 	// reset on invoice.paid.
 	MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string) error
+
+	// FlagPaymentMethodFraud latches fraud_blocked (migration 038) on a disputed /
+	// early-fraud-warned card so the service-block gate stops counting it as
+	// usable. Card-scoped + account-bounded: every ACTIVE mirror row for the
+	// card's fingerprint on the charge's account (fallback: the pm id when the
+	// charge carries no fingerprint). Set-only + idempotent. Returns (found,
+	// error): found=false (0 rows) is a drift no-op — the card was never
+	// mirrored, is already detached, or is already flagged.
+	FlagPaymentMethodFraud(ctx context.Context, stripeCustomerID, fingerprint, stripePaymentMethodID, reason string) (found bool, err error)
 }
 
 // ApplyInvoiceStatusParams carries the columns ApplyInvoiceStatus reconciles
@@ -179,9 +196,19 @@ type InsertPaymentMethodParams struct {
 // Router is the entry point exposed to cmd/account-webhook. It owns
 // signature verification + idempotency + per-event dispatch. The
 // Lambda binary calls Process; everything else is internal.
+// ChargeRetriever is the narrow Stripe surface the fraud handlers need: resolve
+// a charge id (all a dispute / early-fraud-warning event carries) to the card's
+// pm id + fingerprint + owning customer. Kept as a webhook-local interface (not
+// the full billingstripe.Client) so the Router depends only on what it uses;
+// *billingstripe.realClient satisfies it structurally, and tests pass a fake.
+type ChargeRetriever interface {
+	RetrieveCharge(ctx context.Context, chargeID string) (billingstripe.ChargeCardRef, error)
+}
+
 type Router struct {
 	verifier billingstripe.Verifier
 	store    Store
+	charges  ChargeRetriever
 	log      *slog.Logger
 }
 
@@ -189,17 +216,20 @@ type Router struct {
 // values panic at construction. The strict checks catch wiring bugs
 // at startup rather than silently falling back to defaults that would
 // mask the misconfiguration in production.
-func NewRouter(verifier billingstripe.Verifier, store Store, log *slog.Logger) *Router {
+func NewRouter(verifier billingstripe.Verifier, store Store, charges ChargeRetriever, log *slog.Logger) *Router {
 	if verifier == nil {
 		panic("webhook.NewRouter: verifier must not be nil")
 	}
 	if store == nil {
 		panic("webhook.NewRouter: store must not be nil")
 	}
+	if charges == nil {
+		panic("webhook.NewRouter: charges must not be nil")
+	}
 	if log == nil {
 		panic("webhook.NewRouter: log must not be nil")
 	}
-	return &Router{verifier: verifier, store: store, log: log}
+	return &Router{verifier: verifier, store: store, charges: charges, log: log}
 }
 
 // Process verifies the signature, performs the idempotency check,
@@ -214,8 +244,10 @@ func (r *Router) Process(ctx context.Context, payload []byte, signature string) 
 		return Result{HTTPStatus: 400, Status: StatusBadSignature}
 	}
 
-	// Idempotency: insert the event_id FIRST. Duplicate → short-circuit
-	// before any side effect.
+	// Idempotency: insert the event_id FIRST so concurrent duplicate deliveries
+	// of the same event serialize (only one wins the INSERT). A 5xx dispatch
+	// outcome is compensated below so the mark doesn't permanently dedupe an
+	// event whose side effect never completed.
 	firstTime, err := r.store.MarkEventProcessed(ctx, event.ID, string(event.Type))
 	if err != nil {
 		r.log.ErrorContext(ctx, "idempotency record insert failed", "event_id", event.ID, "error", err)
@@ -226,7 +258,22 @@ func (r *Router) Process(ctx context.Context, payload []byte, signature string) 
 		return Result{HTTPStatus: 200, Status: StatusDuplicate}
 	}
 
-	return r.dispatch(ctx, event)
+	res := r.dispatch(ctx, event)
+	if res.HTTPStatus >= 500 {
+		// The side effect did not complete. Drop the idempotency row so Stripe's
+		// redelivery of this same event re-enters dispatch instead of short-
+		// circuiting as a duplicate — otherwise the "500 → Stripe retries"
+		// recovery every handler relies on (the fraud flag, the invoice latches)
+		// is a permanent no-op. All handler writes are replay-idempotent, so
+		// at-least-once re-execution is safe. Best-effort: a failed compensation
+		// leaves the event deduped (logged loudly); the residual crash-between-
+		// dispatch-and-delete window is far narrower than the Stripe-error window
+		// this closes.
+		if derr := r.store.UnmarkEventProcessed(ctx, event.ID); derr != nil {
+			r.log.ErrorContext(ctx, "idempotency compensation delete failed; redelivery will no-op", "event_id", event.ID, "error", derr)
+		}
+	}
+	return res
 }
 
 // dispatch routes to the per-event handler. Unknown events ACK with
@@ -266,6 +313,10 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		// already ranks void/uncollectible as terminal (rank 2), so no handler
 		// change is needed — they only need to be dispatched here.
 		return r.handleInvoiceLifecycle(ctx, event)
+	case stripego.EventTypeChargeDisputeCreated:
+		return r.handleChargeDisputeCreated(ctx, event)
+	case stripego.EventTypeRadarEarlyFraudWarningCreated:
+		return r.handleEarlyFraudWarningCreated(ctx, event)
 	default:
 		r.log.InfoContext(ctx, "webhook unhandled event", "event_id", event.ID, "type", event.Type)
 		return Result{HTTPStatus: 200, Status: StatusUnhandled}

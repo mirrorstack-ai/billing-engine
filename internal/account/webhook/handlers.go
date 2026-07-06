@@ -289,6 +289,83 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 
+// fraud_reason tokens recorded on the mirror row, stable + compact (they feed
+// the fraud_reason audit column, migration 038).
+const (
+	fraudReasonDispute = "dispute"
+	fraudReasonEFW     = "early_fraud_warning"
+)
+
+// handleChargeDisputeCreated flags the disputed card as fraud (charge.dispute.created).
+func (r *Router) handleChargeDisputeCreated(ctx context.Context, event stripego.Event) Result {
+	d, err := decodeDispute(event)
+	if err != nil {
+		r.log.WarnContext(ctx, "charge.dispute.created decode failed", "event_id", event.ID, "error", err)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+	chargeID := ""
+	if d.Charge != nil {
+		chargeID = d.Charge.ID
+	}
+	return r.flagFraudForCharge(ctx, event, chargeID, fraudReasonDispute)
+}
+
+// handleEarlyFraudWarningCreated flags the warned card as fraud
+// (radar.early_fraud_warning.created). Radar EFWs are issuer-driven and fire in
+// LIVE mode only (never test mode), so this path is exercised end-to-end only
+// in production; its logic is identical to the dispute path modulo the reason.
+func (r *Router) handleEarlyFraudWarningCreated(ctx context.Context, event stripego.Event) Result {
+	efw, err := decodeEarlyFraudWarning(event)
+	if err != nil {
+		r.log.WarnContext(ctx, "radar.early_fraud_warning.created decode failed", "event_id", event.ID, "error", err)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+	chargeID := ""
+	if efw.Charge != nil {
+		chargeID = efw.Charge.ID
+	}
+	return r.flagFraudForCharge(ctx, event, chargeID, fraudReasonEFW)
+}
+
+// flagFraudForCharge is the shared resolve→flag core for the dispute + EFW
+// handlers: both events carry only a charge id, so it retrieves the charge to
+// get the card's customer + fingerprint + pm id, then latches fraud_blocked on
+// the matching mirror rows (card-scoped, account-bounded — see
+// FlagPaymentMethodFraud). Failure modes:
+//   - missing charge id (malformed event): 400.
+//   - Stripe retrieve error: 500 so Stripe redelivers (the flag is idempotent).
+//   - charge has no card ref (non-card charge): drift_warning 200, no store call.
+//   - no active mirror row matched (never mirrored / detached / already flagged):
+//     drift_warning 200, no error.
+func (r *Router) flagFraudForCharge(ctx context.Context, event stripego.Event, chargeID, reason string) Result {
+	if chargeID == "" {
+		r.log.WarnContext(ctx, "fraud event missing charge id", "event_id", event.ID, "type", event.Type)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+
+	ref, err := r.charges.RetrieveCharge(ctx, chargeID)
+	if err != nil {
+		r.log.ErrorContext(ctx, "fraud charge retrieve failed", "event_id", event.ID, "charge_id", chargeID, "error", err)
+		return Result{HTTPStatus: 500, Status: StatusInternal}
+	}
+	if ref.PaymentMethodID == "" && ref.Fingerprint == "" {
+		r.log.WarnContext(ctx, "fraud drift: charge carries no card ref", "event_id", event.ID, "charge_id", chargeID)
+		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
+	}
+
+	found, err := r.store.FlagPaymentMethodFraud(ctx, ref.StripeCustomerID, ref.Fingerprint, ref.PaymentMethodID, reason)
+	if err != nil {
+		r.log.ErrorContext(ctx, "fraud flag payment method failed", "event_id", event.ID, "charge_id", chargeID, "error", err)
+		return Result{HTTPStatus: 500, Status: StatusInternal}
+	}
+	if !found {
+		r.log.WarnContext(ctx, "fraud drift: no active mirror row for charge card (never mirrored / detached / already flagged)", "event_id", event.ID, "charge_id", chargeID)
+		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
+	}
+	r.log.InfoContext(ctx, "card fraud-blocked", "event_id", event.ID, "type", event.Type, "reason", reason)
+	return Result{HTTPStatus: 200, Status: StatusOK}
+}
+
 // --- decode helpers -------------------------------------------------------
 //
 // stripe-go's Event.Data.Raw is the JSON payload of the event's data
@@ -344,4 +421,26 @@ func decodeInvoice(event stripego.Event) (*stripego.Invoice, error) {
 		return nil, err
 	}
 	return &inv, nil
+}
+
+func decodeDispute(event stripego.Event) (*stripego.Dispute, error) {
+	if event.Data == nil {
+		return nil, errNilEventData
+	}
+	var d stripego.Dispute
+	if err := json.Unmarshal(event.Data.Raw, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+func decodeEarlyFraudWarning(event stripego.Event) (*stripego.RadarEarlyFraudWarning, error) {
+	if event.Data == nil {
+		return nil, errNilEventData
+	}
+	var efw stripego.RadarEarlyFraudWarning
+	if err := json.Unmarshal(event.Data.Raw, &efw); err != nil {
+		return nil, err
+	}
+	return &efw, nil
 }
