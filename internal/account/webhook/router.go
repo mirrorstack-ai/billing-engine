@@ -56,6 +56,14 @@ type Store interface {
 	// MUST NOT execute the side effect.
 	MarkEventProcessed(ctx context.Context, eventID, eventType string) (firstTime bool, err error)
 
+	// UnmarkEventProcessed deletes the idempotency row for an event. The router
+	// calls it ONLY when dispatch returned a 5xx, so Stripe's redelivery of the
+	// same event re-runs the handler instead of being deduped as a duplicate —
+	// the mark-before-dispatch ordering (which serializes concurrent duplicate
+	// deliveries) would otherwise make the "500 → Stripe retries" recovery a
+	// permanent no-op. Handler writes are replay-idempotent, so re-running is safe.
+	UnmarkEventProcessed(ctx context.Context, eventID string) error
+
 	// TouchAccountByStripeCustomer updates accounts.updated_at for the
 	// account matching stripeCustomerID. Used by customer.updated.
 	// Returns (found bool, error): missing account is logged as a drift
@@ -236,8 +244,10 @@ func (r *Router) Process(ctx context.Context, payload []byte, signature string) 
 		return Result{HTTPStatus: 400, Status: StatusBadSignature}
 	}
 
-	// Idempotency: insert the event_id FIRST. Duplicate → short-circuit
-	// before any side effect.
+	// Idempotency: insert the event_id FIRST so concurrent duplicate deliveries
+	// of the same event serialize (only one wins the INSERT). A 5xx dispatch
+	// outcome is compensated below so the mark doesn't permanently dedupe an
+	// event whose side effect never completed.
 	firstTime, err := r.store.MarkEventProcessed(ctx, event.ID, string(event.Type))
 	if err != nil {
 		r.log.ErrorContext(ctx, "idempotency record insert failed", "event_id", event.ID, "error", err)
@@ -248,7 +258,22 @@ func (r *Router) Process(ctx context.Context, payload []byte, signature string) 
 		return Result{HTTPStatus: 200, Status: StatusDuplicate}
 	}
 
-	return r.dispatch(ctx, event)
+	res := r.dispatch(ctx, event)
+	if res.HTTPStatus >= 500 {
+		// The side effect did not complete. Drop the idempotency row so Stripe's
+		// redelivery of this same event re-enters dispatch instead of short-
+		// circuiting as a duplicate — otherwise the "500 → Stripe retries"
+		// recovery every handler relies on (the fraud flag, the invoice latches)
+		// is a permanent no-op. All handler writes are replay-idempotent, so
+		// at-least-once re-execution is safe. Best-effort: a failed compensation
+		// leaves the event deduped (logged loudly); the residual crash-between-
+		// dispatch-and-delete window is far narrower than the Stripe-error window
+		// this closes.
+		if derr := r.store.UnmarkEventProcessed(ctx, event.ID); derr != nil {
+			r.log.ErrorContext(ctx, "idempotency compensation delete failed; redelivery will no-op", "event_id", event.ID, "error", derr)
+		}
+	}
+	return res
 }
 
 // dispatch routes to the per-event handler. Unknown events ACK with

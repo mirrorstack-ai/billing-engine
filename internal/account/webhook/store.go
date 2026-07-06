@@ -45,6 +45,12 @@ func (s *pgxStore) MarkEventProcessed(ctx context.Context, eventID, eventType st
 	return rows == 1, nil
 }
 
+// UnmarkEventProcessed deletes the idempotency row so a 5xx-failed event is
+// re-run on Stripe's redelivery (see the query/interface docs).
+func (s *pgxStore) UnmarkEventProcessed(ctx context.Context, eventID string) error {
+	return s.q.UnmarkEventProcessed(ctx, eventID)
+}
+
 // TouchAccountByStripeCustomer updates accounts.updated_at for the
 // row matching stripeCustomerID. Returns (found, error). The trigger
 // installed by migration 001 maintains updated_at, but the explicit
