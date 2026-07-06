@@ -229,6 +229,21 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
 	}
 
+	// SERVICE-BLOCK failure latch — set BEFORE the found-guard and the status
+	// reconcile, on BOTH failure signals (payment_failed leaves the invoice
+	// 'open'; marked_uncollectible is a terminal that may arrive first under
+	// out-of-order delivery). ever_failed is invoice-keyed and set-only, so this
+	// is order-independent and a harmless no-op when the mirror row hasn't landed
+	// — the read-time streak derivation (ServiceBlockSignals) does the rest, so
+	// there is no counter to advance here and no reset on invoice.paid. A failure
+	// here is surfaced (500) so Stripe retries; the latch makes the retry a no-op.
+	if event.Type == stripego.EventTypeInvoicePaymentFailed || event.Type == stripego.EventTypeInvoiceMarkedUncollectible {
+		if err := r.store.MarkInvoiceFailed(ctx, inv.ID); err != nil {
+			r.log.ErrorContext(ctx, "invoice failure latch (ever_failed) failed", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "error", err)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+	}
+
 	found, err := r.store.ApplyInvoiceStatus(ctx, ApplyInvoiceStatusParams{
 		StripeInvoiceID: inv.ID,
 		// Stripe invoice status mirrored verbatim (draft/open/paid/
@@ -256,28 +271,11 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
 	}
 
-	// SERVICE-BLOCK streak — invoice.payment_failed advances the account's
-	// consecutive failed-charge streak (migration 040), gated so a single
-	// invoice's Stripe retries count once (RecordFailedCharge's ever_failed
-	// latch). Reached only past the found guard above, so a late payment_failed
-	// against an already-terminal invoice (rejected by the monotonic guard) never
-	// counts. A failure here is surfaced (500) so Stripe retries; the latch makes
-	// the retry idempotent (no double increment).
-	if event.Type == stripego.EventTypeInvoicePaymentFailed {
-		counted, err := r.store.RecordFailedCharge(ctx, inv.ID)
-		if err != nil {
-			r.log.ErrorContext(ctx, "invoice.payment_failed record failed-charge streak failed", "event_id", event.ID, "stripe_invoice_id", inv.ID, "error", err)
-			return Result{HTTPStatus: 500, Status: StatusInternal}
-		}
-		if counted {
-			r.log.InfoContext(ctx, "invoice.payment_failed advanced failed-charge streak", "event_id", event.ID, "stripe_invoice_id", inv.ID)
-		}
-	}
-
-	// RELAX + streak auto-cure — invoice.paid only. A failure here is surfaced
-	// (500) so Stripe retries: both UPDATEs are idempotent (relax is a no-op once
-	// arrears; reset is a no-op once the streak is already 0), so a retry after
-	// the mirror already advanced is safe.
+	// RELAX driver — invoice.paid only. A failure here is surfaced (500) so Stripe
+	// retries: the relax UPDATE is idempotent (a no-op once the account is already
+	// arrears), so a retry after the mirror already advanced is safe. The
+	// service-block auto-cure needs no write here — paying an invoice moves the
+	// ServiceBlockSignals streak cutoff (most-recent paid) forward automatically.
 	if event.Type == stripego.EventTypeInvoicePaid {
 		relaxed, err := r.store.RelaxCollectionOnPaidInvoice(ctx, inv.ID)
 		if err != nil {
@@ -286,15 +284,6 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		}
 		if relaxed {
 			r.log.InfoContext(ctx, "invoice.paid relaxed account prepaid → arrears", "event_id", event.ID, "stripe_invoice_id", inv.ID)
-		}
-
-		reset, err := r.store.ResetFailedChargeStreak(ctx, inv.ID)
-		if err != nil {
-			r.log.ErrorContext(ctx, "invoice.paid reset failed-charge streak failed", "event_id", event.ID, "stripe_invoice_id", inv.ID, "error", err)
-			return Result{HTTPStatus: 500, Status: StatusInternal}
-		}
-		if reset {
-			r.log.InfoContext(ctx, "invoice.paid cleared failed-charge streak (service-block auto-cure)", "event_id", event.ID, "stripe_invoice_id", inv.ID)
 		}
 	}
 	return Result{HTTPStatus: 200, Status: StatusOK}

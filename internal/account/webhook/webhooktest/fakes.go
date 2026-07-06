@@ -49,8 +49,7 @@ type FakeStore struct {
 
 	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
 	RelaxedInvoices []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
-	FailedInvoices  []string                           // stripe_invoice_id values from RecordFailedCharge
-	ResetInvoices   []string                           // stripe_invoice_id values from ResetFailedChargeStreak
+	FailedInvoices  []string                           // stripe_invoice_id values from MarkInvoiceFailed
 
 	// Found-flag knobs
 	TouchedFound bool // returned by TouchAccountByStripeCustomer
@@ -58,8 +57,6 @@ type FakeStore struct {
 	SoftDelFound bool // returned by SoftDeletePaymentMethod
 	InvoiceFound bool // returned by ApplyInvoiceStatus
 	Relaxed      bool // returned by RelaxCollectionOnPaidInvoice
-	FailCounted  bool // returned by RecordFailedCharge (counted)
-	StreakReset  bool // returned by ResetFailedChargeStreak (reset)
 	ActivatedNew bool // returned by StampAccountActivated (firstBind)
 
 	// Error injection
@@ -72,8 +69,7 @@ type FakeStore struct {
 	ErrResolve      error // from ResolvePendingAddCardRequest
 	ErrApplyInvoice error // from ApplyInvoiceStatus
 	ErrRelax        error // from RelaxCollectionOnPaidInvoice
-	ErrRecordFailed error // from RecordFailedCharge
-	ErrResetStreak  error // from ResetFailedChargeStreak
+	ErrMarkFailed   error // from MarkInvoiceFailed
 	ErrActivate     error // from StampAccountActivated
 }
 
@@ -176,20 +172,12 @@ func (s *FakeStore) RelaxCollectionOnPaidInvoice(_ context.Context, stripeInvoic
 	return s.Relaxed, nil
 }
 
-func (s *FakeStore) RecordFailedCharge(_ context.Context, stripeInvoiceID string) (bool, error) {
-	if s.ErrRecordFailed != nil {
-		return false, s.ErrRecordFailed
+func (s *FakeStore) MarkInvoiceFailed(_ context.Context, stripeInvoiceID string) error {
+	if s.ErrMarkFailed != nil {
+		return s.ErrMarkFailed
 	}
 	s.FailedInvoices = append(s.FailedInvoices, stripeInvoiceID)
-	return s.FailCounted, nil
-}
-
-func (s *FakeStore) ResetFailedChargeStreak(_ context.Context, stripeInvoiceID string) (bool, error) {
-	if s.ErrResetStreak != nil {
-		return false, s.ErrResetStreak
-	}
-	s.ResetInvoices = append(s.ResetInvoices, stripeInvoiceID)
-	return s.StreakReset, nil
+	return nil
 }
 
 // SilentLogger returns a slog.Logger that discards all output. Useful
