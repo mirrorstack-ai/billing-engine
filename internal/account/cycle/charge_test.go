@@ -40,9 +40,11 @@ type fakeStripe struct {
 	errInvoice   error // injected on FinalizeInvoice — the money-moving step
 	errFindByRef error
 
-	// crash-recovery lookup (FindInvoiceByRef): the invoice "found" on Stripe
-	// under any ref, and the refs queried.
-	findByRef      *billingstripe.Invoice
+	// crash-recovery lookup (FindInvoiceByRef): invoices "found" on Stripe
+	// KEYED BY REF (wave 2 critic finding — an unkeyed fake could not detect a
+	// cross-leg charge-ref mixup), and the refs queried. Tests seed via
+	// setFindByRef.
+	findByRefByRef map[string]billingstripe.Invoice
 	findByRefCalls []string
 	// onCreateInvoice, when set, runs INSIDE FinalizeInvoice right before it
 	// returns success — modeling a concurrent account mutation (e.g. a
@@ -97,16 +99,23 @@ func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID stri
 	return billingstripe.InvoiceItem{ID: "ii_test_" + uuid.NewString()}, nil
 }
 
-// findByRef, when set, is what FindInvoiceByRef returns — models the crash-
-// recovery lookup finding a crashed attempt's invoice on Stripe. nil = not
-// found (the default: nothing ever reached Stripe under the ref).
+// setFindByRef seeds the invoice the recovery lookup finds under EXACTLY the
+// given ref — a lookup with any other ref misses, so a leg reconciling against
+// another leg's charge identity fails its test.
+func (f *fakeStripe) setFindByRef(ref string, inv billingstripe.Invoice) {
+	if f.findByRefByRef == nil {
+		f.findByRefByRef = map[string]billingstripe.Invoice{}
+	}
+	f.findByRefByRef[ref] = inv
+}
+
 func (f *fakeStripe) FindInvoiceByRef(_ context.Context, _, ref string) (billingstripe.Invoice, bool, error) {
 	f.findByRefCalls = append(f.findByRefCalls, ref)
 	if f.errFindByRef != nil {
 		return billingstripe.Invoice{}, false, f.errFindByRef
 	}
-	if f.findByRef != nil {
-		return *f.findByRef, true, nil
+	if inv, ok := f.findByRefByRef[ref]; ok {
+		return inv, true, nil
 	}
 	return billingstripe.Invoice{}, false, nil
 }
@@ -330,7 +339,7 @@ func TestRunBillingCycle_FrozenRunNotSkippedByPrepaidOrPMGates(t *testing.T) {
 	store.collection.Mode = cycle.BillingModePrepaid
 	store.hasPM = false
 	store.errMarkRun = nil
-	sc.findByRef = &billingstripe.Invoice{ID: sc.invoiceID, Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"}
+	sc.setFindByRef(sc.invoiceCalls[0].ref, billingstripe.Invoice{ID: sc.invoiceID, Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"})
 
 	// RETRY: pre-fix → skipped_prepaid (or skipped_no_pm), stranding the moved
 	// money unmirrored. Fixed: gates never apply over an EXISTING charge; the
@@ -425,7 +434,7 @@ func TestRunBillingCycle_LateReclaimAdoptsFoundInvoiceWithoutNewObjects(t *testi
 
 	// The reclaim lands DAYS later — keys pruned — but the crashed attempt's
 	// invoice is findable under run:<id>.
-	sc.findByRef = &billingstripe.Invoice{ID: "in_prior_boundary", Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"}
+	sc.setFindByRef(sc.invoiceCalls[0].ref, billingstripe.Invoice{ID: "in_prior_boundary", Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"})
 	store.errMarkRun = nil
 
 	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)

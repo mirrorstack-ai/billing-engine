@@ -323,7 +323,7 @@ func TestModuleOverage_RetryAfterCrashRecoversChargeEvenWhenRankFlipped(t *testi
 	// Attempt 1 reached the Stripe section (marker set), charged, and crashed
 	// before the mark. Its finalized invoice sits on Stripe under the ref.
 	store.timers[x].chargeAttemptedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
-	sc.findByRef = &billingstripe.Invoice{ID: "in_crashed", Status: "paid", AmountDue: 240, AmountPaid: 240, Currency: "usd"}
+	sc.setFindByRef("timer:"+x.String(), billingstripe.Invoice{ID: "in_crashed", Status: "paid", AmountDue: 240, AmountPaid: 240, Currency: "usd"})
 
 	// Between crash and retry an EARLIER module is removed — x's live rank
 	// improves to 4 ("included").
@@ -362,7 +362,7 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
 	x := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 	store.timers[x].chargeAttemptedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
-	sc.findByRef = &billingstripe.Invoice{ID: "in_orphan_draft", Status: "draft", AmountDue: 0, Currency: "usd"}
+	sc.setFindByRef("timer:"+x.String(), billingstripe.Invoice{ID: "in_orphan_draft", Status: "draft", AmountDue: 0, Currency: "usd"})
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)

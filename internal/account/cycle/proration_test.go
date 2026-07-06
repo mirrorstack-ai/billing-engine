@@ -95,7 +95,7 @@ func TestChargeCreationProration_RecoveredDraftAcceptsShrunkTimerSet(t *testing.
 	app := store.apps[appID]
 	app.ProrationAttempted = true
 	store.apps[appID] = app
-	sc.findByRef = &billingstripe.Invoice{ID: "in_shrunk_draft", Status: "draft", AmountDue: 1300, Currency: "usd"}
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{ID: "in_shrunk_draft", Status: "draft", AmountDue: 1300, Currency: "usd"})
 
 	// Between crash and retry one co-created over-module is uninstalled — the
 	// live set shrinks to 1.
@@ -127,7 +127,7 @@ func TestChargeCreationProration_RecoveredDraftBelowLiveSetRefused(t *testing.T)
 	app.ProrationAttempted = true
 	store.apps[appID] = app
 	// Base + only 1 of the 2 live over-lines (1000 + 150 = 1150¢): incomplete.
-	sc.findByRef = &billingstripe.Invoice{ID: "in_partial_draft", Status: "draft", AmountDue: 1150, Currency: "usd"}
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{ID: "in_partial_draft", Status: "draft", AmountDue: 1150, Currency: "usd"})
 
 	_, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.Error(t, err, "an incomplete draft is refused for ops, never silently completed or finalized")
@@ -197,7 +197,7 @@ func TestChargeCreationProration_LateRetryAdoptsFoundInvoice(t *testing.T) {
 	app := store.apps[appID]
 	app.ProrationAttempted = true
 	store.apps[appID] = app
-	sc.findByRef = &billingstripe.Invoice{ID: "in_prior_combined", Status: "paid", AmountDue: 1000, AmountPaid: 1000, Currency: "usd"}
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{ID: "in_prior_combined", Status: "paid", AmountDue: 1000, AmountPaid: 1000, Currency: "usd"})
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
