@@ -41,6 +41,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // moduleOverageGraceWindow is the per-install grace window: a module's own timer
@@ -130,13 +131,14 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		return res, nil
 	}
 
-	// "Over": price $3 prorated from the install's UTC day to the end of the
-	// anchored period CONTAINING the install (ADR 0005 anchor from activation) —
-	// install-anchored, NOT grace-elapse-anchored and NOT now-anchored. Anchoring
-	// on the install's own period (rather than now's) keeps this leg's coverage
-	// strictly within the install period, so a grace that straddles a period
-	// boundary never charges the NEXT period here — that period is the boundary
-	// precharge's job (scenario 6, Stage B), which would otherwise double-bill it.
+	// "Over": price $3 prorated from the install's UTC day over the install's own
+	// anchored period (ADR 0005 anchor from activation) — install-anchored, NOT
+	// grace-elapse-anchored and NOT now-anchored — plus, for a grace that
+	// STRADDLES the period boundary, the full fee for the period the grace
+	// elapses into (see the coverage comment below; the boundary precharge
+	// deliberately excludes straddlers via its grace_expires_at < period_end
+	// cutoff, so that period is THIS leg's to bill, and only from the boundary
+	// after that does the precharge take over).
 	periodStart, periodEnd, closed := periodClosedByActivation(cand.InstalledAt, cand.ActivatedAt)
 
 	// D1d — no retroactive catch-up (the SAME posture ChargeCreationProration
@@ -188,7 +190,25 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		return res, nil
 	}
 
+	// Coverage (review 2026-07-06 contract): install day → the END of the period
+	// the grace ELAPSES INTO. Normally that is the install period itself (grace ≪
+	// period length), so the amount is the familiar install-anchored proration.
+	// When the grace STRADDLES the boundary (grace_expires_at at/after the install
+	// period's end), the boundary run for the next period already executed while
+	// this timer was unresolved and — by the same contract (grace_expires_at <
+	// period_end) — excluded it; if this leg only covered the install period, the
+	// straddled period would be billed by NO leg at all. So this charge covers it:
+	// prorated install period + the FULL fee for the straddled period. Both inputs
+	// (installed_at, activation anchor) are immutable, so the amount stays
+	// deterministic across retries — the per-timer Stripe idem keys stay stable.
+	// The precharge picks the timer up from the FIRST boundary after its grace
+	// elapsed, so coverage is complete and disjoint by construction.
+	coverageEnd := periodEnd
 	proratedMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, cand.InstalledAt, periodStart, periodEnd)
+	if !cand.GraceExpiresAt.Before(periodEnd) {
+		_, coverageEnd = billingperiod.AnchoredPeriodWindow(cand.GraceExpiresAt.UTC(), billingperiod.AnchorDay(cand.ActivatedAt))
+		proratedMicros += usage.ModuleOverageFeeMicros
+	}
 	cents, err := centsFromMicros(proratedMicros)
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
@@ -243,11 +263,12 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		AmountDueCents:  inv.AmountDue,
 		AmountPaidCents: inv.AmountPaid,
 		Currency:        chargeCurrency,
-		// Partial coverage window [install day (UTC midnight), period end) — the
-		// SAME instant ProratedBaseMicros priced, so the mirrored window and the
-		// charged amount agree by construction.
+		// Partial coverage window [install day (UTC midnight), coverage end) — the
+		// SAME window the amount above priced (coverage end extends past the install
+		// period only for a boundary-straddling grace), so the mirrored window and
+		// the charged amount agree by construction.
 		PeriodStart:        usage.ProrationCoverageStart(cand.InstalledAt, periodStart),
-		PeriodEnd:          periodEnd,
+		PeriodEnd:          coverageEnd,
 		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)

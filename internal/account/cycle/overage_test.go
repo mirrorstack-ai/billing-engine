@@ -178,6 +178,75 @@ func TestModuleOverage_RemovedWithinGraceNeverCharged(t *testing.T) {
 	require.False(t, store.timers[over].graceCharged)
 }
 
+// --- grace straddling a period boundary: Leg 1 covers the straddled period ----
+
+// Regression (review 2026-07-06, M1): a grace window that straddles a period
+// boundary used to leave the straddled period billed by NO leg — Leg 1's comment
+// deferred it to the boundary precharge, but the boundary ran BEFORE the grace
+// elapsed and (correctly) excluded the unresolved timer. Under the coverage
+// contract Leg 1 now charges install day → the END of the period the grace
+// elapses into: the install period prorated + the straddled period in full.
+func TestModuleOverage_GraceStraddlingBoundaryCoversStraddledPeriod(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store) // activated 2026-05-04 → anchor day 4
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+	app := uuid.New()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	// Installed Jul 2 — 2 days before the [Jun 4, Jul 4) period closes — so its
+	// grace elapses Jul 5, INSIDE the next period [Jul 4, Aug 4).
+	over := seedTimer(store, acct, app, time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC))
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged)
+	require.True(t, store.timers[over].graceCharged)
+
+	// $3 × 2/30 days (Jul 2 → Jul 4 of the 30-day install period, round-half-up
+	// = $0.20) + the FULL $3 for the straddled [Jul 4, Aug 4) period = $3.20.
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 320, sc.itemCalls[0].amountCfg,
+		"install-period proration + the full straddled period")
+
+	// The mirrored window agrees with the amount: coverage runs through the END
+	// of the period the grace elapsed into.
+	require.Len(t, store.invoices, 1)
+	for _, inv := range store.invoices {
+		require.Equal(t, time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC), inv.PeriodStart)
+		require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd)
+	}
+}
+
+// The complement: a grace that elapses INSIDE the install period keeps the
+// familiar install-anchored proration — no straddle surcharge.
+func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store) // anchor day 4
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	// Installed Jun 10; grace elapses Jun 13, well inside [Jun 4, Jul 4).
+	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged)
+	require.True(t, store.timers[over].graceCharged)
+
+	// $3 × 24/30 days (Jun 10 → Jul 4) = $2.40 — and nothing more.
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg)
+	require.Len(t, store.invoices, 1)
+	for _, inv := range store.invoices {
+		require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd,
+			"no straddle → coverage ends at the install period's end")
+	}
+}
+
 // --- over module with no usable PM is skipped and retried (not resolved) ------
 
 func TestModuleOverage_NoPMSkipsAndRetries(t *testing.T) {
