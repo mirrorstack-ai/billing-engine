@@ -248,6 +248,37 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 	}
 }
 
+// Regression (review 2026-07-06, H10): a PREPAID account is never auto-charged
+// off-session — the boundary spine always gated on this, but the per-module
+// grace leg bypassed it entirely. The skip is transient: nothing is resolved,
+// and a relax back to arrears charges through the same keys.
+func TestModuleOverage_PrepaidAccountSkippedNotCharged(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store)
+	store.collection.Mode = cycle.BillingModePrepaid
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	sweepAt := time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
+
+	res, err := svc.SweepModuleOverage(ctx, sweepAt)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Skipped)
+	require.Zero(t, res.Charged)
+	require.Empty(t, sc.invoiceCalls, "a prepaid account is never auto-charged by Leg 1")
+	require.False(t, store.timers[over].graceResolved, "transient skip — nothing resolved")
+
+	// The account relaxes back to arrears → the deferred charge fires.
+	store.collection.Mode = cycle.BillingModeArrears
+	res, err = svc.SweepModuleOverage(ctx, sweepAt)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged)
+	require.True(t, store.timers[over].graceCharged)
+}
+
 // --- C2: items are pinned to their own draft; Stripe failures stay retryable --
 
 // Regression (review 2026-07-06, C2): every Leg-1 line item is PINNED to the

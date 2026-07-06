@@ -51,6 +51,21 @@ func periodClosedByActivation(anchorInstant, activatedAt time.Time) (periodStart
 	return periodStart, periodEnd, !activatedAt.Before(periodEnd)
 }
 
+// offSessionChargePermitted is the collection-mode gate shared by the
+// creation-proration and per-module-overage legs (review 2026-07-06, H10): an
+// account in PREPAID mode is never auto-charged off-session — by ANY leg, not
+// only the boundary spine (which gates itself inside RunBillingCycle). The
+// skip must be TRANSIENT (retried, nothing resolved/armed): the webhook-driven
+// relax can flip the account back to arrears, at which point the deferred
+// charges fire through their unchanged deterministic idem keys.
+func (s *Service) offSessionChargePermitted(ctx context.Context, accountID uuid.UUID) (bool, error) {
+	acct, err := s.store.AccountCollection(ctx, accountID)
+	if err != nil {
+		return false, billing.Internal("account collection lookup failed", err)
+	}
+	return acct.Mode != BillingModePrepaid, nil
+}
+
 // resolveChargeableCustomer is the PM-gate + Stripe-customer resolution shared
 // by all three charge legs (RunBillingCycle, ChargeCreationProration,
 // ChargeModuleOverage): no usable default PM -> ok=false (the caller's own

@@ -72,6 +72,33 @@ func TestSweep_NeverChargesAppDeletedWithinGrace(t *testing.T) {
 	require.Empty(t, store.apps[appID].ProrationInvoiceID)
 }
 
+// Regression (review 2026-07-06, H10): a PREPAID account is never auto-charged
+// off-session — the boundary spine always gated on this, but the creation-
+// proration leg bypassed it. Transient skip (guard unarmed); a relax back to
+// arrears charges through the same keys.
+func TestChargeCreationProration_PrepaidAccountSkippedNotCharged(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	store.collection.Mode = cycle.BillingModePrepaid
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 0)
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusPrepaid, resp.Status)
+	require.Empty(t, sc.invoiceCalls, "a prepaid account is never auto-charged by the creation leg")
+	require.Empty(t, store.apps[appID].ProrationInvoiceID, "transient skip — the guard stays unarmed")
+
+	// Relax → the deferred creation charge fires normally.
+	store.collection.Mode = cycle.BillingModeArrears
+	resp, err = svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.NotEmpty(t, store.apps[appID].ProrationInvoiceID)
+}
+
 // --- (c) a survivor is charged EXACTLY ONCE even if the sweep runs twice ------
 
 func TestSweep_ChargesSurvivorExactlyOnceAcrossReruns(t *testing.T) {

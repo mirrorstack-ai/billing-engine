@@ -70,6 +70,11 @@ const (
 	// ModuleOverageSkippedNoPM: "over" but no usable default PM — left unresolved,
 	// re-attempted on the next sweep through the SAME per-timer idem keys.
 	ModuleOverageSkippedNoPM ModuleOverageStatus = "skipped_no_pm"
+	// ModuleOverageSkippedPrepaid: "over" but the account is in PREPAID collection
+	// mode — off-session auto-charges are not permitted (H10, the same gate the
+	// boundary spine applies). Left unresolved and re-attempted: a webhook-driven
+	// relax back to arrears lets the deferred charge fire through the same keys.
+	ModuleOverageSkippedPrepaid ModuleOverageStatus = "skipped_prepaid"
 	// ModuleOverageSkippedZeroCents: "over" but the prorated overage rounded to 0
 	// cents (unreachable for a real ≥1-day over module at $3) — resolved with no
 	// charge so it never re-sweeps forever.
@@ -223,6 +228,16 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		return res, nil
 	}
 	res.ChargedCents = cents
+
+	// COLLECTION-MODE gate (review 2026-07-06, H10): a prepaid account is never
+	// auto-charged off-session by ANY leg. Skip WITHOUT resolving — a relax back
+	// to arrears re-attempts through the same keys.
+	if permitted, err := s.offSessionChargePermitted(ctx, cand.AccountID); err != nil {
+		return nil, err
+	} else if !permitted {
+		res.Status = ModuleOverageSkippedPrepaid
+		return res, nil
+	}
 
 	// PM gate (same posture as the proration leg): no usable PM → skip WITHOUT
 	// resolving, re-attempted next sweep (the per-timer idem keys stay stable).

@@ -68,6 +68,11 @@ const (
 	// ProrationStatusNoPM: activated but no usable default PM → skipped, same
 	// posture as the boundary spine; re-attempted on the next sweep.
 	ProrationStatusNoPM ProrationStatus = "skipped_no_pm"
+	// ProrationStatusPrepaid: the account is in PREPAID collection mode —
+	// off-session auto-charges are not permitted (H10, the same gate the
+	// boundary spine applies). Transient like no-PM: re-attempted once a
+	// webhook-driven relax flips the account back to arrears.
+	ProrationStatusPrepaid ProrationStatus = "skipped_prepaid"
 	// ProrationStatusNoCharge: the proration rounded to 0 cents (effectively
 	// unreachable for a real survived app whose base is ≥ $20) → nothing to
 	// invoice, guard left unarmed.
@@ -236,6 +241,15 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, billing.Internal("mark proration permanently skipped failed", err)
 		}
 		return &ProrationResult{AppID: appID, Status: ProrationStatusPeriodClosed}, nil
+	}
+
+	// COLLECTION-MODE gate (review 2026-07-06, H10): a prepaid account is never
+	// auto-charged off-session by ANY leg. Transient skip (guard unarmed), like
+	// no-PM — re-attempted once the account relaxes back to arrears.
+	if permitted, err := s.offSessionChargePermitted(ctx, app.AccountID); err != nil {
+		return nil, err
+	} else if !permitted {
+		return &ProrationResult{AppID: appID, Status: ProrationStatusPrepaid}, nil
 	}
 
 	// PM gate (D1d), same posture as the boundary spine: activated but no
