@@ -52,6 +52,9 @@ type fakeStore struct {
 	activatedAccounts []cycle.AccountAnchor   // ActivatedAccounts return
 	latestPeriodEnd   map[uuid.UUID]time.Time // LatestClosedPeriodEnd return (absent → not found)
 
+	// onFreezeCharge runs at the top of FreezeBillingRunCharge (see there).
+	onFreezeCharge func(runID uuid.UUID)
+
 	// risk-graded collection inputs (PR #9)
 	collection    cycle.AccountCollection // AccountCollection return
 	unpaidInvoice bool                    // HasUnpaidInvoice return (delinquency signal)
@@ -385,14 +388,23 @@ func (f *fakeStore) MarkBillingRun(_ context.Context, runID uuid.UUID, status cy
 // First-write-wins, mirroring the SQL's WHERE frozen_charge_cents IS NULL: a
 // reclaim that already froze keeps the ORIGINAL values, so a retry can never
 // overwrite the amount a crashed attempt already put through Stripe.
-func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, charge cycle.FrozenBoundaryCharge) error {
+func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, charge cycle.FrozenBoundaryCharge) (cycle.FrozenBoundaryCharge, error) {
 	if f.errFreezeCharge != nil {
-		return f.errFreezeCharge
+		return cycle.FrozenBoundaryCharge{}, f.errFreezeCharge
 	}
+	// onFreezeCharge, when set, runs BEFORE this process's write — modeling a
+	// concurrent second daemon that reclaimed the same run and froze first (its
+	// write lands in the race window between the caller's top-of-run frozen read
+	// and this freeze). Used by the H6 regression test.
+	if f.onFreezeCharge != nil {
+		f.onFreezeCharge(runID)
+	}
+	// First-write-wins, returning the SURVIVING value (mirrors the SQL's
+	// WHERE frozen_charge_cents IS NULL + read-back).
 	if _, exists := f.frozenCharges[runID]; !exists {
 		f.frozenCharges[runID] = charge
 	}
-	return nil
+	return f.frozenCharges[runID], nil
 }
 
 func (f *fakeStore) BillingRunFrozenCharge(_ context.Context, runID uuid.UUID) (cycle.FrozenBoundaryCharge, bool, error) {

@@ -144,11 +144,13 @@ type Store interface {
 	// FreezeBillingRunCharge records — BEFORE the boundary run's first Stripe
 	// charge — the exact amount + base/overage description determinant it will send
 	// under the deterministic idem keys ii-<run>/inv-<run> (migration 035).
-	// First-write-wins: a reclaimed run that already froze keeps the ORIGINAL
-	// values, so a retry recomputing a different LIVE total never sends Stripe a
-	// mismatched request under the same idem key (the boundary analogue of the
-	// account_overage_snapshots freeze migration 033 dropped).
-	FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) error
+	// First-write-wins, and it returns the SURVIVING row value: when a concurrent
+	// second daemon reclaimed the same run and froze first, the loser's write
+	// no-ops and it MUST adopt the returned winner value — charging a locally
+	// computed amount under the shared idem keys would send Stripe two different
+	// bodies for the same key (the H6 race). The retry path likewise never sends
+	// a request that differs from what a prior attempt froze.
+	FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error)
 
 	// BillingRunFrozenCharge reads a run's frozen boundary charge; ok=false when no
 	// prior attempt reached the Stripe call (a fresh run). On a reclaim it is the
@@ -881,16 +883,28 @@ func (s *pgxStore) MarkBillingRun(ctx context.Context, runID uuid.UUID, status B
 	})
 }
 
-func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) error {
+func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error) {
 	// WHERE frozen_charge_cents IS NULL (in the query) makes this first-write-wins:
-	// a reclaimed run that already froze affects 0 rows and keeps its ORIGINAL
-	// frozen amount, which the caller reads back via BillingRunFrozenCharge first
-	// and reuses — so this only ever writes on the genuine first attempt.
-	return s.q.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
+	// a run that already froze (an earlier attempt, or a CONCURRENT daemon that got
+	// here first) affects 0 rows and keeps the ORIGINAL frozen amount. The read-back
+	// below returns the SURVIVING value regardless of which write won, and the
+	// caller charges THAT — never its locally computed amount — so two racing
+	// processes can never send different bodies under the shared idem keys.
+	if err := s.q.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
 		ID:                   runID.String(),
 		FrozenChargeCents:    pgtype.Int8{Int64: charge.Cents, Valid: true},
 		FrozenChargeWithBase: pgtype.Bool{Bool: charge.WithBase, Valid: true},
-	})
+	}); err != nil {
+		return FrozenBoundaryCharge{}, err
+	}
+	surviving, ok, err := s.BillingRunFrozenCharge(ctx, runID)
+	if err != nil {
+		return FrozenBoundaryCharge{}, err
+	}
+	if !ok {
+		return FrozenBoundaryCharge{}, fmt.Errorf("billing run %s has no frozen charge immediately after freezing", runID)
+	}
+	return surviving, nil
 }
 
 func (s *pgxStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) (FrozenBoundaryCharge, bool, error) {

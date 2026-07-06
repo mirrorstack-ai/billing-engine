@@ -246,6 +246,106 @@ func TestRunBillingCycle_ReclaimReusesFrozenBoundaryChargeAmount(t *testing.T) {
 	}
 }
 
+// Regression (review 2026-07-06, H8): every early-out — the zero-skip and the
+// prepaid/ceiling/risk/PM gates — used to run BEFORE the frozen-charge lookup.
+// A reclaimed run whose prior attempt already put money through Stripe could be
+// marked skipped/invoiced WITHOUT mirroring that charge: unmirrored money now,
+// a fresh double-charge after the idem keys age out. The frozen lookup now runs
+// FIRST, and a frozen run's only job is to finish.
+func TestRunBillingCycle_FrozenRunChargesEvenWhenLiveTotalCollapsesToZero(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000 // $1 arrears
+	store.hasPM = true
+	store.stripeCustomer = "cus_h8"
+	app := seedApp(store, chargeAccount, 0, false) // + $20 base = $21
+
+	sc := newFakeStripe()
+
+	// FIRST attempt: Stripe charges $21, crash before MarkBillingRun.
+	store.errMarkRun = errors.New("crash before mark")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	require.Len(t, sc.finalizeCalls, 1, "the money moved")
+
+	// Between attempts the LIVE total collapses to zero: the app is deleted and
+	// the arrears vanish (e.g. an aggregates correction).
+	a := store.apps[app]
+	a.Deleted = true
+	store.apps[app] = a
+	store.chargedTotal = 0
+	store.errMarkRun = nil
+
+	// RETRY: pre-fix the boundaryTotal==0 zero-skip marked the run 'invoiced'
+	// with NO mirror of the $21 already charged. Fixed: the frozen charge is
+	// reconciled first — replayed through the same keys, mirrored, marked.
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.EqualValues(t, 2100, resp.ChargedCents, "the frozen $21, not the collapsed live $0")
+	require.Len(t, store.invoices, 1, "the crashed attempt's charge is mirrored")
+	for _, m := range store.markedRuns {
+		require.EqualValues(t, 2100, m.totalCents)
+	}
+}
+
+func TestRunBillingCycle_FrozenRunNotSkippedByPrepaidOrPMGates(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_h8b"
+
+	sc := newFakeStripe()
+
+	// FIRST attempt charges $1, crash before mark.
+	store.errMarkRun = errors.New("crash before mark")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	require.Len(t, sc.finalizeCalls, 1)
+
+	// Between attempts: the account tightens to prepaid (possibly triggered by
+	// the crashed attempt's own open invoice) AND its default PM is removed.
+	store.collection.Mode = cycle.BillingModePrepaid
+	store.hasPM = false
+	store.errMarkRun = nil
+
+	// RETRY: pre-fix → skipped_prepaid (or skipped_no_pm), stranding the moved
+	// money unmirrored. Fixed: gates never apply over a frozen charge; the
+	// replay completes through the same keys.
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status,
+		"a frozen run finishes; it is never re-gated into a skip over moved money")
+	require.Len(t, store.invoices, 1)
+}
+
+// Regression (review 2026-07-06, H6): the freeze is first-write-wins AND the
+// charger adopts the SURVIVING value — a concurrent second daemon that
+// reclaimed the same run and froze first wins, so both processes send Stripe
+// the same body under the shared idem keys.
+func TestRunBillingCycle_LostFreezeRaceAdoptsWinnersAmount(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000 // this process computes $1 → 100¢
+	store.hasPM = true
+	store.stripeCustomer = "cus_h6"
+
+	sc := newFakeStripe()
+
+	// A concurrent daemon B froze $47 in the race window between this process's
+	// top-of-run frozen read (empty) and its own freeze attempt.
+	store.onFreezeCharge = func(runID uuid.UUID) {
+		if _, exists := store.frozenCharges[runID]; !exists {
+			store.frozenCharges[runID] = cycle.FrozenBoundaryCharge{Cents: 4700, WithBase: true}
+		}
+	}
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 4700, resp.ChargedCents,
+		"the loser of the freeze race must charge the winner's frozen amount, never its own")
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 4700, sc.itemCalls[0].amountCfg)
+}
+
 func TestRunBillingCycle_CentsRoundHalfUp(t *testing.T) {
 	// 5_000 micros = 0.5 cents → round-half-up → 1 cent.
 	store := newFakeStore()

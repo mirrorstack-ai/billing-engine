@@ -94,6 +94,22 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return &ChargeSummary{FirstRun: false}, nil
 	}
 
+	// FROZEN-CHARGE RECONCILIATION — resolved FIRST, before ANY gate or skip
+	// (review 2026-07-06, H8). A frozen charge means a prior attempt of this run
+	// committed to a Stripe request under the deterministic idem keys — and may
+	// have already MOVED MONEY before crashing short of MarkBillingRun. From that
+	// point the run's ONE job is to finish: replay the same Stripe objects,
+	// mirror the invoice, mark invoiced. Every early-out that used to run first
+	// (prepaid fast-path, zero-skip, spend ceiling, risk judge, PM gate) would
+	// record the run as skipped/invoiced WITHOUT mirroring the charge that
+	// already fired — unmirrored money now, and a fresh double-charge after the
+	// idem keys age out. So each of those gates below applies ONLY when no
+	// frozen charge exists.
+	frozen, hasFrozen, err := s.store.BillingRunFrozenCharge(ctx, runID)
+	if err != nil {
+		return nil, billing.Internal("frozen boundary charge lookup failed", err)
+	}
+
 	// RISK-GRADED COLLECTION GATE (PR #9, design §7-A / billing-tiers §3). Load
 	// the account's collection state up front. The off-session arrears leg may
 	// only ship behind this gate (the GA gate); the run row already exists, so a
@@ -107,8 +123,10 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// Fast path: an account ALREADY in prepaid mode never reads aggregates or
 	// touches Stripe — the off-session arrears leg is not permitted. The usage is
 	// RETAINED (usage_aggregates untouched); the prepaid-credit wallet that would
-	// settle it is a DEFERRED follow-up.
-	if acct.Mode == BillingModePrepaid {
+	// settle it is a DEFERRED follow-up. Never applied over a frozen charge (H8):
+	// a mode tightened AFTER the crashed attempt charged must not strand the
+	// moved money unmirrored.
+	if !hasFrozen && acct.Mode == BillingModePrepaid {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
 		}
@@ -191,8 +209,11 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// period with no live apps or ongoing over-modules) is there nothing to
 	// invoice — mark invoiced with NO Stripe call, never auto-create a Customer
 	// with nothing to charge. A zero total can never breach a limit/ceiling, so
-	// this short-circuits ahead of the risk gate.
-	if boundaryTotal == 0 {
+	// this short-circuits ahead of the risk gate. Never applied over a frozen
+	// charge (H8): a reclaimed run whose LIVE total collapsed to 0 (a module
+	// uninstalled, an app deleted since the crash) still owes the mirror + mark
+	// for the non-zero amount the crashed attempt already put through Stripe.
+	if !hasFrozen && boundaryTotal == 0 {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
 		}
@@ -208,8 +229,9 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// overage never trip a cap that exists to guard against USAGE surprises. (When
 	// a breach skips, the whole invoice — base + overage included — waits for the
 	// re-attempt, keeping one-invoice-per-boundary.) Independent of mode/credit-
-	// limit (a hard cap, not a trust judgment).
-	if collection.ExceedsSpendCeiling(toCollectionAccount(acct), arrears) {
+	// limit (a hard cap, not a trust judgment). Never applied over a frozen
+	// charge (H8) — the crashed attempt's money may already have moved.
+	if !hasFrozen && collection.ExceedsSpendCeiling(toCollectionAccount(acct), arrears) {
 		// skipped_ceiling, NOT skipped_prepaid: the ceiling is a per-cycle cap, not
 		// a mode transition — the account stays in arrears mode and the next cycle
 		// re-attempts once the ceiling is raised or the arrears net below it. The
@@ -232,49 +254,71 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// prepaid → arrears. The relax driver lives in the webhook (invoice.paid with
 	// no remaining open delinquency → RelaxCollectionOnPaidInvoice) so a relax is
 	// driven by a real successful-payment signal and is decoupled from charging —
-	// an account is never relaxed and charged in the same beat. TODO(#9-followup):
-	// wire a usage-spike anomaly signal + a sustained-clean-standing window.
-	delinquent, err := s.store.HasUnpaidInvoice(ctx, accountID)
-	if err != nil {
-		return nil, billing.Internal("delinquency lookup failed", err)
-	}
-	decision := collection.RiskAssess(
-		toCollectionAccount(acct),
-		collection.Signals{Delinquent: delinquent, AccruedArrearsMicros: arrears},
-		false, // cleanStanding: the charge cycle never auto-relaxes (relax is webhook-driven)
-	)
-	if decision.Action == collection.ActionSkipPrepaid {
-		summary.Status = RunStatusSkippedPrepaid
-		if decision.ModeChanged {
-			// A fresh tighten: persist the prepaid mode AND mark the run skipped in
-			// ONE transaction (TightenAndMarkRun) so a crash can't strand the account
-			// tightened with the run row still 'pending'.
-			updated := acct
-			updated.Mode = BillingMode(decision.DesiredMode)
-			if err := s.store.TightenAndMarkRun(ctx, accountID, updated, runID, RunStatusSkippedPrepaid); err != nil {
-				return nil, billing.Internal("tighten and mark billing run failed", err)
+	// an account is never relaxed and charged in the same beat. Never applied
+	// over a frozen charge (H8) — a delinquency signal raised by the crashed
+	// attempt's OWN open invoice must not strand that invoice unmirrored.
+	// TODO(#9-followup): wire a usage-spike anomaly signal + a
+	// sustained-clean-standing window.
+	if !hasFrozen {
+		delinquent, err := s.store.HasUnpaidInvoice(ctx, accountID)
+		if err != nil {
+			return nil, billing.Internal("delinquency lookup failed", err)
+		}
+		decision := collection.RiskAssess(
+			toCollectionAccount(acct),
+			collection.Signals{Delinquent: delinquent, AccruedArrearsMicros: arrears},
+			false, // cleanStanding: the charge cycle never auto-relaxes (relax is webhook-driven)
+		)
+		if decision.Action == collection.ActionSkipPrepaid {
+			summary.Status = RunStatusSkippedPrepaid
+			if decision.ModeChanged {
+				// A fresh tighten: persist the prepaid mode AND mark the run skipped in
+				// ONE transaction (TightenAndMarkRun) so a crash can't strand the account
+				// tightened with the run row still 'pending'.
+				updated := acct
+				updated.Mode = BillingMode(decision.DesiredMode)
+				if err := s.store.TightenAndMarkRun(ctx, accountID, updated, runID, RunStatusSkippedPrepaid); err != nil {
+					return nil, billing.Internal("tighten and mark billing run failed", err)
+				}
+				return summary, nil
+			}
+			// Already prepaid (no transition to persist): just mark the run skipped.
+			if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
+				return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
 			}
 			return summary, nil
 		}
-		// Already prepaid (no transition to persist): just mark the run skipped.
-		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
-			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
-		}
-		return summary, nil
 	}
 
-	// No usable default PM (or the usable-PM-implies-Customer anomaly): skip
-	// (usage RETAINED), re-attempt next cycle.
-	custID, ok, err := s.resolveChargeableCustomer(ctx, accountID)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedNoPM, "", 0); err != nil {
-			return nil, billing.Internal("mark billing run (skipped_no_pm) failed", err)
+	// PM gate. Fresh run: no usable default PM (or the usable-PM-implies-Customer
+	// anomaly) → skip (usage RETAINED), re-attempt next cycle. Frozen run (H8):
+	// the PM gate does NOT apply — the idem-key replay of already-created Stripe
+	// objects needs no fresh authorization, and a genuinely fresh finalize with
+	// the PM since removed fails loudly into the 'failed' (retryable, auditable)
+	// path below rather than being recorded as a skip over moved money. Only the
+	// Customer id is required.
+	var custID string
+	if hasFrozen {
+		custID, err = s.store.AccountStripeCustomer(ctx, accountID)
+		if err != nil {
+			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
-		summary.Status = RunStatusSkippedNoPM
-		return summary, nil
+		if custID == "" {
+			return nil, billing.Internal("billing run has a frozen charge but the account has no Stripe customer id", nil)
+		}
+	} else {
+		var ok bool
+		custID, ok, err = s.resolveChargeableCustomer(ctx, accountID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedNoPM, "", 0); err != nil {
+				return nil, billing.Internal("mark billing run (skipped_no_pm) failed", err)
+			}
+			summary.Status = RunStatusSkippedNoPM
+			return summary, nil
+		}
 	}
 
 	// Resolve the NEW period's window for the base snapshots BEFORE any Stripe
@@ -302,46 +346,47 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
+	liveCents := cents // what the LIVE state says; may be replaced by a frozen amount below
 	withBase := advanceBase+advanceOverage > 0
 
 	// FREEZE-OR-REUSE the boundary Stripe request (crash-safe idempotency,
-	// migration 035). The idem keys ii-<run>/inv-<run> are STABLE across a reclaim
-	// of this run, so the request sent under them must be stable too. A prior
-	// attempt that already reached Stripe froze its computed (cents, withBase);
-	// REUSE those frozen values rather than the ones just recomputed from LIVE
-	// state — drift between the crash and this retry (a module uninstalled flipping
-	// an over-module to included, an app deleted) could have moved the live total,
-	// and re-sending the same idem key with a different amount/description is the
-	// permanent Stripe idempotency-conflict stall this guards against (the bug
-	// ee5043c fixed once for the account-wide model, whose freeze migration 033
-	// dropped). Reconciled BEFORE the cents==0 short-circuit so a retry whose live
-	// total collapsed to 0 still re-charges — and records — the non-zero amount the
-	// crashed attempt already put through Stripe.
-	if frozen, ok, err := s.store.BillingRunFrozenCharge(ctx, runID); err != nil {
-		return nil, billing.Internal("frozen boundary charge lookup failed", err)
-	} else if ok {
+	// migration 035). The idem keys inv-/ii-/fin-<run> are STABLE across a
+	// reclaim of this run, so the request sent under them must be stable too.
+	//
+	//   - Frozen (read at the very top, before every gate — H8): a prior attempt
+	//     already committed to a Stripe request; REUSE the frozen (cents,
+	//     withBase) verbatim rather than the values just recomputed from LIVE
+	//     state — drift between the crash and this retry (a module uninstalled
+	//     flipping an over-module to included, an app deleted) could have moved
+	//     the live total, and re-sending the same idem key with a different
+	//     amount/description is the permanent Stripe idempotency-conflict stall
+	//     this guards against (the bug ee5043c fixed once for the account-wide
+	//     model, whose freeze migration 033 dropped).
+	//   - Fresh: the cents==0 sub-half-cent short-circuit applies (never call
+	//     Stripe for $0 — an advance base/overage, when present, is always ≥ $3
+	//     and can never round to 0; nothing was ever put through Stripe for this
+	//     run), then freeze BEFORE the first Stripe call. The freeze is
+	//     first-write-wins AND returns the SURVIVING row value (H6): a concurrent
+	//     second daemon that reclaimed the same run and froze first wins, and
+	//     THIS process adopts the winner's amount — two racing processes can
+	//     never send different bodies under the shared idem keys.
+	if hasFrozen {
 		cents = frozen.Cents
 		withBase = frozen.WithBase
-	}
-
-	if cents == 0 {
-		// A sub-half-cent arrears total (an advance base/overage, when present, is
-		// always ≥ $3 and can never round to 0) — never call Stripe for $0. The
-		// reuse above found no prior frozen charge (it would have set cents > 0), so
-		// nothing was ever put through Stripe for this run.
-		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
-			return nil, billing.Internal("mark billing run (zero cents) failed", err)
+	} else {
+		if cents == 0 {
+			if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
+				return nil, billing.Internal("mark billing run (zero cents) failed", err)
+			}
+			summary.Status = RunStatusInvoiced
+			return summary, nil
 		}
-		summary.Status = RunStatusInvoiced
-		return summary, nil
-	}
-
-	// Freeze the amount + description this run will charge BEFORE the first Stripe
-	// call. First-write-wins (a reclaim that already froze is a no-op — the reuse
-	// above already adopted its values), so a crash after Stripe succeeds but before
-	// MarkBillingRun commits leaves the frozen request durable for the retry.
-	if err := s.store.FreezeBillingRunCharge(ctx, runID, FrozenBoundaryCharge{Cents: cents, WithBase: withBase}); err != nil {
-		return nil, billing.Internal("freeze boundary charge failed", err)
+		surviving, err := s.store.FreezeBillingRunCharge(ctx, runID, FrozenBoundaryCharge{Cents: cents, WithBase: withBase})
+		if err != nil {
+			return nil, billing.Internal("freeze boundary charge failed", err)
+		}
+		cents = surviving.Cents
+		withBase = surviving.WithBase
 	}
 	summary.ChargedCents = cents
 
@@ -381,6 +426,17 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("account collection lookup failed (post-charge threshold resolve)", err)
 	}
+	// The flag describes the money that MOVED (review 2026-07-06, M4). On the
+	// fresh path that is boundaryTotal (whose cents conversion is exactly what
+	// was charged — sub-cent precision preserved for the threshold comparison).
+	// When the charged cents came from a frozen/surviving value that DIFFERS
+	// from the live recompute (a reclaim after roster drift, or a lost freeze
+	// race), the live total describes a charge that never happened — flag the
+	// amount actually sent to Stripe instead.
+	chargedMicros := boundaryTotal
+	if cents != liveCents {
+		chargedMicros = cents * microsPerCent
+	}
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
 		AccountID:          accountID,
 		StripeInvoiceID:    inv.ID,
@@ -390,7 +446,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		Currency:           chargeCurrency,
 		PeriodStart:        periodStart,
 		PeriodEnd:          periodEnd,
-		IsLargeAutoCollect: flagLargeAutoCollect(boundaryTotal, postChargeAcct),
+		IsLargeAutoCollect: flagLargeAutoCollect(chargedMicros, postChargeAcct),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
