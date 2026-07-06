@@ -66,8 +66,11 @@ const (
 //  5. applies the PaaS credit ONCE at the ACCOUNT level: the same ACTIVE-SaaS
 //     gate as the per-app credit (v1 has no subscription system → always 0),
 //     capped at ModuleUsageTotal + InfraTotal so it never eats base fees,
-//  6. TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal − PaasCredit
-//     (≥ 0 by the cap), plus the v1 plan stub with RenewsAt = the period end.
+//  6. adds the account-wide POOLED module overage (migration 032) once,
+//     snapshot-first (the frozen charge, else a live estimate from the pool),
+//  7. TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal + AccountOverage
+//     − PaasCredit (≥ 0 by the cap), plus the v1 plan stub with RenewsAt = the
+//     period end.
 func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest) (*GetAccountBillResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -168,6 +171,21 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		infraTotal += parts.InfraTotalMicros
 	}
 
+	// Account overage line (migration 033): the steady-state monthly estimate
+	// from the CURRENT live install timers — $3 × max(0, live − IncludedModules).
+	// Under the per-module-instance model overage is billed per install on its own
+	// grace timer (Leg 1) / at the boundary (Leg 2); the display sums the live
+	// "over" timer rows and prices them at the steady-state $3 each — the timer
+	// table is the overage model's source of truth. The display does not prorate
+	// (the charge legs own proration), so this is an estimate of the period's
+	// overage, not a per-line replay of the exact prorated amounts invoiced (that
+	// would need a per-timer charged-micros column — a follow-up). It is an
+	// ACCOUNT line, never allocated back per app.
+	accountOverage, err := s.accountOverageMicros(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+
 	// TODO(subscription): same gate as GetAppBill — v1 has no subscription
 	// system, so the credit is subscription-gated OFF and resolves to 0.
 	const subscriptionActive = false
@@ -185,9 +203,26 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		BaseFeeTotalMicros:     baseFeeTotal,
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,
+		AccountOverageMicros:   accountOverage,
 		PaasCreditMicros:       paasCredit,
-		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal - paasCredit,
+		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage - paasCredit,
 	}, nil
+}
+
+// accountOverageMicros resolves the account overage shown on the bill: the
+// steady-state monthly estimate AccountOverageMicros(live timer count) = $3 ×
+// max(0, live − IncludedModules), where `live` is the count of the account's
+// currently-live install timers (migration 033) — the overage model's source of
+// truth. The first IncludedModules live timers (by FIFO) are "included"; the rest
+// are "over", so max(0, live − included) is exactly the live over-count the charge
+// legs tier on. The PaaS credit never offsets it (overage rides ON TOP, like the
+// base fee), so it is resolved outside the credit math.
+func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID) (int64, error) {
+	live, err := s.store.LiveModuleTimerCountForAccount(ctx, accountID)
+	if err != nil {
+		return 0, billing.Internal("live module timer count lookup failed", err)
+	}
+	return AccountOverageMicros(live), nil
 }
 
 // accountPaasCreditMicros is the ACCOUNT-level PaaS credit: the same

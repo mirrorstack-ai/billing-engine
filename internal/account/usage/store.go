@@ -208,6 +208,15 @@ type Store interface {
 	// deleted BEFORE the period opened is excluded (base 0, no new usage —
 	// residual ledger rows still enumerate through AppIDsWithUsage).
 	MirroredAppIDs(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+
+	// LiveModuleTimerCountForAccount returns the account's currently-live install-
+	// timer count (removed_at IS NULL) — the DISPLAY input to GetAccountBill's
+	// account-overage line under the per-module-instance overage model (migration
+	// 033), shown as the steady-state estimate $3 × max(0, live − IncludedModules)
+	// (usage.AccountOverageMicros). Reads the timer table (the overage model's
+	// source of truth) rather than SUM(apps.module_count), so the shown overage
+	// stays tied to the exact rows the charge legs tier on.
+	LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -401,6 +410,11 @@ type InvoiceMirrorRaw struct {
 	CreatedAt        time.Time
 	HostedInvoiceURL string
 	InvoicePDF       string
+	// IsLargeAutoCollect is the server-computed post-hoc disclosure flag
+	// (migration 034): true when this invoice's off-session charge exceeded the
+	// account's auto-collect threshold that applied when it fired. Read-through
+	// from the mirror for the billing page's large-charge disclosure surface.
+	IsLargeAutoCollect bool
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -603,6 +617,20 @@ func (s *pgxStore) MirroredAppIDs(ctx context.Context, accountID uuid.UUID, peri
 		return nil, err
 	}
 	return parseAppIDs(rows)
+}
+
+// LiveModuleTimerCountForAccount counts the account's currently-live install
+// timers (removed_at IS NULL) — the live input to GetAccountBill's steady-state
+// account-overage estimate ($3 × max(0, live − IncludedModules)). Under the
+// per-module-instance overage model (migration 033) the display reads the timer
+// table (the model's source of truth) instead of SUM(apps.module_count), so the
+// shown overage stays tied to the exact rows the charge legs tier on.
+func (s *pgxStore) LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	n, err := s.q.CountLiveModuleTimersForAccount(ctx, accountID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
 }
 
 // parseAppIDs decodes a generated query's text app_id column into uuid.UUIDs,
@@ -976,16 +1004,17 @@ func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit 
 			StripeInvoiceID: r.StripeInvoiceID,
 			// pgtype.Text zero-values String to "" when NULL, which is exactly
 			// the "not enriched yet" contract InvoiceMirrorRaw documents.
-			Number:           r.Number.String,
-			Status:           r.Status,
-			AmountDueMicros:  due,
-			AmountPaidMicros: paid,
-			Currency:         r.Currency,
-			PeriodStart:      timePtrFromTimestamptz(r.PeriodStart),
-			PeriodEnd:        timePtrFromTimestamptz(r.PeriodEnd),
-			CreatedAt:        r.CreatedAt,
-			HostedInvoiceURL: r.HostedInvoiceUrl.String,
-			InvoicePDF:       r.InvoicePdf.String,
+			Number:             r.Number.String,
+			Status:             r.Status,
+			AmountDueMicros:    due,
+			AmountPaidMicros:   paid,
+			Currency:           r.Currency,
+			PeriodStart:        timePtrFromTimestamptz(r.PeriodStart),
+			PeriodEnd:          timePtrFromTimestamptz(r.PeriodEnd),
+			CreatedAt:          r.CreatedAt,
+			HostedInvoiceURL:   r.HostedInvoiceUrl.String,
+			InvoicePDF:         r.InvoicePdf.String,
+			IsLargeAutoCollect: r.IsLargeAutoCollect,
 		})
 	}
 	return out, nil

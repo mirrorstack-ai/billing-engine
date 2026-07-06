@@ -86,6 +86,9 @@ func (stubUsageStore) AppIDsWithUsage(context.Context, uuid.UUID, time.Time, tim
 func (stubUsageStore) MirroredAppIDs(context.Context, uuid.UUID, time.Time, time.Time) ([]uuid.UUID, error) {
 	return nil, nil
 }
+func (stubUsageStore) LiveModuleTimerCountForAccount(context.Context, uuid.UUID) (int, error) {
+	return 0, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()

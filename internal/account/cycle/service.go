@@ -9,6 +9,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -31,6 +32,62 @@ type Service struct {
 // constructor pattern.
 func NewService(store Store, stripe billingstripe.Client) *Service {
 	return &Service{store: store, stripe: stripe, nowFn: time.Now}
+}
+
+// periodClosedByActivation is the D1d no-retroactive-catch-up decision shared
+// by the creation-proration leg and the module-overage leg: given the anchored
+// period CONTAINING anchorInstant (an app's created_at, or a module timer's
+// installed_at) resolved against the account's activation anchor, report
+// whether the account only activated AT OR AFTER that period's end — i.e. was
+// never chargeable for the period's ENTIRE duration, so charging now (however
+// late the sweep runs) would be retroactive catch-up. Compared against
+// activatedAt, NOT "now": ordinary sweep/grace delay pushing a charge a few
+// days past periodEnd for an already-activated account is expected, not
+// retroactive, and must still charge normally — only the caller decides what
+// to persist when closed=true (each leg's own permanent-skip marker).
+func periodClosedByActivation(anchorInstant, activatedAt time.Time) (periodStart, periodEnd time.Time, closed bool) {
+	anchorDay := billingperiod.AnchorDay(activatedAt)
+	periodStart, periodEnd = billingperiod.AnchoredPeriodWindow(anchorInstant.UTC(), anchorDay)
+	return periodStart, periodEnd, !activatedAt.Before(periodEnd)
+}
+
+// offSessionChargePermitted is the collection-mode gate shared by the
+// creation-proration and per-module-overage legs (review 2026-07-06, H10): an
+// account in PREPAID mode is never auto-charged off-session — by ANY leg, not
+// only the boundary spine (which gates itself inside RunBillingCycle). The
+// skip must be TRANSIENT (retried, nothing resolved/armed): the webhook-driven
+// relax can flip the account back to arrears, at which point the deferred
+// charges fire through their unchanged deterministic idem keys.
+func (s *Service) offSessionChargePermitted(ctx context.Context, accountID uuid.UUID) (bool, error) {
+	acct, err := s.store.AccountCollection(ctx, accountID)
+	if err != nil {
+		return false, billing.Internal("account collection lookup failed", err)
+	}
+	return acct.Mode != BillingModePrepaid, nil
+}
+
+// resolveChargeableCustomer is the PM-gate + Stripe-customer resolution shared
+// by all three charge legs (RunBillingCycle, ChargeCreationProration,
+// ChargeModuleOverage): no usable default PM -> ok=false (the caller's own
+// skip status, transient/retried); a usable PM implies a Stripe Customer (a
+// card can't attach without one) -> an empty custID here is an anomaly,
+// surfaced as an error rather than silently auto-creating a Customer.
+func (s *Service) resolveChargeableCustomer(ctx context.Context, accountID uuid.UUID) (custID string, ok bool, err error) {
+	hasPM, err := s.store.HasUsableDefaultPM(ctx, accountID)
+	if err != nil {
+		return "", false, billing.Internal("usable PM check failed", err)
+	}
+	if !hasPM {
+		return "", false, nil
+	}
+	custID, err = s.store.AccountStripeCustomer(ctx, accountID)
+	if err != nil {
+		return "", false, billing.Internal("stripe customer lookup failed", err)
+	}
+	if custID == "" {
+		return "", false, billing.Internal("account has a usable PM but no Stripe customer id", nil)
+	}
+	return custID, true, nil
 }
 
 // WithNow overrides the Service clock — deterministic-test hook only (mirrors

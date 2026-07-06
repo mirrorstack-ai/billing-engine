@@ -86,6 +86,14 @@ type InvoiceRow struct {
 	// for an unenriched row rather than rendering dead links.
 	HostedInvoiceURL string `json:"hosted_invoice_url,omitempty"`
 	InvoicePDF       string `json:"invoice_pdf,omitempty"`
+
+	// IsLargeAutoCollect is the server-computed post-hoc disclosure flag
+	// (migration 034): true when this invoice's off-session charge exceeded the
+	// account's auto-collect threshold that applied when it fired. The billing
+	// page surfaces flagged charges in its large-auto-collected disclosure
+	// section. Always present (defaults false); api-client-shared's Invoice type
+	// should add a matching `is_large_auto_collect` field to consume it.
+	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
 }
 
 // ListInvoicesResponse is one page of the invoice history, newest-first.
@@ -164,18 +172,19 @@ func (s *Service) ListInvoices(ctx context.Context, req ListInvoicesRequest) (*L
 	invoices := make([]InvoiceRow, 0, len(rows))
 	for _, r := range rows {
 		invoices = append(invoices, InvoiceRow{
-			ID:               r.ID.String(),
-			StripeInvoiceID:  r.StripeInvoiceID,
-			Number:           r.Number,
-			Status:           r.Status,
-			AmountDueMicros:  r.AmountDueMicros,
-			AmountPaidMicros: r.AmountPaidMicros,
-			Currency:         r.Currency,
-			PeriodStart:      r.PeriodStart,
-			PeriodEnd:        r.PeriodEnd,
-			CreatedAt:        r.CreatedAt,
-			HostedInvoiceURL: r.HostedInvoiceURL,
-			InvoicePDF:       r.InvoicePDF,
+			ID:                 r.ID.String(),
+			StripeInvoiceID:    r.StripeInvoiceID,
+			Number:             r.Number,
+			Status:             r.Status,
+			AmountDueMicros:    r.AmountDueMicros,
+			AmountPaidMicros:   r.AmountPaidMicros,
+			Currency:           r.Currency,
+			PeriodStart:        r.PeriodStart,
+			PeriodEnd:          r.PeriodEnd,
+			CreatedAt:          r.CreatedAt,
+			HostedInvoiceURL:   r.HostedInvoiceURL,
+			InvoicePDF:         r.InvoicePDF,
+			IsLargeAutoCollect: r.IsLargeAutoCollect,
 		})
 	}
 
