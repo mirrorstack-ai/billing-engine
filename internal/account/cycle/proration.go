@@ -441,14 +441,32 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				}
 			}
 
-			// Attach the lines — unless a recovered draft already carries them all
-			// (AmountDue == the deterministic total). A partially-lined draft (some
-			// items landed before the crash, keys since pruned) cannot be completed
-			// safely — refuse loudly for ops rather than risk duplicate lines.
-			switch draft.AmountDue {
-			case expectedTotalCents:
-				// every line already attached — collect the marks with the known
-				// invoice id (item ids unrecoverable from the search projection)
+			// Attach the lines — unless a recovered draft already carries a
+			// COMPLETE deterministic line set: base + k overage lines with
+			// len(overTimers) ≤ k ≤ created_module_count (wave 2, D2). The live
+			// overTimers set can only SHRINK between the crash and the retry (an
+			// uninstall, or a rank flip via an earlier removal), so demanding
+			// equality with the LIVE recomputation livelocked every such retry
+			// forever — the crashed attempt's larger (then-correct) line set is
+			// equally valid: those timers were live and over when the lines were
+			// pinned, and D1e forbids unwinding them. k below the live set means
+			// the draft is genuinely INCOMPLETE (crashed mid-attach) — completing
+			// it past the idem-key window risks duplicate lines, so that (and any
+			// amount fitting no k) is refused loudly for ops.
+			completeForSomeK := false
+			if overageCents > 0 && draft.AmountDue >= c {
+				rem := draft.AmountDue - c
+				if rem%overageCents == 0 {
+					k := rem / overageCents
+					completeForSomeK = k >= int64(len(overTimers)) && k <= int64(locked.CreatedModuleCount)
+				}
+			}
+			switch {
+			case draft.AmountDue == expectedTotalCents || completeForSomeK:
+				// every line already attached — collect the marks for the LIVE
+				// still-unresolved timers with the known invoice id (item ids
+				// unrecoverable from the search projection; a timer removed since
+				// the crash keeps its pinned line — D1e — but needs no mark)
 				if overageCents > 0 {
 					for _, timerID := range overTimers {
 						timerCharges = append(timerCharges, ModuleTimerCharge{
@@ -456,7 +474,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 						})
 					}
 				}
-			case 0:
+			case draft.AmountDue == 0:
 				desc := fmt.Sprintf("MirrorStack app base fee (prorated) — app %s", locked.AppID)
 				if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
 					return nil, billing.StripeError("proration invoice item failed", err)
@@ -478,8 +496,8 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				}
 			default:
 				return nil, billing.Internal(fmt.Sprintf(
-					"proration recovery: draft %s carries %d cents but the deterministic total is %d — refusing to finalize a mismatched combined draft (app %s)",
-					draft.ID, draft.AmountDue, expectedTotalCents, locked.AppID), nil)
+					"proration recovery: draft %s carries %d cents, which is neither 0 nor base(%d)+k×overage(%d) for any k ≤ %d — refusing to finalize a corrupt combined draft (app %s)",
+					draft.ID, draft.AmountDue, c, overageCents, locked.CreatedModuleCount, locked.AppID), nil)
 			}
 
 			inv, err = s.stripe.FinalizeInvoice(ctx, draft.ID, appProrationFinalizeIdemKey(locked.AppID))

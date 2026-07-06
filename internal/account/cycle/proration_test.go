@@ -73,6 +73,68 @@ func TestSweep_NeverChargesAppDeletedWithinGrace(t *testing.T) {
 	require.Empty(t, store.apps[appID].ProrationInvoiceID)
 }
 
+// Regression (wave 2, D2): a recovered combined draft whose co-created timer
+// set SHRANK between crash and retry (uninstall / rank flip) used to hit the
+// refuse-loudly branch on every sweep forever — the app's proration never
+// resolved and its modules were never billed by any leg. The validation now
+// accepts base + k overage lines for live-set ≤ k ≤ created count.
+func TestChargeCreationProration_RecoveredDraftAcceptsShrunkTimerSet(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	// Created mid-period with 7 co-created modules → 2 over. Base 15/30 days =
+	// $10 (1000¢); each overage line 15/30 of $3 = $1.50 (150¢).
+	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	registerMirror(t, svc, user, appID, created, 7)
+	_ = acct
+
+	// The crashed attempt pinned base + BOTH overage lines (1000 + 2×150 = 1300¢)
+	// and died before finalize. Marker durable.
+	app := store.apps[appID]
+	app.ProrationAttempted = true
+	store.apps[appID] = app
+	sc.findByRef = &billingstripe.Invoice{ID: "in_shrunk_draft", Status: "draft", AmountDue: 1300, Currency: "usd"}
+
+	// Between crash and retry one co-created over-module is uninstalled — the
+	// live set shrinks to 1.
+	_, err := svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: appID, ModuleCount: intPtr(6)})
+	require.NoError(t, err)
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err, "a shrunk timer set must not livelock the recovery")
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Equal(t, "in_shrunk_draft", resp.ProrationInvoiceID)
+	require.Empty(t, sc.itemCalls, "the crashed attempt's complete line set is finalized as-is")
+	require.Len(t, sc.finalizeCalls, 1)
+	require.Equal(t, "in_shrunk_draft", sc.finalizeCalls[0].invoiceID)
+	require.Equal(t, "in_shrunk_draft", store.apps[appID].ProrationInvoiceID, "the guard arms — no livelock")
+}
+
+// The complement: a draft carrying FEWER lines than the still-live set is
+// genuinely incomplete (crashed mid-attach) — completing it past the idem-key
+// window risks duplicate lines, so it is refused loudly for ops.
+func TestChargeCreationProration_RecoveredDraftBelowLiveSetRefused(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
+
+	app := store.apps[appID]
+	app.ProrationAttempted = true
+	store.apps[appID] = app
+	// Base + only 1 of the 2 live over-lines (1000 + 150 = 1150¢): incomplete.
+	sc.findByRef = &billingstripe.Invoice{ID: "in_partial_draft", Status: "draft", AmountDue: 1150, Currency: "usd"}
+
+	_, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.Error(t, err, "an incomplete draft is refused for ops, never silently completed or finalized")
+	require.Empty(t, sc.finalizeCalls)
+	require.Empty(t, store.apps[appID].ProrationInvoiceID)
+}
+
 // Regression (wave 2, D4): an app created pre-activation whose creation grace
 // straddles into the first post-activation period used to be PERMANENTLY
 // skipped (period_closed) — forgiving the straddled, fully-chargeable period.
