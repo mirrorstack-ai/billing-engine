@@ -210,6 +210,36 @@ func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 		"un-snapshotted current period estimates the pooled overage from the live pool 8 → 3 over → $9")
 }
 
+// Migration 037: the account bill carries each app's FROZEN name + a deleted
+// flag, and — the hoist guard — they show even on a CHARGED (snapshotted)
+// period, where pre-037 the mirror was never read. A deleted app keeps its
+// last-known name so its bill row renders the name instead of "unknown app".
+func TestGetAccountBill_FrozenNameAndDeletedFlagOnChargedPeriod(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	app := seqUUID(1)
+	// A DELETED app with a frozen name, and a CHARGED (snapshotted) base for the
+	// period — the snapshot path, which pre-hoist skipped the mirror read.
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 0, CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+		Name: "影音教育平台", Deleted: true, DeletedAt: time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
+	}
+	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
+		BaseMicros: usage.BaseFeeMicros,
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Apps, 1)
+	require.Equal(t, "影音教育平台", resp.Apps[0].Name, "the frozen name shows even on a charged/snapshotted period (hoist guard)")
+	require.True(t, resp.Apps[0].IsDeleted, "the server-authoritative deleted flag")
+	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "the charged base is unaffected")
+}
+
 // --- period resolution --------------------------------------------------------
 
 func TestGetAccountBill_EmptyPeriodIDResolvesCurrentWindow(t *testing.T) {

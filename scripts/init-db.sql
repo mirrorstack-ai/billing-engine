@@ -42,3 +42,15 @@
 \i migrations/billing/027_apps_mirror.up.sql
 -- 028: per-app-period base snapshots (display == invoice).
 \i migrations/billing/028_app_base_snapshots.up.sql
+
+-- 029–037: base-fee v2 — creation grace, per-module overage timers, auto-collect
+-- disclosure, frozen boundary charge, crash-recovery markers, frozen app name.
+\i migrations/billing/029_apps_proration_sweep_idx.up.sql
+\i migrations/billing/030_apps_created_module_count.up.sql
+\i migrations/billing/031_apps_proration_skipped.up.sql
+\i migrations/billing/032_account_wide_overage.up.sql
+\i migrations/billing/033_app_module_overage_timers.up.sql
+\i migrations/billing/034_auto_collect_disclosure.up.sql
+\i migrations/billing/035_billing_run_frozen_charge.up.sql
+\i migrations/billing/036_charge_attempt_markers.up.sql
+\i migrations/billing/037_apps_name.up.sql

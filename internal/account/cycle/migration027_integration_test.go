@@ -31,8 +31,8 @@ func TestAppsMirror_Integration_GuardSemantics(t *testing.T) {
 
 	// Register + a conflicting retry: the FIRST registration's created_at /
 	// module_count survive (ON CONFLICT DO NOTHING).
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 2, created))
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 9, created.AddDate(0, 0, 5)))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 2, created, ""))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 9, created.AddDate(0, 0, 5), ""))
 	app, found, err := store.AppMirror(ctx, appID)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -85,15 +85,15 @@ func TestAppsMirror_Integration_LiveRosterScan(t *testing.T) {
 	newPeriodStart := mustTime(t, "2026-07-01T00:00:00Z")
 
 	live1, live2, dead, late := uuid.New(), uuid.New(), uuid.New(), uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, live1, acct, 0, created))
-	require.NoError(t, store.InsertAppMirror(ctx, live2, acct, 6, created))
-	require.NoError(t, store.InsertAppMirror(ctx, dead, acct, 9, created))
+	require.NoError(t, store.InsertAppMirror(ctx, live1, acct, 0, created, ""))
+	require.NoError(t, store.InsertAppMirror(ctx, live2, acct, 6, created, ""))
+	require.NoError(t, store.InsertAppMirror(ctx, dead, acct, 9, created, ""))
 	require.NoError(t, store.MarkAppDeleted(ctx, dead))
-	require.NoError(t, store.InsertAppMirror(ctx, uuid.New(), other, 3, created)) // another account's app
+	require.NoError(t, store.InsertAppMirror(ctx, uuid.New(), other, 3, created, "")) // another account's app
 	// Created INSIDE the new period (on the cutoff instant is also out — the
 	// comparison is strict): its new-period base belongs to the RegisterApp
 	// proration leg, never this boundary's advance sum.
-	require.NoError(t, store.InsertAppMirror(ctx, late, acct, 4, mustTime(t, "2026-07-01T10:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, late, acct, 4, mustTime(t, "2026-07-01T10:00:00Z"), ""))
 
 	apps, err := store.LiveAppsCreatedBefore(ctx, acct, newPeriodStart, usage.GraceDays)
 	require.NoError(t, err)
@@ -109,7 +109,7 @@ func TestAppsMirror_Integration_LiveRosterScan(t *testing.T) {
 	// 2026-07-06): excluded too — it hasn't survived grace, and its creation
 	// charge covers the straddled period.
 	inGrace := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, inGrace, acct, 1, mustTime(t, "2026-06-29T00:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, inGrace, acct, 1, mustTime(t, "2026-06-29T00:00:00Z"), ""))
 	apps, err = store.LiveAppsCreatedBefore(ctx, acct, newPeriodStart, usage.GraceDays)
 	require.NoError(t, err)
 	require.Len(t, apps, 2, "an app whose creation grace straddles the boundary joins only at the NEXT boundary")

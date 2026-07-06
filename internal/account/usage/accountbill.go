@@ -159,6 +159,8 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		}
 		apps = append(apps, AccountAppBill{
 			AppID:             appID,
+			Name:              parts.Name,
+			IsDeleted:         parts.IsDeleted,
 			BaseFeeMicros:     parts.BaseFeeMicros,
 			ModuleUsageMicros: parts.ModuleUsageTotalMicros,
 			InfraMicros:       parts.InfraTotalMicros,

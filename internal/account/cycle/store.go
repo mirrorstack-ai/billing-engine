@@ -200,8 +200,14 @@ type Store interface {
 
 	// InsertAppMirror registers a ms_billing.apps roster row idempotently
 	// (ON CONFLICT (app_id) DO NOTHING — a retry never rewrites the original
-	// created_at / module_count, which anchor the proration).
-	InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time) error
+	// created_at / module_count / name, which anchor the proration + freeze the
+	// display name). name "" writes NULL.
+	InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time, name string) error
+
+	// SetAppName updates the frozen display name (SyncAppModules rename);
+	// no-op once the app is deleted (WHERE deleted_at IS NULL), freezing the
+	// last-known name for the bill.
+	SetAppName(ctx context.Context, appID uuid.UUID, name string) error
 
 	// AppMirror reads one roster row (deleted rows included — the caller owns
 	// deletion semantics). found=false → the app was never registered.
@@ -451,6 +457,10 @@ type AppMirror struct {
 	ModuleCount        int
 	CreatedModuleCount int
 	CreatedAt          time.Time
+	// Name: the frozen app display name (migration 037) — "" when NULL. Written
+	// by RegisterApp / SyncAppModules (freeze-on-delete) so a deleted app's bill
+	// still shows its last-known name.
+	Name               string
 	ProrationInvoiceID string
 	ProrationSkipped   bool
 	// ProrationAttempted: a prior creation-proration charge attempt reached its
@@ -1086,13 +1096,24 @@ func (s *pgxStore) AccountActivation(ctx context.Context, accountID uuid.UUID) (
 	return at.Time, true, nil
 }
 
-func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time) error {
+func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
 	// RowsAffected 0 = a retry hit ON CONFLICT DO NOTHING — success either way.
 	_, err := s.q.InsertAppMirror(ctx, db.InsertAppMirrorParams{
 		AppID:       appID.String(),
 		AccountID:   accountID.String(),
 		ModuleCount: int32(moduleCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
 		CreatedAt:   createdAt,
+		Name:        pgtype.Text{String: name, Valid: name != ""}, // NULL when the caller omits a name (frontend falls back)
+	})
+	return err
+}
+
+func (s *pgxStore) SetAppName(ctx context.Context, appID uuid.UUID, name string) error {
+	// 0 rows = the app is deleted (frozen name, WHERE deleted_at IS NULL) — a
+	// documented no-op, the same posture as SetAppModuleCount on a deleted app.
+	_, err := s.q.SetAppName(ctx, db.SetAppNameParams{
+		AppID: appID.String(),
+		Name:  pgtype.Text{String: name, Valid: name != ""},
 	})
 	return err
 }
@@ -1119,6 +1140,7 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 		ModuleCount:        int(row.ModuleCount),
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
+		Name:               row.Name.String,               // "" when NULL (pre-037 / unnamed)
 		ProrationInvoiceID: row.ProrationInvoiceID.String, // "" when NULL (guard unarmed)
 		ProrationSkipped:   row.ProrationSkippedAt.Valid,
 		ProrationAttempted: row.ProrationAttemptedAt.Valid,

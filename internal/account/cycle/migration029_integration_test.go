@@ -37,11 +37,11 @@ func TestAppsPendingProration_Integration_Filter(t *testing.T) {
 	deletedIn := uuid.New()    // deleted WITHIN its grace → excluded (never charged)
 	deletedAfter := uuid.New() // deleted AFTER its grace elapsed → returned (D11: survived, still owes)
 	charged := uuid.New()      // guard armed → excluded
-	require.NoError(t, store.InsertAppMirror(ctx, pending, acct, 0, now.Add(-10*24*time.Hour)))
-	require.NoError(t, store.InsertAppMirror(ctx, young, acct, 0, now.Add(2*time.Hour)))
-	require.NoError(t, store.InsertAppMirror(ctx, deletedIn, acct, 0, now.Add(-time.Hour)))
-	require.NoError(t, store.InsertAppMirror(ctx, deletedAfter, acct, 0, now.Add(-9*24*time.Hour)))
-	require.NoError(t, store.InsertAppMirror(ctx, charged, acct, 0, now.Add(-8*24*time.Hour)))
+	require.NoError(t, store.InsertAppMirror(ctx, pending, acct, 0, now.Add(-10*24*time.Hour), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, young, acct, 0, now.Add(2*time.Hour), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, deletedIn, acct, 0, now.Add(-time.Hour), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, deletedAfter, acct, 0, now.Add(-9*24*time.Hour), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, charged, acct, 0, now.Add(-8*24*time.Hour), ""))
 	require.NoError(t, store.MarkAppDeleted(ctx, deletedIn))
 	require.NoError(t, store.MarkAppDeleted(ctx, deletedAfter))
 	require.NoError(t, store.SetAppProrationInvoice(ctx, charged, "in_already"))
@@ -81,7 +81,7 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 	// Live, unarmed app → the callback fires, and the invoice + snapshot + guard
 	// commit atomically.
 	live := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, live, acct, 0, mustTime(t, "2026-07-01T08:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, live, acct, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 	called := false
 	outcome, invID, err := store.ChargeProrationLocked(ctx, live, func(l cycle.AppMirror) (*cycle.ProrationCharge, error) {
 		called = true
@@ -113,7 +113,7 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 	// relative to the real clock because MarkAppDeleted stamps now() — a fixed
 	// past date would make this a post-grace delete, which D11 charges.
 	deleted := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, deleted, acct, 0, time.Now().UTC().Add(-time.Hour)))
+	require.NoError(t, store.InsertAppMirror(ctx, deleted, acct, 0, time.Now().UTC().Add(-time.Hour), ""))
 	require.NoError(t, store.MarkAppDeleted(ctx, deleted))
 	called = false
 	outcome, _, err = store.ChargeProrationLocked(ctx, deleted, func(cycle.AppMirror) (*cycle.ProrationCharge, error) {
@@ -126,7 +126,7 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 
 	// Callback declines (0 cents) → NoCharge, guard stays unarmed, nothing persisted.
 	zero := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, zero, acct, 0, mustTime(t, "2026-07-01T08:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, zero, acct, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 	outcome, _, err = store.ChargeProrationLocked(ctx, zero, func(cycle.AppMirror) (*cycle.ProrationCharge, error) {
 		return nil, nil
 	})

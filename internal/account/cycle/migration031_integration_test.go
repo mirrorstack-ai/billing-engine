@@ -28,7 +28,7 @@ func TestProrationSkipped_Integration_OneShotAndExcludedFromPending(t *testing.T
 	cutoff := mustTime(t, "2026-04-05T00:00:00Z")
 
 	skipped := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, skipped, acct, 0, mustTime(t, "2026-01-01T08:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, skipped, acct, 0, mustTime(t, "2026-01-01T08:00:00Z"), ""))
 
 	// Past grace, unarmed, not yet skipped → pending.
 	ids, err := store.AppsPendingProration(ctx, cutoff)
@@ -66,7 +66,7 @@ func TestProrationSkipped_Integration_RefusesToSkipAnAlreadyChargedApp(t *testin
 
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 0, mustTime(t, "2026-01-01T08:00:00Z")))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 0, mustTime(t, "2026-01-01T08:00:00Z"), ""))
 	require.NoError(t, store.SetAppProrationInvoice(ctx, appID, "in_already_charged"))
 
 	require.NoError(t, store.SetAppProrationSkipped(ctx, appID)) // no-op, not an error

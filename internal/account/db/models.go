@@ -360,6 +360,8 @@ type MsBillingApp struct {
 	ProrationSkippedAt pgtype.Timestamptz `json:"proration_skipped_at"`
 	// First instant a creation-proration charge attempt for this app reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set and an unarmed guard reconciles against Stripe (ms_charge_ref app-proration:<app_id>) before minting new Stripe objects.
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
+	// App display name, frozen from RegisterApp's payload and updated by SyncAppModules while the app is live (gated on deleted_at IS NULL); NEVER cleared on delete — this is what lets a deleted app's historical bill still show its name. NULL for pre-037 rows / callers that omit it.
+	Name pgtype.Text `json:"name"`
 }
 
 type MsBillingAppBaseSnapshot struct {

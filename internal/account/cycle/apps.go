@@ -47,6 +47,12 @@ type RegisterAppRequest struct {
 	// zero → the server's now. It anchors the creation-proration window, and
 	// the FIRST registration's value is immutable across retries.
 	CreatedAt time.Time `json:"created_at,omitempty"`
+
+	// Name is the platform app display name, FROZEN into the billing mirror on
+	// first registration (migration 037) so a later-deleted app's bill still
+	// shows its name. Empty → NULL (the frontend falls back to its registry
+	// lookup). SyncAppModules updates it while the app is live.
+	Name string `json:"name,omitempty"`
 }
 
 // RegisterAppResponse reports the mirror write. RegisterApp charges nothing
@@ -69,6 +75,10 @@ type SyncAppModulesRequest struct {
 	AppID       uuid.UUID `json:"app_id"`
 	ModuleCount *int      `json:"module_count,omitempty"`
 	Deleted     bool      `json:"deleted,omitempty"`
+	// Name, when non-nil, is an app rename: updates the frozen mirror name while
+	// the app is LIVE (a no-op once deleted, freezing the last-known name). nil
+	// = no name change this sync (same nil-vs-value pattern as ModuleCount).
+	Name *string `json:"name,omitempty"`
 }
 
 // SyncAppModulesResponse echoes the roster row's post-sync state.
@@ -76,6 +86,7 @@ type SyncAppModulesResponse struct {
 	AppID       uuid.UUID `json:"app_id"`
 	ModuleCount int       `json:"module_count"`
 	Deleted     bool      `json:"deleted"`
+	Name        string    `json:"name"`
 }
 
 // RegisterApp mirrors a freshly created platform app into ms_billing.apps. It
@@ -140,7 +151,7 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		return nil, billing.Internal("ensure billing account failed", err)
 	}
 
-	if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.ModuleCount, createdAt); err != nil {
+	if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.ModuleCount, createdAt, req.Name); err != nil {
 		return nil, billing.Internal("insert app mirror failed", err)
 	}
 
@@ -249,9 +260,20 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 		}
 	}
 
+	// Rename — no-op once deleted (frozen name, D1e-style), the same gate as the
+	// count update above: a live app's bill tracks its current name; a deleted
+	// app keeps its last-known name for the historical bill (migration 037).
+	if req.Name != nil && !app.Deleted {
+		if err := s.store.SetAppName(ctx, req.AppID, *req.Name); err != nil {
+			return nil, billing.Internal("set app name failed", err)
+		}
+		app.Name = *req.Name
+	}
+
 	return &SyncAppModulesResponse{
 		AppID:       app.AppID,
 		ModuleCount: app.ModuleCount,
 		Deleted:     app.Deleted,
+		Name:        app.Name,
 	}, nil
 }

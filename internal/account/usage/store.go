@@ -234,6 +234,7 @@ type AppBaseSnapshotInfo struct {
 type AppMirrorInfo struct {
 	ModuleCount int
 	CreatedAt   time.Time
+	Name        string // frozen display name (migration 037); "" when NULL
 	Deleted     bool
 	DeletedAt   time.Time
 }
@@ -569,6 +570,7 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInf
 	return AppMirrorInfo{
 		ModuleCount: int(row.ModuleCount),
 		CreatedAt:   row.CreatedAt,
+		Name:        row.Name.String, // "" when NULL (pre-037 / unnamed)
 		Deleted:     row.DeletedAt.Valid,
 		DeletedAt:   row.DeletedAt.Time,
 	}, true, nil

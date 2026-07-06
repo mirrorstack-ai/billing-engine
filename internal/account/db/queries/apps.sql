@@ -14,15 +14,18 @@
 -- :execrows so the caller can tell a fresh insert (1) from a retry no-op (0),
 -- though both are success.
 -- name: InsertAppMirror :execrows
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at)
-VALUES ($1, $2, $3, $3, $4)
+-- name ($5) is frozen from the FIRST registration like created_at /
+-- module_count (ON CONFLICT DO NOTHING keeps the first value across retries);
+-- SyncAppModules updates it while the app is live (SetAppName).
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name)
+VALUES ($1, $2, $3, $3, $4, $5)
 ON CONFLICT (app_id) DO NOTHING;
 
 -- SelectAppMirror reads one roster row (deleted or not — the caller decides
 -- what deletion means for its path: SyncAppModules no-ops a count update,
 -- GetAppBill still displays the spent creation-period base).
 -- name: SelectAppMirror :one
-SELECT app_id, account_id, module_count, created_module_count, created_at,
+SELECT app_id, account_id, module_count, created_module_count, created_at, name,
        proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1;
@@ -36,7 +39,7 @@ WHERE app_id = $1;
 -- SyncAppModules soft-delete (MarkAppDeleted) only ever contends for the brief
 -- read, never for the duration of a Stripe HTTP call.
 -- name: SelectAppMirrorForUpdate :one
-SELECT app_id, account_id, module_count, created_module_count, created_at,
+SELECT app_id, account_id, module_count, created_module_count, created_at, name,
        proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
@@ -106,6 +109,16 @@ WHERE app_id = $1
 -- name: SetAppModuleCount :execrows
 UPDATE ms_billing.apps
 SET module_count = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL;
+
+-- SetAppName updates the frozen display name (SyncAppModules rename path).
+-- WHERE deleted_at IS NULL freezes the name once deleted — the same
+-- freeze-on-delete posture as SetAppModuleCount, so a rename after deletion is
+-- a documented no-op (0 rows), keeping the last-known name for the bill.
+-- name: SetAppName :execrows
+UPDATE ms_billing.apps
+SET name = $2
 WHERE app_id = $1
   AND deleted_at IS NULL;
 
