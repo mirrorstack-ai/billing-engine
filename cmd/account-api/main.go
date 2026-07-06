@@ -223,6 +223,34 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.SyncAppModules(ctx, req)
 
+	case "SetOrgDesignation":
+		var req cycle.SetOrgDesignationRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.SetOrgDesignation(ctx, req)
+
+	case "GetOrgDesignation":
+		var req cycle.GetOrgDesignationRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.GetOrgDesignation(ctx, req)
+
+	case "RevokeSponsorship":
+		var req cycle.RevokeSponsorshipRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.RevokeSponsorship(ctx, req)
+
+	case "RepointOrgUsage":
+		var req cycle.RepointOrgUsageRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.RepointOrgUsage(ctx, req)
+
 	case "SetBudget":
 		var req budget.SetBudgetRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -403,6 +431,12 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// route group, same as the other billing writes.
 		r.Post("/v1/billing.RegisterApp", makeHTTPHandler(d, "RegisterApp"))
 		r.Post("/v1/billing.SyncAppModules", makeHTTPHandler(d, "SyncAppModules"))
+
+		// Org funding designation + attach sweep (org-billing W0, migration 041).
+		r.Post("/v1/billing.SetOrgDesignation", makeHTTPHandler(d, "SetOrgDesignation"))
+		r.Post("/v1/billing.GetOrgDesignation", makeHTTPHandler(d, "GetOrgDesignation"))
+		r.Post("/v1/billing.RevokeSponsorship", makeHTTPHandler(d, "RevokeSponsorship"))
+		r.Post("/v1/billing.RepointOrgUsage", makeHTTPHandler(d, "RepointOrgUsage"))
 		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of
 		// the SDK meter seam: it is called by platform-trusted producers
 		// (dispatch compute, cdn-worker egress — deferred PRs), accepts ONLY

@@ -77,6 +77,33 @@ type Store interface {
 	// PaymentMethod is populated via JOIN. Returns (nil, nil) when no
 	// row matches both id + account_id (treated as 404 by the service).
 	GetAddCardRequest(ctx context.Context, requestID, accountID uuid.UUID) (*AddCardRequestStatus, error)
+
+	// EnsureOrgAccount is EnsureAccount's org twin (migration 041): the same
+	// advisory-locked get-or-create on the org namespace ('lbto'). Created
+	// regardless of designation state so a funding='org' card can bind before
+	// the designation completes.
+	EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (accountID uuid.UUID, stripeCustomerID string, err error)
+
+	// AccountByOrg resolves the org's account row by EXISTENCE (not
+	// funded-gated) — cards are manageable while a funding='org' designation
+	// awaits its first bind.
+	AccountByOrg(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
+
+	// AccountByOrgFunded resolves the org's account through the designation +
+	// activation gate — Ensure's org resolution ("the pointer never flips to
+	// an unfunded account", design D1).
+	AccountByOrgFunded(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
+
+	// ChargeFundingAccount maps an account to the account whose Stripe
+	// customer / default PM pays its invoices — itself, unless it is an org
+	// account with a sponsor designation. Ensure's payment_method capability
+	// checks the FUNDING account: a sponsor-funded org account owns no PM
+	// rows itself.
+	ChargeFundingAccount(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error)
+
+	// PaymentMethodTargetForOrg is PaymentMethodTarget's org twin: the PM must
+	// belong to the ORG account (detach / set-default ownership gate).
+	PaymentMethodTargetForOrg(ctx context.Context, orgID, paymentMethodID uuid.UUID) (stripePMID, stripeCustomerID string, isDefault, found bool, err error)
 }
 
 // AddCardRequestStatus is the projection of an add_card_requests row
@@ -113,6 +140,13 @@ type pgxStore struct {
 // SAME (namespace, key) pair — the accounts table has no owner UNIQUE
 // constraint; this lock IS the uniqueness guard.
 const AdvisoryLockNamespaceBillingAccountUser int32 = 0x6c627461 // "lbta" — billing_account, easy to grep
+
+// AdvisoryLockNamespaceBillingAccountOrg is the org twin of the user
+// namespace above: every writer that get-or-creates an ORG-owned accounts row
+// (migration 041 — cycle's EnsureOrgAccount, this package's org add-card leg)
+// serializes on this (namespace, hashtext(org_id)) pair for the same reason —
+// the advisory lock IS the uniqueness guard.
+const AdvisoryLockNamespaceBillingAccountOrg int32 = 0x6c62746f // "lbto"
 
 func (s *pgxStore) EnsureAccount(ctx context.Context, userID uuid.UUID) (uuid.UUID, string, error) {
 	var id string
@@ -308,6 +342,96 @@ func (s *pgxStore) GetAddCardRequest(ctx context.Context, requestID, accountID u
 		}
 	}
 	return out, nil
+}
+
+// EnsureOrgAccount mirrors EnsureAccount on the org leg — same
+// transaction + advisory-lock shape, org namespace, org queries.
+func (s *pgxStore) EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, string, error) {
+	var id string
+	var stripeCustomerID string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		if err := qtx.AcquireBillingAccountUserLock(ctx, db.AcquireBillingAccountUserLockParams{
+			Column1: AdvisoryLockNamespaceBillingAccountOrg,
+			Column2: orgID.String(),
+		}); err != nil {
+			return err
+		}
+		existing, err := qtx.SelectAccountByOrg(ctx, nullableUUID(orgID))
+		if err == nil {
+			id, stripeCustomerID = existing.ID, existing.StripeCustomerID
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		inserted, err := qtx.InsertOrgAccount(ctx, nullableUUID(orgID))
+		if err != nil {
+			return err
+		}
+		id, stripeCustomerID = inserted.ID, inserted.StripeCustomerID
+		return nil
+	})
+	if err != nil {
+		return uuid.Nil, "", err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, "", err
+	}
+	return parsed, stripeCustomerID, nil
+}
+
+func (s *pgxStore) AccountByOrg(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	row, err := s.q.SelectAccountByOrg(ctx, nullableUUID(orgID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	parsed, err := uuid.Parse(row.ID)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
+}
+
+func (s *pgxStore) AccountByOrgFunded(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	id, err := s.q.ResolveOrgFundedAccount(ctx, orgID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil // no designation / not activated — unbilled
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
+}
+
+func (s *pgxStore) ChargeFundingAccount(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	id, err := s.q.ChargeFundingAccount(ctx, accountID.String())
+	if err != nil {
+		return uuid.Nil, err // incl. ErrNoRows: the account was just resolved — a missing row is a code bug
+	}
+	return uuid.Parse(id)
+}
+
+func (s *pgxStore) PaymentMethodTargetForOrg(ctx context.Context, orgID, paymentMethodID uuid.UUID) (string, string, bool, bool, error) {
+	row, err := s.q.PaymentMethodTargetForOrg(ctx, db.PaymentMethodTargetForOrgParams{
+		OwnerOrgID: nullableUUID(orgID),
+		ID:         paymentMethodID.String(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, false, nil
+	}
+	if err != nil {
+		return "", "", false, false, err
+	}
+	return row.StripePaymentMethodID, row.StripeCustomerID, row.IsDefault, true, nil
 }
 
 // nullableUUID converts a google/uuid.UUID into the pgtype.UUID the

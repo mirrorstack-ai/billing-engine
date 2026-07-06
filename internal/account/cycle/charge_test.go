@@ -208,6 +208,59 @@ func TestRunBillingCycle_ChargesArrears(t *testing.T) {
 	}
 }
 
+// --- org-billing D1: the funding hop (resolveChargeableCustomer) --------------
+
+func TestRunBillingCycle_SponsorFundingHopChargesSponsorCustomer(t *testing.T) {
+	// An org account whose designation names a sponsor gates on — and charges —
+	// the SPONSOR's default PM + Stripe customer, while everything else (the
+	// run row, the invoice mirror) stays keyed to the ORG account. The org
+	// account itself has NO usable PM and NO customer, so a leg resolving the
+	// org account directly could not have produced this charge.
+	store := newFakeStore()
+	org, orgAcct, sponsorAcct := uuid.New(), uuid.New(), uuid.New()
+	store.accountsByOrg[org] = orgAcct
+	store.orgDesignations[org] = cycle.OrgDesignation{
+		OrgID: org, Funding: cycle.OrgFundingSponsor, SponsorAccountID: sponsorAcct,
+	}
+	store.hasPMByAccount[orgAcct] = false
+	store.hasPMByAccount[sponsorAcct] = true
+	store.stripeCustomerByAccount[sponsorAcct] = "cus_sponsor"
+	store.chargedTotal = 1_000_000
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), orgAcct, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Len(t, sc.itemCalls, 1)
+	require.Equal(t, "cus_sponsor", sc.itemCalls[0].custID, "the charge lands on the sponsor's Stripe customer")
+	require.Equal(t, "cus_sponsor", sc.invoiceCalls[0].custID)
+
+	// Attribution never moves: the mirror + run row stay on the ORG account.
+	require.Equal(t, orgAcct, store.invoices[resp.StripeInvoiceID].AccountID)
+	_, ok := store.insertedRuns[runKey(orgAcct, periodStart, periodEnd)]
+	require.True(t, ok)
+}
+
+func TestRunBillingCycle_SponsorRevokedDegradesToNoPMSkip(t *testing.T) {
+	// The same org account with its designation revoked funds ITSELF (identity
+	// hop) — and it has no PM, so the run degrades to the ordinary transient
+	// skipped_no_pm, never an error and never a charge on the ex-sponsor.
+	store := newFakeStore()
+	org, orgAcct, sponsorAcct := uuid.New(), uuid.New(), uuid.New()
+	store.accountsByOrg[org] = orgAcct // no designation row (revoked)
+	store.hasPMByAccount[orgAcct] = false
+	store.hasPMByAccount[sponsorAcct] = true
+	store.stripeCustomerByAccount[sponsorAcct] = "cus_sponsor"
+	store.chargedTotal = 1_000_000
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), orgAcct, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusSkippedNoPM, resp.Status)
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.invoiceCalls)
+}
+
 // --- FINDING 3: a reclaimed boundary run reuses its FROZEN charge amount, never
 // a freshly-recomputed live total, so the stable Stripe idem key never conflicts -
 

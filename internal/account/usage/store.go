@@ -538,12 +538,23 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 }
 
 func (s *pgxStore) AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, bool, error) {
-	// v1 ships the user-owned path (SelectAccountByUser). Org-owned
-	// accounts (owner_org_id) land with the org billing milestone; until
-	// then an org owner resolves to "no account yet" (lazy), which the
-	// service handles gracefully (records the event NULL-account).
+	// Org owners resolve through the funding designation (migration 041):
+	// designated AND activated → the org's own account; otherwise "no account
+	// yet" (lazy), which the service handles gracefully (records the event
+	// NULL-account — the RepointOrgUsage sweep folds it in at designation).
 	if owner.OrgID != uuid.Nil {
-		return uuid.Nil, false, nil
+		id, err := s.q.ResolveOrgFundedAccount(ctx, owner.OrgID.String())
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, false, nil
+		}
+		if err != nil {
+			return uuid.Nil, false, err
+		}
+		parsed, err := uuid.Parse(id)
+		if err != nil {
+			return uuid.Nil, false, err
+		}
+		return parsed, true, nil
 	}
 	row, err := s.q.SelectAccountByUser(ctx, pgtype.UUID{Bytes: owner.UserID, Valid: true})
 	if errors.Is(err, pgx.ErrNoRows) {
