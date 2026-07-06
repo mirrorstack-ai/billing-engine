@@ -163,19 +163,15 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 	// Synthesize the app's per-module install timers (migration 033), all anchored
 	// at the app's created_at (the read-back mirror's stable first-registration
 	// value) — the RPC carries only an integer module_count, so K identical timer
-	// rows stand in for the K co-created module instances. The reconcile runs
-	// under a per-app advisory lock (H7 — a concurrent retry can never
-	// double-insert the deficit) and makes a fire-and-forget retry a no-op once
-	// the first registration already synthesized them. NEVER for a deleted app
-	// (review 2026-07-06, H4): a late retry — or a billing-backfill
-	// re-registration — that lands after the app was deleted must not resurrect
-	// live timers for it (deletion freezes module_count, so the deficit would
-	// look real and the phantom timers would charge forever).
-	if !app.Deleted {
-		if err := s.store.ReconcileModuleTimersToTarget(ctx, app.AccountID, app.AppID,
-			app.ModuleCount, app.CreatedAt, moduleGraceExpiry(app.CreatedAt), s.nowFn().UTC()); err != nil {
-			return nil, billing.Internal("reconcile module overage timers failed", err)
-		}
+	// rows stand in for the K co-created module instances. The reconcile derives
+	// the target count, owning account, AND deleted state from the roster row
+	// INSIDE its per-app advisory-locked transaction (H7 + wave 2 D8/D9): a
+	// concurrent retry can never double-insert the deficit, a late retry whose
+	// mirror read is stale can never shrink to an outdated count, and a retry
+	// landing after deletion removes orphans instead of resurrecting timers.
+	if err := s.store.ReconcileModuleTimersToTarget(ctx, app.AppID,
+		app.CreatedAt, moduleGraceExpiry(app.CreatedAt), s.nowFn().UTC()); err != nil {
+		return nil, billing.Internal("reconcile module overage timers failed", err)
 	}
 	return resp, nil
 }
@@ -221,25 +217,17 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 	now := s.nowFn().UTC()
 
 	if req.Deleted {
-		if !app.Deleted {
-			if err := s.store.MarkAppDeleted(ctx, req.AppID); err != nil {
-				return nil, billing.Internal("mark app deleted failed", err)
-			}
-			app.Deleted = true
+		// Deletion + timer soft-removal commit in ONE advisory-locked transaction
+		// (wave 2, D9): no crash window can leave the app deleted with live
+		// orphaned timers, no concurrent synthesis retry can interleave a
+		// resurrection, and a re-fired delete signal self-heals idempotently
+		// (first deletion instant kept; already-removed timers affected 0 times).
+		// A module deleted with its app is never charged its overage; no refund
+		// of anything already charged (D1e).
+		if err := s.store.MarkAppDeletedAndRemoveTimers(ctx, req.AppID, now); err != nil {
+			return nil, billing.Internal("mark app deleted + remove timers failed", err)
 		}
-		// Deletion soft-removes ALL the app's still-live install timers — they drop
-		// out of the FIFO and the Leg 1 sweep, so a module deleted with its app is
-		// never charged its overage (no refund of anything already charged, D1e).
-		// Re-fired on EVERY delete signal, not only the first (review 2026-07-06,
-		// H4): the two writes are not transactional, so a crash between them
-		// leaves the app deleted with live orphaned timers — and a retry gated on
-		// !app.Deleted would skip this block forever, leaving the orphans in the
-		// FIFO (demoting other apps' modules to "over") and chargeable. The
-		// soft-remove is idempotent (WHERE removed_at IS NULL), so the re-fire is
-		// free on the happy path and self-heals the crashed one.
-		if err := s.store.SoftRemoveAllModuleTimersForApp(ctx, req.AppID, now); err != nil {
-			return nil, billing.Internal("soft-remove app module timers failed", err)
-		}
+		app.Deleted = true
 	}
 
 	// Count update — no-op once deleted (frozen tier, D1e). req.Deleted in the
@@ -249,14 +237,14 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 			return nil, billing.Internal("set app module count failed", err)
 		}
 		app.ModuleCount = *req.ModuleCount
-		// Reconcile the app's live install timers to the new count under the
-		// per-app advisory lock (H7): grow inserts (anchored at now — genuine new
-		// installs), shrink LIFO-removes the newest. Reconciling against the LIVE
-		// timer count (not the app's prior module_count) makes it idempotent
-		// across SyncAppModules retries and self-healing after a crash between
-		// the count write and the timer write.
-		if err := s.store.ReconcileModuleTimersToTarget(ctx, app.AccountID, req.AppID,
-			*req.ModuleCount, now, moduleGraceExpiry(now), now); err != nil {
+		// Reconcile the app's live install timers under the per-app advisory
+		// lock (H7): grow inserts (anchored at now — genuine new installs),
+		// shrink LIFO-removes the newest. The target is read from the roster row
+		// INSIDE the locked transaction (wave 2, D8) — the count write above is
+		// already committed, so the reconcile sees it (or a NEWER one, which is
+		// equally correct), never a stale caller value.
+		if err := s.store.ReconcileModuleTimersToTarget(ctx, req.AppID,
+			now, moduleGraceExpiry(now), now); err != nil {
 			return nil, billing.Internal("reconcile module overage timers failed", err)
 		}
 	}

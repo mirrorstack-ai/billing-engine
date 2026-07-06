@@ -115,7 +115,7 @@ func TestModuleOverageTimers_Integration_ConcurrentReconcileNeverDoubleInserts(t
 	errs := make(chan error, workers)
 	for i := 0; i < workers; i++ {
 		go func() {
-			errs <- store.ReconcileModuleTimersToTarget(ctx, acct, app, 7, created, created.AddDate(0, 0, 3), created)
+			errs <- store.ReconcileModuleTimersToTarget(ctx, app, created, created.AddDate(0, 0, 3), created)
 		}()
 	}
 	for i := 0; i < workers; i++ {
@@ -126,12 +126,26 @@ func TestModuleOverageTimers_Integration_ConcurrentReconcileNeverDoubleInserts(t
 	require.NoError(t, err)
 	require.Equal(t, 7, n, "concurrent reconciles must never double-insert the deficit")
 
-	// And a concurrent grow/shrink mix still converges to the LAST target
-	// applied — each reconcile is atomic, so no interleaving can overshoot.
-	require.NoError(t, store.ReconcileModuleTimersToTarget(ctx, acct, app, 3, created, created.AddDate(0, 0, 3), mustTime(t, "2026-06-20T00:00:00Z")))
+	// The target is the roster row's CURRENT count read under the lock (wave 2,
+	// D8): shrink the row, reconcile, and the set converges — a stale caller
+	// can no longer impose an outdated target.
+	require.NoError(t, store.SetAppModuleCount(ctx, app, 3))
+	require.NoError(t, store.ReconcileModuleTimersToTarget(ctx, app, created, created.AddDate(0, 0, 3), mustTime(t, "2026-06-20T00:00:00Z")))
 	n, err = store.LiveModuleTimerCountForApp(ctx, app)
 	require.NoError(t, err)
 	require.Equal(t, 3, n)
+
+	// D9: a deleted row reconciles to ZERO — a late synthesis retry removes
+	// orphans instead of resurrecting timers, and the locked delete removes
+	// everything atomically to begin with.
+	require.NoError(t, store.MarkAppDeletedAndRemoveTimers(ctx, app, mustTime(t, "2026-06-21T00:00:00Z")))
+	n, err = store.LiveModuleTimerCountForApp(ctx, app)
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.NoError(t, store.ReconcileModuleTimersToTarget(ctx, app, created, created.AddDate(0, 0, 3), mustTime(t, "2026-06-21T00:00:00Z")))
+	n, err = store.LiveModuleTimerCountForApp(ctx, app)
+	require.NoError(t, err)
+	require.Zero(t, n, "a deleted app's reconcile target is zero — no resurrection")
 }
 
 // Stage B: the row_number()-windowed reads backing scenario 3 (CoCreatedOverModuleTimers),

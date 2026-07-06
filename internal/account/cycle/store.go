@@ -327,16 +327,28 @@ type Store interface {
 	// creation-proration leg — first-write-wins, never cleared.
 	MarkAppProrationAttempted(ctx context.Context, appID uuid.UUID, at time.Time) error
 
-	// ReconcileModuleTimersToTarget brings an app's live install-timer set to
-	// exactly target, ATOMICALLY under a per-app advisory transaction lock
-	// (review 2026-07-06, H7): a grow inserts the deficit anchored at
+	// ReconcileModuleTimersToTarget brings an app's live install-timer set into
+	// line with its CURRENT roster row, ATOMICALLY under a per-app advisory
+	// transaction lock (review 2026-07-06, H7; hardened in wave 2, D8/D9): the
+	// target count, owning account, and deleted state are all read from the
+	// apps row INSIDE the locked transaction — never caller-supplied — so a
+	// late fire-and-forget retry can neither shrink timers to a stale
+	// module_count (D8) nor resurrect timers for an app deleted after its
+	// mirror read (D9: a deleted row reconciles to zero, removing any live
+	// orphans instead of inserting). A grow inserts the deficit anchored at
 	// installedAt/graceExpiresAt, a shrink LIFO-soft-removes the surplus at
-	// removedAt. The lock is what makes the count-then-write reconcile safe
-	// against the fire-and-forget-with-retry RPC environment — two concurrent
-	// RegisterApp/SyncAppModules executions for the same app used to both read
-	// the same live count and both insert the full deficit, minting phantom
-	// timers that were then wrongfully charged $3 each at every boundary.
-	ReconcileModuleTimersToTarget(ctx context.Context, accountID, appID uuid.UUID, target int, installedAt, graceExpiresAt, removedAt time.Time) error
+	// removedAt. The lock also serializes concurrent executions so two retries
+	// can never both insert the full deficit (phantom $3 timers).
+	ReconcileModuleTimersToTarget(ctx context.Context, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error
+
+	// MarkAppDeletedAndRemoveTimers soft-deletes the roster row AND soft-removes
+	// every still-live install timer in ONE transaction under the SAME per-app
+	// advisory lock the reconcile takes (wave 2, D9) — a crash can no longer
+	// separate the two writes, and a concurrent synthesis retry serializes
+	// behind (or ahead of, then gets corrected by) the deletion. Idempotent:
+	// re-fire keeps the first deletion instant and affects already-removed
+	// timers zero times.
+	MarkAppDeletedAndRemoveTimers(ctx context.Context, appID uuid.UUID, removedAt time.Time) error
 
 	// ModuleOverageTimersPastGrace is Leg 1's work list: live, unresolved install
 	// timers whose grace window has elapsed as of `at`, on chargeable (activated)
@@ -1435,12 +1447,20 @@ func (s *pgxStore) MarkAppProrationAttempted(ctx context.Context, appID uuid.UUI
 	})
 }
 
-// ReconcileModuleTimersToTarget — count + write in ONE transaction serialized
-// by a per-app advisory xact lock, so concurrent RegisterApp/SyncAppModules
-// retries can never both observe the same live count and double-insert (H7).
-// The lock key is derived from the app id; pg_advisory_xact_lock releases on
-// commit/rollback automatically.
-func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, accountID, appID uuid.UUID, target int, installedAt, graceExpiresAt, removedAt time.Time) error {
+// lockModuleTimers takes the per-app advisory xact lock every timer-set writer
+// serializes on. Released automatically on commit/rollback.
+func lockModuleTimers(ctx context.Context, tx pgx.Tx, appID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "module-timers:"+appID.String())
+	return err
+}
+
+// ReconcileModuleTimersToTarget — roster read + count + write in ONE
+// transaction serialized by the per-app advisory xact lock, so concurrent
+// RegisterApp/SyncAppModules retries can never both observe the same live
+// count and double-insert (H7), a stale caller can never impose an outdated
+// target (D8 — the target is the row's CURRENT module_count, read under the
+// lock), and a deleted row reconciles to zero instead of resurrecting (D9).
+func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1448,32 +1468,69 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, accountID,
 	defer deferredRollback(ctx, tx)
 	qtx := s.q.WithTx(tx)
 
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "module-timers:"+appID.String()); err != nil {
+	if err := lockModuleTimers(ctx, tx, appID); err != nil {
 		return err
+	}
+	row, err := qtx.SelectAppMirror(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // no roster row — nothing to reconcile against
+	}
+	if err != nil {
+		return err
+	}
+	target := int64(row.ModuleCount)
+	if row.DeletedAt.Valid {
+		target = 0 // deleted apps hold no live timers — remove orphans, never insert
 	}
 	live, err := qtx.LiveModuleTimerCountForApp(ctx, appID.String())
 	if err != nil {
 		return err
 	}
 	switch {
-	case int64(target) > live:
+	case target > live:
 		if err := qtx.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
-			AccountID:      accountID.String(),
+			AccountID:      row.AccountID,
 			AppID:          appID.String(),
 			InstalledAt:    installedAt,
 			GraceExpiresAt: graceExpiresAt,
-			Count:          int32(int64(target) - live), //nolint:gosec // bounded by maxModuleCount (100000)
+			Count:          int32(target - live), //nolint:gosec // bounded by maxModuleCount (100000)
 		}); err != nil {
 			return err
 		}
-	case int64(target) < live:
+	case target < live:
 		if err := qtx.SoftRemoveNewestModuleTimers(ctx, db.SoftRemoveNewestModuleTimersParams{
 			AppID:      appID.String(),
 			RemovedAt:  removedAt,
-			LimitCount: int32(live - int64(target)), //nolint:gosec // bounded by maxModuleCount (100000)
+			LimitCount: int32(live - target), //nolint:gosec // bounded by maxModuleCount (100000)
 		}); err != nil {
 			return err
 		}
+	}
+	return tx.Commit(ctx)
+}
+
+// MarkAppDeletedAndRemoveTimers — the deletion write and the timer soft-remove
+// in ONE transaction under the SAME advisory lock (wave 2, D9): no crash
+// window between them, and no interleaving with a concurrent reconcile.
+func (s *pgxStore) MarkAppDeletedAndRemoveTimers(ctx context.Context, appID uuid.UUID, removedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	if err := lockModuleTimers(ctx, tx, appID); err != nil {
+		return err
+	}
+	if _, err := qtx.MarkAppDeleted(ctx, appID.String()); err != nil {
+		return err
+	}
+	if err := qtx.SoftRemoveAllModuleTimersForApp(ctx, db.SoftRemoveAllModuleTimersForAppParams{
+		AppID:     appID.String(),
+		RemovedAt: pgtype.Timestamptz{Time: removedAt, Valid: true},
+	}); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }

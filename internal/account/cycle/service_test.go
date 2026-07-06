@@ -726,25 +726,40 @@ func (f *fakeStore) SoftRemoveNewestModuleTimers(_ context.Context, appID uuid.U
 	return nil
 }
 
-func (f *fakeStore) ReconcileModuleTimersToTarget(ctx context.Context, accountID, appID uuid.UUID, target int, installedAt, graceExpiresAt, removedAt time.Time) error {
+func (f *fakeStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error {
 	if f.errReconcileTimers != nil {
 		return f.errReconcileTimers
 	}
-	// Mirrors the pgx locked reconcile: count live, insert the deficit anchored
-	// at installedAt/graceExpiresAt, or LIFO-remove the surplus at removedAt.
-	// (Unit tests are single-threaded; the advisory-lock serialization itself is
-	// exercised by the integration test.)
+	// Mirrors the pgx locked reconcile (wave 2, D8/D9): the target, account, and
+	// deleted state come from the CURRENT roster row — never the caller; a
+	// deleted row reconciles to zero. (Unit tests are single-threaded; the
+	// advisory-lock serialization itself is exercised by the integration test.)
+	app, ok := f.apps[appID]
+	if !ok {
+		return nil
+	}
+	target := app.ModuleCount
+	if app.Deleted {
+		target = 0
+	}
 	live, err := f.LiveModuleTimerCountForApp(ctx, appID)
 	if err != nil {
 		return err
 	}
 	switch {
 	case target > live:
-		return f.InsertModuleOverageTimers(ctx, accountID, appID, installedAt, graceExpiresAt, target-live)
+		return f.InsertModuleOverageTimers(ctx, app.AccountID, appID, installedAt, graceExpiresAt, target-live)
 	case target < live:
 		return f.SoftRemoveNewestModuleTimers(ctx, appID, live-target, removedAt)
 	}
 	return nil
+}
+
+func (f *fakeStore) MarkAppDeletedAndRemoveTimers(ctx context.Context, appID uuid.UUID, removedAt time.Time) error {
+	if err := f.MarkAppDeleted(ctx, appID); err != nil {
+		return err
+	}
+	return f.SoftRemoveAllModuleTimersForApp(ctx, appID, removedAt)
 }
 
 func (f *fakeStore) SoftRemoveAllModuleTimersForApp(_ context.Context, appID uuid.UUID, removedAt time.Time) error {
