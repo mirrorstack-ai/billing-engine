@@ -205,9 +205,14 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	if app.ProrationSkipped {
 		return &ProrationResult{AppID: appID, Status: ProrationStatusPeriodClosed}, nil
 	}
-	// Deleted within grace (or after) → never charged (D1e). The locked section
-	// re-checks this authoritatively; this is the cheap early-out.
-	if app.Deleted {
+	// Deleted WITHIN grace → never charged (scenario 1). Deleted AFTER the
+	// grace elapsed SURVIVED it and still owes the creation charge (wave 2,
+	// D11) — grace only delays WHEN the charge fires, and the H2 boundary
+	// exclusion leaves no other leg as a backstop, so skipping any deleted app
+	// was a user-timable ~$22 dodge in the grace-elapse→sweep window. The
+	// locked section re-checks this authoritatively; this is the cheap
+	// early-out.
+	if app.Deleted && app.DeletedAt.Before(moduleGraceExpiry(app.CreatedAt.UTC())) {
 		return &ProrationResult{AppID: appID, Status: ProrationStatusDeleted}, nil
 	}
 

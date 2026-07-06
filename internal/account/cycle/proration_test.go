@@ -486,15 +486,16 @@ func TestSweep_ChargesOnlyPastGraceLiveUnchargedApps(t *testing.T) {
 
 	past := uuid.New()  // past grace, live, uncharged → charged
 	young := uuid.New() // within grace → skipped
-	gone := uuid.New()  // past grace but deleted → skipped
+	gone := uuid.New()  // deleted WITHIN grace → skipped (D11: only in-grace deletes are free)
 	registerMirror(t, svc, user, past, time.Date(2026, 6, 20, 8, 0, 0, 0, time.UTC), 0)
 	registerMirror(t, svc, user, young, time.Date(2026, 6, 29, 8, 0, 0, 0, time.UTC), 0)
 	registerMirror(t, svc, user, gone, time.Date(2026, 6, 20, 8, 0, 0, 0, time.UTC), 0)
-	_, err := svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: gone, Deleted: true})
+	svcDay1 := cycle.NewService(store, sc).WithNow(func() time.Time { return time.Date(2026, 6, 21, 8, 0, 0, 0, time.UTC) })
+	_, err := svcDay1.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: gone, Deleted: true})
 	require.NoError(t, err)
 
 	// Sweep as of Jun 30 → cutoff Jun 27: past (Jun 20) qualifies; young (Jun 29)
-	// is within grace; gone is deleted.
+	// is within grace; gone was deleted inside its grace.
 	res, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, 1, res.Pending)
@@ -502,6 +503,32 @@ func TestSweep_ChargesOnlyPastGraceLiveUnchargedApps(t *testing.T) {
 	require.NotEmpty(t, store.apps[past].ProrationInvoiceID)
 	require.Empty(t, store.apps[young].ProrationInvoiceID)
 	require.Empty(t, store.apps[gone].ProrationInvoiceID)
+}
+
+// Regression (wave 2, D11): an app deleted AFTER its grace elapsed SURVIVED
+// the grace — the creation charge is owed (grace only delays WHEN it fires).
+// Pre-fix any deleted app was skipped, which — combined with the H2 boundary
+// exclusion — made "delete in the grace-elapse→sweep window" a user-timable
+// ~$22 dodge (creation proration + the straddled month), repeatable per app.
+func TestSweep_AppDeletedAfterGraceStillPaysCreationCharge(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	// Created Jul 1 08:00 → grace ends Jul 4 08:00 (straddles the Jul 4 anchor
+	// boundary). Deleted Jul 4 12:00 — AFTER grace, BEFORE the daily sweep.
+	registerMirror(t, svc, user, appID, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), 0)
+	svcPostGrace := cycle.NewService(store, sc).WithNow(func() time.Time { return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC) })
+	_, err := svcPostGrace.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: appID, Deleted: true})
+	require.NoError(t, err)
+
+	res, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 7, 5, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged,
+		"a post-grace delete survived the grace — the creation (+straddle) charge is owed, not dodgeable")
+	require.NotEmpty(t, store.apps[appID].ProrationInvoiceID)
+	require.Len(t, sc.finalizeCalls, 1)
 }
 
 // --- FINDING 1: the creation-proration charge must price off the module count

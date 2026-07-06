@@ -552,11 +552,13 @@ func (f *fakeStore) AppsPendingProration(_ context.Context, createdBefore time.T
 		return nil, f.errPendingProration
 	}
 	// Mirrors the SQL: created_at <= cutoff AND proration_invoice_id IS NULL AND
-	// deleted_at IS NULL AND proration_skipped_at IS NULL. Sorted by created_at
-	// for a deterministic sweep order.
+	// (deleted_at IS NULL OR deleted after the grace elapsed — D11: a survivor
+	// still owes) AND proration_skipped_at IS NULL. Sorted by created_at for a
+	// deterministic sweep order.
 	var out []uuid.UUID
 	for id, app := range f.apps {
-		if app.ProrationInvoiceID == "" && !app.Deleted && !app.ProrationSkipped && !app.CreatedAt.After(createdBefore) {
+		deletedInGrace := app.Deleted && app.DeletedAt.Before(app.CreatedAt.UTC().AddDate(0, 0, 3))
+		if app.ProrationInvoiceID == "" && !deletedInGrace && !app.ProrationSkipped && !app.CreatedAt.After(createdBefore) {
 			out = append(out, id)
 		}
 	}
@@ -579,8 +581,8 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 	if !ok {
 		return cycle.ProrationLockedNotFound, "", nil
 	}
-	if app.Deleted {
-		return cycle.ProrationLockedDeleted, "", nil
+	if app.Deleted && app.DeletedAt.Before(app.CreatedAt.UTC().AddDate(0, 0, 3)) {
+		return cycle.ProrationLockedDeleted, "", nil // deleted WITHIN grace only (D11)
 	}
 	if app.ProrationInvoiceID != "" {
 		return cycle.ProrationLockedAlreadyCharged, app.ProrationInvoiceID, nil
@@ -756,8 +758,16 @@ func (f *fakeStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uui
 }
 
 func (f *fakeStore) MarkAppDeletedAndRemoveTimers(ctx context.Context, appID uuid.UUID, removedAt time.Time) error {
-	if err := f.MarkAppDeleted(ctx, appID); err != nil {
-		return err
+	if f.errMarkDeleted != nil {
+		return f.errMarkDeleted
+	}
+	// DeletedAt = the service clock's removedAt (the real SQL uses now() in the
+	// same transaction) — NOT the test host's wall clock, which would misplace
+	// the deletion relative to the fixtures' grace windows (D11 pivots on it).
+	if app, ok := f.apps[appID]; ok && !app.Deleted {
+		app.Deleted = true
+		app.DeletedAt = removedAt
+		f.apps[appID] = app
 	}
 	return f.SoftRemoveAllModuleTimersForApp(ctx, appID, removedAt)
 }

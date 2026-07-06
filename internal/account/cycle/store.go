@@ -1128,7 +1128,12 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 }
 
 func (s *pgxStore) AppsPendingProration(ctx context.Context, createdBefore time.Time) ([]uuid.UUID, error) {
-	rows, err := s.q.AppsPendingProration(ctx, createdBefore)
+	rows, err := s.q.AppsPendingProration(ctx, db.AppsPendingProrationParams{
+		CreatedBefore: createdBefore,
+		// hours, not days (D5): the SQL grace cutoff must match the Go legs'
+		// fixed 24h-per-day UTC window regardless of the session timezone.
+		GraceHours: usage.GraceDays * 24,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1172,7 +1177,11 @@ func (s *pgxStore) lockAndReadChargeableApp(ctx context.Context, appID uuid.UUID
 	if err != nil {
 		return AppMirror{}, 0, "", false, err
 	}
-	if row.DeletedAt.Valid {
+	// Deleted WITHIN grace = never charged (scenario 1). Deleted AFTER the
+	// grace elapsed SURVIVED it (wave 2, D11) — the creation charge is owed
+	// (grace only delays WHEN it fires; the H2 boundary exclusion means no
+	// other leg has a backstop for this window), so the charge proceeds.
+	if row.DeletedAt.Valid && row.DeletedAt.Time.Before(moduleGraceExpiry(row.CreatedAt.UTC())) {
 		return AppMirror{}, ProrationLockedDeleted, "", false, nil
 	}
 	if row.ProrationInvoiceID.Valid {

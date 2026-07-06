@@ -56,8 +56,11 @@ func TestScenario1_CreatedThenDeletedInGraceNeverCharged(t *testing.T) {
 	require.Empty(t, sc.itemCalls, "no charge at creation (scenario 1)")
 	require.Equal(t, 3, liveTimerCount(store, appID))
 
-	// Deleted WITHIN grace (day 1) → the app + all its install timers drop out.
-	_, err := svc.SyncAppModules(ctx, cycle.SyncAppModulesRequest{AppID: appID, Deleted: true})
+	// Deleted WITHIN grace (day 1 — the delete must be clocked inside the
+	// grace window: D11 makes a post-grace delete chargeable) → the app + all
+	// its install timers drop out.
+	svcDay1 := cycle.NewService(store, sc).WithNow(func() time.Time { return scenarioCreatedAt.AddDate(0, 0, 1) })
+	_, err := svcDay1.SyncAppModules(ctx, cycle.SyncAppModulesRequest{AppID: appID, Deleted: true})
 	require.NoError(t, err)
 	require.Equal(t, 0, liveTimerCount(store, appID), "delete soft-removes all timers")
 

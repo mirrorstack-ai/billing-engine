@@ -15,24 +15,33 @@ import (
 const appsPendingProration = `-- name: AppsPendingProration :many
 SELECT app_id
 FROM ms_billing.apps
-WHERE created_at <= $1
+WHERE created_at <= $1::timestamptz
   AND proration_invoice_id IS NULL
-  AND deleted_at IS NULL
+  AND (deleted_at IS NULL
+       OR deleted_at >= created_at + make_interval(hours => $2::int))
   AND proration_skipped_at IS NULL
 ORDER BY created_at
 `
 
+type AppsPendingProrationParams struct {
+	CreatedBefore time.Time `json:"created_before"`
+	GraceHours    int32     `json:"grace_hours"`
+}
+
 // AppsPendingProration is the creation-proration sweep's work list: apps that
-// have survived the grace window ($1 = now() − GraceDays) and were never charged
-// their creation-period base. proration_invoice_id IS NULL is the one-shot guard
-// (an already-charged app drops out); deleted_at IS NULL excludes apps
-// soft-deleted within grace (they are NEVER charged); proration_skipped_at IS
-// NULL excludes apps permanently skipped as a would-be retroactive catch-up
-// (migration 031, D1d). Ordered by created_at so the oldest pending app
-// charges first. Backed by the partial index apps_pending_proration_idx
-// (migrations 029/031).
-func (q *Queries) AppsPendingProration(ctx context.Context, createdAt time.Time) ([]string, error) {
-	rows, err := q.db.Query(ctx, appsPendingProration, createdAt)
+// have survived the grace window (@created_before = now() − GraceDays) and were
+// never charged their creation-period base. proration_invoice_id IS NULL is the
+// one-shot guard (an already-charged app drops out); the deleted_at predicate
+// excludes ONLY apps soft-deleted WITHIN their grace (never charged, scenario
+// 1) — an app deleted AFTER its grace elapsed SURVIVED it and still owes the
+// creation charge (wave 2, D11: grace only delays WHEN the charge fires, and
+// the H2 boundary exclusion leaves no other leg as a backstop; pre-fix this
+// was a user-timable ~$22 dodge in the grace-elapse→sweep window). Grace in
+// HOURS (D5 — session-TZ/DST safety). proration_skipped_at IS NULL excludes
+// apps permanently skipped as a would-be retroactive catch-up (migration 031,
+// D1d). Ordered by created_at so the oldest pending app charges first.
+func (q *Queries) AppsPendingProration(ctx context.Context, arg AppsPendingProrationParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, appsPendingProration, arg.CreatedBefore, arg.GraceHours)
 	if err != nil {
 		return nil, err
 	}
