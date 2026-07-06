@@ -12,11 +12,11 @@
 -- unit_price_micros is µ$ PER 1K TOKENS = (USD per 1M tokens) × 1000. Billing AI
 -- tokens in the coarsest per-1k unit keeps every per-unit price ≥ 1 µ$ so the
 -- integer BIGINT never floors a sub-micro per-token price to 0.
---   Sonnet 5 raw COGS (Anthropic list, intro price, July 2026):
---     input  $2/1M  → 2  × 1000 = 2000  µ$/1k
---     output $10/1M → 10 × 1000 = 10000 µ$/1k
---     cache_write $2.50/1M → 2.5 × 1000 = 2500 µ$/1k
---     cache_read  $0.20/1M → 0.2 × 1000 =  200 µ$/1k
+--   Sonnet 5 raw COGS (Anthropic standard list price):
+--     input  $3/1M  → 3  × 1000 = 3000  µ$/1k
+--     output $15/1M → 15 × 1000 = 15000 µ$/1k
+--     cache_write $3.75/1M → 3.75 × 1000 = 3750 µ$/1k
+--     cache_read  $0.30/1M → 0.3 × 1000 =  300 µ$/1k
 --
 -- RAW COGS, NOT ×1.2 (same contract as 017/018): these are the RAW PROVIDER LIST
 -- cost. The agent's 1.2× DISPLAY markup (models.go priceMarkup, served by
@@ -48,11 +48,11 @@
 INSERT INTO ms_billing.metric_model_prices (
     metric, model, unit_price_micros, active
 ) VALUES
-    -- Claude Sonnet 5 — in $2/1M, out $10/1M, cache_write $2.50/1M, cache_read $0.20/1M.
-    ('infra.ai.input.tokens',       'anthropic.claude-sonnet-5', 2000,  true),
-    ('infra.ai.output.tokens',      'anthropic.claude-sonnet-5', 10000, true),
-    ('infra.ai.cache_write.tokens', 'anthropic.claude-sonnet-5', 2500,  true),
-    ('infra.ai.cache_read.tokens',  'anthropic.claude-sonnet-5',  200,  true)
+    -- Claude Sonnet 5 — in $3/1M, out $15/1M, cache_write $3.75/1M, cache_read $0.30/1M.
+    ('infra.ai.input.tokens',       'anthropic.claude-sonnet-5', 3000,  true),
+    ('infra.ai.output.tokens',      'anthropic.claude-sonnet-5', 15000, true),
+    ('infra.ai.cache_write.tokens', 'anthropic.claude-sonnet-5', 3750,  true),
+    ('infra.ai.cache_read.tokens',  'anthropic.claude-sonnet-5',  300,  true)
 ON CONFLICT (metric, model) DO NOTHING;
 
 -- 2) RETIRE — deactivate the removed Sonnet 4.6 rows. KEEP the rows (historical
