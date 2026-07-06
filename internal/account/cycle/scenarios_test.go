@@ -421,6 +421,31 @@ func TestScenario6_ReclaimedBoundaryNeverPrechargesInsidePeriodModule(t *testing
 		"a module installed inside the new period was already covered by its own grace charge — precharging it again double-bills the period")
 }
 
+// Regression (wave 2, D1): the precharge must NOT depend on the mutable
+// grace_resolved flag. cmd/billing-cycle runs the boundary spine before the
+// grace sweeps, so a timer whose grace expired in the ~24h before the boundary
+// is still UNRESOLVED when the boundary run executes — keying on resolution
+// excluded it, and (Leg 1's coverage being derived from immutable timestamps
+// and stopping at the boundary) its post-boundary period was then billed by
+// nobody. The predicate now uses immutable cutoffs only.
+func TestScenario6_ExpiredButUnresolvedTimerStillPrecharged(t *testing.T) {
+	store := newFakeStore()
+	store.hasPM = true
+	store.stripeCustomer = "cus_d1"
+	app := seedApp(store, chargeAccount, 0, false)
+
+	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 5)
+	// Installed Jun 25 → grace expired Jun 28, BEFORE the Jul 1 boundary — but
+	// no sweep has resolved it yet (the boundary runs first in the beat).
+	seedTimer(store, chargeAccount, app, timeUTC(2026, 6, 25, 0))
+
+	sc := newFakeStripe()
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, usage.ModuleOverageFeeMicros, resp.AdvanceOverageMicros,
+		"an expired-but-unresolved over-module is ongoing — its own Leg 1 charge stops at the boundary, so skipping it here gaps the new period")
+}
+
 // Regression (review 2026-07-06, C1): an over-module resolved WITHOUT charge
 // under the D1d period-closed posture (installed pre-activation, so its own
 // install period is forgiven) still owes overage for every post-activation

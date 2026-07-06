@@ -172,12 +172,17 @@ func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
 	// The boundary that opens the account's [Jul 4, Aug 4) period (anchor day 4).
 	newPeriodStart := mustTime(t, "2026-07-04T00:00:00Z")
 
-	// Before any charge, none are "ongoing" (grace_resolved all false).
+	// The 2 over-rank timers (installed Jun 19, grace expired Jun 22) are
+	// "ongoing" for the Jul-4 boundary EVEN BEFORE any sweep resolves them —
+	// the predicate keys on immutable timestamps only (wave 2, D1: keying on
+	// grace_resolved made the precharge depend on cron ordering and gapped a
+	// period for timers resolved after their covering boundary run).
 	ongoing, err := store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules, newPeriodStart)
 	require.NoError(t, err)
-	require.Zero(t, ongoing, "nothing resolved yet → no ongoing over-module")
+	require.Equal(t, 2, ongoing, "expired-but-unresolved over-modules are already ongoing")
 
-	// Charge the 2 co-created over-modules (scenario 3) → they become "ongoing".
+	// Charging them (scenario 3) does not change the count — resolution is not
+	// part of the predicate.
 	for _, id := range over {
 		require.NoError(t, store.MarkModuleTimerCharged(ctx, id, created.AddDate(0, 0, 3), "in_x", "ii_x"))
 	}

@@ -882,11 +882,12 @@ func (f *fakeStore) CountOngoingOverModuleTimers(_ context.Context, accountID uu
 	}
 	// Live FIFO: the first includedModules are "included"; the rest are "over".
 	// Count the "over" tail owed a precharge for the new period opening at
-	// periodEnd: installed before it, grace elapsed before it, verdict resolved
-	// (charged or D1d resolved-uncharged) — mirroring the SQL predicate.
+	// periodEnd: installed before it, grace elapsed before it — IMMUTABLE
+	// cutoffs only (wave 2, D1: resolution state is sweep-ordering-dependent
+	// and deliberately not part of the predicate), mirroring the SQL.
 	n := 0
 	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
-		if rank >= includedModules && t.graceResolved &&
+		if rank >= includedModules &&
 			t.installedAt.Before(periodEnd) && t.graceExpiresAt.Before(periodEnd) {
 			n++
 		}

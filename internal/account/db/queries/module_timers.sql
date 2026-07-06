@@ -136,8 +136,8 @@ WHERE id = @timer_id::uuid
 -- predicate. "over" is re-derived LIVE, so a charged timer that has since flipped
 -- to "included" (an earlier install removed) is not counted.
 --
--- The coverage contract with the grace legs (review 2026-07-06) — a timer is
--- "ongoing" for the new period iff ALL of:
+-- The coverage contract with the grace legs (review 2026-07-06, tightened in
+-- wave 2 D1) — a timer is "ongoing" for the new period iff BOTH of:
 --   * installed_at < @period_end — it existed before the new period opened. A
 --     module installed INSIDE the new period had that period covered by its OWN
 --     grace charge (Leg 1 / scenario 3), exactly the same cutoff the advance-base
@@ -148,22 +148,31 @@ WHERE id = @timer_id::uuid
 --     elapses into, so a boundary-straddling timer's new period belongs to Leg 1,
 --     not this precharge (counting it would double-bill; skipping the NEXT
 --     boundary would leave a gap — this predicate does neither).
---   * grace_resolved — its grace verdict is terminal. Resolved-WITHOUT-charge
---     rows (the D1d period-closed posture: installed pre-activation, so the
---     install period itself is forgiven) still owe every period from the first
---     post-activation boundary onward; the previous grace_charged_at IS NOT NULL
---     proxy silently exempted them from ALL overage billing, forever.
+--
+-- DELIBERATELY NOT a condition: grace_resolved (wave 2, D1). Resolution state
+-- is MUTABLE and set only by the sweeps, so keying on it made the precharge
+-- depend on cron ordering: a timer whose grace expired in the ~24h before the
+-- boundary was still unresolved when the boundary run executed, got excluded,
+-- and its post-boundary period was then billed by NO leg (Leg 1's coverage is
+-- derived from immutable timestamps and stops at the boundary). Both cutoffs
+-- above are immutable, so the precharge decision is identical whenever the run
+-- (or its reclaim) executes. An expired-unresolved timer counted here is
+-- charged its own install-period coverage by Leg 1 later — disjoint windows,
+-- never a double-bill. D1d resolved-uncharged rows count too (only the
+-- pre-activation install period is forgiven). Residual edge (accepted,
+-- verdict-at-boundary-time semantics): a timer whose live rank improves
+-- over→included between this run and its own sweep keeps the one precharge —
+-- no refund (D1e); the next boundary excludes it by rank.
 -- name: CountOngoingOverModuleTimers :one
 SELECT COALESCE(count(*), 0)::bigint AS over_count
 FROM (
-    SELECT installed_at, grace_expires_at, grace_resolved,
+    SELECT installed_at, grace_expires_at,
            row_number() OVER (ORDER BY installed_at, id) AS rn
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = @account_id::uuid
       AND removed_at IS NULL
 ) ranked
 WHERE rn > @included_modules::int
-  AND grace_resolved = true
   AND installed_at < @period_end::timestamptz
   AND grace_expires_at < @period_end::timestamptz;
 
