@@ -228,6 +228,26 @@ func (q *Queries) LiveModuleTimerRankBefore(ctx context.Context, arg LiveModuleT
 	return rank, err
 }
 
+const markModuleTimerChargeAttempted = `-- name: MarkModuleTimerChargeAttempted :exec
+UPDATE ms_billing.app_module_overage_timers
+SET charge_attempted_at = $2
+WHERE id = $1
+  AND charge_attempted_at IS NULL
+`
+
+type MarkModuleTimerChargeAttemptedParams struct {
+	ID                string             `json:"id"`
+	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
+}
+
+// MarkModuleTimerChargeAttempted stamps the recovery marker (036) BEFORE a
+// charge attempt's first Stripe call. First-write-wins (the FIRST attempt
+// instant is the durable one); never cleared.
+func (q *Queries) MarkModuleTimerChargeAttempted(ctx context.Context, arg MarkModuleTimerChargeAttemptedParams) error {
+	_, err := q.db.Exec(ctx, markModuleTimerChargeAttempted, arg.ID, arg.ChargeAttemptedAt)
+	return err
+}
+
 const markModuleTimerCharged = `-- name: MarkModuleTimerCharged :exec
 UPDATE ms_billing.app_module_overage_timers
 SET grace_resolved        = true,
@@ -279,7 +299,7 @@ func (q *Queries) MarkModuleTimerIncluded(ctx context.Context, id string) error 
 
 const moduleOverageTimersPastGrace = `-- name: ModuleOverageTimersPastGrace :many
 SELECT t.id, t.account_id, t.app_id, t.installed_at, t.grace_expires_at,
-       a.activated_at
+       t.charge_attempted_at, a.activated_at
 FROM ms_billing.app_module_overage_timers t
 JOIN ms_billing.accounts a ON a.id = t.account_id
 WHERE t.removed_at IS NULL
@@ -290,21 +310,23 @@ ORDER BY t.installed_at, t.id
 `
 
 type ModuleOverageTimersPastGraceRow struct {
-	ID             string             `json:"id"`
-	AccountID      string             `json:"account_id"`
-	AppID          string             `json:"app_id"`
-	InstalledAt    time.Time          `json:"installed_at"`
-	GraceExpiresAt time.Time          `json:"grace_expires_at"`
-	ActivatedAt    pgtype.Timestamptz `json:"activated_at"`
+	ID                string             `json:"id"`
+	AccountID         string             `json:"account_id"`
+	AppID             string             `json:"app_id"`
+	InstalledAt       time.Time          `json:"installed_at"`
+	GraceExpiresAt    time.Time          `json:"grace_expires_at"`
+	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
+	ActivatedAt       pgtype.Timestamptz `json:"activated_at"`
 }
 
 // ModuleOverageTimersPastGrace is Leg 1's work list: live, unresolved install
 // timers whose grace window has elapsed as of $1, on accounts that are chargeable
 // (activated_at IS NOT NULL — the same activation gate as the spine + proration
 // leg). Each row carries the account's activation anchor so the sweep can resolve
-// the install's period window without a second read. Ordered (installed_at, id)
-// so the oldest install charges first (matches the FIFO ordering). Backed by
-// app_module_overage_timers_sweep_idx.
+// the install's period window without a second read, and the charge_attempted_at
+// recovery marker (036) so a retried candidate reconciles against Stripe first.
+// Ordered (installed_at, id) so the oldest install charges first (matches the
+// FIFO ordering). Backed by app_module_overage_timers_sweep_idx.
 func (q *Queries) ModuleOverageTimersPastGrace(ctx context.Context, graceExpiresAt time.Time) ([]ModuleOverageTimersPastGraceRow, error) {
 	rows, err := q.db.Query(ctx, moduleOverageTimersPastGrace, graceExpiresAt)
 	if err != nil {
@@ -320,6 +342,7 @@ func (q *Queries) ModuleOverageTimersPastGrace(ctx context.Context, graceExpires
 			&i.AppID,
 			&i.InstalledAt,
 			&i.GraceExpiresAt,
+			&i.ChargeAttemptedAt,
 			&i.ActivatedAt,
 		); err != nil {
 			return nil, err
@@ -330,6 +353,24 @@ func (q *Queries) ModuleOverageTimersPastGrace(ctx context.Context, graceExpires
 		return nil, err
 	}
 	return items, nil
+}
+
+const moduleTimerStillPending = `-- name: ModuleTimerStillPending :one
+SELECT (removed_at IS NULL AND grace_resolved = false)::bool AS pending
+FROM ms_billing.app_module_overage_timers
+WHERE id = $1
+`
+
+// ModuleTimerStillPending is the charge-time re-verification read (review
+// 2026-07-06, M2): the sweep's work list is read ONCE and can be minutes stale
+// by the time a late candidate is processed — re-check live + unresolved
+// immediately before acting so a module removed (or resolved by a concurrent
+// sweep) mid-batch is not charged.
+func (q *Queries) ModuleTimerStillPending(ctx context.Context, id string) (bool, error) {
+	row := q.db.QueryRow(ctx, moduleTimerStillPending, id)
+	var pending bool
+	err := row.Scan(&pending)
+	return pending, err
 }
 
 const softRemoveAllModuleTimersForApp = `-- name: SoftRemoveAllModuleTimersForApp :exec

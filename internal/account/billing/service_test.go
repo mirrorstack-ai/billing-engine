@@ -259,6 +259,10 @@ func (f *fakeStripe) FinalizeInvoice(context.Context, string, string) (billingst
 	panic("FinalizeInvoice must not be called by the billing package")
 }
 
+func (f *fakeStripe) FindInvoiceByRef(context.Context, string, string) (billingstripe.Invoice, bool, error) {
+	panic("FindInvoiceByRef must not be called by the billing package")
+}
+
 // --- tests ----------------------------------------------------------------
 
 func TestEnsure_NoAccount_ReturnsMissingBillingAccount(t *testing.T) {

@@ -86,6 +86,16 @@ type Client interface {
 	// the original finalization. Returns the finalized invoice projection
 	// (id/status/amounts) for the mirror.
 	FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+
+	// FindInvoiceByRef looks a Customer's invoice up by its ms_charge_ref
+	// metadata anchor (stamped by CreateDraftInvoice) — the crash-recovery read
+	// (review 2026-07-06, H5): Stripe prunes idempotency keys after ~24h, so a
+	// charge leg retrying past that window can no longer rely on key replay to
+	// find what a crashed attempt created. found=false when no invoice carries
+	// the ref. Backed by the Stripe Search API; its indexing lags writes by up
+	// to ~1 minute, which the retry cadences (daily sweeps) sit far above —
+	// short-window retries are still covered by idem-key replay.
+	FindInvoiceByRef(ctx context.Context, custID, ref string) (Invoice, bool, error)
 }
 
 // InvoiceItem is the trust-boundary-edge projection of a Stripe invoice item

@@ -15,6 +15,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // registerMirror seeds a roster row through RegisterApp (which only mirrors — no
@@ -70,6 +71,35 @@ func TestSweep_NeverChargesAppDeletedWithinGrace(t *testing.T) {
 	require.Equal(t, 0, res.Pending, "a deleted app is excluded from the sweep")
 	require.Empty(t, sc.itemCalls, "an app deleted within grace is never charged")
 	require.Empty(t, store.apps[appID].ProrationInvoiceID)
+}
+
+// Regression (review 2026-07-06, H5): a creation-proration retry past Stripe's
+// ~24h idempotency-key window reconciles by the app's ms_charge_ref anchor —
+// a crashed attempt's finalized combined invoice is adopted (guard armed with
+// ITS id, timers marked against it) with no new Stripe objects.
+func TestChargeCreationProration_LateRetryAdoptsFoundInvoice(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 0)
+
+	// A prior attempt reached its Stripe section (marker set), finalized the
+	// invoice, and crashed before persisting.
+	app := store.apps[appID]
+	app.ProrationAttempted = true
+	store.apps[appID] = app
+	sc.findByRef = &billingstripe.Invoice{ID: "in_prior_combined", Status: "paid", AmountDue: 1000, AmountPaid: 1000, Currency: "usd"}
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Equal(t, "in_prior_combined", resp.ProrationInvoiceID)
+	require.Equal(t, "in_prior_combined", store.apps[appID].ProrationInvoiceID, "the guard arms with the recovered invoice")
+	require.Empty(t, sc.invoiceCalls, "no second draft")
+	require.Empty(t, sc.itemCalls, "no re-attached lines")
+	require.Empty(t, sc.finalizeCalls, "no second finalize — the money moved once")
 }
 
 // Regression (review 2026-07-06, H10): a PREPAID account is never auto-charged

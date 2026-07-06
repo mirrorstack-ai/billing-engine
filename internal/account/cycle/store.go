@@ -302,6 +302,23 @@ type Store interface {
 	// for an app — the app-deletion path. Idempotent (WHERE removed_at IS NULL).
 	SoftRemoveAllModuleTimersForApp(ctx context.Context, appID uuid.UUID, removedAt time.Time) error
 
+	// MarkModuleTimerChargeAttempted stamps the migration-036 recovery marker
+	// BEFORE a charge attempt's first Stripe call — first-write-wins, never
+	// cleared. A later retry seeing it set reconciles against Stripe (the
+	// ms_charge_ref anchor) before recomputing any live verdict or minting new
+	// Stripe objects.
+	MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) error
+
+	// ModuleTimerStillPending re-verifies, immediately before acting on a sweep
+	// candidate, that the timer is STILL live and unresolved — the work list is
+	// read once and can be minutes stale by the time a late candidate is
+	// processed (M2).
+	ModuleTimerStillPending(ctx context.Context, timerID uuid.UUID) (bool, error)
+
+	// MarkAppProrationAttempted stamps the migration-036 recovery marker for the
+	// creation-proration leg — first-write-wins, never cleared.
+	MarkAppProrationAttempted(ctx context.Context, appID uuid.UUID, at time.Time) error
+
 	// ReconcileModuleTimersToTarget brings an app's live install-timer set to
 	// exactly target, ATOMICALLY under a per-app advisory transaction lock
 	// (review 2026-07-06, H7): a grow inserts the deficit anchored at
@@ -367,6 +384,10 @@ type ModuleOverageCandidate struct {
 	InstalledAt    time.Time
 	GraceExpiresAt time.Time
 	ActivatedAt    time.Time
+	// ChargeAttemptedAt: a prior charge attempt reached its Stripe section
+	// (migration 036 recovery marker); zero = never attempted. A retried
+	// candidate reconciles against Stripe BEFORE recomputing any live verdict.
+	ChargeAttemptedAt time.Time
 }
 
 // AppModuleCount pairs one live roster app with its module_count snapshot —
@@ -412,6 +433,10 @@ type AppMirror struct {
 	CreatedAt          time.Time
 	ProrationInvoiceID string
 	ProrationSkipped   bool
+	// ProrationAttempted: a prior creation-proration charge attempt reached its
+	// Stripe section (migration 036 recovery marker) — a retry with this set and
+	// an unarmed guard reconciles against Stripe before minting new objects.
+	ProrationAttempted bool
 	Deleted            bool
 	DeletedAt          time.Time
 }
@@ -1068,6 +1093,7 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 		CreatedAt:          row.CreatedAt,
 		ProrationInvoiceID: row.ProrationInvoiceID.String, // "" when NULL (guard unarmed)
 		ProrationSkipped:   row.ProrationSkippedAt.Valid,
+		ProrationAttempted: row.ProrationAttemptedAt.Valid,
 		Deleted:            row.DeletedAt.Valid,
 		DeletedAt:          row.DeletedAt.Time,
 	}, true, nil
@@ -1139,6 +1165,7 @@ func (s *pgxStore) lockAndReadChargeableApp(ctx context.Context, appID uuid.UUID
 		ModuleCount:        int(row.ModuleCount),
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
+		ProrationAttempted: row.ProrationAttemptedAt.Valid,
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1368,6 +1395,28 @@ func (s *pgxStore) InsertModuleOverageTimers(ctx context.Context, accountID, app
 	})
 }
 
+func (s *pgxStore) MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) error {
+	return s.q.MarkModuleTimerChargeAttempted(ctx, db.MarkModuleTimerChargeAttemptedParams{
+		ID:                timerID.String(),
+		ChargeAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
+	})
+}
+
+func (s *pgxStore) ModuleTimerStillPending(ctx context.Context, timerID uuid.UUID) (bool, error) {
+	pending, err := s.q.ModuleTimerStillPending(ctx, timerID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // the row vanished — certainly not pending
+	}
+	return pending, err
+}
+
+func (s *pgxStore) MarkAppProrationAttempted(ctx context.Context, appID uuid.UUID, at time.Time) error {
+	return s.q.MarkAppProrationAttempted(ctx, db.MarkAppProrationAttemptedParams{
+		AppID:                appID.String(),
+		ProrationAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
+	})
+}
+
 // ReconcileModuleTimersToTarget — count + write in ONE transaction serialized
 // by a per-app advisory xact lock, so concurrent RegisterApp/SyncAppModules
 // retries can never both observe the same live count and double-insert (H7).
@@ -1453,14 +1502,18 @@ func (s *pgxStore) ModuleOverageTimersPastGrace(ctx context.Context, at time.Tim
 		if !r.ActivatedAt.Valid {
 			continue
 		}
-		out = append(out, ModuleOverageCandidate{
+		cand := ModuleOverageCandidate{
 			ID:             id,
 			AccountID:      acct,
 			AppID:          app,
 			InstalledAt:    r.InstalledAt,
 			GraceExpiresAt: r.GraceExpiresAt,
 			ActivatedAt:    r.ActivatedAt.Time,
-		})
+		}
+		if r.ChargeAttemptedAt.Valid {
+			cand.ChargeAttemptedAt = r.ChargeAttemptedAt.Time
+		}
+		out = append(out, cand)
 	}
 	return out, nil
 }

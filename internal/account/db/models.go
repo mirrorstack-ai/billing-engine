@@ -358,6 +358,8 @@ type MsBillingApp struct {
 	CreatedModuleCount int32 `json:"created_module_count"`
 	// Set once (never unset) when ChargeCreationProration determines the account only activated at/after this app's anchored creation period had already closed — a would-be retroactive catch-up charge (D1d). The app is permanently excluded from the proration sweep from then on.
 	ProrationSkippedAt pgtype.Timestamptz `json:"proration_skipped_at"`
+	// First instant a creation-proration charge attempt for this app reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set and an unarmed guard reconciles against Stripe (ms_charge_ref app-proration:<app_id>) before minting new Stripe objects.
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 }
 
 type MsBillingAppBaseSnapshot struct {
@@ -382,6 +384,8 @@ type MsBillingAppModuleOverageTimer struct {
 	GraceInvoiceID     pgtype.Text        `json:"grace_invoice_id"`
 	GraceInvoiceItemID pgtype.Text        `json:"grace_invoice_item_id"`
 	CreatedAt          time.Time          `json:"created_at"`
+	// First instant a Leg-1 (or combined-invoice) charge attempt for this timer reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set reconciles against Stripe (ms_charge_ref) before recomputing any live verdict.
+	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
 }
 
 type MsBillingBillingPeriod struct {

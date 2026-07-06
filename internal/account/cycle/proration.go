@@ -45,6 +45,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // ProrationStatus classifies one ChargeCreationProration outcome for the sweep's
@@ -243,30 +244,51 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		return &ProrationResult{AppID: appID, Status: ProrationStatusPeriodClosed}, nil
 	}
 
-	// COLLECTION-MODE gate (review 2026-07-06, H10): a prepaid account is never
-	// auto-charged off-session by ANY leg. Transient skip (guard unarmed), like
-	// no-PM — re-attempted once the account relaxes back to arrears.
-	if permitted, err := s.offSessionChargePermitted(ctx, app.AccountID); err != nil {
-		return nil, err
-	} else if !permitted {
-		return &ProrationResult{AppID: appID, Status: ProrationStatusPrepaid}, nil
-	}
-
-	// PM gate (D1d), same posture as the boundary spine: activated but no
-	// usable default PM is skipped and re-attempted next sweep (unlike the
-	// period-closed case above, "no PM right now" is not itself evidence the
-	// account was ever ineligible for this specific period, so it stays a
-	// transient, retried skip rather than a permanent one — see the judgment
-	// call noted in the PR description for the limits of this).
 	if s.stripe == nil {
 		return nil, billing.Internal("ChargeCreationProration requires a Stripe client", nil)
 	}
-	custID, ok, err := s.resolveChargeableCustomer(ctx, app.AccountID)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return &ProrationResult{AppID: appID, Status: ProrationStatusNoPM}, nil
+
+	// Gates — FIRST attempt only (the proration analogue of the boundary's H8
+	// rule): once a prior attempt reached its Stripe section
+	// (proration_attempted_at set), money may already have moved, and this
+	// call's job is to RECONCILE — a prepaid tighten or a removed PM after the
+	// crash must not strand the charge unmirrored behind a transient skip. The
+	// attempted path resolves only the Customer id (an idem/recovery replay
+	// needs no fresh authorization).
+	var custID string
+	if app.ProrationAttempted {
+		custID, err = s.store.AccountStripeCustomer(ctx, app.AccountID)
+		if err != nil {
+			return nil, billing.Internal("stripe customer lookup failed", err)
+		}
+		if custID == "" {
+			return nil, billing.Internal("app has an attempted proration charge but the account has no Stripe customer id", nil)
+		}
+	} else {
+		// COLLECTION-MODE gate (review 2026-07-06, H10): a prepaid account is
+		// never auto-charged off-session by ANY leg. Transient skip (guard
+		// unarmed), like no-PM — re-attempted once the account relaxes back to
+		// arrears.
+		if permitted, err := s.offSessionChargePermitted(ctx, app.AccountID); err != nil {
+			return nil, err
+		} else if !permitted {
+			return &ProrationResult{AppID: appID, Status: ProrationStatusPrepaid}, nil
+		}
+
+		// PM gate (D1d), same posture as the boundary spine: activated but no
+		// usable default PM is skipped and re-attempted next sweep (unlike the
+		// period-closed case above, "no PM right now" is not itself evidence the
+		// account was ever ineligible for this specific period, so it stays a
+		// transient, retried skip rather than a permanent one — see the judgment
+		// call noted in the PR description for the limits of this).
+		var ok bool
+		custID, ok, err = s.resolveChargeableCustomer(ctx, app.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return &ProrationResult{AppID: appID, Status: ProrationStatusNoPM}, nil
+		}
 	}
 
 	// The charge callback runs AFTER the row lock is released (ChargeProrationLocked,
@@ -310,22 +332,6 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, nil // rounds to 0 cents → nothing to invoice (guard stays unarmed)
 		}
 
-		// Draft→pinned-items→finalize (C2): the empty draft is created FIRST so
-		// the base line and every co-created overage line are pinned to THIS
-		// invoice explicitly — never floating customer-level pending items that a
-		// concurrently-finalizing leg's invoice could sweep up (or that a crash
-		// here would leak onto the account's next unrelated invoice). Only the
-		// finalize step at the end moves money.
-		draft, err := s.stripe.CreateDraftInvoice(ctx, custID, "app-proration:"+locked.AppID.String(), appProrationInvoiceIdemKey(locked.AppID))
-		if err != nil {
-			return nil, billing.StripeError("proration draft invoice failed", err)
-		}
-
-		desc := fmt.Sprintf("MirrorStack app base fee (prorated) — app %s", locked.AppID)
-		if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
-			return nil, billing.StripeError("proration invoice item failed", err)
-		}
-
 		// Scenario 3 — the combined creation invoice. Modules co-created with the
 		// app (install date == created_at) that are "over" per the live FIFO have
 		// their OWN grace elapse at this SAME instant (same GraceDays anchor), so
@@ -352,29 +358,109 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		if err != nil {
 			return nil, billing.Internal("overage micros to cents conversion failed", err)
 		}
-		var timerCharges []ModuleTimerCharge
-		var overageTotalMicros int64
+		expectedTotalCents := c
 		if overageCents > 0 {
-			overDesc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", locked.AppID)
-			for _, timerID := range overTimers {
-				item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, overageCents, chargeCurrency, overDesc, moduleOverageItemIdemKey(timerID))
-				if err != nil {
-					return nil, billing.StripeError("combined module overage invoice item failed", err)
+			expectedTotalCents += overageCents * int64(len(overTimers))
+		}
+
+		// CRASH RECOVERY (review 2026-07-06, H5): a set proration_attempted_at
+		// marker means a prior attempt reached its Stripe section — reconcile by
+		// the ms_charge_ref anchor before minting anything. Past Stripe's ~24h
+		// idempotency-key window a bare key replay would create a SECOND draft +
+		// items + charge. A finalized invoice found → the money moved; adopt it.
+		// An inert draft found → complete THAT draft below instead of creating one.
+		var inv billingstripe.Invoice
+		var draft billingstripe.Invoice
+		var recoveredFinal bool
+		if locked.ProrationAttempted {
+			if found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, appProrationChargeRef(locked.AppID)); err != nil {
+				return nil, billing.StripeError("proration recovery lookup failed", err)
+			} else if ok {
+				if found.Status == "draft" {
+					draft = found
+				} else {
+					inv = found
+					recoveredFinal = true
 				}
-				timerCharges = append(timerCharges, ModuleTimerCharge{
-					TimerID:       timerID,
-					ChargedAt:     s.nowFn().UTC(),
-					InvoiceID:     draft.ID,
-					InvoiceItemID: item.ID,
-				})
-				overageTotalMicros += overageMicros
 			}
 		}
 
-		inv, err := s.stripe.FinalizeInvoice(ctx, draft.ID, appProrationFinalizeIdemKey(locked.AppID))
-		if err != nil {
-			return nil, billing.StripeError("proration invoice finalize failed", err)
+		var timerCharges []ModuleTimerCharge
+		if !recoveredFinal {
+			// Draft→pinned-items→finalize (C2): the empty draft is created FIRST so
+			// the base line and every co-created overage line are pinned to THIS
+			// invoice explicitly — never floating customer-level pending items that a
+			// concurrently-finalizing leg's invoice could sweep up (or that a crash
+			// here would leak onto the account's next unrelated invoice). Only the
+			// finalize step at the end moves money. The migration-036 attempt marker
+			// is stamped BEFORE the first Stripe call (first-write-wins).
+			if draft.ID == "" {
+				if err := s.store.MarkAppProrationAttempted(ctx, locked.AppID, s.nowFn().UTC()); err != nil {
+					return nil, billing.Internal("mark proration attempted failed", err)
+				}
+				draft, err = s.stripe.CreateDraftInvoice(ctx, custID, appProrationChargeRef(locked.AppID), appProrationInvoiceIdemKey(locked.AppID))
+				if err != nil {
+					return nil, billing.StripeError("proration draft invoice failed", err)
+				}
+			}
+
+			// Attach the lines — unless a recovered draft already carries them all
+			// (AmountDue == the deterministic total). A partially-lined draft (some
+			// items landed before the crash, keys since pruned) cannot be completed
+			// safely — refuse loudly for ops rather than risk duplicate lines.
+			switch draft.AmountDue {
+			case expectedTotalCents:
+				// every line already attached — collect the marks with the known
+				// invoice id (item ids unrecoverable from the search projection)
+				if overageCents > 0 {
+					for _, timerID := range overTimers {
+						timerCharges = append(timerCharges, ModuleTimerCharge{
+							TimerID: timerID, ChargedAt: s.nowFn().UTC(), InvoiceID: draft.ID,
+						})
+					}
+				}
+			case 0:
+				desc := fmt.Sprintf("MirrorStack app base fee (prorated) — app %s", locked.AppID)
+				if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
+					return nil, billing.StripeError("proration invoice item failed", err)
+				}
+				if overageCents > 0 {
+					overDesc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", locked.AppID)
+					for _, timerID := range overTimers {
+						item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, overageCents, chargeCurrency, overDesc, moduleOverageItemIdemKey(timerID))
+						if err != nil {
+							return nil, billing.StripeError("combined module overage invoice item failed", err)
+						}
+						timerCharges = append(timerCharges, ModuleTimerCharge{
+							TimerID:       timerID,
+							ChargedAt:     s.nowFn().UTC(),
+							InvoiceID:     draft.ID,
+							InvoiceItemID: item.ID,
+						})
+					}
+				}
+			default:
+				return nil, billing.Internal(fmt.Sprintf(
+					"proration recovery: draft %s carries %d cents but the deterministic total is %d — refusing to finalize a mismatched combined draft (app %s)",
+					draft.ID, draft.AmountDue, expectedTotalCents, locked.AppID), nil)
+			}
+
+			inv, err = s.stripe.FinalizeInvoice(ctx, draft.ID, appProrationFinalizeIdemKey(locked.AppID))
+			if err != nil {
+				return nil, billing.StripeError("proration invoice finalize failed", err)
+			}
+		} else {
+			// Recovered a finalized invoice: rebuild the co-created timer marks
+			// against it (item ids unrecoverable from the search projection).
+			if overageCents > 0 {
+				for _, timerID := range overTimers {
+					timerCharges = append(timerCharges, ModuleTimerCharge{
+						TimerID: timerID, ChargedAt: s.nowFn().UTC(), InvoiceID: inv.ID,
+					})
+				}
+			}
 		}
+		overageTotalMicros := overageMicros * int64(len(timerCharges))
 
 		// Resolve the account's large-charge disclosure threshold AT CHARGE TIME,
 		// immediately AFTER the Stripe calls above succeeded — the SAME point (via
@@ -513,3 +599,7 @@ func (s *Service) SweepCreationProrations(ctx context.Context, at time.Time) (*S
 func appProrationItemIdemKey(appID uuid.UUID) string     { return "app-ii-" + appID.String() }
 func appProrationInvoiceIdemKey(appID uuid.UUID) string  { return "app-inv-" + appID.String() }
 func appProrationFinalizeIdemKey(appID uuid.UUID) string { return "app-fin-" + appID.String() }
+
+// appProrationChargeRef is the deterministic ms_charge_ref metadata anchor for
+// one app's combined creation invoice — what FindInvoiceByRef recovers by.
+func appProrationChargeRef(appID uuid.UUID) string { return "app-proration:" + appID.String() }

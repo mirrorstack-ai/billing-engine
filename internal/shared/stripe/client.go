@@ -2,6 +2,7 @@ package stripe
 
 import (
 	"context"
+	"fmt"
 
 	stripego "github.com/stripe/stripe-go/v85"
 	stripeclient "github.com/stripe/stripe-go/v85/client"
@@ -185,6 +186,29 @@ func (c *realClient) FinalizeInvoice(ctx context.Context, invoiceID, idemKey str
 		return Invoice{}, err
 	}
 	return projectInvoice(inv), nil
+}
+
+// FindInvoiceByRef searches the Customer's invoices for the ms_charge_ref
+// metadata anchor — the crash-recovery read for retries past Stripe's ~24h
+// idempotency-key window (see the interface comment). Uses the Stripe Search
+// API; at most one invoice can carry a given ref (the ref is the deterministic
+// charge identity and the draft that carries it is created under an idem key).
+func (c *realClient) FindInvoiceByRef(ctx context.Context, custID, ref string) (Invoice, bool, error) {
+	params := &stripego.InvoiceSearchParams{
+		SearchParams: stripego.SearchParams{
+			Query:   fmt.Sprintf(`customer:"%s" AND metadata["ms_charge_ref"]:"%s"`, custID, ref),
+			Limit:   stripego.Int64(1),
+			Context: ctx,
+		},
+	}
+	it := c.sc.Invoices.Search(params)
+	if it.Next() {
+		return projectInvoice(it.Invoice()), true, nil
+	}
+	if err := it.Err(); err != nil {
+		return Invoice{}, false, err
+	}
+	return Invoice{}, false, nil
 }
 
 // projectInvoice maps a stripe-go invoice to the trust-boundary-edge Invoice

@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // seedTimer inserts one live, unresolved install timer directly into the fake
@@ -246,6 +247,131 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 		require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd,
 			"no straddle → coverage ends at the install period's end")
 	}
+}
+
+// Regression (review 2026-07-06, H9): a crash between the Stripe charge and
+// MarkModuleTimerCharged, followed by an earlier module's removal, used to let
+// the retry recompute the timer's rank as "included" and resolve it uncharged —
+// real money moved with no invoice mirror, no disclosure, no mark. With the
+// migration-036 attempt marker the retry reconciles against Stripe FIRST: the
+// finalized invoice is found by its ms_charge_ref, mirrored, and marked, and
+// the (now-improved) live rank never gets to orphan it.
+func TestModuleOverage_RetryAfterCrashRecoversChargeEvenWhenRankFlipped(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	x := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	// Attempt 1 reached the Stripe section (marker set), charged, and crashed
+	// before the mark. Its finalized invoice sits on Stripe under the ref.
+	store.timers[x].chargeAttemptedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
+	sc.findByRef = &billingstripe.Invoice{ID: "in_crashed", Status: "paid", AmountDue: 240, AmountPaid: 240, Currency: "usd"}
+
+	// Between crash and retry an EARLIER module is removed — x's live rank
+	// improves to 4 ("included").
+	for id, tm := range store.timers {
+		if tm.installedAt.Equal(time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)) {
+			store.timers[id].removed = true
+			store.timers[id].removedAt = time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+			break
+		}
+	}
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged, "the moved money is recovered, not orphaned by the rank flip")
+	require.True(t, store.timers[x].graceCharged)
+	require.Equal(t, "in_crashed", store.timers[x].graceInvoiceID)
+	inv, ok := store.invoices["in_crashed"]
+	require.True(t, ok, "the crashed attempt's invoice is mirrored")
+	require.EqualValues(t, 240, inv.AmountDueCents)
+	// H5: no NEW Stripe objects were minted on recovery.
+	require.Empty(t, sc.invoiceCalls, "no second draft")
+	require.Empty(t, sc.finalizeCalls, "no second finalize")
+}
+
+// H5, the draft-completion arm: the crashed attempt created its draft but died
+// before attaching the line / finalizing. The retry completes THAT draft (the
+// deterministic line attached to the FOUND invoice id, then finalized) instead
+// of minting a second one — safe even after Stripe pruned the idem keys.
+func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	x := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	store.timers[x].chargeAttemptedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
+	sc.findByRef = &billingstripe.Invoice{ID: "in_orphan_draft", Status: "draft", AmountDue: 0, Currency: "usd"}
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged)
+	require.Empty(t, sc.invoiceCalls, "the found draft is completed — never a second CreateDraftInvoice")
+	require.Len(t, sc.itemCalls, 1)
+	require.Equal(t, "in_orphan_draft", sc.itemCalls[0].invoiceID, "the line lands on the crashed attempt's own draft")
+	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg)
+	require.Len(t, sc.finalizeCalls, 1)
+	require.Equal(t, "in_orphan_draft", sc.finalizeCalls[0].invoiceID)
+	require.True(t, store.timers[x].graceCharged)
+}
+
+// The recovery no-op arm: the marker is set but Stripe has NOTHING under the
+// ref — the crashed attempt never created its invoice. The retry charges fresh.
+func TestModuleOverage_AttemptedButNothingOnStripeChargesFresh(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	x := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	store.timers[x].chargeAttemptedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
+	// sc.findByRef stays nil — not found.
+
+	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged)
+	require.NotEmpty(t, sc.findByRefCalls, "the recovery lookup ran")
+	require.Len(t, sc.invoiceCalls, 1, "nothing to recover → fresh draft→item→finalize")
+	require.Len(t, sc.finalizeCalls, 1)
+	require.True(t, store.timers[x].graceCharged)
+}
+
+// Regression (review 2026-07-06, M2): a candidate that went stale between the
+// work-list read and its turn — removed, or resolved by a concurrent sweep —
+// is re-verified at charge time and never charged.
+func TestModuleOverage_StaleCandidateNotCharged(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	x := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+
+	// The candidate as the work list saw it...
+	cand := cycle.ModuleOverageCandidate{
+		ID: x, AccountID: acct, AppID: store.timers[x].appID,
+		InstalledAt: store.timers[x].installedAt, GraceExpiresAt: store.timers[x].graceExpiresAt,
+		ActivatedAt: time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC),
+	}
+	// ...then the module is uninstalled before its turn in the batch.
+	store.timers[x].removed = true
+	store.timers[x].removedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
+
+	res, err := svc.ChargeModuleOverage(ctx, cand, time.Date(2026, 6, 14, 1, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, cycle.ModuleOverageSkippedStale, res.Status)
+	require.Empty(t, sc.invoiceCalls, "a stale candidate never reaches Stripe")
+	require.False(t, store.timers[x].graceCharged)
 }
 
 // Regression (review 2026-07-06, H10): a PREPAID account is never auto-charged

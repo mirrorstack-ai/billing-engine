@@ -35,9 +35,15 @@ type fakeStripe struct {
 	invoiceAmountPaid int64
 
 	// injected errors
-	errItem    error
-	errDraft   error
-	errInvoice error // injected on FinalizeInvoice — the money-moving step
+	errItem      error
+	errDraft     error
+	errInvoice   error // injected on FinalizeInvoice — the money-moving step
+	errFindByRef error
+
+	// crash-recovery lookup (FindInvoiceByRef): the invoice "found" on Stripe
+	// under any ref, and the refs queried.
+	findByRef      *billingstripe.Invoice
+	findByRefCalls []string
 	// onCreateInvoice, when set, runs INSIDE FinalizeInvoice right before it
 	// returns success — modeling a concurrent account mutation (e.g. a
 	// threshold edit) that lands while the real Stripe HTTP call is in
@@ -89,6 +95,20 @@ func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID stri
 		return billingstripe.InvoiceItem{}, f.errItem
 	}
 	return billingstripe.InvoiceItem{ID: "ii_test_" + uuid.NewString()}, nil
+}
+
+// findByRef, when set, is what FindInvoiceByRef returns — models the crash-
+// recovery lookup finding a crashed attempt's invoice on Stripe. nil = not
+// found (the default: nothing ever reached Stripe under the ref).
+func (f *fakeStripe) FindInvoiceByRef(_ context.Context, _, ref string) (billingstripe.Invoice, bool, error) {
+	f.findByRefCalls = append(f.findByRefCalls, ref)
+	if f.errFindByRef != nil {
+		return billingstripe.Invoice{}, false, f.errFindByRef
+	}
+	if f.findByRef != nil {
+		return *f.findByRef, true, nil
+	}
+	return billingstripe.Invoice{}, false, nil
 }
 
 func (f *fakeStripe) FinalizeInvoice(_ context.Context, invoiceID, idemKey string) (billingstripe.Invoice, error) {
@@ -344,6 +364,39 @@ func TestRunBillingCycle_LostFreezeRaceAdoptsWinnersAmount(t *testing.T) {
 		"the loser of the freeze race must charge the winner's frozen amount, never its own")
 	require.Len(t, sc.itemCalls, 1)
 	require.EqualValues(t, 4700, sc.itemCalls[0].amountCfg)
+}
+
+// Regression (review 2026-07-06, H5): a frozen reclaim past Stripe's ~24h
+// idempotency-key window can no longer trust key replay — a bare re-send would
+// mint a SECOND draft+item+charge. The reclaim now reconciles by the run's
+// ms_charge_ref anchor first: the crashed attempt's finalized invoice is
+// adopted (mirrored + marked) with NO new Stripe objects.
+func TestRunBillingCycle_LateReclaimAdoptsFoundInvoiceWithoutNewObjects(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_h5"
+
+	sc := newFakeStripe()
+
+	// FIRST attempt charges $1, crash before mark (frozen marker durable).
+	store.errMarkRun = errors.New("crash before mark")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	drafts, finalizes := len(sc.invoiceCalls), len(sc.finalizeCalls)
+
+	// The reclaim lands DAYS later — keys pruned — but the crashed attempt's
+	// invoice is findable under run:<id>.
+	sc.findByRef = &billingstripe.Invoice{ID: "in_prior_boundary", Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"}
+	store.errMarkRun = nil
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Len(t, sc.invoiceCalls, drafts, "no second draft on a recovered reclaim")
+	require.Len(t, sc.finalizeCalls, finalizes, "no second finalize — the money moved once")
+	_, mirrored := store.invoices["in_prior_boundary"]
+	require.True(t, mirrored, "the crashed attempt's invoice is mirrored")
 }
 
 func TestRunBillingCycle_CentsRoundHalfUp(t *testing.T) {

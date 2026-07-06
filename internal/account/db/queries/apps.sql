@@ -23,7 +23,7 @@ ON CONFLICT (app_id) DO NOTHING;
 -- GetAppBill still displays the spent creation-period base).
 -- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at,
-       proration_invoice_id, proration_skipped_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1;
 
@@ -37,7 +37,7 @@ WHERE app_id = $1;
 -- read, never for the duration of a Stripe HTTP call.
 -- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at,
-       proration_invoice_id, proration_skipped_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE;
@@ -84,6 +84,15 @@ SET proration_skipped_at = now()
 WHERE app_id = $1
   AND proration_skipped_at IS NULL
   AND proration_invoice_id IS NULL;
+
+-- MarkAppProrationAttempted stamps the recovery marker (036) BEFORE a
+-- creation-proration charge attempt's first Stripe call. First-write-wins
+-- (the FIRST attempt instant is the durable one); never cleared.
+-- name: MarkAppProrationAttempted :exec
+UPDATE ms_billing.apps
+SET proration_attempted_at = $2
+WHERE app_id = $1
+  AND proration_attempted_at IS NULL;
 
 -- SetAppModuleCount snapshots a new installed-module count (SyncAppModules).
 -- WHERE deleted_at IS NULL makes a count update on a deleted app a no-op

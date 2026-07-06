@@ -211,6 +211,26 @@ func (q *Queries) MarkAppDeleted(ctx context.Context, appID string) (int64, erro
 	return result.RowsAffected(), nil
 }
 
+const markAppProrationAttempted = `-- name: MarkAppProrationAttempted :exec
+UPDATE ms_billing.apps
+SET proration_attempted_at = $2
+WHERE app_id = $1
+  AND proration_attempted_at IS NULL
+`
+
+type MarkAppProrationAttemptedParams struct {
+	AppID                string             `json:"app_id"`
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
+}
+
+// MarkAppProrationAttempted stamps the recovery marker (036) BEFORE a
+// creation-proration charge attempt's first Stripe call. First-write-wins
+// (the FIRST attempt instant is the durable one); never cleared.
+func (q *Queries) MarkAppProrationAttempted(ctx context.Context, arg MarkAppProrationAttemptedParams) error {
+	_, err := q.db.Exec(ctx, markAppProrationAttempted, arg.AppID, arg.ProrationAttemptedAt)
+	return err
+}
+
 const mirroredAppIDsOverlappingWindow = `-- name: MirroredAppIDsOverlappingWindow :many
 SELECT app_id
 FROM ms_billing.apps
@@ -293,20 +313,21 @@ func (q *Queries) SelectAppBaseSnapshot(ctx context.Context, arg SelectAppBaseSn
 
 const selectAppMirror = `-- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at,
-       proration_invoice_id, proration_skipped_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
 `
 
 type SelectAppMirrorRow struct {
-	AppID              string             `json:"app_id"`
-	AccountID          string             `json:"account_id"`
-	ModuleCount        int32              `json:"module_count"`
-	CreatedModuleCount int32              `json:"created_module_count"`
-	CreatedAt          time.Time          `json:"created_at"`
-	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
-	ProrationSkippedAt pgtype.Timestamptz `json:"proration_skipped_at"`
-	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
+	AppID                string             `json:"app_id"`
+	AccountID            string             `json:"account_id"`
+	ModuleCount          int32              `json:"module_count"`
+	CreatedModuleCount   int32              `json:"created_module_count"`
+	CreatedAt            time.Time          `json:"created_at"`
+	ProrationInvoiceID   pgtype.Text        `json:"proration_invoice_id"`
+	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 }
 
 // SelectAppMirror reads one roster row (deleted or not — the caller decides
@@ -323,6 +344,7 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 		&i.CreatedAt,
 		&i.ProrationInvoiceID,
 		&i.ProrationSkippedAt,
+		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
 	)
 	return i, err
@@ -330,21 +352,22 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 
 const selectAppMirrorForUpdate = `-- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at,
-       proration_invoice_id, proration_skipped_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE
 `
 
 type SelectAppMirrorForUpdateRow struct {
-	AppID              string             `json:"app_id"`
-	AccountID          string             `json:"account_id"`
-	ModuleCount        int32              `json:"module_count"`
-	CreatedModuleCount int32              `json:"created_module_count"`
-	CreatedAt          time.Time          `json:"created_at"`
-	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
-	ProrationSkippedAt pgtype.Timestamptz `json:"proration_skipped_at"`
-	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
+	AppID                string             `json:"app_id"`
+	AccountID            string             `json:"account_id"`
+	ModuleCount          int32              `json:"module_count"`
+	CreatedModuleCount   int32              `json:"created_module_count"`
+	CreatedAt            time.Time          `json:"created_at"`
+	ProrationInvoiceID   pgtype.Text        `json:"proration_invoice_id"`
+	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 }
 
 // SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
@@ -366,6 +389,7 @@ func (q *Queries) SelectAppMirrorForUpdate(ctx context.Context, appID string) (S
 		&i.CreatedAt,
 		&i.ProrationInvoiceID,
 		&i.ProrationSkippedAt,
+		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
 	)
 	return i, err

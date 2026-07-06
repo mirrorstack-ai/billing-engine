@@ -155,6 +155,7 @@ type fakeTimer struct {
 	graceChargedAt     time.Time
 	graceInvoiceID     string
 	graceInvoiceItemID string
+	chargeAttemptedAt  time.Time // migration-036 recovery marker
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -762,12 +763,13 @@ func (f *fakeStore) ModuleOverageTimersPastGrace(_ context.Context, at time.Time
 			continue // activated_at IS NOT NULL gate
 		}
 		out = append(out, cycle.ModuleOverageCandidate{
-			ID:             t.id,
-			AccountID:      t.accountID,
-			AppID:          t.appID,
-			InstalledAt:    t.installedAt,
-			GraceExpiresAt: t.graceExpiresAt,
-			ActivatedAt:    activatedAt,
+			ID:                t.id,
+			AccountID:         t.accountID,
+			AppID:             t.appID,
+			InstalledAt:       t.installedAt,
+			GraceExpiresAt:    t.graceExpiresAt,
+			ChargeAttemptedAt: t.chargeAttemptedAt,
+			ActivatedAt:       activatedAt,
 		})
 	}
 	// Ordered (installed_at, id) like the query, so the sweep charges oldest-first
@@ -796,6 +798,29 @@ func (f *fakeStore) LiveModuleTimerRankBefore(_ context.Context, accountID, time
 		}
 	}
 	return rank, nil
+}
+
+func (f *fakeStore) MarkModuleTimerChargeAttempted(_ context.Context, timerID uuid.UUID, at time.Time) error {
+	if t, ok := f.timers[timerID]; ok && t.chargeAttemptedAt.IsZero() {
+		t.chargeAttemptedAt = at // first-write-wins, mirroring the SQL
+	}
+	return nil
+}
+
+func (f *fakeStore) ModuleTimerStillPending(_ context.Context, timerID uuid.UUID) (bool, error) {
+	t, ok := f.timers[timerID]
+	if !ok {
+		return false, nil
+	}
+	return !t.removed && !t.graceResolved, nil
+}
+
+func (f *fakeStore) MarkAppProrationAttempted(_ context.Context, appID uuid.UUID, _ time.Time) error {
+	if app, ok := f.apps[appID]; ok && !app.ProrationAttempted {
+		app.ProrationAttempted = true // first-write-wins
+		f.apps[appID] = app
+	}
+	return nil
 }
 
 func (f *fakeStore) MarkModuleTimerIncluded(_ context.Context, timerID uuid.UUID) error {

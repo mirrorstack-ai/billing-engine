@@ -390,9 +390,14 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 	summary.ChargedCents = cents
 
-	// Charge. A failure after the PM gate marks the run 'failed' (auditable) and
-	// returns the error.
-	inv, err := s.charge(ctx, runID, custID, cents, withBase)
+	// Charge — or, on a frozen reclaim, RECONCILE against Stripe first (H5): the
+	// frozen marker means a prior attempt reached its Stripe section, and past
+	// the ~24h idempotency-key window a bare "replay" would mint brand-new
+	// objects and double-charge. boundaryInvoice looks the run's invoice up by
+	// its ms_charge_ref anchor and finishes whatever it finds; only when Stripe
+	// has nothing does it charge fresh. A failure after the PM gate marks the
+	// run 'failed' (auditable) and returns the error.
+	inv, err := s.boundaryInvoice(ctx, runID, custID, cents, withBase, hasFrozen)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is
@@ -490,18 +495,62 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 // text. Returns the finalized invoice projection (id/status/amounts) for the
 // mirror upsert.
 func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool) (billingstripe.Invoice, error) {
-	desc := fmt.Sprintf("MirrorStack usage — run %s", runID)
-	if withBase {
-		desc = fmt.Sprintf("MirrorStack usage + app base fees — run %s", runID)
-	}
-	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, "run:"+runID.String(), invoiceIdemKey(runID))
+	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, boundaryChargeRef(runID), invoiceIdemKey(runID))
 	if err != nil {
 		return billingstripe.Invoice{}, err
 	}
-	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, invoiceItemIdemKey(runID)); err != nil {
+	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), invoiceItemIdemKey(runID)); err != nil {
 		return billingstripe.Invoice{}, err
 	}
 	return s.stripe.FinalizeInvoice(ctx, draft.ID, invoiceFinalizeIdemKey(runID))
+}
+
+// boundaryInvoice resolves the boundary run's Stripe invoice. reconcile=true
+// (a frozen reclaim — a prior attempt reached its Stripe section) looks the
+// invoice up by the run's ms_charge_ref anchor first (H5 — idem keys are
+// pruned by Stripe after ~24h, so key replay alone cannot be trusted on a
+// late reclaim): a finalized invoice is returned as-is (money already moved);
+// an inert draft is completed — the deterministic line attached if it never
+// landed, then finalized; a mismatched draft is refused loudly. Only when
+// Stripe has nothing under the ref (the crashed attempt never created its
+// invoice) — or on a fresh run — does it charge through s.charge.
+func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase, reconcile bool) (billingstripe.Invoice, error) {
+	if reconcile {
+		found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, boundaryChargeRef(runID))
+		if err != nil {
+			return billingstripe.Invoice{}, err
+		}
+		if ok {
+			if found.Status != "draft" {
+				return found, nil // already finalized — the money moved; just mirror it
+			}
+			switch found.AmountDue {
+			case 0:
+				if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), invoiceItemIdemKey(runID)); err != nil {
+					return billingstripe.Invoice{}, err
+				}
+			case cents:
+				// line already attached — nothing to add
+			default:
+				return billingstripe.Invoice{}, fmt.Errorf(
+					"boundary recovery: draft %s carries %d cents but the frozen amount is %d — refusing to finalize a mismatched draft (run %s)",
+					found.ID, found.AmountDue, cents, runID)
+			}
+			return s.stripe.FinalizeInvoice(ctx, found.ID, invoiceFinalizeIdemKey(runID))
+		}
+	}
+	return s.charge(ctx, runID, custID, cents, withBase)
+}
+
+// boundaryChargeRef is the deterministic ms_charge_ref metadata anchor for one
+// boundary run's invoice — what FindInvoiceByRef recovers by.
+func boundaryChargeRef(runID uuid.UUID) string { return "run:" + runID.String() }
+
+func boundaryChargeDesc(runID uuid.UUID, withBase bool) string {
+	if withBase {
+		return fmt.Sprintf("MirrorStack usage + app base fees — run %s", runID)
+	}
+	return fmt.Sprintf("MirrorStack usage — run %s", runID)
 }
 
 // AccountsWithUsageEvents returns the accounts with raw usage_events in the
