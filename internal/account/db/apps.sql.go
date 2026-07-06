@@ -16,6 +16,7 @@ const appsPendingProration = `-- name: AppsPendingProration :many
 SELECT app_id
 FROM ms_billing.apps
 WHERE created_at <= $1::timestamptz
+  AND account_id IS NOT NULL
   AND proration_invoice_id IS NULL
   AND (deleted_at IS NULL
        OR deleted_at >= created_at + make_interval(hours => $2::int))
@@ -40,6 +41,8 @@ type AppsPendingProrationParams struct {
 // HOURS (D5 — session-TZ/DST safety). proration_skipped_at IS NULL excludes
 // apps permanently skipped as a would-be retroactive catch-up (migration 031,
 // D1d). Ordered by created_at so the oldest pending app charges first.
+// account_id IS NOT NULL excludes UNBILLED org roster rows (migration 041) —
+// an org app enters this sweep only once RepointOrgUsage attaches it.
 func (q *Queries) AppsPendingProration(ctx context.Context, arg AppsPendingProrationParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, appsPendingProration, arg.CreatedBefore, arg.GraceHours)
 	if err != nil {
@@ -97,17 +100,18 @@ func (q *Queries) InsertAdvanceBaseSnapshot(ctx context.Context, arg InsertAdvan
 
 const insertAppMirror = `-- name: InsertAppMirror :execrows
 
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name)
-VALUES ($1, $2, $3, $3, $4, $5)
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id)
+VALUES ($1, $2, $3, $3, $4, $5, $6)
 ON CONFLICT (app_id) DO NOTHING
 `
 
 type InsertAppMirrorParams struct {
 	AppID       string      `json:"app_id"`
-	AccountID   string      `json:"account_id"`
+	AccountID   pgtype.UUID `json:"account_id"`
 	ModuleCount int32       `json:"module_count"`
 	CreatedAt   time.Time   `json:"created_at"`
 	Name        pgtype.Text `json:"name"`
+	OwnerOrgID  pgtype.UUID `json:"owner_org_id"`
 }
 
 // Queries backing the ms_billing.apps mirror (migration 027) — the base-fee
@@ -126,7 +130,11 @@ type InsertAppMirrorParams struct {
 // though both are success.
 // name ($5) is frozen from the FIRST registration like created_at /
 // module_count (ON CONFLICT DO NOTHING keeps the first value across retries);
-// SyncAppModules updates it while the app is live (SetAppName).
+// SyncAppModules updates it while the app is live (SetAppName). account_id
+// ($2) is NULL for an org-owned app whose org has not designated funding yet
+// (an UNBILLED roster row, migration 041); owner_org_id ($6) is stamped on
+// every org-owned registration — funded or not — so the RepointOrgUsage sweep
+// can scope the org's NULL-account events through the roster.
 func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertAppMirror,
 		arg.AppID,
@@ -134,6 +142,7 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 		arg.ModuleCount,
 		arg.CreatedAt,
 		arg.Name,
+		arg.OwnerOrgID,
 	)
 	if err != nil {
 		return 0, err
@@ -338,7 +347,7 @@ WHERE app_id = $1
 
 type SelectAppMirrorRow struct {
 	AppID                string             `json:"app_id"`
-	AccountID            string             `json:"account_id"`
+	AccountID            pgtype.UUID        `json:"account_id"`
 	ModuleCount          int32              `json:"module_count"`
 	CreatedModuleCount   int32              `json:"created_module_count"`
 	CreatedAt            time.Time          `json:"created_at"`
@@ -380,7 +389,7 @@ FOR UPDATE
 
 type SelectAppMirrorForUpdateRow struct {
 	AppID                string             `json:"app_id"`
-	AccountID            string             `json:"account_id"`
+	AccountID            pgtype.UUID        `json:"account_id"`
 	ModuleCount          int32              `json:"module_count"`
 	CreatedModuleCount   int32              `json:"created_module_count"`
 	CreatedAt            time.Time          `json:"created_at"`

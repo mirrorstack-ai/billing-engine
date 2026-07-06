@@ -444,7 +444,7 @@ func (s *Service) SweepModuleOverage(ctx context.Context, at time.Time) (*SweepM
 // blocked by a PM removed after the crash (an idem/finalize failure lands in
 // the sweep's retried-error path instead).
 func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOverageCandidate, at time.Time, res *ModuleOverageResult) (bool, error) {
-	custID, err := s.store.AccountStripeCustomer(ctx, cand.AccountID)
+	custID, err := s.recoveryCustomer(ctx, cand.AccountID)
 	if err != nil {
 		return false, billing.Internal("stripe customer lookup failed (module overage recovery)", err)
 	}

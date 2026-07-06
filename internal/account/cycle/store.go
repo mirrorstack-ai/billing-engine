@@ -201,8 +201,79 @@ type Store interface {
 	// InsertAppMirror registers a ms_billing.apps roster row idempotently
 	// (ON CONFLICT (app_id) DO NOTHING — a retry never rewrites the original
 	// created_at / module_count / name, which anchor the proration + freeze the
-	// display name). name "" writes NULL.
-	InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time, name string) error
+	// display name). name "" writes NULL. accountID uuid.Nil registers an
+	// UNBILLED org roster row (NULL account, migration 041); ownerOrgID is the
+	// org principal for org-owned apps (uuid.Nil = user-owned).
+	InsertAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount int, createdAt time.Time, name string) error
+
+	// EnsureOrgAccount resolves the org's billing account, creating the row if
+	// none exists yet — the org twin of EnsureAccountForUser (advisory-locked
+	// get-or-create, namespace 'lbto'). No Stripe Customer is created here.
+	EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, error)
+
+	// AccountIDByUser resolves a user's EXISTING billing account (Nil, false
+	// when none). The sponsor-designation lookup: a sponsor must already have
+	// an account with a usable default PM — designation never creates one.
+	AccountIDByUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, bool, error)
+
+	// OrgAccountID resolves the org's EXISTING account row (Nil, false when
+	// none), regardless of designation or activation — the read behind
+	// GetOrgDesignation's account echo.
+	OrgAccountID(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
+
+	// OrgDesignation reads the org's funding designation row. found=false →
+	// the org never designated (unbilled).
+	OrgDesignation(ctx context.Context, orgID uuid.UUID) (OrgDesignation, bool, error)
+
+	// UpsertOrgDesignation writes the org's funding choice; a re-designation
+	// overwrites in place (funding switches change only which instrument
+	// future invoice finalization charges — attribution never moves, D1).
+	UpsertOrgDesignation(ctx context.Context, d OrgDesignation) error
+
+	// DeleteOrgDesignation is the sponsor self-revoke: the org drops back to
+	// unbilled until re-designation. deleted=false when no row existed
+	// (idempotent revoke).
+	DeleteOrgDesignation(ctx context.Context, orgID uuid.UUID) (bool, error)
+
+	// ResolveOrgFundedAccount is THE org account resolution (ingest, reads,
+	// RegisterApp): the org's own account, gated on a designation row existing
+	// AND the account being activated — "the pointer never flips to an
+	// unfunded account" (D1). found=false → the org is unbilled.
+	ResolveOrgFundedAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
+
+	// ActivateAccountIfUnset stamps the ADR-0006 activation anchor when the
+	// org account activates by SPONSOR designation (anchor = designation day;
+	// the card-bind webhook stamps the funding='org' case). Idempotent — the
+	// anchor is immutable once set.
+	ActivateAccountIfUnset(ctx context.Context, accountID uuid.UUID, at time.Time) error
+
+	// OrgUnbilledBacklogMicros estimates the org's pre-designation unbilled
+	// backlog (NULL-account events scoped through the roster's owner_org_id),
+	// priced like the live bill display — the DISCLOSURE figure shown before
+	// the designating user confirms.
+	OrgUnbilledBacklogMicros(ctx context.Context, orgID uuid.UUID) (int64, error)
+
+	// AttachOrgAppsToAccount backfills account_id onto the org's unbilled
+	// roster rows (the roster half of the RepointOrgUsage sweep); returns the
+	// attached-row count.
+	AttachOrgAppsToAccount(ctx context.Context, orgID, accountID uuid.UUID) (int64, error)
+
+	// RepointOrgNullAccountEvents folds the org's NULL-account events into its
+	// funded account, clamping recorded_at up to windowStart (the account's
+	// current open window) so every backfilled event bills in the first period
+	// that closes after designation — original instants audit to
+	// repointed_from (migration 041). Returns the swept-event count.
+	RepointOrgNullAccountEvents(ctx context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error)
+
+	// OrgLiveAppIDs lists the org's live roster rows — the attach sweep
+	// reconciles each one's timers after account_id backfills.
+	OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error)
+
+	// ChargeFundingAccount maps an account to the account whose Stripe
+	// customer / default PM pays its invoices: itself, unless it is an org
+	// account whose designation names a sponsor (D1 funding hop). Resolved at
+	// charge time by resolveChargeableCustomer.
+	ChargeFundingAccount(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error)
 
 	// SetAppName updates the frozen display name (SyncAppModules rename);
 	// no-op once the app is deleted (WHERE deleted_at IS NULL), freezing the
@@ -1096,11 +1167,14 @@ func (s *pgxStore) AccountActivation(ctx context.Context, accountID uuid.UUID) (
 	return at.Time, true, nil
 }
 
-func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
+func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
 	// RowsAffected 0 = a retry hit ON CONFLICT DO NOTHING — success either way.
+	// accountID uuid.Nil → NULL: an UNBILLED org roster row awaiting funding
+	// designation (migration 041); ownerOrgID uuid.Nil → NULL for user-owned apps.
 	_, err := s.q.InsertAppMirror(ctx, db.InsertAppMirrorParams{
 		AppID:       appID.String(),
-		AccountID:   accountID.String(),
+		AccountID:   pgUUIDOrNull(accountID),
+		OwnerOrgID:  pgUUIDOrNull(ownerOrgID),
 		ModuleCount: int32(moduleCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
 		CreatedAt:   createdAt,
 		Name:        pgtype.Text{String: name, Valid: name != ""}, // NULL when the caller omits a name (frontend falls back)
@@ -1130,13 +1204,11 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 	if err != nil {
 		return AppMirror{}, false, err
 	}
-	acct, err := uuid.Parse(row.AccountID)
-	if err != nil {
-		return AppMirror{}, false, err
-	}
 	return AppMirror{
-		AppID:              app,
-		AccountID:          acct,
+		AppID: app,
+		// Nil = an UNBILLED org roster row (NULL account, migration 041) — the
+		// charge legs and the timer reconcile all skip it until attach.
+		AccountID:          uuidFromPg(row.AccountID),
 		ModuleCount:        int(row.ModuleCount),
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
@@ -1214,13 +1286,12 @@ func (s *pgxStore) lockAndReadChargeableApp(ctx context.Context, appID uuid.UUID
 	if err != nil {
 		return AppMirror{}, 0, "", false, err
 	}
-	acct, err := uuid.Parse(row.AccountID)
-	if err != nil {
-		return AppMirror{}, 0, "", false, err
-	}
 	locked = AppMirror{
-		AppID:              app,
-		AccountID:          acct,
+		AppID: app,
+		// Nil (NULL account — unbilled org roster row) never reaches the charge:
+		// AppsPendingProration excludes such rows and ChargeCreationProration
+		// guards the direct path, so this decode just carries the state through.
+		AccountID:          uuidFromPg(row.AccountID),
 		ModuleCount:        int(row.ModuleCount),
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
@@ -1519,8 +1590,17 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 	}
 	switch {
 	case target > live:
+		// An UNBILLED org roster row (NULL account, migration 041) synthesizes
+		// no timers — app_module_overage_timers.account_id is NOT NULL and there
+		// is no account to tier on. The RepointOrgUsage attach sweep reconciles
+		// the app again once account_id is backfilled, anchoring fresh timers at
+		// the designation instant (prospective billing, org-billing D1). Shrinks
+		// and removals below still run (they key on app_id only).
+		if !row.AccountID.Valid {
+			return tx.Commit(ctx)
+		}
 		if err := qtx.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
-			AccountID:      row.AccountID,
+			AccountID:      uuidFromPg(row.AccountID).String(),
 			AppID:          appID.String(),
 			InstalledAt:    installedAt,
 			GraceExpiresAt: graceExpiresAt,
@@ -1672,6 +1752,185 @@ func (s *pgxStore) CoCreatedOverModuleTimers(ctx context.Context, accountID, app
 		return nil, err
 	}
 	return parseUUIDs(ids)
+}
+
+// EnsureOrgAccount mirrors EnsureAccountForUser on the org leg: the SAME
+// advisory-locked get-or-create shape, serialized on the exported org
+// namespace ('lbto') because the accounts table has no owner UNIQUE
+// constraint — the lock IS the uniqueness guard.
+func (s *pgxStore) EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, error) {
+	var id string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		if err := qtx.AcquireBillingAccountUserLock(ctx, db.AcquireBillingAccountUserLockParams{
+			Column1: billing.AdvisoryLockNamespaceBillingAccountOrg,
+			Column2: orgID.String(),
+		}); err != nil {
+			return err
+		}
+		existing, err := qtx.SelectAccountByOrg(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+		if err == nil {
+			id = existing.ID
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		inserted, err := qtx.InsertOrgAccount(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+		if err != nil {
+			return err
+		}
+		id = inserted.ID
+		return nil
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return uuid.Parse(id)
+}
+
+func (s *pgxStore) AccountIDByUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, bool, error) {
+	id, err := s.q.AccountIDByUser(ctx, pgtype.UUID{Bytes: userID, Valid: true})
+	return uuidRowFound(id, err)
+}
+
+func (s *pgxStore) OrgAccountID(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	row, err := s.q.SelectAccountByOrg(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+	return uuidRowFound(row.ID, err)
+}
+
+func (s *pgxStore) OrgDesignation(ctx context.Context, orgID uuid.UUID) (OrgDesignation, bool, error) {
+	row, err := s.q.GetOrgDesignation(ctx, orgID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return OrgDesignation{}, false, nil
+	}
+	if err != nil {
+		return OrgDesignation{}, false, err
+	}
+	org, err := uuid.Parse(row.OrgID)
+	if err != nil {
+		return OrgDesignation{}, false, err
+	}
+	updatedBy, err := uuid.Parse(row.UpdatedBy)
+	if err != nil {
+		return OrgDesignation{}, false, err
+	}
+	return OrgDesignation{
+		OrgID:                  org,
+		Funding:                OrgFunding(row.Funding),
+		SponsorAccountID:       uuidFromPg(row.SponsorAccountID),
+		SponsorUserID:          uuidFromPg(row.SponsorUserID),
+		DisclosedBacklogMicros: row.DisclosedBacklogMicros,
+		UpdatedBy:              updatedBy,
+	}, true, nil
+}
+
+func (s *pgxStore) UpsertOrgDesignation(ctx context.Context, d OrgDesignation) error {
+	return s.q.UpsertOrgDesignation(ctx, db.UpsertOrgDesignationParams{
+		OrgID:                  d.OrgID.String(),
+		Funding:                string(d.Funding),
+		SponsorAccountID:       pgUUIDOrNull(d.SponsorAccountID),
+		SponsorUserID:          pgUUIDOrNull(d.SponsorUserID),
+		DisclosedBacklogMicros: d.DisclosedBacklogMicros,
+		UpdatedBy:              d.UpdatedBy.String(),
+	})
+}
+
+func (s *pgxStore) DeleteOrgDesignation(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	rows, err := s.q.DeleteOrgDesignation(ctx, orgID.String())
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (s *pgxStore) ResolveOrgFundedAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	// ErrNoRows = no designation, or not yet activated — unbilled, normal.
+	id, err := s.q.ResolveOrgFundedAccount(ctx, orgID.String())
+	return uuidRowFound(id, err)
+}
+
+func (s *pgxStore) ActivateAccountIfUnset(ctx context.Context, accountID uuid.UUID, at time.Time) error {
+	// 0 rows = already activated — the anchor is immutable, a no-op by design.
+	_, err := s.q.ActivateAccountIfUnset(ctx, db.ActivateAccountIfUnsetParams{
+		ID:          accountID.String(),
+		ActivatedAt: pgtype.Timestamptz{Time: at, Valid: true},
+	})
+	return err
+}
+
+func (s *pgxStore) OrgUnbilledBacklogMicros(ctx context.Context, orgID uuid.UUID) (int64, error) {
+	n, err := s.q.OrgUnbilledBacklogMicros(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+	if err != nil {
+		return 0, err
+	}
+	// Same single decode-and-round point as every live money read.
+	return usage.MicrosFromNumeric(n)
+}
+
+func (s *pgxStore) AttachOrgAppsToAccount(ctx context.Context, orgID, accountID uuid.UUID) (int64, error) {
+	return s.q.AttachOrgAppsToAccount(ctx, db.AttachOrgAppsToAccountParams{
+		OwnerOrgID: pgtype.UUID{Bytes: orgID, Valid: true},
+		AccountID:  pgtype.UUID{Bytes: accountID, Valid: true},
+	})
+}
+
+func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	return s.q.RepointOrgNullAccountEvents(ctx, db.RepointOrgNullAccountEventsParams{
+		AccountID:   accountID.String(),
+		WindowStart: windowStart,
+		OrgID:       orgID.String(),
+	})
+}
+
+func (s *pgxStore) OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := s.q.OrgLiveAppIDs(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+func (s *pgxStore) ChargeFundingAccount(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	id, err := s.q.ChargeFundingAccount(ctx, accountID.String())
+	if err != nil {
+		return uuid.Nil, err // incl. ErrNoRows: a missing accounts row is a code bug, not a skip
+	}
+	return uuid.Parse(id)
+}
+
+// uuidRowFound decodes the (uuid-as-string, error) shape every single-row
+// account-resolution query yields: ErrNoRows → (Nil, false, nil) — a normal
+// lazy/missing outcome, not an error — else the parsed id.
+func uuidRowFound(id string, err error) (uuid.UUID, bool, error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
+}
+
+// pgUUIDOrNull maps uuid.Nil to a SQL NULL and a real UUID to a valid
+// pgtype.UUID — the encode twin of uuidFromPg.
+func pgUUIDOrNull(id uuid.UUID) pgtype.UUID {
+	if id == uuid.Nil {
+		return pgtype.UUID{} // Valid: false → NULL
+	}
+	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+// uuidFromPg decodes a nullable uuid column: NULL → uuid.Nil.
+func uuidFromPg(u pgtype.UUID) uuid.UUID {
+	if !u.Valid {
+		return uuid.Nil
+	}
+	return uuid.UUID(u.Bytes)
 }
 
 // parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc

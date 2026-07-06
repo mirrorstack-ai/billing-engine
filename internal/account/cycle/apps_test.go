@@ -325,6 +325,52 @@ func TestRegisterApp_CreatesMissingAccount(t *testing.T) {
 	require.Empty(t, sc.itemCalls)
 }
 
+func TestRegisterApp_FundedOrgResolvesOrgAccount(t *testing.T) {
+	// An ORG owner resolves through the funding designation (migration 041):
+	// a designated + activated org registers straight onto the org account —
+	// still no charge (creation grace applies identically).
+	store := newFakeStore()
+	org, acct := uuid.New(), uuid.New()
+	store.accountsByOrg[org] = acct
+	store.orgDesignations[org] = cycle.OrgDesignation{OrgID: org, Funding: cycle.OrgFundingOrg}
+	store.activation[acct] = time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)
+	sc := newFakeStripe()
+	appID := uuid.New()
+
+	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerOrgID: org, AppID: appID, ModuleCount: 2,
+	})
+	require.NoError(t, err)
+	require.Equal(t, acct, resp.AccountID)
+	require.Equal(t, acct, store.apps[appID].AccountID)
+	require.Equal(t, org, store.appOwnerOrg[appID])
+	require.Equal(t, 2, liveTimerCount(store, appID))
+	require.Empty(t, sc.itemCalls)
+}
+
+func TestRegisterApp_UnfundedOrgRegistersUnbilled(t *testing.T) {
+	// An org that never designated (or has not activated yet) registers an
+	// UNBILLED roster row: Nil account, owner_org_id stamped for the later
+	// attach sweep — and NO error, app creation must not block on billing.
+	store := newFakeStore()
+	org := uuid.New() // no designation, no account
+	sc := newFakeStripe()
+	appID := uuid.New()
+
+	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerOrgID: org, AppID: appID, ModuleCount: 3,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uuid.Nil, resp.AccountID)
+	require.Equal(t, uuid.Nil, store.apps[appID].AccountID)
+	require.Equal(t, org, store.appOwnerOrg[appID])
+	// Timers still synthesize (each rides its own grace, Nil-account until the
+	// attach sweep backfills the roster row); nothing charges.
+	require.Equal(t, 3, liveTimerCount(store, appID))
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.invoiceCalls)
+}
+
 func TestRegisterApp_Validation(t *testing.T) {
 	svc := appsSvc(newFakeStore(), newFakeStripe())
 	for _, tc := range []struct {
@@ -333,7 +379,6 @@ func TestRegisterApp_Validation(t *testing.T) {
 	}{
 		{"no owner", cycle.RegisterAppRequest{AppID: uuid.New()}},
 		{"both owners", cycle.RegisterAppRequest{OwnerUserID: uuid.New(), OwnerOrgID: uuid.New(), AppID: uuid.New()}},
-		{"org owner (v1 user-only)", cycle.RegisterAppRequest{OwnerOrgID: uuid.New(), AppID: uuid.New()}},
 		{"nil app", cycle.RegisterAppRequest{OwnerUserID: uuid.New()}},
 		{"negative module count", cycle.RegisterAppRequest{OwnerUserID: uuid.New(), AppID: uuid.New(), ModuleCount: -1}},
 		// FINDING-4 pin: a count past the cap must be rejected loudly, never

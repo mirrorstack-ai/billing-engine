@@ -73,6 +73,26 @@ type fakeStore struct {
 	activation     map[uuid.UUID]time.Time
 	baseSnapshots  map[snapKey]fakeBaseSnapshot
 
+	// per-account overrides for HasUsableDefaultPM / AccountStripeCustomer
+	// (absent → the flat hasPM / stripeCustomer defaults above). The org
+	// funding-hop tests need the sponsor and org accounts to differ.
+	hasPMByAccount          map[uuid.UUID]bool
+	stripeCustomerByAccount map[uuid.UUID]string
+
+	// org-billing state (migration 041). accountsByOrg models the
+	// EnsureOrgAccount get-or-create; orgDesignations the designation rows;
+	// appOwnerOrg the roster rows' owner_org_id stamp (cycle.AppMirror does
+	// not carry it); orgBacklog seeds OrgUnbilledBacklogMicros; orgNullEvents
+	// seeds each org's pending NULL-account event count, consumed by the
+	// repoint sweep (swept rows never match again); repointCalls records the
+	// sweep's events half so tests can assert the window clamp.
+	accountsByOrg   map[uuid.UUID]uuid.UUID
+	orgDesignations map[uuid.UUID]cycle.OrgDesignation
+	appOwnerOrg     map[uuid.UUID]uuid.UUID
+	orgBacklog      map[uuid.UUID]int64
+	orgNullEvents   map[uuid.UUID]int64
+	repointCalls    []repointCall
+
 	// per-module install-timer state (migration 033). timers models
 	// ms_billing.app_module_overage_timers keyed by surrogate id; each row's
 	// removed/graceResolved/graceCharged* fields mirror the columns the FIFO +
@@ -178,6 +198,14 @@ type markedRun struct {
 	totalCents int64
 }
 
+// repointCall records one RepointOrgNullAccountEvents call — orgID/accountID
+// plus the windowStart the sweep clamped the swept events into.
+type repointCall struct {
+	orgID       uuid.UUID
+	accountID   uuid.UUID
+	windowStart time.Time
+}
+
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		prices:              map[string]int64{},
@@ -197,6 +225,14 @@ func newFakeStore() *fakeStore {
 		activation:          map[uuid.UUID]time.Time{},
 		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
 		timers:              map[uuid.UUID]*fakeTimer{},
+
+		hasPMByAccount:          map[uuid.UUID]bool{},
+		stripeCustomerByAccount: map[uuid.UUID]string{},
+		accountsByOrg:           map[uuid.UUID]uuid.UUID{},
+		orgDesignations:         map[uuid.UUID]cycle.OrgDesignation{},
+		appOwnerOrg:             map[uuid.UUID]uuid.UUID{},
+		orgBacklog:              map[uuid.UUID]int64{},
+		orgNullEvents:           map[uuid.UUID]int64{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -313,16 +349,22 @@ func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time
 	return f.chargedTotal, nil
 }
 
-func (f *fakeStore) HasUsableDefaultPM(_ context.Context, _ uuid.UUID) (bool, error) {
+func (f *fakeStore) HasUsableDefaultPM(_ context.Context, accountID uuid.UUID) (bool, error) {
 	if f.errPM != nil {
 		return false, f.errPM
+	}
+	if v, ok := f.hasPMByAccount[accountID]; ok {
+		return v, nil
 	}
 	return f.hasPM, nil
 }
 
-func (f *fakeStore) AccountStripeCustomer(_ context.Context, _ uuid.UUID) (string, error) {
+func (f *fakeStore) AccountStripeCustomer(_ context.Context, accountID uuid.UUID) (string, error) {
 	if f.errCustomer != nil {
 		return "", f.errCustomer
+	}
+	if c, ok := f.stripeCustomerByAccount[accountID]; ok {
+		return c, nil
 	}
 	return f.stripeCustomer, nil
 }
@@ -479,7 +521,7 @@ func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (t
 	return at, ok, nil
 }
 
-func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
+func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
 	if f.errAppInsert != nil {
 		return f.errAppInsert
 	}
@@ -492,7 +534,120 @@ func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUI
 		CreatedAt:          createdAt,
 		Name:               name, // frozen on first registration (migration 037)
 	}
+	if ownerOrgID != uuid.Nil {
+		f.appOwnerOrg[appID] = ownerOrgID // owner_org_id stamp (migration 041); Nil = user-owned (NULL)
+	}
 	return nil
+}
+
+// --- org account + designation fake (migration 041) -------------------------
+
+func (f *fakeStore) EnsureOrgAccount(_ context.Context, orgID uuid.UUID) (uuid.UUID, error) {
+	if id, ok := f.accountsByOrg[orgID]; ok {
+		return id, nil // get-or-create: the same org always resolves the same account
+	}
+	id := uuid.New()
+	f.accountsByOrg[orgID] = id
+	return id, nil
+}
+
+func (f *fakeStore) AccountIDByUser(_ context.Context, userID uuid.UUID) (uuid.UUID, bool, error) {
+	id, ok := f.accountsByUser[userID]
+	return id, ok, nil
+}
+
+func (f *fakeStore) OrgAccountID(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	id, ok := f.accountsByOrg[orgID]
+	return id, ok, nil
+}
+
+func (f *fakeStore) OrgDesignation(_ context.Context, orgID uuid.UUID) (cycle.OrgDesignation, bool, error) {
+	d, ok := f.orgDesignations[orgID]
+	return d, ok, nil
+}
+
+func (f *fakeStore) UpsertOrgDesignation(_ context.Context, d cycle.OrgDesignation) error {
+	f.orgDesignations[d.OrgID] = d // re-designation overwrites in place
+	return nil
+}
+
+func (f *fakeStore) DeleteOrgDesignation(_ context.Context, orgID uuid.UUID) (bool, error) {
+	_, existed := f.orgDesignations[orgID]
+	delete(f.orgDesignations, orgID)
+	return existed, nil
+}
+
+func (f *fakeStore) ResolveOrgFundedAccount(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	// Mirrors the SQL's single funded gate: a designation row exists AND the
+	// org's account row is activated.
+	if _, designated := f.orgDesignations[orgID]; !designated {
+		return uuid.Nil, false, nil
+	}
+	acct, ok := f.accountsByOrg[orgID]
+	if !ok {
+		return uuid.Nil, false, nil
+	}
+	if _, activated := f.activation[acct]; !activated {
+		return uuid.Nil, false, nil
+	}
+	return acct, true, nil
+}
+
+func (f *fakeStore) ActivateAccountIfUnset(_ context.Context, accountID uuid.UUID, at time.Time) error {
+	if _, ok := f.activation[accountID]; !ok {
+		f.activation[accountID] = at // the anchor is immutable once set (ADR 0006)
+	}
+	return nil
+}
+
+func (f *fakeStore) OrgUnbilledBacklogMicros(_ context.Context, orgID uuid.UUID) (int64, error) {
+	return f.orgBacklog[orgID], nil
+}
+
+func (f *fakeStore) AttachOrgAppsToAccount(_ context.Context, orgID, accountID uuid.UUID) (int64, error) {
+	// WHERE owner_org_id = $1 AND account_id IS NULL — attached rows never
+	// match again (idempotent sweep).
+	var n int64
+	for id, app := range f.apps {
+		if f.appOwnerOrg[id] == orgID && app.AccountID == uuid.Nil {
+			app.AccountID = accountID
+			f.apps[id] = app
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *fakeStore) RepointOrgNullAccountEvents(_ context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	f.repointCalls = append(f.repointCalls, repointCall{orgID, accountID, windowStart})
+	n := f.orgNullEvents[orgID]
+	delete(f.orgNullEvents, orgID) // swept events never match again (account_id IS NULL)
+	return n, nil
+}
+
+func (f *fakeStore) OrgLiveAppIDs(_ context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {
+	var out []uuid.UUID
+	for id, app := range f.apps {
+		if f.appOwnerOrg[id] == orgID && !app.Deleted {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
+	return out, nil
+}
+
+func (f *fakeStore) ChargeFundingAccount(_ context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	// Identity, unless the account is an org account whose designation names a
+	// sponsor — mirrors the SQL's LEFT JOIN + COALESCE (D1 funding hop).
+	for orgID, acct := range f.accountsByOrg {
+		if acct != accountID {
+			continue
+		}
+		if d, ok := f.orgDesignations[orgID]; ok && d.Funding == cycle.OrgFundingSponsor {
+			return d.SponsorAccountID, nil
+		}
+	}
+	return accountID, nil
 }
 
 func (f *fakeStore) SetAppName(_ context.Context, appID uuid.UUID, name string) error {

@@ -538,12 +538,13 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 }
 
 func (s *pgxStore) AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, bool, error) {
-	// v1 ships the user-owned path (SelectAccountByUser). Org-owned
-	// accounts (owner_org_id) land with the org billing milestone; until
-	// then an org owner resolves to "no account yet" (lazy), which the
-	// service handles gracefully (records the event NULL-account).
+	// Org owners resolve through the funding designation (migration 041):
+	// designated AND activated → the org's own account; otherwise "no account
+	// yet" (lazy), which the service handles gracefully (records the event
+	// NULL-account — the RepointOrgUsage sweep folds it in at designation).
 	if owner.OrgID != uuid.Nil {
-		return uuid.Nil, false, nil
+		id, err := s.q.ResolveOrgFundedAccount(ctx, owner.OrgID.String())
+		return uuidRowFound(id, err)
 	}
 	row, err := s.q.SelectAccountByUser(ctx, pgtype.UUID{Bytes: owner.UserID, Valid: true})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1058,6 +1059,23 @@ func (s *pgxStore) UpsertModuleVisibility(ctx context.Context, moduleID uuid.UUI
 		ModuleID:   moduleID.String(),
 		Visibility: db.MsBillingMarginShareClass(vis),
 	})
+}
+
+// uuidRowFound decodes the (uuid-as-string, error) shape a single-row
+// account-resolution query yields: ErrNoRows → (Nil, false, nil) — the normal
+// lazy/missing outcome — else the parsed id.
+func uuidRowFound(id string, err error) (uuid.UUID, bool, error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
 }
 
 // nullableAccountID maps a Nil account UUID to a SQL NULL (the lazy

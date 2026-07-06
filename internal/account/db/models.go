@@ -348,7 +348,7 @@ type MsBillingAddCardRequest struct {
 
 type MsBillingApp struct {
 	AppID              string             `json:"app_id"`
-	AccountID          string             `json:"account_id"`
+	AccountID          pgtype.UUID        `json:"account_id"`
 	ModuleCount        int32              `json:"module_count"`
 	CreatedAt          time.Time          `json:"created_at"`
 	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
@@ -361,7 +361,8 @@ type MsBillingApp struct {
 	// First instant a creation-proration charge attempt for this app reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set and an unarmed guard reconciles against Stripe (ms_charge_ref app-proration:<app_id>) before minting new Stripe objects.
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 	// App display name, frozen from RegisterApp's payload and updated by SyncAppModules while the app is live (gated on deleted_at IS NULL); NEVER cleared on delete — this is what lets a deleted app's historical bill still show its name. NULL for pre-037 rows / callers that omit it.
-	Name pgtype.Text `json:"name"`
+	Name       pgtype.Text `json:"name"`
+	OwnerOrgID pgtype.UUID `json:"owner_org_id"`
 }
 
 type MsBillingAppBaseSnapshot struct {
@@ -501,6 +502,17 @@ type MsBillingModuleVisibility struct {
 	UpdatedAt  time.Time                 `json:"updated_at"`
 }
 
+type MsBillingOrgBillingDesignation struct {
+	OrgID                  string      `json:"org_id"`
+	Funding                string      `json:"funding"`
+	SponsorAccountID       pgtype.UUID `json:"sponsor_account_id"`
+	SponsorUserID          pgtype.UUID `json:"sponsor_user_id"`
+	DisclosedBacklogMicros int64       `json:"disclosed_backlog_micros"`
+	UpdatedBy              string      `json:"updated_by"`
+	CreatedAt              time.Time   `json:"created_at"`
+	UpdatedAt              time.Time   `json:"updated_at"`
+}
+
 type MsBillingPaymentMethodsMirror struct {
 	ID                    string             `json:"id"`
 	AccountID             string             `json:"account_id"`
@@ -552,6 +564,7 @@ type MsBillingUsageEvent struct {
 	IngestedAt    time.Time           `json:"ingested_at"`
 	Model         pgtype.Text         `json:"model"`
 	ModuleVersion pgtype.Text         `json:"module_version"`
+	RepointedFrom pgtype.Timestamptz  `json:"repointed_from"`
 }
 
 type MsBillingWebhookEventsProcessed struct {
