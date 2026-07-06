@@ -2,29 +2,38 @@ package usage
 
 import "time"
 
-// This file is the SINGLE home of the base-fee math (owner spec 2026-07-05,
-// DESIGN.md "Base fee — v1 spec"). Both consumers — the display read
-// (GetAppBill, this package) and the charge spine (cycle: the RegisterApp
-// creation-proration charge + the boundary advance leg) — compute an app's
-// per-period base through these two functions, so the bill page, the invoice,
-// and the mirror can never disagree by construction. All money is integer
-// micro-dollars; the arithmetic here is pure int64 (no big.Rat needed: the
-// operands are bounded — see ProratedBaseMicros).
+// This file is the SINGLE home of the base-fee + overage display math (owner
+// spec 2026-07-05, DESIGN.md "Base fee — v2: creation grace + per-module overage
+// timers"). Both consumers — the display read (GetAppBill / GetAccountBill, this
+// package) and the charge spine (cycle: the creation/combined charge, the
+// boundary advance leg, the per-module grace sweep) — compute the per-app FLAT
+// base and the account overage through these functions, so the bill page, the
+// invoice, and the mirror can never disagree by construction. All money is
+// integer micro-dollars; the arithmetic here is pure int64 (no big.Rat needed:
+// the operands are bounded — see ProratedBaseMicros).
+//
+// The flat $20/app base is per-app; the $3/module surcharge applies to the
+// account's over-count, max(0, live module count − IncludedModules). Under the
+// per-module-instance model (migration 033) the charge legs tier per install
+// TIMER (each on its own grace), while the DISPLAY reads the live timer count
+// through AccountOverageMicros. There is deliberately NO per-app overage helper:
+// an app's base is just the flat (plan-resolved) fee.
 
-// AppBaseFeeMicros is an app's FULL per-period base fee:
+// AccountOverageMicros is the account's module overage shown for one period:
 //
-//	base + ModuleOverageFeeMicros × max(0, moduleCount − IncludedModules)
+//	ModuleOverageFeeMicros × max(0, liveModuleCount − IncludedModules)
 //
-// baseFeeMicros is the plan-resolved flat fee (resolveBaseFeeMicros; the
-// charge spine passes BaseFeeMicros until a plan resolver exists) so the
-// plan seam stays in ONE place and this function stays pure tier math.
-// A negative moduleCount cannot occur (DB CHECK module_count >= 0); the
-// max(0, …) clamp still makes the function total.
-func AppBaseFeeMicros(baseFeeMicros int64, moduleCount int) int64 {
-	if extra := moduleCount - IncludedModules; extra > 0 {
-		return baseFeeMicros + ModuleOverageFeeMicros*int64(extra)
+// liveModuleCount is the account's live installed-module count (the count of live
+// install timers, migration 033 — one pool of IncludedModules for the WHOLE
+// account, not per app). The first IncludedModules live installs (by FIFO) are
+// "included"; the rest are "over", so max(0, live − included) is exactly the live
+// over-count. A liveModuleCount ≤ IncludedModules yields 0 (the max(0, …) clamp
+// makes the function total; a negative count cannot occur — a live-row count).
+func AccountOverageMicros(liveModuleCount int) int64 {
+	if extra := liveModuleCount - IncludedModules; extra > 0 {
+		return ModuleOverageFeeMicros * int64(extra)
 	}
-	return baseFeeMicros
+	return 0
 }
 
 // ProratedBaseMicros prorates an app's per-period base fee for the period

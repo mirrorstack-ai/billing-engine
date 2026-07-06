@@ -128,6 +128,9 @@ func (f *fakeStore) AppIDsWithUsage(_ context.Context, _ uuid.UUID, _, _ time.Ti
 func (f *fakeStore) MirroredAppIDs(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]uuid.UUID, error) {
 	return nil, nil
 }
+func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, _ uuid.UUID) (int, error) {
+	return 0, nil
+}
 
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 

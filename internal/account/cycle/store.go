@@ -141,6 +141,30 @@ type Store interface {
 	// (empty → NULL), and the charged total in whole cents.
 	MarkBillingRun(ctx context.Context, runID uuid.UUID, status BillingRunStatus, stripeInvoiceID string, totalCents int64) error
 
+	// MarkBillingRunInvoicedIfUnfrozen terminally marks a ZERO-total run
+	// 'invoiced' (no Stripe call happened) — guarded on the run still being
+	// UNFROZEN (wave 2, D7): a concurrent reclaim may have frozen + charged
+	// after this process's top-of-run frozen read, and an unguarded terminal
+	// mark would bury that charge forever. ok=false → the guard lost; the
+	// caller must back off and leave the run reclaimable.
+	MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID uuid.UUID) (bool, error)
+
+	// FreezeBillingRunCharge records — BEFORE the boundary run's first Stripe
+	// charge — the exact amount + base/overage description determinant it will send
+	// under the deterministic idem keys ii-<run>/inv-<run> (migration 035).
+	// First-write-wins, and it returns the SURVIVING row value: when a concurrent
+	// second daemon reclaimed the same run and froze first, the loser's write
+	// no-ops and it MUST adopt the returned winner value — charging a locally
+	// computed amount under the shared idem keys would send Stripe two different
+	// bodies for the same key (the H6 race). The retry path likewise never sends
+	// a request that differs from what a prior attempt froze.
+	FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error)
+
+	// BillingRunFrozenCharge reads a run's frozen boundary charge; ok=false when no
+	// prior attempt reached the Stripe call (a fresh run). On a reclaim it is the
+	// amount already charged, which the retry REUSES verbatim.
+	BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) (charge FrozenBoundaryCharge, ok bool, err error)
+
 	// AccountsWithUnbilledUsage returns the accounts that have usage_aggregates
 	// in a closed period window [periodStart, periodEnd) with no billing_run yet
 	// — the work list for cmd/billing-cycle.
@@ -183,11 +207,50 @@ type Store interface {
 	// deletion semantics). found=false → the app was never registered.
 	AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, bool, error)
 
+	// AppsPendingProration returns the app ids past the creation grace window
+	// (created_at <= createdBefore = now − GraceDays) that are still LIVE
+	// (deleted_at IS NULL), NOT yet charged (proration_invoice_id IS NULL), and
+	// NOT permanently skipped (proration_skipped_at IS NULL, migration 031) —
+	// the creation-proration sweep's work list. An app deleted within grace,
+	// already charged, or already determined to be a would-be retroactive
+	// catch-up (D1d) is excluded.
+	AppsPendingProration(ctx context.Context, createdBefore time.Time) ([]uuid.UUID, error)
+
+	// ChargeProrationLocked runs the creation-proration charge for ONE app. It
+	// briefly SELECT ... FOR UPDATE-locks the roster row to re-verify the row is
+	// still chargeable (deleted_at IS NULL AND proration_invoice_id IS NULL) and
+	// read its frozen state, then RELEASES the lock before invoking charge —
+	// which performs the (potentially slow) Stripe network calls OUTSIDE any
+	// lock or transaction — and finally persists the mirrored invoice, the base
+	// snapshot, and the one-shot guard in a second short transaction. The lock is
+	// deliberately NOT held across the Stripe call (a prior version did; it could
+	// block a concurrent SyncAppModules/MarkAppDeleted write for the Stripe SDK's
+	// full ~80s-per-call timeout): a soft-delete that commits while the charge
+	// callback is in flight does NOT unwind an already-succeeded Stripe charge
+	// (D1e already forbids refunds — the money moved), so the persist step
+	// writes the invoice/snapshot/guard unconditionally on success. A second,
+	// genuinely concurrent charge attempt for the SAME app converges on the SAME
+	// Stripe objects (the deterministic per-app Idempotency-Keys) and the guard's
+	// first-write-wins UPDATE, so this stays race-safe without a lock spanning
+	// both phases. charge returning (nil, nil) means "nothing to charge" (0
+	// cents) → nothing is persisted. The returned invoice id is the armed (or
+	// pre-armed) guard's.
+	ChargeProrationLocked(ctx context.Context, appID uuid.UUID, charge func(locked AppMirror) (*ProrationCharge, error)) (ProrationOutcome, string, error)
+
 	// SetAppProrationInvoice arms the ONE-SHOT creation-proration guard: it
 	// records the Stripe invoice id, first-charge-wins (UPDATE … WHERE
 	// proration_invoice_id IS NULL). An already-armed guard is NOT an error —
 	// the write is a no-op and the original invoice id survives.
 	SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, stripeInvoiceID string) error
+
+	// SetAppProrationSkipped arms the PERMANENT creation-proration skip marker
+	// (migration 031, D1d): the account only activated at/after this app's
+	// anchored creation period had already closed, so the app is EXCLUDED from
+	// every future sweep rather than left pending forever (proration_invoice_id
+	// stays NULL, so without this marker AppsPendingProration would resurface it
+	// on every sweep indefinitely). First-write-wins and a no-op if the app was
+	// somehow already charged in the meantime — never an error.
+	SetAppProrationSkipped(ctx context.Context, appID uuid.UUID) error
 
 	// SetAppModuleCount snapshots a new installed-module count. A deleted
 	// app's count is frozen (the UPDATE's WHERE deleted_at IS NULL no-ops —
@@ -199,14 +262,17 @@ type Store interface {
 	MarkAppDeleted(ctx context.Context, appID uuid.UUID) error
 
 	// LiveAppsCreatedBefore returns every LIVE (deleted_at IS NULL) app on the
-	// account created STRICTLY BEFORE createdBefore, with its module_count —
-	// the boundary charge's advance-base input. createdBefore is the NEW
-	// period's start (the closed window's period_end): an app created inside
-	// the new period is EXCLUDED because RegisterApp's creation-proration leg
-	// already owns that period's base (full or prorated) — it joins the
+	// account that has JOINED the advance-base mechanism by createdBefore (the
+	// NEW period's start, i.e. the closed window's period_end), with its
+	// module_count — the boundary charge's advance-base input. An app is
+	// excluded when created inside the new period (its creation-proration leg
+	// owns that period's base) OR when its creation grace (graceDays) had not
+	// yet elapsed by createdBefore (it hasn't survived grace — deleted-in-grace
+	// is never charged — and when it survives, its creation charge covers
+	// through the END of the period its grace elapses into). It joins the
 	// advance leg at the NEXT boundary. Empty for a pre-backfill account →
 	// advance base 0 (pre-027 behavior).
-	LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error)
+	LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time, graceDays int) ([]AppModuleCount, error)
 
 	// UpsertProrationBaseSnapshot persists the creation-proration leg's
 	// per-app-period base snapshot (migration 028, source='proration'), keyed
@@ -221,6 +287,127 @@ type Store interface {
 	// proration snapshot, or a prior reclaimed attempt's own row) wins, so a
 	// re-run never rewrites what was already recorded as billed.
 	InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSnapshot) error
+
+	// --- per-module-instance overage timers (migration 033) -----------------
+
+	// LiveModuleTimerCountForApp returns the count of an app's currently-live
+	// (removed_at IS NULL) install timers — the reconciliation input RegisterApp
+	// / SyncAppModules use to bring the live-timer set into line with the app's
+	// module_count idempotently across fire-and-forget retries.
+	LiveModuleTimerCountForApp(ctx context.Context, appID uuid.UUID) (int, error)
+
+	// InsertModuleOverageTimers inserts n identical install timers for one app,
+	// all anchored at installedAt with grace expiring at graceExpiresAt (=
+	// installedAt + the 3-day grace window). n <= 0 is a no-op.
+	InsertModuleOverageTimers(ctx context.Context, accountID, appID uuid.UUID, installedAt, graceExpiresAt time.Time, n int) error
+
+	// SoftRemoveNewestModuleTimers LIFO-soft-removes the n NEWEST currently-live
+	// install timers for one app (a SyncAppModules shrink removes what was added
+	// most recently). n <= 0 is a no-op.
+	SoftRemoveNewestModuleTimers(ctx context.Context, appID uuid.UUID, n int, removedAt time.Time) error
+
+	// SoftRemoveAllModuleTimersForApp soft-removes every still-live install timer
+	// for an app — the app-deletion path. Idempotent (WHERE removed_at IS NULL).
+	SoftRemoveAllModuleTimersForApp(ctx context.Context, appID uuid.UUID, removedAt time.Time) error
+
+	// MarkModuleTimerChargeAttempted stamps the migration-036 recovery marker
+	// BEFORE a charge attempt's first Stripe call — first-write-wins, never
+	// cleared. A later retry seeing it set reconciles against Stripe (the
+	// ms_charge_ref anchor) before recomputing any live verdict or minting new
+	// Stripe objects.
+	MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) error
+
+	// ModuleTimerStillPending re-verifies, immediately before acting on a sweep
+	// candidate, that the timer is STILL live and unresolved — the work list is
+	// read once and can be minutes stale by the time a late candidate is
+	// processed (M2).
+	ModuleTimerStillPending(ctx context.Context, timerID uuid.UUID) (bool, error)
+
+	// MarkAppProrationAttempted stamps the migration-036 recovery marker for the
+	// creation-proration leg — first-write-wins, never cleared.
+	MarkAppProrationAttempted(ctx context.Context, appID uuid.UUID, at time.Time) error
+
+	// ReconcileModuleTimersToTarget brings an app's live install-timer set into
+	// line with its CURRENT roster row, ATOMICALLY under a per-app advisory
+	// transaction lock (review 2026-07-06, H7; hardened in wave 2, D8/D9): the
+	// target count, owning account, and deleted state are all read from the
+	// apps row INSIDE the locked transaction — never caller-supplied — so a
+	// late fire-and-forget retry can neither shrink timers to a stale
+	// module_count (D8) nor resurrect timers for an app deleted after its
+	// mirror read (D9: a deleted row reconciles to zero, removing any live
+	// orphans instead of inserting). A grow inserts the deficit anchored at
+	// installedAt/graceExpiresAt, a shrink LIFO-soft-removes the surplus at
+	// removedAt. The lock also serializes concurrent executions so two retries
+	// can never both insert the full deficit (phantom $3 timers).
+	ReconcileModuleTimersToTarget(ctx context.Context, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error
+
+	// MarkAppDeletedAndRemoveTimers soft-deletes the roster row AND soft-removes
+	// every still-live install timer in ONE transaction under the SAME per-app
+	// advisory lock the reconcile takes (wave 2, D9) — a crash can no longer
+	// separate the two writes, and a concurrent synthesis retry serializes
+	// behind (or ahead of, then gets corrected by) the deletion. Idempotent:
+	// re-fire keeps the first deletion instant and affects already-removed
+	// timers zero times.
+	MarkAppDeletedAndRemoveTimers(ctx context.Context, appID uuid.UUID, removedAt time.Time) error
+
+	// ModuleOverageTimersPastGrace is Leg 1's work list: live, unresolved install
+	// timers whose grace window has elapsed as of `at`, on chargeable (activated)
+	// accounts — each with the account's activation anchor so the sweep resolves
+	// the install's period window without a second read.
+	ModuleOverageTimersPastGrace(ctx context.Context, at time.Time) ([]ModuleOverageCandidate, error)
+
+	// LiveModuleTimerRankBefore returns the 0-based FIFO rank of one install timer
+	// among the account's currently-live timers ordered (installed_at ASC, id
+	// ASC): the count of live timers ordering STRICTLY BEFORE it. rank <
+	// IncludedModules ⇒ "included"; rank >= IncludedModules ⇒ "over". Computed
+	// fresh at every grace-check (never cached).
+	LiveModuleTimerRankBefore(ctx context.Context, accountID, timerID uuid.UUID, installedAt time.Time) (int, error)
+
+	// MarkModuleTimerIncluded stamps the TERMINAL "included" verdict
+	// (grace_resolved=true, no charge) — first-write-wins (WHERE grace_resolved
+	// IS false). Monotonicity makes it permanent; the row is never re-checked.
+	MarkModuleTimerIncluded(ctx context.Context, timerID uuid.UUID) error
+
+	// MarkModuleTimerCharged stamps the TERMINAL "over and charged" verdict once
+	// Leg 1's Stripe charge succeeded: grace_charged_at + grace_resolved=true and
+	// the GENUINE Stripe invoice / invoice-item ids (never idempotency-key
+	// strings). WHERE grace_resolved IS false keeps a crash-retry idempotent.
+	MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error
+
+	// CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario
+	// 6): the count of the account's live timers that are "over" (live-FIFO rank
+	// >= includedModules) AND owed a full precharge for the NEW period opening at
+	// periodEnd — installed before it, grace elapsed before it (a straddling
+	// grace's new period is Leg 1's coverage), and grace terminally resolved
+	// (charged, OR resolved-uncharged via the D1d period-closed posture — those
+	// still owe every post-activation period). See the query comment for the full
+	// coverage contract.
+	CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error)
+
+	// CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
+	// ids of an app's live, unresolved install timers whose install instant equals
+	// the app's createdAt (co-created at app creation) AND that are "over" (live-FIFO
+	// rank >= includedModules) — the co-created over-modules folded onto the app's
+	// own creation-proration invoice, priced from the same day-0 window.
+	CoCreatedOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error)
+}
+
+// ModuleOverageCandidate is one per-module-instance install timer the Leg 1
+// grace sweep evaluates (migration 033): its surrogate id + app/account, the
+// InstalledAt anchor (FIFO key AND proration anchor), GraceExpiresAt (already
+// elapsed for a candidate), and the owning account's ActivatedAt (the billing-
+// period anchor, ADR 0005, used to resolve the install's period window).
+type ModuleOverageCandidate struct {
+	ID             uuid.UUID
+	AccountID      uuid.UUID
+	AppID          uuid.UUID
+	InstalledAt    time.Time
+	GraceExpiresAt time.Time
+	ActivatedAt    time.Time
+	// ChargeAttemptedAt: a prior charge attempt reached its Stripe section
+	// (migration 036 recovery marker); zero = never attempted. A retried
+	// candidate reconciles against Stripe BEFORE recomputing any live verdict.
+	ChargeAttemptedAt time.Time
 }
 
 // AppModuleCount pairs one live roster app with its module_count snapshot —
@@ -249,12 +436,27 @@ type AppBaseSnapshot struct {
 // AppMirror is the in-memory form of a ms_billing.apps roster row (migration
 // 027). ProrationInvoiceID is "" while the one-shot creation-proration guard
 // is unarmed; DeletedAt is meaningful only when Deleted is true.
+// CreatedModuleCount (migration 030) is the module count FROZEN at
+// RegisterApp time — immutable, never touched by SyncAppModules — and is what
+// ChargeCreationProration prices the historical creation-period window from;
+// ModuleCount is the LIVE count SyncAppModules keeps current and is what the
+// boundary advance leg (and the display read for all FUTURE periods) uses.
+// ProrationSkipped (migration 031) is true once the app's creation-proration
+// charge has been PERMANENTLY skipped as a would-be retroactive catch-up
+// (D1d): the account only activated at/after the app's anchored creation
+// period had already closed.
 type AppMirror struct {
 	AppID              uuid.UUID
 	AccountID          uuid.UUID
 	ModuleCount        int
+	CreatedModuleCount int
 	CreatedAt          time.Time
 	ProrationInvoiceID string
+	ProrationSkipped   bool
+	// ProrationAttempted: a prior creation-proration charge attempt reached its
+	// Stripe section (migration 036 recovery marker) — a retry with this set and
+	// an unarmed guard reconciles against Stripe before minting new objects.
+	ProrationAttempted bool
 	Deleted            bool
 	DeletedAt          time.Time
 }
@@ -266,6 +468,17 @@ type AppMirror struct {
 type AccountAnchor struct {
 	ID          uuid.UUID
 	ActivatedAt time.Time
+}
+
+// FrozenBoundaryCharge is the boundary run's Stripe request FROZEN before its
+// first charge (migration 035): the whole-cent amount and whether the line
+// includes advance base/overage (the description determinant). Both feed the
+// deterministic idem keys ii-<run>/inv-<run>, so a reclaimed run reuses this
+// frozen tuple verbatim rather than re-deriving a possibly-drifted live total —
+// keeping every retry's Stripe request byte-identical under the stable key.
+type FrozenBoundaryCharge struct {
+	Cents    int64
+	WithBase bool
 }
 
 // ErrAccountNotFound is returned by UpdateAccountCollection when no accounts row
@@ -282,6 +495,11 @@ type AccountCollection struct {
 	HasSpendCeiling    bool
 	SpendCeilingMicros int64
 	CreatedAt          time.Time
+	// AutoCollectThresholdMicros is the per-account large-charge disclosure
+	// threshold (migration 034), nil when the account uses the platform default
+	// (collection.DefaultAutoCollectThresholdMicros). Resolved AT CHARGE TIME by
+	// collection.IsLargeAutoCollect to freeze the post-hoc disclosure flag.
+	AutoCollectThresholdMicros *int64
 }
 
 // BillingMode mirrors ms_billing.usage_billing_mode (and collection.Mode)
@@ -309,6 +527,11 @@ type InvoiceMirror struct {
 	Currency        string
 	PeriodStart     time.Time
 	PeriodEnd       time.Time
+	// IsLargeAutoCollect is the server-computed post-hoc disclosure flag
+	// (migration 034): true iff the charged amount exceeded the account's
+	// resolved auto-collect threshold WHEN THE CHARGE FIRED. Set by every
+	// off-session charge call site; false for anything below the threshold.
+	IsLargeAutoCollect bool
 }
 
 // RawAggregate is one per-kind aggregated row from the rollup SELECTs, before
@@ -604,12 +827,18 @@ func (s *pgxStore) AccountCollection(ctx context.Context, accountID uuid.UUID) (
 	if err != nil {
 		return AccountCollection{}, err
 	}
+	var autoCollectThreshold *int64
+	if row.AutoCollectThresholdMicros.Valid {
+		v := row.AutoCollectThresholdMicros.Int64
+		autoCollectThreshold = &v
+	}
 	return AccountCollection{
-		Mode:               BillingMode(row.UsageBillingMode),
-		CreditLimitMicros:  row.CreditLimitMicros,
-		HasSpendCeiling:    row.SpendCeilingMicros.Valid,
-		SpendCeilingMicros: row.SpendCeilingMicros.Int64,
-		CreatedAt:          row.CreatedAt,
+		Mode:                       BillingMode(row.UsageBillingMode),
+		CreditLimitMicros:          row.CreditLimitMicros,
+		HasSpendCeiling:            row.SpendCeilingMicros.Valid,
+		SpendCeilingMicros:         row.SpendCeilingMicros.Int64,
+		CreatedAt:                  row.CreatedAt,
+		AutoCollectThresholdMicros: autoCollectThreshold,
 	}, nil
 }
 
@@ -685,14 +914,15 @@ func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {
 		return err
 	}
 	return s.q.UpsertInvoice(ctx, db.UpsertInvoiceParams{
-		AccountID:       inv.AccountID.String(),
-		StripeInvoiceID: inv.StripeInvoiceID,
-		Status:          inv.Status,
-		AmountDue:       due,
-		AmountPaid:      paid,
-		Currency:        inv.Currency,
-		PeriodStart:     pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
-		PeriodEnd:       pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
+		AccountID:          inv.AccountID.String(),
+		StripeInvoiceID:    inv.StripeInvoiceID,
+		Status:             inv.Status,
+		AmountDue:          due,
+		AmountPaid:         paid,
+		Currency:           inv.Currency,
+		PeriodStart:        pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
+		PeriodEnd:          pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
+		IsLargeAutoCollect: inv.IsLargeAutoCollect,
 	})
 }
 
@@ -707,6 +937,52 @@ func (s *pgxStore) MarkBillingRun(ctx context.Context, runID uuid.UUID, status B
 		StripeInvoiceID: pgtype.Text{String: stripeInvoiceID, Valid: stripeInvoiceID != ""},
 		TotalAmount:     total,
 	})
+}
+
+func (s *pgxStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID uuid.UUID) (bool, error) {
+	rows, err := s.q.MarkBillingRunInvoicedIfUnfrozen(ctx, runID.String())
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error) {
+	// WHERE frozen_charge_cents IS NULL (in the query) makes this first-write-wins:
+	// a run that already froze (an earlier attempt, or a CONCURRENT daemon that got
+	// here first) affects 0 rows and keeps the ORIGINAL frozen amount. The read-back
+	// below returns the SURVIVING value regardless of which write won, and the
+	// caller charges THAT — never its locally computed amount — so two racing
+	// processes can never send different bodies under the shared idem keys.
+	if err := s.q.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
+		ID:                   runID.String(),
+		FrozenChargeCents:    pgtype.Int8{Int64: charge.Cents, Valid: true},
+		FrozenChargeWithBase: pgtype.Bool{Bool: charge.WithBase, Valid: true},
+	}); err != nil {
+		return FrozenBoundaryCharge{}, err
+	}
+	surviving, ok, err := s.BillingRunFrozenCharge(ctx, runID)
+	if err != nil {
+		return FrozenBoundaryCharge{}, err
+	}
+	if !ok {
+		return FrozenBoundaryCharge{}, fmt.Errorf("billing run %s has no frozen charge immediately after freezing", runID)
+	}
+	return surviving, nil
+}
+
+func (s *pgxStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) (FrozenBoundaryCharge, bool, error) {
+	row, err := s.q.BillingRunFrozenCharge(ctx, runID.String())
+	if err != nil {
+		return FrozenBoundaryCharge{}, false, err
+	}
+	if !row.FrozenChargeCents.Valid {
+		return FrozenBoundaryCharge{}, false, nil // fresh run — no prior attempt froze
+	}
+	return FrozenBoundaryCharge{
+		Cents:    row.FrozenChargeCents.Int64,
+		WithBase: row.FrozenChargeWithBase.Bool,
+	}, true, nil
 }
 
 func (s *pgxStore) AccountsWithUsageEvents(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
@@ -841,11 +1117,219 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 		AppID:              app,
 		AccountID:          acct,
 		ModuleCount:        int(row.ModuleCount),
+		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
 		ProrationInvoiceID: row.ProrationInvoiceID.String, // "" when NULL (guard unarmed)
+		ProrationSkipped:   row.ProrationSkippedAt.Valid,
+		ProrationAttempted: row.ProrationAttemptedAt.Valid,
 		Deleted:            row.DeletedAt.Valid,
 		DeletedAt:          row.DeletedAt.Time,
 	}, true, nil
+}
+
+func (s *pgxStore) AppsPendingProration(ctx context.Context, createdBefore time.Time) ([]uuid.UUID, error) {
+	rows, err := s.q.AppsPendingProration(ctx, db.AppsPendingProrationParams{
+		CreatedBefore: createdBefore,
+		// hours, not days (D5): the SQL grace cutoff must match the Go legs'
+		// fixed 24h-per-day UTC window regardless of the session timezone.
+		GraceHours: usage.GraceDays * 24,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+// deferredRollback rolls back tx using a short-lived DETACHED context rather
+// than reusing ctx verbatim. ctx may already be cancelled or past its deadline
+// by the time this runs (e.g. the surrounding Lambda invocation timed out
+// while a Stripe call the caller was awaiting stalled) — Rollback on a dead
+// context can fail silently, leaving the row lock / transaction open until
+// Postgres's own dead-connection detection eventually reclaims it. Stripping
+// cancellation (context.WithoutCancel) while keeping request-scoped values,
+// then applying a fresh short timeout, lets cleanup reach Postgres either way.
+func deferredRollback(ctx context.Context, tx pgx.Tx) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = tx.Rollback(rctx) // no-op after a successful Commit
+}
+
+// lockAndReadChargeableApp briefly SELECT ... FOR UPDATE-locks the roster row,
+// re-verifies it is still chargeable (deleted_at IS NULL AND
+// proration_invoice_id IS NULL), and releases the lock (the transaction
+// commits either way — there is nothing left to write once the terminal
+// checks pass, so a plain commit is equivalent to and cheaper than a rollback
+// here). proceed=false means the caller must return (outcome, invID, nil)
+// immediately without invoking charge; proceed=true carries the locked
+// snapshot (including the frozen created_module_count) charge prices from.
+func (s *pgxStore) lockAndReadChargeableApp(ctx context.Context, appID uuid.UUID) (locked AppMirror, outcome ProrationOutcome, invID string, proceed bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AppMirror{}, 0, "", false, err
+	}
+	defer deferredRollback(ctx, tx)
+
+	qtx := s.q.WithTx(tx)
+	row, err := qtx.SelectAppMirrorForUpdate(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AppMirror{}, ProrationLockedNotFound, "", false, nil
+	}
+	if err != nil {
+		return AppMirror{}, 0, "", false, err
+	}
+	// Deleted WITHIN grace = never charged (scenario 1). Deleted AFTER the
+	// grace elapsed SURVIVED it (wave 2, D11) — the creation charge is owed
+	// (grace only delays WHEN it fires; the H2 boundary exclusion means no
+	// other leg has a backstop for this window), so the charge proceeds.
+	if row.DeletedAt.Valid && row.DeletedAt.Time.Before(moduleGraceExpiry(row.CreatedAt.UTC())) {
+		return AppMirror{}, ProrationLockedDeleted, "", false, nil
+	}
+	if row.ProrationInvoiceID.Valid {
+		return AppMirror{}, ProrationLockedAlreadyCharged, row.ProrationInvoiceID.String, false, nil
+	}
+
+	app, err := uuid.Parse(row.AppID)
+	if err != nil {
+		return AppMirror{}, 0, "", false, err
+	}
+	acct, err := uuid.Parse(row.AccountID)
+	if err != nil {
+		return AppMirror{}, 0, "", false, err
+	}
+	locked = AppMirror{
+		AppID:              app,
+		AccountID:          acct,
+		ModuleCount:        int(row.ModuleCount),
+		CreatedModuleCount: int(row.CreatedModuleCount),
+		CreatedAt:          row.CreatedAt,
+		ProrationAttempted: row.ProrationAttemptedAt.Valid,
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return AppMirror{}, 0, "", false, err
+	}
+	return locked, 0, "", true, nil
+}
+
+// persistProrationCharge mirrors a SUCCESSFULLY-created Stripe charge (the
+// invoice, the migration-028 base snapshot, and the one-shot guard) inside one
+// short transaction. Called AFTER the Stripe network call has already
+// completed — the money has already moved — so this always persists on a
+// non-nil pc: a concurrent soft-delete that raced in during the (now-released)
+// window between the lock and this write does NOT unwind an already-succeeded
+// charge (D1e forbids refunds), and a genuinely concurrent second charge
+// attempt for the same app converges on identical values (the deterministic
+// per-app Stripe Idempotency-Keys guarantee the SAME invoice id, and every
+// write here is itself idempotent / first-write-wins).
+func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, pc *ProrationCharge) (ProrationOutcome, string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	due, err := centsNumeric(pc.Invoice.AmountDueCents)
+	if err != nil {
+		return 0, "", err
+	}
+	paid, err := centsNumeric(pc.Invoice.AmountPaidCents)
+	if err != nil {
+		return 0, "", err
+	}
+	if err := qtx.UpsertInvoice(ctx, db.UpsertInvoiceParams{
+		AccountID:       pc.Invoice.AccountID.String(),
+		StripeInvoiceID: pc.Invoice.StripeInvoiceID,
+		Status:          pc.Invoice.Status,
+		AmountDue:       due,
+		AmountPaid:      paid,
+		Currency:        pc.Invoice.Currency,
+		PeriodStart:     pgtype.Timestamptz{Time: pc.Invoice.PeriodStart, Valid: !pc.Invoice.PeriodStart.IsZero()},
+		PeriodEnd:       pgtype.Timestamptz{Time: pc.Invoice.PeriodEnd, Valid: !pc.Invoice.PeriodEnd.IsZero()},
+		// Scenario 5 — the disclosure flag the charge callback computed for the FULL
+		// combined debit (base + co-created overage lines). Dropping it here would
+		// silently write false for every creation/combined invoice.
+		IsLargeAutoCollect: pc.Invoice.IsLargeAutoCollect,
+	}); err != nil {
+		return 0, "", err
+	}
+	if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+		AppID:       pc.Snapshot.AppID.String(),
+		PeriodStart: pc.Snapshot.PeriodStart,
+		PeriodEnd:   pc.Snapshot.PeriodEnd,
+		ModuleCount: int32(pc.Snapshot.ModuleCount), //nolint:gosec // count comes from the locked apps row, whose writers validate 0 ≤ count ≤ maxModuleCount
+		BaseMicros:  pc.Snapshot.BaseMicros,
+	}); err != nil {
+		return 0, "", err
+	}
+	// A creation grace that straddled the period boundary billed the straddled
+	// period IN FULL on this same invoice — freeze its snapshot too (the boundary
+	// leg excluded the app there and writes nothing for that period).
+	if pc.StraddleSnapshot != nil {
+		if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+			AppID:       pc.StraddleSnapshot.AppID.String(),
+			PeriodStart: pc.StraddleSnapshot.PeriodStart,
+			PeriodEnd:   pc.StraddleSnapshot.PeriodEnd,
+			ModuleCount: int32(pc.StraddleSnapshot.ModuleCount), //nolint:gosec // same validated apps-row count as above
+			BaseMicros:  pc.StraddleSnapshot.BaseMicros,
+		}); err != nil {
+			return 0, "", err
+		}
+	}
+	// Arm the one-shot guard. First-write-wins (WHERE proration_invoice_id IS
+	// NULL): a concurrent second attempt for the same app affects 0 rows here
+	// and keeps the winner's (identical, by construction) invoice id.
+	if _, err := qtx.SetAppProrationInvoice(ctx, db.SetAppProrationInvoiceParams{
+		AppID:              appID.String(),
+		ProrationInvoiceID: pgtype.Text{String: pc.InvoiceID, Valid: true},
+	}); err != nil {
+		return 0, "", err
+	}
+
+	// Scenario 3 — stamp the co-created over-module timers billed on this SAME
+	// combined invoice as terminally charged, in the SAME transaction as the guard
+	// arm (all-or-nothing: an over-module and the app base are marked together).
+	// WHERE grace_resolved = false is first-write-wins — a Leg 1 sweep that already
+	// resolved a timer (its own invoice) affects 0 rows here, keeping the winner's ids.
+	for _, tc := range pc.TimerCharges {
+		if err := qtx.MarkModuleTimerCharged(ctx, db.MarkModuleTimerChargedParams{
+			TimerID:            tc.TimerID.String(),
+			GraceChargedAt:     tc.ChargedAt,
+			GraceInvoiceID:     pgtype.Text{String: tc.InvoiceID, Valid: tc.InvoiceID != ""},
+			GraceInvoiceItemID: pgtype.Text{String: tc.InvoiceItemID, Valid: tc.InvoiceItemID != ""},
+		}); err != nil {
+			return 0, "", err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, "", err
+	}
+	return ProrationLockedCharged, pc.InvoiceID, nil
+}
+
+func (s *pgxStore) ChargeProrationLocked(ctx context.Context, appID uuid.UUID, charge func(AppMirror) (*ProrationCharge, error)) (ProrationOutcome, string, error) {
+	// Phase 1: lock just long enough to read + verify chargeable state, then
+	// release — never held across the Stripe call below.
+	locked, outcome, invID, proceed, err := s.lockAndReadChargeableApp(ctx, appID)
+	if err != nil {
+		return 0, "", err
+	}
+	if !proceed {
+		return outcome, invID, nil
+	}
+
+	// Phase 2: the Stripe network calls, OUTSIDE any lock or transaction.
+	pc, err := charge(locked)
+	if err != nil {
+		return 0, "", err // guard unarmed → the next sweep retries (idem keys)
+	}
+	if pc == nil {
+		return ProrationLockedNoCharge, "", nil // 0 cents — nothing to invoice
+	}
+
+	// Phase 3: persist the successful charge.
+	return s.persistProrationCharge(ctx, appID, pc)
 }
 
 func (s *pgxStore) SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, stripeInvoiceID string) error {
@@ -856,6 +1340,13 @@ func (s *pgxStore) SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, 
 		AppID:              appID.String(),
 		ProrationInvoiceID: pgtype.Text{String: stripeInvoiceID, Valid: true},
 	})
+	return err
+}
+
+func (s *pgxStore) SetAppProrationSkipped(ctx context.Context, appID uuid.UUID) error {
+	// 0 rows = already marked, or already charged in the meantime — neither is
+	// an error: the marker is a one-shot, first-write-wins terminal state.
+	_, err := s.q.SetAppProrationSkipped(ctx, appID.String())
 	return err
 }
 
@@ -875,10 +1366,13 @@ func (s *pgxStore) MarkAppDeleted(ctx context.Context, appID uuid.UUID) error {
 	return err
 }
 
-func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error) {
+func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time, graceDays int) ([]AppModuleCount, error) {
 	rows, err := s.q.LiveAppModuleCountsCreatedBefore(ctx, db.LiveAppModuleCountsCreatedBeforeParams{
-		AccountID: accountID.String(),
-		CreatedAt: createdBefore,
+		AccountID:     accountID.String(),
+		CreatedBefore: createdBefore,
+		// hours, not days (wave 2, D5): keeps the SQL cutoff identical to the Go
+		// legs' fixed 24h-per-day UTC grace regardless of the session timezone.
+		GraceHours: int32(graceDays) * 24, //nolint:gosec // graceDays is the small GraceDays const (3)
 	})
 	if err != nil {
 		return nil, err
@@ -915,6 +1409,247 @@ func (s *pgxStore) InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSn
 		BaseMicros:  snap.BaseMicros,
 	})
 	return err
+}
+
+// --- per-module-instance overage timers (migration 033) --------------------
+
+func (s *pgxStore) LiveModuleTimerCountForApp(ctx context.Context, appID uuid.UUID) (int, error) {
+	n, err := s.q.LiveModuleTimerCountForApp(ctx, appID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (s *pgxStore) InsertModuleOverageTimers(ctx context.Context, accountID, appID uuid.UUID, installedAt, graceExpiresAt time.Time, n int) error {
+	if n <= 0 {
+		return nil // generate_series(1, 0) would be a no-op anyway; skip the round-trip
+	}
+	return s.q.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
+		AccountID:      accountID.String(),
+		AppID:          appID.String(),
+		InstalledAt:    installedAt,
+		GraceExpiresAt: graceExpiresAt,
+		Count:          int32(n), //nolint:gosec // n = a module_count delta, bounded by maxModuleCount (100000), far below int32 max
+	})
+}
+
+func (s *pgxStore) MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) error {
+	return s.q.MarkModuleTimerChargeAttempted(ctx, db.MarkModuleTimerChargeAttemptedParams{
+		ID:                timerID.String(),
+		ChargeAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
+	})
+}
+
+func (s *pgxStore) ModuleTimerStillPending(ctx context.Context, timerID uuid.UUID) (bool, error) {
+	pending, err := s.q.ModuleTimerStillPending(ctx, timerID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // the row vanished — certainly not pending
+	}
+	return pending, err
+}
+
+func (s *pgxStore) MarkAppProrationAttempted(ctx context.Context, appID uuid.UUID, at time.Time) error {
+	return s.q.MarkAppProrationAttempted(ctx, db.MarkAppProrationAttemptedParams{
+		AppID:                appID.String(),
+		ProrationAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
+	})
+}
+
+// lockModuleTimers takes the per-app advisory xact lock every timer-set writer
+// serializes on. Released automatically on commit/rollback.
+func lockModuleTimers(ctx context.Context, tx pgx.Tx, appID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "module-timers:"+appID.String())
+	return err
+}
+
+// ReconcileModuleTimersToTarget — roster read + count + write in ONE
+// transaction serialized by the per-app advisory xact lock, so concurrent
+// RegisterApp/SyncAppModules retries can never both observe the same live
+// count and double-insert (H7), a stale caller can never impose an outdated
+// target (D8 — the target is the row's CURRENT module_count, read under the
+// lock), and a deleted row reconciles to zero instead of resurrecting (D9).
+func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	if err := lockModuleTimers(ctx, tx, appID); err != nil {
+		return err
+	}
+	row, err := qtx.SelectAppMirror(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // no roster row — nothing to reconcile against
+	}
+	if err != nil {
+		return err
+	}
+	target := int64(row.ModuleCount)
+	if row.DeletedAt.Valid {
+		target = 0 // deleted apps hold no live timers — remove orphans, never insert
+	}
+	live, err := qtx.LiveModuleTimerCountForApp(ctx, appID.String())
+	if err != nil {
+		return err
+	}
+	switch {
+	case target > live:
+		if err := qtx.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
+			AccountID:      row.AccountID,
+			AppID:          appID.String(),
+			InstalledAt:    installedAt,
+			GraceExpiresAt: graceExpiresAt,
+			Count:          int32(target - live), //nolint:gosec // bounded by maxModuleCount (100000)
+		}); err != nil {
+			return err
+		}
+	case target < live:
+		if err := qtx.SoftRemoveNewestModuleTimers(ctx, db.SoftRemoveNewestModuleTimersParams{
+			AppID:      appID.String(),
+			RemovedAt:  removedAt,
+			LimitCount: int32(live - target), //nolint:gosec // bounded by maxModuleCount (100000)
+		}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// MarkAppDeletedAndRemoveTimers — the deletion write and the timer soft-remove
+// in ONE transaction under the SAME advisory lock (wave 2, D9): no crash
+// window between them, and no interleaving with a concurrent reconcile.
+func (s *pgxStore) MarkAppDeletedAndRemoveTimers(ctx context.Context, appID uuid.UUID, removedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	if err := lockModuleTimers(ctx, tx, appID); err != nil {
+		return err
+	}
+	if _, err := qtx.MarkAppDeleted(ctx, appID.String()); err != nil {
+		return err
+	}
+	if err := qtx.SoftRemoveAllModuleTimersForApp(ctx, db.SoftRemoveAllModuleTimersForAppParams{
+		AppID:     appID.String(),
+		RemovedAt: pgtype.Timestamptz{Time: removedAt, Valid: true},
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *pgxStore) SoftRemoveNewestModuleTimers(ctx context.Context, appID uuid.UUID, n int, removedAt time.Time) error {
+	if n <= 0 {
+		return nil
+	}
+	return s.q.SoftRemoveNewestModuleTimers(ctx, db.SoftRemoveNewestModuleTimersParams{
+		AppID:      appID.String(),
+		LimitCount: int32(n), //nolint:gosec // n = a module_count delta, bounded by maxModuleCount (100000), far below int32 max
+		RemovedAt:  removedAt,
+	})
+}
+
+func (s *pgxStore) SoftRemoveAllModuleTimersForApp(ctx context.Context, appID uuid.UUID, removedAt time.Time) error {
+	return s.q.SoftRemoveAllModuleTimersForApp(ctx, db.SoftRemoveAllModuleTimersForAppParams{
+		AppID:     appID.String(),
+		RemovedAt: pgtype.Timestamptz{Time: removedAt, Valid: true},
+	})
+}
+
+func (s *pgxStore) ModuleOverageTimersPastGrace(ctx context.Context, at time.Time) ([]ModuleOverageCandidate, error) {
+	rows, err := s.q.ModuleOverageTimersPastGrace(ctx, at)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ModuleOverageCandidate, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		acct, err := uuid.Parse(r.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		app, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return nil, err
+		}
+		// The query filters activated_at IS NOT NULL, so a non-Valid value here is
+		// a driver anomaly; skip it defensively rather than anchor on the zero time.
+		if !r.ActivatedAt.Valid {
+			continue
+		}
+		cand := ModuleOverageCandidate{
+			ID:             id,
+			AccountID:      acct,
+			AppID:          app,
+			InstalledAt:    r.InstalledAt,
+			GraceExpiresAt: r.GraceExpiresAt,
+			ActivatedAt:    r.ActivatedAt.Time,
+		}
+		if r.ChargeAttemptedAt.Valid {
+			cand.ChargeAttemptedAt = r.ChargeAttemptedAt.Time
+		}
+		out = append(out, cand)
+	}
+	return out, nil
+}
+
+func (s *pgxStore) LiveModuleTimerRankBefore(ctx context.Context, accountID, timerID uuid.UUID, installedAt time.Time) (int, error) {
+	rank, err := s.q.LiveModuleTimerRankBefore(ctx, db.LiveModuleTimerRankBeforeParams{
+		AccountID:   accountID.String(),
+		InstalledAt: installedAt,
+		TimerID:     timerID.String(),
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(rank), nil
+}
+
+func (s *pgxStore) MarkModuleTimerIncluded(ctx context.Context, timerID uuid.UUID) error {
+	return s.q.MarkModuleTimerIncluded(ctx, timerID.String())
+}
+
+func (s *pgxStore) MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error {
+	return s.q.MarkModuleTimerCharged(ctx, db.MarkModuleTimerChargedParams{
+		TimerID:            timerID.String(),
+		GraceChargedAt:     chargedAt,
+		GraceInvoiceID:     pgtype.Text{String: invoiceID, Valid: invoiceID != ""},
+		GraceInvoiceItemID: pgtype.Text{String: invoiceItemID, Valid: invoiceItemID != ""},
+	})
+}
+
+func (s *pgxStore) CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
+	n, err := s.q.CountOngoingOverModuleTimers(ctx, db.CountOngoingOverModuleTimersParams{
+		AccountID:       accountID.String(),
+		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is the small IncludedModules const (5)
+		PeriodEnd:       periodEnd,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (s *pgxStore) CoCreatedOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error) {
+	ids, err := s.q.CoCreatedOverModuleTimers(ctx, db.CoCreatedOverModuleTimersParams{
+		AccountID:       accountID.String(),
+		AppID:           appID.String(),
+		CreatedAt:       createdAt,
+		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is the small IncludedModules const (5)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(ids)
 }
 
 // parseUUIDs parses a slice of UUID-as-string account ids (the form the sqlc

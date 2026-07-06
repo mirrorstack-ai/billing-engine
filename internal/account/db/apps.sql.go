@@ -12,6 +12,54 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const appsPendingProration = `-- name: AppsPendingProration :many
+SELECT app_id
+FROM ms_billing.apps
+WHERE created_at <= $1::timestamptz
+  AND proration_invoice_id IS NULL
+  AND (deleted_at IS NULL
+       OR deleted_at >= created_at + make_interval(hours => $2::int))
+  AND proration_skipped_at IS NULL
+ORDER BY created_at
+`
+
+type AppsPendingProrationParams struct {
+	CreatedBefore time.Time `json:"created_before"`
+	GraceHours    int32     `json:"grace_hours"`
+}
+
+// AppsPendingProration is the creation-proration sweep's work list: apps that
+// have survived the grace window (@created_before = now() − GraceDays) and were
+// never charged their creation-period base. proration_invoice_id IS NULL is the
+// one-shot guard (an already-charged app drops out); the deleted_at predicate
+// excludes ONLY apps soft-deleted WITHIN their grace (never charged, scenario
+// 1) — an app deleted AFTER its grace elapsed SURVIVED it and still owes the
+// creation charge (wave 2, D11: grace only delays WHEN the charge fires, and
+// the H2 boundary exclusion leaves no other leg as a backstop; pre-fix this
+// was a user-timable ~$22 dodge in the grace-elapse→sweep window). Grace in
+// HOURS (D5 — session-TZ/DST safety). proration_skipped_at IS NULL excludes
+// apps permanently skipped as a would-be retroactive catch-up (migration 031,
+// D1d). Ordered by created_at so the oldest pending app charges first.
+func (q *Queries) AppsPendingProration(ctx context.Context, arg AppsPendingProrationParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, appsPendingProration, arg.CreatedBefore, arg.GraceHours)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var app_id string
+		if err := rows.Scan(&app_id); err != nil {
+			return nil, err
+		}
+		items = append(items, app_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertAdvanceBaseSnapshot = `-- name: InsertAdvanceBaseSnapshot :execrows
 INSERT INTO ms_billing.app_base_snapshots
     (app_id, period_start, period_end, module_count, base_micros, source)
@@ -49,8 +97,8 @@ func (q *Queries) InsertAdvanceBaseSnapshot(ctx context.Context, arg InsertAdvan
 
 const insertAppMirror = `-- name: InsertAppMirror :execrows
 
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_at)
-VALUES ($1, $2, $3, $4)
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at)
+VALUES ($1, $2, $3, $3, $4)
 ON CONFLICT (app_id) DO NOTHING
 `
 
@@ -67,10 +115,14 @@ type InsertAppMirrorParams struct {
 // the installed-module-count snapshot, and the one-shot proration guard.
 // InsertAppMirror registers an app row idempotently: ON CONFLICT (app_id) DO
 // NOTHING so a RegisterApp retry (or a concurrent double-fire) never rewrites
-// created_at / module_count / the proration guard of the original insert —
-// the FIRST registration's values are the stable proration anchor. :execrows
-// so the caller can tell a fresh insert (1) from a retry no-op (0), though
-// both are success.
+// created_at / module_count / created_module_count / the proration guard of
+// the original insert — the FIRST registration's values are the stable
+// proration anchor. created_module_count is stamped from the SAME $3 value as
+// module_count and NEVER written again by any other query (migration 030) —
+// it is the frozen count ChargeCreationProration prices its historical window
+// from, immune to a later SyncAppModules install/uninstall during grace.
+// :execrows so the caller can tell a fresh insert (1) from a retry no-op (0),
+// though both are success.
 func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertAppMirror,
 		arg.AppID,
@@ -87,14 +139,16 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 const liveAppModuleCountsCreatedBefore = `-- name: LiveAppModuleCountsCreatedBefore :many
 SELECT app_id, module_count
 FROM ms_billing.apps
-WHERE account_id = $1
+WHERE account_id = $1::uuid
   AND deleted_at IS NULL
-  AND created_at < $2
+  AND created_at < $2::timestamptz
+  AND created_at + make_interval(hours => $3::int) < $2::timestamptz
 `
 
 type LiveAppModuleCountsCreatedBeforeParams struct {
-	AccountID string    `json:"account_id"`
-	CreatedAt time.Time `json:"created_at"`
+	AccountID     string    `json:"account_id"`
+	CreatedBefore time.Time `json:"created_before"`
+	GraceHours    int32     `json:"grace_hours"`
 }
 
 type LiveAppModuleCountsCreatedBeforeRow struct {
@@ -103,20 +157,37 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 }
 
 // LiveAppModuleCountsCreatedBefore returns (app_id, module_count) for every
-// LIVE (deleted_at IS NULL) app on the account created STRICTLY BEFORE the
-// cutoff — the boundary charge's advance-base input:
+// LIVE (deleted_at IS NULL) app on the account that has JOINED the advance
+// base mechanism by the cutoff — the boundary charge's advance-base input:
 // advance base = Σ (BaseFee + Overage × max(0, module_count − included)).
-// The cutoff is the NEW period's start (the closed window's period_end): an
-// app created INSIDE the new period is excluded, because RegisterApp's
-// creation-proration leg already charged that app's new-period base (full or
-// prorated) — summing it here would double-bill the same period (same-day
-// cron race, and deterministically on reclaimed skipped_no_pm/failed runs).
-// Such an app joins the advance leg at the NEXT boundary. Deleted apps are
-// excluded (D1e); an account with no rows (pre-backfill) sums to base 0 and
-// keeps the pre-027 arrears-only invoice. app_id is returned so the charge
-// leg can write the per-app-period base snapshot (migration 028) it bills.
+// The cutoff is the NEW period's start (the closed window's period_end). Two
+// conditions, mirroring the module-timer coverage contract (review 2026-07-06):
+//   - created_at < @created_before — an app created INSIDE the new period is
+//     excluded, because RegisterApp's creation-proration leg already charged
+//     that app's new-period base (full or prorated) — summing it here would
+//     double-bill the same period (same-day cron race, and deterministically
+//     on reclaimed skipped_no_pm/failed runs).
+//   - created_at + grace < @created_before — an app whose CREATION GRACE had
+//     not yet elapsed when the new period opened is excluded: it has not
+//     survived grace yet (an app deleted in grace is NEVER charged, scenario
+//     1 — precharging its next-period base here would bill a full month for
+//     an app that can still be deleted for free), and when it does survive,
+//     its creation-proration charge covers through the END of the period its
+//     grace elapses into (the straddled period), so this boundary's new
+//     period is already that leg's coverage. Spec: apps "join this boundary
+//     mechanism starting at the NEXT boundary after their own creation charge
+//     fires".
+//
+// Deleted apps are excluded (D1e); an account with no rows (pre-backfill)
+// sums to base 0 and keeps the pre-027 arrears-only invoice. app_id is
+// returned so the charge leg can write the per-app-period base snapshot
+// (migration 028) it bills. The grace interval is expressed in HOURS, not
+// days (wave 2, D5): timestamptz + a day-interval is evaluated in the SESSION
+// timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
+// UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
+// by an hour around DST and double-bill or gap a whole period.
 func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg LiveAppModuleCountsCreatedBeforeParams) ([]LiveAppModuleCountsCreatedBeforeRow, error) {
-	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedAt)
+	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedBefore, arg.GraceHours)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +222,26 @@ func (q *Queries) MarkAppDeleted(ctx context.Context, appID string) (int64, erro
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const markAppProrationAttempted = `-- name: MarkAppProrationAttempted :exec
+UPDATE ms_billing.apps
+SET proration_attempted_at = $2
+WHERE app_id = $1
+  AND proration_attempted_at IS NULL
+`
+
+type MarkAppProrationAttemptedParams struct {
+	AppID                string             `json:"app_id"`
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
+}
+
+// MarkAppProrationAttempted stamps the recovery marker (036) BEFORE a
+// creation-proration charge attempt's first Stripe call. First-write-wins
+// (the FIRST attempt instant is the durable one); never cleared.
+func (q *Queries) MarkAppProrationAttempted(ctx context.Context, arg MarkAppProrationAttemptedParams) error {
+	_, err := q.db.Exec(ctx, markAppProrationAttempted, arg.AppID, arg.ProrationAttemptedAt)
+	return err
 }
 
 const mirroredAppIDsOverlappingWindow = `-- name: MirroredAppIDsOverlappingWindow :many
@@ -234,18 +325,22 @@ func (q *Queries) SelectAppBaseSnapshot(ctx context.Context, arg SelectAppBaseSn
 }
 
 const selectAppMirror = `-- name: SelectAppMirror :one
-SELECT app_id, account_id, module_count, created_at, proration_invoice_id, deleted_at
+SELECT app_id, account_id, module_count, created_module_count, created_at,
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1
 `
 
 type SelectAppMirrorRow struct {
-	AppID              string             `json:"app_id"`
-	AccountID          string             `json:"account_id"`
-	ModuleCount        int32              `json:"module_count"`
-	CreatedAt          time.Time          `json:"created_at"`
-	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
-	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
+	AppID                string             `json:"app_id"`
+	AccountID            string             `json:"account_id"`
+	ModuleCount          int32              `json:"module_count"`
+	CreatedModuleCount   int32              `json:"created_module_count"`
+	CreatedAt            time.Time          `json:"created_at"`
+	ProrationInvoiceID   pgtype.Text        `json:"proration_invoice_id"`
+	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 }
 
 // SelectAppMirror reads one roster row (deleted or not — the caller decides
@@ -258,8 +353,56 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 		&i.AppID,
 		&i.AccountID,
 		&i.ModuleCount,
+		&i.CreatedModuleCount,
 		&i.CreatedAt,
 		&i.ProrationInvoiceID,
+		&i.ProrationSkippedAt,
+		&i.ProrationAttemptedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const selectAppMirrorForUpdate = `-- name: SelectAppMirrorForUpdate :one
+SELECT app_id, account_id, module_count, created_module_count, created_at,
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
+FROM ms_billing.apps
+WHERE app_id = $1
+FOR UPDATE
+`
+
+type SelectAppMirrorForUpdateRow struct {
+	AppID                string             `json:"app_id"`
+	AccountID            string             `json:"account_id"`
+	ModuleCount          int32              `json:"module_count"`
+	CreatedModuleCount   int32              `json:"created_module_count"`
+	CreatedAt            time.Time          `json:"created_at"`
+	ProrationInvoiceID   pgtype.Text        `json:"proration_invoice_id"`
+	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+}
+
+// SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
+// the creation-proration charge's race-safety primitive. The charge locks the
+// row here just long enough to re-verify deleted_at IS NULL and
+// proration_invoice_id IS NULL and read the frozen created_module_count,
+// releasing the lock immediately after (ChargeProrationLocked runs the actual
+// Stripe network call OUTSIDE this lock — see store.go); a concurrent
+// SyncAppModules soft-delete (MarkAppDeleted) only ever contends for the brief
+// read, never for the duration of a Stripe HTTP call.
+func (q *Queries) SelectAppMirrorForUpdate(ctx context.Context, appID string) (SelectAppMirrorForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, selectAppMirrorForUpdate, appID)
+	var i SelectAppMirrorForUpdateRow
+	err := row.Scan(
+		&i.AppID,
+		&i.AccountID,
+		&i.ModuleCount,
+		&i.CreatedModuleCount,
+		&i.CreatedAt,
+		&i.ProrationInvoiceID,
+		&i.ProrationSkippedAt,
+		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
 	)
 	return i, err
@@ -309,6 +452,29 @@ type SetAppProrationInvoiceParams struct {
 // :execrows so the caller can observe (and tolerate) the already-set case.
 func (q *Queries) SetAppProrationInvoice(ctx context.Context, arg SetAppProrationInvoiceParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setAppProrationInvoice, arg.AppID, arg.ProrationInvoiceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setAppProrationSkipped = `-- name: SetAppProrationSkipped :execrows
+UPDATE ms_billing.apps
+SET proration_skipped_at = now()
+WHERE app_id = $1
+  AND proration_skipped_at IS NULL
+  AND proration_invoice_id IS NULL
+`
+
+// SetAppProrationSkipped arms the PERMANENT skip marker (migration 031, D1d):
+// the account only activated at/after this app's anchored creation period had
+// already closed, so charging it now would be a retroactive catch-up. The
+// WHERE clause makes it idempotent (a re-evaluation, or a concurrent one,
+// affects 0 rows once set) and defensively refuses to mark an app that was
+// somehow already charged in the meantime. :execrows so the caller can
+// observe (and tolerate) the already-set / already-charged cases.
+func (q *Queries) SetAppProrationSkipped(ctx context.Context, appID string) (int64, error) {
+	result, err := q.db.Exec(ctx, setAppProrationSkipped, appID)
 	if err != nil {
 		return 0, err
 	}

@@ -13,24 +13,27 @@ func day(y int, m time.Month, d int) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
-// --- AppBaseFeeMicros: overage tier boundaries ------------------------------
+// --- AccountOverageMicros: account-wide POOLED overage tier boundaries -------
 
-func TestAppBaseFeeMicros_OverageBoundaries(t *testing.T) {
-	// Owner spec 2026-07-05: base + $3 × max(0, count − 5). The boundary cases
-	// pin the tier edges: 5 included modules cost nothing extra, the 6th costs
-	// exactly one overage, 0 modules never discount below the base.
+func TestAccountOverageMicros_PooledBoundaries(t *testing.T) {
+	// Owner spec 2026-07-05 / migration 032: $3 × max(0, pooledCount − 5), where
+	// pooledCount is Σ live-app module_count for the WHOLE account. The boundary
+	// cases pin the tier edges: ≤5 pooled modules cost nothing, the 6th costs
+	// exactly one overage, and the overage is NOT the flat base (it is the
+	// account-level surcharge only).
 	for _, tc := range []struct {
-		name  string
-		count int
-		want  int64
+		name   string
+		pooled int
+		want   int64
 	}{
-		{"zero modules → flat base (no negative overage)", 0, usage.BaseFeeMicros},
-		{"exactly included (5) → flat base", usage.IncludedModules, usage.BaseFeeMicros},
-		{"included+1 (6) → one $3 overage", usage.IncludedModules + 1, usage.BaseFeeMicros + usage.ModuleOverageFeeMicros},
-		{"included+10 → ten overages", usage.IncludedModules + 10, usage.BaseFeeMicros + 10*usage.ModuleOverageFeeMicros},
+		{"zero pooled → no overage", 0, 0},
+		{"under pool (3) → no overage", 3, 0},
+		{"exactly included (5) → no overage", usage.IncludedModules, 0},
+		{"included+1 (6) → one $3 overage", usage.IncludedModules + 1, usage.ModuleOverageFeeMicros},
+		{"included+10 → ten overages", usage.IncludedModules + 10, 10 * usage.ModuleOverageFeeMicros},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, usage.AppBaseFeeMicros(usage.BaseFeeMicros, tc.count))
+			require.Equal(t, tc.want, usage.AccountOverageMicros(tc.pooled))
 		})
 	}
 }
@@ -122,12 +125,4 @@ func TestProratedBaseMicros_ClampedAnchorMonth(t *testing.T) {
 	// remain 30 → round_half_up(20e6 × 30/31) = 19_354_839 (…838.7 rounds up).
 	got = usage.ProratedBaseMicros(usage.BaseFeeMicros, day(2026, 3, 1), day(2026, 2, 28), day(2026, 3, 31))
 	require.EqualValues(t, 19_354_839, got)
-}
-
-func TestProratedBaseMicros_ProratesTheOverageToo(t *testing.T) {
-	// The prorated amount is the FULL app base (base + overage), not the flat
-	// fee: 7 modules → 26e6; half of a 30-day period (15 days) → 13e6.
-	appBase := usage.AppBaseFeeMicros(usage.BaseFeeMicros, 7)
-	got := usage.ProratedBaseMicros(appBase, day(2026, 6, 19), day(2026, 6, 4), day(2026, 7, 4))
-	require.EqualValues(t, 13_000_000, got)
 }

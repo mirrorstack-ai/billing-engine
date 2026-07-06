@@ -17,16 +17,18 @@ SELECT
     usage_billing_mode,
     credit_limit_micros,
     spend_ceiling_micros,
+    auto_collect_threshold_micros,
     created_at
 FROM ms_billing.accounts
 WHERE id = $1
 `
 
 type AccountCollectionFieldsRow struct {
-	UsageBillingMode   MsBillingUsageBillingMode `json:"usage_billing_mode"`
-	CreditLimitMicros  int64                     `json:"credit_limit_micros"`
-	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
-	CreatedAt          time.Time                 `json:"created_at"`
+	UsageBillingMode           MsBillingUsageBillingMode `json:"usage_billing_mode"`
+	CreditLimitMicros          int64                     `json:"credit_limit_micros"`
+	SpendCeilingMicros         pgtype.Int8               `json:"spend_ceiling_micros"`
+	AutoCollectThresholdMicros pgtype.Int8               `json:"auto_collect_threshold_micros"`
+	CreatedAt                  time.Time                 `json:"created_at"`
 }
 
 // AccountCollectionFields loads the risk-graded collection controls for the
@@ -35,7 +37,10 @@ type AccountCollectionFieldsRow struct {
 // limit. created_at is returned so the risk-judge can compute account tenure
 // WITHOUT a cross-schema read into ms_account (billing-engine never reads
 // ms_account tables). spend_ceiling_micros is NULL when no ceiling is set; the
-// Go layer carries it as a nullable.
+// Go layer carries it as a nullable. auto_collect_threshold_micros (migration
+// 031) is NULL when the account uses the platform default; the charge leg
+// resolves it to collection.DefaultAutoCollectThresholdMicros AT CHARGE TIME to
+// decide the post-hoc large-charge disclosure flag.
 func (q *Queries) AccountCollectionFields(ctx context.Context, id string) (AccountCollectionFieldsRow, error) {
 	row := q.db.QueryRow(ctx, accountCollectionFields, id)
 	var i AccountCollectionFieldsRow
@@ -43,6 +48,7 @@ func (q *Queries) AccountCollectionFields(ctx context.Context, id string) (Accou
 		&i.UsageBillingMode,
 		&i.CreditLimitMicros,
 		&i.SpendCeilingMicros,
+		&i.AutoCollectThresholdMicros,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -246,6 +252,56 @@ func (q *Queries) ActivatedAccounts(ctx context.Context) ([]ActivatedAccountsRow
 	return items, nil
 }
 
+const billingRunFrozenCharge = `-- name: BillingRunFrozenCharge :one
+SELECT frozen_charge_cents, frozen_charge_with_base
+FROM ms_billing.billing_runs
+WHERE id = $1
+`
+
+type BillingRunFrozenChargeRow struct {
+	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+}
+
+// BillingRunFrozenCharge reads a run's frozen boundary-charge amount + description
+// determinant (set by a prior attempt's FreezeBillingRunCharge). Both are NULL
+// when no prior attempt reached the Stripe charge (a fresh run), so the caller
+// freezes the freshly-computed values and charges them; on a reclaim they are the
+// amount already charged, which the retry REUSES verbatim.
+func (q *Queries) BillingRunFrozenCharge(ctx context.Context, id string) (BillingRunFrozenChargeRow, error) {
+	row := q.db.QueryRow(ctx, billingRunFrozenCharge, id)
+	var i BillingRunFrozenChargeRow
+	err := row.Scan(&i.FrozenChargeCents, &i.FrozenChargeWithBase)
+	return i, err
+}
+
+const freezeBillingRunCharge = `-- name: FreezeBillingRunCharge :exec
+UPDATE ms_billing.billing_runs
+SET frozen_charge_cents     = $2,
+    frozen_charge_with_base = $3
+WHERE id = $1
+  AND frozen_charge_cents IS NULL
+`
+
+type FreezeBillingRunChargeParams struct {
+	ID                   string      `json:"id"`
+	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+}
+
+// FreezeBillingRunCharge records, BEFORE the boundary Stripe charge, the exact
+// whole-cent amount AND the base/overage description determinant this run will
+// send Stripe under the deterministic idem keys ii-<run> / inv-<run> (migration
+// 035). First-write-wins (WHERE frozen_charge_cents IS NULL): a reclaimed run that
+// already froze keeps its ORIGINAL values, so a retry that recomputed a different
+// LIVE total can never send Stripe a mismatched request under the same idem key.
+// InsertBillingRun's ON CONFLICT DO UPDATE deliberately leaves these columns
+// untouched, so the freeze survives the reclaim.
+func (q *Queries) FreezeBillingRunCharge(ctx context.Context, arg FreezeBillingRunChargeParams) error {
+	_, err := q.db.Exec(ctx, freezeBillingRunCharge, arg.ID, arg.FrozenChargeCents, arg.FrozenChargeWithBase)
+	return err
+}
+
 const hasUsableDefaultPM = `-- name: HasUsableDefaultPM :one
 SELECT EXISTS (
     SELECT 1
@@ -365,6 +421,32 @@ func (q *Queries) MarkBillingRun(ctx context.Context, arg MarkBillingRunParams) 
 	return err
 }
 
+const markBillingRunInvoicedIfUnfrozen = `-- name: MarkBillingRunInvoicedIfUnfrozen :execrows
+UPDATE ms_billing.billing_runs
+SET status            = 'invoiced',
+    stripe_invoice_id = NULL,
+    total_amount      = 0
+WHERE id = $1
+  AND frozen_charge_cents IS NULL
+`
+
+// MarkBillingRunInvoicedIfUnfrozen is the ZERO-SKIP terminal mark (review
+// 2026-07-06 wave 2, D7): marking a run 'invoiced' with NO Stripe call is only
+// safe while no attempt has committed to a charge. Under the two-daemons model
+// (H6), a concurrent reclaim can freeze + charge between this process's
+// top-of-run frozen read and its zero-skip; an unguarded terminal mark would
+// bury that charge forever ('invoiced' blocks all future reclaims). The
+// frozen_charge_cents IS NULL guard makes the stale zero-skip LOSE: 0 rows →
+// the caller errors out, the run stays reclaimable, and the next reclaim
+// reconciles the frozen charge.
+func (q *Queries) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, markBillingRunInvoicedIfUnfrozen, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const periodChargedTotal = `-- name: PeriodChargedTotal :one
 SELECT COALESCE(SUM(ua.charged_micros), 0)::bigint AS total_micros
 FROM ms_billing.usage_aggregates ua
@@ -427,35 +509,42 @@ const upsertInvoice = `-- name: UpsertInvoice :exec
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
-    period_start, period_end
+    period_start, period_end, is_large_auto_collect
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8
+    $1, $2, $3, $4, $5, $6, $7, $8, $9
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
-    status       = EXCLUDED.status,
-    amount_due   = EXCLUDED.amount_due,
-    amount_paid  = EXCLUDED.amount_paid,
-    currency     = EXCLUDED.currency,
-    period_start = EXCLUDED.period_start,
-    period_end   = EXCLUDED.period_end
+    status                = EXCLUDED.status,
+    amount_due            = EXCLUDED.amount_due,
+    amount_paid           = EXCLUDED.amount_paid,
+    currency              = EXCLUDED.currency,
+    period_start          = EXCLUDED.period_start,
+    period_end            = EXCLUDED.period_end,
+    is_large_auto_collect = EXCLUDED.is_large_auto_collect
 `
 
 type UpsertInvoiceParams struct {
-	AccountID       string             `json:"account_id"`
-	StripeInvoiceID string             `json:"stripe_invoice_id"`
-	Status          string             `json:"status"`
-	AmountDue       pgtype.Numeric     `json:"amount_due"`
-	AmountPaid      pgtype.Numeric     `json:"amount_paid"`
-	Currency        string             `json:"currency"`
-	PeriodStart     pgtype.Timestamptz `json:"period_start"`
-	PeriodEnd       pgtype.Timestamptz `json:"period_end"`
+	AccountID          string             `json:"account_id"`
+	StripeInvoiceID    string             `json:"stripe_invoice_id"`
+	Status             string             `json:"status"`
+	AmountDue          pgtype.Numeric     `json:"amount_due"`
+	AmountPaid         pgtype.Numeric     `json:"amount_paid"`
+	Currency           string             `json:"currency"`
+	PeriodStart        pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd          pgtype.Timestamptz `json:"period_end"`
+	IsLargeAutoCollect bool               `json:"is_large_auto_collect"`
 }
 
 // UpsertInvoice mirrors a Stripe invoice into ms_billing.invoices, keyed on the
 // UNIQUE stripe_invoice_id so a re-run (deterministic Stripe Idempotency-Key
 // returns the same invoice) upserts the same row rather than duplicating it.
 // Webhook reconciliation (PR #7) later updates status + amount_paid in place.
+// is_large_auto_collect (migration 034) is the server-computed post-hoc
+// disclosure flag, frozen at invoice-create time from the amount charged vs the
+// account threshold that applied WHEN THE CHARGE FIRED. A deterministic re-run
+// (same Stripe idem key → same invoice, same charged amount) re-computes the same
+// value, so carrying it through EXCLUDED on conflict is a no-op refresh.
 func (q *Queries) UpsertInvoice(ctx context.Context, arg UpsertInvoiceParams) error {
 	_, err := q.db.Exec(ctx, upsertInvoice,
 		arg.AccountID,
@@ -466,6 +555,7 @@ func (q *Queries) UpsertInvoice(ctx context.Context, arg UpsertInvoiceParams) er
 		arg.Currency,
 		arg.PeriodStart,
 		arg.PeriodEnd,
+		arg.IsLargeAutoCollect,
 	)
 	return err
 }

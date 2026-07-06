@@ -331,6 +331,8 @@ type MsBillingAccount struct {
 	SpendCeilingMicros pgtype.Int8               `json:"spend_ceiling_micros"`
 	// UTC instant the account bound its FIRST credit card (billing-account activation). Immutable, first-bind-wins; billing-period anchor day = activated_at day-of-month (ADR 0005). NULL = never activated -> skipped by cmd/billing-cycle.
 	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
+	// Per-account size threshold (micro-USD) above which a SUCCESSFUL off-session charge is disclosed as "large" on the billing page. NULL = platform default ($100 = 100000000 micros). Resolved at charge time; pure disclosure, changes no charging behaviour.
+	AutoCollectThresholdMicros pgtype.Int8 `json:"auto_collect_threshold_micros"`
 }
 
 type MsBillingAddCardRequest struct {
@@ -352,6 +354,12 @@ type MsBillingApp struct {
 	ProrationInvoiceID pgtype.Text        `json:"proration_invoice_id"`
 	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
 	UpdatedAt          time.Time          `json:"updated_at"`
+	// Module count frozen at RegisterApp time (immutable — SyncAppModules never writes this column). ChargeCreationProration prices the creation-period window off THIS value, never the live module_count.
+	CreatedModuleCount int32 `json:"created_module_count"`
+	// Set once (never unset) when ChargeCreationProration determines the account only activated at/after this app's anchored creation period had already closed — a would-be retroactive catch-up charge (D1d). The app is permanently excluded from the proration sweep from then on.
+	ProrationSkippedAt pgtype.Timestamptz `json:"proration_skipped_at"`
+	// First instant a creation-proration charge attempt for this app reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set and an unarmed guard reconciles against Stripe (ms_charge_ref app-proration:<app_id>) before minting new Stripe objects.
+	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 }
 
 type MsBillingAppBaseSnapshot struct {
@@ -364,6 +372,22 @@ type MsBillingAppBaseSnapshot struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type MsBillingAppModuleOverageTimer struct {
+	ID                 string             `json:"id"`
+	AccountID          string             `json:"account_id"`
+	AppID              string             `json:"app_id"`
+	InstalledAt        time.Time          `json:"installed_at"`
+	GraceExpiresAt     time.Time          `json:"grace_expires_at"`
+	RemovedAt          pgtype.Timestamptz `json:"removed_at"`
+	GraceChargedAt     pgtype.Timestamptz `json:"grace_charged_at"`
+	GraceResolved      bool               `json:"grace_resolved"`
+	GraceInvoiceID     pgtype.Text        `json:"grace_invoice_id"`
+	GraceInvoiceItemID pgtype.Text        `json:"grace_invoice_item_id"`
+	CreatedAt          time.Time          `json:"created_at"`
+	// First instant a Leg-1 (or combined-invoice) charge attempt for this timer reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set reconciles against Stripe (ms_charge_ref) before recomputing any live verdict.
+	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
+}
+
 type MsBillingBillingPeriod struct {
 	ID          string                       `json:"id"`
 	AccountID   string                       `json:"account_id"`
@@ -374,14 +398,16 @@ type MsBillingBillingPeriod struct {
 }
 
 type MsBillingBillingRun struct {
-	ID              string         `json:"id"`
-	AccountID       string         `json:"account_id"`
-	PeriodStart     time.Time      `json:"period_start"`
-	PeriodEnd       time.Time      `json:"period_end"`
-	Status          string         `json:"status"`
-	StripeInvoiceID pgtype.Text    `json:"stripe_invoice_id"`
-	TotalAmount     pgtype.Numeric `json:"total_amount"`
-	CreatedAt       time.Time      `json:"created_at"`
+	ID                   string         `json:"id"`
+	AccountID            string         `json:"account_id"`
+	PeriodStart          time.Time      `json:"period_start"`
+	PeriodEnd            time.Time      `json:"period_end"`
+	Status               string         `json:"status"`
+	StripeInvoiceID      pgtype.Text    `json:"stripe_invoice_id"`
+	TotalAmount          pgtype.Numeric `json:"total_amount"`
+	CreatedAt            time.Time      `json:"created_at"`
+	FrozenChargeCents    pgtype.Int8    `json:"frozen_charge_cents"`
+	FrozenChargeWithBase pgtype.Bool    `json:"frozen_charge_with_base"`
 }
 
 type MsBillingBudget struct {
@@ -439,6 +465,8 @@ type MsBillingInvoice struct {
 	HostedInvoiceUrl pgtype.Text `json:"hosted_invoice_url"`
 	// Stripe invoice PDF download URL. Assigned at finalization; NULL = not yet delivered.
 	InvoicePdf pgtype.Text `json:"invoice_pdf"`
+	// Server-computed at invoice-create time: true iff the charged amount (netted arrears + advance base, micros) exceeded the account auto_collect_threshold_micros (or the default when NULL) that applied WHEN THE CHARGE FIRED. Post-hoc disclosure only.
+	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
 }
 
 type MsBillingMetricDefinition struct {

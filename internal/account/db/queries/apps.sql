@@ -5,22 +5,64 @@
 
 -- InsertAppMirror registers an app row idempotently: ON CONFLICT (app_id) DO
 -- NOTHING so a RegisterApp retry (or a concurrent double-fire) never rewrites
--- created_at / module_count / the proration guard of the original insert —
--- the FIRST registration's values are the stable proration anchor. :execrows
--- so the caller can tell a fresh insert (1) from a retry no-op (0), though
--- both are success.
+-- created_at / module_count / created_module_count / the proration guard of
+-- the original insert — the FIRST registration's values are the stable
+-- proration anchor. created_module_count is stamped from the SAME $3 value as
+-- module_count and NEVER written again by any other query (migration 030) —
+-- it is the frozen count ChargeCreationProration prices its historical window
+-- from, immune to a later SyncAppModules install/uninstall during grace.
+-- :execrows so the caller can tell a fresh insert (1) from a retry no-op (0),
+-- though both are success.
 -- name: InsertAppMirror :execrows
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_at)
-VALUES ($1, $2, $3, $4)
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at)
+VALUES ($1, $2, $3, $3, $4)
 ON CONFLICT (app_id) DO NOTHING;
 
 -- SelectAppMirror reads one roster row (deleted or not — the caller decides
 -- what deletion means for its path: SyncAppModules no-ops a count update,
 -- GetAppBill still displays the spent creation-period base).
 -- name: SelectAppMirror :one
-SELECT app_id, account_id, module_count, created_at, proration_invoice_id, deleted_at
+SELECT app_id, account_id, module_count, created_module_count, created_at,
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
 FROM ms_billing.apps
 WHERE app_id = $1;
+
+-- SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
+-- the creation-proration charge's race-safety primitive. The charge locks the
+-- row here just long enough to re-verify deleted_at IS NULL and
+-- proration_invoice_id IS NULL and read the frozen created_module_count,
+-- releasing the lock immediately after (ChargeProrationLocked runs the actual
+-- Stripe network call OUTSIDE this lock — see store.go); a concurrent
+-- SyncAppModules soft-delete (MarkAppDeleted) only ever contends for the brief
+-- read, never for the duration of a Stripe HTTP call.
+-- name: SelectAppMirrorForUpdate :one
+SELECT app_id, account_id, module_count, created_module_count, created_at,
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
+FROM ms_billing.apps
+WHERE app_id = $1
+FOR UPDATE;
+
+-- AppsPendingProration is the creation-proration sweep's work list: apps that
+-- have survived the grace window (@created_before = now() − GraceDays) and were
+-- never charged their creation-period base. proration_invoice_id IS NULL is the
+-- one-shot guard (an already-charged app drops out); the deleted_at predicate
+-- excludes ONLY apps soft-deleted WITHIN their grace (never charged, scenario
+-- 1) — an app deleted AFTER its grace elapsed SURVIVED it and still owes the
+-- creation charge (wave 2, D11: grace only delays WHEN the charge fires, and
+-- the H2 boundary exclusion leaves no other leg as a backstop; pre-fix this
+-- was a user-timable ~$22 dodge in the grace-elapse→sweep window). Grace in
+-- HOURS (D5 — session-TZ/DST safety). proration_skipped_at IS NULL excludes
+-- apps permanently skipped as a would-be retroactive catch-up (migration 031,
+-- D1d). Ordered by created_at so the oldest pending app charges first.
+-- name: AppsPendingProration :many
+SELECT app_id
+FROM ms_billing.apps
+WHERE created_at <= @created_before::timestamptz
+  AND proration_invoice_id IS NULL
+  AND (deleted_at IS NULL
+       OR deleted_at >= created_at + make_interval(hours => @grace_hours::int))
+  AND proration_skipped_at IS NULL
+ORDER BY created_at;
 
 -- SetAppProrationInvoice arms the ONE-SHOT proration guard: it records the
 -- Stripe invoice id of the creation-proration charge, and the WHERE
@@ -32,6 +74,29 @@ UPDATE ms_billing.apps
 SET proration_invoice_id = $2
 WHERE app_id = $1
   AND proration_invoice_id IS NULL;
+
+-- SetAppProrationSkipped arms the PERMANENT skip marker (migration 031, D1d):
+-- the account only activated at/after this app's anchored creation period had
+-- already closed, so charging it now would be a retroactive catch-up. The
+-- WHERE clause makes it idempotent (a re-evaluation, or a concurrent one,
+-- affects 0 rows once set) and defensively refuses to mark an app that was
+-- somehow already charged in the meantime. :execrows so the caller can
+-- observe (and tolerate) the already-set / already-charged cases.
+-- name: SetAppProrationSkipped :execrows
+UPDATE ms_billing.apps
+SET proration_skipped_at = now()
+WHERE app_id = $1
+  AND proration_skipped_at IS NULL
+  AND proration_invoice_id IS NULL;
+
+-- MarkAppProrationAttempted stamps the recovery marker (036) BEFORE a
+-- creation-proration charge attempt's first Stripe call. First-write-wins
+-- (the FIRST attempt instant is the durable one); never cleared.
+-- name: MarkAppProrationAttempted :exec
+UPDATE ms_billing.apps
+SET proration_attempted_at = $2
+WHERE app_id = $1
+  AND proration_attempted_at IS NULL;
 
 -- SetAppModuleCount snapshots a new installed-module count (SyncAppModules).
 -- WHERE deleted_at IS NULL makes a count update on a deleted app a no-op
@@ -54,24 +119,41 @@ WHERE app_id = $1
   AND deleted_at IS NULL;
 
 -- LiveAppModuleCountsCreatedBefore returns (app_id, module_count) for every
--- LIVE (deleted_at IS NULL) app on the account created STRICTLY BEFORE the
--- cutoff — the boundary charge's advance-base input:
+-- LIVE (deleted_at IS NULL) app on the account that has JOINED the advance
+-- base mechanism by the cutoff — the boundary charge's advance-base input:
 -- advance base = Σ (BaseFee + Overage × max(0, module_count − included)).
--- The cutoff is the NEW period's start (the closed window's period_end): an
--- app created INSIDE the new period is excluded, because RegisterApp's
--- creation-proration leg already charged that app's new-period base (full or
--- prorated) — summing it here would double-bill the same period (same-day
--- cron race, and deterministically on reclaimed skipped_no_pm/failed runs).
--- Such an app joins the advance leg at the NEXT boundary. Deleted apps are
--- excluded (D1e); an account with no rows (pre-backfill) sums to base 0 and
--- keeps the pre-027 arrears-only invoice. app_id is returned so the charge
--- leg can write the per-app-period base snapshot (migration 028) it bills.
+-- The cutoff is the NEW period's start (the closed window's period_end). Two
+-- conditions, mirroring the module-timer coverage contract (review 2026-07-06):
+--   * created_at < @created_before — an app created INSIDE the new period is
+--     excluded, because RegisterApp's creation-proration leg already charged
+--     that app's new-period base (full or prorated) — summing it here would
+--     double-bill the same period (same-day cron race, and deterministically
+--     on reclaimed skipped_no_pm/failed runs).
+--   * created_at + grace < @created_before — an app whose CREATION GRACE had
+--     not yet elapsed when the new period opened is excluded: it has not
+--     survived grace yet (an app deleted in grace is NEVER charged, scenario
+--     1 — precharging its next-period base here would bill a full month for
+--     an app that can still be deleted for free), and when it does survive,
+--     its creation-proration charge covers through the END of the period its
+--     grace elapses into (the straddled period), so this boundary's new
+--     period is already that leg's coverage. Spec: apps "join this boundary
+--     mechanism starting at the NEXT boundary after their own creation charge
+--     fires".
+-- Deleted apps are excluded (D1e); an account with no rows (pre-backfill)
+-- sums to base 0 and keeps the pre-027 arrears-only invoice. app_id is
+-- returned so the charge leg can write the per-app-period base snapshot
+-- (migration 028) it bills. The grace interval is expressed in HOURS, not
+-- days (wave 2, D5): timestamptz + a day-interval is evaluated in the SESSION
+-- timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
+-- UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
+-- by an hour around DST and double-bill or gap a whole period.
 -- name: LiveAppModuleCountsCreatedBefore :many
 SELECT app_id, module_count
 FROM ms_billing.apps
-WHERE account_id = $1
+WHERE account_id = @account_id::uuid
   AND deleted_at IS NULL
-  AND created_at < $2;
+  AND created_at < @created_before::timestamptz
+  AND created_at + make_interval(hours => @grace_hours::int) < @created_before::timestamptz;
 
 -- UpsertProrationBaseSnapshot records what RegisterApp's creation-proration
 -- leg billed one app for its creation period (migration 028). Keyed by the

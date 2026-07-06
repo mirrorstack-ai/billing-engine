@@ -70,17 +70,45 @@ func main() {
 	}
 
 	// Local one-shot run: close every card-bound account's just-ended anchored
-	// period as of now, then exit. No HTTP listener — the dev cycle is a single
-	// batch invocation.
-	res := runCycle(context.Background(), svc, time.Now().UTC())
+	// period as of now, sweep the creation-proration grace queue (scenario 3 —
+	// combined creation invoice), then sweep the per-module overage grace queue
+	// (Leg 1), then exit. No HTTP listener — the dev cycle is a single batch.
+	at := time.Now().UTC()
+	res := runCycle(context.Background(), svc, at)
+	// Proration BEFORE the overage sweep: the creation-proration charge folds an
+	// app's co-created over-modules onto ONE combined invoice (scenario 3), then
+	// the overage sweep (Leg 1) finds them already resolved and skips them — so a
+	// co-created over-module is billed on the combined invoice, not a second one.
+	sweepFailed := runProrationSweep(context.Background(), svc, at)
+	runOverageSweep(context.Background(), svc, at, &res)
 	slog.Info("billing-cycle local run complete",
 		"as_of", res.AsOf,
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 		"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
-		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
-	if res.Failed > 0 {
+		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
+		"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
+		"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
+	if res.Failed > 0 || sweepFailed {
 		os.Exit(1)
 	}
+}
+
+// runProrationSweep charges the creation-period base for every app that has
+// survived the grace window as of `at` (the second leg of the cycle job,
+// alongside the per-account boundary loop). Reports whether any per-app charge
+// failed so the caller can set a non-zero exit code; a failure is retried on the
+// next sweep and never aborts the batch. Logged here so both transports share
+// the shape.
+func runProrationSweep(ctx context.Context, svc *cycle.Service, at time.Time) bool {
+	sweep, err := svc.SweepCreationProrations(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "creation-proration sweep failed", "as_of", at, "error", err)
+		return true
+	}
+	slog.InfoContext(ctx, "creation-proration sweep complete",
+		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
+		"skipped", sweep.Skipped, "failed", sweep.Failed)
+	return sweep.Failed > 0
 }
 
 // buildService wires the pgxpool + Stripe client into the cycle Service. The
@@ -103,12 +131,20 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			at = time.Now().UTC()
 		}
 		res := runCycle(ctx, svc, at.UTC())
+		// Proration BEFORE the overage sweep (see main()): the combined creation
+		// invoice (scenario 3) resolves an app's co-created over-modules first, so
+		// the overage sweep (Leg 1) skips them — one combined invoice, not two.
+		runProrationSweep(ctx, svc, at.UTC())
+		runOverageSweep(ctx, svc, at.UTC(), &res)
 		slog.InfoContext(ctx, "billing-cycle lambda run complete",
 			"as_of", res.AsOf,
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 			"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
-			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed)
-		// A per-account charge failure is recorded (billing_runs status='failed')
+			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
+			"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
+			"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
+		// A per-account charge failure (or a per-app proration failure) is recorded
+		// (billing_runs status='failed')
 		// and does NOT fail the batch — the next cycle retries it. The handler
 		// returns nil so EventBridge doesn't replay the whole batch.
 		return nil
@@ -127,6 +163,12 @@ type cycleResult struct {
 	AlreadyRun  int
 	FailedRuns  int // per-account charge runs that ended status='failed'
 	Failed      int // errors (rollup error, charge error, or list error)
+
+	// Mid-period per-module overage grace sweep (migration 033, Leg 1).
+	OverageCandidates int // install timers past their grace window this sweep evaluated
+	OverageCharged    int // "over" installs whose overage was invoiced mid-period
+	OverageSkipped    int // evaluated but not charged (resolved-included / no PM / 0 cents)
+	OverageFailed     int // per-timer overage-charge errors (counted, never abort)
 }
 
 // runCycle closes every card-bound account's just-ended ANCHORED period as of
@@ -223,6 +265,28 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 		tally(&res, a.ID, chargeSummary)
 	}
 	return res
+}
+
+// runOverageSweep runs Leg 1's per-module overage grace sweep as of `at`. A
+// single timer's error is logged + counted inside the sweep but never aborts the
+// batch (the next sweep retries it through the same deterministic Stripe keys).
+func runOverageSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *cycleResult) {
+	sweep, err := svc.SweepModuleOverage(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "module overage sweep failed", "as_of", at, "error", err)
+		res.Failed++
+		return
+	}
+	res.OverageCandidates = sweep.Pending
+	res.OverageCharged = sweep.Charged
+	// "Skipped" folds the resolved-as-included verdicts and the transient no-PM /
+	// zero-cent skips — everything evaluated but not charged this sweep.
+	res.OverageSkipped = sweep.Included + sweep.Skipped
+	res.OverageFailed = sweep.Failed
+	res.Failed += sweep.Failed
+	slog.InfoContext(ctx, "module overage sweep complete",
+		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
+		"included", sweep.Included, "skipped", sweep.Skipped, "failed", sweep.Failed)
 }
 
 // tally classifies one account's charge summary for the run totals + a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sort"
 	"testing"
 	"time"
 
@@ -51,6 +52,9 @@ type fakeStore struct {
 	activatedAccounts []cycle.AccountAnchor   // ActivatedAccounts return
 	latestPeriodEnd   map[uuid.UUID]time.Time // LatestClosedPeriodEnd return (absent → not found)
 
+	// onFreezeCharge runs at the top of FreezeBillingRunCharge (see there).
+	onFreezeCharge func(runID uuid.UUID)
+
 	// risk-graded collection inputs (PR #9)
 	collection    cycle.AccountCollection // AccountCollection return
 	unpaidInvoice bool                    // HasUnpaidInvoice return (delinquency signal)
@@ -69,43 +73,89 @@ type fakeStore struct {
 	activation     map[uuid.UUID]time.Time
 	baseSnapshots  map[snapKey]fakeBaseSnapshot
 
+	// per-module install-timer state (migration 033). timers models
+	// ms_billing.app_module_overage_timers keyed by surrogate id; each row's
+	// removed/graceResolved/graceCharged* fields mirror the columns the FIFO +
+	// Leg 1 sweep read and write.
+	timers map[uuid.UUID]*fakeTimer
+
 	// captured charge writes
-	insertedRuns map[string]uuid.UUID                 // (account/start/end) → run id (the idempotency gate state)
-	runStatus    map[uuid.UUID]cycle.BillingRunStatus // run id → current status (models the DB row's terminal state)
-	markedRuns   map[uuid.UUID]markedRun              // run id → terminal mark
-	invoices     map[string]cycle.InvoiceMirror       // stripe_invoice_id → mirror
+	insertedRuns  map[string]uuid.UUID                     // (account/start/end) → run id (the idempotency gate state)
+	runStatus     map[uuid.UUID]cycle.BillingRunStatus     // run id → current status (models the DB row's terminal state)
+	markedRuns    map[uuid.UUID]markedRun                  // run id → terminal mark
+	invoices      map[string]cycle.InvoiceMirror           // stripe_invoice_id → mirror
+	frozenCharges map[uuid.UUID]cycle.FrozenBoundaryCharge // run id → frozen boundary charge (migration 035); survives a reclaim
 
 	// injected errors
-	errOpen          error
-	errRaw           error
-	errPrice         error
-	errUpsert        error
-	errIncome        error
-	errVis           error
-	errSettle        error
-	errInsertRun     error
-	errTotal         error
-	errPM            error
-	errCustomer      error
-	errInvoice       error
-	errMarkRun       error
-	errUnbilled      error
-	errUsageEvents   error
-	errActivated     error // ActivatedAccounts
-	errLatestPeriod  error // LatestClosedPeriodEnd
-	errCollection    error // AccountCollection
-	errUpdateColl    error // UpdateAccountCollection
-	errUnpaid        error // HasUnpaidInvoice
-	errEnsureAcct    error // EnsureAccountForUser
-	errActivation    error // AccountActivation
-	errAppInsert     error // InsertAppMirror
-	errAppMirror     error // AppMirror
-	errSetProration  error // SetAppProrationInvoice
-	errSetCount      error // SetAppModuleCount
-	errMarkDeleted   error // MarkAppDeleted
-	errLiveCounts    error // LiveAppsCreatedBefore
-	errProrationSnap error // UpsertProrationBaseSnapshot
-	errAdvanceSnap   error // InsertAdvanceBaseSnapshot
+	errOpen             error
+	errRaw              error
+	errPrice            error
+	errUpsert           error
+	errIncome           error
+	errVis              error
+	errSettle           error
+	errInsertRun        error
+	errTotal            error
+	errPM               error
+	errCustomer         error
+	errInvoice          error
+	errMarkRun          error
+	errUnbilled         error
+	errUsageEvents      error
+	errActivated        error // ActivatedAccounts
+	errLatestPeriod     error // LatestClosedPeriodEnd
+	errCollection       error // AccountCollection
+	errUpdateColl       error // UpdateAccountCollection
+	errUnpaid           error // HasUnpaidInvoice
+	errEnsureAcct       error // EnsureAccountForUser
+	errActivation       error // AccountActivation
+	errAppInsert        error // InsertAppMirror
+	errAppMirror        error // AppMirror
+	errSetProration     error // SetAppProrationInvoice
+	errSetSkipped       error // SetAppProrationSkipped
+	errSetCount         error // SetAppModuleCount
+	errMarkDeleted      error // MarkAppDeleted
+	errLiveCounts       error // LiveAppsCreatedBefore
+	errProrationSnap    error // UpsertProrationBaseSnapshot
+	errAdvanceSnap      error // InsertAdvanceBaseSnapshot
+	errPendingProration error // AppsPendingProration
+	errChargeLocked     error // ChargeProrationLocked
+	// errPersistAfterStripe fails ChargeProrationLocked's persist phase (Phase 3)
+	// AFTER the charge callback's Stripe calls already succeeded — modeling a
+	// combined-invoice charge whose guard/timer marks fail to commit (deadlock /
+	// transient tx error) even though Stripe already moved the money.
+	errPersistAfterStripe error
+	errFreezeCharge       error // FreezeBillingRunCharge
+	errFrozenCharge       error // BillingRunFrozenCharge
+
+	errLiveTimerCount   error // LiveModuleTimerCountForApp
+	errInsertTimers     error // InsertModuleOverageTimers
+	errReconcileTimers  error // ReconcileModuleTimersToTarget
+	errRemoveNewest     error // SoftRemoveNewestModuleTimers
+	errRemoveAllTimers  error // SoftRemoveAllModuleTimersForApp
+	errTimersPastGrace  error // ModuleOverageTimersPastGrace
+	errTimerRank        error // LiveModuleTimerRankBefore
+	errMarkIncluded     error // MarkModuleTimerIncluded
+	errMarkTimerCharged error // MarkModuleTimerCharged
+	errCountOngoingOver error // CountOngoingOverModuleTimers
+	errCoCreatedOver    error // CoCreatedOverModuleTimers
+}
+
+// fakeTimer models one ms_billing.app_module_overage_timers row (migration 033).
+type fakeTimer struct {
+	id                 uuid.UUID
+	accountID          uuid.UUID
+	appID              uuid.UUID
+	installedAt        time.Time
+	graceExpiresAt     time.Time
+	removed            bool
+	removedAt          time.Time
+	graceResolved      bool
+	graceCharged       bool
+	graceChargedAt     time.Time
+	graceInvoiceID     string
+	graceInvoiceItemID string
+	chargeAttemptedAt  time.Time // migration-036 recovery marker
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -141,10 +191,12 @@ func newFakeStore() *fakeStore {
 		runStatus:           map[uuid.UUID]cycle.BillingRunStatus{},
 		markedRuns:          map[uuid.UUID]markedRun{},
 		invoices:            map[string]cycle.InvoiceMirror{},
+		frozenCharges:       map[uuid.UUID]cycle.FrozenBoundaryCharge{},
 		apps:                map[uuid.UUID]cycle.AppMirror{},
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
 		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
+		timers:              map[uuid.UUID]*fakeTimer{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -334,6 +386,48 @@ func (f *fakeStore) MarkBillingRun(_ context.Context, runID uuid.UUID, status cy
 	return nil
 }
 
+// FreezeBillingRunCharge records the run's frozen boundary charge (migration 035).
+// First-write-wins, mirroring the SQL's WHERE frozen_charge_cents IS NULL: a
+// reclaim that already froze keeps the ORIGINAL values, so a retry can never
+// overwrite the amount a crashed attempt already put through Stripe.
+func (f *fakeStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID uuid.UUID) (bool, error) {
+	// Mirrors the SQL guard: the terminal zero-mark loses to a concurrent freeze.
+	if _, frozen := f.frozenCharges[runID]; frozen {
+		return false, nil
+	}
+	if err := f.MarkBillingRun(ctx, runID, cycle.RunStatusInvoiced, "", 0); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, charge cycle.FrozenBoundaryCharge) (cycle.FrozenBoundaryCharge, error) {
+	if f.errFreezeCharge != nil {
+		return cycle.FrozenBoundaryCharge{}, f.errFreezeCharge
+	}
+	// onFreezeCharge, when set, runs BEFORE this process's write — modeling a
+	// concurrent second daemon that reclaimed the same run and froze first (its
+	// write lands in the race window between the caller's top-of-run frozen read
+	// and this freeze). Used by the H6 regression test.
+	if f.onFreezeCharge != nil {
+		f.onFreezeCharge(runID)
+	}
+	// First-write-wins, returning the SURVIVING value (mirrors the SQL's
+	// WHERE frozen_charge_cents IS NULL + read-back).
+	if _, exists := f.frozenCharges[runID]; !exists {
+		f.frozenCharges[runID] = charge
+	}
+	return f.frozenCharges[runID], nil
+}
+
+func (f *fakeStore) BillingRunFrozenCharge(_ context.Context, runID uuid.UUID) (cycle.FrozenBoundaryCharge, bool, error) {
+	if f.errFrozenCharge != nil {
+		return cycle.FrozenBoundaryCharge{}, false, f.errFrozenCharge
+	}
+	c, ok := f.frozenCharges[runID]
+	return c, ok, nil
+}
+
 func (f *fakeStore) AccountsWithUsageEvents(_ context.Context, _, _ time.Time) ([]uuid.UUID, error) {
 	if f.errUsageEvents != nil {
 		return nil, f.errUsageEvents
@@ -393,7 +487,9 @@ func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID uuid.UUI
 		return nil // ON CONFLICT (app_id) DO NOTHING — the FIRST registration wins
 	}
 	f.apps[appID] = cycle.AppMirror{
-		AppID: appID, AccountID: accountID, ModuleCount: moduleCount, CreatedAt: createdAt,
+		AppID: appID, AccountID: accountID, ModuleCount: moduleCount,
+		CreatedModuleCount: moduleCount, // frozen at insert, mirroring InsertAppMirror's $3/$3 write
+		CreatedAt:          createdAt,
 	}
 	return nil
 }
@@ -412,6 +508,17 @@ func (f *fakeStore) SetAppProrationInvoice(_ context.Context, appID uuid.UUID, s
 	}
 	if app, ok := f.apps[appID]; ok && app.ProrationInvoiceID == "" {
 		app.ProrationInvoiceID = stripeInvoiceID // first-charge-wins, like the WHERE … IS NULL
+		f.apps[appID] = app
+	}
+	return nil
+}
+
+func (f *fakeStore) SetAppProrationSkipped(_ context.Context, appID uuid.UUID) error {
+	if f.errSetSkipped != nil {
+		return f.errSetSkipped
+	}
+	if app, ok := f.apps[appID]; ok && !app.ProrationSkipped && app.ProrationInvoiceID == "" {
+		app.ProrationSkipped = true // first-write-wins, like the WHERE … IS NULL guard
 		f.apps[appID] = app
 	}
 	return nil
@@ -440,16 +547,95 @@ func (f *fakeStore) MarkAppDeleted(_ context.Context, appID uuid.UUID) error {
 	return nil
 }
 
-func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID, createdBefore time.Time) ([]cycle.AppModuleCount, error) {
+func (f *fakeStore) AppsPendingProration(_ context.Context, createdBefore time.Time) ([]uuid.UUID, error) {
+	if f.errPendingProration != nil {
+		return nil, f.errPendingProration
+	}
+	// Mirrors the SQL: created_at <= cutoff AND proration_invoice_id IS NULL AND
+	// (deleted_at IS NULL OR deleted after the grace elapsed — D11: a survivor
+	// still owes) AND proration_skipped_at IS NULL. Sorted by created_at for a
+	// deterministic sweep order.
+	var out []uuid.UUID
+	for id, app := range f.apps {
+		deletedInGrace := app.Deleted && app.DeletedAt.Before(app.CreatedAt.UTC().AddDate(0, 0, 3))
+		if app.ProrationInvoiceID == "" && !deletedInGrace && !app.ProrationSkipped && !app.CreatedAt.After(createdBefore) {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return f.apps[out[i]].CreatedAt.Before(f.apps[out[j]].CreatedAt)
+	})
+	return out, nil
+}
+
+// ChargeProrationLocked models the pgxStore's FOR UPDATE-locked charge section:
+// it re-checks the terminal state (the fake's in-memory row is the "locked"
+// read), invokes charge only when still chargeable, and persists the invoice +
+// snapshot + arms the guard on a non-nil payload — exactly what the real tx does
+// atomically.
+func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, charge func(cycle.AppMirror) (*cycle.ProrationCharge, error)) (cycle.ProrationOutcome, string, error) {
+	if f.errChargeLocked != nil {
+		return 0, "", f.errChargeLocked
+	}
+	app, ok := f.apps[appID]
+	if !ok {
+		return cycle.ProrationLockedNotFound, "", nil
+	}
+	if app.Deleted && app.DeletedAt.Before(app.CreatedAt.UTC().AddDate(0, 0, 3)) {
+		return cycle.ProrationLockedDeleted, "", nil // deleted WITHIN grace only (D11)
+	}
+	if app.ProrationInvoiceID != "" {
+		return cycle.ProrationLockedAlreadyCharged, app.ProrationInvoiceID, nil
+	}
+	pc, err := charge(app)
+	if err != nil {
+		return 0, "", err
+	}
+	if pc == nil {
+		return cycle.ProrationLockedNoCharge, "", nil
+	}
+	// Phase 3 failure AFTER the callback's Stripe calls already succeeded: the
+	// money moved, but the guard-arm + timer marks never commit. Models a
+	// deadlock/transient tx error so a test can prove the co-created over-module
+	// timers stay unresolved (and are NOT independently re-invoiced by Leg 1).
+	if f.errPersistAfterStripe != nil {
+		return 0, "", f.errPersistAfterStripe
+	}
+	f.invoices[pc.Invoice.StripeInvoiceID] = pc.Invoice
+	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}
+	if pc.StraddleSnapshot != nil {
+		f.baseSnapshots[snapKey{pc.StraddleSnapshot.AppID, pc.StraddleSnapshot.PeriodStart}] = fakeBaseSnapshot{snap: *pc.StraddleSnapshot, source: "proration"}
+	}
+	app.ProrationInvoiceID = pc.InvoiceID // first-charge-wins, like WHERE … IS NULL under the lock
+	f.apps[appID] = app
+	// Scenario 3 — mark the co-created over-module timers billed on this combined
+	// invoice terminally charged, in the SAME "transaction" (first-write-wins on
+	// grace_resolved, like the real MarkModuleTimerCharged WHERE grace_resolved = false).
+	for _, tc := range pc.TimerCharges {
+		if t, ok := f.timers[tc.TimerID]; ok && !t.graceResolved {
+			t.graceResolved = true
+			t.graceCharged = true
+			t.graceChargedAt = tc.ChargedAt
+			t.graceInvoiceID = tc.InvoiceID
+			t.graceInvoiceItemID = tc.InvoiceItemID
+		}
+	}
+	return cycle.ProrationLockedCharged, pc.InvoiceID, nil
+}
+
+func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID, createdBefore time.Time, graceDays int) ([]cycle.AppModuleCount, error) {
 	if f.errLiveCounts != nil {
 		return nil, f.errLiveCounts
 	}
 	apps := []cycle.AppModuleCount{}
 	for _, app := range f.apps {
-		// Strictly-before cutoff, mirroring the SQL's created_at < $2: an app
-		// created ON or AFTER the new period's start is excluded (its base is
-		// RegisterApp's proration leg's, never the advance leg's).
-		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) {
+		// Strictly-before cutoffs, mirroring the SQL: an app created ON or AFTER
+		// the new period's start is excluded (its base is the proration leg's,
+		// never the advance leg's), and so is an app whose creation grace had not
+		// yet elapsed when the new period opened (H2 — it hasn't survived grace,
+		// and its creation charge covers through the grace-elapsed period).
+		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) &&
+			app.CreatedAt.AddDate(0, 0, graceDays).Before(createdBefore) {
 			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount})
 		}
 	}
@@ -478,6 +664,273 @@ func (f *fakeStore) InsertAdvanceBaseSnapshot(_ context.Context, snap cycle.AppB
 	}
 	f.baseSnapshots[k] = fakeBaseSnapshot{snap: snap, source: "advance"}
 	return nil
+}
+
+// --- per-module install-timer fake (migration 033) --------------------------
+
+func (f *fakeStore) LiveModuleTimerCountForApp(_ context.Context, appID uuid.UUID) (int, error) {
+	if f.errLiveTimerCount != nil {
+		return 0, f.errLiveTimerCount
+	}
+	n := 0
+	for _, t := range f.timers {
+		if t.appID == appID && !t.removed {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *fakeStore) InsertModuleOverageTimers(_ context.Context, accountID, appID uuid.UUID, installedAt, graceExpiresAt time.Time, n int) error {
+	if f.errInsertTimers != nil {
+		return f.errInsertTimers
+	}
+	for i := 0; i < n; i++ {
+		id := uuid.New()
+		f.timers[id] = &fakeTimer{
+			id:             id,
+			accountID:      accountID,
+			appID:          appID,
+			installedAt:    installedAt,
+			graceExpiresAt: graceExpiresAt,
+		}
+	}
+	return nil
+}
+
+// liveTimersForApp returns the app's live timers sorted (installed_at DESC, id
+// DESC) — the LIFO removal order.
+func (f *fakeStore) liveTimersForApp(appID uuid.UUID) []*fakeTimer {
+	var out []*fakeTimer
+	for _, t := range f.timers {
+		if t.appID == appID && !t.removed {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].installedAt.Equal(out[j].installedAt) {
+			return out[i].installedAt.After(out[j].installedAt)
+		}
+		return out[i].id.String() > out[j].id.String()
+	})
+	return out
+}
+
+func (f *fakeStore) SoftRemoveNewestModuleTimers(_ context.Context, appID uuid.UUID, n int, removedAt time.Time) error {
+	if f.errRemoveNewest != nil {
+		return f.errRemoveNewest
+	}
+	live := f.liveTimersForApp(appID)
+	for i := 0; i < n && i < len(live); i++ {
+		live[i].removed = true
+		live[i].removedAt = removedAt
+	}
+	return nil
+}
+
+func (f *fakeStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error {
+	if f.errReconcileTimers != nil {
+		return f.errReconcileTimers
+	}
+	// Mirrors the pgx locked reconcile (wave 2, D8/D9): the target, account, and
+	// deleted state come from the CURRENT roster row — never the caller; a
+	// deleted row reconciles to zero. (Unit tests are single-threaded; the
+	// advisory-lock serialization itself is exercised by the integration test.)
+	app, ok := f.apps[appID]
+	if !ok {
+		return nil
+	}
+	target := app.ModuleCount
+	if app.Deleted {
+		target = 0
+	}
+	live, err := f.LiveModuleTimerCountForApp(ctx, appID)
+	if err != nil {
+		return err
+	}
+	switch {
+	case target > live:
+		return f.InsertModuleOverageTimers(ctx, app.AccountID, appID, installedAt, graceExpiresAt, target-live)
+	case target < live:
+		return f.SoftRemoveNewestModuleTimers(ctx, appID, live-target, removedAt)
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkAppDeletedAndRemoveTimers(ctx context.Context, appID uuid.UUID, removedAt time.Time) error {
+	if f.errMarkDeleted != nil {
+		return f.errMarkDeleted
+	}
+	// DeletedAt = the service clock's removedAt (the real SQL uses now() in the
+	// same transaction) — NOT the test host's wall clock, which would misplace
+	// the deletion relative to the fixtures' grace windows (D11 pivots on it).
+	if app, ok := f.apps[appID]; ok && !app.Deleted {
+		app.Deleted = true
+		app.DeletedAt = removedAt
+		f.apps[appID] = app
+	}
+	return f.SoftRemoveAllModuleTimersForApp(ctx, appID, removedAt)
+}
+
+func (f *fakeStore) SoftRemoveAllModuleTimersForApp(_ context.Context, appID uuid.UUID, removedAt time.Time) error {
+	if f.errRemoveAllTimers != nil {
+		return f.errRemoveAllTimers
+	}
+	for _, t := range f.timers {
+		if t.appID == appID && !t.removed {
+			t.removed = true
+			t.removedAt = removedAt
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) ModuleOverageTimersPastGrace(_ context.Context, at time.Time) ([]cycle.ModuleOverageCandidate, error) {
+	if f.errTimersPastGrace != nil {
+		return nil, f.errTimersPastGrace
+	}
+	var out []cycle.ModuleOverageCandidate
+	for _, t := range f.timers {
+		if t.removed || t.graceResolved || t.graceExpiresAt.After(at) {
+			continue
+		}
+		activatedAt, activated := f.activation[t.accountID]
+		if !activated {
+			continue // activated_at IS NOT NULL gate
+		}
+		out = append(out, cycle.ModuleOverageCandidate{
+			ID:                t.id,
+			AccountID:         t.accountID,
+			AppID:             t.appID,
+			InstalledAt:       t.installedAt,
+			GraceExpiresAt:    t.graceExpiresAt,
+			ChargeAttemptedAt: t.chargeAttemptedAt,
+			ActivatedAt:       activatedAt,
+		})
+	}
+	// Ordered (installed_at, id) like the query, so the sweep charges oldest-first
+	// deterministically.
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].InstalledAt.Equal(out[j].InstalledAt) {
+			return out[i].InstalledAt.Before(out[j].InstalledAt)
+		}
+		return out[i].ID.String() < out[j].ID.String()
+	})
+	return out, nil
+}
+
+func (f *fakeStore) LiveModuleTimerRankBefore(_ context.Context, accountID, timerID uuid.UUID, installedAt time.Time) (int, error) {
+	if f.errTimerRank != nil {
+		return 0, f.errTimerRank
+	}
+	rank := 0
+	for _, t := range f.timers {
+		if t.accountID != accountID || t.removed {
+			continue
+		}
+		if t.installedAt.Before(installedAt) ||
+			(t.installedAt.Equal(installedAt) && t.id.String() < timerID.String()) {
+			rank++
+		}
+	}
+	return rank, nil
+}
+
+func (f *fakeStore) MarkModuleTimerChargeAttempted(_ context.Context, timerID uuid.UUID, at time.Time) error {
+	if t, ok := f.timers[timerID]; ok && t.chargeAttemptedAt.IsZero() {
+		t.chargeAttemptedAt = at // first-write-wins, mirroring the SQL
+	}
+	return nil
+}
+
+func (f *fakeStore) ModuleTimerStillPending(_ context.Context, timerID uuid.UUID) (bool, error) {
+	t, ok := f.timers[timerID]
+	if !ok {
+		return false, nil
+	}
+	return !t.removed && !t.graceResolved, nil
+}
+
+func (f *fakeStore) MarkAppProrationAttempted(_ context.Context, appID uuid.UUID, _ time.Time) error {
+	if app, ok := f.apps[appID]; ok && !app.ProrationAttempted {
+		app.ProrationAttempted = true // first-write-wins
+		f.apps[appID] = app
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkModuleTimerIncluded(_ context.Context, timerID uuid.UUID) error {
+	if f.errMarkIncluded != nil {
+		return f.errMarkIncluded
+	}
+	if t, ok := f.timers[timerID]; ok && !t.graceResolved {
+		t.graceResolved = true
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkModuleTimerCharged(_ context.Context, timerID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error {
+	if f.errMarkTimerCharged != nil {
+		return f.errMarkTimerCharged
+	}
+	if t, ok := f.timers[timerID]; ok && !t.graceResolved {
+		t.graceResolved = true
+		t.graceCharged = true
+		t.graceChargedAt = chargedAt
+		t.graceInvoiceID = invoiceID
+		t.graceInvoiceItemID = invoiceItemID
+	}
+	return nil
+}
+
+// liveTimersForAccountFIFO returns the account's live timers ordered (installed_at
+// ASC, id ASC) — the FIFO order the rank/over predicates read.
+func (f *fakeStore) liveTimersForAccountFIFO(accountID uuid.UUID) []*fakeTimer {
+	var out []*fakeTimer
+	for _, t := range f.timers {
+		if t.accountID == accountID && !t.removed {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].installedAt.Equal(out[j].installedAt) {
+			return out[i].installedAt.Before(out[j].installedAt)
+		}
+		return out[i].id.String() < out[j].id.String()
+	})
+	return out
+}
+
+func (f *fakeStore) CountOngoingOverModuleTimers(_ context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
+	if f.errCountOngoingOver != nil {
+		return 0, f.errCountOngoingOver
+	}
+	// Live FIFO: the first includedModules are "included"; the rest are "over".
+	// Count the "over" tail owed a precharge for the new period opening at
+	// periodEnd: installed before it, grace elapsed before it — IMMUTABLE
+	// cutoffs only (wave 2, D1: resolution state is sweep-ordering-dependent
+	// and deliberately not part of the predicate), mirroring the SQL.
+	n := 0
+	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
+		if rank >= includedModules &&
+			t.installedAt.Before(periodEnd) && t.graceExpiresAt.Before(periodEnd) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *fakeStore) CoCreatedOverModuleTimers(_ context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error) {
+	if f.errCoCreatedOver != nil {
+		return nil, f.errCoCreatedOver
+	}
+	var out []uuid.UUID
+	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
+		if rank >= includedModules && t.appID == appID && !t.graceResolved && t.installedAt.Equal(createdAt) {
+			out = append(out, t.id)
+		}
+	}
+	return out, nil
 }
 
 // --- helpers --------------------------------------------------------------

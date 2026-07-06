@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -23,8 +24,9 @@ import (
 
 type fakeStripe struct {
 	// recorded calls
-	itemCalls    []itemCall
-	invoiceCalls []invoiceCall
+	itemCalls     []itemCall
+	invoiceCalls  []invoiceCall // draft creations (one per invoice, C2 flow)
+	finalizeCalls []finalizeCall
 
 	// returns
 	invoiceID         string
@@ -33,12 +35,29 @@ type fakeStripe struct {
 	invoiceAmountPaid int64
 
 	// injected errors
-	errItem    error
-	errInvoice error
+	errItem      error
+	errDraft     error
+	errInvoice   error // injected on FinalizeInvoice — the money-moving step
+	errFindByRef error
+
+	// crash-recovery lookup (FindInvoiceByRef): invoices "found" on Stripe
+	// KEYED BY REF (wave 2 critic finding — an unkeyed fake could not detect a
+	// cross-leg charge-ref mixup), and the refs queried. Tests seed via
+	// setFindByRef.
+	findByRefByRef map[string]billingstripe.Invoice
+	findByRefCalls []string
+	// onCreateInvoice, when set, runs INSIDE FinalizeInvoice right before it
+	// returns success — modeling a concurrent account mutation (e.g. a
+	// threshold edit) that lands while the real Stripe HTTP call is in
+	// flight, i.e. strictly AFTER any pre-charge store read the caller
+	// already did and strictly BEFORE any post-charge store read the caller
+	// does once this call returns. Used by the finding-#2 regression test.
+	onCreateInvoice func()
 }
 
 type itemCall struct {
 	custID    string
+	invoiceID string
 	amountCfg int64
 	currency  string
 	desc      string
@@ -46,9 +65,14 @@ type itemCall struct {
 }
 
 type invoiceCall struct {
-	custID      string
-	autoAdvance bool
-	idemKey     string
+	custID  string
+	ref     string
+	idemKey string
+}
+
+type finalizeCall struct {
+	invoiceID string
+	idemKey   string
 }
 
 func newFakeStripe() *fakeStripe {
@@ -59,21 +83,53 @@ func newFakeStripe() *fakeStripe {
 	}
 }
 
-func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID string, amountCents int64, currency, desc, idemKey string) (billingstripe.InvoiceItem, error) {
-	f.itemCalls = append(f.itemCalls, itemCall{custID, amountCents, currency, desc, idemKey})
+func (f *fakeStripe) CreateDraftInvoice(_ context.Context, custID, ref, idemKey string) (billingstripe.Invoice, error) {
+	f.invoiceCalls = append(f.invoiceCalls, invoiceCall{custID, ref, idemKey})
+	if f.errDraft != nil {
+		return billingstripe.Invoice{}, f.errDraft
+	}
+	return billingstripe.Invoice{ID: f.invoiceID, Status: "draft", Currency: "usd"}, nil
+}
+
+func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID string, amountCents int64, currency, desc, idemKey string) (billingstripe.InvoiceItem, error) {
+	f.itemCalls = append(f.itemCalls, itemCall{custID, invoiceID, amountCents, currency, desc, idemKey})
 	if f.errItem != nil {
 		return billingstripe.InvoiceItem{}, f.errItem
 	}
 	return billingstripe.InvoiceItem{ID: "ii_test_" + uuid.NewString()}, nil
 }
 
-func (f *fakeStripe) CreateInvoice(_ context.Context, custID string, autoAdvance bool, idemKey string) (billingstripe.Invoice, error) {
-	f.invoiceCalls = append(f.invoiceCalls, invoiceCall{custID, autoAdvance, idemKey})
+// setFindByRef seeds the invoice the recovery lookup finds under EXACTLY the
+// given ref — a lookup with any other ref misses, so a leg reconciling against
+// another leg's charge identity fails its test.
+func (f *fakeStripe) setFindByRef(ref string, inv billingstripe.Invoice) {
+	if f.findByRefByRef == nil {
+		f.findByRefByRef = map[string]billingstripe.Invoice{}
+	}
+	f.findByRefByRef[ref] = inv
+}
+
+func (f *fakeStripe) FindInvoiceByRef(_ context.Context, _, ref string) (billingstripe.Invoice, bool, error) {
+	f.findByRefCalls = append(f.findByRefCalls, ref)
+	if f.errFindByRef != nil {
+		return billingstripe.Invoice{}, false, f.errFindByRef
+	}
+	if inv, ok := f.findByRefByRef[ref]; ok {
+		return inv, true, nil
+	}
+	return billingstripe.Invoice{}, false, nil
+}
+
+func (f *fakeStripe) FinalizeInvoice(_ context.Context, invoiceID, idemKey string) (billingstripe.Invoice, error) {
+	f.finalizeCalls = append(f.finalizeCalls, finalizeCall{invoiceID, idemKey})
 	if f.errInvoice != nil {
 		return billingstripe.Invoice{}, f.errInvoice
 	}
+	if f.onCreateInvoice != nil {
+		f.onCreateInvoice()
+	}
 	return billingstripe.Invoice{
-		ID:         f.invoiceID,
+		ID:         invoiceID,
 		Status:     f.invoiceStatus,
 		AmountDue:  f.invoiceAmountDue,
 		AmountPaid: f.invoiceAmountPaid,
@@ -135,7 +191,7 @@ func TestRunBillingCycle_ChargesArrears(t *testing.T) {
 	require.Equal(t, "cus_test_1", sc.itemCalls[0].custID)
 	require.EqualValues(t, 123, sc.itemCalls[0].amountCfg)
 	require.Equal(t, "usd", sc.itemCalls[0].currency)
-	require.True(t, sc.invoiceCalls[0].autoAdvance)
+	require.Len(t, sc.finalizeCalls, 1, "the draft is finalized (auto_advance) — the money-moving step")
 
 	// Invoice mirrored + run marked invoiced.
 	require.Len(t, store.invoices, 1)
@@ -150,6 +206,244 @@ func TestRunBillingCycle_ChargesArrears(t *testing.T) {
 		require.EqualValues(t, 123, m.totalCents)
 		require.NotEmpty(t, m.invoiceID)
 	}
+}
+
+// --- FINDING 3: a reclaimed boundary run reuses its FROZEN charge amount, never
+// a freshly-recomputed live total, so the stable Stripe idem key never conflicts -
+
+func TestRunBillingCycle_ReclaimReusesFrozenBoundaryChargeAmount(t *testing.T) {
+	// Reproduces the exact failure scenario. Account X's boundary run computes
+	// arrears $1 + advance base $40 (2 apps) + advance overage $6 (2 ongoing
+	// over-modules) = $47 (4700¢), calls Stripe under ii-<run>/inv-<run> (the money
+	// moves), but crashes before MarkBillingRun commits — the run stays 'pending'.
+	// Before the retry a customer uninstalls one over-module, so a LIVE recompute
+	// would now yield only $44 (4400¢). InsertBillingRun RECLAIMS the SAME run id
+	// (same idem keys). Pre-fix, the retry re-sent those keys with the recomputed
+	// $44 — a mismatched body under a used idem key — which Stripe rejects,
+	// permanently stalling the run. Fixed: the retry REUSES the frozen $47 under the
+	// same keys and completes.
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000 // $1 usage arrears
+	store.hasPM = true
+	store.stripeCustomer = "cus_f3"
+
+	// 2 live apps created before the new period → $40 advance base.
+	seedApp(store, chargeAccount, 0, false)
+	app2 := seedApp(store, chargeAccount, 0, false)
+	// 5 included (ranks 0-4) + 2 ongoing over-modules already charged in a prior
+	// period (ranks 5-6) → overCount 2 → $6 advance overage.
+	seedIncluded(store, chargeAccount, app2, timeUTC(2026, 5, 1, 0), 5)
+	o1 := seedTimer(store, chargeAccount, app2, timeUTC(2026, 5, 10, 0))
+	o2 := seedTimer(store, chargeAccount, app2, timeUTC(2026, 5, 11, 0))
+	for _, id := range []uuid.UUID{o1, o2} {
+		store.timers[id].graceResolved = true
+		store.timers[id].graceCharged = true // charged in a prior period → ongoing
+	}
+
+	sc := newFakeStripe()
+
+	// FIRST attempt: Stripe charges $47, but MarkBillingRun fails (Lambda timed out
+	// before commit) → the run stays 'pending', the frozen $47 is durable.
+	store.errMarkRun = errors.New("lambda timeout before MarkBillingRun commit")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err, "the mark failed → the run is left pending, resumable")
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 4700, sc.itemCalls[0].amountCfg, "$1 + $40 + 2×$3 = $47")
+	firstIdem := sc.itemCalls[0].idemKey
+
+	// Between attempts: a customer uninstalls one over-module → a LIVE recompute
+	// would now yield overCount 1 → $44, NOT $47.
+	store.timers[o2].removed = true
+	store.timers[o2].removedAt = timeUTC(2026, 6, 15, 0)
+	store.errMarkRun = nil // the retry's mark succeeds
+
+	// RETRY: reclaims the SAME run id (same idem keys). It must charge the FROZEN
+	// $47, never the recomputed $44 — otherwise Stripe rejects the reused key.
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.True(t, resp.FirstRun, "a reclaimed non-terminal run is a fresh charge attempt")
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Len(t, sc.itemCalls, 2)
+	require.Equal(t, firstIdem, sc.itemCalls[1].idemKey,
+		"the reclaim reuses the same run id → the same Stripe idem key")
+	require.EqualValues(t, 4700, sc.itemCalls[1].amountCfg,
+		"so the amount under that key must be the frozen $47, not the recomputed $44")
+	require.EqualValues(t, 4700, resp.ChargedCents)
+	for _, m := range store.markedRuns {
+		require.Equal(t, cycle.RunStatusInvoiced, m.status)
+		require.EqualValues(t, 4700, m.totalCents)
+	}
+}
+
+// Regression (review 2026-07-06, H8): every early-out — the zero-skip and the
+// prepaid/ceiling/risk/PM gates — used to run BEFORE the frozen-charge lookup.
+// A reclaimed run whose prior attempt already put money through Stripe could be
+// marked skipped/invoiced WITHOUT mirroring that charge: unmirrored money now,
+// a fresh double-charge after the idem keys age out. The frozen lookup now runs
+// FIRST, and a frozen run's only job is to finish.
+func TestRunBillingCycle_FrozenRunChargesEvenWhenLiveTotalCollapsesToZero(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000 // $1 arrears
+	store.hasPM = true
+	store.stripeCustomer = "cus_h8"
+	app := seedApp(store, chargeAccount, 0, false) // + $20 base = $21
+
+	sc := newFakeStripe()
+
+	// FIRST attempt: Stripe charges $21, crash before MarkBillingRun.
+	store.errMarkRun = errors.New("crash before mark")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	require.Len(t, sc.finalizeCalls, 1, "the money moved")
+
+	// Between attempts the LIVE total collapses to zero: the app is deleted and
+	// the arrears vanish (e.g. an aggregates correction).
+	a := store.apps[app]
+	a.Deleted = true
+	store.apps[app] = a
+	store.chargedTotal = 0
+	store.errMarkRun = nil
+
+	// RETRY: pre-fix the boundaryTotal==0 zero-skip marked the run 'invoiced'
+	// with NO mirror of the $21 already charged. Fixed: the frozen charge is
+	// reconciled first — replayed through the same keys, mirrored, marked.
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.EqualValues(t, 2100, resp.ChargedCents, "the frozen $21, not the collapsed live $0")
+	require.Len(t, store.invoices, 1, "the crashed attempt's charge is mirrored")
+	for _, m := range store.markedRuns {
+		require.EqualValues(t, 2100, m.totalCents)
+	}
+}
+
+func TestRunBillingCycle_FrozenRunNotSkippedByPrepaidOrPMGates(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_h8b"
+
+	sc := newFakeStripe()
+
+	// FIRST attempt charges $1, crash before mark.
+	store.errMarkRun = errors.New("crash before mark")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	require.Len(t, sc.finalizeCalls, 1)
+
+	// Between attempts: the account tightens to prepaid (possibly triggered by
+	// the crashed attempt's own open invoice) AND its default PM is removed.
+	// The crashed attempt's FINALIZED invoice exists on Stripe under the ref
+	// (that existence — not the frozen marker alone — is what justifies
+	// bypassing the gates, wave 2 D6).
+	store.collection.Mode = cycle.BillingModePrepaid
+	store.hasPM = false
+	store.errMarkRun = nil
+	sc.setFindByRef(sc.invoiceCalls[0].ref, billingstripe.Invoice{ID: sc.invoiceID, Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"})
+
+	// RETRY: pre-fix → skipped_prepaid (or skipped_no_pm), stranding the moved
+	// money unmirrored. Fixed: gates never apply over an EXISTING charge; the
+	// reconcile completes through the same objects.
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status,
+		"a run whose charge exists on Stripe finishes; it is never re-gated into a skip over moved money")
+	require.Len(t, store.invoices, 1)
+}
+
+// Regression (wave 2, D6): the frozen marker is stamped BEFORE the first
+// Stripe call, so "frozen" alone does not mean money moved. A reclaim whose
+// prior attempt froze and then died BEFORE creating anything on Stripe is a
+// genuinely fresh charge — the collection gates must apply, not be bypassed.
+func TestRunBillingCycle_FrozenButNothingOnStripeIsReGated(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_d6"
+
+	sc := newFakeStripe()
+
+	// FIRST attempt: freezes, then the draft create fails — nothing on Stripe.
+	sc.errDraft = errors.New("stripe 5xx before any object existed")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	require.Empty(t, sc.finalizeCalls, "no money moved")
+
+	// Overnight the account tightens to prepaid. findByRef stays nil (nothing
+	// under the ref).
+	store.collection.Mode = cycle.BillingModePrepaid
+	sc.errDraft = nil
+
+	// RECLAIM: pre-fix the frozen marker bypassed every gate and a FRESH
+	// draft+item+finalize fired against the prepaid account. Fixed: nothing on
+	// Stripe → re-gated → skipped_prepaid (non-terminal; the frozen amount
+	// survives for a post-relax reclaim).
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusSkippedPrepaid, resp.Status,
+		"frozen-but-nothing-on-Stripe is a fresh charge — the prepaid gate applies")
+	require.Empty(t, sc.finalizeCalls, "no off-session charge against a prepaid account")
+}
+
+// Regression (review 2026-07-06, H6): the freeze is first-write-wins AND the
+// charger adopts the SURVIVING value — a concurrent second daemon that
+// reclaimed the same run and froze first wins, so both processes send Stripe
+// the same body under the shared idem keys.
+func TestRunBillingCycle_LostFreezeRaceAdoptsWinnersAmount(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000 // this process computes $1 → 100¢
+	store.hasPM = true
+	store.stripeCustomer = "cus_h6"
+
+	sc := newFakeStripe()
+
+	// A concurrent daemon B froze $47 in the race window between this process's
+	// top-of-run frozen read (empty) and its own freeze attempt.
+	store.onFreezeCharge = func(runID uuid.UUID) {
+		if _, exists := store.frozenCharges[runID]; !exists {
+			store.frozenCharges[runID] = cycle.FrozenBoundaryCharge{Cents: 4700, WithBase: true}
+		}
+	}
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 4700, resp.ChargedCents,
+		"the loser of the freeze race must charge the winner's frozen amount, never its own")
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 4700, sc.itemCalls[0].amountCfg)
+}
+
+// Regression (review 2026-07-06, H5): a frozen reclaim past Stripe's ~24h
+// idempotency-key window can no longer trust key replay — a bare re-send would
+// mint a SECOND draft+item+charge. The reclaim now reconciles by the run's
+// ms_charge_ref anchor first: the crashed attempt's finalized invoice is
+// adopted (mirrored + marked) with NO new Stripe objects.
+func TestRunBillingCycle_LateReclaimAdoptsFoundInvoiceWithoutNewObjects(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_h5"
+
+	sc := newFakeStripe()
+
+	// FIRST attempt charges $1, crash before mark (frozen marker durable).
+	store.errMarkRun = errors.New("crash before mark")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	drafts, finalizes := len(sc.invoiceCalls), len(sc.finalizeCalls)
+
+	// The reclaim lands DAYS later — keys pruned — but the crashed attempt's
+	// invoice is findable under run:<id>.
+	sc.setFindByRef(sc.invoiceCalls[0].ref, billingstripe.Invoice{ID: "in_prior_boundary", Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"})
+	store.errMarkRun = nil
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Len(t, sc.invoiceCalls, drafts, "no second draft on a recovered reclaim")
+	require.Len(t, sc.finalizeCalls, finalizes, "no second finalize — the money moved once")
+	_, mirrored := store.invoices["in_prior_boundary"]
+	require.True(t, mirrored, "the crashed attempt's invoice is mirrored")
 }
 
 func TestRunBillingCycle_CentsRoundHalfUp(t *testing.T) {
@@ -469,4 +763,172 @@ func TestRunBillingCycle_PropagatesStoreErrors(t *testing.T) {
 			requireCode(t, err, billing.CodeInternal)
 		})
 	}
+}
+
+// --- large auto-collect disclosure flag (migration 034) -------------------
+
+func TestRunBillingCycle_LargeChargeFlagsMirror(t *testing.T) {
+	// A charge above the default $100 threshold (nil override) freezes
+	// is_large_auto_collect=true on the mirror. $150 arrears → flagged.
+	store := newFakeStore()
+	store.chargedTotal = 150_000_000 // $150 in micros, over the $100 default
+	store.hasPM = true
+	store.stripeCustomer = "cus_large"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.True(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$150 > $100 default threshold → disclosed as large")
+}
+
+func TestRunBillingCycle_SmallChargeDoesNotFlagMirror(t *testing.T) {
+	// A charge below the default threshold leaves the flag false (the historic /
+	// non-disclosed default).
+	store := newFakeStore()
+	store.chargedTotal = 50_000_000 // $50 in micros, under the $100 default
+	store.hasPM = true
+	store.stripeCustomer = "cus_small"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$50 < $100 default threshold → not disclosed")
+}
+
+func TestRunBillingCycle_PerAccountThresholdOverrideRespected(t *testing.T) {
+	// A $200 per-account override governs over the $100 default: a $150 charge is
+	// under the CUSTOM threshold and so is NOT flagged, proving the flag is
+	// resolved against the account's own threshold at charge time.
+	store := newFakeStore()
+	override := int64(200_000_000) // $200 override
+	store.collection.AutoCollectThresholdMicros = &override
+	store.chargedTotal = 150_000_000 // $150, over default but under the override
+	store.hasPM = true
+	store.stripeCustomer = "cus_override"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"$150 < $200 per-account override → not disclosed despite exceeding the default")
+}
+
+// TestRunBillingCycle_SubCentAboveThresholdChargesExactThresholdNotFlagged is
+// the end-to-end regression for finding #1 (collection.IsLargeAutoCollect
+// compared raw pre-rounding micros against the threshold instead of the SAME
+// post-rounding cents Stripe actually charges).
+//
+// FAILS without the fix: arrears = $100.00 + 100 micros ($100.0001) is
+// strictly ABOVE the raw $100,000,000-micro default threshold, so the old
+// `chargedMicros > threshold` comparison flagged the mirror row "large" even
+// though the money that actually hit the card — the SAME
+// centsFromMicros(arrears) conversion this test asserts on the fake Stripe
+// call — is EXACTLY $100.00 (round-half-up rounds 100_000_100/10_000 =
+// 10000.01 DOWN to 10000 cents), identical to what a charge of exactly the
+// threshold itself would produce. Proves the concrete dollar amount, not just
+// "no error": the Stripe invoice item is created for precisely 10000 cents
+// ($100.00), and the mirror is NOT flagged, matching the "exactly at
+// threshold is not large" contract.
+func TestRunBillingCycle_SubCentAboveThresholdChargesExactThresholdNotFlagged(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 100_000_100 // $100.00 + 100 micros ($0.0001) — inside the half-cent gap
+	store.hasPM = true
+	store.stripeCustomer = "cus_subcent"
+	sc := newFakeStripe()
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 10000, sc.itemCalls[0].amountCfg,
+		"Stripe is charged exactly 10000 cents ($100.00), not $100.01 — the same amount charging exactly the threshold would produce")
+	require.EqualValues(t, 10000, resp.ChargedCents)
+
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"a charge that rounds down to EXACTLY the $100 threshold must not be disclosed as large")
+}
+
+// --- regression: finding #2 (threshold resolved at different points relative
+// to the charge in RunBillingCycle vs. RegisterApp) -------------------------
+//
+// Both tests below charge $150 while a concurrent threshold edit ($100
+// default → $200 override) lands DURING the Stripe CreateInvoice HTTP call —
+// i.e. strictly after any pre-charge store read and strictly before any
+// post-charge store read. Both call sites must resolve the SAME way (the
+// edit that landed mid-charge is picked up), matching the "resolved at charge
+// time" contract identically on both legs.
+//
+// FAILS without the fix: RunBillingCycle read `acct` (and its
+// AutoCollectThresholdMicros) at the TOP of the function — before the risk
+// gate, the PM check, and both Stripe HTTP calls — so it never observes the
+// edit and still uses the stale $100 default, flagging the $150 charge as
+// large. RegisterApp, by contrast, already re-resolves the threshold AFTER
+// its Stripe call succeeds, so it picks up the new $200 override and does
+// NOT flag the same $150 charge. That asymmetry — same race, different
+// outcome depending on which leg charged — is exactly what this test
+// forbids.
+
+func TestRunBillingCycle_ConcurrentThresholdEditMidChargeResolvesPostCharge(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 150_000_000 // $150: over the $100 default, under a $200 override
+	store.hasPM = true
+	store.stripeCustomer = "cus_race_boundary"
+	sc := newFakeStripe()
+	sc.onCreateInvoice = func() {
+		// The concurrent edit: an operator (or the account owner) raises the
+		// disclosure threshold to $200 WHILE this charge's Stripe call is in
+		// flight.
+		override := int64(200_000_000)
+		store.collection.AutoCollectThresholdMicros = &override
+	}
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.EqualValues(t, 15000, resp.ChargedCents, "still charges $150 — the edit only affects disclosure, never the amount")
+	require.False(t, store.invoices[resp.StripeInvoiceID].IsLargeAutoCollect,
+		"the threshold is resolved AFTER the Stripe charge succeeds, so the mid-charge $200 edit governs — $150 is not flagged")
+}
+
+func TestChargeCreationProration_ConcurrentThresholdEditMidChargeResolvesPostCharge(t *testing.T) {
+	// The creation-proration leg (the grace-sweep charge, proration.go) resolves
+	// its large-charge disclosure threshold at the SAME point relative to the
+	// actual charge as the boundary leg above: immediately AFTER the Stripe call
+	// succeeds, never from a pre-charge snapshot. Under the unified model this
+	// leg bills the FLAT per-app base only ($20 — module overage is no longer
+	// folded in), so the straddle here is a $20 charge between a $10 pre-charge
+	// threshold and a $30 mid-charge override.
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	// Pre-charge threshold $10: were it resolved BEFORE the charge, the $20 base
+	// would flag "large" ($20 > $10).
+	stale := int64(10_000_000)
+	store.collection.AutoCollectThresholdMicros = &stale
+	sc := newFakeStripe()
+	sc.onCreateInvoice = func() {
+		// The concurrent edit lands WHILE the Stripe call is in flight, raising
+		// the threshold to $30 — above the $20 base.
+		override := int64(30_000_000)
+		store.collection.AutoCollectThresholdMicros = &override
+	}
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	// CreatedAt on the anchored period boundary (day 4, matching registeredAccount's
+	// May-4 activation) → the FULL flat $20 base, no proration dampening.
+	registerMirror(t, svc, user, appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), 3)
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2000, resp.ProrationCents, "flat $20 base, charged in full")
+	require.NotEmpty(t, resp.ProrationInvoiceID)
+
+	require.False(t, store.invoices[resp.ProrationInvoiceID].IsLargeAutoCollect,
+		"the threshold is resolved AFTER the Stripe charge succeeds on this leg too, so the mid-charge $30 edit governs — $20 is not flagged")
 }

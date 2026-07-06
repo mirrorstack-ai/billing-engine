@@ -2,6 +2,7 @@ package stripe
 
 import (
 	"context"
+	"fmt"
 
 	stripego "github.com/stripe/stripe-go/v85"
 	stripeclient "github.com/stripe/stripe-go/v85/client"
@@ -113,16 +114,46 @@ func (c *realClient) SetDefaultPaymentMethod(ctx context.Context, stripeCustomer
 	return err
 }
 
-// CreateInvoiceItem creates a pending invoice item on the Customer for one
-// metered metric line. amountCents is whole cents (the caller converts
-// micro-dollars → cents round-half-up before this call; Stripe amounts are
-// integer minor units). The deterministic Idempotency-Key (ii-<run>-<metric>)
-// makes a re-run safe — Stripe returns the original item instead of creating a
-// second one. We project to a plain InvoiceItem (id only) so consumers stay
-// off stripe-go.
-func (c *realClient) CreateInvoiceItem(ctx context.Context, custID string, amountCents int64, currency, desc, idemKey string) (InvoiceItem, error) {
+// CreateDraftInvoice creates an EMPTY draft invoice line items are then
+// pinned to (CreateInvoiceItem) and that charges only on FinalizeInvoice.
+// PendingInvoiceItemsBehavior=exclude is load-bearing (review 2026-07-06, C2):
+// it guarantees this invoice can never sweep up another charge leg's orphaned
+// customer-level pending item — with several independent item→invoice
+// sequences per account, the legacy include behavior pooled a crashed leg's
+// item onto the next leg's unrelated invoice. ref is stamped as the
+// ms_charge_ref metadata anchor for crash reconciliation. The deterministic
+// Idempotency-Key (inv-<id>) makes a re-run reuse the original draft.
+func (c *realClient) CreateDraftInvoice(ctx context.Context, custID, ref, idemKey string) (Invoice, error) {
+	params := &stripego.InvoiceParams{
+		Customer:                    stripego.String(custID),
+		CollectionMethod:            stripego.String(string(stripego.InvoiceCollectionMethodChargeAutomatically)),
+		AutoAdvance:                 stripego.Bool(false),
+		PendingInvoiceItemsBehavior: stripego.String("exclude"),
+	}
+	if ref != "" {
+		params.AddMetadata("ms_charge_ref", ref)
+	}
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	inv, err := c.sc.Invoices.New(params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
+// CreateInvoiceItem creates an invoice item PINNED to the given draft invoice
+// (never a floating customer-level pending item — see CreateDraftInvoice).
+// amountCents is whole cents (the caller converts micro-dollars → cents
+// round-half-up before this call; Stripe amounts are integer minor units). The
+// deterministic Idempotency-Key makes a re-run safe — Stripe returns the
+// original item (already pinned to the same replayed draft) instead of
+// creating a second one. We project to a plain InvoiceItem (id only) so
+// consumers stay off stripe-go.
+func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc, idemKey string) (InvoiceItem, error) {
 	params := &stripego.InvoiceItemParams{
 		Customer: stripego.String(custID),
+		Invoice:  stripego.String(invoiceID),
 		Amount:   stripego.Int64(amountCents),
 		Currency: stripego.String(currency),
 	}
@@ -138,35 +169,58 @@ func (c *realClient) CreateInvoiceItem(ctx context.Context, custID string, amoun
 	return InvoiceItem{ID: item.ID}, nil
 }
 
-// CreateInvoice creates a draft invoice with
-// collection_method=charge_automatically that sweeps up the Customer's pending
-// invoice items. With autoAdvance=true Stripe finalizes the draft and runs the
-// off-session PaymentIntent against the default PM automatically — the metered
-// auto-charge. PendingInvoiceItemsBehavior=include pulls the pending items
-// created just above into this invoice (the default behavior changed across
-// Stripe API versions; pinning it keeps the line items deterministic). The
-// deterministic Idempotency-Key (inv-<run>) makes a re-run reuse the original
-// invoice. Projected to a plain Invoice (id/status/amounts) for the mirror.
-func (c *realClient) CreateInvoice(ctx context.Context, custID string, autoAdvance bool, idemKey string) (Invoice, error) {
-	params := &stripego.InvoiceParams{
-		Customer:                    stripego.String(custID),
-		CollectionMethod:            stripego.String(string(stripego.InvoiceCollectionMethodChargeAutomatically)),
-		AutoAdvance:                 stripego.Bool(autoAdvance),
-		PendingInvoiceItemsBehavior: stripego.String("include"),
+// FinalizeInvoice finalizes the draft with auto_advance=true — Stripe runs the
+// off-session PaymentIntent against the default PM (the metered auto-charge).
+// The ONLY money-moving step of the draft→items→finalize flow. The
+// deterministic Idempotency-Key (fin-<id>) makes a re-run replay the original
+// finalization instead of double-charging. Projected to a plain Invoice
+// (id/status/amounts) for the mirror.
+func (c *realClient) FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error) {
+	params := &stripego.InvoiceFinalizeInvoiceParams{
+		AutoAdvance: stripego.Bool(true),
 	}
 	params.Context = ctx
 	params.SetIdempotencyKey(idemKey)
-	inv, err := c.sc.Invoices.New(params)
+	inv, err := c.sc.Invoices.FinalizeInvoice(invoiceID, params)
 	if err != nil {
 		return Invoice{}, err
 	}
+	return projectInvoice(inv), nil
+}
+
+// FindInvoiceByRef searches the Customer's invoices for the ms_charge_ref
+// metadata anchor — the crash-recovery read for retries past Stripe's ~24h
+// idempotency-key window (see the interface comment). Uses the Stripe Search
+// API; at most one invoice can carry a given ref (the ref is the deterministic
+// charge identity and the draft that carries it is created under an idem key).
+func (c *realClient) FindInvoiceByRef(ctx context.Context, custID, ref string) (Invoice, bool, error) {
+	params := &stripego.InvoiceSearchParams{
+		SearchParams: stripego.SearchParams{
+			Query:   fmt.Sprintf(`customer:"%s" AND metadata["ms_charge_ref"]:"%s"`, custID, ref),
+			Limit:   stripego.Int64(1),
+			Context: ctx,
+		},
+	}
+	it := c.sc.Invoices.Search(params)
+	if it.Next() {
+		return projectInvoice(it.Invoice()), true, nil
+	}
+	if err := it.Err(); err != nil {
+		return Invoice{}, false, err
+	}
+	return Invoice{}, false, nil
+}
+
+// projectInvoice maps a stripe-go invoice to the trust-boundary-edge Invoice
+// projection the cycle consumer mirrors.
+func projectInvoice(inv *stripego.Invoice) Invoice {
 	return Invoice{
 		ID:         inv.ID,
 		Status:     string(inv.Status),
 		AmountDue:  inv.AmountDue,
 		AmountPaid: inv.AmountPaid,
 		Currency:   string(inv.Currency),
-	}, nil
+	}
 }
 
 // NewVerifier returns a Verifier for the configured webhook signing

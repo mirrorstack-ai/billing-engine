@@ -31,8 +31,8 @@ func seedMirrorApp(t *testing.T, pool *pgxpool.Pool, acct, app uuid.UUID, create
 		del = deletedAt
 	}
 	_, err := pool.Exec(context.Background(),
-		`INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_at, deleted_at)
-		 VALUES ($1, $2, 0, $3, $4)`,
+		`INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, deleted_at)
+		 VALUES ($1, $2, 0, 0, $3, $4)`,
 		app.String(), acct.String(), createdAt, del)
 	require.NoError(t, err)
 }
