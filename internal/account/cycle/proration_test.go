@@ -698,3 +698,50 @@ func TestChargeCreationProration_ActivatedBeforePeriodClosesStillCharges(t *test
 	require.Len(t, sc.itemCalls, 1)
 	require.False(t, store.apps[appID].ProrationSkipped)
 }
+
+// Recovery resolves the SAME funding hop as the fresh-charge path: a
+// sponsor-funded org app's crashed proration attempt is looked up under the
+// SPONSOR's Stripe customer — the org account has none, so a recovery
+// resolving the attribution account directly would fail loudly (or, worse,
+// miss the moved money and re-charge fresh once the idem key ages out).
+func TestChargeCreationProration_RecoveryResolvesSponsorCustomer(t *testing.T) {
+	store := newFakeStore()
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+
+	org, orgAcct, sponsorAcct := uuid.New(), uuid.New(), uuid.New()
+	store.accountsByOrg[org] = orgAcct
+	store.orgDesignations[org] = cycle.OrgDesignation{
+		OrgID: org, Funding: cycle.OrgFundingSponsor, SponsorAccountID: sponsorAcct,
+	}
+	// Org account: activated (sponsor designation), NO PM, NO customer of its
+	// own. Sponsor: usable PM + customer — the only chargeable instrument.
+	created := appsNow.AddDate(0, 0, -7) // past grace, same anchored period
+	store.activation[orgAcct] = created
+	store.hasPMByAccount[orgAcct] = false
+	store.hasPMByAccount[sponsorAcct] = true
+	store.stripeCustomerByAccount[sponsorAcct] = "cus_sponsor"
+
+	appID := uuid.New()
+	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerOrgID: org, AppID: appID, CreatedAt: created,
+	})
+	require.NoError(t, err)
+	require.Equal(t, orgAcct, store.apps[appID].AccountID, "funded org app registers on the org account")
+
+	// A prior attempt crashed after arming the durable marker but before any
+	// Stripe object survived (FindInvoiceByRef finds nothing) — recovery must
+	// SEARCH the sponsor's customer, then charge fresh through the same hop.
+	app := store.apps[appID]
+	app.ProrationAttempted = true
+	store.apps[appID] = app
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Equal(t, []string{"cus_sponsor"}, sc.findByRefCustIDs,
+		"the recovery lookup must search the FUNDING customer, not the org account's")
+	require.Len(t, sc.invoiceCalls, 1)
+	require.Equal(t, "cus_sponsor", sc.invoiceCalls[0].custID,
+		"the fresh charge after a not-found recovery rides the same funding hop")
+}

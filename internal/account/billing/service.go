@@ -70,7 +70,7 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 	var found bool
 	var err error
 	if req.OrgID != uuid.Nil {
-		accountID, found, err = s.store.AccountByOrgFunded(ctx, req.OrgID)
+		accountID, found, err = s.store.ResolveOrgFundedAccount(ctx, req.OrgID)
 	} else {
 		accountID, found, err = s.store.AccountByUser(ctx, req.UserID)
 	}
@@ -82,18 +82,20 @@ func (s *Service) Ensure(ctx context.Context, req EnsureRequest) (*EnsureRespons
 		return resp, nil
 	}
 
-	// The payment_method capability checks the FUNDING account (org-billing
-	// D1): a sponsor-funded org account owns no PM rows — the sponsor's does.
-	// A self-funded account (every user account, org-funded orgs) maps to
-	// itself, so the hop is uniform.
-	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
-	if err != nil {
-		return nil, Internal("funding account lookup failed", err)
-	}
-
 	// Per-capability checks. Order is fixed (PM before subscription) so
 	// the Missing slice is deterministic regardless of Require ordering.
 	if slices.Contains(require, RequirePaymentMethod) {
+		// The payment_method capability checks the FUNDING account (org-billing
+		// D1): a sponsor-funded org account owns no PM rows — the sponsor's
+		// does. User principals fund themselves, so they skip the hop (the SQL
+		// is provably identity for a non-org account).
+		fundingID := accountID
+		if req.OrgID != uuid.Nil {
+			fundingID, err = s.store.ChargeFundingAccount(ctx, accountID)
+			if err != nil {
+				return nil, Internal("funding account lookup failed", err)
+			}
+		}
 		hasPM, err := s.store.HasUsablePaymentMethod(ctx, fundingID)
 		if err != nil {
 			return nil, Internal("payment-method lookup failed", err)

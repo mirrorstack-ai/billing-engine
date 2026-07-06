@@ -89,10 +89,12 @@ type Store interface {
 	// awaits its first bind.
 	AccountByOrg(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
 
-	// AccountByOrgFunded resolves the org's account through the designation +
-	// activation gate — Ensure's org resolution ("the pointer never flips to
-	// an unfunded account", design D1).
-	AccountByOrgFunded(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
+	// ResolveOrgFundedAccount resolves the org's account through the
+	// designation + activation gate — Ensure's org resolution ("the pointer
+	// never flips to an unfunded account", design D1). Named identically in
+	// every store that wraps the one generated query, so THE org account
+	// resolution greps as one thing.
+	ResolveOrgFundedAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
 
 	// ChargeFundingAccount maps an account to the account whose Stripe
 	// customer / default PM pays its invoices — itself, unless it is an org
@@ -384,32 +386,13 @@ func (s *pgxStore) EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (uuid.
 
 func (s *pgxStore) AccountByOrg(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
 	row, err := s.q.SelectAccountByOrg(ctx, nullableUUID(orgID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, false, nil
-	}
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	parsed, err := uuid.Parse(row.ID)
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	return parsed, true, nil
+	return uuidRowFound(row.ID, err)
 }
 
-func (s *pgxStore) AccountByOrgFunded(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+func (s *pgxStore) ResolveOrgFundedAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	// ErrNoRows = no designation / not activated — unbilled, a normal outcome.
 	id, err := s.q.ResolveOrgFundedAccount(ctx, orgID.String())
-	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, false, nil // no designation / not activated — unbilled
-	}
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	parsed, err := uuid.Parse(id)
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	return parsed, true, nil
+	return uuidRowFound(id, err)
 }
 
 func (s *pgxStore) ChargeFundingAccount(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error) {
@@ -432,6 +415,24 @@ func (s *pgxStore) PaymentMethodTargetForOrg(ctx context.Context, orgID, payment
 		return "", "", false, false, err
 	}
 	return row.StripePaymentMethodID, row.StripeCustomerID, row.IsDefault, true, nil
+}
+
+// uuidRowFound decodes the (uuid-as-string, error) shape every single-row
+// account-resolution query yields: ErrNoRows → (Nil, false, nil) — a normal
+// lazy/missing outcome, not an error — else the parsed id. One home for the
+// ceremony so the resolution wrappers stay one line each.
+func uuidRowFound(id string, err error) (uuid.UUID, bool, error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
 }
 
 // nullableUUID converts a google/uuid.UUID into the pgtype.UUID the

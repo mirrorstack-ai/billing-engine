@@ -1600,7 +1600,7 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 			return tx.Commit(ctx)
 		}
 		if err := qtx.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
-			AccountID:      uuid.UUID(row.AccountID.Bytes).String(),
+			AccountID:      uuidFromPg(row.AccountID).String(),
 			AppID:          appID.String(),
 			InstalledAt:    installedAt,
 			GraceExpiresAt: graceExpiresAt,
@@ -1791,32 +1791,12 @@ func (s *pgxStore) EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (uuid.
 
 func (s *pgxStore) AccountIDByUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, bool, error) {
 	id, err := s.q.AccountIDByUser(ctx, pgtype.UUID{Bytes: userID, Valid: true})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, false, nil
-	}
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	parsed, err := uuid.Parse(id)
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	return parsed, true, nil
+	return uuidRowFound(id, err)
 }
 
 func (s *pgxStore) OrgAccountID(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
 	row, err := s.q.SelectAccountByOrg(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, false, nil
-	}
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	parsed, err := uuid.Parse(row.ID)
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	return parsed, true, nil
+	return uuidRowFound(row.ID, err)
 }
 
 func (s *pgxStore) OrgDesignation(ctx context.Context, orgID uuid.UUID) (OrgDesignation, bool, error) {
@@ -1865,18 +1845,9 @@ func (s *pgxStore) DeleteOrgDesignation(ctx context.Context, orgID uuid.UUID) (b
 }
 
 func (s *pgxStore) ResolveOrgFundedAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	// ErrNoRows = no designation, or not yet activated — unbilled, normal.
 	id, err := s.q.ResolveOrgFundedAccount(ctx, orgID.String())
-	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, false, nil // no designation, or not yet activated — unbilled
-	}
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	parsed, err := uuid.Parse(id)
-	if err != nil {
-		return uuid.Nil, false, err
-	}
-	return parsed, true, nil
+	return uuidRowFound(id, err)
 }
 
 func (s *pgxStore) ActivateAccountIfUnset(ctx context.Context, accountID uuid.UUID, at time.Time) error {
@@ -1926,6 +1897,23 @@ func (s *pgxStore) ChargeFundingAccount(ctx context.Context, accountID uuid.UUID
 		return uuid.Nil, err // incl. ErrNoRows: a missing accounts row is a code bug, not a skip
 	}
 	return uuid.Parse(id)
+}
+
+// uuidRowFound decodes the (uuid-as-string, error) shape every single-row
+// account-resolution query yields: ErrNoRows → (Nil, false, nil) — a normal
+// lazy/missing outcome, not an error — else the parsed id.
+func uuidRowFound(id string, err error) (uuid.UUID, bool, error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
 }
 
 // pgUUIDOrNull maps uuid.Nil to a SQL NULL and a real UUID to a valid

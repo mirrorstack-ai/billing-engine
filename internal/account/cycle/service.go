@@ -101,6 +101,30 @@ func (s *Service) resolveChargeableCustomer(ctx context.Context, accountID uuid.
 	return custID, true, nil
 }
 
+// recoveryCustomer resolves the Stripe customer a CRASHED charge attempt's
+// invoice is searched under (FindInvoiceByRef) — through the SAME funding hop
+// the fresh-charge path applied when it created the invoice, so recovery and
+// charge always look at the same customer. For a sponsor-funded org account
+// the attribution account usually has NO Stripe customer at all; searching it
+// would turn every recovery into a loud error, or a false "nothing" that
+// re-charges fresh. Deliberately NOT PM-gated, matching each recovery leg's
+// reconcile-before-gates posture.
+//
+// Known narrow gap: a funding SWITCH between the crashed attempt and this
+// recovery resolves the NEW instrument, so the old instrument's invoice is
+// invisible here — the deterministic idempotency keys (~24h) then return the
+// ORIGINAL invoice on the re-charge attempt, the same backstop the Search-lag
+// note in RunBillingCycle already relies on. The recorded-instrument
+// hardening (stamping the funding account onto the attempt markers) travels
+// with the org-billing W2 transfer wave.
+func (s *Service) recoveryCustomer(ctx context.Context, accountID uuid.UUID) (string, error) {
+	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	return s.store.AccountStripeCustomer(ctx, fundingID)
+}
+
 // WithNow overrides the Service clock — deterministic-test hook only (mirrors
 // the usage.Service nowFn seam). Returns the Service for chaining.
 func (s *Service) WithNow(now func() time.Time) *Service {

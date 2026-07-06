@@ -124,7 +124,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// path are non-terminal; the frozen amount survives for a later reclaim.
 	var recovered *billingstripe.Invoice
 	if hasFrozen {
-		custID, err := s.store.AccountStripeCustomer(ctx, accountID)
+		custID, err := s.recoveryCustomer(ctx, accountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
@@ -342,12 +342,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// as a skip over moved money. Only the Customer id is required there.
 	var custID string
 	if moneyMayHaveMoved {
-		custID, err = s.store.AccountStripeCustomer(ctx, accountID)
+		custID, err = s.recoveryCustomer(ctx, accountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
 		if custID == "" {
-			return nil, billing.Internal("billing run has a recovered Stripe invoice but the account has no Stripe customer id", nil)
+			return nil, billing.Internal("billing run has a recovered Stripe invoice but the funding account has no Stripe customer id", nil)
 		}
 	} else {
 		var ok bool

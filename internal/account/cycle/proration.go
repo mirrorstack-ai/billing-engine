@@ -288,12 +288,12 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	var recoveredInv *billingstripe.Invoice
 	moneyMayHaveMoved := false
 	if app.ProrationAttempted {
-		custID, err = s.store.AccountStripeCustomer(ctx, app.AccountID)
+		custID, err = s.recoveryCustomer(ctx, app.AccountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
 		if custID == "" {
-			return nil, billing.Internal("app has an attempted proration charge but the account has no Stripe customer id", nil)
+			return nil, billing.Internal("app has an attempted proration charge but the funding account has no Stripe customer id", nil)
 		}
 		if found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, appProrationChargeRef(appID)); err != nil {
 			return nil, billing.StripeError("proration recovery lookup failed", err)
