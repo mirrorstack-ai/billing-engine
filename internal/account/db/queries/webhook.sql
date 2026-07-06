@@ -223,3 +223,42 @@ WHERE a.id = (
         WHERE i.account_id = a.id
           AND i.status IN ('open', 'uncollectible')
       );
+
+-- MarkInvoiceEverFailed sets the sticky ever_failed flag (migration 039) on the
+-- first invoice.payment_failed for a row. The `AND NOT ever_failed` guard makes
+-- it a one-way latch: :execrows returns 1 ONLY on the first flip, 0 on Stripe's
+-- subsequent retry events (distinct event ids, so the webhook's event-level
+-- dedup does not collapse them). The webhook increments the account streak ONLY
+-- when this returns 1, so a single invoice's retries count as one failure.
+-- name: MarkInvoiceEverFailed :execrows
+UPDATE ms_billing.invoices
+SET ever_failed = true
+WHERE stripe_invoice_id = $1
+  AND NOT ever_failed;
+
+-- IncrementFailedChargeStreak bumps the account's consecutive failed-charge
+-- streak (migration 040) by one, resolving the account via the invoice mirror.
+-- Called by the webhook ONLY after MarkInvoiceEverFailed reports a fresh flip,
+-- so it counts distinct failed invoices, not per-retry events. :execrows so the
+-- caller can log a drift no-op when the invoice has no mirror row yet.
+-- name: IncrementFailedChargeStreak :execrows
+UPDATE ms_billing.accounts
+SET failed_charge_streak = failed_charge_streak + 1
+WHERE id = (
+        SELECT inv.account_id FROM ms_billing.invoices AS inv
+        WHERE inv.stripe_invoice_id = $1
+      );
+
+-- ResetFailedChargeStreak clears the account's consecutive failed-charge streak
+-- to 0 on a successful charge (invoice.paid) — the auto-cure that unblocks a
+-- previously-blocked account. Resolves the account via the invoice mirror. The
+-- `AND failed_charge_streak <> 0` guard makes it a no-op (0 rows) when the
+-- streak is already clean, so a replayed/redundant paid event is idempotent.
+-- name: ResetFailedChargeStreak :execrows
+UPDATE ms_billing.accounts
+SET failed_charge_streak = 0
+WHERE id = (
+        SELECT inv.account_id FROM ms_billing.invoices AS inv
+        WHERE inv.stripe_invoice_id = $1
+      )
+  AND failed_charge_streak <> 0;

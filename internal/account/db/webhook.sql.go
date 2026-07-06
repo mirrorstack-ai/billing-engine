@@ -133,6 +133,28 @@ func (q *Queries) DuplicateFingerprintPM(ctx context.Context, arg DuplicateFinge
 	return id, err
 }
 
+const incrementFailedChargeStreak = `-- name: IncrementFailedChargeStreak :execrows
+UPDATE ms_billing.accounts
+SET failed_charge_streak = failed_charge_streak + 1
+WHERE id = (
+        SELECT inv.account_id FROM ms_billing.invoices AS inv
+        WHERE inv.stripe_invoice_id = $1
+      )
+`
+
+// IncrementFailedChargeStreak bumps the account's consecutive failed-charge
+// streak (migration 040) by one, resolving the account via the invoice mirror.
+// Called by the webhook ONLY after MarkInvoiceEverFailed reports a fresh flip,
+// so it counts distinct failed invoices, not per-retry events. :execrows so the
+// caller can log a drift no-op when the invoice has no mirror row yet.
+func (q *Queries) IncrementFailedChargeStreak(ctx context.Context, stripeInvoiceID string) (int64, error) {
+	result, err := q.db.Exec(ctx, incrementFailedChargeStreak, stripeInvoiceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const insertPaymentMethod = `-- name: InsertPaymentMethod :execrows
 WITH acct AS (
     SELECT id FROM ms_billing.accounts WHERE stripe_customer_id = $1
@@ -223,6 +245,27 @@ func (q *Queries) MarkEventProcessed(ctx context.Context, arg MarkEventProcessed
 	return result.RowsAffected(), nil
 }
 
+const markInvoiceEverFailed = `-- name: MarkInvoiceEverFailed :execrows
+UPDATE ms_billing.invoices
+SET ever_failed = true
+WHERE stripe_invoice_id = $1
+  AND NOT ever_failed
+`
+
+// MarkInvoiceEverFailed sets the sticky ever_failed flag (migration 039) on the
+// first invoice.payment_failed for a row. The `AND NOT ever_failed` guard makes
+// it a one-way latch: :execrows returns 1 ONLY on the first flip, 0 on Stripe's
+// subsequent retry events (distinct event ids, so the webhook's event-level
+// dedup does not collapse them). The webhook increments the account streak ONLY
+// when this returns 1, so a single invoice's retries count as one failure.
+func (q *Queries) MarkInvoiceEverFailed(ctx context.Context, stripeInvoiceID string) (int64, error) {
+	result, err := q.db.Exec(ctx, markInvoiceEverFailed, stripeInvoiceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const mirrorRowByStripePM = `-- name: MirrorRowByStripePM :one
 SELECT id, account_id, fingerprint
 FROM ms_billing.payment_methods_mirror
@@ -283,6 +326,29 @@ WHERE a.id = (
 // mirror row); the Go layer logs the outcome but treats 0 as success.
 func (q *Queries) RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoiceID string) (int64, error) {
 	result, err := q.db.Exec(ctx, relaxCollectionOnPaidInvoice, stripeInvoiceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resetFailedChargeStreak = `-- name: ResetFailedChargeStreak :execrows
+UPDATE ms_billing.accounts
+SET failed_charge_streak = 0
+WHERE id = (
+        SELECT inv.account_id FROM ms_billing.invoices AS inv
+        WHERE inv.stripe_invoice_id = $1
+      )
+  AND failed_charge_streak <> 0
+`
+
+// ResetFailedChargeStreak clears the account's consecutive failed-charge streak
+// to 0 on a successful charge (invoice.paid) — the auto-cure that unblocks a
+// previously-blocked account. Resolves the account via the invoice mirror. The
+// `AND failed_charge_streak <> 0` guard makes it a no-op (0 rows) when the
+// streak is already clean, so a replayed/redundant paid event is idempotent.
+func (q *Queries) ResetFailedChargeStreak(ctx context.Context, stripeInvoiceID string) (int64, error) {
+	result, err := q.db.Exec(ctx, resetFailedChargeStreak, stripeInvoiceID)
 	if err != nil {
 		return 0, err
 	}

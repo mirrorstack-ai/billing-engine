@@ -128,6 +128,22 @@ type Store interface {
 	// no-op (the account was not prepaid, is still delinquent, or has no mirror
 	// row), never an error. It NEVER charges — relax and charge are decoupled.
 	RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoiceID string) (relaxed bool, err error)
+
+	// RecordFailedCharge maintains the service-block failed-charge streak on
+	// invoice.payment_failed: it flips the sticky per-invoice ever_failed marker
+	// (migration 039) and, ONLY on the FIRST failure of a distinct invoice,
+	// increments accounts.failed_charge_streak (migration 040) — so Stripe's
+	// per-retry payment_failed events (distinct event ids, past the event-level
+	// dedup) count as a single failure. Returns (counted bool, error):
+	// counted=true only when this was the first failure for the invoice and the
+	// streak advanced; false is a retry no-op or a not-yet-mirrored invoice.
+	RecordFailedCharge(ctx context.Context, stripeInvoiceID string) (counted bool, err error)
+
+	// ResetFailedChargeStreak clears accounts.failed_charge_streak to 0 on
+	// invoice.paid — the auto-cure that unblocks an account the streak had
+	// blocked. Returns (reset bool, error): reset=false (0 rows) is a no-op — the
+	// streak was already clean or the invoice has no mirror row.
+	ResetFailedChargeStreak(ctx context.Context, stripeInvoiceID string) (reset bool, err error)
 }
 
 // ApplyInvoiceStatusParams carries the columns ApplyInvoiceStatus reconciles

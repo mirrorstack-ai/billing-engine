@@ -295,6 +295,57 @@ func (s *pgxStore) RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoi
 	return rows > 0, nil
 }
 
+// RecordFailedCharge flips the sticky ever_failed marker on the invoice and, on
+// the first failure of a distinct invoice ONLY, advances the account's
+// consecutive failed-charge streak (see the query docs). The flip GATES the
+// increment: MarkInvoiceEverFailed returns rows=1 exactly once per invoice (a
+// one-way latch), so Stripe's per-retry payment_failed events never double-count.
+//
+// The flip and the increment MUST be atomic. They run in ONE transaction so the
+// latch is never visible unless the increment also commits — otherwise a crash
+// or transient error between two autocommits would leave ever_failed=true with
+// the streak un-advanced, and the latch would then permanently suppress the
+// increment on every retry/redelivery (event-id dedup short-circuits the same
+// event; a later distinct event sees ever_failed already true). That would
+// silently UNDER-count the streak and let a should-be-blocked account read
+// eligible. On any error the tx rolls back, so the handler's 500 → Stripe
+// redelivery re-flips and re-increments correctly. Returns (counted, error)
+// where counted=true means the streak advanced.
+func (s *pgxStore) RecordFailedCharge(ctx context.Context, stripeInvoiceID string) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := s.q.WithTx(tx)
+
+	flipped, err := qtx.MarkInvoiceEverFailed(ctx, stripeInvoiceID)
+	if err != nil {
+		return false, err
+	}
+	if flipped == 0 {
+		// Already-failed invoice (a retry) or no mirror row yet — the streak
+		// counts distinct failed invoices, not events, so do not increment.
+		// Commit the (empty) tx so the caller sees a clean no-op.
+		return false, tx.Commit(ctx)
+	}
+	if _, err := qtx.IncrementFailedChargeStreak(ctx, stripeInvoiceID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+// ResetFailedChargeStreak clears the account's failed-charge streak to 0 on a
+// paid invoice (auto-cure). Returns (reset, error): reset=false (0 rows) is a
+// no-op — the streak was already clean or the invoice has no mirror row.
+func (s *pgxStore) ResetFailedChargeStreak(ctx context.Context, stripeInvoiceID string) (bool, error) {
+	rows, err := s.q.ResetFailedChargeStreak(ctx, stripeInvoiceID)
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // text wraps a non-null Go string in the pgtype.Text the generated
 // queries expect for nullable TEXT columns.
 func text(s string) pgtype.Text {

@@ -715,3 +715,103 @@ func readMode(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID) string {
 		accountID.String()).Scan(&mode))
 	return mode
 }
+
+// --- service-block failed-charge streak (migrations 039/040) --------------
+
+func readFailedStreak(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID) int {
+	t.Helper()
+	var streak int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT failed_charge_streak FROM ms_billing.accounts WHERE id = $1`,
+		accountID.String()).Scan(&streak))
+	return streak
+}
+
+func TestPgxStore_RecordFailedCharge_StreakLifecycle(t *testing.T) {
+	// The full streak lifecycle over the REAL store (exercises the atomic
+	// latch+increment tx): first failure counts once, a retry of the SAME
+	// invoice does not re-count, a second DISTINCT invoice advances to the
+	// block threshold, and a paid invoice resets to 0 (auto-cure).
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_streak")
+	ctx := context.Background()
+
+	seedInvoice(t, pool, accountID, "in_A", "open", 0, 1200)
+	counted, err := store.RecordFailedCharge(ctx, "in_A")
+	require.NoError(t, err)
+	require.True(t, counted, "first failure of a distinct invoice counts")
+	require.Equal(t, 1, readFailedStreak(t, pool, accountID))
+
+	// Retry of the SAME invoice (a distinct Stripe event) — ever_failed latch
+	// suppresses a second increment.
+	counted, err = store.RecordFailedCharge(ctx, "in_A")
+	require.NoError(t, err)
+	require.False(t, counted, "a retry of the same invoice must not re-count")
+	require.Equal(t, 1, readFailedStreak(t, pool, accountID))
+
+	// A second DISTINCT failed invoice advances the streak to the block threshold.
+	seedInvoice(t, pool, accountID, "in_B", "open", 0, 1200)
+	counted, err = store.RecordFailedCharge(ctx, "in_B")
+	require.NoError(t, err)
+	require.True(t, counted)
+	require.Equal(t, 2, readFailedStreak(t, pool, accountID))
+
+	// A successful charge clears the streak (auto-cure), and a repeat reset is
+	// an idempotent no-op.
+	reset, err := store.ResetFailedChargeStreak(ctx, "in_B")
+	require.NoError(t, err)
+	require.True(t, reset)
+	require.Equal(t, 0, readFailedStreak(t, pool, accountID))
+
+	reset, err = store.ResetFailedChargeStreak(ctx, "in_B")
+	require.NoError(t, err)
+	require.False(t, reset, "reset is idempotent once the streak is 0")
+}
+
+func TestPgxStore_RecordFailedCharge_NoMirrorRow_IsNoOp(t *testing.T) {
+	// A payment_failed for an un-mirrored invoice must not advance any streak
+	// (the latch flips zero rows) and must not error.
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	ctx := context.Background()
+
+	counted, err := store.RecordFailedCharge(ctx, "in_orphan")
+	require.NoError(t, err)
+	require.False(t, counted)
+}
+
+func TestPgxStore_ServiceBlockSignals_ReflectsCardStreakAndFirstCharge(t *testing.T) {
+	// The billing store's one-shot signal read reflects the usable non-fraud
+	// card count, the failed-charge streak, and the earliest real charge.
+	pool := testutil.NewTestDB(t)
+	bstore := billing.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_sig")
+	ctx := context.Background()
+
+	// Brand new: no card, no charge, clean streak.
+	sig, err := bstore.ServiceBlockSignals(ctx, accountID)
+	require.NoError(t, err)
+	require.Equal(t, 0, sig.UsableCardCount)
+	require.Equal(t, 0, sig.FailedChargeStreak)
+	require.Equal(t, "", sig.FirstChargeStatus)
+
+	// A usable non-fraud card, a fraud-blocked card (excluded), and an
+	// uncollectible earliest invoice.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.payment_methods_mirror
+		   (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year)
+		 VALUES ($1, 'pm_good', 'visa', '4242', 12, 2999)`, accountID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.payment_methods_mirror
+		   (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, fraud_blocked)
+		 VALUES ($1, 'pm_fraud', 'visa', '0002', 12, 2999, true)`, accountID)
+	require.NoError(t, err)
+	seedInvoice(t, pool, accountID, "in_first", "uncollectible", 0, 1200)
+
+	sig, err = bstore.ServiceBlockSignals(ctx, accountID)
+	require.NoError(t, err)
+	require.Equal(t, 1, sig.UsableCardCount, "fraud-blocked card is excluded from the usable count")
+	require.Equal(t, "uncollectible", sig.FirstChargeStatus)
+}
