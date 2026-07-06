@@ -130,14 +130,16 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 const liveAppModuleCountsCreatedBefore = `-- name: LiveAppModuleCountsCreatedBefore :many
 SELECT app_id, module_count
 FROM ms_billing.apps
-WHERE account_id = $1
+WHERE account_id = $1::uuid
   AND deleted_at IS NULL
-  AND created_at < $2
+  AND created_at < $2::timestamptz
+  AND created_at + make_interval(days => $3::int) < $2::timestamptz
 `
 
 type LiveAppModuleCountsCreatedBeforeParams struct {
-	AccountID string    `json:"account_id"`
-	CreatedAt time.Time `json:"created_at"`
+	AccountID     string    `json:"account_id"`
+	CreatedBefore time.Time `json:"created_before"`
+	GraceDays     int32     `json:"grace_days"`
 }
 
 type LiveAppModuleCountsCreatedBeforeRow struct {
@@ -146,20 +148,33 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 }
 
 // LiveAppModuleCountsCreatedBefore returns (app_id, module_count) for every
-// LIVE (deleted_at IS NULL) app on the account created STRICTLY BEFORE the
-// cutoff — the boundary charge's advance-base input:
+// LIVE (deleted_at IS NULL) app on the account that has JOINED the advance
+// base mechanism by the cutoff — the boundary charge's advance-base input:
 // advance base = Σ (BaseFee + Overage × max(0, module_count − included)).
-// The cutoff is the NEW period's start (the closed window's period_end): an
-// app created INSIDE the new period is excluded, because RegisterApp's
-// creation-proration leg already charged that app's new-period base (full or
-// prorated) — summing it here would double-bill the same period (same-day
-// cron race, and deterministically on reclaimed skipped_no_pm/failed runs).
-// Such an app joins the advance leg at the NEXT boundary. Deleted apps are
-// excluded (D1e); an account with no rows (pre-backfill) sums to base 0 and
-// keeps the pre-027 arrears-only invoice. app_id is returned so the charge
-// leg can write the per-app-period base snapshot (migration 028) it bills.
+// The cutoff is the NEW period's start (the closed window's period_end). Two
+// conditions, mirroring the module-timer coverage contract (review 2026-07-06):
+//   - created_at < @created_before — an app created INSIDE the new period is
+//     excluded, because RegisterApp's creation-proration leg already charged
+//     that app's new-period base (full or prorated) — summing it here would
+//     double-bill the same period (same-day cron race, and deterministically
+//     on reclaimed skipped_no_pm/failed runs).
+//   - created_at + grace < @created_before — an app whose CREATION GRACE had
+//     not yet elapsed when the new period opened is excluded: it has not
+//     survived grace yet (an app deleted in grace is NEVER charged, scenario
+//     1 — precharging its next-period base here would bill a full month for
+//     an app that can still be deleted for free), and when it does survive,
+//     its creation-proration charge covers through the END of the period its
+//     grace elapses into (the straddled period), so this boundary's new
+//     period is already that leg's coverage. Spec: apps "join this boundary
+//     mechanism starting at the NEXT boundary after their own creation charge
+//     fires".
+//
+// Deleted apps are excluded (D1e); an account with no rows (pre-backfill)
+// sums to base 0 and keeps the pre-027 arrears-only invoice. app_id is
+// returned so the charge leg can write the per-app-period base snapshot
+// (migration 028) it bills.
 func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg LiveAppModuleCountsCreatedBeforeParams) ([]LiveAppModuleCountsCreatedBeforeRow, error) {
-	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedAt)
+	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedBefore, arg.GraceDays)
 	if err != nil {
 		return nil, err
 	}

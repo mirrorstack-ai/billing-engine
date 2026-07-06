@@ -125,11 +125,15 @@ const (
 // guard, so the combined charge is all-or-nothing: a co-created over-module and
 // the app base fee are billed and marked together, never one without the other.
 type ProrationCharge struct {
-	InvoiceID    string
-	Cents        int64
-	Invoice      InvoiceMirror
-	Snapshot     AppBaseSnapshot
-	TimerCharges []ModuleTimerCharge
+	InvoiceID string
+	Cents     int64
+	Invoice   InvoiceMirror
+	Snapshot  AppBaseSnapshot
+	// StraddleSnapshot freezes the straddled period billed IN FULL on this same
+	// invoice when the app's creation grace crossed its period boundary (the
+	// coverage contract, review 2026-07-06) — nil otherwise.
+	StraddleSnapshot *AppBaseSnapshot
+	TimerCharges     []ModuleTimerCharge
 }
 
 // ModuleTimerCharge is one co-created over-module install timer's terminal
@@ -265,7 +269,25 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		// its own grace timer). created_module_count is still frozen at RegisterApp
 		// time and recorded on the snapshot for display, but it no longer moves the
 		// base amount — a create with 0 or 50 modules prorates the identical flat base.
-		prorated := usage.ProratedBaseMicros(usage.BaseFeeMicros, locked.CreatedAt, periodStart, periodEnd)
+		creationPeriodMicros := usage.ProratedBaseMicros(usage.BaseFeeMicros, locked.CreatedAt, periodStart, periodEnd)
+
+		// Coverage contract (review 2026-07-06, H2): this charge covers creation
+		// day → the END of the period the creation grace ELAPSES INTO. Normally
+		// that is the creation period itself. An app created within GraceDays of
+		// its period boundary is still IN GRACE at that boundary, so the advance
+		// leg deliberately excludes it there (LiveAppsCreatedBefore's grace
+		// cutoff — a grace-deleted app must never pay a month of base); when it
+		// SURVIVES, this charge bills the straddled period in full on top of the
+		// creation-period proration, and the app joins the advance leg at the
+		// NEXT boundary. Deterministic across retries (created_at + activation
+		// anchor are immutable) — the app-keyed Stripe idem keys stay stable.
+		coverageEnd := periodEnd
+		prorated := creationPeriodMicros
+		straddle := !moduleGraceExpiry(locked.CreatedAt.UTC()).Before(periodEnd)
+		if straddle {
+			_, coverageEnd = billingperiod.AnchoredPeriodWindow(moduleGraceExpiry(locked.CreatedAt.UTC()), billingperiod.AnchorDay(activatedAt))
+			prorated += usage.BaseFeeMicros
+		}
 		c, err := centsFromMicros(prorated)
 		if err != nil {
 			return nil, billing.Internal("micros to cents conversion failed", err)
@@ -294,7 +316,14 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		if err != nil {
 			return nil, billing.Internal("co-created over-module timers lookup failed", err)
 		}
+		// Same coverage as the base: creation period prorated, plus the straddled
+		// period in full when the (shared, co-created) grace crosses the boundary
+		// — the boundary precharge's grace_expires_at cutoff excluded these timers
+		// there, so the straddled period is this combined invoice's to bill.
 		overageMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, locked.CreatedAt, periodStart, periodEnd)
+		if straddle {
+			overageMicros += usage.ModuleOverageFeeMicros
+		}
 		overageCents, err := centsFromMicros(overageMicros)
 		if err != nil {
 			return nil, billing.Internal("overage micros to cents conversion failed", err)
@@ -337,11 +366,13 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, billing.Internal("account collection lookup failed", err)
 		}
 
-		// Mirror the PARTIAL window [creation day, period end) — the same coverage
-		// start ProratedBaseMicros priced, so mirror and amount agree by construction.
+		// Mirror the PARTIAL window [creation day, coverage end) — the same window
+		// the amount priced (coverage end extends past the creation period only
+		// when the grace straddles the boundary), so mirror and amount agree by
+		// construction.
 		partialStart := usage.ProrationCoverageStart(locked.CreatedAt, periodStart)
 		cents = c
-		return &ProrationCharge{
+		pc := &ProrationCharge{
 			InvoiceID: inv.ID,
 			Cents:     c,
 			Invoice: InvoiceMirror{
@@ -352,21 +383,35 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				AmountPaidCents:    inv.AmountPaid,
 				Currency:           chargeCurrency,
 				PeriodStart:        partialStart,
-				PeriodEnd:          periodEnd,
+				PeriodEnd:          coverageEnd,
 				IsLargeAutoCollect: flagLargeAutoCollect(prorated+overageTotalMicros, acct),
 			},
 			// Freeze what was billed keyed by the FULL anchored period_start (the
 			// display identity, migration 028); BaseMicros is the prorated BASE amount
-			// (the co-created overage rides the per-module timers, not the base snapshot).
+			// for the CREATION period only (the co-created overage rides the
+			// per-module timers, not the base snapshot).
 			Snapshot: AppBaseSnapshot{
 				AppID:       locked.AppID,
 				PeriodStart: periodStart,
 				PeriodEnd:   periodEnd,
 				ModuleCount: locked.CreatedModuleCount,
-				BaseMicros:  prorated,
+				BaseMicros:  creationPeriodMicros,
 			},
 			TimerCharges: timerCharges,
-		}, nil
+		}
+		if straddle {
+			// The straddled period was billed IN FULL on this same invoice — freeze
+			// its own snapshot row so the display shows that period's base as
+			// charged (the boundary leg excluded the app there and writes nothing).
+			pc.StraddleSnapshot = &AppBaseSnapshot{
+				AppID:       locked.AppID,
+				PeriodStart: periodEnd,
+				PeriodEnd:   coverageEnd,
+				ModuleCount: locked.CreatedModuleCount,
+				BaseMicros:  usage.BaseFeeMicros,
+			}
+		}
+		return pc, nil
 	})
 	if err != nil {
 		// A billing.Error from the charge callback (Stripe / conversion) is already

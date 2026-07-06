@@ -252,14 +252,17 @@ type Store interface {
 	MarkAppDeleted(ctx context.Context, appID uuid.UUID) error
 
 	// LiveAppsCreatedBefore returns every LIVE (deleted_at IS NULL) app on the
-	// account created STRICTLY BEFORE createdBefore, with its module_count —
-	// the boundary charge's advance-base input. createdBefore is the NEW
-	// period's start (the closed window's period_end): an app created inside
-	// the new period is EXCLUDED because RegisterApp's creation-proration leg
-	// already owns that period's base (full or prorated) — it joins the
+	// account that has JOINED the advance-base mechanism by createdBefore (the
+	// NEW period's start, i.e. the closed window's period_end), with its
+	// module_count — the boundary charge's advance-base input. An app is
+	// excluded when created inside the new period (its creation-proration leg
+	// owns that period's base) OR when its creation grace (graceDays) had not
+	// yet elapsed by createdBefore (it hasn't survived grace — deleted-in-grace
+	// is never charged — and when it survives, its creation charge covers
+	// through the END of the period its grace elapses into). It joins the
 	// advance leg at the NEXT boundary. Empty for a pre-backfill account →
 	// advance base 0 (pre-027 behavior).
-	LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error)
+	LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time, graceDays int) ([]AppModuleCount, error)
 
 	// UpsertProrationBaseSnapshot persists the creation-proration leg's
 	// per-app-period base snapshot (migration 028, source='proration'), keyed
@@ -1170,6 +1173,20 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 	}); err != nil {
 		return 0, "", err
 	}
+	// A creation grace that straddled the period boundary billed the straddled
+	// period IN FULL on this same invoice — freeze its snapshot too (the boundary
+	// leg excluded the app there and writes nothing for that period).
+	if pc.StraddleSnapshot != nil {
+		if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+			AppID:       pc.StraddleSnapshot.AppID.String(),
+			PeriodStart: pc.StraddleSnapshot.PeriodStart,
+			PeriodEnd:   pc.StraddleSnapshot.PeriodEnd,
+			ModuleCount: int32(pc.StraddleSnapshot.ModuleCount), //nolint:gosec // same validated apps-row count as above
+			BaseMicros:  pc.StraddleSnapshot.BaseMicros,
+		}); err != nil {
+			return 0, "", err
+		}
+	}
 	// Arm the one-shot guard. First-write-wins (WHERE proration_invoice_id IS
 	// NULL): a concurrent second attempt for the same app affects 0 rows here
 	// and keeps the winner's (identical, by construction) invoice id.
@@ -1260,10 +1277,11 @@ func (s *pgxStore) MarkAppDeleted(ctx context.Context, appID uuid.UUID) error {
 	return err
 }
 
-func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) ([]AppModuleCount, error) {
+func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUID, createdBefore time.Time, graceDays int) ([]AppModuleCount, error) {
 	rows, err := s.q.LiveAppModuleCountsCreatedBefore(ctx, db.LiveAppModuleCountsCreatedBeforeParams{
-		AccountID: accountID.String(),
-		CreatedAt: createdBefore,
+		AccountID:     accountID.String(),
+		CreatedBefore: createdBefore,
+		GraceDays:     int32(graceDays), //nolint:gosec // graceDays is the small GraceDays const (3)
 	})
 	if err != nil {
 		return nil, err

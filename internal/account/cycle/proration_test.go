@@ -88,7 +88,10 @@ func TestSweep_ChargesSurvivorExactlyOnceAcrossReruns(t *testing.T) {
 	require.Equal(t, 1, first.Pending)
 	require.Equal(t, 1, first.Charged)
 	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 200, sc.itemCalls[0].amountCfg) // 3 of 30 days of $20
+	// 3 of 30 days of $20 ($2) + the straddled [Jul 4, Aug 4) period in full
+	// ($20) — created Jul 1 08:00, so the grace crosses the Jul 4 boundary and
+	// the advance leg excludes the app there (coverage contract, H2).
+	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
 	armed := store.apps[appID].ProrationInvoiceID
 	require.NotEmpty(t, armed)
 
@@ -102,13 +105,16 @@ func TestSweep_ChargesSurvivorExactlyOnceAcrossReruns(t *testing.T) {
 	require.Equal(t, armed, store.apps[appID].ProrationInvoiceID)
 }
 
-// --- (d) the proration $ amount is unchanged from the pre-grace charge --------
+// --- (d) the proration $ amount, mirror window, and snapshots -----------------
 
 func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
-	// The SAME numbers the pre-grace RegisterApp charge produced, now via the
-	// delayed charge leg: 20e6 × 3/30 = 2_000_000 micros → 200 cents, mirrored
-	// with the PARTIAL window [creation day, period end), snapshot frozen at the
-	// FULL anchored period start with the prorated amount.
+	// The creation-period part is the SAME number the pre-grace RegisterApp
+	// charge produced: 20e6 × 3/30 = 2_000_000 micros. Created Jul 1 08:00, the
+	// grace crosses the Jul 4 boundary (coverage contract, H2), so the charge
+	// ALSO covers the straddled [Jul 4, Aug 4) period in full: 22e6 micros →
+	// 2200 cents, mirrored with the window [creation day, straddled period end),
+	// TWO snapshots frozen — the creation period's prorated amount and the
+	// straddled period's full base.
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	sc := newFakeStripe()
@@ -119,11 +125,11 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
 	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
-	require.EqualValues(t, 200, resp.ProrationCents)
+	require.EqualValues(t, 2200, resp.ProrationCents)
 
 	require.Len(t, sc.itemCalls, 1)
 	require.Len(t, sc.invoiceCalls, 1)
-	require.EqualValues(t, 200, sc.itemCalls[0].amountCfg)
+	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
 	require.Equal(t, "cus_apps_1", sc.itemCalls[0].custID)
 	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
 	require.Equal(t, "app-inv-"+appID.String(), sc.invoiceCalls[0].idemKey)
@@ -133,15 +139,21 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	mirror := store.invoices[sc.invoiceID]
 	require.Equal(t, acct, mirror.AccountID)
 	require.Equal(t, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), mirror.PeriodStart) // partial coverage start
-	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
+	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd, "coverage runs through the straddled period's end")
 	require.Equal(t, sc.invoiceID, store.apps[appID].ProrationInvoiceID)
 
 	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}]
 	require.True(t, ok, "the charge freezes its base keyed on the FULL anchored period start")
 	require.Equal(t, "proration", snap.source)
-	require.EqualValues(t, 2_000_000, snap.snap.BaseMicros)
+	require.EqualValues(t, 2_000_000, snap.snap.BaseMicros, "the creation-period snapshot carries only the prorated part")
 	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), snap.snap.PeriodEnd)
 	require.Equal(t, 0, snap.snap.ModuleCount)
+
+	straddleSnap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)}]
+	require.True(t, ok, "the straddled period billed in full gets its own snapshot (the boundary leg writes nothing for it)")
+	require.Equal(t, "proration", straddleSnap.source)
+	require.EqualValues(t, 20_000_000, straddleSnap.snap.BaseMicros)
+	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), straddleSnap.snap.PeriodEnd)
 }
 
 func TestChargeCreationProration_ChargesFlatBaseNotFoldedOverage(t *testing.T) {
@@ -338,10 +350,11 @@ func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceInsta
 	// mandatory grace window — before the sweep ever charges — and the sweep
 	// fires after grace elapses. Pre-fix, the charge priced off the module_count
 	// read FRESH at sweep time (7, live) → 20e6 + 2×3e6 = 26e6 base, 3 of 30 days
-	// → 2_600_000 micros → 260 cents: a HIGHER tier retroactively applied to
-	// days that never had 7 modules installed. Fixed: the charge prices off
-	// created_module_count (frozen at registration, 0) → 20e6 base, 3 of 30 days
-	// → 2_000_000 micros → 200 cents — identical to
+	// → 2_600_000 micros: a HIGHER tier retroactively applied to days that never
+	// had 7 modules installed. Fixed: the charge prices off created_module_count
+	// (frozen at registration, 0) → 20e6 base, 3 of 30 days → 2_000_000 micros,
+	// plus the straddled [Jul 4, Aug 4) period's full base (created Jul 1 08:00 —
+	// the grace crosses the boundary) → 22e6 → 2200 cents — identical to
 	// TestChargeCreationProration_AmountMatchesLegacyProration's un-synced case.
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
@@ -361,10 +374,10 @@ func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceInsta
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
 	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
-	require.EqualValues(t, 200, resp.ProrationCents,
+	require.EqualValues(t, 2200, resp.ProrationCents,
 		"must price off the FROZEN count (0 modules → $20 base), not the live count (7 → $26 base)")
 	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 200, sc.itemCalls[0].amountCfg)
+	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
 
 	// The migration-028 snapshot must also record the FROZEN count/amount — the
 	// display must never show a tier that never applied to those days either.

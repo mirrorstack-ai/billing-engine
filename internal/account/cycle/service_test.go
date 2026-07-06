@@ -576,6 +576,9 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 	}
 	f.invoices[pc.Invoice.StripeInvoiceID] = pc.Invoice
 	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}
+	if pc.StraddleSnapshot != nil {
+		f.baseSnapshots[snapKey{pc.StraddleSnapshot.AppID, pc.StraddleSnapshot.PeriodStart}] = fakeBaseSnapshot{snap: *pc.StraddleSnapshot, source: "proration"}
+	}
 	app.ProrationInvoiceID = pc.InvoiceID // first-charge-wins, like WHERE … IS NULL under the lock
 	f.apps[appID] = app
 	// Scenario 3 — mark the co-created over-module timers billed on this combined
@@ -593,16 +596,19 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 	return cycle.ProrationLockedCharged, pc.InvoiceID, nil
 }
 
-func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID, createdBefore time.Time) ([]cycle.AppModuleCount, error) {
+func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID, createdBefore time.Time, graceDays int) ([]cycle.AppModuleCount, error) {
 	if f.errLiveCounts != nil {
 		return nil, f.errLiveCounts
 	}
 	apps := []cycle.AppModuleCount{}
 	for _, app := range f.apps {
-		// Strictly-before cutoff, mirroring the SQL's created_at < $2: an app
-		// created ON or AFTER the new period's start is excluded (its base is
-		// RegisterApp's proration leg's, never the advance leg's).
-		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) {
+		// Strictly-before cutoffs, mirroring the SQL: an app created ON or AFTER
+		// the new period's start is excluded (its base is the proration leg's,
+		// never the advance leg's), and so is an app whose creation grace had not
+		// yet elapsed when the new period opened (H2 — it hasn't survived grace,
+		// and its creation charge covers through the grace-elapsed period).
+		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) &&
+			app.CreatedAt.AddDate(0, 0, graceDays).Before(createdBefore) {
 			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount})
 		}
 	}

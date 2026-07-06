@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
@@ -94,7 +95,7 @@ func TestAppsMirror_Integration_LiveRosterScan(t *testing.T) {
 	// proration leg, never this boundary's advance sum.
 	require.NoError(t, store.InsertAppMirror(ctx, late, acct, 4, mustTime(t, "2026-07-01T10:00:00Z")))
 
-	apps, err := store.LiveAppsCreatedBefore(ctx, acct, newPeriodStart)
+	apps, err := store.LiveAppsCreatedBefore(ctx, acct, newPeriodStart, usage.GraceDays)
 	require.NoError(t, err)
 	counts := make([]int, 0, len(apps))
 	for _, a := range apps {
@@ -104,10 +105,20 @@ func TestAppsMirror_Integration_LiveRosterScan(t *testing.T) {
 	require.ElementsMatch(t, []int{0, 6}, counts,
 		"deleted apps, other accounts' apps, and apps created inside the new period never enter the advance-base sum")
 
-	// At the NEXT boundary the late app pre-exists the newer period and joins.
-	apps, err = store.LiveAppsCreatedBefore(ctx, acct, mustTime(t, "2026-08-01T00:00:00Z"))
+	// Created inside period A but still IN GRACE at the boundary (H2, review
+	// 2026-07-06): excluded too — it hasn't survived grace, and its creation
+	// charge covers the straddled period.
+	inGrace := uuid.New()
+	require.NoError(t, store.InsertAppMirror(ctx, inGrace, acct, 1, mustTime(t, "2026-06-29T00:00:00Z")))
+	apps, err = store.LiveAppsCreatedBefore(ctx, acct, newPeriodStart, usage.GraceDays)
 	require.NoError(t, err)
-	require.Len(t, apps, 3)
+	require.Len(t, apps, 2, "an app whose creation grace straddles the boundary joins only at the NEXT boundary")
+
+	// At the NEXT boundary the late + in-grace apps pre-exist the newer period
+	// (grace long elapsed) and join.
+	apps, err = store.LiveAppsCreatedBefore(ctx, acct, mustTime(t, "2026-08-01T00:00:00Z"), usage.GraceDays)
+	require.NoError(t, err)
+	require.Len(t, apps, 4)
 
 	// EnsureAccountForUser: get-or-create resolves the SAME account twice.
 	userID := uuid.New()

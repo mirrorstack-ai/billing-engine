@@ -445,6 +445,29 @@ func TestScenario6_D1dResolvedUnchargedOverModuleStillPrecharged(t *testing.T) {
 		"a D1d resolved-uncharged over-module is ongoing — only its pre-activation install period is forgiven, not every period after")
 }
 
+// Regression (review 2026-07-06, H2): an app created within GraceDays of the
+// boundary is still IN GRACE when the boundary runs — it must NOT be precharged
+// the new period's base. It can still be deleted for free (scenario 1: deleted
+// within grace is NEVER charged); an app that survives has the straddled period
+// billed by its own creation charge, and joins the advance leg at the NEXT
+// boundary. Pre-fix the boundary billed it a full month while still deletable.
+func TestScenario6_AppStillInGraceAtBoundaryNotPrechargedBase(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000 // keep the invoice non-zero without any base
+	store.hasPM = true
+	store.stripeCustomer = "cus_h2"
+	// Created Jun 29 — inside period A [Jun 1, Jul 1) but within GraceDays of
+	// the Jul 1 boundary, so its grace (expires Jul 2) straddles it.
+	seedAppCreated(store, chargeAccount, 0, false, timeUTC(2026, 6, 29, 0))
+
+	sc := newFakeStripe()
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Zero(t, resp.AdvanceBaseMicros,
+		"an app still inside its creation grace at the boundary is not precharged — deleted-in-grace must stay free, and a survivor's creation charge covers the straddled period")
+	require.EqualValues(t, 1_000_000, resp.ArrearsMicros)
+}
+
 // Regression (review 2026-07-06, M1 boundary side): a charged over-module whose
 // grace STRADDLES the boundary is excluded from the precharge — its own Leg 1
 // charge covers through the END of the period its grace elapses into, so the

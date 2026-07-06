@@ -131,17 +131,21 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 
 	// ADVANCE base leg: the NEW period's base fee for every LIVE app on the
-	// roster that EXISTED BEFORE the new period opened (created_at < periodEnd
-	// — the closed window's end IS the new period's start), snapshotted at
-	// charge time (D1b/D1e — see the method comment). An app created INSIDE
-	// the new period is EXCLUDED: RegisterApp's creation-proration leg already
-	// charged its new-period base (full or prorated), so adding it here would
-	// double-bill the same period — on the same-day cron race, and
-	// deterministically whenever a skipped_no_pm/failed run is reclaimed after
-	// the app registered. It joins the advance leg at the NEXT boundary.
+	// roster that had JOINED the advance mechanism before the new period opened,
+	// snapshotted at charge time (D1b/D1e — see the method comment). An app
+	// created INSIDE the new period is EXCLUDED (its creation-proration leg
+	// already charged that period's base — adding it here would double-bill on
+	// the same-day cron race, and deterministically on a reclaimed
+	// skipped_no_pm/failed run), and so is an app still INSIDE its creation
+	// grace at the boundary (review 2026-07-06, H2): it hasn't survived grace —
+	// an app deleted in grace is NEVER charged (scenario 1), so precharging its
+	// next-period base would bill a full month for an app still deletable for
+	// free — and when it survives, its creation charge covers through the END of
+	// the period its grace elapses into, making this boundary's new period that
+	// leg's coverage. Either way it joins the advance leg at the NEXT boundary.
 	// Deleted apps drop out of the base but their usage arrears (already in
 	// `total` above) still bill. Empty roster (pre-backfill) → base 0.
-	apps, err := s.store.LiveAppsCreatedBefore(ctx, accountID, periodEnd)
+	apps, err := s.store.LiveAppsCreatedBefore(ctx, accountID, periodEnd, usage.GraceDays)
 	if err != nil {
 		return nil, billing.Internal("live app roster read failed", err)
 	}
@@ -472,15 +476,16 @@ func (s *Service) AccountsWithUnbilledUsage(ctx context.Context, periodStart, pe
 // cycle's gate for running the boundary charge on a NO-USAGE period: an
 // account with live pre-existing apps still owes the advance base fee, while
 // a no-usage, no-apps (pre-backfill) account keeps the historical skip (no
-// billing_run at all). Apps created INSIDE the new period don't arm the gate:
-// their new-period base is RegisterApp's proration leg's, and they join the
-// advance leg at the NEXT boundary — running a boundary for them here would
-// only mint a zero-charge run row.
+// billing_run at all). Apps created INSIDE the new period — or still inside
+// their creation grace at the boundary (H2, same rule as the advance leg
+// itself) — don't arm the gate: their new-period base is the creation-
+// proration leg's, and they join the advance leg at the NEXT boundary —
+// running a boundary for them here would only mint a zero-charge run row.
 func (s *Service) AccountHasLiveApps(ctx context.Context, accountID uuid.UUID, createdBefore time.Time) (bool, error) {
 	if accountID == uuid.Nil {
 		return false, billing.InvalidInput("account_id required")
 	}
-	apps, err := s.store.LiveAppsCreatedBefore(ctx, accountID, createdBefore)
+	apps, err := s.store.LiveAppsCreatedBefore(ctx, accountID, createdBefore, usage.GraceDays)
 	if err != nil {
 		return false, billing.Internal("live app roster read failed", err)
 	}
