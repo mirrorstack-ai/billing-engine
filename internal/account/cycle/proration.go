@@ -296,22 +296,32 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, nil // rounds to 0 cents → nothing to invoice (guard stays unarmed)
 		}
 
+		// Draft→pinned-items→finalize (C2): the empty draft is created FIRST so
+		// the base line and every co-created overage line are pinned to THIS
+		// invoice explicitly — never floating customer-level pending items that a
+		// concurrently-finalizing leg's invoice could sweep up (or that a crash
+		// here would leak onto the account's next unrelated invoice). Only the
+		// finalize step at the end moves money.
+		draft, err := s.stripe.CreateDraftInvoice(ctx, custID, "app-proration:"+locked.AppID.String(), appProrationInvoiceIdemKey(locked.AppID))
+		if err != nil {
+			return nil, billing.StripeError("proration draft invoice failed", err)
+		}
+
 		desc := fmt.Sprintf("MirrorStack app base fee (prorated) — app %s", locked.AppID)
-		if _, err := s.stripe.CreateInvoiceItem(ctx, custID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
+		if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
 			return nil, billing.StripeError("proration invoice item failed", err)
 		}
 
 		// Scenario 3 — the combined creation invoice. Modules co-created with the
 		// app (install date == created_at) that are "over" per the live FIFO have
 		// their OWN grace elapse at this SAME instant (same GraceDays anchor), so
-		// bill them as ADDITIONAL line items on this SAME invoice rather than minting
-		// a second one. Each is $3 prorated over the IDENTICAL day-0 → period-end
-		// window as the base (same created_at, so every co-created module is the
-		// same amount). They use the SAME per-timer idem keys (mod-overage-ii-<id>)
-		// Leg 1 would use, so if Leg 1 races and charges one first, this
-		// CreateInvoiceItem returns the already-consumed item and the money lands
-		// exactly once; the grace_resolved guard (persistProrationCharge) records the
-		// winner. Priced/marked BEFORE the invoice is created so all lines pool onto it.
+		// bill them as ADDITIONAL line items PINNED to this SAME draft rather than
+		// minting a second invoice. Each is $3 over the IDENTICAL coverage window
+		// as the base (same created_at, so every co-created module is the same
+		// amount). They use the SAME per-timer item idem keys (mod-overage-ii-<id>)
+		// Leg 1 would use; the deferred-to-combined guard (overage.go) keeps Leg 1
+		// off co-created timers while this charge is pending, and the
+		// grace_resolved guard (persistProrationCharge) records the winner.
 		overTimers, err := s.store.CoCreatedOverModuleTimers(ctx, locked.AccountID, locked.AppID, locked.CreatedAt, usage.IncludedModules)
 		if err != nil {
 			return nil, billing.Internal("co-created over-module timers lookup failed", err)
@@ -333,26 +343,23 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		if overageCents > 0 {
 			overDesc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", locked.AppID)
 			for _, timerID := range overTimers {
-				item, err := s.stripe.CreateInvoiceItem(ctx, custID, overageCents, chargeCurrency, overDesc, moduleOverageItemIdemKey(timerID))
+				item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, overageCents, chargeCurrency, overDesc, moduleOverageItemIdemKey(timerID))
 				if err != nil {
 					return nil, billing.StripeError("combined module overage invoice item failed", err)
 				}
 				timerCharges = append(timerCharges, ModuleTimerCharge{
 					TimerID:       timerID,
 					ChargedAt:     s.nowFn().UTC(),
+					InvoiceID:     draft.ID,
 					InvoiceItemID: item.ID,
 				})
 				overageTotalMicros += overageMicros
 			}
 		}
 
-		inv, err := s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, appProrationInvoiceIdemKey(locked.AppID))
+		inv, err := s.stripe.FinalizeInvoice(ctx, draft.ID, appProrationFinalizeIdemKey(locked.AppID))
 		if err != nil {
-			return nil, billing.StripeError("proration invoice failed", err)
-		}
-		// Stamp the (single) combined-invoice id onto each co-created overage mark.
-		for i := range timerCharges {
-			timerCharges[i].InvoiceID = inv.ID
+			return nil, billing.StripeError("proration invoice finalize failed", err)
 		}
 
 		// Resolve the account's large-charge disclosure threshold AT CHARGE TIME,
@@ -482,11 +489,13 @@ func (s *Service) SweepCreationProrations(ctx context.Context, at time.Time) (*S
 	return res, nil
 }
 
-// appProrationItemIdemKey / appProrationInvoiceIdemKey build the deterministic
-// Stripe Idempotency-Keys for the creation-proration charge. The APP id is the
-// stable charge identity (each app prorates at most once — the one-shot
+// appProrationItemIdemKey / appProrationInvoiceIdemKey /
+// appProrationFinalizeIdemKey build the deterministic Stripe Idempotency-Keys
+// for the creation-proration charge's draft→items→finalize flow. The APP id is
+// the stable charge identity (each app prorates at most once — the one-shot
 // proration_invoice_id guard), so a re-attempt (a retried sweep after a crash
-// between the Stripe call and the guard-arm) reuses the SAME Stripe objects and
-// can never double-charge even before the guard is armed.
-func appProrationItemIdemKey(appID uuid.UUID) string    { return "app-ii-" + appID.String() }
-func appProrationInvoiceIdemKey(appID uuid.UUID) string { return "app-inv-" + appID.String() }
+// between the Stripe calls and the guard-arm) reuses the SAME Stripe objects
+// and can never double-charge even before the guard is armed.
+func appProrationItemIdemKey(appID uuid.UUID) string     { return "app-ii-" + appID.String() }
+func appProrationInvoiceIdemKey(appID uuid.UUID) string  { return "app-inv-" + appID.String() }
+func appProrationFinalizeIdemKey(appID uuid.UUID) string { return "app-fin-" + appID.String() }

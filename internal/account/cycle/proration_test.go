@@ -133,7 +133,7 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	require.Equal(t, "cus_apps_1", sc.itemCalls[0].custID)
 	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
 	require.Equal(t, "app-inv-"+appID.String(), sc.invoiceCalls[0].idemKey)
-	require.True(t, sc.invoiceCalls[0].autoAdvance)
+	require.Len(t, sc.finalizeCalls, 1, "the draft is finalized (auto_advance) — the money-moving step")
 
 	require.Equal(t, sc.invoiceID, resp.ProrationInvoiceID)
 	mirror := store.invoices[sc.invoiceID]

@@ -423,22 +423,29 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	return summary, nil
 }
 
-// charge creates the Stripe invoice item + draft invoice for the boundary total
-// (usage arrears + advance base + advance overage), with the two deterministic
-// Idempotency-Keys (ii-<run>, inv-<run>) so a re-run reuses the same Stripe
-// objects. withBase only widens the line DESCRIPTION when the total includes an
-// advance base fee and/or ongoing-module overage — a pure-usage invoice keeps the
-// historical line text. Returns the created invoice projection (id/status/amounts)
-// for the mirror upsert.
+// charge runs the boundary total (usage arrears + advance base + advance
+// overage) through the draft→pinned-item→finalize flow with three
+// deterministic Idempotency-Keys (inv-<run>, ii-<run>, fin-<run>) so a re-run
+// reuses the same Stripe objects. The item is PINNED to this run's own draft
+// (never a floating pending item another leg's invoice could sweep up — C2),
+// and only the finalize step moves money. withBase only widens the line
+// DESCRIPTION when the total includes an advance base fee and/or
+// ongoing-module overage — a pure-usage invoice keeps the historical line
+// text. Returns the finalized invoice projection (id/status/amounts) for the
+// mirror upsert.
 func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool) (billingstripe.Invoice, error) {
 	desc := fmt.Sprintf("MirrorStack usage — run %s", runID)
 	if withBase {
 		desc = fmt.Sprintf("MirrorStack usage + app base fees — run %s", runID)
 	}
-	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, cents, chargeCurrency, desc, invoiceItemIdemKey(runID)); err != nil {
+	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, "run:"+runID.String(), invoiceIdemKey(runID))
+	if err != nil {
 		return billingstripe.Invoice{}, err
 	}
-	return s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, invoiceIdemKey(runID))
+	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, invoiceItemIdemKey(runID)); err != nil {
+		return billingstripe.Invoice{}, err
+	}
+	return s.stripe.FinalizeInvoice(ctx, draft.ID, invoiceFinalizeIdemKey(runID))
 }
 
 // AccountsWithUsageEvents returns the accounts with raw usage_events in the
@@ -517,14 +524,17 @@ func (s *Service) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID
 	return end, found, nil
 }
 
-// invoiceItemIdemKey / invoiceIdemKey build the deterministic per-run Stripe
-// Idempotency-Keys. The run id is the stable charge identity, so a re-fire
-// (same run row) produces the SAME keys and Stripe returns the original objects
-// instead of creating duplicates. The arrears charge is a SINGLE pooled line
-// per run (Σ charged across all metrics), so the item key is ii-<run> (not
-// per-metric) — matching the single combined invoice item this leg creates.
-func invoiceItemIdemKey(runID uuid.UUID) string { return "ii-" + runID.String() }
-func invoiceIdemKey(runID uuid.UUID) string     { return "inv-" + runID.String() }
+// invoiceItemIdemKey / invoiceIdemKey / invoiceFinalizeIdemKey build the
+// deterministic per-run Stripe Idempotency-Keys for the boundary leg's
+// draft→item→finalize flow. The run id is the stable charge identity, so a
+// re-fire (same run row) produces the SAME keys and Stripe returns the
+// original objects instead of creating duplicates. The arrears charge is a
+// SINGLE pooled line per run (Σ charged across all metrics), so the item key
+// is ii-<run> (not per-metric) — matching the single combined invoice item
+// this leg creates.
+func invoiceItemIdemKey(runID uuid.UUID) string     { return "ii-" + runID.String() }
+func invoiceIdemKey(runID uuid.UUID) string         { return "inv-" + runID.String() }
+func invoiceFinalizeIdemKey(runID uuid.UUID) string { return "fin-" + runID.String() }
 
 // flagLargeAutoCollect is the ONE large-charge disclosure resolver (scenario 5,
 // migration 034), called from EVERY off-session charge site — the boundary leg

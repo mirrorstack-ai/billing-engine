@@ -9,6 +9,7 @@ package cycle_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -245,6 +246,63 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 		require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd,
 			"no straddle → coverage ends at the install period's end")
 	}
+}
+
+// --- C2: items are pinned to their own draft; Stripe failures stay retryable --
+
+// Regression (review 2026-07-06, C2): every Leg-1 line item is PINNED to the
+// timer's own draft invoice (created first, pending_invoice_items_behavior=
+// exclude) and money moves only at finalize — a crash at any step leaves an
+// inert draft that no other charge leg's invoice can sweep up. Also the first
+// Stripe-failure injection on this leg: a failed item or finalize leaves the
+// timer unresolved, and the retry replays the SAME deterministic idem keys.
+func TestModuleOverage_StripeFailureLeavesTimerRetryableWithSameKeys(t *testing.T) {
+	store := newFakeStore()
+	_, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := cycle.NewService(store, sc)
+	ctx := context.Background()
+
+	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	sweepAt := time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
+
+	// Attempt 1: the pinned-item create fails AFTER the draft exists.
+	sc.errItem = errors.New("stripe: item boom")
+	res, err := svc.SweepModuleOverage(ctx, sweepAt)
+	require.NoError(t, err, "a per-timer failure never aborts the batch")
+	require.Equal(t, 1, res.Failed)
+	require.Empty(t, sc.finalizeCalls, "no finalize → no money moved")
+	require.False(t, store.timers[over].graceResolved, "left unresolved for the retry")
+	require.Empty(t, store.invoices, "nothing mirrored")
+
+	// Attempt 2: the finalize (money-moving step) fails.
+	sc.errItem = nil
+	sc.errInvoice = errors.New("stripe: finalize boom")
+	res, err = svc.SweepModuleOverage(ctx, sweepAt)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Failed)
+	require.False(t, store.timers[over].graceResolved)
+	require.Empty(t, store.invoices)
+
+	// Attempt 3 succeeds — through the SAME deterministic keys as both failures.
+	sc.errInvoice = nil
+	res, err = svc.SweepModuleOverage(ctx, sweepAt)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged)
+	require.True(t, store.timers[over].graceCharged)
+
+	require.GreaterOrEqual(t, len(sc.invoiceCalls), 3)
+	require.GreaterOrEqual(t, len(sc.itemCalls), 2)
+	for _, dc := range sc.invoiceCalls {
+		require.Equal(t, "mod-overage-inv-"+over.String(), dc.idemKey, "every attempt reuses the same draft idem key")
+		require.Equal(t, "timer:"+over.String(), dc.ref, "the draft carries the charge-ref metadata anchor")
+	}
+	for _, ic := range sc.itemCalls {
+		require.Equal(t, "mod-overage-ii-"+over.String(), ic.idemKey)
+		require.NotEmpty(t, ic.invoiceID, "the line item is PINNED to the timer's own draft, never a floating pending item")
+	}
+	require.Equal(t, "mod-overage-fin-"+over.String(), sc.finalizeCalls[len(sc.finalizeCalls)-1].idemKey)
 }
 
 // --- over module with no usable PM is skipped and retried (not resolved) ------

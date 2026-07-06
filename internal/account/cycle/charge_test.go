@@ -24,8 +24,9 @@ import (
 
 type fakeStripe struct {
 	// recorded calls
-	itemCalls    []itemCall
-	invoiceCalls []invoiceCall
+	itemCalls     []itemCall
+	invoiceCalls  []invoiceCall // draft creations (one per invoice, C2 flow)
+	finalizeCalls []finalizeCall
 
 	// returns
 	invoiceID         string
@@ -35,9 +36,9 @@ type fakeStripe struct {
 
 	// injected errors
 	errItem    error
-	errInvoice error
-
-	// onCreateInvoice, when set, runs INSIDE CreateInvoice right before it
+	errDraft   error
+	errInvoice error // injected on FinalizeInvoice — the money-moving step
+	// onCreateInvoice, when set, runs INSIDE FinalizeInvoice right before it
 	// returns success — modeling a concurrent account mutation (e.g. a
 	// threshold edit) that lands while the real Stripe HTTP call is in
 	// flight, i.e. strictly AFTER any pre-charge store read the caller
@@ -48,6 +49,7 @@ type fakeStripe struct {
 
 type itemCall struct {
 	custID    string
+	invoiceID string
 	amountCfg int64
 	currency  string
 	desc      string
@@ -55,9 +57,14 @@ type itemCall struct {
 }
 
 type invoiceCall struct {
-	custID      string
-	autoAdvance bool
-	idemKey     string
+	custID  string
+	ref     string
+	idemKey string
+}
+
+type finalizeCall struct {
+	invoiceID string
+	idemKey   string
 }
 
 func newFakeStripe() *fakeStripe {
@@ -68,16 +75,24 @@ func newFakeStripe() *fakeStripe {
 	}
 }
 
-func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID string, amountCents int64, currency, desc, idemKey string) (billingstripe.InvoiceItem, error) {
-	f.itemCalls = append(f.itemCalls, itemCall{custID, amountCents, currency, desc, idemKey})
+func (f *fakeStripe) CreateDraftInvoice(_ context.Context, custID, ref, idemKey string) (billingstripe.Invoice, error) {
+	f.invoiceCalls = append(f.invoiceCalls, invoiceCall{custID, ref, idemKey})
+	if f.errDraft != nil {
+		return billingstripe.Invoice{}, f.errDraft
+	}
+	return billingstripe.Invoice{ID: f.invoiceID, Status: "draft", Currency: "usd"}, nil
+}
+
+func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID string, amountCents int64, currency, desc, idemKey string) (billingstripe.InvoiceItem, error) {
+	f.itemCalls = append(f.itemCalls, itemCall{custID, invoiceID, amountCents, currency, desc, idemKey})
 	if f.errItem != nil {
 		return billingstripe.InvoiceItem{}, f.errItem
 	}
 	return billingstripe.InvoiceItem{ID: "ii_test_" + uuid.NewString()}, nil
 }
 
-func (f *fakeStripe) CreateInvoice(_ context.Context, custID string, autoAdvance bool, idemKey string) (billingstripe.Invoice, error) {
-	f.invoiceCalls = append(f.invoiceCalls, invoiceCall{custID, autoAdvance, idemKey})
+func (f *fakeStripe) FinalizeInvoice(_ context.Context, invoiceID, idemKey string) (billingstripe.Invoice, error) {
+	f.finalizeCalls = append(f.finalizeCalls, finalizeCall{invoiceID, idemKey})
 	if f.errInvoice != nil {
 		return billingstripe.Invoice{}, f.errInvoice
 	}
@@ -85,7 +100,7 @@ func (f *fakeStripe) CreateInvoice(_ context.Context, custID string, autoAdvance
 		f.onCreateInvoice()
 	}
 	return billingstripe.Invoice{
-		ID:         f.invoiceID,
+		ID:         invoiceID,
 		Status:     f.invoiceStatus,
 		AmountDue:  f.invoiceAmountDue,
 		AmountPaid: f.invoiceAmountPaid,
@@ -147,7 +162,7 @@ func TestRunBillingCycle_ChargesArrears(t *testing.T) {
 	require.Equal(t, "cus_test_1", sc.itemCalls[0].custID)
 	require.EqualValues(t, 123, sc.itemCalls[0].amountCfg)
 	require.Equal(t, "usd", sc.itemCalls[0].currency)
-	require.True(t, sc.invoiceCalls[0].autoAdvance)
+	require.Len(t, sc.finalizeCalls, 1, "the draft is finalized (auto_advance) — the money-moving step")
 
 	// Invoice mirrored + run marked invoiced.
 	require.Len(t, store.invoices, 1)

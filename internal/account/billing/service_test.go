@@ -242,16 +242,21 @@ func (f *fakeStripe) SetDefaultPaymentMethod(_ context.Context, stripeCustomerID
 	return nil
 }
 
-// CreateInvoiceItem / CreateInvoice are the PR #6 charge methods. The billing
+// CreateDraftInvoice / CreateInvoiceItem / FinalizeInvoice are the charge
+// methods (PR #6, draft→pinned-items→finalize since the C2 fix). The billing
 // package never calls them (the charge cycle lives in internal/account/cycle),
 // so these are panic stubs present only to keep this fake satisfying the
 // widened billingstripe.Client interface.
-func (f *fakeStripe) CreateInvoiceItem(context.Context, string, int64, string, string, string) (billingstripe.InvoiceItem, error) {
+func (f *fakeStripe) CreateDraftInvoice(context.Context, string, string, string) (billingstripe.Invoice, error) {
+	panic("CreateDraftInvoice must not be called by the billing package")
+}
+
+func (f *fakeStripe) CreateInvoiceItem(context.Context, string, string, int64, string, string, string) (billingstripe.InvoiceItem, error) {
 	panic("CreateInvoiceItem must not be called by the billing package")
 }
 
-func (f *fakeStripe) CreateInvoice(context.Context, string, bool, string) (billingstripe.Invoice, error) {
-	panic("CreateInvoice must not be called by the billing package")
+func (f *fakeStripe) FinalizeInvoice(context.Context, string, string) (billingstripe.Invoice, error) {
+	panic("FinalizeInvoice must not be called by the billing package")
 }
 
 // --- tests ----------------------------------------------------------------

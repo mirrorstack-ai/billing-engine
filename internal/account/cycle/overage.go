@@ -167,19 +167,19 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// Scenario 3 combined-invoice ownership guard. A co-created over-module timer
 	// (installed AT the app's created_at) whose app's creation proration is still
 	// UNRESOLVED is the COMBINED-invoice path's responsibility (proration.go), NOT
-	// Leg 1's: the creation-proration charge folds this timer's overage onto the
-	// app's ONE creation invoice (app-inv-<appID>) using the SHARED per-timer item
-	// key. cmd/billing-cycle runs the proration sweep BEFORE this one so the happy
-	// path resolves these timers first (they never reach here). But if that sweep's
-	// persist phase FAILED after its Stripe calls already landed the overage item on
-	// the combined invoice, the timer is still unresolved when this sweep runs in
-	// the SAME process — and minting our OWN invoice (mod-overage-inv-<timerID>)
-	// here would mis-attribute money Stripe already pooled onto the combined invoice
-	// to a second, stray invoice (or conflict outright). So DEFER (skip WITHOUT
-	// resolving): the proration sweep retries every cycle and converges on the SAME
-	// combined invoice via the deterministic keys, then marks this timer resolved,
-	// dropping it from this work list. A LATER install (installed_at != created_at)
-	// is never co-created, so it charges here normally.
+	// Leg 1's: the creation-proration charge pins this timer's overage line onto
+	// the app's ONE creation invoice (app-inv-<appID>) using the SHARED per-timer
+	// item key. cmd/billing-cycle runs the proration sweep BEFORE this one so the
+	// happy path resolves these timers first (they never reach here). But if that
+	// sweep's persist phase FAILED after its Stripe calls already finalized the
+	// combined invoice (money moved, lines pinned), the timer is still unresolved
+	// when this sweep runs in the SAME process — and minting our OWN invoice
+	// (mod-overage-inv-<timerID>) here would double-charge overage the combined
+	// invoice already collected. So DEFER (skip WITHOUT resolving): the proration
+	// sweep retries every cycle and converges on the SAME combined invoice via
+	// the deterministic keys, then marks this timer resolved, dropping it from
+	// this work list. A LATER install (installed_at != created_at) is never
+	// co-created, so it charges here normally.
 	app, found, err := s.store.AppMirror(ctx, cand.AppID)
 	if err != nil {
 		return nil, billing.Internal("app mirror lookup failed", err)
@@ -235,17 +235,24 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		return res, nil
 	}
 
-	// Charge via a per-timer invoice with deterministic idem keys derived from the
-	// timer id (the stable charge identity — each install charges at most once,
-	// the grace_resolved guard), so a crash-retry reuses the SAME Stripe objects.
+	// Charge via a per-timer draft→pinned-item→finalize flow with deterministic
+	// idem keys derived from the timer id (the stable charge identity — each
+	// install charges at most once, the grace_resolved guard), so a crash-retry
+	// reuses the SAME Stripe objects. The item is PINNED to this timer's own
+	// draft (C2 — a floating pending item could be swept onto another leg's
+	// invoice); only the finalize step moves money.
 	desc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", cand.AppID)
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, cents, chargeCurrency, desc, moduleOverageItemIdemKey(cand.ID))
+	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, "timer:"+cand.ID.String(), moduleOverageInvoiceIdemKey(cand.ID))
+	if err != nil {
+		return nil, billing.StripeError("module overage draft invoice failed", err)
+	}
+	item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, moduleOverageItemIdemKey(cand.ID))
 	if err != nil {
 		return nil, billing.StripeError("module overage invoice item failed", err)
 	}
-	inv, err := s.stripe.CreateInvoice(ctx, custID, true /* autoAdvance */, moduleOverageInvoiceIdemKey(cand.ID))
+	inv, err := s.stripe.FinalizeInvoice(ctx, draft.ID, moduleOverageFinalizeIdemKey(cand.ID))
 	if err != nil {
-		return nil, billing.StripeError("module overage invoice failed", err)
+		return nil, billing.StripeError("module overage invoice finalize failed", err)
 	}
 
 	// Resolve the large-charge disclosure threshold AT CHARGE TIME, immediately
@@ -344,4 +351,8 @@ func moduleOverageItemIdemKey(timerID uuid.UUID) string {
 
 func moduleOverageInvoiceIdemKey(timerID uuid.UUID) string {
 	return "mod-overage-inv-" + timerID.String()
+}
+
+func moduleOverageFinalizeIdemKey(timerID uuid.UUID) string {
+	return "mod-overage-fin-" + timerID.String()
 }

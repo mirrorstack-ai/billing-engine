@@ -51,28 +51,41 @@ type Client interface {
 	// webhook syncs is_default across the account's mirror rows.
 	SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID, stripePaymentMethodID string) error
 
-	// CreateInvoiceItem creates a pending invoice item on the Customer — one
-	// per metered metric line — that the next CreateInvoice draft sweeps up.
-	// amountCents is the whole-cent customer charge (micro-dollars are
-	// converted to cents round-half-up by the caller BEFORE reaching Stripe —
-	// Stripe amounts are integer minor units, never float). desc is the line
-	// description shown on the invoice. idemKey is a deterministic Stripe
-	// Idempotency-Key (ii-<run>-<metric>) so a re-run / partial-failure resume
-	// never creates a duplicate line. Unlike the card-management methods this
-	// returns a plain InvoiceItem (not a stripe-go type) so the cycle consumer
-	// stays free of stripe-go imports — the charge path is the trust-boundary
-	// edge and the consumer needs only the id.
-	CreateInvoiceItem(ctx context.Context, custID string, amountCents int64, currency, desc, idemKey string) (InvoiceItem, error)
+	// CreateDraftInvoice creates an EMPTY draft invoice
+	// (collection_method=charge_automatically, auto_advance=false,
+	// pending_invoice_items_behavior=exclude) that line items are then PINNED
+	// to via CreateInvoiceItem, and that charges only once FinalizeInvoice
+	// runs. The exclude behavior is load-bearing (review 2026-07-06, C2): the
+	// legacy include behavior swept up ALL of the Customer's pending items, so
+	// with several independent item→invoice sequences per account (boundary +
+	// per-timer Leg 1 + combined creation) an orphaned item from any crashed
+	// leg leaked onto the NEXT leg's unrelated invoice — money collected on the
+	// wrong invoice and a permanent idempotency wedge for the crashed leg. ref
+	// is the deterministic charge identity ("run:<id>" / "timer:<id>" /
+	// "app-proration:<id>"), stamped as metadata for crash reconciliation.
+	// idemKey (inv-<id>) makes a re-run reuse the SAME draft.
+	CreateDraftInvoice(ctx context.Context, custID, ref, idemKey string) (Invoice, error)
 
-	// CreateInvoice creates a draft invoice with
-	// collection_method=charge_automatically that sweeps up the Customer's
-	// pending invoice items. When autoAdvance is true, Stripe finalizes the
-	// draft and attempts an off-session PaymentIntent on the Customer's default
-	// payment method automatically (the off-session metered charge). idemKey is
-	// the deterministic per-run Stripe Idempotency-Key (inv-<run>). Returns a
-	// plain Invoice (id + status + amounts) so the cycle consumer can mirror it
-	// without importing stripe-go.
-	CreateInvoice(ctx context.Context, custID string, autoAdvance bool, idemKey string) (Invoice, error)
+	// CreateInvoiceItem creates an invoice item PINNED to the given draft
+	// invoice — never a floating customer-level pending item. amountCents is
+	// the whole-cent customer charge (micro-dollars are converted to cents
+	// round-half-up by the caller BEFORE reaching Stripe — Stripe amounts are
+	// integer minor units, never float). desc is the line description shown on
+	// the invoice. idemKey is a deterministic Stripe Idempotency-Key
+	// (ii-<run> / mod-overage-ii-<timer> / app-ii-<app>) so a re-run /
+	// partial-failure resume never creates a duplicate line (the replayed item
+	// is already pinned to the same replayed draft). Returns a plain
+	// InvoiceItem so the cycle consumer stays free of stripe-go imports.
+	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc, idemKey string) (InvoiceItem, error)
+
+	// FinalizeInvoice finalizes a draft invoice with auto_advance=true: Stripe
+	// runs the off-session PaymentIntent against the Customer's default payment
+	// method (the metered auto-charge). This is the ONLY step that moves money —
+	// a crash before it leaves an inert draft that can never charge and never
+	// pollute another leg's invoice. idemKey (fin-<id>) makes a re-run replay
+	// the original finalization. Returns the finalized invoice projection
+	// (id/status/amounts) for the mirror.
+	FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
 }
 
 // InvoiceItem is the trust-boundary-edge projection of a Stripe invoice item
