@@ -208,7 +208,16 @@ SELECT
              EXTRACT(YEAR  FROM current_date)::INT,
              EXTRACT(MONTH FROM current_date)::INT
          ))::int AS usable_card_count,
-    a.failed_charge_streak,
+    (SELECT COUNT(*)
+       FROM ms_billing.invoices f
+       WHERE f.account_id = a.id
+         AND (f.ever_failed OR f.status = 'uncollectible')
+         AND f.created_at > COALESCE(
+             (SELECT MAX(p.created_at)
+                FROM ms_billing.invoices p
+                WHERE p.account_id = a.id AND p.status = 'paid'),
+             '-infinity'::timestamptz
+         ))::int AS failed_charge_streak,
     COALESCE((
         SELECT inv.status
         FROM ms_billing.invoices inv
@@ -235,8 +244,22 @@ type ServiceBlockSignalsRow struct {
 //	                      (NOT fraud_blocked, migration 038), NOT-expired cards.
 //	                      Reuses HasUsablePaymentMethod's expiry predicate,
 //	                      COUNT instead of EXISTS. The gate blocks at 0.
-//	failed_charge_streak — the account's consecutive failed-charge counter
-//	                      (migration 040), read verbatim. The gate blocks at >= 2.
+//	failed_charge_streak — the account's consecutive failed-charge count,
+//	                      DERIVED at read time from the timestamped invoice
+//	                      mirror: the number of distinct FAILED invoices
+//	                      (ever_failed, migration 039, OR currently
+//	                      'uncollectible') created AFTER the account's most-
+//	                      recent PAID invoice. The gate blocks at >= 2.
+//	                      Deriving it (vs a stored counter mutated by two
+//	                      out-of-transaction webhook UPDATEs in Stripe DELIVERY
+//	                      order) makes it immune to at-least-once + out-of-order
+//	                      delivery: reorder the paid/failed events however you
+//	                      like, the count over the immutable (status, ever_failed,
+//	                      created_at) facts is the same. "Reset on the next
+//	                      successful charge" falls out for free — a newer paid
+//	                      invoice moves the cutoff forward, excluding older
+//	                      failures. A failed-then-paid invoice is excluded (its
+//	                      created_at is not AFTER its own paid instant).
 //	first_charge_status  — the status of the account's EARLIEST real charge:
 //	                      the oldest invoice that is not 'draft' (never
 //	                      finalized) or 'void' (cancelled, never a real charge

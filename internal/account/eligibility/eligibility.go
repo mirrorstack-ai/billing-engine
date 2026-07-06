@@ -21,10 +21,11 @@ package eligibility
 
 // MaxFailedChargeStreak is the consecutive failed-charge count at which services
 // are blocked. The spec is "< 2 failed" (2 excluded), so a streak of 0 or 1
-// passes and 2+ blocks. The streak is RECOVERABLE — it resets to 0 on the next
-// successful charge (accounts.failed_charge_streak, migration 040) — so a block
-// here self-heals when the account pays. Hardcoded (mirrors collection's inline
-// finance thresholds); promote to a per-account column only if a knob is needed.
+// passes and 2+ blocks. The streak is RECOVERABLE — it is derived (by
+// ServiceBlockSignals) as the failures since the account's last successful
+// charge, so paying moves the cutoff forward and self-heals the block.
+// Hardcoded (mirrors collection's inline finance thresholds); promote to a
+// per-account column only if a knob is needed.
 const MaxFailedChargeStreak = 2
 
 // FirstChargeState is the outcome of the account's EARLIEST real charge — the
