@@ -40,7 +40,7 @@ const (
 )
 
 // OrgDesignation is the ms_billing.org_billing_designations row (migration
-// 038). SponsorAccountID / SponsorUserID are Nil unless Funding is sponsor.
+// 041). SponsorAccountID / SponsorUserID are Nil unless Funding is sponsor.
 type OrgDesignation struct {
 	OrgID                  uuid.UUID
 	Funding                OrgFunding

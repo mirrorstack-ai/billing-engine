@@ -27,7 +27,7 @@ type fakeStore struct {
 
 	// org-billing state (migration 041). accountsByOrg models the org account
 	// rows (existence — AccountByOrg / EnsureOrgAccount); fundedOrgs the
-	// designation+activation gate AccountByOrgFunded reads; fundingOf the
+	// designation+activation gate ResolveOrgFundedAccount reads; fundingOf the
 	// sponsor funding hop (absent → identity); orgPMTargets the org twin of
 	// pmTargets (PaymentMethodTargetForOrg).
 	accountsByOrg map[uuid.UUID]fakeAccount
@@ -203,7 +203,7 @@ func (s *fakeStore) AccountByOrg(_ context.Context, orgID uuid.UUID) (uuid.UUID,
 	return a.id, true, nil
 }
 
-func (s *fakeStore) AccountByOrgFunded(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+func (s *fakeStore) ResolveOrgFundedAccount(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
 	// Row EXISTENCE is not enough — the funded gate (designation + activation)
 	// is modeled as an explicit flag.
 	a, ok := s.accountsByOrg[orgID]

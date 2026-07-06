@@ -46,6 +46,9 @@ type fakeStripe struct {
 	// setFindByRef.
 	findByRefByRef map[string]billingstripe.Invoice
 	findByRefCalls []string
+	// findByRefCustIDs records the customer each lookup searched under — the
+	// recovery legs must resolve the SAME funding hop as the fresh-charge path.
+	findByRefCustIDs []string
 	// onCreateInvoice, when set, runs INSIDE FinalizeInvoice right before it
 	// returns success — modeling a concurrent account mutation (e.g. a
 	// threshold edit) that lands while the real Stripe HTTP call is in
@@ -109,8 +112,9 @@ func (f *fakeStripe) setFindByRef(ref string, inv billingstripe.Invoice) {
 	f.findByRefByRef[ref] = inv
 }
 
-func (f *fakeStripe) FindInvoiceByRef(_ context.Context, _, ref string) (billingstripe.Invoice, bool, error) {
+func (f *fakeStripe) FindInvoiceByRef(_ context.Context, custID, ref string) (billingstripe.Invoice, bool, error) {
 	f.findByRefCalls = append(f.findByRefCalls, ref)
+	f.findByRefCustIDs = append(f.findByRefCustIDs, custID)
 	if f.errFindByRef != nil {
 		return billingstripe.Invoice{}, false, f.errFindByRef
 	}
