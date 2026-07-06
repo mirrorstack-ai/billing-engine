@@ -138,6 +138,15 @@ type Store interface {
 	// time (not a maintained counter), so there is no account write and nothing to
 	// reset on invoice.paid.
 	MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string) error
+
+	// FlagPaymentMethodFraud latches fraud_blocked (migration 038) on a disputed /
+	// early-fraud-warned card so the service-block gate stops counting it as
+	// usable. Card-scoped + account-bounded: every ACTIVE mirror row for the
+	// card's fingerprint on the charge's account (fallback: the pm id when the
+	// charge carries no fingerprint). Set-only + idempotent. Returns (found,
+	// error): found=false (0 rows) is a drift no-op — the card was never
+	// mirrored, is already detached, or is already flagged.
+	FlagPaymentMethodFraud(ctx context.Context, stripeCustomerID, fingerprint, stripePaymentMethodID, reason string) (found bool, err error)
 }
 
 // ApplyInvoiceStatusParams carries the columns ApplyInvoiceStatus reconciles
@@ -179,9 +188,19 @@ type InsertPaymentMethodParams struct {
 // Router is the entry point exposed to cmd/account-webhook. It owns
 // signature verification + idempotency + per-event dispatch. The
 // Lambda binary calls Process; everything else is internal.
+// ChargeRetriever is the narrow Stripe surface the fraud handlers need: resolve
+// a charge id (all a dispute / early-fraud-warning event carries) to the card's
+// pm id + fingerprint + owning customer. Kept as a webhook-local interface (not
+// the full billingstripe.Client) so the Router depends only on what it uses;
+// *billingstripe.realClient satisfies it structurally, and tests pass a fake.
+type ChargeRetriever interface {
+	RetrieveCharge(ctx context.Context, chargeID string) (billingstripe.ChargeCardRef, error)
+}
+
 type Router struct {
 	verifier billingstripe.Verifier
 	store    Store
+	charges  ChargeRetriever
 	log      *slog.Logger
 }
 
@@ -189,17 +208,20 @@ type Router struct {
 // values panic at construction. The strict checks catch wiring bugs
 // at startup rather than silently falling back to defaults that would
 // mask the misconfiguration in production.
-func NewRouter(verifier billingstripe.Verifier, store Store, log *slog.Logger) *Router {
+func NewRouter(verifier billingstripe.Verifier, store Store, charges ChargeRetriever, log *slog.Logger) *Router {
 	if verifier == nil {
 		panic("webhook.NewRouter: verifier must not be nil")
 	}
 	if store == nil {
 		panic("webhook.NewRouter: store must not be nil")
 	}
+	if charges == nil {
+		panic("webhook.NewRouter: charges must not be nil")
+	}
 	if log == nil {
 		panic("webhook.NewRouter: log must not be nil")
 	}
-	return &Router{verifier: verifier, store: store, log: log}
+	return &Router{verifier: verifier, store: store, charges: charges, log: log}
 }
 
 // Process verifies the signature, performs the idempotency check,
@@ -266,6 +288,10 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		// already ranks void/uncollectible as terminal (rank 2), so no handler
 		// change is needed — they only need to be dispatched here.
 		return r.handleInvoiceLifecycle(ctx, event)
+	case stripego.EventTypeChargeDisputeCreated:
+		return r.handleChargeDisputeCreated(ctx, event)
+	case stripego.EventTypeRadarEarlyFraudWarningCreated:
+		return r.handleEarlyFraudWarningCreated(ctx, event)
 	default:
 		r.log.InfoContext(ctx, "webhook unhandled event", "event_id", event.ID, "type", event.Type)
 		return Result{HTTPStatus: 200, Status: StatusUnhandled}

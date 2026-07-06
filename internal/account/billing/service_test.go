@@ -236,6 +236,10 @@ func (f *fakeStripe) CreateCheckoutSession(_ context.Context, _, _ string) (*str
 	}, nil
 }
 
+func (f *fakeStripe) RetrieveCharge(_ context.Context, _ string) (billingstripe.ChargeCardRef, error) {
+	return billingstripe.ChargeCardRef{}, nil // unused by the billing service
+}
+
 func (f *fakeStripe) DetachPaymentMethod(_ context.Context, stripePaymentMethodID string) error {
 	if f.errDetach != nil {
 		return f.errDetach

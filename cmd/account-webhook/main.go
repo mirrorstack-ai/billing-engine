@@ -69,11 +69,18 @@ func main() {
 // + router.
 func buildRouter() *webhook.Router {
 	webhookSecret := config.MustEnv("STRIPE_WEBHOOK_SECRET")
+	// The fraud handlers (charge.dispute.created / radar.early_fraud_warning.created)
+	// carry only a charge id, so the webhook must retrieve the charge to resolve
+	// the disputed card — this binary now also loads the Stripe API key (a
+	// restricted rk_* with charges:read is sufficient). Still inside the
+	// billing-engine trust boundary (CLAUDE.md).
+	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 	pool := config.MustPgxPool()
 
 	verifier := billingstripe.NewVerifier(webhookSecret)
 	store := webhook.NewStore(pool)
-	return webhook.NewRouter(verifier, store, slog.Default())
+	charges := billingstripe.NewClient(stripeKey)
+	return webhook.NewRouter(verifier, store, charges, slog.Default())
 }
 
 // proxyHandler is the Lambda entrypoint. Uses APIGatewayProxyRequest
