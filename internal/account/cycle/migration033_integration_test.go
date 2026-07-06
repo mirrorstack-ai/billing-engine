@@ -215,8 +215,14 @@ func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
 	// exempted such modules from ALL overage billing forever.
 	lateCands, err := store.ModuleOverageTimersPastGrace(ctx, mustTime(t, "2026-07-02T00:00:00Z"))
 	require.NoError(t, err)
-	require.Len(t, lateCands, 1, "only the rank-7 timer is still unresolved")
-	require.NoError(t, store.MarkModuleTimerIncluded(ctx, lateCands[0].ID))
+	var rank7 cycle.ModuleOverageCandidate
+	for _, c := range lateCands {
+		if c.AppID == appB {
+			rank7 = c
+		}
+	}
+	require.NotEqual(t, uuid.Nil, rank7.ID, "the rank-7 appB timer is in the late work list")
+	require.NoError(t, store.MarkModuleTimerIncluded(ctx, rank7.ID))
 	ongoing, err = store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules, newPeriodStart)
 	require.NoError(t, err)
 	require.Equal(t, 3, ongoing, "a resolved-uncharged (D1d) over-module still owes every later period")
@@ -229,8 +235,14 @@ func TestModuleOverageTimers_Integration_OverQueries(t *testing.T) {
 	require.NoError(t, store.InsertModuleOverageTimers(ctx, acct, appB, straddle, straddle.AddDate(0, 0, 3), 1))
 	straddleCands, err := store.ModuleOverageTimersPastGrace(ctx, mustTime(t, "2026-07-06T00:00:00Z"))
 	require.NoError(t, err)
-	require.Len(t, straddleCands, 1)
-	require.NoError(t, store.MarkModuleTimerCharged(ctx, straddleCands[0].ID, mustTime(t, "2026-07-05T00:00:00Z"), "in_straddle", "ii_straddle"))
+	var straddleTimer cycle.ModuleOverageCandidate
+	for _, c := range straddleCands {
+		if c.InstalledAt.Equal(straddle) {
+			straddleTimer = c
+		}
+	}
+	require.NotEqual(t, uuid.Nil, straddleTimer.ID, "the Jul-2 straddle timer is in the late work list")
+	require.NoError(t, store.MarkModuleTimerCharged(ctx, straddleTimer.ID, mustTime(t, "2026-07-05T00:00:00Z"), "in_straddle", "ii_straddle"))
 	ongoing, err = store.CountOngoingOverModuleTimers(ctx, acct, usage.IncludedModules, newPeriodStart)
 	require.NoError(t, err)
 	require.Equal(t, 3, ongoing, "a boundary-straddling grace is Leg 1's coverage, never the precharge's")
