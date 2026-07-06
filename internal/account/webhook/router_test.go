@@ -658,6 +658,45 @@ func TestProcess_Fraud_FlagStoreError_Internal(t *testing.T) {
 	require.Equal(t, webhook.StatusInternal, res.Status)
 }
 
+// --- 5xx idempotency compensation (redelivery recovery) -------------------
+
+func TestProcess_5xxDispatch_UnmarksSoRedeliveryReRuns(t *testing.T) {
+	// A 5xx dispatch outcome must DROP the idempotency row, so Stripe's
+	// redelivery of the same event re-enters the handler instead of being deduped
+	// forever (the "500 → Stripe retries" recovery the handlers document).
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_retry", "charge.dispute.created", "ch_1")}
+	s := webhooktest.NewFakeStore()
+	c := &webhooktest.FakeChargeRetriever{Err: errors.New("stripe 503")}
+	r := newRouterWithCharges(v, s, c)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, 500, res.HTTPStatus)
+	require.False(t, s.Processed["evt_retry"], "a 5xx must unmark the event for redelivery")
+
+	// Redelivery with a now-healthy retriever actually applies the flag.
+	c.Err = nil
+	c.Refs = map[string]billingstripe.ChargeCardRef{"ch_1": {PaymentMethodID: "pm_1", Fingerprint: "fp_1", StripeCustomerID: "cus_1"}}
+	res = r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.FraudFlags, 1, "redelivery re-ran the handler and flagged the card")
+}
+
+func TestProcess_2xxDispatch_StaysDedupedOnRedelivery(t *testing.T) {
+	// A successful (2xx) event stays recorded, so a redelivery is deduped — the
+	// compensation must fire ONLY on 5xx.
+	v := &webhooktest.FakeVerifier{Event: fraudEvent("evt_ok", "charge.dispute.created", "ch_1")}
+	s := webhooktest.NewFakeStore()
+	c := fraudRetriever("ch_1", billingstripe.ChargeCardRef{PaymentMethodID: "pm_1", Fingerprint: "fp_1", StripeCustomerID: "cus_1"})
+	r := newRouterWithCharges(v, s, c)
+
+	require.Equal(t, webhook.StatusOK, r.Process(context.Background(), []byte(`{}`), "sig").Status)
+	require.True(t, s.Processed["evt_ok"], "a 2xx stays recorded")
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, webhook.StatusDuplicate, res.Status)
+	require.Len(t, s.FraudFlags, 1, "a deduped redelivery must not re-flag")
+}
+
 func TestProcess_InvoiceVoided_AppliesVoid(t *testing.T) {
 	// An admin/Stripe void (invoice.voided, status 'void') MUST reach the
 	// reconciler so the mirror leaves 'open' and the delinquency signal clears.

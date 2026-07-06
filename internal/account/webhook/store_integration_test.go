@@ -952,3 +952,20 @@ func TestPgxStore_FlagPaymentMethodFraud_UnknownCard_Drift(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, found, "no matching mirror row → drift no-op")
 }
+
+func TestPgxStore_FlagPaymentMethodFraud_NullFingerprintRow_MatchedByPMID(t *testing.T) {
+	// A legacy/wallet mirror row with a NULL fingerprint, but the disputed charge
+	// DID carry a fingerprint — the row must still be flagged via its exact pm id
+	// (the additive pm-id arm), not silently missed (F2).
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	accountID := seedAccount(t, pool, "cus_wallet")
+	seedCardFP(t, pool, accountID, "pm_wallet", "") // NULL fingerprint
+	ctx := context.Background()
+
+	found, err := store.FlagPaymentMethodFraud(ctx, "cus_wallet", "fp_charge", "pm_wallet", "dispute")
+	require.NoError(t, err)
+	require.True(t, found, "a NULL-fingerprint row must be flagged by exact pm id even when the charge carries a fingerprint")
+	blocked, _, _ := readFraud(t, pool, "pm_wallet")
+	require.True(t, blocked)
+}

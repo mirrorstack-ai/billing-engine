@@ -153,7 +153,7 @@ WHERE pmm.account_id = a.id
   AND NOT pmm.fraud_blocked
   AND (
         (NULLIF($3::text, '') IS NOT NULL AND pmm.fingerprint = $3)
-     OR (NULLIF($3::text, '') IS NULL     AND pmm.stripe_payment_method_id = $4)
+     OR (NULLIF($4::text, '') IS NOT NULL AND pmm.stripe_payment_method_id = $4)
       )
 `
 
@@ -171,19 +171,26 @@ type FlagPaymentMethodFraudParams struct {
 // the charge from Stripe to get the customer id + card fingerprint + pm id, then
 // calls this.
 //
-// CARD-SCOPED, account-bounded: it flags every ACTIVE mirror row for the card's
-// FINGERPRINT on the account the charge belongs to — the fingerprint is the
-// canonical "same physical card" identity (robust to the duplicate-collapse
-// re-keying in ResolvePendingAddCardRequest, which mints a fresh pm_* per
-// re-add), and no LIMIT so a card re-added on the same account before the
-// collapse ran is fully covered. It NEVER blocks the account's OTHER cards, and
-// the stripe_customer_id bound means a shared physical card on a different
-// account is untouched. Falls back to the pm id only when the charge has no
-// fingerprint (non-card / legacy). Set-only + NOT fraud_blocked makes it
-// idempotent — a replay, or the second of the dispute/EFW pair for the same
-// card, flags 0 rows. deleted_at IS NULL keeps it to gate-visible cards.
-// :execrows → 0 = drift/no-op (never mirrored, already detached, or already
-// flagged): the Go layer logs drift_warning and ACKs 200.
+// CARD-SCOPED, account-bounded. It flags, within the charge's account, every
+// ACTIVE mirror row that is the disputed physical card, matched by EITHER key
+// (additive OR):
+//   - FINGERPRINT — the canonical "same physical card" identity, robust to the
+//     duplicate-collapse re-keying in ResolvePendingAddCardRequest (which mints
+//     a fresh pm_* per re-add); no LIMIT, so all same-card siblings are covered.
+//   - exact PM ID — catches a mirror row whose fingerprint is NULL (legacy
+//     pre-005 rows, or wallet-tokenized cards) but whose stripe_payment_method_id
+//     is exactly the charge's pm — which the fingerprint arm would miss.
+//
+// Both arms are guarded against an empty key (a non-card charge with neither is
+// short-circuited to drift in the handler), so an empty param never widens the
+// match. Each arm still matches only the ONE physical card (pm id is unique;
+// fingerprint is that card's identity), so no OTHER card is touched, and the
+// stripe_customer_id bound means a shared card on a DIFFERENT account is
+// untouched. Set-only + NOT fraud_blocked makes it idempotent — a replay, or the
+// second of the dispute/EFW pair for the same card, flags 0 rows. deleted_at IS
+// NULL keeps it to gate-visible cards. :execrows → 0 = drift/no-op (never
+// mirrored, already detached, or already flagged): the Go layer logs
+// drift_warning and ACKs 200.
 func (q *Queries) FlagPaymentMethodFraud(ctx context.Context, arg FlagPaymentMethodFraudParams) (int64, error) {
 	result, err := q.db.Exec(ctx, flagPaymentMethodFraud,
 		arg.FraudReason,
@@ -505,4 +512,21 @@ func (q *Queries) TouchAccountByStripeCustomer(ctx context.Context, stripeCustom
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const unmarkEventProcessed = `-- name: UnmarkEventProcessed :exec
+DELETE FROM ms_billing.webhook_events_processed WHERE event_id = $1
+`
+
+// UnmarkEventProcessed deletes the idempotency row for an event so Stripe's
+// redelivery of the same event_id re-enters the handler instead of being
+// short-circuited as a duplicate. The router calls this ONLY when dispatch
+// returned a 5xx (the side effect did not complete): mark-processed commits
+// BEFORE dispatch to serialize concurrent duplicate deliveries, so without this
+// compensation a transient handler failure would be permanently deduped and the
+// documented "500 → Stripe retries" recovery would never fire. Every handler's
+// writes are replay-idempotent, so re-running on redelivery is safe.
+func (q *Queries) UnmarkEventProcessed(ctx context.Context, eventID string) error {
+	_, err := q.db.Exec(ctx, unmarkEventProcessed, eventID)
+	return err
 }

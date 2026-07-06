@@ -64,6 +64,7 @@ type FakeStore struct {
 
 	// Error injection
 	ErrMark         error // from MarkEventProcessed
+	ErrUnmark       error // from UnmarkEventProcessed
 	ErrTouch        error // from TouchAccountByStripeCustomer
 	ErrSetDefault   error // from SetDefaultPaymentMethod
 	ErrInsert       error // from InsertPaymentMethod
@@ -112,6 +113,14 @@ func (s *FakeStore) MarkEventProcessed(_ context.Context, eventID, _ string) (bo
 	}
 	s.Processed[eventID] = true
 	return true, nil
+}
+
+func (s *FakeStore) UnmarkEventProcessed(_ context.Context, eventID string) error {
+	if s.ErrUnmark != nil {
+		return s.ErrUnmark
+	}
+	delete(s.Processed, eventID)
+	return nil
 }
 
 func (s *FakeStore) TouchAccountByStripeCustomer(_ context.Context, _ string) (bool, error) {
