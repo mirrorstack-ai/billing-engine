@@ -311,6 +311,22 @@ func (s *pgxStore) MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string
 	return err
 }
 
+// FlagPaymentMethodFraud latches fraud_blocked on the disputed/warned card
+// (card-scoped, account-bounded; see the query doc). Returns (found, error):
+// found=false (0 rows) is a drift no-op the handler ACKs 200.
+func (s *pgxStore) FlagPaymentMethodFraud(ctx context.Context, stripeCustomerID, fingerprint, stripePaymentMethodID, reason string) (bool, error) {
+	rows, err := s.q.FlagPaymentMethodFraud(ctx, db.FlagPaymentMethodFraudParams{
+		FraudReason:           text(reason),
+		StripeCustomerID:      text(stripeCustomerID),
+		Fingerprint:           fingerprint,
+		StripePaymentMethodID: stripePaymentMethodID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // text wraps a non-null Go string in the pgtype.Text the generated
 // queries expect for nullable TEXT columns.
 func text(s string) pgtype.Text {

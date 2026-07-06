@@ -87,6 +87,15 @@ type Client interface {
 	// (id/status/amounts) for the mirror.
 	FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
 
+	// RetrieveCharge fetches a charge by id and projects the card-identifying
+	// fields the fraud webhook needs. The charge.dispute.created /
+	// radar.early_fraud_warning.created events carry only a charge id (no pm id,
+	// no fingerprint), so resolving the disputed card to a mirror row requires
+	// this one retrieve. A retrieved charge returns both the payment_method id
+	// and payment_method_details.card.fingerprint by default. Rare + off the hot
+	// path, so a synchronous call in the webhook handler is fine.
+	RetrieveCharge(ctx context.Context, chargeID string) (ChargeCardRef, error)
+
 	// FindInvoiceByRef looks a Customer's invoice up by its ms_charge_ref
 	// metadata anchor (stamped by CreateDraftInvoice) — the crash-recovery read
 	// (review 2026-07-06, H5): Stripe prunes idempotency keys after ~24h, so a
@@ -116,6 +125,19 @@ type Invoice struct {
 	AmountDue  int64
 	AmountPaid int64
 	Currency   string
+}
+
+// ChargeCardRef is the trust-boundary-edge projection of a Stripe charge the
+// fraud webhook needs to resolve a disputed/warned card to a mirror row:
+// the payment_method id, the card fingerprint (the canonical "same physical
+// card" identity, preferred for matching), and the owning Stripe customer id
+// (to scope the flag to one account). Kept stripe-go-free like Invoice. Any
+// field may be empty — a non-card charge has no card block, and Stripe tags
+// fingerprint omitempty (wallet-tokenized cards may also omit it).
+type ChargeCardRef struct {
+	PaymentMethodID  string
+	Fingerprint      string
+	StripeCustomerID string
 }
 
 // Verifier verifies Stripe webhook signatures. Kept separate from

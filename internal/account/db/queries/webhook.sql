@@ -247,3 +247,38 @@ UPDATE ms_billing.invoices
 SET ever_failed = true
 WHERE stripe_invoice_id = $1
   AND NOT ever_failed;
+
+-- FlagPaymentMethodFraud latches fraud_blocked (migration 038) on the disputed /
+-- early-fraud-warned physical card so the service-block gate (ServiceBlockSignals)
+-- stops counting it as usable. The charge.dispute.created / radar.early_fraud_
+-- warning.created events carry only a charge id, so the handler first retrieves
+-- the charge from Stripe to get the customer id + card fingerprint + pm id, then
+-- calls this.
+--
+-- CARD-SCOPED, account-bounded: it flags every ACTIVE mirror row for the card's
+-- FINGERPRINT on the account the charge belongs to — the fingerprint is the
+-- canonical "same physical card" identity (robust to the duplicate-collapse
+-- re-keying in ResolvePendingAddCardRequest, which mints a fresh pm_* per
+-- re-add), and no LIMIT so a card re-added on the same account before the
+-- collapse ran is fully covered. It NEVER blocks the account's OTHER cards, and
+-- the stripe_customer_id bound means a shared physical card on a different
+-- account is untouched. Falls back to the pm id only when the charge has no
+-- fingerprint (non-card / legacy). Set-only + NOT fraud_blocked makes it
+-- idempotent — a replay, or the second of the dispute/EFW pair for the same
+-- card, flags 0 rows. deleted_at IS NULL keeps it to gate-visible cards.
+-- :execrows → 0 = drift/no-op (never mirrored, already detached, or already
+-- flagged): the Go layer logs drift_warning and ACKs 200.
+-- name: FlagPaymentMethodFraud :execrows
+UPDATE ms_billing.payment_methods_mirror pmm
+SET fraud_blocked    = true,
+    fraud_reason     = @fraud_reason,
+    fraud_flagged_at = now()
+FROM ms_billing.accounts a
+WHERE pmm.account_id = a.id
+  AND a.stripe_customer_id = @stripe_customer_id
+  AND pmm.deleted_at IS NULL
+  AND NOT pmm.fraud_blocked
+  AND (
+        (NULLIF(@fingerprint::text, '') IS NOT NULL AND pmm.fingerprint = @fingerprint)
+     OR (NULLIF(@fingerprint::text, '') IS NULL     AND pmm.stripe_payment_method_id = @stripe_payment_method_id)
+      );
