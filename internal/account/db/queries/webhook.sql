@@ -8,6 +8,17 @@ INSERT INTO ms_billing.webhook_events_processed (event_id, event_type)
 VALUES ($1, $2)
 ON CONFLICT (event_id) DO NOTHING;
 
+-- UnmarkEventProcessed deletes the idempotency row for an event so Stripe's
+-- redelivery of the same event_id re-enters the handler instead of being
+-- short-circuited as a duplicate. The router calls this ONLY when dispatch
+-- returned a 5xx (the side effect did not complete): mark-processed commits
+-- BEFORE dispatch to serialize concurrent duplicate deliveries, so without this
+-- compensation a transient handler failure would be permanently deduped and the
+-- documented "500 → Stripe retries" recovery would never fire. Every handler's
+-- writes are replay-idempotent, so re-running on redelivery is safe.
+-- name: UnmarkEventProcessed :exec
+DELETE FROM ms_billing.webhook_events_processed WHERE event_id = $1;
+
 -- TouchAccountByStripeCustomer bumps updated_at for the account matching
 -- a Stripe customer. :execrows → >0 means found.
 -- name: TouchAccountByStripeCustomer :execrows
@@ -247,3 +258,44 @@ UPDATE ms_billing.invoices
 SET ever_failed = true
 WHERE stripe_invoice_id = $1
   AND NOT ever_failed;
+
+-- FlagPaymentMethodFraud latches fraud_blocked (migration 038) on the disputed /
+-- early-fraud-warned physical card so the service-block gate (ServiceBlockSignals)
+-- stops counting it as usable. The charge.dispute.created / radar.early_fraud_
+-- warning.created events carry only a charge id, so the handler first retrieves
+-- the charge from Stripe to get the customer id + card fingerprint + pm id, then
+-- calls this.
+--
+-- CARD-SCOPED, account-bounded. It flags, within the charge's account, every
+-- ACTIVE mirror row that is the disputed physical card, matched by EITHER key
+-- (additive OR):
+--   - FINGERPRINT — the canonical "same physical card" identity, robust to the
+--     duplicate-collapse re-keying in ResolvePendingAddCardRequest (which mints
+--     a fresh pm_* per re-add); no LIMIT, so all same-card siblings are covered.
+--   - exact PM ID — catches a mirror row whose fingerprint is NULL (legacy
+--     pre-005 rows, or wallet-tokenized cards) but whose stripe_payment_method_id
+--     is exactly the charge's pm — which the fingerprint arm would miss.
+-- Both arms are guarded against an empty key (a non-card charge with neither is
+-- short-circuited to drift in the handler), so an empty param never widens the
+-- match. Each arm still matches only the ONE physical card (pm id is unique;
+-- fingerprint is that card's identity), so no OTHER card is touched, and the
+-- stripe_customer_id bound means a shared card on a DIFFERENT account is
+-- untouched. Set-only + NOT fraud_blocked makes it idempotent — a replay, or the
+-- second of the dispute/EFW pair for the same card, flags 0 rows. deleted_at IS
+-- NULL keeps it to gate-visible cards. :execrows → 0 = drift/no-op (never
+-- mirrored, already detached, or already flagged): the Go layer logs
+-- drift_warning and ACKs 200.
+-- name: FlagPaymentMethodFraud :execrows
+UPDATE ms_billing.payment_methods_mirror pmm
+SET fraud_blocked    = true,
+    fraud_reason     = @fraud_reason,
+    fraud_flagged_at = now()
+FROM ms_billing.accounts a
+WHERE pmm.account_id = a.id
+  AND a.stripe_customer_id = @stripe_customer_id
+  AND pmm.deleted_at IS NULL
+  AND NOT pmm.fraud_blocked
+  AND (
+        (NULLIF(@fingerprint::text, '') IS NOT NULL AND pmm.fingerprint = @fingerprint)
+     OR (NULLIF(@stripe_payment_method_id::text, '') IS NOT NULL AND pmm.stripe_payment_method_id = @stripe_payment_method_id)
+      );

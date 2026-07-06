@@ -100,6 +100,30 @@ func (c *realClient) DetachPaymentMethod(ctx context.Context, stripePaymentMetho
 	return err
 }
 
+// RetrieveCharge fetches a charge and projects the card-identifying fields the
+// fraud webhook resolves against. payment_method (a plain string id) and
+// payment_method_details.card.fingerprint ride the default charge retrieve, so
+// no expand params are needed; customer arrives unexpanded (only .ID set),
+// which is all we use. Missing card details (a non-card charge) leave the
+// respective fields empty rather than erroring — the caller treats an empty
+// pm+fingerprint as drift.
+func (c *realClient) RetrieveCharge(ctx context.Context, chargeID string) (ChargeCardRef, error) {
+	params := &stripego.ChargeParams{}
+	params.Context = ctx
+	ch, err := c.sc.Charges.Get(chargeID, params)
+	if err != nil {
+		return ChargeCardRef{}, err
+	}
+	ref := ChargeCardRef{PaymentMethodID: ch.PaymentMethod}
+	if ch.Customer != nil {
+		ref.StripeCustomerID = ch.Customer.ID
+	}
+	if ch.PaymentMethodDetails != nil && ch.PaymentMethodDetails.Card != nil {
+		ref.Fingerprint = ch.PaymentMethodDetails.Card.Fingerprint
+	}
+	return ref, nil
+}
+
 // SetDefaultPaymentMethod sets the Customer's invoice-settings default
 // payment method. The resulting customer.updated webhook syncs the
 // mirror's is_default flags for the account.

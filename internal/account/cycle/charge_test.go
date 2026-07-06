@@ -86,6 +86,10 @@ func newFakeStripe() *fakeStripe {
 	}
 }
 
+func (f *fakeStripe) RetrieveCharge(_ context.Context, _ string) (billingstripe.ChargeCardRef, error) {
+	return billingstripe.ChargeCardRef{}, nil // unused by the charge cycle
+}
+
 func (f *fakeStripe) CreateDraftInvoice(_ context.Context, custID, ref, idemKey string) (billingstripe.Invoice, error) {
 	f.invoiceCalls = append(f.invoiceCalls, invoiceCall{custID, ref, idemKey})
 	if f.errDraft != nil {

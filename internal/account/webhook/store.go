@@ -45,6 +45,12 @@ func (s *pgxStore) MarkEventProcessed(ctx context.Context, eventID, eventType st
 	return rows == 1, nil
 }
 
+// UnmarkEventProcessed deletes the idempotency row so a 5xx-failed event is
+// re-run on Stripe's redelivery (see the query/interface docs).
+func (s *pgxStore) UnmarkEventProcessed(ctx context.Context, eventID string) error {
+	return s.q.UnmarkEventProcessed(ctx, eventID)
+}
+
 // TouchAccountByStripeCustomer updates accounts.updated_at for the
 // row matching stripeCustomerID. Returns (found, error). The trigger
 // installed by migration 001 maintains updated_at, but the explicit
@@ -309,6 +315,22 @@ func (s *pgxStore) RelaxCollectionOnPaidInvoice(ctx context.Context, stripeInvoi
 func (s *pgxStore) MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string) error {
 	_, err := s.q.MarkInvoiceFailed(ctx, stripeInvoiceID)
 	return err
+}
+
+// FlagPaymentMethodFraud latches fraud_blocked on the disputed/warned card
+// (card-scoped, account-bounded; see the query doc). Returns (found, error):
+// found=false (0 rows) is a drift no-op the handler ACKs 200.
+func (s *pgxStore) FlagPaymentMethodFraud(ctx context.Context, stripeCustomerID, fingerprint, stripePaymentMethodID, reason string) (bool, error) {
+	rows, err := s.q.FlagPaymentMethodFraud(ctx, db.FlagPaymentMethodFraudParams{
+		FraudReason:           text(reason),
+		StripeCustomerID:      text(stripeCustomerID),
+		Fingerprint:           fingerprint,
+		StripePaymentMethodID: stripePaymentMethodID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 // text wraps a non-null Go string in the pgtype.Text the generated
