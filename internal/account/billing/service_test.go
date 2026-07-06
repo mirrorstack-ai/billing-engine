@@ -20,6 +20,7 @@ type fakeStore struct {
 	hasUsablePM      map[uuid.UUID]bool
 	hasUnpaidInvoice map[uuid.UUID]bool
 	paymentMethodsBy map[uuid.UUID][]billing.PaymentMethod
+	serviceSignals   map[uuid.UUID]billing.ServiceSignals
 	addCardRequests  map[uuid.UUID]*fakeAddCardRequest
 
 	// PM-target lookups for detach / set-default, keyed by payment method id.
@@ -32,6 +33,7 @@ type fakeStore struct {
 	errHasUsablePaymentMx   error
 	errHasUnpaidInvoice     error
 	errListPaymentMethods   error
+	errServiceSignals       error
 	errPaymentMethodTarget  error
 	errInsertAddCardRequest error
 	errSetSetupIntent       error
@@ -62,6 +64,7 @@ func newFakeStore() *fakeStore {
 		hasUsablePM:      map[uuid.UUID]bool{},
 		hasUnpaidInvoice: map[uuid.UUID]bool{},
 		paymentMethodsBy: map[uuid.UUID][]billing.PaymentMethod{},
+		serviceSignals:   map[uuid.UUID]billing.ServiceSignals{},
 		pmTargets:        map[uuid.UUID]pmTarget{},
 		addCardRequests:  map[uuid.UUID]*fakeAddCardRequest{},
 	}
@@ -123,6 +126,13 @@ func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) (
 		return nil, s.errListPaymentMethods
 	}
 	return s.paymentMethodsBy[accountID], nil
+}
+
+func (s *fakeStore) ServiceBlockSignals(_ context.Context, accountID uuid.UUID) (billing.ServiceSignals, error) {
+	if s.errServiceSignals != nil {
+		return billing.ServiceSignals{}, s.errServiceSignals
+	}
+	return s.serviceSignals[accountID], nil
 }
 
 func (s *fakeStore) PaymentMethodTarget(_ context.Context, _ uuid.UUID, paymentMethodID uuid.UUID) (string, string, bool, bool, error) {
@@ -619,6 +629,103 @@ func TestGetPaymentMethods_HasMethods_ReturnsAll(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.PaymentMethods, 2)
 	require.True(t, resp.PaymentMethods[0].IsDefault)
+}
+
+// --- GetServiceStatus (service-block gate) --------------------------------
+
+func TestGetServiceStatus_MissingUserID_InvalidInput(t *testing.T) {
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
+
+	_, err := svc.GetServiceStatus(context.Background(), billing.GetServiceStatusRequest{})
+
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInvalidInput, be.Code)
+}
+
+func TestGetServiceStatus_NoAccount_BlockedNoCard(t *testing.T) {
+	// A user with no billing account has no card on file → blocked on the card
+	// gate, not a 404.
+	svc := billing.NewService(newFakeStore(), &fakeStripe{}, "")
+
+	resp, err := svc.GetServiceStatus(context.Background(), billing.GetServiceStatusRequest{UserID: uuid.New()})
+
+	require.NoError(t, err)
+	require.True(t, resp.Blocked)
+	require.Equal(t, "NO_USABLE_CARD", resp.Reason)
+	require.Equal(t, []string{"NO_USABLE_CARD"}, resp.Reasons)
+}
+
+func TestGetServiceStatus_Eligible(t *testing.T) {
+	store := newFakeStore()
+	userID, accountID := uuid.New(), uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_x"}
+	store.serviceSignals[accountID] = billing.ServiceSignals{
+		UsableCardCount: 1, FailedChargeStreak: 1, FirstChargeStatus: "paid",
+	}
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.GetServiceStatus(context.Background(), billing.GetServiceStatusRequest{UserID: userID})
+
+	require.NoError(t, err)
+	require.False(t, resp.Blocked)
+	require.Equal(t, "ELIGIBLE", resp.Reason)
+	require.Empty(t, resp.Reasons)
+}
+
+func TestGetServiceStatus_NewAccountWithCardIsGraced(t *testing.T) {
+	// No charge yet ("" first-charge status) + a card → eligible (grace).
+	store := newFakeStore()
+	userID, accountID := uuid.New(), uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID}
+	store.serviceSignals[accountID] = billing.ServiceSignals{UsableCardCount: 1, FirstChargeStatus: ""}
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	resp, err := svc.GetServiceStatus(context.Background(), billing.GetServiceStatusRequest{UserID: userID})
+
+	require.NoError(t, err)
+	require.False(t, resp.Blocked)
+}
+
+func TestGetServiceStatus_MapsSignalsToBlockingReasons(t *testing.T) {
+	cases := []struct {
+		name       string
+		signals    billing.ServiceSignals
+		wantReason string
+	}{
+		{"no card", billing.ServiceSignals{UsableCardCount: 0, FirstChargeStatus: "paid"}, "NO_USABLE_CARD"},
+		{"first charge uncollectible", billing.ServiceSignals{UsableCardCount: 1, FirstChargeStatus: "uncollectible"}, "FIRST_CHARGE_FAILED"},
+		{"streak of two", billing.ServiceSignals{UsableCardCount: 1, FirstChargeStatus: "paid", FailedChargeStreak: 2}, "TOO_MANY_FAILURES"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			userID, accountID := uuid.New(), uuid.New()
+			store.accountsByUser[userID] = fakeAccount{id: accountID}
+			store.serviceSignals[accountID] = tc.signals
+			svc := billing.NewService(store, &fakeStripe{}, "")
+
+			resp, err := svc.GetServiceStatus(context.Background(), billing.GetServiceStatusRequest{UserID: userID})
+
+			require.NoError(t, err)
+			require.True(t, resp.Blocked)
+			require.Equal(t, tc.wantReason, resp.Reason)
+		})
+	}
+}
+
+func TestGetServiceStatus_SignalsError_Internal(t *testing.T) {
+	store := newFakeStore()
+	userID, accountID := uuid.New(), uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID}
+	store.errServiceSignals = errors.New("conn dropped")
+	svc := billing.NewService(store, &fakeStripe{}, "")
+
+	_, err := svc.GetServiceStatus(context.Background(), billing.GetServiceStatusRequest{UserID: userID})
+
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodeInternal, be.Code)
 }
 
 func TestDetachPaymentMethod_OwnedPM_DetachesFromStripe(t *testing.T) {

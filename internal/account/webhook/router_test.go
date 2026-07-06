@@ -460,6 +460,83 @@ func TestProcess_InvoicePaymentFailed_StaysOpen(t *testing.T) {
 	require.Equal(t, int64(0), s.AppliedInvoices[0].AmountPaidCents)
 }
 
+// --- service-block failure latch (migration 039; streak derived at read time) ---
+
+func TestProcess_FailureEvents_LatchEverFailed(t *testing.T) {
+	// Both failure signals latch ever_failed via MarkInvoiceFailed — and BEFORE
+	// the found-guard, so an out-of-order marked_uncollectible (or a not-yet-
+	// mirrored invoice) still latches. No account write happens; the streak is
+	// derived at read time.
+	for _, ev := range []struct{ name, typ, status string }{
+		{"payment_failed", "invoice.payment_failed", "open"},
+		{"marked_uncollectible", "invoice.marked_uncollectible", "uncollectible"},
+	} {
+		t.Run(ev.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_lat_"+ev.name, ev.typ, "in_1", ev.status, 0, 1200)}
+			s := webhooktest.NewFakeStore()
+			r := newRouter(v, s)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, 200, res.HTTPStatus)
+			require.Equal(t, webhook.StatusOK, res.Status)
+			require.Equal(t, []string{"in_1"}, s.FailedInvoices, "failure events must latch ever_failed")
+		})
+	}
+}
+
+func TestProcess_FailureLatch_RunsEvenOnDriftMirror(t *testing.T) {
+	// The latch is set BEFORE the found-guard, so a payment_failed for a not-yet-
+	// mirrored invoice still calls MarkInvoiceFailed (a store-side no-op) — this
+	// is what makes the read-time streak order-independent. The event still ACKs
+	// drift (the status reconcile found no row).
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_lat_drift", "invoice.payment_failed", "in_orphan", "open", 0, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Equal(t, []string{"in_orphan"}, s.FailedInvoices, "latch runs ahead of the found-guard")
+}
+
+func TestProcess_NonFailureInvoiceEvent_DoesNotLatch(t *testing.T) {
+	// Only the two failure signals latch ever_failed. created/finalized/paid/void
+	// land the mirror but never mark the invoice failed.
+	for _, ev := range []struct{ name, typ, status string }{
+		{"created", "invoice.created", "draft"},
+		{"finalized", "invoice.finalized", "open"},
+		{"paid", "invoice.paid", "paid"},
+		{"voided", "invoice.voided", "void"},
+	} {
+		t.Run(ev.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_nl_"+ev.name, ev.typ, "in_x", ev.status, 0, 1200)}
+			s := webhooktest.NewFakeStore()
+			r := newRouter(v, s)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, webhook.StatusOK, res.Status)
+			require.Empty(t, s.FailedInvoices, "only failure events latch ever_failed")
+		})
+	}
+}
+
+func TestProcess_FailureLatchError_Internal(t *testing.T) {
+	// A latch store error surfaces as 500 so Stripe retries; the set-only latch
+	// makes the retry a harmless no-op.
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_lat_err", "invoice.payment_failed", "in_1", "open", 0, 1200)}
+	s := webhooktest.NewFakeStore()
+	s.ErrMarkFailed = errors.New("db down")
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+}
+
 func TestProcess_InvoiceVoided_AppliesVoid(t *testing.T) {
 	// An admin/Stripe void (invoice.voided, status 'void') MUST reach the
 	// reconciler so the mirror leaves 'open' and the delinquency signal clears.

@@ -37,12 +37,12 @@ WHERE i.stripe_invoice_id = $7
         -- forward transition: incoming rank strictly above the stored rank …
         (CASE $1::text
             WHEN 'draft' THEN 0 WHEN 'open' THEN 1
-            WHEN 'paid' THEN 2 WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2
+            WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2 WHEN 'paid' THEN 3
             ELSE -1 END)
         >
         (CASE i.status
             WHEN 'draft' THEN 0 WHEN 'open' THEN 1
-            WHEN 'paid' THEN 2 WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2
+            WHEN 'void' THEN 2 WHEN 'uncollectible' THEN 2 WHEN 'paid' THEN 3
             ELSE -1 END)
         -- … OR an identical re-apply (idempotent amount refresh on replay).
         OR i.status = $1
@@ -76,16 +76,24 @@ type ApplyInvoiceStatusParams struct {
 // Out-of-order + at-least-once safety: Stripe delivers webhooks at-least-once
 // and NOT in guaranteed order, so a late invoice.finalized (open) can arrive
 // after invoice.paid (paid). The WHERE guard enforces a MONOTONIC status
-// transition via a rank ladder — draft(0) < open(1) < paid/void/uncollectible(2,
-// terminal) — so the row's status can only move forward. The new status's rank
+// transition via a rank ladder — draft(0) < open(1) < void/uncollectible(2) <
+// paid(3) — so the row's status can only move forward. The new status's rank
 // must be strictly greater than the current rank (a forward transition), with
 // one exception: an identical re-apply of the SAME status is allowed through so
-// a replayed paid can refresh amount_paid/amount_due idempotently. A terminal
-// status (rank 2) is never overwritten by a different status because no rank
-// exceeds 2 and the equal-rank branch requires status equality, so paid→void
-// (both rank 2) is a no-op — terminal-once-set holds. The CASE ladder is inline
-// (not a stored ENUM) so a new Stripe status maps to the bottom rung (-1) and
-// can never silently regress a known terminal state.
+// a replayed paid can refresh amount_paid/amount_due idempotently.
+//
+// paid outranks void/uncollectible (rank 3 vs 2) DELIBERATELY: paying an
+// invoice that Stripe already marked uncollectible (the customer settles it on
+// the hosted page) transitions it uncollectible→paid, which MUST land so the
+// delinquency signal clears and the collection relax + service-block cure run
+// off the invoice.paid handler. Ranking paid at 2 (its old value) rejected that
+// transition (2 > 2 false) and trapped a paying customer in delinquent/blocked
+// state forever. void/uncollectible stay at 2 and so still cannot overwrite a
+// paid(3) row (2 > 3 false; the equal-rank branch requires status equality), and
+// Stripe never emits void/uncollectible AFTER a real payment — so terminal-once-
+// paid still holds while the genuine recovery is no longer blocked. The CASE
+// ladder is inline (not a stored ENUM) so a new Stripe status maps to the bottom
+// rung (-1) and can never silently regress a known terminal state.
 //
 // :execrows → >0 means the row existed AND the guard let the update through; 0
 // means either no mirror row (drift: the charge spine's UpsertInvoice hasn't
@@ -217,6 +225,31 @@ type MarkEventProcessedParams struct {
 // the caller can map 1 row → firstTime=true, 0 → duplicate.
 func (q *Queries) MarkEventProcessed(ctx context.Context, arg MarkEventProcessedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, markEventProcessed, arg.EventID, arg.EventType)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markInvoiceFailed = `-- name: MarkInvoiceFailed :execrows
+UPDATE ms_billing.invoices
+SET ever_failed = true
+WHERE stripe_invoice_id = $1
+  AND NOT ever_failed
+`
+
+// MarkInvoiceFailed sets the sticky ever_failed flag (migration 039) on an
+// invoice that failed a payment (invoice.payment_failed / marked_uncollectible).
+// ever_failed is what lets ServiceBlockSignals count an invoice that is still
+// 'open' after a failed charge (a currently-'uncollectible' invoice the
+// derivation already catches by status). :execrows, but the caller ignores the
+// count: the flag is a set-only latch (a second failure event for the same
+// invoice re-sets it to the same value — 0 rows, a harmless no-op), and the
+// failed-charge STREAK is derived at read time from these facts + created_at,
+// not maintained as a counter, so there is nothing to double-count. Keyed on the
+// invoice, so it is a safe no-op when the mirror row has not landed yet.
+func (q *Queries) MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string) (int64, error) {
+	result, err := q.db.Exec(ctx, markInvoiceFailed, stripeInvoiceID)
 	if err != nil {
 		return 0, err
 	}
