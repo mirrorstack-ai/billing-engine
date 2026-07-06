@@ -1151,6 +1151,10 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 		Currency:        pc.Invoice.Currency,
 		PeriodStart:     pgtype.Timestamptz{Time: pc.Invoice.PeriodStart, Valid: !pc.Invoice.PeriodStart.IsZero()},
 		PeriodEnd:       pgtype.Timestamptz{Time: pc.Invoice.PeriodEnd, Valid: !pc.Invoice.PeriodEnd.IsZero()},
+		// Scenario 5 — the disclosure flag the charge callback computed for the FULL
+		// combined debit (base + co-created overage lines). Dropping it here would
+		// silently write false for every creation/combined invoice.
+		IsLargeAutoCollect: pc.Invoice.IsLargeAutoCollect,
 	}); err != nil {
 		return 0, "", err
 	}

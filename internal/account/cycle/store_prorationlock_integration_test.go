@@ -140,3 +140,36 @@ func TestChargeProrationLocked_Integration_ConcurrentDeleteDoesNotBlockOnLock(t 
 	require.True(t, app.Deleted, "the delete committed")
 	require.Equal(t, "in_slow_del", app.ProrationInvoiceID, "the already-succeeded Stripe charge is still recorded, not silently dropped")
 }
+
+// Regression (review 2026-07-06): persistProrationCharge dropped the
+// IsLargeAutoCollect field from its UpsertInvoiceParams, so the combined
+// creation invoice (scenario 3/5a) was ALWAYS persisted with
+// is_large_auto_collect = false in production even when the charge callback
+// computed true — the unit suite never caught it because the fake store
+// carries the InvoiceMirror struct through verbatim. Assert against the REAL
+// pgx persist path.
+func TestChargeProrationLocked_Integration_PersistsLargeAutoCollectFlag(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	appID := uuid.New()
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, 0, mustTime(t, "2026-07-01T08:00:00Z")))
+
+	pc := mkProrationCharge(acct, appID, "in_large_flag", mustTime(t, "2026-07-04T00:00:00Z"))
+	pc.Invoice.IsLargeAutoCollect = true
+
+	outcome, invID, err := store.ChargeProrationLocked(ctx, appID, func(cycle.AppMirror) (*cycle.ProrationCharge, error) {
+		return pc, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationLockedCharged, outcome)
+	require.Equal(t, "in_large_flag", invID)
+
+	var flagged bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT is_large_auto_collect FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		"in_large_flag").Scan(&flagged))
+	require.True(t, flagged, "the charge callback's IsLargeAutoCollect must survive the pgx persist path")
+}
