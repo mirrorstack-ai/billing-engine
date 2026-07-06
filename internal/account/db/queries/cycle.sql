@@ -162,6 +162,23 @@ SET status            = $2,
     total_amount      = $4
 WHERE id = $1;
 
+-- MarkBillingRunInvoicedIfUnfrozen is the ZERO-SKIP terminal mark (review
+-- 2026-07-06 wave 2, D7): marking a run 'invoiced' with NO Stripe call is only
+-- safe while no attempt has committed to a charge. Under the two-daemons model
+-- (H6), a concurrent reclaim can freeze + charge between this process's
+-- top-of-run frozen read and its zero-skip; an unguarded terminal mark would
+-- bury that charge forever ('invoiced' blocks all future reclaims). The
+-- frozen_charge_cents IS NULL guard makes the stale zero-skip LOSE: 0 rows →
+-- the caller errors out, the run stays reclaimable, and the next reclaim
+-- reconciles the frozen charge.
+-- name: MarkBillingRunInvoicedIfUnfrozen :execrows
+UPDATE ms_billing.billing_runs
+SET status            = 'invoiced',
+    stripe_invoice_id = NULL,
+    total_amount      = 0
+WHERE id = $1
+  AND frozen_charge_cents IS NULL;
+
 -- FreezeBillingRunCharge records, BEFORE the boundary Stripe charge, the exact
 -- whole-cent amount AND the base/overage description determinant this run will
 -- send Stripe under the deterministic idem keys ii-<run> / inv-<run> (migration

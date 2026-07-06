@@ -442,6 +442,15 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 	if !ok {
 		return false, nil
 	}
+	if found.Status == "void" {
+		// The charge was CANCELED (support voided it during an incident) —
+		// adopting it as 'charged' would silently forgive the overage and
+		// terminally consume the timer's charge identity. Fail loudly into the
+		// sweep's retried-error path so ops decides.
+		return false, billing.Internal(fmt.Sprintf(
+			"module overage recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (timer %s needs ops resolution)",
+			found.ID, moduleOverageChargeRef(cand.ID), cand.ID), nil)
+	}
 
 	proratedMicros, periodStart, _, coverageEnd, _ := moduleOverageCoverage(cand)
 	cents, err := centsFromMicros(proratedMicros)

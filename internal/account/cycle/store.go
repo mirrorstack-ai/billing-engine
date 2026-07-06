@@ -141,6 +141,14 @@ type Store interface {
 	// (empty → NULL), and the charged total in whole cents.
 	MarkBillingRun(ctx context.Context, runID uuid.UUID, status BillingRunStatus, stripeInvoiceID string, totalCents int64) error
 
+	// MarkBillingRunInvoicedIfUnfrozen terminally marks a ZERO-total run
+	// 'invoiced' (no Stripe call happened) — guarded on the run still being
+	// UNFROZEN (wave 2, D7): a concurrent reclaim may have frozen + charged
+	// after this process's top-of-run frozen read, and an unguarded terminal
+	// mark would bury that charge forever. ok=false → the guard lost; the
+	// caller must back off and leave the run reclaimable.
+	MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID uuid.UUID) (bool, error)
+
 	// FreezeBillingRunCharge records — BEFORE the boundary run's first Stripe
 	// charge — the exact amount + base/overage description determinant it will send
 	// under the deterministic idem keys ii-<run>/inv-<run> (migration 035).
@@ -919,6 +927,14 @@ func (s *pgxStore) MarkBillingRun(ctx context.Context, runID uuid.UUID, status B
 	})
 }
 
+func (s *pgxStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID uuid.UUID) (bool, error) {
+	rows, err := s.q.MarkBillingRunInvoicedIfUnfrozen(ctx, runID.String())
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error) {
 	// WHERE frozen_charge_cents IS NULL (in the query) makes this first-write-wins:
 	// a run that already froze (an earlier attempt, or a CONCURRENT daemon that got
@@ -1333,7 +1349,9 @@ func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUI
 	rows, err := s.q.LiveAppModuleCountsCreatedBefore(ctx, db.LiveAppModuleCountsCreatedBeforeParams{
 		AccountID:     accountID.String(),
 		CreatedBefore: createdBefore,
-		GraceDays:     int32(graceDays), //nolint:gosec // graceDays is the small GraceDays const (3)
+		// hours, not days (wave 2, D5): keeps the SQL cutoff identical to the Go
+		// legs' fixed 24h-per-day UTC grace regardless of the session timezone.
+		GraceHours: int32(graceDays) * 24, //nolint:gosec // graceDays is the small GraceDays const (3)
 	})
 	if err != nil {
 		return nil, err

@@ -133,13 +133,13 @@ FROM ms_billing.apps
 WHERE account_id = $1::uuid
   AND deleted_at IS NULL
   AND created_at < $2::timestamptz
-  AND created_at + make_interval(days => $3::int) < $2::timestamptz
+  AND created_at + make_interval(hours => $3::int) < $2::timestamptz
 `
 
 type LiveAppModuleCountsCreatedBeforeParams struct {
 	AccountID     string    `json:"account_id"`
 	CreatedBefore time.Time `json:"created_before"`
-	GraceDays     int32     `json:"grace_days"`
+	GraceHours    int32     `json:"grace_hours"`
 }
 
 type LiveAppModuleCountsCreatedBeforeRow struct {
@@ -172,9 +172,13 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 // Deleted apps are excluded (D1e); an account with no rows (pre-backfill)
 // sums to base 0 and keeps the pre-027 arrears-only invoice. app_id is
 // returned so the charge leg can write the per-app-period base snapshot
-// (migration 028) it bills.
+// (migration 028) it bills. The grace interval is expressed in HOURS, not
+// days (wave 2, D5): timestamptz + a day-interval is evaluated in the SESSION
+// timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
+// UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
+// by an hour around DST and double-bill or gap a whole period.
 func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg LiveAppModuleCountsCreatedBeforeParams) ([]LiveAppModuleCountsCreatedBeforeRow, error) {
-	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedBefore, arg.GraceDays)
+	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedBefore, arg.GraceHours)
 	if err != nil {
 		return nil, err
 	}

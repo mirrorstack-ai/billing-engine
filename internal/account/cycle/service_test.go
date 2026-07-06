@@ -390,6 +390,17 @@ func (f *fakeStore) MarkBillingRun(_ context.Context, runID uuid.UUID, status cy
 // First-write-wins, mirroring the SQL's WHERE frozen_charge_cents IS NULL: a
 // reclaim that already froze keeps the ORIGINAL values, so a retry can never
 // overwrite the amount a crashed attempt already put through Stripe.
+func (f *fakeStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID uuid.UUID) (bool, error) {
+	// Mirrors the SQL guard: the terminal zero-mark loses to a concurrent freeze.
+	if _, frozen := f.frozenCharges[runID]; frozen {
+		return false, nil
+	}
+	if err := f.MarkBillingRun(ctx, runID, cycle.RunStatusInvoiced, "", 0); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, charge cycle.FrozenBoundaryCharge) (cycle.FrozenBoundaryCharge, error) {
 	if f.errFreezeCharge != nil {
 		return cycle.FrozenBoundaryCharge{}, f.errFreezeCharge

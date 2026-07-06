@@ -138,14 +138,18 @@ WHERE app_id = $1
 -- Deleted apps are excluded (D1e); an account with no rows (pre-backfill)
 -- sums to base 0 and keeps the pre-027 arrears-only invoice. app_id is
 -- returned so the charge leg can write the per-app-period base snapshot
--- (migration 028) it bills.
+-- (migration 028) it bills. The grace interval is expressed in HOURS, not
+-- days (wave 2, D5): timestamptz + a day-interval is evaluated in the SESSION
+-- timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
+-- UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
+-- by an hour around DST and double-bill or gap a whole period.
 -- name: LiveAppModuleCountsCreatedBefore :many
 SELECT app_id, module_count
 FROM ms_billing.apps
 WHERE account_id = @account_id::uuid
   AND deleted_at IS NULL
   AND created_at < @created_before::timestamptz
-  AND created_at + make_interval(days => @grace_days::int) < @created_before::timestamptz;
+  AND created_at + make_interval(hours => @grace_hours::int) < @created_before::timestamptz;
 
 -- UpsertProrationBaseSnapshot records what RegisterApp's creation-proration
 -- leg billed one app for its creation period (migration 028). Keyed by the

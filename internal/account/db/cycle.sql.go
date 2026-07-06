@@ -421,6 +421,32 @@ func (q *Queries) MarkBillingRun(ctx context.Context, arg MarkBillingRunParams) 
 	return err
 }
 
+const markBillingRunInvoicedIfUnfrozen = `-- name: MarkBillingRunInvoicedIfUnfrozen :execrows
+UPDATE ms_billing.billing_runs
+SET status            = 'invoiced',
+    stripe_invoice_id = NULL,
+    total_amount      = 0
+WHERE id = $1
+  AND frozen_charge_cents IS NULL
+`
+
+// MarkBillingRunInvoicedIfUnfrozen is the ZERO-SKIP terminal mark (review
+// 2026-07-06 wave 2, D7): marking a run 'invoiced' with NO Stripe call is only
+// safe while no attempt has committed to a charge. Under the two-daemons model
+// (H6), a concurrent reclaim can freeze + charge between this process's
+// top-of-run frozen read and its zero-skip; an unguarded terminal mark would
+// bury that charge forever ('invoiced' blocks all future reclaims). The
+// frozen_charge_cents IS NULL guard makes the stale zero-skip LOSE: 0 rows →
+// the caller errors out, the run stays reclaimable, and the next reclaim
+// reconciles the frozen charge.
+func (q *Queries) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, markBillingRunInvoicedIfUnfrozen, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const periodChargedTotal = `-- name: PeriodChargedTotal :one
 SELECT COALESCE(SUM(ua.charged_micros), 0)::bigint AS total_micros
 FROM ms_billing.usage_aggregates ua

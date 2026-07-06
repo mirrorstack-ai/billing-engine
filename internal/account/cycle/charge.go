@@ -213,9 +213,18 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// charge (H8): a reclaimed run whose LIVE total collapsed to 0 (a module
 	// uninstalled, an app deleted since the crash) still owes the mirror + mark
 	// for the non-zero amount the crashed attempt already put through Stripe.
+	// The terminal zero-mark is GUARDED on the run still being unfrozen (wave 2,
+	// D7): our hasFrozen read is stale under the two-daemons model, and a
+	// concurrent reclaim may have frozen + charged since — an unguarded terminal
+	// 'invoiced' would bury that charge forever. Guard lost → error out; the run
+	// stays reclaimable and the next reclaim reconciles the frozen charge.
 	if !hasFrozen && boundaryTotal == 0 {
-		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
+		ok, err := s.store.MarkBillingRunInvoicedIfUnfrozen(ctx, runID)
+		if err != nil {
 			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
+		}
+		if !ok {
+			return nil, billing.Internal("zero-skip lost to a concurrent freeze — run left pending for the next reclaim to reconcile", nil)
 		}
 		summary.Status = RunStatusInvoiced
 		return summary, nil
@@ -375,8 +384,13 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		withBase = frozen.WithBase
 	} else {
 		if cents == 0 {
-			if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
+			// Same D7 guard as the zero-skip above — terminal only while unfrozen.
+			ok, err := s.store.MarkBillingRunInvoicedIfUnfrozen(ctx, runID)
+			if err != nil {
 				return nil, billing.Internal("mark billing run (zero cents) failed", err)
+			}
+			if !ok {
+				return nil, billing.Internal("zero-cents skip lost to a concurrent freeze — run left pending for the next reclaim to reconcile", nil)
 			}
 			summary.Status = RunStatusInvoiced
 			return summary, nil
@@ -521,8 +535,17 @@ func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID s
 			return billingstripe.Invoice{}, err
 		}
 		if ok {
+			if found.Status == "void" {
+				// A voided invoice means the charge was CANCELED (support action
+				// during an incident) — adopting it as 'charged' would silently
+				// forgive the arrears and terminally consume the run. Fail loudly
+				// into the auditable 'failed' path so ops decides.
+				return billingstripe.Invoice{}, fmt.Errorf(
+					"boundary recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (run %s needs ops resolution)",
+					found.ID, boundaryChargeRef(runID), runID)
+			}
 			if found.Status != "draft" {
-				return found, nil // already finalized — the money moved; just mirror it
+				return found, nil // finalized (paid/open/uncollectible) — the charge exists; mirror it
 			}
 			switch found.AmountDue {
 			case 0:

@@ -376,9 +376,17 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			if found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, appProrationChargeRef(locked.AppID)); err != nil {
 				return nil, billing.StripeError("proration recovery lookup failed", err)
 			} else if ok {
-				if found.Status == "draft" {
+				switch found.Status {
+				case "void":
+					// A voided invoice means the charge was CANCELED — adopting it
+					// would arm the one-shot guard over money that never moved.
+					// Fail loudly into the sweep's retried-error path for ops.
+					return nil, billing.Internal(fmt.Sprintf(
+						"proration recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (app %s needs ops resolution)",
+						found.ID, appProrationChargeRef(locked.AppID), locked.AppID), nil)
+				case "draft":
 					draft = found
-				} else {
+				default:
 					inv = found
 					recoveredFinal = true
 				}
