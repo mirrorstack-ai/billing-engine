@@ -324,18 +324,56 @@ func TestRunBillingCycle_FrozenRunNotSkippedByPrepaidOrPMGates(t *testing.T) {
 
 	// Between attempts: the account tightens to prepaid (possibly triggered by
 	// the crashed attempt's own open invoice) AND its default PM is removed.
+	// The crashed attempt's FINALIZED invoice exists on Stripe under the ref
+	// (that existence — not the frozen marker alone — is what justifies
+	// bypassing the gates, wave 2 D6).
 	store.collection.Mode = cycle.BillingModePrepaid
 	store.hasPM = false
 	store.errMarkRun = nil
+	sc.findByRef = &billingstripe.Invoice{ID: sc.invoiceID, Status: "paid", AmountDue: 100, AmountPaid: 100, Currency: "usd"}
 
 	// RETRY: pre-fix → skipped_prepaid (or skipped_no_pm), stranding the moved
-	// money unmirrored. Fixed: gates never apply over a frozen charge; the
-	// replay completes through the same keys.
+	// money unmirrored. Fixed: gates never apply over an EXISTING charge; the
+	// reconcile completes through the same objects.
 	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status,
-		"a frozen run finishes; it is never re-gated into a skip over moved money")
+		"a run whose charge exists on Stripe finishes; it is never re-gated into a skip over moved money")
 	require.Len(t, store.invoices, 1)
+}
+
+// Regression (wave 2, D6): the frozen marker is stamped BEFORE the first
+// Stripe call, so "frozen" alone does not mean money moved. A reclaim whose
+// prior attempt froze and then died BEFORE creating anything on Stripe is a
+// genuinely fresh charge — the collection gates must apply, not be bypassed.
+func TestRunBillingCycle_FrozenButNothingOnStripeIsReGated(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_d6"
+
+	sc := newFakeStripe()
+
+	// FIRST attempt: freezes, then the draft create fails — nothing on Stripe.
+	sc.errDraft = errors.New("stripe 5xx before any object existed")
+	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err)
+	require.Empty(t, sc.finalizeCalls, "no money moved")
+
+	// Overnight the account tightens to prepaid. findByRef stays nil (nothing
+	// under the ref).
+	store.collection.Mode = cycle.BillingModePrepaid
+	sc.errDraft = nil
+
+	// RECLAIM: pre-fix the frozen marker bypassed every gate and a FRESH
+	// draft+item+finalize fired against the prepaid account. Fixed: nothing on
+	// Stripe → re-gated → skipped_prepaid (non-terminal; the frozen amount
+	// survives for a post-relax reclaim).
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusSkippedPrepaid, resp.Status,
+		"frozen-but-nothing-on-Stripe is a fresh charge — the prepaid gate applies")
+	require.Empty(t, sc.finalizeCalls, "no off-session charge against a prepaid account")
 }
 
 // Regression (review 2026-07-06, H6): the freeze is first-write-wins AND the

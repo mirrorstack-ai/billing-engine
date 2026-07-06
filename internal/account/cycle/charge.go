@@ -110,6 +110,39 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("frozen boundary charge lookup failed", err)
 	}
 
+	// The freeze is stamped BEFORE the first Stripe call, so "frozen" alone does
+	// not mean money moved — a crash (or Stripe 4xx) between the freeze and
+	// CreateDraftInvoice leaves nothing on Stripe at all. Resolve which case
+	// this reclaim is NOW (wave 2, D6): an invoice found under the run's
+	// ms_charge_ref means a prior attempt reached Stripe and this run's only
+	// job is to finish it (gates bypassed, below); nothing found means the
+	// retry is a genuinely FRESH charge and every collection gate must apply —
+	// bypassing them let a prepaid-tightened / PM-removed account be charged
+	// fresh. (Search-lag safety: the Search API lags writes by ≲1min while idem
+	// keys live ~24h — a lag-missed invoice is re-found by idem-key replay, so
+	// a false "nothing" can never double-charge.) Skips taken on the re-gated
+	// path are non-terminal; the frozen amount survives for a later reclaim.
+	var recovered *billingstripe.Invoice
+	if hasFrozen {
+		custID, err := s.store.AccountStripeCustomer(ctx, accountID)
+		if err != nil {
+			return nil, billing.Internal("stripe customer lookup failed", err)
+		}
+		if custID != "" {
+			if found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, boundaryChargeRef(runID)); err != nil {
+				return nil, billing.StripeError("boundary recovery lookup failed", err)
+			} else if ok {
+				recovered = &found
+			}
+		}
+	}
+	// moneyMayHaveMoved is what actually justifies bypassing the gates: a
+	// FINALIZED invoice (or a void one — refused loudly downstream, D10). A
+	// recovered inert DRAFT moved no money yet, so finalizing it is still a
+	// fresh off-session debit and every gate applies; a gate skip leaves the
+	// draft inert and the run non-terminal for a later re-attempt.
+	moneyMayHaveMoved := recovered != nil && recovered.Status != "draft"
+
 	// RISK-GRADED COLLECTION GATE (PR #9, design §7-A / billing-tiers §3). Load
 	// the account's collection state up front. The off-session arrears leg may
 	// only ship behind this gate (the GA gate); the run row already exists, so a
@@ -126,7 +159,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// settle it is a DEFERRED follow-up. Never applied over a frozen charge (H8):
 	// a mode tightened AFTER the crashed attempt charged must not strand the
 	// moved money unmirrored.
-	if !hasFrozen && acct.Mode == BillingModePrepaid {
+	if !moneyMayHaveMoved && acct.Mode == BillingModePrepaid {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
 		}
@@ -240,7 +273,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// re-attempt, keeping one-invoice-per-boundary.) Independent of mode/credit-
 	// limit (a hard cap, not a trust judgment). Never applied over a frozen
 	// charge (H8) — the crashed attempt's money may already have moved.
-	if !hasFrozen && collection.ExceedsSpendCeiling(toCollectionAccount(acct), arrears) {
+	if !moneyMayHaveMoved && collection.ExceedsSpendCeiling(toCollectionAccount(acct), arrears) {
 		// skipped_ceiling, NOT skipped_prepaid: the ceiling is a per-cycle cap, not
 		// a mode transition — the account stays in arrears mode and the next cycle
 		// re-attempts once the ceiling is raised or the arrears net below it. The
@@ -268,7 +301,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// attempt's OWN open invoice must not strand that invoice unmirrored.
 	// TODO(#9-followup): wire a usage-spike anomaly signal + a
 	// sustained-clean-standing window.
-	if !hasFrozen {
+	if !moneyMayHaveMoved {
 		delinquent, err := s.store.HasUnpaidInvoice(ctx, accountID)
 		if err != nil {
 			return nil, billing.Internal("delinquency lookup failed", err)
@@ -299,21 +332,22 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		}
 	}
 
-	// PM gate. Fresh run: no usable default PM (or the usable-PM-implies-Customer
-	// anomaly) → skip (usage RETAINED), re-attempt next cycle. Frozen run (H8):
-	// the PM gate does NOT apply — the idem-key replay of already-created Stripe
-	// objects needs no fresh authorization, and a genuinely fresh finalize with
-	// the PM since removed fails loudly into the 'failed' (retryable, auditable)
-	// path below rather than being recorded as a skip over moved money. Only the
-	// Customer id is required.
+	// PM gate. Fresh run — including a frozen reclaim whose prior attempt never
+	// reached Stripe (D6) — no usable default PM (or the usable-PM-implies-
+	// Customer anomaly) → skip (usage RETAINED), re-attempt next cycle. Only
+	// when the prior attempt's invoice EXISTS on Stripe is the gate bypassed
+	// (H8): completing already-created Stripe objects needs no fresh
+	// authorization, and a finalize with the PM since removed fails loudly into
+	// the 'failed' (retryable, auditable) path below rather than being recorded
+	// as a skip over moved money. Only the Customer id is required there.
 	var custID string
-	if hasFrozen {
+	if moneyMayHaveMoved {
 		custID, err = s.store.AccountStripeCustomer(ctx, accountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
 		if custID == "" {
-			return nil, billing.Internal("billing run has a frozen charge but the account has no Stripe customer id", nil)
+			return nil, billing.Internal("billing run has a recovered Stripe invoice but the account has no Stripe customer id", nil)
 		}
 	} else {
 		var ok bool
@@ -407,11 +441,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// Charge — or, on a frozen reclaim, RECONCILE against Stripe first (H5): the
 	// frozen marker means a prior attempt reached its Stripe section, and past
 	// the ~24h idempotency-key window a bare "replay" would mint brand-new
-	// objects and double-charge. boundaryInvoice looks the run's invoice up by
-	// its ms_charge_ref anchor and finishes whatever it finds; only when Stripe
-	// has nothing does it charge fresh. A failure after the PM gate marks the
-	// run 'failed' (auditable) and returns the error.
-	inv, err := s.boundaryInvoice(ctx, runID, custID, cents, withBase, hasFrozen)
+	// objects and double-charge. boundaryInvoice finishes the invoice already
+	// FOUND under the run's ms_charge_ref (looked up once, next to the frozen
+	// read — D6); with nothing recovered it charges fresh (through the gates
+	// above). A failure after the PM gate marks the run 'failed' (auditable)
+	// and returns the error.
+	inv, err := s.boundaryInvoice(ctx, runID, custID, cents, withBase, recovered)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is
@@ -519,48 +554,40 @@ func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, ce
 	return s.stripe.FinalizeInvoice(ctx, draft.ID, invoiceFinalizeIdemKey(runID))
 }
 
-// boundaryInvoice resolves the boundary run's Stripe invoice. reconcile=true
-// (a frozen reclaim — a prior attempt reached its Stripe section) looks the
-// invoice up by the run's ms_charge_ref anchor first (H5 — idem keys are
-// pruned by Stripe after ~24h, so key replay alone cannot be trusted on a
-// late reclaim): a finalized invoice is returned as-is (money already moved);
-// an inert draft is completed — the deterministic line attached if it never
-// landed, then finalized; a mismatched draft is refused loudly. Only when
-// Stripe has nothing under the ref (the crashed attempt never created its
-// invoice) — or on a fresh run — does it charge through s.charge.
-func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase, reconcile bool) (billingstripe.Invoice, error) {
-	if reconcile {
-		found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, boundaryChargeRef(runID))
-		if err != nil {
-			return billingstripe.Invoice{}, err
+// boundaryInvoice resolves the boundary run's Stripe invoice. recovered (the
+// invoice RunBillingCycle already found under the run's ms_charge_ref anchor,
+// next to the frozen read — H5/D6) is finished: a finalized invoice is
+// returned as-is (money already moved); a VOID one is refused loudly (the
+// charge was canceled — adopting it would silently forgive the arrears and
+// terminally consume the run); an inert draft is completed — the
+// deterministic line attached if it never landed, then finalized; a
+// mismatched draft is refused loudly. recovered == nil (nothing on Stripe, or
+// a fresh run) charges through s.charge — that path re-entered every
+// collection gate in RunBillingCycle.
+func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool, recovered *billingstripe.Invoice) (billingstripe.Invoice, error) {
+	if recovered != nil {
+		found := *recovered
+		if found.Status == "void" {
+			return billingstripe.Invoice{}, fmt.Errorf(
+				"boundary recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (run %s needs ops resolution)",
+				found.ID, boundaryChargeRef(runID), runID)
 		}
-		if ok {
-			if found.Status == "void" {
-				// A voided invoice means the charge was CANCELED (support action
-				// during an incident) — adopting it as 'charged' would silently
-				// forgive the arrears and terminally consume the run. Fail loudly
-				// into the auditable 'failed' path so ops decides.
-				return billingstripe.Invoice{}, fmt.Errorf(
-					"boundary recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (run %s needs ops resolution)",
-					found.ID, boundaryChargeRef(runID), runID)
-			}
-			if found.Status != "draft" {
-				return found, nil // finalized (paid/open/uncollectible) — the charge exists; mirror it
-			}
-			switch found.AmountDue {
-			case 0:
-				if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), invoiceItemIdemKey(runID)); err != nil {
-					return billingstripe.Invoice{}, err
-				}
-			case cents:
-				// line already attached — nothing to add
-			default:
-				return billingstripe.Invoice{}, fmt.Errorf(
-					"boundary recovery: draft %s carries %d cents but the frozen amount is %d — refusing to finalize a mismatched draft (run %s)",
-					found.ID, found.AmountDue, cents, runID)
-			}
-			return s.stripe.FinalizeInvoice(ctx, found.ID, invoiceFinalizeIdemKey(runID))
+		if found.Status != "draft" {
+			return found, nil // finalized (paid/open/uncollectible) — the charge exists; mirror it
 		}
+		switch found.AmountDue {
+		case 0:
+			if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), invoiceItemIdemKey(runID)); err != nil {
+				return billingstripe.Invoice{}, err
+			}
+		case cents:
+			// line already attached — nothing to add
+		default:
+			return billingstripe.Invoice{}, fmt.Errorf(
+				"boundary recovery: draft %s carries %d cents but the frozen amount is %d — refusing to finalize a mismatched draft (run %s)",
+				found.ID, found.AmountDue, cents, runID)
+		}
+		return s.stripe.FinalizeInvoice(ctx, found.ID, invoiceFinalizeIdemKey(runID))
 	}
 	return s.charge(ctx, runID, custID, cents, withBase)
 }

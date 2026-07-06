@@ -483,6 +483,16 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 
 	inv := found
 	if found.Status == "draft" {
+		// An inert draft moved NO money — finalizing it is a fresh off-session
+		// debit, so the prepaid collection gate applies exactly as on a first
+		// attempt (wave 2, D6). Skip WITHOUT resolving; the draft stays inert
+		// and a relax back to arrears completes it through the same keys.
+		if permitted, err := s.offSessionChargePermitted(ctx, cand.AccountID); err != nil {
+			return false, err
+		} else if !permitted {
+			res.Status = ModuleOverageSkippedPrepaid
+			return true, nil
+		}
 		// The crashed attempt never finalized. Complete ITS draft — never mint a
 		// second one. The line either never landed (AmountDue 0 → attach it, with
 		// the deterministic amount the crashed attempt would have used) or already

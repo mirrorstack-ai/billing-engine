@@ -261,14 +261,18 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		return nil, billing.Internal("ChargeCreationProration requires a Stripe client", nil)
 	}
 
-	// Gates — FIRST attempt only (the proration analogue of the boundary's H8
-	// rule): once a prior attempt reached its Stripe section
-	// (proration_attempted_at set), money may already have moved, and this
-	// call's job is to RECONCILE — a prepaid tighten or a removed PM after the
-	// crash must not strand the charge unmirrored behind a transient skip. The
-	// attempted path resolves only the Customer id (an idem/recovery replay
-	// needs no fresh authorization).
+	// Gates + recovery resolution. Once a prior attempt reached its Stripe
+	// section (proration_attempted_at set), look its invoice up NOW by the
+	// ms_charge_ref anchor (once — the charge callback consumes the result):
+	// a FINALIZED invoice means money moved and this call's only job is to
+	// RECONCILE (gates bypassed — a prepaid tighten or removed PM after the
+	// crash must not strand the charge unmirrored); a VOID one is refused
+	// loudly (D10); an inert DRAFT or nothing at all moved NO money (wave 2,
+	// D6) — finalizing/minting is a fresh off-session debit and every gate
+	// applies, exactly as on a first attempt.
 	var custID string
+	var recoveredInv *billingstripe.Invoice
+	moneyMayHaveMoved := false
 	if app.ProrationAttempted {
 		custID, err = s.store.AccountStripeCustomer(ctx, app.AccountID)
 		if err != nil {
@@ -277,11 +281,23 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		if custID == "" {
 			return nil, billing.Internal("app has an attempted proration charge but the account has no Stripe customer id", nil)
 		}
-	} else {
+		if found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, appProrationChargeRef(appID)); err != nil {
+			return nil, billing.StripeError("proration recovery lookup failed", err)
+		} else if ok {
+			if found.Status == "void" {
+				return nil, billing.Internal(fmt.Sprintf(
+					"proration recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (app %s needs ops resolution)",
+					found.ID, appProrationChargeRef(appID), appID), nil)
+			}
+			recoveredInv = &found
+			moneyMayHaveMoved = found.Status != "draft"
+		}
+	}
+	if !moneyMayHaveMoved {
 		// COLLECTION-MODE gate (review 2026-07-06, H10): a prepaid account is
 		// never auto-charged off-session by ANY leg. Transient skip (guard
 		// unarmed), like no-PM — re-attempted once the account relaxes back to
-		// arrears.
+		// arrears. A recovered inert draft stays inert across the skip.
 		if permitted, err := s.offSessionChargePermitted(ctx, app.AccountID); err != nil {
 			return nil, err
 		} else if !permitted {
@@ -392,33 +408,22 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			expectedTotalCents += overageCents * int64(len(overTimers))
 		}
 
-		// CRASH RECOVERY (review 2026-07-06, H5): a set proration_attempted_at
-		// marker means a prior attempt reached its Stripe section — reconcile by
-		// the ms_charge_ref anchor before minting anything. Past Stripe's ~24h
-		// idempotency-key window a bare key replay would create a SECOND draft +
-		// items + charge. A finalized invoice found → the money moved; adopt it.
-		// An inert draft found → complete THAT draft below instead of creating one.
+		// CRASH RECOVERY (review 2026-07-06, H5): the outer gate section already
+		// looked the attempted charge up by its ms_charge_ref anchor (once —
+		// void refused there, gates re-applied when nothing/only-a-draft was
+		// found, D6). A finalized invoice → the money moved; adopt it. An inert
+		// draft → complete THAT draft below instead of creating one. Past
+		// Stripe's ~24h idempotency-key window a bare key replay would have
+		// created a SECOND draft + items + charge.
 		var inv billingstripe.Invoice
 		var draft billingstripe.Invoice
 		var recoveredFinal bool
-		if locked.ProrationAttempted {
-			if found, ok, err := s.stripe.FindInvoiceByRef(ctx, custID, appProrationChargeRef(locked.AppID)); err != nil {
-				return nil, billing.StripeError("proration recovery lookup failed", err)
-			} else if ok {
-				switch found.Status {
-				case "void":
-					// A voided invoice means the charge was CANCELED — adopting it
-					// would arm the one-shot guard over money that never moved.
-					// Fail loudly into the sweep's retried-error path for ops.
-					return nil, billing.Internal(fmt.Sprintf(
-						"proration recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (app %s needs ops resolution)",
-						found.ID, appProrationChargeRef(locked.AppID), locked.AppID), nil)
-				case "draft":
-					draft = found
-				default:
-					inv = found
-					recoveredFinal = true
-				}
+		if recoveredInv != nil {
+			if recoveredInv.Status == "draft" {
+				draft = *recoveredInv
+			} else {
+				inv = *recoveredInv
+				recoveredFinal = true
 			}
 		}
 
