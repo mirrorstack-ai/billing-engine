@@ -238,3 +238,58 @@ WHERE account_id = @account_id::uuid
   AND created_at < @period_end::timestamptz
   AND (deleted_at IS NULL OR deleted_at > @period_start::timestamptz)
 ORDER BY app_id;
+
+-- SettledNewCreationCharges is the SETTLED half of the ListNewCreationCharges read (the
+-- web-account bill's 本期新建立 / "new this period" section): every app CREATED
+-- in the resolved window whose creation-proration leg has already minted its
+-- one invoice (proration_invoice_id armed, migration 027), joined to that
+-- invoice in the ms_billing.invoices mirror so the row carries the ACTUAL
+-- settled total — which may include co-created over-module line items billed on
+-- the SAME combined invoice (proration.go scenario 3), NOT just a base
+-- snapshot. Membership is the app's created_at ∈ [@period_start, @period_end);
+-- the join is 1:1 (stripe_invoice_id is unique in the mirror). The
+-- amount_due > 0 AND status <> 'void' filters drop a $0 / voided invoice —
+-- a skipped_period_closed / no_charge proration never arms proration_invoice_id
+-- at all (the guard stays NULL), so it is excluded by the join gate here rather
+-- than needing a status predicate. amount_due is NUMERIC whole cents (Stripe
+-- minor units); the store converts it to int64 micros (×10_000). Ordered by the
+-- invoice created_at DESC (the display's "recorded at", newest-first), app_id
+-- breaking ties for a deterministic scan.
+-- name: SettledNewCreationCharges :many
+SELECT a.app_id,
+       i.id AS invoice_id,
+       i.number,
+       i.amount_due,
+       i.created_at AS recorded_at
+FROM ms_billing.apps a
+JOIN ms_billing.invoices i ON i.stripe_invoice_id = a.proration_invoice_id
+WHERE a.account_id = @account_id::uuid
+  AND a.created_at >= @period_start::timestamptz
+  AND a.created_at < @period_end::timestamptz
+  AND a.proration_invoice_id IS NOT NULL
+  AND i.status <> 'void'
+  AND i.amount_due > 0
+ORDER BY i.created_at DESC, a.app_id;
+
+-- PendingNewCreationCharges is the PENDING half of the ListNewCreationCharges read: apps
+-- CREATED in the resolved window that are STILL IN GRACE — not yet charged
+-- (proration_invoice_id IS NULL), still live (deleted_at IS NULL), not
+-- permanently skipped (proration_skipped_at IS NULL, migration 031), and whose
+-- creation grace has NOT yet elapsed (created_at > @grace_cutoff, the service's
+-- now − GraceDays, matching AppsPendingProration's cutoff from the other side).
+-- Only the CURRENT live window can hold in-grace apps (a past period's apps have
+-- all elapsed grace), so the service issues this query only for the current
+-- window. No money is derived here — the display shows the charge ETA
+-- (created_at + GraceDays), not an invented proration amount. Ordered by
+-- created_at (equivalently by the ETA) for a stable, soonest-first scan.
+-- name: PendingNewCreationCharges :many
+SELECT app_id, created_at
+FROM ms_billing.apps
+WHERE account_id = @account_id::uuid
+  AND created_at >= @period_start::timestamptz
+  AND created_at < @period_end::timestamptz
+  AND proration_invoice_id IS NULL
+  AND proration_skipped_at IS NULL
+  AND deleted_at IS NULL
+  AND created_at > @grace_cutoff::timestamptz
+ORDER BY created_at;

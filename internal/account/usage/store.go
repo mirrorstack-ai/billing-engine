@@ -217,6 +217,50 @@ type Store interface {
 	// source of truth) rather than SUM(apps.module_count), so the shown overage
 	// stays tied to the exact rows the charge legs tier on.
 	LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
+
+	// SettledNewCreationCharges reads the SETTLED half of ListNewCreationCharges: every
+	// app CREATED in [periodStart, periodEnd) whose creation-proration leg has
+	// already minted its one invoice (proration_invoice_id armed, migration
+	// 027), joined to that invoice in the ms_billing.invoices mirror. The
+	// AmountDueMicros is the invoice's ACTUAL settled total (converted from the
+	// mirror's NUMERIC whole cents ×10_000) — which may include co-created
+	// over-module line items on the SAME combined invoice (proration.go scenario
+	// 3), not just a base snapshot. $0 / voided invoices are excluded in SQL;
+	// skipped / no-charge prorations never armed the guard and drop out via the
+	// join. Ordered by the invoice created_at DESC (newest-first), app_id tie-break.
+	SettledNewCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]SettledNewCreationChargeRaw, error)
+
+	// PendingNewCreationCharges reads the PENDING half of ListNewCreationCharges: apps
+	// CREATED in [periodStart, periodEnd) that are STILL IN GRACE — uncharged
+	// (proration_invoice_id IS NULL), live (deleted_at IS NULL), not permanently
+	// skipped (proration_skipped_at IS NULL), and created_at > graceCutoff (the
+	// service's now − GraceDays, the mirror of AppsPendingProration's cutoff). No
+	// money is read — the display shows the charge ETA, not a proration amount.
+	// The service issues this ONLY for the current live window (a past period
+	// holds no still-in-grace apps). Ordered by created_at (equivalently ETA).
+	PendingNewCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd, graceCutoff time.Time) ([]PendingNewCreationChargeRaw, error)
+}
+
+// SettledNewCreationChargeRaw is one decoded SettledNewCreationCharges row: a settled
+// creation-proration charge for an app created in the window. InvoiceID is the
+// mirror row's UUID; Number is Stripe's customer-facing invoice number ("" when
+// the row was mirrored before finalization enriched it). AmountDueMicros is the
+// invoice total in int64 micro-USD (cents ×10_000, converted at the store
+// boundary). RecordedAt is the invoice's created_at (the display "recorded at").
+type SettledNewCreationChargeRaw struct {
+	AppID           uuid.UUID
+	InvoiceID       uuid.UUID
+	Number          string
+	AmountDueMicros int64
+	RecordedAt      time.Time
+}
+
+// PendingNewCreationChargeRaw is one decoded PendingNewCreationCharges row: an app still
+// in its creation grace, awaiting the proration sweep. CreatedAt anchors the
+// charge ETA (created_at + GraceDays) the service derives for display.
+type PendingNewCreationChargeRaw struct {
+	AppID     uuid.UUID
+	CreatedAt time.Time
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -620,6 +664,69 @@ func (s *pgxStore) MirroredAppIDs(ctx context.Context, accountID uuid.UUID, peri
 		return nil, err
 	}
 	return parseAppIDs(rows)
+}
+
+// SettledNewCreationCharges reads the settled creation-proration charges for apps
+// created in the window — see the Store interface doc. amount_due is the
+// mirror's NUMERIC whole cents; centsNumericToMicros does the ×10_000 cents →
+// micros conversion once, at this boundary (as ListInvoices does).
+func (s *pgxStore) SettledNewCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]SettledNewCreationChargeRaw, error) {
+	rows, err := s.q.SettledNewCreationCharges(ctx, db.SettledNewCreationChargesParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SettledNewCreationChargeRaw, 0, len(rows))
+	for _, r := range rows {
+		appID, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return nil, fmt.Errorf("decode app_id %q: %w", r.AppID, err)
+		}
+		invoiceID, err := uuid.Parse(r.InvoiceID)
+		if err != nil {
+			return nil, fmt.Errorf("decode invoice id for app %q: %w", r.AppID, err)
+		}
+		amount, err := centsNumericToMicros(r.AmountDue)
+		if err != nil {
+			return nil, fmt.Errorf("decode amount_due for app %q: %w", r.AppID, err)
+		}
+		out = append(out, SettledNewCreationChargeRaw{
+			AppID:     appID,
+			InvoiceID: invoiceID,
+			// pgtype.Text zero-values String to "" when NULL — the "not yet
+			// number-enriched" contract SettledNewCreationChargeRaw documents.
+			Number:          r.Number.String,
+			AmountDueMicros: amount,
+			RecordedAt:      r.RecordedAt,
+		})
+	}
+	return out, nil
+}
+
+// PendingNewCreationCharges reads the still-in-grace apps created in the window —
+// see the Store interface doc. Money-free (the display shows the ETA).
+func (s *pgxStore) PendingNewCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd, graceCutoff time.Time) ([]PendingNewCreationChargeRaw, error) {
+	rows, err := s.q.PendingNewCreationCharges(ctx, db.PendingNewCreationChargesParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		GraceCutoff: graceCutoff,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PendingNewCreationChargeRaw, 0, len(rows))
+	for _, r := range rows {
+		appID, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return nil, fmt.Errorf("decode app_id %q: %w", r.AppID, err)
+		}
+		out = append(out, PendingNewCreationChargeRaw{AppID: appID, CreatedAt: r.CreatedAt})
+	}
+	return out, nil
 }
 
 // LiveModuleTimerCountForAccount counts the account's currently-live install
