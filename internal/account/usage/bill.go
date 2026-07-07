@@ -336,6 +336,8 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 			BillableQuantity: r.BillableQuantity,
 			UnitPriceMicros:  r.UnitPriceMicros,
 			ChargedMicros:    r.ChargedMicros,
+			ActiveSeconds:    r.ActiveSeconds,
+			PeriodDays:       r.PeriodDays,
 		})
 		moduleUsageTotal += r.ChargedMicros
 	}

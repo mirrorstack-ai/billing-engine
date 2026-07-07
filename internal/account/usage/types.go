@@ -276,6 +276,17 @@ type AppMetricUsage struct {
 	// ChargedMicros is what the app owner pays for this line: declared
 	// unit_price × billable quantity, NO markup.
 	ChargedMicros int64 `json:"charged_micros"`
+	// ActiveSeconds / PeriodDays are the usage-time-pricing Phase 2 read-path
+	// surface of migration 044's reproducibility columns (usage_aggregates.
+	// active_seconds / period_days) — display only, no new pricing math. They
+	// back a future "used N / period_days days" caption per version line.
+	// Both nil (omitted from the wire) until this line has been rolled up
+	// AND the kind is a level kind (peak/time_weighted); an additive
+	// (count/sum) row or a not-yet-rolled-up live estimate also nils both —
+	// nil must never be coerced to 0, which would claim "zero active time"
+	// instead of "not known yet".
+	ActiveSeconds *float64 `json:"active_seconds,omitempty"`
+	PeriodDays    *float64 `json:"period_days,omitempty"`
 }
 
 // AppInfraUsage is one declared infra metric's app-level line. Present for
