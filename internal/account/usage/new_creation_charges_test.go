@@ -173,8 +173,9 @@ func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	c := resp.Charges[0]
 	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
 	require.Equal(t, "Draft App", c.Name)
-	require.Zero(t, c.BaseFeeMicros, "pending charges no base yet")
-	require.Zero(t, c.AddonMicros, "pending charges no add-ons yet")
+	require.EqualValues(t, usage.BaseFeeMicros, c.BaseFeeMicros, "pending projects its accruing base fee")
+	require.EqualValues(t, usage.BaseFeeMicros, c.AmountMicros, "amount == projected base for pending")
+	require.Zero(t, c.AddonMicros, "pending projects base only, not add-on overage")
 	require.Equal(t, 3, c.AddonModuleCount, "8 − IncludedModules(5) = 3, known even while uncharged")
 }
 
@@ -240,7 +241,7 @@ func TestListNewCreationCharges_CurrentWindowSettledAndPending(t *testing.T) {
 
 	require.Equal(t, appPending, resp.Charges[1].AppID)
 	require.Equal(t, usage.NewCreationChargeStatusPending, resp.Charges[1].Status)
-	require.Zero(t, resp.Charges[1].AmountMicros, "pending carries no amount (ETA only)")
+	require.EqualValues(t, usage.BaseFeeMicros, resp.Charges[1].AmountMicros, "pending projects its accruing base fee")
 	require.Nil(t, resp.Charges[1].RecordedAt)
 	require.Empty(t, resp.Charges[1].InvoiceID)
 	require.NotNil(t, resp.Charges[1].ChargeETA)

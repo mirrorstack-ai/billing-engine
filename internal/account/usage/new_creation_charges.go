@@ -41,7 +41,7 @@ const (
 	// row carries the invoice's real settled amount + number/id + recorded_at.
 	NewCreationChargeStatusSettled = "settled"
 	// NewCreationChargeStatusPending: the app is still in creation grace (uncharged);
-	// the row carries a charge_eta and amount_micros = 0.
+	// the row carries a charge_eta and its PROJECTED (accruing) base fee.
 	NewCreationChargeStatusPending = "pending"
 )
 
@@ -64,8 +64,9 @@ type ListNewCreationChargesRequest struct {
 // base is (or will be) charged via the creation-proration leg. For a SETTLED row
 // AmountMicros is the invoice's actual settled total, RecordedAt is the invoice
 // created_at, and InvoiceID is the invoice Number (else the mirror UUID); for a
-// PENDING row AmountMicros is 0 and ChargeETA is created_at + GraceDays (the
-// other three are absent). Money is integer micro-USD.
+// PENDING row AmountMicros/BaseFeeMicros is the PROJECTED base fee it will
+// accrue (the whole cycle bills at period close), ChargeETA is created_at +
+// GraceDays, and RecordedAt/InvoiceID are absent. Money is integer micro-USD.
 //
 // The per-component BREAKDOWN lets the UI render "App · <Name> · 基礎費用" and
 // "App · <Name> · <AddonModuleCount> 加購模組": Name is the app's display name
@@ -199,15 +200,15 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			charges = append(charges, NewCreationCharge{
 				AppID:  r.AppID,
 				Status: NewCreationChargeStatusPending,
-				// No amount: there is no side-effect-free proration-preview helper,
-				// and inventing a second money formula risks diverging from what
-				// actually charges — the UI shows the ETA, not a number. Both money
-				// components are 0 for the same reason; the add-on COUNT is still
-				// known from the frozen registration count.
-				AmountMicros:     0,
+				// PROJECTED base fee: the whole cycle bills at period close, so a
+				// still-in-grace app shows its accruing base fee (BaseFeeMicros),
+				// not 0 — it is an unpaid estimate, like every other line. Base
+				// only; the add-on overage is not projected here (its COUNT is
+				// still surfaced from the frozen registration count).
+				AmountMicros:     BaseFeeMicros,
 				ChargeETA:        &eta,
 				Name:             r.Name,
-				BaseFeeMicros:    0,
+				BaseFeeMicros:    BaseFeeMicros,
 				AddonModuleCount: addonModuleCount(r.CreatedModuleCount),
 				AddonMicros:      0,
 			})
