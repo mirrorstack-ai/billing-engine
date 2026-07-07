@@ -84,10 +84,25 @@ GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_v
 -- query only aggregates quantity + the window snapshot, it never prices.
 -- Peak's OLD (pre-this-PR) price convention had ZERO time-weighting (a flat
 -- MAX × price regardless of how long the level was held), so this factor is
--- a genuinely NEW proration, not a double-count: a single-version period has
--- window_v == P (Σ window_v == P by construction once ≥1 sample exists), so
--- the factor is 1 and the charge is byte-for-byte the pre-this-PR number —
--- the load-bearing no-regression invariant.
+-- a genuinely NEW proration, not a double-count: the LOAD-BEARING
+-- no-regression invariant is that a single-version period must have
+-- window_v == P (factor 1, byte-for-byte the pre-this-PR number).
+--
+-- That invariant does NOT hold from the raw per-row Δt alone: a real
+-- gauge samples on some periodic cadence, so the FIRST sample of a period is
+-- essentially never at EXACTLY period_start — without correction, window_v
+-- telescopes to only (period_end − first_sample), silently under-billing
+-- EVERY peak metric on EVERY period by the sampling-cadence gap, even with
+-- zero version changes. row_num's CASE WHEN row_num = 1 branch fixes this:
+-- the (period_start, first_sample) gap is credited to whichever
+-- module_version owns the stream's very first row, restoring Σ window_v ==
+-- P exactly (telescoping sum) and window_v == P in the single-version case
+-- regardless of sampling cadence. (The residual imprecision this shifts
+-- onto a genuinely brand-new mid-period install — crediting it a few extra
+-- hours/days it technically didn't run — is the SAME class of approximation
+-- Phase 4's "install upgraded_at → billing feed for exact window bounds" is
+-- explicitly scoped to tighten later; it is strictly preferable to a
+-- universal, permanent under-charge on the common case today.)
 --
 -- model stays in the GROUP BY (it prices infra.ai.* lines); module_version
 -- is ALSO now a pricing key via metric_version_prices (migration 044),
@@ -98,18 +113,31 @@ WITH raw_events AS (
         app_id, module_id, metric, kind,
         COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
-        value, recorded_at, event_id
+        value, recorded_at, event_id,
+        sqlc.arg(period_start)::timestamptz AS period_start
     FROM ms_billing.usage_events
     WHERE account_id = $1
-      AND recorded_at >= $2
-      AND recorded_at <  $3
+      AND recorded_at >= sqlc.arg(period_start)::timestamptz
+      AND recorded_at <  sqlc.arg(period_end)::timestamptz
       AND kind = 'peak'
 ),
 windowed AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version, value, recorded_at,
-        LEAD(recorded_at, 1, $3::timestamptz)
-            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end
+        app_id, module_id, metric, kind, model, module_version, value, recorded_at, period_start,
+        LEAD(recorded_at, 1, sqlc.arg(period_end)::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end,
+        -- row_num identifies the EARLIEST-observed row of the WHOLE (app,
+        -- module, metric, model) stream this period (rn=1 — the same
+        -- ORDER BY as the LEAD above, so ties resolve to the identical row).
+        -- Its own window gets extended BACKWARD to period_start below: with
+        -- no boundary-snapshot mechanism, [period_start, first_sample) has
+        -- no data, but it must NOT go unattributed the way it did before
+        -- this fix — a peak metric that has run continuously for months and
+        -- simply samples on some periodic cadence (not exactly on the
+        -- period boundary) would otherwise lose that gap from EVERY
+        -- version's window on EVERY period, silently shrinking window_v/P
+        -- below 1 even in the single-version, no-change common case.
+        ROW_NUMBER() OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS row_num
     FROM raw_events
 )
 SELECT
@@ -120,7 +148,10 @@ SELECT
     model,
     module_version,
     COALESCE(MAX(value), 0)::numeric AS billable_quantity,
-    COALESCE(SUM(EXTRACT(EPOCH FROM (segment_end - recorded_at))), 0)::numeric AS active_seconds
+    COALESCE(SUM(
+        EXTRACT(EPOCH FROM (segment_end - recorded_at))
+        + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (recorded_at - period_start)) ELSE 0 END
+    ), 0)::numeric AS active_seconds
 FROM windowed
 GROUP BY app_id, module_id, metric, kind, model, module_version;
 
