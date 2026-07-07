@@ -202,6 +202,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.SetMetricDefinitions(ctx, req)
 
+	case "SetMetricVersionPrices":
+		var req usage.SetMetricVersionPricesRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.SetMetricVersionPrices(ctx, req)
+
 	case "SetInfraPriceOverrides":
 		var req usage.SetInfraPriceOverridesRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -446,6 +453,13 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// credential + route group with the other account-billing reads.
 		r.Post("/v1/billing.ListNewCreationCharges", makeHTTPHandler(d, "ListNewCreationCharges"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
+		// Per-version immutable price snapshot (usage-time-pricing Phase 1,
+		// migration 044) — api-platform fires it at VERSION PUBLISH time
+		// (mirroring SetMetricDefinitions' manifest sync), so the rollup can
+		// resolve a version-stamped event's price VERSION-FIRST instead of the
+		// version-blind metric_definitions catalog row. Same control-plane
+		// credential + route group as SetMetricDefinitions.
+		r.Post("/v1/billing.SetMetricVersionPrices", makeHTTPHandler(d, "SetMetricVersionPrices"))
 		// Per-module infra price OVERRIDES (decision 19 §4.3) — the INVERSE of
 		// SetMetricDefinitions: it persists a module's ms.Meter("infra.X",
 		// ms.Price(n)) override for a RESERVED platform-infra metric (which

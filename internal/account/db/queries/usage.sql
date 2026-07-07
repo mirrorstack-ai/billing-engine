@@ -43,6 +43,25 @@ DO UPDATE SET
     unit_price_micros = EXCLUDED.unit_price_micros,
     active            = EXCLUDED.active;
 
+-- UpsertMetricVersionPrice writes ONE immutable per-(module, metric,
+-- module_version) price snapshot (migration 044, usage-time-pricing Phase 1
+-- — SetMetricVersionPrices, the control-plane RPC api-platform fires at
+-- version PUBLISH). UNLIKE UpsertMetricDefinition (which DOES UPDATE — the
+-- catalog is a live, mutable row), this is ON CONFLICT DO NOTHING: the table
+-- has NO update path at all, by design. A duplicate publish of the exact
+-- same (module_id, metric, module_version) is a no-op, never an overwrite —
+-- this is what makes a mid-period re-price of a LATER version never
+-- retroactively change an EARLIER version's already-billed price. :execrows
+-- so the caller can tell a fresh snapshot (1) from an already-published,
+-- unchanged one (0) — both are success, never an error.
+-- name: UpsertMetricVersionPrice :execrows
+INSERT INTO ms_billing.metric_version_prices (
+    module_id, metric, module_version, unit_price_micros
+) VALUES (
+    $1, $2, $3, $4
+)
+ON CONFLICT (module_id, metric, module_version) DO NOTHING;
+
 -- UpsertInfraPriceOverride writes ONE per-(module, metric) price OVERRIDE for a
 -- reserved platform-infra metric (decision 19 §4.3): the ms.Meter("infra.X",
 -- ms.Price(n)) override a module declared for a platform-MEASURED metric. It is

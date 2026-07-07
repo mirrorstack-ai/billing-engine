@@ -100,6 +100,19 @@ type MetricAggregate struct {
 	MarkupDen       int
 	RawCostMicros   int64
 	ChargedMicros   int64
+
+	// ActiveSeconds / PeriodDays (migration 044) are the window-proration
+	// reproducibility snapshot for a LEVEL metric (peak, time_weighted): the
+	// version's active window (window_v, seconds) and the whole rollup
+	// period length (P, days) at rollup time, so a closed invoice can
+	// re-derive the exact per-version window fraction without re-reading
+	// usage_events. nil for the additive kinds (count/sum — proration never
+	// applies to them) and for a LEVEL row with no window data (a unit-test
+	// fake bypassing the real rollup SQL). Pointers (not "" sentinels, unlike
+	// Model/ModuleVersion) because NULL and "genuinely zero" are distinct
+	// here — a zero-length window is real data, absence is not.
+	ActiveSeconds *string
+	PeriodDays    *string
 }
 
 // RollupSummary reports what a RollupPeriod call wrote: the period it targeted

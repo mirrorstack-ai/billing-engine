@@ -58,42 +58,88 @@ WHERE account_id = $1
   AND kind IN ('count', 'sum')
 GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '');
 
--- RollupPeakKind aggregates the peak kind by MAX(value) — the highest
--- absolute level observed in the window is the billable quantity. model and
--- module_version are grouped (COALESCE(…, '')) for parity with the other
--- rollups; peak AI / versioned metrics are not expected today but the
--- dimensions stay consistent.
+-- RollupPeakKind aggregates the peak kind PER VERSION (usage-time-pricing
+-- Phase 1, docs-temp/usage-time-pricing/design.md — supersedes the
+-- fix/peak-multiversion-overcharge (#58) exploration, which collapsed
+-- module_version out of this query entirely). For each (app, module, metric,
+-- model, module_version): billable_quantity is MAX(value) over THAT
+-- version's OWN events only (never the period-wide max), and active_seconds
+-- is the version's ACTIVE WINDOW (window_v) — the summed duration of the
+-- time-ordered segments it opened.
+--
+-- window_v is derived by LEAD-ing across the FULL (app, module, metric,
+-- model) stream WITH module_version deliberately OUT of the PARTITION BY —
+-- this is #58's one surviving insight: a successor version's first sample
+-- terminates its predecessor's segment at the TRUE handoff instant, so no
+-- window tail-bleeds past a version boundary. module_version is then back in
+-- the OUTER GROUP BY (the disposition that supersedes #58: peak no longer
+-- collapses it) so each version's MAX + window are attributed and priced
+-- independently.
+--
+-- UNIFIED LEVEL MODEL: every LEVEL metric (peak, time_weighted) bills
+-- charge_v = representative_level_v × (window_v / P) × price_v, P being the
+-- whole period length. For peak, representative_level_v is this query's
+-- billable_quantity (the version's own MAX) and window_v is active_seconds;
+-- cycle/money.go applies the window_v/P proration at pricing time — this
+-- query only aggregates quantity + the window snapshot, it never prices.
+-- Peak's OLD (pre-this-PR) price convention had ZERO time-weighting (a flat
+-- MAX × price regardless of how long the level was held), so this factor is
+-- a genuinely NEW proration, not a double-count: the LOAD-BEARING
+-- no-regression invariant is that a single-version period must have
+-- window_v == P (factor 1, byte-for-byte the pre-this-PR number).
+--
+-- That invariant does NOT hold from the raw per-row Δt alone: a real
+-- gauge samples on some periodic cadence, so the FIRST sample of a period is
+-- essentially never at EXACTLY period_start — without correction, window_v
+-- telescopes to only (period_end − first_sample), silently under-billing
+-- EVERY peak metric on EVERY period by the sampling-cadence gap, even with
+-- zero version changes. row_num's CASE WHEN row_num = 1 branch fixes this:
+-- the (period_start, first_sample) gap is credited to whichever
+-- module_version owns the stream's very first row, restoring Σ window_v ==
+-- P exactly (telescoping sum) and window_v == P in the single-version case
+-- regardless of sampling cadence. (The residual imprecision this shifts
+-- onto a genuinely brand-new mid-period install — crediting it a few extra
+-- hours/days it technically didn't run — is the SAME class of approximation
+-- Phase 4's "install upgraded_at → billing feed for exact window bounds" is
+-- explicitly scoped to tighten later; it is strictly preferable to a
+-- universal, permanent under-charge on the common case today.)
+--
+-- model stays in the GROUP BY (it prices infra.ai.* lines); module_version
+-- is ALSO now a pricing key via metric_version_prices (migration 044),
+-- version-first-resolved in Go (cycle.MetricPriceMicros).
 -- name: RollupPeakKind :many
-SELECT
-    app_id                         AS app_id,
-    module_id                      AS module_id,
-    metric                         AS metric,
-    kind                           AS kind,
-    COALESCE(model, '')            AS model,
-    COALESCE(module_version, '')   AS module_version,
-    COALESCE(MAX(value), 0)::numeric AS billable_quantity
-FROM ms_billing.usage_events
-WHERE account_id = $1
-  AND recorded_at >= $2
-  AND recorded_at <  $3
-  AND kind = 'peak'
-GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '');
-
--- RollupTimeWeightedKind integrates the step function under the ordered
--- samples: each sample's value is held until the NEXT sample (or until
--- period_end for the last sample). The segment duration is
--- LEAD(recorded_at, 1, period_end) - recorded_at; the integral is
--- Σ value × duration. EXTRACT(EPOCH ...) yields seconds; /3600 converts to
--- hours, so the inner expression is in byte-hours for a storage gauge (NOT
--- micro-dollars — the alias is segment_byte_hours to avoid confusion with the
--- micro-dollar money columns elsewhere in this schema). A period with no
--- samples produces no row (skipped) — its integral is undefined / 0 (design
--- §8). The window ORDER BY is (recorded_at, event_id): event_id is the TEXT PK,
--- so it breaks recorded_at ties deterministically and the LEAD assigns the
--- remaining duration to a stable last row regardless of plan or vacuum. The
--- PARTITION BY carries model + module_version so the step function is held
--- separately per (model, module_version), matching the other two rollups.
--- name: RollupTimeWeightedKind :many
+WITH raw_events AS (
+    SELECT
+        app_id, module_id, metric, kind,
+        COALESCE(model, '')          AS model,
+        COALESCE(module_version, '') AS module_version,
+        value, recorded_at, event_id,
+        sqlc.arg(period_start)::timestamptz AS period_start
+    FROM ms_billing.usage_events
+    WHERE account_id = $1
+      AND recorded_at >= sqlc.arg(period_start)::timestamptz
+      AND recorded_at <  sqlc.arg(period_end)::timestamptz
+      AND kind = 'peak'
+),
+windowed AS (
+    SELECT
+        app_id, module_id, metric, kind, model, module_version, value, recorded_at, period_start,
+        LEAD(recorded_at, 1, sqlc.arg(period_end)::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end,
+        -- row_num identifies the EARLIEST-observed row of the WHOLE (app,
+        -- module, metric, model) stream this period (rn=1 — the same
+        -- ORDER BY as the LEAD above, so ties resolve to the identical row).
+        -- Its own window gets extended BACKWARD to period_start below: with
+        -- no boundary-snapshot mechanism, [period_start, first_sample) has
+        -- no data, but it must NOT go unattributed the way it did before
+        -- this fix — a peak metric that has run continuously for months and
+        -- simply samples on some periodic cadence (not exactly on the
+        -- period boundary) would otherwise lose that gap from EVERY
+        -- version's window on EVERY period, silently shrinking window_v/P
+        -- below 1 even in the single-version, no-change common case.
+        ROW_NUMBER() OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS row_num
+    FROM raw_events
+)
 SELECT
     app_id,
     module_id,
@@ -101,26 +147,90 @@ SELECT
     kind,
     model,
     module_version,
-    COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity
-FROM (
+    COALESCE(MAX(value), 0)::numeric AS billable_quantity,
+    COALESCE(SUM(
+        EXTRACT(EPOCH FROM (segment_end - recorded_at))
+        + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (recorded_at - period_start)) ELSE 0 END
+    ), 0)::numeric AS active_seconds
+FROM windowed
+GROUP BY app_id, module_id, metric, kind, model, module_version;
+
+-- RollupTimeWeightedKind integrates the step function under the ordered
+-- samples PER VERSION (usage-time-pricing Phase 1 — supersedes #58's
+-- collapse of this query): each sample's value is held until the NEXT
+-- sample (or until period_end for the stream's last sample). The segment
+-- duration is LEAD(recorded_at, 1, period_end) - recorded_at; the integral
+-- is Σ value × duration. EXTRACT(EPOCH ...) yields seconds; /3600 converts
+-- to hours, so segment_byte_hours is in byte-hours for a storage gauge (NOT
+-- micro-dollars). A period with no samples produces no row (skipped) — its
+-- integral is undefined / 0 (design §8). The window ORDER BY is
+-- (recorded_at, event_id): event_id is the TEXT PK, so it breaks
+-- recorded_at ties deterministically and the LEAD assigns the remaining
+-- duration to a stable last row regardless of plan or vacuum.
+--
+-- module_version is OUT of the LEAD's PARTITION BY (#58's one surviving
+-- insight): the window walks the FULL time-ordered (app, module, metric,
+-- model) stream, so a successor version's first sample terminates its
+-- predecessor's LAST segment at the TRUE handoff instant — no tail bleeds
+-- past a version boundary (the double-charge #58 fixed). module_version is
+-- back in the OUTER GROUP BY (the disposition that supersedes #58:
+-- time_weighted no longer collapses it either), so billable_quantity here is
+-- I_v = Σ(value × duration) over THAT version's own segments only, and
+-- active_seconds is the same segments' summed duration (window_v) —
+-- reproducibility snapshot only, see below.
+--
+-- UNIT CONVENTION (design doc resolved decision #3 — do not "fix" this by
+-- copying peak's proration here): time_weighted's price is ALREADY
+-- per-unit-HOUR (e.g. storage.gib_hours — $/GiB-hour), so I_v is already the
+-- fully time-weighted billable quantity: charge_v = I_v × price_v, exactly
+-- as before this PR. It must NOT ALSO be scaled by (window_v / P) — that
+-- would double-normalize time for every per-hour-priced time_weighted
+-- metric (storage included), since the integral already bakes in precisely
+-- how long each version's level was held. (Contrast RollupPeakKind, whose
+-- price is a flat period-wide rate with ZERO built-in time-weighting, so ITS
+-- charge genuinely needs the explicit window_v/P factor.) active_seconds is
+-- carried through purely for the reproducibility snapshot / a future
+-- "used N of P days" display, never as a second charge multiplier. A
+-- single-version period trivially reproduces the pre-this-PR number (there
+-- is only one version's I_v to sum) — the load-bearing no-regression
+-- invariant.
+-- name: RollupTimeWeightedKind :many
+WITH raw_events AS (
     SELECT
-        app_id,
-        module_id,
-        metric,
-        kind,
-        COALESCE(model, '') AS model,
+        app_id, module_id, metric, kind,
+        COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
-        value * EXTRACT(EPOCH FROM (
-            LEAD(recorded_at, 1, $3::timestamptz)
-                OVER (PARTITION BY app_id, module_id, metric, COALESCE(model, ''), COALESCE(module_version, '') ORDER BY recorded_at, event_id)
-            - recorded_at
-        )) / 3600.0 AS segment_byte_hours
+        value, recorded_at, event_id
     FROM ms_billing.usage_events
     WHERE account_id = $1
       AND recorded_at >= $2
       AND recorded_at <  $3
       AND kind = 'time_weighted'
-) segments
+),
+windowed AS (
+    SELECT
+        app_id, module_id, metric, kind, model, module_version, value, recorded_at,
+        LEAD(recorded_at, 1, $3::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end
+    FROM raw_events
+),
+segments AS (
+    SELECT
+        app_id, module_id, metric, kind, model, module_version,
+        EXTRACT(EPOCH FROM (segment_end - recorded_at)) AS duration_seconds,
+        value * EXTRACT(EPOCH FROM (segment_end - recorded_at)) / 3600.0 AS segment_byte_hours
+    FROM windowed
+)
+SELECT
+    app_id,
+    module_id,
+    metric,
+    kind,
+    model,
+    module_version,
+    COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity,
+    COALESCE(SUM(duration_seconds), 0)::numeric   AS active_seconds
+FROM segments
 GROUP BY app_id, module_id, metric, kind, model, module_version;
 
 -- LookupMetricPrice returns the per-unit customer price for a (module, metric)
@@ -131,6 +241,28 @@ GROUP BY app_id, module_id, metric, kind, model, module_version;
 SELECT unit_price_micros
 FROM ms_billing.metric_definitions
 WHERE module_id = $1 AND metric = $2;
+
+-- LookupMetricVersionPrice returns the per-unit customer price SNAPSHOTTED
+-- for a (module, metric, module_version) at version-publish time (migration
+-- 044) — the VERSION-FIRST price resolution the rollup tries before falling
+-- back to LookupMetricPrice's version-blind catalog row. pgx.ErrNoRows means
+-- no snapshot exists for this version (a module_version='' event — pre
+-- version-stamping — or any version published with no SetMetricVersionPrices
+-- sync for whatever legacy reason); the Go caller (cycle.MetricPriceMicros)
+-- falls back to LookupMetricPrice on that error, exactly like a missing
+-- per-model row falls back to the catalog for AI metrics. This table is
+-- INSERT-ONLY (no UPDATE path — see migration 044), so a row returned here is
+-- the price this version was ALWAYS published at: a LATER version's re-price
+-- can never change what this query returns for an EARLIER version. This is
+-- the fix for the mid-period-reprice bug (design doc "usage-time-pricing")
+-- that catalog-only LookupMetricPrice cannot avoid — a catalog row is
+-- mutated in place by every SetMetricDefinitions sync, so resolving through
+-- it alone would retroactively re-bill already-accrued usage at whatever
+-- price the CURRENT publish happens to carry.
+-- name: LookupMetricVersionPrice :one
+SELECT unit_price_micros
+FROM ms_billing.metric_version_prices
+WHERE module_id = $1 AND metric = $2 AND module_version = $3;
 
 -- LookupModelPrice returns the RAW provider COGS for a (metric, model) pair from
 -- the per-model side-table (migration 018) — the AUTHORITATIVE price when a
@@ -159,15 +291,19 @@ WHERE metric = $1 AND model = $2;
 -- only — never priced). Both are part of the idempotency key so two models
 -- or two versions on one metric are distinct billable rows. Snapshots
 -- billable_quantity + unit_price + the markup multiplier + raw/charged so a
--- closed invoice is reproducible.
+-- closed invoice is reproducible. active_seconds/period_days (migration 044)
+-- are the window-proration reproducibility snapshot: NULL for additive kinds
+-- (count/sum — proration never applies), populated for peak/time_weighted so
+-- a closed invoice can re-derive the exact per-version window fraction
+-- without re-reading usage_events.
 -- name: UpsertUsageAggregate :exec
 INSERT INTO ms_billing.usage_aggregates (
     period_id, account_id, app_id, module_id, metric, model, module_version, kind,
     billable_quantity, unit_price_micros,
     customer_markup_num, customer_markup_den,
-    raw_cost_micros, charged_micros, rolled_up_at
+    raw_cost_micros, charged_micros, active_seconds, period_days, rolled_up_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now()
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now()
 )
 ON CONFLICT (period_id, app_id, module_id, metric, model, module_version)
 DO UPDATE SET
@@ -177,6 +313,8 @@ DO UPDATE SET
     customer_markup_den = EXCLUDED.customer_markup_den,
     raw_cost_micros     = EXCLUDED.raw_cost_micros,
     charged_micros      = EXCLUDED.charged_micros,
+    active_seconds      = EXCLUDED.active_seconds,
+    period_days         = EXCLUDED.period_days,
     rolled_up_at        = EXCLUDED.rolled_up_at;
 
 -- ModuleIncomeForPeriod sums charged_micros per module across the period's

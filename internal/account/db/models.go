@@ -496,6 +496,15 @@ type MsBillingMetricModelPrice struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
+type MsBillingMetricVersionPrice struct {
+	ID              string    `json:"id"`
+	ModuleID        string    `json:"module_id"`
+	Metric          string    `json:"metric"`
+	ModuleVersion   string    `json:"module_version"`
+	UnitPriceMicros int64     `json:"unit_price_micros"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
 type MsBillingModuleVisibility struct {
 	ModuleID   string                    `json:"module_id"`
 	Visibility MsBillingMarginShareClass `json:"visibility"`
@@ -550,6 +559,8 @@ type MsBillingUsageAggregate struct {
 	RolledUpAt        time.Time           `json:"rolled_up_at"`
 	Model             string              `json:"model"`
 	ModuleVersion     string              `json:"module_version"`
+	ActiveSeconds     pgtype.Numeric      `json:"active_seconds"`
+	PeriodDays        pgtype.Numeric      `json:"period_days"`
 }
 
 type MsBillingUsageEvent struct {

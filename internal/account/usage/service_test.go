@@ -22,10 +22,11 @@ func inf() float64 { return math.Inf(1) }
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
-	defs                   map[string]usage.MetricDefinition // key: module/metric
-	accounts               map[uuid.UUID]uuid.UUID           // owner userID → accountID
-	events                 map[string]usage.UsageEvent       // event_id → event (idempotency)
-	anchorDays             map[uuid.UUID]int                 // accountID → billing-period anchor day (0/absent → 1)
+	defs                   map[string]usage.MetricDefinition   // key: module/metric
+	versionPrices          map[string]usage.MetricVersionPrice // key: module/metric/version (migration 044)
+	accounts               map[uuid.UUID]uuid.UUID             // owner userID → accountID
+	events                 map[string]usage.UsageEvent         // event_id → event (idempotency)
+	anchorDays             map[uuid.UUID]int                   // accountID → billing-period anchor day (0/absent → 1)
 	periodRows             []usage.MetricUsageRaw
 	historyRows            []usage.PeriodMetricUsageRaw
 	versionRows            []usage.VersionUsageRaw
@@ -99,6 +100,7 @@ type fakeStore struct {
 	errPeriod             error
 	errVisibility         error
 	errUpsertDef          error
+	errUpsertVersionPrice error
 	errUpsertOverride     error
 	errHistory            error
 	errVersion            error
@@ -134,6 +136,7 @@ type periodWindow struct {
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		defs:                        map[string]usage.MetricDefinition{},
+		versionPrices:               map[string]usage.MetricVersionPrice{},
 		accounts:                    map[uuid.UUID]uuid.UUID{},
 		events:                      map[string]usage.UsageEvent{},
 		anchorDays:                  map[uuid.UUID]int{},
@@ -354,6 +357,26 @@ func (f *fakeStore) UpsertMetricDefinitions(_ context.Context, defs []usage.Metr
 			Priced:          def.Priced,
 			Active:          def.Active,
 		}
+	}
+	return nil
+}
+
+// versionPriceKey mirrors the metric_version_prices PRIMARY KEY
+// (module_id, metric, module_version).
+func versionPriceKey(moduleID uuid.UUID, metric, version string) string {
+	return moduleID.String() + "/" + metric + "/" + version
+}
+
+func (f *fakeStore) UpsertMetricVersionPrices(_ context.Context, prices []usage.MetricVersionPrice) error {
+	if f.errUpsertVersionPrice != nil {
+		return f.errUpsertVersionPrice // all-or-nothing: nothing is written on error
+	}
+	for _, p := range prices {
+		key := versionPriceKey(p.ModuleID, p.Metric, p.ModuleVersion)
+		if _, exists := f.versionPrices[key]; exists {
+			continue // ON CONFLICT DO NOTHING: immutable once written
+		}
+		f.versionPrices[key] = p
 	}
 	return nil
 }

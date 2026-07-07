@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -187,16 +188,27 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		return nil, billing.Internal("aggregate usage events failed", err)
 	}
 
+	// P (the unified level model's period-length denominator, usage-time-pricing
+	// Phase 1) is fixed ONCE per rollup call — every LEVEL row in this period
+	// prorates against the SAME whole-period length. Exact big.Rat (nanosecond
+	// time.Duration → seconds), never float. periodDays is the matching
+	// reproducibility snapshot rendered once, reused on every LEVEL aggregate.
+	periodSeconds := periodSecondsRat(periodStart, periodEnd)
+	periodDays := ratDecimalString(new(big.Rat).Quo(periodSeconds, big.NewRat(86400, 1)))
+
 	summary := &RollupSummary{
 		PeriodID:   periodID,
 		Aggregates: make([]MetricAggregate, 0, len(raws)),
 	}
 	for _, raw := range raws {
-		// Resolve the per-unit price by (module, metric, model): an infra.ai.*
-		// event carries a model → priced PER MODEL from metric_model_prices, with
-		// the catalog row as fallback; every other metric carries model="" →
-		// resolved straight from the catalog (migration 018).
-		priceMicros, priced, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric, raw.Model)
+		// Resolve the per-unit price by (module, metric, model, module_version):
+		// a version-stamped event resolves VERSION-FIRST from the immutable
+		// metric_version_prices snapshot (migration 044); an infra.ai.* event
+		// with no version snapshot carries a model → priced PER MODEL from
+		// metric_model_prices, with the catalog row as fallback; every other
+		// metric carries model="" → resolved straight from the catalog
+		// (migration 018).
+		priceMicros, priced, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric, raw.Model, raw.ModuleVersion)
 		if err != nil {
 			// A RETIRED per-model price (active=false) must fail the cycle loud,
 			// not silently fall back to the cheaper catalog floor and under-bill
@@ -226,15 +238,34 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			}
 		}
 
-		// raw_cost = quantity × unit_price (the un-marked-up cost, snapshotted
-		// for reproducibility); charged applies the markup in ONE rounding pass
-		// over the full product (NOT a second round on raw_cost) so a fractional
-		// quantity bills the single declared round (see chargedMicros).
-		rawCost, err := rawCostMicros(raw.BillableQuantity, priceMicros)
+		// pricedQuantity is the quantity ACTUALLY fed into raw_cost/charged: for
+		// peak it is the version's MAX window-prorated by (window_v / P) — a
+		// genuinely NEW factor, since peak's pre-this-PR price convention had
+		// ZERO time-weighting (see RollupPeakKind's query comment). Every other
+		// kind (time_weighted, count, sum) prices its raw billable_quantity
+		// UNCHANGED: time_weighted's byte-hours integral is already fully
+		// time-weighted (scaling it again would double-normalize — see
+		// RollupTimeWeightedKind's query comment), and the additive kinds were
+		// never prorated. The PERSISTED billable_quantity (below) always stays
+		// the raw, unscaled representative level — proration is pricing-only.
+		pricedQuantity := raw.BillableQuantity
+		if raw.Kind == usage.KindPeak {
+			pricedQuantity, err = prorateLevelQuantity(raw.BillableQuantity, raw.ActiveSeconds, periodSeconds)
+			if err != nil {
+				return nil, billing.Internal("compute window-prorated peak quantity failed", err)
+			}
+		}
+
+		// raw_cost = pricedQuantity × unit_price (the un-marked-up cost,
+		// snapshotted for reproducibility); charged applies the markup in ONE
+		// rounding pass over the full product (NOT a second round on raw_cost)
+		// so a fractional quantity bills the single declared round (see
+		// chargedMicros).
+		rawCost, err := rawCostMicros(pricedQuantity, priceMicros)
 		if err != nil {
 			return nil, billing.Internal("compute raw cost failed", err)
 		}
-		charged, err := chargedMicros(raw.BillableQuantity, priceMicros, num, den)
+		charged, err := chargedMicros(pricedQuantity, priceMicros, num, den)
 		if err != nil {
 			return nil, billing.Internal("compute charged cost failed", err)
 		}
@@ -252,6 +283,16 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			MarkupDen:        den,
 			RawCostMicros:    rawCost,
 			ChargedMicros:    charged,
+		}
+		// active_seconds/period_days (migration 044) are the window-proration
+		// reproducibility snapshot: populated only when the rollup actually
+		// produced window data for this row (peak/time_weighted via the real
+		// SQL) — NULL for the additive kinds and for any row a unit-test fake
+		// doesn't wire, matching prorateLevelQuantity's own "" → no-op contract.
+		if raw.ActiveSeconds != "" {
+			as, pd := raw.ActiveSeconds, periodDays
+			agg.ActiveSeconds = &as
+			agg.PeriodDays = &pd
 		}
 		if err := s.store.UpsertUsageAggregate(ctx, periodID, accountID, agg); err != nil {
 			return nil, billing.Internal("upsert usage aggregate failed", err)
