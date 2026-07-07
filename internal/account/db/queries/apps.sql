@@ -255,14 +255,28 @@ ORDER BY app_id;
 -- minor units); the store converts it to int64 micros (×10_000). Ordered by the
 -- invoice created_at DESC (the display's "recorded at", newest-first), app_id
 -- breaking ties for a deterministic scan.
+--
+-- The per-component BREAKDOWN columns let the UI split the row into
+-- "基礎費用" + "N 加購模組": a.name is the frozen display name (037);
+-- a.created_module_count is the count frozen at registration (030) the add-on
+-- tier is derived from; s.base_micros is the SETTLED creation base from the
+-- app's 'proration' base snapshot (028), LEFT-joined so a settled app missing
+-- its snapshot still returns (base NULL → the service treats it as 0 and the
+-- whole amount folds into add-ons). The snapshot join is 1:1: there is exactly
+-- one source='proration' row per app (its creation period).
 -- name: SettledNewCreationCharges :many
 SELECT a.app_id,
+       a.name,
+       a.created_module_count,
+       s.base_micros,
        i.id AS invoice_id,
        i.number,
        i.amount_due,
        i.created_at AS recorded_at
 FROM ms_billing.apps a
 JOIN ms_billing.invoices i ON i.stripe_invoice_id = a.proration_invoice_id
+LEFT JOIN ms_billing.app_base_snapshots s
+       ON s.app_id = a.app_id AND s.source = 'proration'
 WHERE a.account_id = @account_id::uuid
   AND a.created_at >= @period_start::timestamptz
   AND a.created_at < @period_end::timestamptz
@@ -282,8 +296,12 @@ ORDER BY i.created_at DESC, a.app_id;
 -- window. No money is derived here — the display shows the charge ETA
 -- (created_at + GraceDays), not an invented proration amount. Ordered by
 -- created_at (equivalently by the ETA) for a stable, soonest-first scan.
+--
+-- name + created_module_count are surfaced for the breakdown display (the
+-- add-on-module count is known at creation even though nothing is charged yet);
+-- there is no base snapshot for an in-grace app, so the service reports base 0.
 -- name: PendingNewCreationCharges :many
-SELECT app_id, created_at
+SELECT app_id, name, created_module_count, created_at
 FROM ms_billing.apps
 WHERE account_id = @account_id::uuid
   AND created_at >= @period_start::timestamptz

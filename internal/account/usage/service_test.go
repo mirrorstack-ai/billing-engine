@@ -47,6 +47,7 @@ type fakeStore struct {
 	newAppProrationInvoiceID map[uuid.UUID]string   // app_id → armed proration_invoice_id (settled guard)
 	newAppProrationSkipped   map[uuid.UUID]bool     // app_id → proration_skipped_at set (permanent skip)
 	newAppInvoices           map[string]fakeInvoice // stripe_invoice_id → the mirror row the settled join lands on
+	newAppProrationBase      map[uuid.UUID]int64    // app_id → 'proration' base snapshot base_micros (settled breakdown; absent → 0)
 	errSettledNewApp         error
 	errPendingNewApp         error
 	gotPendingGraceCutoff    time.Time // captured graceCutoff the service resolved (now − GraceDays)
@@ -145,6 +146,7 @@ func newFakeStore() *fakeStore {
 		newAppProrationInvoiceID:    map[uuid.UUID]string{},
 		newAppProrationSkipped:      map[uuid.UUID]bool{},
 		newAppInvoices:              map[string]fakeInvoice{},
+		newAppProrationBase:         map[uuid.UUID]int64{},
 	}
 }
 
@@ -219,6 +221,12 @@ func (f *fakeStore) SettledNewCreationCharges(_ context.Context, _ uuid.UUID, st
 			Number:          inv.number,
 			AmountDueMicros: inv.amountMicros,
 			RecordedAt:      inv.createdAt,
+			// The fake models created_module_count with the roster row's ModuleCount
+			// and the 'proration' base snapshot with newAppProrationBase (absent → 0,
+			// the LEFT-JOIN-miss contract).
+			Name:               m.Name,
+			CreatedModuleCount: m.ModuleCount,
+			BaseMicros:         f.newAppProrationBase[id],
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -256,7 +264,12 @@ func (f *fakeStore) PendingNewCreationCharges(_ context.Context, _ uuid.UUID, st
 		if !m.CreatedAt.After(graceCutoff) {
 			continue // grace already elapsed → not pending
 		}
-		out = append(out, usage.PendingNewCreationChargeRaw{AppID: id, CreatedAt: m.CreatedAt})
+		out = append(out, usage.PendingNewCreationChargeRaw{
+			AppID:              id,
+			CreatedAt:          m.CreatedAt,
+			Name:               m.Name,
+			CreatedModuleCount: m.ModuleCount,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
