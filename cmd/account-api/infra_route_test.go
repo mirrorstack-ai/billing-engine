@@ -89,6 +89,12 @@ func (stubUsageStore) MirroredAppIDs(context.Context, uuid.UUID, time.Time, time
 func (stubUsageStore) LiveModuleTimerCountForAccount(context.Context, uuid.UUID) (int, error) {
 	return 0, nil
 }
+func (stubUsageStore) SettledNewCreationCharges(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.SettledNewCreationChargeRaw, error) {
+	return nil, nil
+}
+func (stubUsageStore) PendingNewCreationCharges(context.Context, uuid.UUID, time.Time, time.Time, time.Time) ([]usage.PendingNewCreationChargeRaw, error) {
+	return nil, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()
