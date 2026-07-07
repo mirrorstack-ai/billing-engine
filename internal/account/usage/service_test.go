@@ -40,6 +40,17 @@ type fakeStore struct {
 	appMirrors             map[uuid.UUID]usage.AppMirrorInfo    // app_id → ms_billing.apps roster row (migration 027)
 	baseSnapshots          map[string]usage.AppBaseSnapshotInfo // app_id/period_start → charged-base snapshot (migration 028)
 
+	// ListNewCreationCharges fixtures (本期新建立). The Settled/Pending fakes
+	// RE-IMPLEMENT the SQL contract over appMirrors + these parallel maps (as the
+	// ListInvoices / MirroredAppIDs fakes re-implement their queries), so service
+	// tests exercise realistic join + filter behavior.
+	newAppProrationInvoiceID map[uuid.UUID]string   // app_id → armed proration_invoice_id (settled guard)
+	newAppProrationSkipped   map[uuid.UUID]bool     // app_id → proration_skipped_at set (permanent skip)
+	newAppInvoices           map[string]fakeInvoice // stripe_invoice_id → the mirror row the settled join lands on
+	errSettledNewApp         error
+	errPendingNewApp         error
+	gotPendingGraceCutoff    time.Time // captured graceCutoff the service resolved (now − GraceDays)
+
 	// per-module overage display (migration 033): LiveModuleTimerCountForAccount
 	// counts the account's live install timers — the sole input to
 	// GetAccountBill's steady-state account-overage estimate. The single-account
@@ -131,7 +142,20 @@ func newFakeStore() *fakeStore {
 		appBillRowsByApp:            map[uuid.UUID][]usage.AppMetricUsageRaw{},
 		appInfraBillRowsByApp:       map[uuid.UUID][]usage.AppInfraUsage{},
 		appModuleInfraBillRowsByApp: map[uuid.UUID][]usage.AppModuleInfraUsage{},
+		newAppProrationInvoiceID:    map[uuid.UUID]string{},
+		newAppProrationSkipped:      map[uuid.UUID]bool{},
+		newAppInvoices:              map[string]fakeInvoice{},
 	}
+}
+
+// fakeInvoice is the minimal ms_billing.invoices mirror row the SettledNewCreationCharges
+// join lands on: what the settled read projects (id/number/amount/created_at/status).
+type fakeInvoice struct {
+	id           uuid.UUID
+	number       string
+	status       string
+	amountMicros int64
+	createdAt    time.Time
 }
 
 // AppIDsWithUsage returns the configured usage-half roster (the fake does not
@@ -161,6 +185,80 @@ func (f *fakeStore) MirroredAppIDs(_ context.Context, _ uuid.UUID, start, end ti
 		}
 		out = append(out, id)
 	}
+	return out, nil
+}
+
+// SettledNewCreationCharges re-implements the SettledNewCreationCharges SQL contract in
+// Go over appMirrors + the proration/invoice fixtures: apps with created_at in
+// [start, end) whose proration guard is armed, joined to their invoice,
+// excluding voided / $0 invoices, ordered by the invoice created_at DESC (app_id
+// tie-break) — so service tests prove the assembly, not the fake's map order.
+func (f *fakeStore) SettledNewCreationCharges(_ context.Context, _ uuid.UUID, start, end time.Time) ([]usage.SettledNewCreationChargeRaw, error) {
+	if f.errSettledNewApp != nil {
+		return nil, f.errSettledNewApp
+	}
+	out := make([]usage.SettledNewCreationChargeRaw, 0)
+	for id, m := range f.appMirrors {
+		if m.CreatedAt.Before(start) || !m.CreatedAt.Before(end) {
+			continue // created_at ∉ [start, end)
+		}
+		sid := f.newAppProrationInvoiceID[id]
+		if sid == "" {
+			continue // guard NULL → not settled (skipped / no-charge / still pending)
+		}
+		inv, ok := f.newAppInvoices[sid]
+		if !ok {
+			continue // no mirror row → the join finds nothing
+		}
+		if inv.status == "void" || inv.amountMicros <= 0 {
+			continue // SQL drops voided / $0 invoices
+		}
+		out = append(out, usage.SettledNewCreationChargeRaw{
+			AppID:           id,
+			InvoiceID:       inv.id,
+			Number:          inv.number,
+			AmountDueMicros: inv.amountMicros,
+			RecordedAt:      inv.createdAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].RecordedAt.Equal(out[j].RecordedAt) {
+			return out[i].RecordedAt.After(out[j].RecordedAt)
+		}
+		return out[i].AppID.String() < out[j].AppID.String()
+	})
+	return out, nil
+}
+
+// PendingNewCreationCharges re-implements the PendingNewCreationCharges SQL contract: apps
+// created in [start, end) that are uncharged (guard NULL), not skipped, live,
+// and still in grace (created_at > graceCutoff), ordered by created_at. It
+// captures graceCutoff so a test can assert the service passed now − GraceDays.
+func (f *fakeStore) PendingNewCreationCharges(_ context.Context, _ uuid.UUID, start, end, graceCutoff time.Time) ([]usage.PendingNewCreationChargeRaw, error) {
+	f.gotPendingGraceCutoff = graceCutoff
+	if f.errPendingNewApp != nil {
+		return nil, f.errPendingNewApp
+	}
+	out := make([]usage.PendingNewCreationChargeRaw, 0)
+	for id, m := range f.appMirrors {
+		if m.CreatedAt.Before(start) || !m.CreatedAt.Before(end) {
+			continue // created_at ∉ [start, end)
+		}
+		if f.newAppProrationInvoiceID[id] != "" {
+			continue // guard armed → settled, not pending
+		}
+		if f.newAppProrationSkipped[id] {
+			continue // permanently skipped
+		}
+		if m.Deleted {
+			continue // soft-deleted → excluded
+		}
+		if !m.CreatedAt.After(graceCutoff) {
+			continue // grace already elapsed → not pending
+		}
+		out = append(out, usage.PendingNewCreationChargeRaw{AppID: id, CreatedAt: m.CreatedAt})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
 }
 
