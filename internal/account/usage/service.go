@@ -480,6 +480,51 @@ func (s *Service) SetMetricDefinitions(ctx context.Context, req SetMetricDefinit
 	return &SetMetricDefinitionsResponse{Synced: len(req.Metrics)}, nil
 }
 
+// SetMetricVersionPrices syncs a version's immutable per-metric price
+// snapshot(s) into metric_version_prices (usage-time-pricing Phase 1,
+// migration 044). It is a platform CONTROL-PLANE call: api-platform fires it
+// at version PUBLISH time (mirroring SetMetricDefinitions' manifest sync),
+// so the rollup can resolve a version-stamped event's price VERSION-FIRST
+// (cycle.MetricPriceMicros → LookupMetricVersionPrice) instead of the
+// version-blind metric_definitions catalog row — the fix for the
+// mid-period-reprice bug (docs-temp/usage-time-pricing/design.md): a LATER
+// version's re-price can never retroactively change an EARLIER version's
+// already-snapshotted price.
+//
+// Semantics: written ONCE per (module_id, metric, module_version). A
+// duplicate publish of the exact same version is a no-op (ON CONFLICT DO
+// NOTHING at the store layer), never an error and never an overwrite.
+func (s *Service) SetMetricVersionPrices(ctx context.Context, req SetMetricVersionPricesRequest) (*SetMetricVersionPricesResponse, error) {
+	if req.ModuleID == uuid.Nil {
+		return nil, billing.InvalidInput("module_id required")
+	}
+	// Validate every entry BEFORE touching the store, then upsert the whole
+	// set in one transaction (UpsertMetricVersionPrices is all-or-nothing) —
+	// mirrors SetMetricDefinitions' validate-then-upsert shape.
+	prices := make([]MetricVersionPrice, 0, len(req.Prices))
+	for _, p := range req.Prices {
+		if p.Metric == "" {
+			return nil, billing.InvalidInput("metric required")
+		}
+		if p.ModuleVersion == "" {
+			return nil, billing.InvalidInput("module_version required")
+		}
+		if p.UnitPriceMicros < 0 {
+			return nil, billing.InvalidInput("unit_price_micros must be non-negative")
+		}
+		prices = append(prices, MetricVersionPrice{
+			ModuleID:        req.ModuleID,
+			Metric:          p.Metric,
+			ModuleVersion:   p.ModuleVersion,
+			UnitPriceMicros: p.UnitPriceMicros,
+		})
+	}
+	if err := s.store.UpsertMetricVersionPrices(ctx, prices); err != nil {
+		return nil, billing.Internal("upsert metric version prices failed", err)
+	}
+	return &SetMetricVersionPricesResponse{Synced: len(req.Prices)}, nil
+}
+
 // SetInfraPriceOverrides writes a module's per-metric price OVERRIDES for the
 // reserved platform-infra metrics it re-priced via ms.Meter("infra.X",
 // ms.Price(n)) (decision 19 §4.3). It is the INVERSE of SetMetricDefinitions

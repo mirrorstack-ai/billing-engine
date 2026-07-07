@@ -1059,6 +1059,46 @@ func (q *Queries) UpsertMetricDefinition(ctx context.Context, arg UpsertMetricDe
 	return err
 }
 
+const upsertMetricVersionPrice = `-- name: UpsertMetricVersionPrice :execrows
+INSERT INTO ms_billing.metric_version_prices (
+    module_id, metric, module_version, unit_price_micros
+) VALUES (
+    $1, $2, $3, $4
+)
+ON CONFLICT (module_id, metric, module_version) DO NOTHING
+`
+
+type UpsertMetricVersionPriceParams struct {
+	ModuleID        string `json:"module_id"`
+	Metric          string `json:"metric"`
+	ModuleVersion   string `json:"module_version"`
+	UnitPriceMicros int64  `json:"unit_price_micros"`
+}
+
+// UpsertMetricVersionPrice writes ONE immutable per-(module, metric,
+// module_version) price snapshot (migration 044, usage-time-pricing Phase 1
+// — SetMetricVersionPrices, the control-plane RPC api-platform fires at
+// version PUBLISH). UNLIKE UpsertMetricDefinition (which DOES UPDATE — the
+// catalog is a live, mutable row), this is ON CONFLICT DO NOTHING: the table
+// has NO update path at all, by design. A duplicate publish of the exact
+// same (module_id, metric, module_version) is a no-op, never an overwrite —
+// this is what makes a mid-period re-price of a LATER version never
+// retroactively change an EARLIER version's already-billed price. :execrows
+// so the caller can tell a fresh snapshot (1) from an already-published,
+// unchanged one (0) — both are success, never an error.
+func (q *Queries) UpsertMetricVersionPrice(ctx context.Context, arg UpsertMetricVersionPriceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertMetricVersionPrice,
+		arg.ModuleID,
+		arg.Metric,
+		arg.ModuleVersion,
+		arg.UnitPriceMicros,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertModuleVisibility = `-- name: UpsertModuleVisibility :exec
 INSERT INTO ms_billing.module_visibility (module_id, visibility)
 VALUES ($1, $2)
