@@ -92,6 +92,9 @@ type fakeStore struct {
 	orgBacklog      map[uuid.UUID]int64
 	orgNullEvents   map[uuid.UUID]int64
 	repointCalls    []repointCall
+	// sponsoredOrgs seeds ListSponsoredOrgIDs (sponsor user → the funded,
+	// activated orgs they sponsor) — the /me sponsored-orgs read's roster.
+	sponsoredOrgs map[uuid.UUID][]uuid.UUID
 
 	// per-module install-timer state (migration 033). timers models
 	// ms_billing.app_module_overage_timers keyed by surrogate id; each row's
@@ -233,6 +236,7 @@ func newFakeStore() *fakeStore {
 		appOwnerOrg:             map[uuid.UUID]uuid.UUID{},
 		orgBacklog:              map[uuid.UUID]int64{},
 		orgNullEvents:           map[uuid.UUID]int64{},
+		sponsoredOrgs:           map[uuid.UUID][]uuid.UUID{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
 		// fields) flow through the gate to the charge path unchanged. Risk tests
@@ -634,6 +638,10 @@ func (f *fakeStore) OrgLiveAppIDs(_ context.Context, orgID uuid.UUID) ([]uuid.UU
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
 	return out, nil
+}
+
+func (f *fakeStore) ListSponsoredOrgIDs(_ context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	return f.sponsoredOrgs[userID], nil
 }
 
 func (f *fakeStore) ChargeFundingAccount(_ context.Context, accountID uuid.UUID) (uuid.UUID, error) {

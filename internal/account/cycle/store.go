@@ -269,6 +269,10 @@ type Store interface {
 	// reconciles each one's timers after account_id backfills.
 	OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error)
 
+	// ListSponsoredOrgIDs lists the orgs a user sponsors (funding='sponsor',
+	// activated account) — the roster behind the /me sponsored-orgs read.
+	ListSponsoredOrgIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
+
 	// ChargeFundingAccount maps an account to the account whose Stripe
 	// customer / default PM pays its invoices: itself, unless it is an org
 	// account whose designation names a sponsor (D1 funding hop). Resolved at
@@ -1885,6 +1889,14 @@ func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accou
 
 func (s *pgxStore) OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.q.OrgLiveAppIDs(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+func (s *pgxStore) ListSponsoredOrgIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := s.q.ListSponsoredOrgIDs(ctx, pgtype.UUID{Bytes: userID, Valid: true})
 	if err != nil {
 		return nil, err
 	}
