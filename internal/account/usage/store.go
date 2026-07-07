@@ -247,20 +247,33 @@ type Store interface {
 // the row was mirrored before finalization enriched it). AmountDueMicros is the
 // invoice total in int64 micro-USD (cents ×10_000, converted at the store
 // boundary). RecordedAt is the invoice's created_at (the display "recorded at").
+// Name is the app's frozen display name ("" when NULL). CreatedModuleCount is the
+// module count frozen at registration (the add-on tier's input). BaseMicros is the
+// settled creation base from the app's 'proration' base snapshot (0 when the app
+// has no snapshot — the LEFT JOIN found nothing); the service derives the add-on
+// component as AmountDueMicros − BaseMicros.
 type SettledNewCreationChargeRaw struct {
-	AppID           uuid.UUID
-	InvoiceID       uuid.UUID
-	Number          string
-	AmountDueMicros int64
-	RecordedAt      time.Time
+	AppID              uuid.UUID
+	InvoiceID          uuid.UUID
+	Number             string
+	AmountDueMicros    int64
+	RecordedAt         time.Time
+	Name               string
+	CreatedModuleCount int
+	BaseMicros         int64
 }
 
 // PendingNewCreationChargeRaw is one decoded PendingNewCreationCharges row: an app still
 // in its creation grace, awaiting the proration sweep. CreatedAt anchors the
-// charge ETA (created_at + GraceDays) the service derives for display.
+// charge ETA (created_at + GraceDays) the service derives for display. Name is the
+// app's frozen display name ("" when NULL); CreatedModuleCount is the frozen
+// registration count (the add-on tier's input — known even though the app is not
+// yet charged, so no base/add-on money is derived here).
 type PendingNewCreationChargeRaw struct {
-	AppID     uuid.UUID
-	CreatedAt time.Time
+	AppID              uuid.UUID
+	CreatedAt          time.Time
+	Name               string
+	CreatedModuleCount int
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -701,6 +714,12 @@ func (s *pgxStore) SettledNewCreationCharges(ctx context.Context, accountID uuid
 			Number:          r.Number.String,
 			AmountDueMicros: amount,
 			RecordedAt:      r.RecordedAt,
+			Name:            r.Name.String, // "" when NULL (pre-037 / unnamed)
+			// pgtype.Int8 zero-values Int64 to 0 when NULL — a settled app with no
+			// 'proration' snapshot (LEFT JOIN miss) folds its whole amount into
+			// add-ons, matching the "base 0" contract.
+			CreatedModuleCount: int(r.CreatedModuleCount),
+			BaseMicros:         r.BaseMicros.Int64,
 		})
 	}
 	return out, nil
@@ -724,7 +743,12 @@ func (s *pgxStore) PendingNewCreationCharges(ctx context.Context, accountID uuid
 		if err != nil {
 			return nil, fmt.Errorf("decode app_id %q: %w", r.AppID, err)
 		}
-		out = append(out, PendingNewCreationChargeRaw{AppID: appID, CreatedAt: r.CreatedAt})
+		out = append(out, PendingNewCreationChargeRaw{
+			AppID:              appID,
+			CreatedAt:          r.CreatedAt,
+			Name:               r.Name.String, // "" when NULL (pre-037 / unnamed)
+			CreatedModuleCount: int(r.CreatedModuleCount),
+		})
 	}
 	return out, nil
 }
