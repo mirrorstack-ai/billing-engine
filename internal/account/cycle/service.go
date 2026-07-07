@@ -22,6 +22,19 @@ type Service struct {
 	store  Store
 	stripe billingstripe.Client
 	nowFn  func() time.Time
+	// bill is the ONE audited account-bill pricing spine (usage.Service),
+	// injected via WithAccountBill. ListSponsoredOrgs reuses it to price each
+	// sponsored org's current-window total instead of growing a second rollup.
+	// nil until wired — only ListSponsoredOrgs depends on it (the charge/rollup
+	// legs never touch it), so rollup-only wiring leaves it nil.
+	bill AccountBillReader
+}
+
+// AccountBillReader is the account-bill read ListSponsoredOrgs reuses to price
+// a sponsored org's current-window total — satisfied by *usage.Service. Narrow
+// on purpose: only GetAccountBill's TotalMicros feeds the sponsored roster.
+type AccountBillReader interface {
+	GetAccountBill(ctx context.Context, req usage.GetAccountBillRequest) (*usage.GetAccountBillResponse, error)
 }
 
 // NewService wires a Service. store is required; passing nil panics at the
@@ -129,6 +142,15 @@ func (s *Service) recoveryCustomer(ctx context.Context, accountID uuid.UUID) (st
 // the usage.Service nowFn seam). Returns the Service for chaining.
 func (s *Service) WithNow(now func() time.Time) *Service {
 	s.nowFn = now
+	return s
+}
+
+// WithAccountBill injects the account-bill pricing spine ListSponsoredOrgs
+// reuses to compute each sponsored org's current-window total (the *usage.Service
+// wired in main). Optional dependency — mirrors WithBudgetEvaluator; only
+// ListSponsoredOrgs needs it. Returns the Service for chaining.
+func (s *Service) WithAccountBill(bill AccountBillReader) *Service {
+	s.bill = bill
 	return s
 }
 
