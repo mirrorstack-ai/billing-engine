@@ -1179,6 +1179,36 @@ func TestGetAppUsageSummary_ReturnsPerModuleVersionLines(t *testing.T) {
 	require.EqualValues(t, 600, resp.Metrics[1].ChargedMicros)
 }
 
+func TestGetAppUsageSummary_ForwardsActiveWindowFields(t *testing.T) {
+	// GetAppUsageSummary must carry ActiveSeconds/PeriodDays from the raw store
+	// row onto the wire AppMetricUsage verbatim (usage-time-pricing Phase 2,
+	// display-only read path) — nil stays nil, a populated value stays exact.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	rolledActiveSeconds := 1_296_000.0
+	rolledPeriodDays := 30.0
+	store.appRows = []usage.AppMetricUsageRaw{
+		{Metric: "storage.gib_hours", Kind: usage.KindTimeWeighted, ModuleVersion: "1.0.0",
+			ActiveSeconds: &rolledActiveSeconds, PeriodDays: &rolledPeriodDays},
+		{Metric: "orders.placed", Kind: usage.KindCount, ModuleVersion: "1.0.0"}, // live / additive: both nil
+	}
+
+	resp, err := newService(store).GetAppUsageSummary(context.Background(), usage.GetAppUsageSummaryRequest{OwnerUserID: owner, AppID: uuid.New()})
+	require.NoError(t, err)
+	require.Len(t, resp.Metrics, 2)
+
+	rolled := resp.Metrics[0]
+	require.NotNil(t, rolled.ActiveSeconds)
+	require.NotNil(t, rolled.PeriodDays)
+	require.EqualValues(t, 1_296_000.0, *rolled.ActiveSeconds)
+	require.EqualValues(t, 30.0, *rolled.PeriodDays)
+
+	notRolled := resp.Metrics[1]
+	require.Nil(t, notRolled.ActiveSeconds, "nil stays nil — never coerced to 0")
+	require.Nil(t, notRolled.PeriodDays, "nil stays nil — never coerced to 0")
+}
+
 func TestGetAppUsageSummary_ChargesDeclaredPriceNoMarkup(t *testing.T) {
 	// The app owner pays the module's declared unit_price per unit with NO
 	// customer markup by visibility — charged == unit_price × quantity, and the
