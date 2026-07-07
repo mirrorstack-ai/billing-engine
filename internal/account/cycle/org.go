@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
@@ -125,6 +126,34 @@ type RepointOrgUsageResponse struct {
 	Funded          bool      `json:"funded"`
 	AttachedApps    int64     `json:"attached_apps"`
 	RepointedEvents int64     `json:"repointed_events"`
+}
+
+// ListSponsoredOrgsRequest is the payload of the /me sponsored-orgs read (the
+// orgs SponsorUserID pays for). There is deliberately NO period selector: a
+// billing_periods id is scoped to a SINGLE account, so the caller's personal
+// period id has no meaning in a sponsored org's own period history — each org
+// is always priced for its OWN current window. (A historical cross-account
+// total would need date-range → per-org-period mapping, not an id; deferred.)
+//
+// AUTHZ CONTRACT: billing-engine trusts api-platform to have verified WHO the
+// session user is; this read re-verifies nothing and simply filters by
+// SponsorUserID — a user only ever sees the orgs their OWN account sponsors.
+type ListSponsoredOrgsRequest struct {
+	SponsorUserID uuid.UUID `json:"sponsor_user_id"`
+}
+
+// SponsoredOrg is one sponsored org's identity + current-window total. No
+// name / slug / theme — billing-engine structurally lacks them; api-platform
+// joins those from ms_organizations before serving the account endpoint.
+type SponsoredOrg struct {
+	OrgID       uuid.UUID `json:"org_id"`
+	TotalMicros int64     `json:"total_micros"`
+}
+
+// ListSponsoredOrgsResponse carries the sponsored roster (empty slice, never
+// nil, when the user sponsors nothing).
+type ListSponsoredOrgsResponse struct {
+	Orgs []SponsoredOrg `json:"orgs"`
 }
 
 // SetOrgDesignation writes the org's funding choice (design D1):
@@ -332,6 +361,39 @@ func (s *Service) RepointOrgUsage(ctx context.Context, req RepointOrgUsageReques
 		AttachedApps:    attached,
 		RepointedEvents: repointed,
 	}, nil
+}
+
+// ListSponsoredOrgs returns the orgs the user sponsors, each with its
+// current-window total. It resolves the sponsored
+// org_ids from the designation table, then prices EACH org through the SAME
+// audited account-bill spine the /me and /orgs bills read (GetAccountBill for
+// OwnerOrgID) — one pricing path, no second rollup. Empty (never nil) when the
+// user sponsors nothing. Identity (name/slug/theme) is joined downstream by
+// api-platform; billing-engine returns only org_id + total_micros.
+func (s *Service) ListSponsoredOrgs(ctx context.Context, req ListSponsoredOrgsRequest) (*ListSponsoredOrgsResponse, error) {
+	if req.SponsorUserID == uuid.Nil {
+		return nil, billing.InvalidInput("sponsor_user_id required")
+	}
+	if s.bill == nil {
+		return nil, billing.Internal("account-bill dependency not wired (WithAccountBill)", nil)
+	}
+
+	orgIDs, err := s.store.ListSponsoredOrgIDs(ctx, req.SponsorUserID)
+	if err != nil {
+		return nil, billing.Internal("sponsored org lookup failed", err)
+	}
+
+	orgs := make([]SponsoredOrg, 0, len(orgIDs))
+	for _, orgID := range orgIDs {
+		bill, err := s.bill.GetAccountBill(ctx, usage.GetAccountBillRequest{
+			OwnerOrgID: orgID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		orgs = append(orgs, SponsoredOrg{OrgID: orgID, TotalMicros: bill.TotalMicros})
+	}
+	return &ListSponsoredOrgsResponse{Orgs: orgs}, nil
 }
 
 // attachOrgBilling is the shared attach/backfill sweep body: backfill

@@ -151,3 +151,17 @@ FROM ms_billing.payment_methods_mirror pmm
 JOIN ms_billing.accounts a ON a.id = pmm.account_id
 WHERE a.owner_kind = 'org' AND a.owner_org_id = $1
   AND pmm.id = $2 AND pmm.deleted_at IS NULL;
+
+-- ListSponsoredOrgIDs lists the orgs a user sponsors (org-billing W1, the /me
+-- sponsored-orgs read). funding='sponsor' means the sponsor pair is the acting
+-- user's OWN account (migration 041), so filtering on sponsor_user_id yields
+-- exactly the orgs this user pays for. The activated_at gate mirrors
+-- ResolveOrgFundedAccount — an org whose account never activated is unbilled
+-- and carries no total, so it is excluded from the sponsored roster. Uses the
+-- funding='sponsor' partial index on sponsor_user_id (migration 043).
+-- name: ListSponsoredOrgIDs :many
+SELECT d.org_id
+FROM ms_billing.org_billing_designations d
+JOIN ms_billing.accounts a ON a.owner_kind = 'org' AND a.owner_org_id = d.org_id
+WHERE d.funding = 'sponsor' AND d.sponsor_user_id = $1 AND a.activated_at IS NOT NULL
+ORDER BY d.org_id;
