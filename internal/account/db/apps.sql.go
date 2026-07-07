@@ -309,7 +309,7 @@ func (q *Queries) MirroredAppIDsOverlappingWindow(ctx context.Context, arg Mirro
 }
 
 const pendingNewCreationCharges = `-- name: PendingNewCreationCharges :many
-SELECT app_id, created_at
+SELECT app_id, name, created_module_count, created_at
 FROM ms_billing.apps
 WHERE account_id = $1::uuid
   AND created_at >= $2::timestamptz
@@ -329,8 +329,10 @@ type PendingNewCreationChargesParams struct {
 }
 
 type PendingNewCreationChargesRow struct {
-	AppID     string    `json:"app_id"`
-	CreatedAt time.Time `json:"created_at"`
+	AppID              string      `json:"app_id"`
+	Name               pgtype.Text `json:"name"`
+	CreatedModuleCount int32       `json:"created_module_count"`
+	CreatedAt          time.Time   `json:"created_at"`
 }
 
 // PendingNewCreationCharges is the PENDING half of the ListNewCreationCharges read: apps
@@ -344,6 +346,10 @@ type PendingNewCreationChargesRow struct {
 // window. No money is derived here — the display shows the charge ETA
 // (created_at + GraceDays), not an invented proration amount. Ordered by
 // created_at (equivalently by the ETA) for a stable, soonest-first scan.
+//
+// name + created_module_count are surfaced for the breakdown display (the
+// add-on-module count is known at creation even though nothing is charged yet);
+// there is no base snapshot for an in-grace app, so the service reports base 0.
 func (q *Queries) PendingNewCreationCharges(ctx context.Context, arg PendingNewCreationChargesParams) ([]PendingNewCreationChargesRow, error) {
 	rows, err := q.db.Query(ctx, pendingNewCreationCharges,
 		arg.AccountID,
@@ -358,7 +364,12 @@ func (q *Queries) PendingNewCreationCharges(ctx context.Context, arg PendingNewC
 	items := []PendingNewCreationChargesRow{}
 	for rows.Next() {
 		var i PendingNewCreationChargesRow
-		if err := rows.Scan(&i.AppID, &i.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&i.AppID,
+			&i.Name,
+			&i.CreatedModuleCount,
+			&i.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -586,12 +597,17 @@ func (q *Queries) SetAppProrationSkipped(ctx context.Context, appID string) (int
 
 const settledNewCreationCharges = `-- name: SettledNewCreationCharges :many
 SELECT a.app_id,
+       a.name,
+       a.created_module_count,
+       s.base_micros,
        i.id AS invoice_id,
        i.number,
        i.amount_due,
        i.created_at AS recorded_at
 FROM ms_billing.apps a
 JOIN ms_billing.invoices i ON i.stripe_invoice_id = a.proration_invoice_id
+LEFT JOIN ms_billing.app_base_snapshots s
+       ON s.app_id = a.app_id AND s.source = 'proration'
 WHERE a.account_id = $1::uuid
   AND a.created_at >= $2::timestamptz
   AND a.created_at < $3::timestamptz
@@ -608,11 +624,14 @@ type SettledNewCreationChargesParams struct {
 }
 
 type SettledNewCreationChargesRow struct {
-	AppID      string         `json:"app_id"`
-	InvoiceID  string         `json:"invoice_id"`
-	Number     pgtype.Text    `json:"number"`
-	AmountDue  pgtype.Numeric `json:"amount_due"`
-	RecordedAt time.Time      `json:"recorded_at"`
+	AppID              string         `json:"app_id"`
+	Name               pgtype.Text    `json:"name"`
+	CreatedModuleCount int32          `json:"created_module_count"`
+	BaseMicros         pgtype.Int8    `json:"base_micros"`
+	InvoiceID          string         `json:"invoice_id"`
+	Number             pgtype.Text    `json:"number"`
+	AmountDue          pgtype.Numeric `json:"amount_due"`
+	RecordedAt         time.Time      `json:"recorded_at"`
 }
 
 // SettledNewCreationCharges is the SETTLED half of the ListNewCreationCharges read (the
@@ -631,6 +650,15 @@ type SettledNewCreationChargesRow struct {
 // minor units); the store converts it to int64 micros (×10_000). Ordered by the
 // invoice created_at DESC (the display's "recorded at", newest-first), app_id
 // breaking ties for a deterministic scan.
+//
+// The per-component BREAKDOWN columns let the UI split the row into
+// "基礎費用" + "N 加購模組": a.name is the frozen display name (037);
+// a.created_module_count is the count frozen at registration (030) the add-on
+// tier is derived from; s.base_micros is the SETTLED creation base from the
+// app's 'proration' base snapshot (028), LEFT-joined so a settled app missing
+// its snapshot still returns (base NULL → the service treats it as 0 and the
+// whole amount folds into add-ons). The snapshot join is 1:1: there is exactly
+// one source='proration' row per app (its creation period).
 func (q *Queries) SettledNewCreationCharges(ctx context.Context, arg SettledNewCreationChargesParams) ([]SettledNewCreationChargesRow, error) {
 	rows, err := q.db.Query(ctx, settledNewCreationCharges, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
 	if err != nil {
@@ -642,6 +670,9 @@ func (q *Queries) SettledNewCreationCharges(ctx context.Context, arg SettledNewC
 		var i SettledNewCreationChargesRow
 		if err := rows.Scan(
 			&i.AppID,
+			&i.Name,
+			&i.CreatedModuleCount,
+			&i.BaseMicros,
 			&i.InvoiceID,
 			&i.Number,
 			&i.AmountDue,

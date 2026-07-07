@@ -87,6 +87,97 @@ func TestListNewCreationCharges_SettledDerivation(t *testing.T) {
 	require.Nil(t, c.ChargeETA) // settled rows carry no ETA
 }
 
+// TestListNewCreationCharges_SettledBreakdown: a settled 7-module app splits its
+// invoice total into base (the 'proration' snapshot) + add-ons, surfaces the app
+// name, and reports addon_module_count = max(0, 7 − IncludedModules) = 2 — with
+// base + addon == amount (the contract invariant).
+func TestListNewCreationCharges_SettledBreakdown(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	created := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+	invAt := time.Date(2026, 5, 13, 0, 0, 0, 0, time.UTC)
+	app := uuid.New()
+	seedSettledApp(store, app, created, "in_brk", "INV-BRK", "paid", 22_000_000, invAt)
+	// 7 installed modules (2 over the bundled allowance) + a $16 base snapshot →
+	// the remaining $6 is the co-created over-module add-on component.
+	m := store.appMirrors[app]
+	m.Name = "Marketing Site"
+	m.ModuleCount = 7 // the fake maps this to created_module_count
+	store.appMirrors[app] = m
+	store.newAppProrationBase[app] = 16_000_000
+
+	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+	c := resp.Charges[0]
+	require.Equal(t, "Marketing Site", c.Name)
+	require.EqualValues(t, 22_000_000, c.AmountMicros)
+	require.EqualValues(t, 16_000_000, c.BaseFeeMicros)
+	require.EqualValues(t, 6_000_000, c.AddonMicros)
+	require.Equal(t, 2, c.AddonModuleCount, "7 − IncludedModules(5) = 2 add-on modules")
+	require.EqualValues(t, c.AmountMicros, c.BaseFeeMicros+c.AddonMicros, "base + addon == amount")
+}
+
+// TestListNewCreationCharges_SettledNoAddons: a <=5-module app has no add-on
+// modules — addon_module_count 0, addon_micros 0, and the base equals the whole
+// invoice total.
+func TestListNewCreationCharges_SettledNoAddons(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	created := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
+	app := uuid.New()
+	seedSettledApp(store, app, created, "in_noadd", "INV-NA", "paid", 12_000_000, created)
+	m := store.appMirrors[app]
+	m.Name = "Tiny App"
+	m.ModuleCount = 5 // exactly the allowance → no add-ons
+	store.appMirrors[app] = m
+	store.newAppProrationBase[app] = 12_000_000
+
+	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+	c := resp.Charges[0]
+	require.Equal(t, "Tiny App", c.Name)
+	require.Zero(t, c.AddonModuleCount)
+	require.Zero(t, c.AddonMicros)
+	require.EqualValues(t, 12_000_000, c.BaseFeeMicros)
+}
+
+// TestListNewCreationCharges_PendingBreakdown: a pending (in-grace) app reports
+// no money in either component (base 0, addon 0) but still surfaces its name and
+// the add-on-module count known from the frozen registration count.
+func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	now := time.Now().UTC()
+
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: now, Name: "Draft App", ModuleCount: 8}
+
+	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner, // current window
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+	c := resp.Charges[0]
+	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
+	require.Equal(t, "Draft App", c.Name)
+	require.Zero(t, c.BaseFeeMicros, "pending charges no base yet")
+	require.Zero(t, c.AddonMicros, "pending charges no add-ons yet")
+	require.Equal(t, 3, c.AddonModuleCount, "8 − IncludedModules(5) = 3, known even while uncharged")
+}
+
 // TestListNewCreationCharges_SettledInvoiceIDFallsBackToUUID: an invoice not yet
 // number-enriched (Number "") surfaces the mirror UUID as invoice_id.
 func TestListNewCreationCharges_SettledInvoiceIDFallsBackToUUID(t *testing.T) {
