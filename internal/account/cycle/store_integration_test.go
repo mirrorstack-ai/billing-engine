@@ -340,3 +340,85 @@ func TestTightenAndMarkRun_Integration(t *testing.T) {
 		`SELECT status FROM ms_billing.billing_runs WHERE id = $1`, runID.String()).Scan(&status))
 	require.Equal(t, "skipped_ceiling", status)
 }
+
+// TestRollupPeriod_Integration_PeakMaxAcrossVersions pins the peak
+// double-charge fix. A peak metric that spans two module_versions within one
+// period must bill the single period-wide MAX (5), never Σ(per-version MAX)
+// (5+2=7). RollupPeakKind opts peak OUT of the version split — MAX is not
+// additive over module_version — so it collapses to exactly one version-blank
+// aggregate row. (The additive kinds keep splitting per version; see
+// TestMigration023_Up_DistinctPerModuleVersion for the sum case.)
+func TestRollupPeriod_Integration_PeakMaxAcrossVersions(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	svc := cycle.NewService(cycle.NewStore(pool), nil)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	app, mod := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, mod, "queue.depth", usage.KindPeak, 1_000)
+
+	// Same metric, one period, two module_versions. The true period peak is 5.
+	// The larger value is emitted SECOND so qty==5 proves MAX, not first-seen.
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 2, "2026-06-01T00:00:00Z", "0.1.2")
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 5, "2026-06-02T00:00:00Z", "0.1.3")
+
+	resp, err := svc.RollupPeriod(ctx, acct, mustTime(t, pStart), mustTime(t, pEnd))
+	require.NoError(t, err)
+	require.Len(t, resp.Aggregates, 1, "peak collapses across module_versions into one billable row")
+
+	agg := resp.Aggregates[0]
+	require.Empty(t, agg.ModuleVersion, "the collapsed peak row is version-blank")
+	require.Equal(t, "5", agg.BillableQuantity, "bills the true period MAX (5), not Σ per-version MAX (5+2=7)")
+	require.EqualValues(t, 5_000, agg.ChargedMicros) // 5 × 1_000, no markup on a custom metric
+
+	// DB-level proof: exactly one snapshotted usage_aggregates row for this
+	// (app, module, metric) — the SQL GROUP BY collapse, not just the Go slice.
+	var count int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.usage_aggregates WHERE app_id=$1 AND module_id=$2 AND metric=$3`,
+		app.String(), mod.String(), "queue.depth").Scan(&count))
+	require.Equal(t, 1, count)
+	var qty string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT billable_quantity::text FROM ms_billing.usage_aggregates WHERE app_id=$1 AND module_id=$2 AND metric=$3`,
+		app.String(), mod.String(), "queue.depth").Scan(&qty))
+	require.Equal(t, "5", qty)
+}
+
+// TestRollupPeriod_Integration_TimeWeightedAcrossVersions pins the sibling of
+// the peak fix. A time_weighted (∫ value·dt) metric whose level persists
+// across a mid-period version upgrade must bill the true period integral, not
+// the LEAD-to-period_end tail counted once per version. A level of 100 held
+// for the whole 30-day period integrates to 100 × 720h = 72000 unit-hours
+// regardless of the v1→v2 handoff at day 15; the old per-version PARTITION
+// over-charged (100×720h + 100×360h = 108000). time_weighted, like peak, opts
+// out of the version split — so it collapses to one version-blank row.
+func TestRollupPeriod_Integration_TimeWeightedAcrossVersions(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	svc := cycle.NewService(cycle.NewStore(pool), nil)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	app, mod := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, mod, "db.rows_held", usage.KindTimeWeighted, 1_000)
+
+	// Level 100 held all period; the module upgrades v1.0.0 → v2.0.0 at day 15.
+	seedEventVersion(t, pool, acct, app, mod, "db.rows_held", usage.KindTimeWeighted, 100, "2026-06-01T00:00:00Z", "1.0.0")
+	seedEventVersion(t, pool, acct, app, mod, "db.rows_held", usage.KindTimeWeighted, 100, "2026-06-16T00:00:00Z", "2.0.0")
+
+	resp, err := svc.RollupPeriod(ctx, acct, mustTime(t, pStart), mustTime(t, pEnd))
+	require.NoError(t, err)
+	require.Len(t, resp.Aggregates, 1, "the integral collapses across module_versions into one billable row")
+
+	agg := resp.Aggregates[0]
+	require.Empty(t, agg.ModuleVersion, "the collapsed integral row is version-blank")
+	// 100 held for the whole 30-day period = 100 × 720h = 72000 unit-hours
+	// (NOT 108000 = 100×720h + 100×360h from billing each version's tail).
+	require.EqualValues(t, 72_000_000, agg.ChargedMicros) // 72000 unit-hours × 1_000µ$, no markup
+
+	var count int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.usage_aggregates WHERE app_id=$1 AND module_id=$2 AND metric=$3`,
+		app.String(), mod.String(), "db.rows_held").Scan(&count))
+	require.Equal(t, 1, count)
+}
