@@ -37,6 +37,18 @@ type Store interface {
 	// updates kind/unit/price/active in place.
 	UpsertMetricDefinitions(ctx context.Context, defs []MetricDeclaration) error
 
+	// UpsertMetricVersionPrices writes a version's immutable per-(module,
+	// metric, module_version) price snapshot(s) (usage-time-pricing Phase 1,
+	// migration 044) in a SINGLE transaction — all-or-nothing, mirroring
+	// UpsertMetricDefinitions. UNLIKE that method, this is NEVER an
+	// in-place update: each row is ON CONFLICT (module_id, metric,
+	// module_version) DO NOTHING, so a duplicate publish of the same version
+	// is a no-op — the snapshot, once written, is immutable for the life of
+	// that version. This is the fix for the mid-period-reprice bug: a LATER
+	// version's re-price can never retroactively change an EARLIER version's
+	// already-snapshotted price.
+	UpsertMetricVersionPrices(ctx context.Context, prices []MetricVersionPrice) error
+
 	// UpsertInfraPriceOverrides writes a module's per-metric price OVERRIDES
 	// for the reserved platform-infra metrics (decision 19 §4.3), keyed
 	// (module_id, metric) with the REAL module_id. Each row is PRICE-ONLY:
@@ -322,6 +334,17 @@ type MetricDeclaration struct {
 	Active          bool
 }
 
+// MetricVersionPrice is one immutable per-(module, metric, module_version)
+// price snapshot synced via UpsertMetricVersionPrices (usage-time-pricing
+// Phase 1, migration 044) — the Go form of a SetMetricVersionPrices payload
+// entry, keyed with the request's ModuleID.
+type MetricVersionPrice struct {
+	ModuleID        uuid.UUID
+	Metric          string
+	ModuleVersion   string
+	UnitPriceMicros int64
+}
+
 // Owner is a polymorphic owner principal. Exactly one of UserID / OrgID
 // is set; both Nil means a lazy (account-less) event.
 type Owner struct {
@@ -527,6 +550,40 @@ func (s *pgxStore) UpsertMetricDefinitions(ctx context.Context, defs []MetricDec
 			Unit:            def.Unit,
 			UnitPriceMicros: nullablePriceMicros(def.UnitPriceMicros, def.Priced),
 			Active:          def.Active,
+		}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// UpsertMetricVersionPrices upserts each immutable per-version price
+// snapshot in one transaction (all-or-nothing, mirroring
+// UpsertMetricDefinitions). UNLIKE that method's generated query (DO UPDATE
+// — the catalog is a live, mutable row), the generated
+// UpsertMetricVersionPrice is ON CONFLICT DO NOTHING: a duplicate publish of
+// the same (module_id, metric, module_version) affects 0 rows and is a
+// no-op, never an overwrite — this is the immutability the design requires,
+// enforced at the SQL layer, not just asserted in Go.
+func (s *pgxStore) UpsertMetricVersionPrices(ctx context.Context, prices []MetricVersionPrice) error {
+	if len(prices) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	// Rollback is a no-op after a successful Commit, so the deferred rollback
+	// safely covers every early-return error path without double-handling.
+	defer tx.Rollback(ctx)
+
+	qtx := s.q.WithTx(tx)
+	for _, p := range prices {
+		if _, err := qtx.UpsertMetricVersionPrice(ctx, db.UpsertMetricVersionPriceParams{
+			ModuleID:        p.ModuleID.String(),
+			Metric:          p.Metric,
+			ModuleVersion:   p.ModuleVersion,
+			UnitPriceMicros: p.UnitPriceMicros,
 		}); err != nil {
 			return err
 		}

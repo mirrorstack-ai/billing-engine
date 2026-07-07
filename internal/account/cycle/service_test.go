@@ -27,6 +27,11 @@ type fakeStore struct {
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
 	modelPrices map[string]int64 // metric/model → per-model price (migration 018); checked before prices when a model is carried
+	// versionPrices models the metric_version_prices immutable snapshot
+	// (migration 044): module/metric/version → price, checked BEFORE model
+	// and catalog when the row carries a module_version — mirrors the
+	// pgxStore's version-first resolution.
+	versionPrices map[string]int64
 	// inactiveModelPrices models metric_model_prices rows that EXIST but were
 	// retired (active=false). A model in this set returns ErrInactiveModelPrice
 	// (the rollup fails loud) rather than silently falling back to the catalog,
@@ -213,6 +218,7 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		prices:              map[string]int64{},
 		modelPrices:         map[string]int64{},
+		versionPrices:       map[string]int64{},
 		inactiveModelPrices: map[string]bool{},
 		visibility:          map[uuid.UUID]cycle.Visibility{},
 		periodID:            uuid.New(),
@@ -260,6 +266,12 @@ func priceKey(moduleID uuid.UUID, metric string) string { return moduleID.String
 // modelPriceKey mirrors the metric_model_prices PRIMARY KEY (metric, model).
 func modelPriceKey(metric, model string) string { return metric + "/" + model }
 
+// versionPriceKey mirrors the metric_version_prices PRIMARY KEY (module_id,
+// metric, module_version).
+func versionPriceKey(moduleID uuid.UUID, metric, version string) string {
+	return moduleID.String() + "/" + metric + "/" + version
+}
+
 func (f *fakeStore) OpenPeriodForAccount(_ context.Context, _ uuid.UUID, _, _ time.Time) (uuid.UUID, error) {
 	if f.errOpen != nil {
 		return uuid.Nil, f.errOpen
@@ -274,9 +286,17 @@ func (f *fakeStore) RawAggregates(_ context.Context, _ uuid.UUID, _, _ time.Time
 	return f.raws, nil
 }
 
-func (f *fakeStore) MetricPriceMicros(_ context.Context, moduleID uuid.UUID, metric, model string) (int64, bool, error) {
+func (f *fakeStore) MetricPriceMicros(_ context.Context, moduleID uuid.UUID, metric, model, moduleVersion string) (int64, bool, error) {
 	if f.errPrice != nil {
 		return 0, false, f.errPrice
+	}
+	// VERSION-FIRST (migration 044): an immutable version snapshot wins
+	// outright over both the per-model and catalog paths, mirroring the
+	// pgxStore's resolution order. A miss falls through unchanged.
+	if moduleVersion != "" {
+		if p, ok := f.versionPrices[versionPriceKey(moduleID, metric, moduleVersion)]; ok {
+			return p, true, nil
+		}
 	}
 	// Per-model price wins when the event carries a model (migration 018); a miss
 	// falls back to the (module, metric) catalog price, mirroring the pgxStore. A

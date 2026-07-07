@@ -45,15 +45,24 @@ type Store interface {
 	RawAggregates(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]RawAggregate, error)
 
 	// MetricPriceMicros returns the per-unit customer price snapshotted onto the
-	// aggregate. When model != "" it resolves the AUTHORITATIVE per-(metric,
-	// model) price from metric_model_prices (migration 018) first, falling back
-	// to the (module, metric) catalog row when no per-model price exists; model
-	// == "" resolves the catalog row directly. priced=false (NULL/absent price)
-	// → the metric is metered-but-unpriced and prices to 0. A per-model row that
-	// EXISTS but is RETIRED (active=false) returns ErrInactiveModelPrice instead
-	// of silently falling back to the cheaper catalog floor — the Service fails
-	// the cycle loud rather than under-bill a deliberately-retired model.
-	MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model string) (micros int64, priced bool, err error)
+	// aggregate. Resolution order (usage-time-pricing Phase 1, migration 044):
+	//  1. VERSION-FIRST: when moduleVersion != "", try the IMMUTABLE
+	//     per-(module, metric, module_version) snapshot (metric_version_prices).
+	//     A hit wins outright — this is what stops a later version's re-price
+	//     from retroactively re-billing an earlier version's already-accrued
+	//     usage (the snapshot, once written, can never be overwritten). A miss
+	//     (no snapshot for this version) falls through to step 2.
+	//  2. When model != "" it resolves the AUTHORITATIVE per-(metric, model)
+	//     price from metric_model_prices (migration 018), falling back to the
+	//     catalog row when no per-model price exists.
+	//  3. model == "" (and no version snapshot) resolves the (module, metric)
+	//     catalog row directly.
+	// priced=false (NULL/absent price) → the metric is metered-but-unpriced and
+	// prices to 0. A per-model row that EXISTS but is RETIRED (active=false)
+	// returns ErrInactiveModelPrice instead of silently falling back to the
+	// cheaper catalog floor — the Service fails the cycle loud rather than
+	// under-bill a deliberately-retired model.
+	MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model, moduleVersion string) (micros int64, priced bool, err error)
 
 	// UpsertUsageAggregate writes one snapshotted billable record idempotently
 	// on (period_id, app_id, module_id, metric). A re-run upserts the identical
@@ -627,8 +636,11 @@ type InvoiceMirror struct {
 // price source in MetricPriceMicros (per-model vs catalog). ModuleVersion is
 // the version-attribution dimension the rollup ALSO groups by (migration
 // 023): empty for a version-less event, the emitting module's version
-// otherwise. It never affects pricing — it is carried straight through onto
-// the aggregate for reporting only.
+// otherwise — and (usage-time-pricing Phase 1, migration 044) it is now ALSO
+// a PRICING key: MetricPriceMicros tries the version-first snapshot before
+// falling back to model/catalog. ActiveSeconds (migration 044) is the
+// version's active window (window_v, seconds) for peak/time_weighted rows
+// ONLY — "" for count/sum (proration never applies to additive kinds).
 type RawAggregate struct {
 	AppID            uuid.UUID
 	ModuleID         uuid.UUID
@@ -637,6 +649,7 @@ type RawAggregate struct {
 	Model            string
 	ModuleVersion    string
 	BillableQuantity string
+	ActiveSeconds    string
 }
 
 // ModuleIncome pairs a module with its period income (Σ charged_micros).
@@ -688,14 +701,19 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 		return nil, err
 	}
 	twRows, err := s.q.RollupTimeWeightedKind(ctx, db.RollupTimeWeightedKindParams{
-		AccountID: acct, RecordedAt: periodStart, Column3: periodEnd,
+		AccountID: acct, RecordedAt: periodStart, RecordedAt_2: periodEnd,
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	out := make([]RawAggregate, 0, len(sumRows)+len(peakRows)+len(twRows))
-	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, qty pgtype.Numeric) error {
+	// appendRow's activeSeconds param is pgtype.Numeric{} (Valid=false) for the
+	// additive kinds (count/sum never carry a window); RawAggregate.ActiveSeconds
+	// renders "" in that case (NOT "0" — numericString's NULL rendering — because
+	// "no window data" and "a genuinely zero-length window" must stay
+	// distinguishable downstream in cycle/money.go's proration).
+	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, qty, activeSeconds pgtype.Numeric) error {
 		app, err := uuid.Parse(appID)
 		if err != nil {
 			return err
@@ -703,6 +721,10 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 		mod, err := uuid.Parse(moduleID)
 		if err != nil {
 			return err
+		}
+		as := ""
+		if activeSeconds.Valid {
+			as = numericString(activeSeconds)
 		}
 		out = append(out, RawAggregate{
 			AppID:            app,
@@ -712,28 +734,54 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 			Model:            model,         // "" for non-AI rows (COALESCE(model, ''))
 			ModuleVersion:    moduleVersion, // "" for version-less rows (COALESCE(module_version, ''))
 			BillableQuantity: numericString(qty),
+			ActiveSeconds:    as,
 		})
 		return nil
 	}
 	for _, r := range sumRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, pgtype.Numeric{}); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range peakRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range twRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
 }
 
-func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model string) (int64, bool, error) {
+func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model, moduleVersion string) (int64, bool, error) {
+	// VERSION-FIRST (usage-time-pricing Phase 1, migration 044): an event
+	// stamped with a module_version resolves its price from the IMMUTABLE
+	// per-(module, metric, module_version) snapshot BEFORE anything else. A
+	// hit wins outright — this is the fix for the mid-period-reprice bug: the
+	// snapshot is written ONCE at version publish and never overwritten (ON
+	// CONFLICT DO NOTHING), so a later version's re-price can never
+	// retroactively change what an EARLIER version already resolved here. A
+	// MISSING snapshot (pgx.ErrNoRows — module_version="" pre-stamping, or a
+	// version published with no SetMetricVersionPrices sync) falls through to
+	// the existing model/catalog chain below, unchanged.
+	if moduleVersion != "" {
+		price, err := s.q.LookupMetricVersionPrice(ctx, db.LookupMetricVersionPriceParams{
+			ModuleID:      moduleID.String(),
+			Metric:        metric,
+			ModuleVersion: moduleVersion,
+		})
+		if err == nil {
+			return price, true, nil // NOT NULL column → a row means priced
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, err
+		}
+		// pgx.ErrNoRows → no version snapshot; fall through to model/catalog.
+	}
+
 	// PER-MODEL FIRST: an event that carries a model (the infra.ai.* family,
 	// migration 018) is priced from the AUTHORITATIVE (metric, model) side-table.
 	// A MISSING row (pgx.ErrNoRows) is NOT unpriced — it falls through to the
@@ -811,6 +859,14 @@ func (s *pgxStore) UpsertUsageAggregate(ctx context.Context, periodID, accountID
 	if err != nil {
 		return err
 	}
+	activeSeconds, err := nullableNumericFromString(agg.ActiveSeconds)
+	if err != nil {
+		return err
+	}
+	periodDays, err := nullableNumericFromString(agg.PeriodDays)
+	if err != nil {
+		return err
+	}
 	return s.q.UpsertUsageAggregate(ctx, db.UpsertUsageAggregateParams{
 		PeriodID:          periodID.String(),
 		AccountID:         accountID.String(),
@@ -826,6 +882,8 @@ func (s *pgxStore) UpsertUsageAggregate(ctx context.Context, periodID, accountID
 		CustomerMarkupDen: int32(agg.MarkupDen),
 		RawCostMicros:     agg.RawCostMicros,
 		ChargedMicros:     agg.ChargedMicros,
+		ActiveSeconds:     activeSeconds,
+		PeriodDays:        periodDays,
 	})
 }
 
