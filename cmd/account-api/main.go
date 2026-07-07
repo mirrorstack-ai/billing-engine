@@ -258,6 +258,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.RepointOrgUsage(ctx, req)
 
+	case "ListSponsoredOrgs":
+		var req cycle.ListSponsoredOrgsRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.ListSponsoredOrgs(ctx, req)
+
 	case "SetBudget":
 		var req budget.SetBudgetRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -364,7 +371,10 @@ func buildDispatcher() *dispatcher {
 	// Service because RegisterApp's creation-proration charge reuses the charge
 	// spine's Stripe invoice plumbing — same client, same micros→cents boundary,
 	// same invoice mirror (base-fee v1, D1c).
-	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient)
+	// ListSponsoredOrgs prices each sponsored org through the account-bill
+	// spine (usage.Service.GetAccountBill) — one audited pricing path, no
+	// second rollup — so the cycle Service borrows the usage Service here.
+	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient).WithAccountBill(usageSvc)
 
 	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc}
 }
@@ -445,6 +455,9 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.GetOrgDesignation", makeHTTPHandler(d, "GetOrgDesignation"))
 		r.Post("/v1/billing.RevokeSponsorship", makeHTTPHandler(d, "RevokeSponsorship"))
 		r.Post("/v1/billing.RepointOrgUsage", makeHTTPHandler(d, "RepointOrgUsage"))
+		// Sponsored-orgs read (org-billing W1): the /me sponsored-orgs list.
+		// A control-plane read — internal secret, NOT the meter seam.
+		r.Post("/v1/billing.ListSponsoredOrgs", makeHTTPHandler(d, "ListSponsoredOrgs"))
 		// Platform-infra ingest (Plane 1). RecordInfraUsage is the INVERSE of
 		// the SDK meter seam: it is called by platform-trusted producers
 		// (dispatch compute, cdn-worker egress — deferred PRs), accepts ONLY

@@ -15,6 +15,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
 
 // Fixed clock: 2026-07-06 12:00 UTC. A sponsor designation activates the org
@@ -334,4 +335,66 @@ func TestRepointOrgUsage_FundedRunsAttachSweep(t *testing.T) {
 	require.Zero(t, resp.AttachedApps)
 	require.Zero(t, resp.RepointedEvents)
 	require.Equal(t, 2, liveTimerCount(store, app))
+}
+
+// --- ListSponsoredOrgs -------------------------------------------------------
+
+// fakeBill is a stand-in for the account-bill pricing spine (usage.Service):
+// it records each GetAccountBill request and returns the seeded per-org total,
+// so the sponsored-orgs test asserts the ONE pricing path is reused (never a
+// second rollup) and that each org is priced for its OWN current window.
+type fakeBill struct {
+	totals map[uuid.UUID]int64 // org id → TotalMicros
+	reqs   []usage.GetAccountBillRequest
+}
+
+func (b *fakeBill) GetAccountBill(_ context.Context, req usage.GetAccountBillRequest) (*usage.GetAccountBillResponse, error) {
+	b.reqs = append(b.reqs, req)
+	return &usage.GetAccountBillResponse{TotalMicros: b.totals[req.OwnerOrgID]}, nil
+}
+
+func TestListSponsoredOrgs_PricesEachSponsoredOrgThroughTheBillSpine(t *testing.T) {
+	store := newFakeStore()
+	user := uuid.New()
+	org1, org2 := uuid.New(), uuid.New()
+	store.sponsoredOrgs[user] = []uuid.UUID{org1, org2}
+	bill := &fakeBill{totals: map[uuid.UUID]int64{org1: 3_000_000, org2: 7_500_000}}
+
+	svc := orgSvc(store).WithAccountBill(bill)
+	resp, err := svc.ListSponsoredOrgs(context.Background(), cycle.ListSponsoredOrgsRequest{
+		SponsorUserID: user,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []cycle.SponsoredOrg{
+		{OrgID: org1, TotalMicros: 3_000_000},
+		{OrgID: org2, TotalMicros: 7_500_000},
+	}, resp.Orgs)
+
+	// Each org priced through the ONE spine, scoped to the org owner and to that
+	// org's OWN current window (period id "" — never a user-owner, never the
+	// caller's account-scoped period id, never a second rollup).
+	require.Len(t, bill.reqs, 2)
+	for _, r := range bill.reqs {
+		require.Equal(t, uuid.Nil, r.OwnerUserID)
+		require.Equal(t, "", r.PeriodID)
+	}
+	require.Equal(t, org1, bill.reqs[0].OwnerOrgID)
+	require.Equal(t, org2, bill.reqs[1].OwnerOrgID)
+}
+
+func TestListSponsoredOrgs_EmptyWhenUserSponsorsNothing(t *testing.T) {
+	bill := &fakeBill{totals: map[uuid.UUID]int64{}}
+	resp, err := orgSvc(newFakeStore()).WithAccountBill(bill).
+		ListSponsoredOrgs(context.Background(), cycle.ListSponsoredOrgsRequest{SponsorUserID: uuid.New()})
+	require.NoError(t, err)
+	require.NotNil(t, resp.Orgs)
+	require.Empty(t, resp.Orgs)
+	require.Empty(t, bill.reqs) // no orgs → the spine is never touched
+}
+
+func TestListSponsoredOrgs_RequiresSponsorUser(t *testing.T) {
+	bill := &fakeBill{totals: map[uuid.UUID]int64{}}
+	_, err := orgSvc(newFakeStore()).WithAccountBill(bill).
+		ListSponsoredOrgs(context.Background(), cycle.ListSponsoredOrgsRequest{})
+	requireCode(t, err, billing.CodeInvalidInput)
 }

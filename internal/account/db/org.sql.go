@@ -151,6 +151,41 @@ func (q *Queries) InsertOrgAccount(ctx context.Context, ownerOrgID pgtype.UUID) 
 	return i, err
 }
 
+const listSponsoredOrgIDs = `-- name: ListSponsoredOrgIDs :many
+SELECT d.org_id
+FROM ms_billing.org_billing_designations d
+JOIN ms_billing.accounts a ON a.owner_kind = 'org' AND a.owner_org_id = d.org_id
+WHERE d.funding = 'sponsor' AND d.sponsor_user_id = $1 AND a.activated_at IS NOT NULL
+ORDER BY d.org_id
+`
+
+// ListSponsoredOrgIDs lists the orgs a user sponsors (org-billing W1, the /me
+// sponsored-orgs read). funding='sponsor' means the sponsor pair is the acting
+// user's OWN account (migration 041), so filtering on sponsor_user_id yields
+// exactly the orgs this user pays for. The activated_at gate mirrors
+// ResolveOrgFundedAccount — an org whose account never activated is unbilled
+// and carries no total, so it is excluded from the sponsored roster. Uses the
+// funding='sponsor' partial index on sponsor_user_id (migration 043).
+func (q *Queries) ListSponsoredOrgIDs(ctx context.Context, sponsorUserID pgtype.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listSponsoredOrgIDs, sponsorUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var org_id string
+		if err := rows.Scan(&org_id); err != nil {
+			return nil, err
+		}
+		items = append(items, org_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const orgLiveAppIDs = `-- name: OrgLiveAppIDs :many
 SELECT app_id
 FROM ms_billing.apps
