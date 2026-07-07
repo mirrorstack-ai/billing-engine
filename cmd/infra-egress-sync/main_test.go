@@ -79,6 +79,9 @@ func (f *fakeStore) LookupMetricDefinition(_ context.Context, _ uuid.UUID, _ str
 func (f *fakeStore) UpsertMetricDefinitions(_ context.Context, _ []usage.MetricDeclaration) error {
 	return nil
 }
+func (f *fakeStore) UpsertMetricVersionPrices(_ context.Context, _ []usage.MetricVersionPrice) error {
+	return nil
+}
 func (f *fakeStore) UpsertInfraPriceOverrides(_ context.Context, _ uuid.UUID, _ []usage.InfraPriceOverride) error {
 	return nil
 }

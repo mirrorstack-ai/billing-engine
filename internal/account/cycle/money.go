@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -51,6 +52,70 @@ func chargedMicros(quantity string, unitPriceMicros int64, num, den int) (int64,
 	product := new(big.Rat).Mul(qty, new(big.Rat).SetInt64(unitPriceMicros))
 	scaled := new(big.Rat).Mul(product, big.NewRat(int64(num), int64(den)))
 	return roundRatHalfUp(scaled)
+}
+
+// periodSecondsRat returns the EXACT rollup period length in seconds, as a
+// big.Rat (period_end − period_start, taken from Go's nanosecond-precision
+// time.Duration — never float). This is P in the unified level model
+// (charge_v = representative_level_v × (window_v / P) × price_v,
+// docs-temp/usage-time-pricing/design.md): the peak window-proration
+// denominator, and the basis for the period_days reproducibility snapshot.
+// Callers validate periodEnd.After(periodStart) before this is called
+// (RollupPeriod's InvalidInput guard), so the result is always positive.
+func periodSecondsRat(periodStart, periodEnd time.Time) *big.Rat {
+	return new(big.Rat).SetFrac(big.NewInt(periodEnd.Sub(periodStart).Nanoseconds()), big.NewInt(1_000_000_000))
+}
+
+// ratDecimalString renders a big.Rat as its exact (or precision-bounded)
+// decimal string, matching numericString's rendering rule (terminating
+// fractions render exactly; a non-terminating fraction is bounded to
+// ratStringPrec places — display-only, quantity/window values never carry
+// money through this path). Factored out of numericString so the
+// period_days snapshot (built straight from a big.Rat, not a pgtype.Numeric
+// read back from Postgres) can reuse the identical rendering.
+func ratDecimalString(r *big.Rat) string {
+	if r.IsInt() {
+		return r.Num().String()
+	}
+	return r.FloatString(ratStringPrec)
+}
+
+// prorateLevelQuantity scales a LEVEL metric's billable quantity (peak's
+// version-scoped MAX) by its active-window fraction (activeSeconds / P) —
+// the window_v/P factor in the unified level model. It is PRICING-ONLY: the
+// persisted usage_aggregates.billable_quantity keeps the raw, unscaled
+// representative level (design: "keep the SAME per-kind meaning as today").
+// The returned string is fed straight into rawCostMicros/chargedMicros,
+// which already parse via big.Rat.SetString — this deliberately returns the
+// exact "num/den" fraction form (big.Rat.RatString) rather than rounding to
+// a decimal, so no precision is lost before the single money-rounding pass.
+//
+// activeSeconds == "" means no window data is available for this row — a
+// unit-test fake bypassing the real rollup SQL (activeSeconds is a real,
+// SQL-computed dimension only the integration-tested pgxStore populates), or
+// (defensively) any row this isn't wired for — and is treated as the WHOLE
+// period (factor 1, i.e. no scaling), so a caller that never populates
+// window data sees byte-for-byte unchanged behavior. time_weighted never
+// calls this (see RollupTimeWeightedKind's query comment: its integral is
+// already fully time-weighted; scaling it again would double-normalize).
+func prorateLevelQuantity(quantity, activeSeconds string, periodSeconds *big.Rat) (string, error) {
+	if activeSeconds == "" {
+		return quantity, nil
+	}
+	qty, ok := new(big.Rat).SetString(quantity)
+	if !ok {
+		return "", fmt.Errorf("parse billable quantity %q", quantity)
+	}
+	active, ok := new(big.Rat).SetString(activeSeconds)
+	if !ok {
+		return "", fmt.Errorf("parse active seconds %q", activeSeconds)
+	}
+	if periodSeconds.Sign() <= 0 {
+		return "", fmt.Errorf("period seconds must be positive, got %s", periodSeconds.RatString())
+	}
+	scaled := new(big.Rat).Quo(active, periodSeconds)
+	scaled.Mul(scaled, qty)
+	return scaled.RatString(), nil
 }
 
 // takeMicros computes platform_take = round_half_up(num/den × base). base is
@@ -158,6 +223,24 @@ func numericFromString(s string) (pgtype.Numeric, error) {
 	var n pgtype.Numeric
 	if err := n.Scan(s); err != nil {
 		return pgtype.Numeric{}, fmt.Errorf("encode numeric from %q: %w", s, err)
+	}
+	return n, nil
+}
+
+// nullableNumericFromString builds the pgtype.Numeric for the NULLABLE
+// active_seconds / period_days columns (migration 044): nil → a NULL write
+// (Valid=false — the additive kinds never carry a window), a non-nil pointer
+// → the exact decimal string, same encoding as numericFromString. Unlike
+// numericFromString, an empty pointee is NOT special-cased to "0" — a
+// genuinely empty string here would be a caller bug, not an absent value
+// (absence is nil, not "").
+func nullableNumericFromString(s *string) (pgtype.Numeric, error) {
+	if s == nil {
+		return pgtype.Numeric{}, nil // Valid=false → NULL
+	}
+	var n pgtype.Numeric
+	if err := n.Scan(*s); err != nil {
+		return pgtype.Numeric{}, fmt.Errorf("encode nullable numeric from %q: %w", *s, err)
 	}
 	return n, nil
 }

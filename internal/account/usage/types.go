@@ -652,6 +652,37 @@ type SetMetricDefinitionsResponse struct {
 	Synced int `json:"synced"`
 }
 
+// MetricVersionPriceDef is one (metric, module_version) price snapshot in a
+// SetMetricVersionPrices payload (usage-time-pricing Phase 1, migration
+// 044) — the wire form of a version's price AT PUBLISH TIME. Written ONCE
+// per (module_id, metric, module_version): the service upserts with ON
+// CONFLICT DO NOTHING, so a duplicate publish of the exact same version is a
+// no-op, never an overwrite. This is what makes a mid-period re-price of a
+// LATER version never retroactively change an EARLIER version's
+// already-billed price — module_version publish is immutable-once-priced.
+type MetricVersionPriceDef struct {
+	Metric          string `json:"metric"`
+	ModuleVersion   string `json:"module_version"`
+	UnitPriceMicros int64  `json:"unit_price_micros"`
+}
+
+// SetMetricVersionPricesRequest is the payload of SetMetricVersionPrices, a
+// platform CONTROL-PLANE call (same gating as SetMetricDefinitions: the
+// internal secret, NOT the meter secret). api-platform fires it at version
+// PUBLISH time with the version's per-metric price(s), so the rollup can
+// resolve VERSION-FIRST (LookupMetricVersionPrice) before falling back to
+// the version-blind metric_definitions catalog.
+type SetMetricVersionPricesRequest struct {
+	ModuleID uuid.UUID               `json:"module_id"`
+	Prices   []MetricVersionPriceDef `json:"prices"`
+}
+
+// SetMetricVersionPricesResponse reports how many price snapshots were
+// synced (a no-op duplicate still counts — it is success, not an error).
+type SetMetricVersionPricesResponse struct {
+	Synced int `json:"synced"`
+}
+
 // InfraPriceOverride is one (metric, price) override in a
 // SetInfraPriceOverrides payload — the wire form of a module's
 // ms.Meter("infra.X", ms.Price(n)) manifest declaration for a RESERVED
