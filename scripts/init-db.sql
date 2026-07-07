@@ -60,3 +60,9 @@
 -- facts in ServiceBlockSignals, so it needs no stored column).
 \i migrations/billing/038_payment_method_fraud.up.sql
 \i migrations/billing/039_invoice_ever_failed.up.sql
+
+-- 041: org billing designations (per-org PSP/distributor routing).
+\i migrations/billing/041_org_billing_designations.up.sql
+
+-- 042: AI roster refresh — seed Claude Sonnet 5 COGS, retire Sonnet 4.6.
+\i migrations/billing/042_ai_model_prices_sonnet5.up.sql
