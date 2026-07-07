@@ -695,7 +695,7 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 		return nil, err
 	}
 	peakRows, err := s.q.RollupPeakKind(ctx, db.RollupPeakKindParams{
-		AccountID: acct, RecordedAt: periodStart, RecordedAt_2: periodEnd,
+		AccountID: acct, PeriodStart: periodStart, PeriodEnd: periodEnd,
 	})
 	if err != nil {
 		return nil, err

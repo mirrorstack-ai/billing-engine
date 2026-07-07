@@ -297,3 +297,101 @@ func TestUsageTimePricing_MidPeriodReprice_V1RateNeverRetroactivelyChanges(t *te
 	require.EqualValues(t, 500, v2.UnitPriceMicros, "v2 resolves its own new snapshot")
 	require.EqualValues(t, 1_500, v2.ChargedMicros, "3 × 500")
 }
+
+// TestUsageTimePricing_SingleVersionPeak_SamplingCadenceGapDoesNotShaveCharge
+// pins a real bug found in adversarial review of this PR: the "single-version
+// period ⇒ window_v/P = 1 ⇒ full peak, unchanged" invariant (design doc line
+// 85) does NOT hold from the raw per-row LEAD delta alone, because a real
+// gauge samples on some periodic cadence — its FIRST sample of a period is
+// essentially never at EXACTLY period_start. Without correction, window_v
+// telescopes to only (period_end − first_sample), silently under-billing
+// EVERY peak metric on EVERY period by the sampling-cadence gap, even with
+// ZERO version changes ever (the overwhelmingly common case). The other
+// tests in this file don't catch this because they seed their first sample
+// AT period_start exactly, which never happens with real telemetry.
+//
+// The fix: RollupPeakKind's windowed CTE credits the (period_start,
+// first_sample) gap to whichever module_version owns the stream's very
+// first row (ROW_NUMBER() = 1), restoring Σ window_v == P (and window_v ==
+// P in the single-version case) regardless of sampling cadence.
+func TestUsageTimePricing_SingleVersionPeak_SamplingCadenceGapDoesNotShaveCharge(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	svc := cycle.NewService(cycle.NewStore(pool), nil)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	app, mod := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, mod, "queue.depth", usage.KindPeak, 1_000) // $0.001/unit flat catalog price
+
+	// Only one version ever seen ("" — pre version-stamping, matching
+	// today's production reality where module_version is 100% NULL). First
+	// sample is ONE HOUR after period_start — an ordinary sampling-cadence
+	// gap for a module that has been running continuously for months, NOT a
+	// genuine leading install gap.
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 5, "2026-06-01T01:00:00Z", "")
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 3, "2026-06-15T00:00:00Z", "")
+
+	resp, err := svc.RollupPeriod(ctx, acct, mustTime(t, pStart), mustTime(t, pEnd))
+	require.NoError(t, err)
+
+	byVersion := aggByVersion(resp.Aggregates, "queue.depth")
+	require.Len(t, byVersion, 1)
+	v := byVersion[""]
+
+	require.NotNil(t, v.ActiveSeconds)
+	require.Equal(t, "2592000", *v.ActiveSeconds, "the sampling-cadence gap before the first sample must not shrink the sole version's window below the full period")
+
+	preThisPRCharge := int64(5) * 1_000 // MAX=5 × flat catalog price 1_000, no time-weighting
+	require.EqualValues(t, preThisPRCharge, v.ChargedMicros,
+		"a continuously-running single-version metric must bill the SAME as before this PR regardless of where its first sample of the period happens to land")
+}
+
+// TestUsageTimePricing_ThreeVersionPeak_WindowsStillSumToPeriod generalizes
+// the two-version peak test to THREE versions, guarding against an
+// off-by-one/pairwise-only implementation of the window segmentation:
+// window_v must still partition the period across an arbitrary number of
+// versions, each pricing off its OWN MAX at its OWN snapshot.
+func TestUsageTimePricing_ThreeVersionPeak_WindowsStillSumToPeriod(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	svc := cycle.NewService(cycle.NewStore(pool), nil)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	app, mod := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, mod, "queue.depth", usage.KindPeak, 999) // catalog fallback; version snapshots below win
+	seedVersionPrice(t, pool, mod, "queue.depth", "1.0.0", 10_000)  // $0.01/unit
+	seedVersionPrice(t, pool, mod, "queue.depth", "1.1.0", 20_000)  // $0.02/unit
+	seedVersionPrice(t, pool, mod, "queue.depth", "1.2.0", 30_000)  // $0.03/unit
+
+	// Three equal 10-day windows: v1 days 0-10, v2 days 10-20, v3 days 20-30.
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 4, "2026-06-01T00:00:00Z", "1.0.0")
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 2, "2026-06-05T00:00:00Z", "1.0.0")
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 9, "2026-06-11T00:00:00Z", "1.1.0")
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 3, "2026-06-15T00:00:00Z", "1.1.0")
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 6, "2026-06-21T00:00:00Z", "1.2.0")
+	seedEventVersion(t, pool, acct, app, mod, "queue.depth", usage.KindPeak, 1, "2026-06-25T00:00:00Z", "1.2.0")
+
+	resp, err := svc.RollupPeriod(ctx, acct, mustTime(t, pStart), mustTime(t, pEnd))
+	require.NoError(t, err)
+
+	byVersion := aggByVersion(resp.Aggregates, "queue.depth")
+	require.Len(t, byVersion, 3, "three distinct version rows expected")
+
+	v1, v2, v3 := byVersion["1.0.0"], byVersion["1.1.0"], byVersion["1.2.0"]
+	require.Equal(t, "4", v1.BillableQuantity, "v1's OWN MAX")
+	require.Equal(t, "9", v2.BillableQuantity, "v2's OWN MAX")
+	require.Equal(t, "6", v3.BillableQuantity, "v3's OWN MAX")
+
+	require.Equal(t, "864000", *v1.ActiveSeconds, "10 days each")
+	require.Equal(t, "864000", *v2.ActiveSeconds)
+	require.Equal(t, "864000", *v3.ActiveSeconds)
+
+	// charge_v = MAX_v × (window_v/P) × price_v, window_v/P = 1/3 each:
+	//   v1: 4 × (1/3) × 10_000 = 13_333.33 → rounds to 13_333
+	//   v2: 9 × (1/3) × 20_000 = 60_000
+	//   v3: 6 × (1/3) × 30_000 = 60_000
+	require.EqualValues(t, 13_333, v1.ChargedMicros)
+	require.EqualValues(t, 60_000, v2.ChargedMicros)
+	require.EqualValues(t, 60_000, v3.ChargedMicros)
+	require.EqualValues(t, 133_333, resp.TotalChargedMicros)
+}
