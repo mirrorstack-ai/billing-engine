@@ -188,6 +188,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.usageSvc.ListInvoices(ctx, req)
 
+	case "ListNewCreationCharges":
+		var req usage.ListNewCreationChargesRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.usageSvc.ListNewCreationCharges(ctx, req)
+
 	case "SetMetricDefinitions":
 		var req usage.SetMetricDefinitionsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -432,6 +439,12 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// owns; NO Stripe round-trip), so it shares the control-plane
 		// credential + route group with the other account-billing reads.
 		r.Post("/v1/billing.ListInvoices", makeHTTPHandler(d, "ListInvoices"))
+		// New-app charges (本期新建立): the apps CREATED in the resolved period
+		// whose base is charged via the creation-proration leg — settled (invoice
+		// fired) + in-grace pending. Read-only over the apps + invoices mirrors
+		// this service owns (NO Stripe round-trip), so it shares the control-plane
+		// credential + route group with the other account-billing reads.
+		r.Post("/v1/billing.ListNewCreationCharges", makeHTTPHandler(d, "ListNewCreationCharges"))
 		r.Post("/v1/billing.SetMetricDefinitions", makeHTTPHandler(d, "SetMetricDefinitions"))
 		// Per-module infra price OVERRIDES (decision 19 §4.3) — the INVERSE of
 		// SetMetricDefinitions: it persists a module's ms.Meter("infra.X",
