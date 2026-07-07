@@ -59,10 +59,15 @@ WHERE account_id = $1
 GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '');
 
 -- RollupPeakKind aggregates the peak kind by MAX(value) — the highest
--- absolute level observed in the window is the billable quantity. model and
--- module_version are grouped (COALESCE(…, '')) for parity with the other
--- rollups; peak AI / versioned metrics are not expected today but the
--- dimensions stay consistent.
+-- absolute level observed in the window is the billable quantity. Unlike the
+-- additive kinds, peak deliberately does NOT split by module_version: MAX is
+-- not additive, so a metric that spans >1 version within a period must bill
+-- the single period-wide peak, never Σ(per-version MAX) — the latter
+-- over-charges the customer once module_version is stamped. module_version is
+-- therefore projected as '' and dropped from the GROUP BY; model IS kept
+-- because it prices the line (a version never does). Governing rule: keep a
+-- GROUP BY dimension only when the aggregate is additive over it (the split
+-- is money-preserving) OR it changes the resolved price (model); else drop it.
 -- name: RollupPeakKind :many
 SELECT
     app_id                         AS app_id,
@@ -70,14 +75,14 @@ SELECT
     metric                         AS metric,
     kind                           AS kind,
     COALESCE(model, '')            AS model,
-    COALESCE(module_version, '')   AS module_version,
+    ''::text                       AS module_version,
     COALESCE(MAX(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
   AND recorded_at >= $2
   AND recorded_at <  $3
   AND kind = 'peak'
-GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '');
+GROUP BY app_id, module_id, metric, kind, COALESCE(model, '');
 
 -- RollupTimeWeightedKind integrates the step function under the ordered
 -- samples: each sample's value is held until the NEXT sample (or until
@@ -90,9 +95,13 @@ GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_v
 -- samples produces no row (skipped) — its integral is undefined / 0 (design
 -- §8). The window ORDER BY is (recorded_at, event_id): event_id is the TEXT PK,
 -- so it breaks recorded_at ties deterministically and the LEAD assigns the
--- remaining duration to a stable last row regardless of plan or vacuum. The
--- PARTITION BY carries model + module_version so the step function is held
--- separately per (model, module_version), matching the other two rollups.
+-- remaining duration to a stable last row regardless of plan or vacuum. Like
+-- peak, time_weighted does NOT split by module_version: the integral is not
+-- additive across versions — the LEAD default bleeds each version's last
+-- sample to period_end, so the tail would be billed once per version. Held as
+-- a single time-ordered stream (module_version dropped from PARTITION BY and
+-- GROUP BY, projected '') the integral is the true period value. model is kept
+-- in both because it prices the line.
 -- name: RollupTimeWeightedKind :many
 SELECT
     app_id,
@@ -100,7 +109,7 @@ SELECT
     metric,
     kind,
     model,
-    module_version,
+    ''::text AS module_version,
     COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity
 FROM (
     SELECT
@@ -109,10 +118,9 @@ FROM (
         metric,
         kind,
         COALESCE(model, '') AS model,
-        COALESCE(module_version, '') AS module_version,
         value * EXTRACT(EPOCH FROM (
             LEAD(recorded_at, 1, $3::timestamptz)
-                OVER (PARTITION BY app_id, module_id, metric, COALESCE(model, ''), COALESCE(module_version, '') ORDER BY recorded_at, event_id)
+                OVER (PARTITION BY app_id, module_id, metric, COALESCE(model, '') ORDER BY recorded_at, event_id)
             - recorded_at
         )) / 3600.0 AS segment_byte_hours
     FROM ms_billing.usage_events
@@ -121,7 +129,7 @@ FROM (
       AND recorded_at <  $3
       AND kind = 'time_weighted'
 ) segments
-GROUP BY app_id, module_id, metric, kind, model, module_version;
+GROUP BY app_id, module_id, metric, kind, model;
 
 -- LookupMetricPrice returns the per-unit customer price for a (module, metric)
 -- at rollup time, to snapshot onto the aggregate. NULL price → unpriced
