@@ -66,13 +66,36 @@ type ListNewCreationChargesRequest struct {
 // created_at, and InvoiceID is the invoice Number (else the mirror UUID); for a
 // PENDING row AmountMicros is 0 and ChargeETA is created_at + GraceDays (the
 // other three are absent). Money is integer micro-USD.
+//
+// The per-component BREAKDOWN lets the UI render "App · <Name> · 基礎費用" and
+// "App · <Name> · <AddonModuleCount> 加購模組": Name is the app's display name
+// ("" when unknown); AddonModuleCount is max(0, created_module_count −
+// IncludedModules), the count of add-on modules beyond the bundled allowance;
+// BaseFeeMicros + AddonMicros partition AmountMicros for a settled row
+// (BaseFeeMicros is the settled creation base, AddonMicros the co-created
+// over-module component on the same invoice). A pending row reports both money
+// components as 0 (nothing charged yet) but still surfaces Name + AddonModuleCount.
 type NewCreationCharge struct {
-	AppID        uuid.UUID  `json:"app_id"`
-	Status       string     `json:"status"`
-	AmountMicros int64      `json:"amount_micros"`
-	RecordedAt   *time.Time `json:"recorded_at,omitempty"`
-	InvoiceID    string     `json:"invoice_id,omitempty"`
-	ChargeETA    *time.Time `json:"charge_eta,omitempty"`
+	AppID            uuid.UUID  `json:"app_id"`
+	Status           string     `json:"status"`
+	AmountMicros     int64      `json:"amount_micros"`
+	RecordedAt       *time.Time `json:"recorded_at,omitempty"`
+	InvoiceID        string     `json:"invoice_id,omitempty"`
+	ChargeETA        *time.Time `json:"charge_eta,omitempty"`
+	Name             string     `json:"name"`
+	BaseFeeMicros    int64      `json:"base_fee_micros"`
+	AddonModuleCount int        `json:"addon_module_count"`
+	AddonMicros      int64      `json:"addon_micros"`
+}
+
+// addonModuleCount is the count of CHARGED add-on modules for an app: those
+// installed beyond the account's bundled IncludedModules allowance. Reuses the
+// single IncludedModules const (bill.go) rather than hardcoding the threshold.
+func addonModuleCount(createdModuleCount int) int {
+	if n := createdModuleCount - IncludedModules; n > 0 {
+		return n
+	}
+	return 0
 }
 
 // ListNewCreationChargesResponse is the ordered 本期新建立 list: settled rows first
@@ -144,12 +167,20 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			invoiceID = r.InvoiceID.String()
 		}
 		recordedAt := r.RecordedAt
+		// base + add-on partition the invoice total: BaseFeeMicros is the settled
+		// creation base (the 'proration' snapshot; 0 when absent), AddonMicros the
+		// co-created over-module component billed on the SAME invoice. By
+		// construction base + addon == AmountMicros (the contract invariant).
 		charges = append(charges, NewCreationCharge{
-			AppID:        r.AppID,
-			Status:       NewCreationChargeStatusSettled,
-			AmountMicros: r.AmountDueMicros,
-			RecordedAt:   &recordedAt,
-			InvoiceID:    invoiceID,
+			AppID:            r.AppID,
+			Status:           NewCreationChargeStatusSettled,
+			AmountMicros:     r.AmountDueMicros,
+			RecordedAt:       &recordedAt,
+			InvoiceID:        invoiceID,
+			Name:             r.Name,
+			BaseFeeMicros:    r.BaseMicros,
+			AddonModuleCount: addonModuleCount(r.CreatedModuleCount),
+			AddonMicros:      r.AmountDueMicros - r.BaseMicros,
 		})
 	}
 
@@ -170,9 +201,15 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 				Status: NewCreationChargeStatusPending,
 				// No amount: there is no side-effect-free proration-preview helper,
 				// and inventing a second money formula risks diverging from what
-				// actually charges — the UI shows the ETA, not a number.
-				AmountMicros: 0,
-				ChargeETA:    &eta,
+				// actually charges — the UI shows the ETA, not a number. Both money
+				// components are 0 for the same reason; the add-on COUNT is still
+				// known from the frozen registration count.
+				AmountMicros:     0,
+				ChargeETA:        &eta,
+				Name:             r.Name,
+				BaseFeeMicros:    0,
+				AddonModuleCount: addonModuleCount(r.CreatedModuleCount),
+				AddonMicros:      0,
 			})
 		}
 	}
