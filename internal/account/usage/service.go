@@ -424,6 +424,8 @@ func (s *Service) GetAppUsageSummary(ctx context.Context, req GetAppUsageSummary
 			BillableQuantity: r.BillableQuantity,
 			UnitPriceMicros:  r.UnitPriceMicros,
 			ChargedMicros:    r.ChargedMicros,
+			ActiveSeconds:    r.ActiveSeconds,
+			PeriodDays:       r.PeriodDays,
 		})
 	}
 	return &GetAppUsageSummaryResponse{

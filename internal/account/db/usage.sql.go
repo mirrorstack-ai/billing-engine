@@ -22,7 +22,16 @@ WITH rolled AS (
         ua.module_version                                  AS module_version,
         COALESCE(SUM(ua.billable_quantity), 0)::numeric    AS billable_quantity,
         COALESCE(MAX(ua.unit_price_micros), 0)::bigint     AS unit_price_micros,
-        COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros
+        COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros,
+        -- active_seconds / period_days (migration 044, usage-time-pricing
+        -- Phase 1): the GROUP BY key here is already the exact idempotency
+        -- key of one usage_aggregates row (module_id, metric, kind, model,
+        -- module_version), so MAX over a singleton group is just "the
+        -- value" — same pattern as unit_price_micros above. NULL when the
+        -- row predates these columns or is an additive (count/sum) kind
+        -- that legitimately never populates them (migration 044 header).
+        MAX(ua.active_seconds)::numeric                    AS active_seconds,
+        MAX(ua.period_days)::numeric                       AS period_days
     FROM ms_billing.usage_aggregates ua
     JOIN ms_billing.billing_periods bp
         ON bp.id = ua.period_id
@@ -48,7 +57,13 @@ live AS (
             WHEN e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%'
                 THEN COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
             ELSE COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0)
-        END::numeric                                       AS charged_micros
+        END::numeric                                       AS charged_micros,
+        -- The live (pre-rollup) estimate has no window-segmentation logic —
+        -- that lives only in cmd/billing-cycle's rollup. Explicit NULL,
+        -- type-matched to the rolled branch so the UNION ALL type-checks:
+        -- before a period rolls up, the active window is simply unknown.
+        NULL::numeric                                      AS active_seconds,
+        NULL::numeric                                      AS period_days
     FROM ms_billing.usage_events e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
@@ -60,12 +75,14 @@ live AS (
 )
 SELECT
     module_id, metric, kind, model, module_version,
-    billable_quantity, unit_price_micros, charged_micros
+    billable_quantity, unit_price_micros, charged_micros,
+    active_seconds, period_days
 FROM rolled
 UNION ALL
 SELECT
     module_id, metric, kind, model, module_version,
-    billable_quantity, unit_price_micros, charged_micros
+    billable_quantity, unit_price_micros, charged_micros,
+    active_seconds, period_days
 FROM live
 WHERE NOT EXISTS (SELECT 1 FROM rolled)
 ORDER BY module_id, metric, model, module_version
@@ -87,6 +104,8 @@ type AppBillLinesRow struct {
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
 	UnitPriceMicros  int64               `json:"unit_price_micros"`
 	ChargedMicros    pgtype.Numeric      `json:"charged_micros"`
+	ActiveSeconds    pgtype.Numeric      `json:"active_seconds"`
+	PeriodDays       pgtype.Numeric      `json:"period_days"`
 }
 
 // AppBillLines is the FULL per-app bill's line source — the read behind
@@ -145,6 +164,8 @@ func (q *Queries) AppBillLines(ctx context.Context, arg AppBillLinesParams) ([]A
 			&i.BillableQuantity,
 			&i.UnitPriceMicros,
 			&i.ChargedMicros,
+			&i.ActiveSeconds,
+			&i.PeriodDays,
 		); err != nil {
 			return nil, err
 		}
@@ -521,7 +542,16 @@ WITH rolled AS (
         ua.module_version                                  AS module_version,
         COALESCE(SUM(ua.billable_quantity), 0)::numeric    AS billable_quantity,
         COALESCE(MAX(ua.unit_price_micros), 0)::bigint     AS unit_price_micros,
-        COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros
+        COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros,
+        -- active_seconds / period_days (migration 044, usage-time-pricing
+        -- Phase 1): the GROUP BY key here is already the exact idempotency
+        -- key of one usage_aggregates row (module_id, metric, kind, model,
+        -- module_version), so MAX over a singleton group is just "the
+        -- value" — same pattern as unit_price_micros above. NULL when the
+        -- row predates these columns or is an additive (count/sum) kind
+        -- that legitimately never populates them (migration 044 header).
+        MAX(ua.active_seconds)::numeric                    AS active_seconds,
+        MAX(ua.period_days)::numeric                       AS period_days
     FROM ms_billing.usage_aggregates ua
     JOIN ms_billing.billing_periods bp
         ON bp.id = ua.period_id
@@ -542,7 +572,13 @@ live AS (
         COALESCE(
             SUM(e.value * COALESCE(md.unit_price_micros, 0)),
             0
-        )::numeric                                         AS charged_micros
+        )::numeric                                         AS charged_micros,
+        -- The live (pre-rollup) estimate has no window-segmentation logic —
+        -- that lives only in cmd/billing-cycle's rollup. Explicit NULL,
+        -- type-matched to the rolled branch so the UNION ALL type-checks:
+        -- before a period rolls up, the active window is simply unknown.
+        NULL::numeric                                      AS active_seconds,
+        NULL::numeric                                      AS period_days
     FROM ms_billing.usage_events e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
@@ -554,12 +590,14 @@ live AS (
 )
 SELECT
     module_id, metric, kind, model, module_version,
-    billable_quantity, unit_price_micros, charged_micros
+    billable_quantity, unit_price_micros, charged_micros,
+    active_seconds, period_days
 FROM rolled
 UNION ALL
 SELECT
     module_id, metric, kind, model, module_version,
-    billable_quantity, unit_price_micros, charged_micros
+    billable_quantity, unit_price_micros, charged_micros,
+    active_seconds, period_days
 FROM live
 WHERE NOT EXISTS (SELECT 1 FROM rolled)
 ORDER BY module_id, metric, model, module_version
@@ -581,6 +619,8 @@ type AppUsageSummaryRow struct {
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
 	UnitPriceMicros  int64               `json:"unit_price_micros"`
 	ChargedMicros    pgtype.Numeric      `json:"charged_micros"`
+	ActiveSeconds    pgtype.Numeric      `json:"active_seconds"`
+	PeriodDays       pgtype.Numeric      `json:"period_days"`
 }
 
 // AppUsageSummary is the APP-OWNER's bill for ONE app in the CURRENT period —
@@ -644,6 +684,8 @@ func (q *Queries) AppUsageSummary(ctx context.Context, arg AppUsageSummaryParams
 			&i.BillableQuantity,
 			&i.UnitPriceMicros,
 			&i.ChargedMicros,
+			&i.ActiveSeconds,
+			&i.PeriodDays,
 		); err != nil {
 			return nil, err
 		}

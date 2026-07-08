@@ -451,6 +451,15 @@ type AppMetricUsageRaw struct {
 	BillableQuantity float64
 	UnitPriceMicros  int64
 	ChargedMicros    int64
+	// ActiveSeconds / PeriodDays are the usage-time-pricing Phase 2 read-path
+	// surface of migration 044's reproducibility columns (usage_aggregates.
+	// active_seconds / period_days): the version's active window and the
+	// period length, for a future "used N / period_days days" display. Both
+	// nil when the row hasn't been rolled up yet (the live branch never
+	// segments a window) or when the kind is additive (count/sum), which
+	// legitimately never populates them — nil means "not shown", never 0.
+	ActiveSeconds *float64
+	PeriodDays    *float64
 }
 
 // BillingPeriodRaw is one row of ListBillingPeriods: a real billing_periods
@@ -980,7 +989,7 @@ func (s *pgxStore) AppUsage(ctx context.Context, accountID, appID uuid.UUID, per
 	}
 	out := make([]AppMetricUsageRaw, 0, len(rows))
 	for _, r := range rows {
-		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros)
+		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros, r.ActiveSeconds, r.PeriodDays)
 		if err != nil {
 			return nil, err
 		}
@@ -1005,7 +1014,7 @@ func (s *pgxStore) AppBill(ctx context.Context, accountID, appID uuid.UUID, peri
 	}
 	out := make([]AppMetricUsageRaw, 0, len(rows))
 	for _, r := range rows {
-		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros)
+		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros, r.ActiveSeconds, r.PeriodDays)
 		if err != nil {
 			return nil, err
 		}
@@ -1217,7 +1226,7 @@ func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit 
 // no-op on the already-integer rolled branch, the single rounding point on the
 // live SUM(value × unit_price [× markup]) branch), and module_id parsed from its
 // text form. Shared by AppUsage + AppBill (identical generated row shapes).
-func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, quantity, charged pgtype.Numeric, unitPriceMicros int64) (AppMetricUsageRaw, error) {
+func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, quantity, charged pgtype.Numeric, unitPriceMicros int64, activeSeconds, periodDays pgtype.Numeric) (AppMetricUsageRaw, error) {
 	qty, err := floatFromNumeric(quantity)
 	if err != nil {
 		return AppMetricUsageRaw{}, fmt.Errorf("decode billable_quantity for metric %q: %w", metric, err)
@@ -1230,6 +1239,14 @@ func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, mod
 	if err != nil {
 		return AppMetricUsageRaw{}, fmt.Errorf("decode module_id for metric %q: %w", metric, err)
 	}
+	activeSecondsPtr, err := floatPtrFromNumeric(activeSeconds)
+	if err != nil {
+		return AppMetricUsageRaw{}, fmt.Errorf("decode active_seconds for metric %q: %w", metric, err)
+	}
+	periodDaysPtr, err := floatPtrFromNumeric(periodDays)
+	if err != nil {
+		return AppMetricUsageRaw{}, fmt.Errorf("decode period_days for metric %q: %w", metric, err)
+	}
 	return AppMetricUsageRaw{
 		ModuleID:         mod,
 		Metric:           metric,
@@ -1239,6 +1256,8 @@ func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, mod
 		BillableQuantity: qty,
 		UnitPriceMicros:  unitPriceMicros,
 		ChargedMicros:    chargedMicros,
+		ActiveSeconds:    activeSecondsPtr,
+		PeriodDays:       periodDaysPtr,
 	}, nil
 }
 
@@ -1330,6 +1349,28 @@ func floatFromNumeric(n pgtype.Numeric) (float64, error) {
 		return 0, err
 	}
 	return fv.Float64, nil
+}
+
+// floatPtrFromNumeric decodes a NULLABLE NUMERIC display value (usage-time-
+// pricing Phase 2's active_seconds / period_days columns) to *float64: SQL
+// NULL → nil (so the wire's omitempty drops the field and the UI never
+// mis-renders "not yet rolled up" as "zero active time"), else a pointer to
+// the decoded value. Mirrors floatFromNumeric's Float64Value() decode (these
+// are display quantities, not money — float is acceptable, same rationale)
+// but preserves nullability the way timePtrFromTimestamptz does for nullable
+// timestamps, rather than floatFromNumeric's COALESCE-to-0 (that helper's
+// callers already resolved NULL to 0 in SQL; this one's callers deliberately
+// did not, because 0 and "unknown" are different claims here).
+func floatPtrFromNumeric(n pgtype.Numeric) (*float64, error) {
+	if !n.Valid {
+		return nil, nil
+	}
+	fv, err := n.Float64Value()
+	if err != nil {
+		return nil, err
+	}
+	v := fv.Float64
+	return &v, nil
 }
 
 // timePtrFromTimestamptz maps a nullable timestamptz to *time.Time: NULL →
