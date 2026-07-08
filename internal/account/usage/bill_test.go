@@ -346,6 +346,37 @@ func TestGetAppBill_KeepsPerModuleVersionLines(t *testing.T) {
 	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "both versions are one installed module")
 }
 
+func TestGetAppBill_ForwardsActiveWindowFields(t *testing.T) {
+	// GetAppBill must carry ActiveSeconds/PeriodDays from the raw store row
+	// onto the wire AppMetricUsage verbatim (usage-time-pricing Phase 2,
+	// display-only read path) — nil stays nil, a populated value stays exact.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	mod := uuid.New()
+	rolledActiveSeconds := 864_000.0
+	rolledPeriodDays := 30.0
+	store.appBillRows = []usage.AppMetricUsageRaw{
+		{ModuleID: mod, Metric: "connections.peak", Kind: usage.KindPeak, ModuleVersion: "2.0.0",
+			ActiveSeconds: &rolledActiveSeconds, PeriodDays: &rolledPeriodDays},
+		customLine(mod, "orders.placed", "1.0.0", 400), // live / additive: both nil
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
+	require.NoError(t, err)
+	require.Len(t, resp.ModuleUsage, 2)
+
+	rolled := resp.ModuleUsage[0]
+	require.NotNil(t, rolled.ActiveSeconds)
+	require.NotNil(t, rolled.PeriodDays)
+	require.EqualValues(t, 864_000.0, *rolled.ActiveSeconds)
+	require.EqualValues(t, 30.0, *rolled.PeriodDays)
+
+	notRolled := resp.ModuleUsage[1]
+	require.Nil(t, notRolled.ActiveSeconds, "nil stays nil — never coerced to 0")
+	require.Nil(t, notRolled.PeriodDays, "nil stays nil — never coerced to 0")
+}
+
 // --- GetAppBill: account / period resolution ------------------------------
 
 func TestGetAppBill_NoAccountReturnsBaseFeeOnly(t *testing.T) {

@@ -51,10 +51,14 @@ func TestAppBill_Integration_LiveInfraMarkupAndSplit(t *testing.T) {
 	custom, ok := findAppRow(rows, "orders.placed", "", "")
 	require.True(t, ok)
 	require.EqualValues(t, 400, custom.ChargedMicros, "custom metric: 4 × 100, NO markup")
+	require.Nil(t, custom.ActiveSeconds, "live estimate has no window-segmentation logic — unknown, not 0")
+	require.Nil(t, custom.PeriodDays, "live estimate has no window-segmentation logic — unknown, not 0")
 
 	infra, ok := findAppRow(rows, "infra.egress.api.bytes", "", "")
 	require.True(t, ok)
 	require.EqualValues(t, 1200, infra.ChargedMicros, "reserved infra metric: 10 × 100 × 1.2")
+	require.Nil(t, infra.ActiveSeconds)
+	require.Nil(t, infra.PeriodDays)
 }
 
 // TestAppBill_Integration_RolledInfraFrozenNotRemarkedUp: once rolled up, the
@@ -83,6 +87,43 @@ func TestAppBill_Integration_RolledInfraFrozenNotRemarkedUp(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "rolled branch wins; live events suppressed")
 	require.EqualValues(t, 1200, rows[0].ChargedMicros, "frozen charged, not re-marked-up")
+	// Pre-Phase-1 additive (sum) aggregate row: active_seconds/period_days are
+	// legitimately NULL in the DB (proration never applies to count/sum kinds —
+	// migration 044). Must surface as nil, not 0, not an error.
+	require.Nil(t, rows[0].ActiveSeconds, "NULL active_seconds (additive kind) decodes to nil, not 0")
+	require.Nil(t, rows[0].PeriodDays, "NULL period_days (additive kind) decodes to nil, not 0")
+}
+
+// TestAppBill_Integration_RolledSurfacesActiveWindow: a ROLLED (post-rollup)
+// peak/time_weighted aggregate row with active_seconds/period_days populated
+// (usage-time-pricing Phase 1) surfaces the EXACT values on AppBill's
+// returned rows — not nil, not rounded/mangled.
+func TestAppBill_Integration_RolledSurfacesActiveWindow(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	app := uuid.New()
+	mod := uuid.New()
+	appSeedMetricDef(t, pool, mod, "connections.peak", usage.KindPeak, 50)
+
+	periodID := appSeedPeriod(t, pool, acct, appPeriodStart, appPeriodEnd)
+	activeSeconds := 864_000.0 // 10 days, in seconds
+	periodDays := 30.0
+	appSeedAggregateWithWindow(t, pool, periodID, acct, app, mod, "connections.peak", usage.KindPeak, "", "2.0.0",
+		20, 50, 1000, 1000, &activeSeconds, &periodDays)
+
+	rows, err := store.AppBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+
+	r := rows[0]
+	require.NotNil(t, r.ActiveSeconds)
+	require.NotNil(t, r.PeriodDays)
+	require.EqualValues(t, 864_000.0, *r.ActiveSeconds, "exact rolled active_seconds, not rounded/mangled")
+	require.EqualValues(t, 30.0, *r.PeriodDays, "exact rolled period_days, not rounded/mangled")
 }
 
 // countActiveSentinelMetrics returns how many ACTIVE platform-infra sentinel
