@@ -10,10 +10,19 @@
 //
 // Auth contract:
 //
-//   - Production: IAM gates lambda.Invoke (the function URL is not
-//     exposed via API Gateway in v1; api-platform invokes by ARN).
+//   - Production: IAM gates lambda.Invoke (the RPC surface is not exposed
+//     via API Gateway; api-platform invokes by ARN).
 //   - Local HTTP: X-MS-Internal-Secret header on every non-/__health
 //     route. The secret is fail-closed (empty → 503 secret_unconfigured).
+//
+// Third entry point, production only: api.mirrorstack.ai/billing/healthz
+// (mirrorstack-infra's stacks/billing.go maps a minimal HTTP API onto
+// this same Lambda for Cloudflare Health Checks). lambdaInvokeHandler
+// tells this apart from a real lambda.Invoke RPC call by the presence of
+// "rawPath" (API Gateway v2 payload format 2.0 always sets it; the RPC
+// envelope never does) and returns a static 200 without touching the
+// dispatcher or the database — nothing about the IAM-gated RPC surface
+// changes.
 //
 // Spec: mirrorstack-docs/api/billing/account-api.md.
 package main
@@ -561,6 +570,21 @@ func (s *statusRecorder) WriteHeader(code int) {
 // of a module's reach in production. RecordInfraUsage is absent from any
 // SDK-accessible / meter-secret surface on BOTH transports (design §3a / §5).
 func lambdaInvokeHandler(ctx context.Context, payload json.RawMessage) (json.RawMessage, error) {
+	// api.mirrorstack.ai/billing/healthz lands here as an API Gateway v2
+	// payload-format-2.0 event, which always sets rawPath; a lambda.Invoke
+	// rpcEnvelope never does. Returns before disp.dispatch is ever
+	// called — the IAM-gated RPC surface above is completely untouched.
+	var probe struct {
+		RawPath string `json:"rawPath"`
+	}
+	if err := json.Unmarshal(payload, &probe); err == nil && probe.RawPath != "" {
+		return json.Marshal(map[string]any{
+			"statusCode": 200,
+			"headers":    map[string]string{"content-type": "application/json"},
+			"body":       `{"status":"ok"}`,
+		})
+	}
+
 	var env rpcEnvelope
 	if err := json.Unmarshal(payload, &env); err != nil {
 		return json.Marshal(buildResponse(nil, billing.InvalidInput("malformed envelope: "+err.Error())))
