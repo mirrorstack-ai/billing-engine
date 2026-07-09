@@ -784,3 +784,72 @@ func TestProcess_InvoiceEvent_StoreError_Internal(t *testing.T) {
 	require.Equal(t, 500, res.HTTPStatus)
 	require.Equal(t, webhook.StatusInternal, res.Status)
 }
+
+// --- ProcessTrusted (EventBridge entry point) -----------------------------
+
+// TestProcessTrusted_SkipsVerification_DispatchesDespiteFailingVerifier proves
+// the Process/ProcessTrusted split: both are wired to the SAME Router (and
+// therefore the same always-erroring FakeVerifier). Process calls
+// r.verifier.Verify first and fails closed at 400/bad-signature — the
+// verifier IS reached and IS the reason it fails. ProcessTrusted, called
+// against that identical router, reaches dispatch and ACKs 200/OK — proving
+// it never calls r.verifier.Verify at all (an EventBridge event never
+// carries a signature to verify in the first place; trust is structural).
+func TestProcessTrusted_SkipsVerification_DispatchesDespiteFailingVerifier(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Err: errors.New("signature mismatch")}
+	s := webhooktest.NewFakeStore()
+	r := newRouter(v, s)
+
+	// Sanity: Process against this router+verifier fails closed.
+	processRes := r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, 400, processRes.HTTPStatus)
+	require.Equal(t, webhook.StatusBadSignature, processRes.Status)
+
+	// ProcessTrusted against the identical router bypasses the verifier
+	// entirely and reaches dispatch.
+	event := customerEvent("evt_trusted_1", "customer.created", "cus_x", "")
+	trustedRes := r.ProcessTrusted(context.Background(), event)
+	require.Equal(t, 200, trustedRes.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, trustedRes.Status)
+	require.True(t, s.Processed["evt_trusted_1"], "ProcessTrusted must still run the idempotency + dispatch tail")
+}
+
+// TestProcessTrusted_Duplicate proves ProcessTrusted shares the same
+// idempotency gate as Process (both delegate to processVerifiedEvent): a
+// second delivery of the same event_id short-circuits to StatusDuplicate
+// without re-dispatching.
+func TestProcessTrusted_Duplicate(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Err: errors.New("signature mismatch")}
+	s := webhooktest.NewFakeStore()
+	r := newRouter(v, s)
+	event := customerEvent("evt_trusted_dup", "customer.created", "cus_x", "")
+
+	first := r.ProcessTrusted(context.Background(), event)
+	require.Equal(t, webhook.StatusOK, first.Status)
+
+	second := r.ProcessTrusted(context.Background(), event)
+	require.Equal(t, 200, second.HTTPStatus)
+	require.Equal(t, webhook.StatusDuplicate, second.Status)
+}
+
+// TestProcessTrusted_5xxDispatch_UnmarksSoRedeliveryReRuns proves the 5xx
+// idempotency compensation (shared via processVerifiedEvent) also applies to
+// the ProcessTrusted path — EventBridge's own retry redelivers the same
+// event, and it must re-enter dispatch rather than dedupe forever.
+func TestProcessTrusted_5xxDispatch_UnmarksSoRedeliveryReRuns(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Err: errors.New("signature mismatch")}
+	s := webhooktest.NewFakeStore()
+	c := &webhooktest.FakeChargeRetriever{Err: errors.New("stripe 503")}
+	r := newRouterWithCharges(v, s, c)
+	event := fraudEvent("evt_trusted_retry", "charge.dispute.created", "ch_1")
+
+	res := r.ProcessTrusted(context.Background(), event)
+	require.Equal(t, 500, res.HTTPStatus)
+	require.False(t, s.Processed["evt_trusted_retry"], "a 5xx must unmark the event for redelivery")
+
+	c.Err = nil
+	c.Refs = map[string]billingstripe.ChargeCardRef{"ch_1": {PaymentMethodID: "pm_1", Fingerprint: "fp_1", StripeCustomerID: "cus_1"}}
+	res = r.ProcessTrusted(context.Background(), event)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.FraudFlags, 1, "redelivery re-ran the handler and flagged the card")
+}
