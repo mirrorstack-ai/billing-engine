@@ -243,7 +243,26 @@ func (r *Router) Process(ctx context.Context, payload []byte, signature string) 
 		r.log.WarnContext(ctx, "webhook signature verify failed", "error", err)
 		return Result{HTTPStatus: 400, Status: StatusBadSignature}
 	}
+	return r.processVerifiedEvent(ctx, event)
+}
 
+// ProcessTrusted runs the idempotency check + dispatch for an event whose
+// authenticity is already guaranteed by the transport, skipping signature
+// verification entirely. It exists for the EventBridge entry point
+// (cmd/account-webhook-eventbridge): trust there is structural — only
+// Stripe's partner event source can PutEvents onto the bus, and only that
+// Rule's ARN can invoke the Lambda — so there is no HMAC signature to
+// verify in the first place. Everything after verification (idempotency,
+// dispatch, 5xx compensation) is identical to Process.
+func (r *Router) ProcessTrusted(ctx context.Context, event stripego.Event) Result {
+	return r.processVerifiedEvent(ctx, event)
+}
+
+// processVerifiedEvent is the shared post-verification tail of Process and
+// ProcessTrusted: idempotency check, dispatch to the per-event handler, and
+// 5xx compensation. Callers are responsible for establishing that event is
+// authentic before calling this.
+func (r *Router) processVerifiedEvent(ctx context.Context, event stripego.Event) Result {
 	// Idempotency: insert the event_id FIRST so concurrent duplicate deliveries
 	// of the same event serialize (only one wins the INSERT). A 5xx dispatch
 	// outcome is compensated below so the mark doesn't permanently dedupe an

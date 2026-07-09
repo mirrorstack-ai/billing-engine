@@ -35,6 +35,7 @@ jobs:
           for pair in \
             account-api:billing-account-api \
             account-webhook:billing-webhook \
+            account-webhook-eventbridge:billing-webhook-eventbridge \
             billing-cycle:billing-cycle \
             infra-egress-sync:billing-egress-sync
           do
