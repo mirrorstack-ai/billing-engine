@@ -96,6 +96,29 @@ func TestHTTPHandler_Duplicate(t *testing.T) {
 
 // --- proxyHandler (Lambda transport — same router contract) ---------------
 
+// A GET must return 200 without ever calling router.Process - the
+// verifier here always errors, so a 400/BadSignature result would prove
+// the health-check branch didn't short-circuit before it.
+func TestProxyHandler_HealthCheck_GetBypassesRouter(t *testing.T) {
+	router := makeRouter(t,
+		&webhooktest.FakeVerifier{Err: errors.New("signature mismatch")},
+		webhooktest.NewFakeStore(),
+	)
+	handler := proxyHandler(router)
+
+	req := events.APIGatewayProxyRequest{HTTPMethod: http.MethodGet}
+	res, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler returned err: %v", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", res.StatusCode)
+	}
+	if got := decodeStatus(t, strings.NewReader(res.Body)); got != webhook.StatusOK {
+		t.Errorf("status body: got %q, want %q", got, webhook.StatusOK)
+	}
+}
+
 func TestProxyHandler_BadSignature(t *testing.T) {
 	router := makeRouter(t,
 		&webhooktest.FakeVerifier{Err: errors.New("signature mismatch")},

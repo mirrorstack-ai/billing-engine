@@ -88,6 +88,20 @@ func buildRouter() *webhook.Router {
 // Gateway already deploys behind it.
 func proxyHandler(router *webhook.Router) func(context.Context, events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	return func(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+		// Health-check branch: Stripe always sends POST with a signature,
+		// so a GET here is unambiguously a health probe (Cloudflare or
+		// otherwise), never a real webhook delivery. Returns before ever
+		// calling router.Process - a GET/no-signature request there
+		// resolves to a 500, which CodeDeploy's canary error-rate alarm
+		// counts as a genuine Lambda error and can block deploys of this
+		// whole stack (reproduced live: a health check polling this path
+		// every 60s tripped WebhookCanaryErrorRate to 100%, blocking an
+		// unrelated deploy). This branch changes nothing about real
+		// webhook processing.
+		if req.HTTPMethod == http.MethodGet {
+			return proxyResponse(http.StatusOK, webhook.StatusOK), nil
+		}
+
 		sig := req.Headers[stripeSigHeader]
 		if sig == "" {
 			// API Gateway REST APIs lowercase header keys; check both.
