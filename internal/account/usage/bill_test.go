@@ -571,11 +571,13 @@ func TestGetAppBill_MirroredAppShowsFlatBase(t *testing.T) {
 	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "per-app base is flat (overage is pooled)")
 }
 
-func TestGetAppBill_MirroredAppProratesCreationPeriod(t *testing.T) {
-	// created_at inside the displayed period → the base is PRORATED with the
-	// same remain_days formula the RegisterApp charge used: created May 22 of
-	// [May 1, Jun 1) (31 days) → remain 10 → round_half_up(20e6 × 10/31) =
-	// 6_451_613. Display == what the proration invoice actually charged.
+func TestGetAppBill_MirroredAppCreationPeriodShowsFullBase(t *testing.T) {
+	// Regression #63: created_at inside the displayed period must NOT prorate
+	// the recurring estimate. The (created_at → period-end) proration is the
+	// one-time "New creation" charge, surfaced in its own section; this line
+	// previews the advance-base leg (cycle/charge.go), which always bills the
+	// FULL fee. The old pin ("display == what the proration invoice charged")
+	// conflated the two charges and showed $14.19 for a $20 plan in prod.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -588,8 +590,8 @@ func TestGetAppBill_MirroredAppProratesCreationPeriod(t *testing.T) {
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
 	require.NoError(t, err)
-	require.EqualValues(t, 6_451_613, resp.BaseFeeMicros)
-	require.EqualValues(t, 6_451_613, resp.TotalMicros, "base-only bill: total == prorated base")
+	require.EqualValues(t, usage.BaseFeeMicros, resp.BaseFeeMicros)
+	require.EqualValues(t, usage.BaseFeeMicros, resp.TotalMicros, "base-only bill: total == full advance base")
 }
 
 func TestGetAppBill_AppDeletedBeforePeriodShowsZeroBase(t *testing.T) {

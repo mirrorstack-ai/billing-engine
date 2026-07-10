@@ -146,8 +146,9 @@ func pctMicros(base int64, pct int) (int64, error) {
 //     later SyncAppModules count changes. Only an un-snapshotted period
 //     (pre-feature history, unactivated account, in-progress period) falls
 //     back to the live ESTIMATE from the mirror (migration 027): the FLAT
-//     plan-resolved base (resolveBaseFeeMicros(plan)), PRORATED via
-//     ProratedBaseMicros when the app's created_at falls inside the period.
+//     plan-resolved base (resolveBaseFeeMicros(plan)) — full fee even when
+//     created_at falls inside the period (the creation proration is the
+//     sweep's one-time charge, never the recurring line; issue #63).
 //     Module overage is NOT in the per-app base anymore — it is account-wide
 //     pooled (migration 032, surfaced on GetAccountBill). An app ABSENT from
 //     the mirror (pre-backfill) falls back to the flat plan base below,
@@ -424,9 +425,14 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		case mirrored:
 			// No snapshot → estimate the FLAT per-app base from the plan (module
 			// overage is now account-wide pooled, migration 032 — never folded
-			// into the per-app base here), the SAME ProratedBaseMicros math the
-			// charge legs bill, prorated when created_at falls inside the period.
-			baseFee = ProratedBaseMicros(resolveBaseFeeMicros(plan), mirror.CreatedAt, periodStart, periodEnd)
+			// into the per-app base here). FULL fee, never prorated: the
+			// recurring line previews the advance-base charge leg
+			// (cycle/charge.go), which bills the full next-period fee per live
+			// app. The (created_at → period-end) proration is exclusively the
+			// one-time "New creation" charge (cycle/proration.go) — applying it
+			// here double-derived it and showed $14.19 for a $20 plan on every
+			// mid-period app (issue #63; the Aug-1 invoice was already correct).
+			baseFee = resolveBaseFeeMicros(plan)
 		default:
 			// No mirror row (pre-backfill): the flat per-app base. The pre-032
 			// usage-proxy overage is gone — overage is pooled at the account
