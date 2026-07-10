@@ -173,8 +173,12 @@ func TestGetAccountBill_MirrorLifecycleAcrossTheWindow(t *testing.T) {
 	require.Equal(t, deletedDuring, resp.Apps[0].AppID)
 	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "deleted mid-period keeps the spent base")
 	require.Equal(t, createdDuring, resp.Apps[1].AppID)
-	require.EqualValues(t, 6_451_613, resp.Apps[1].BaseFeeMicros, "created May 22 of 31 days → 10/31 proration")
-	require.Equal(t, usage.BaseFeeMicros+6_451_613, resp.TotalMicros)
+	// Regression #63: mid-period creation must NOT prorate the recurring
+	// estimate — the (created_at → period-end) proration is the one-time "New
+	// creation" charge; this line previews the advance-base leg, always the
+	// full fee. (Prod symptom: $20 plan showed 20×22/31 = $14.19 per app.)
+	require.EqualValues(t, usage.BaseFeeMicros, resp.Apps[1].BaseFeeMicros, "created mid-period still previews the FULL advance base")
+	require.Equal(t, usage.BaseFeeMicros*2, resp.TotalMicros)
 }
 
 // --- snapshot-first base ----------------------------------------------------
