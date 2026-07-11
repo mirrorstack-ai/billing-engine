@@ -321,25 +321,40 @@ func (s *Service) GetPaymentMethods(ctx context.Context, req GetPaymentMethodsRe
 
 // GetServiceStatus is the read behind the platform's service-block gate: it
 // returns whether the account's services should be BLOCKED on payment standing
-// (no usable non-fraud card, a failed first charge, or a failed-charge streak
-// >= 2), per internal/account/eligibility. Read-only; never touches Stripe.
+// (no usable non-fraud card, a failed first charge, a failed-charge streak
+// >= 2, or >= 2 unpaid invoices — funding-gates design, DECIDED 2026-07-11),
+// per internal/account/eligibility. Read-only; never touches Stripe.
 //
-// A user with no billing account yet has no card on file, so the gate blocks on
-// the card requirement (ReasonNoUsableCard) rather than 404-ing — the caller
-// reads one Blocked flag and never has to special-case "not set up". A real
-// account gathers the three signals in one store read and hands them to the
-// pure Evaluate.
+// Owner is a user XOR an org. A user with no billing account yet has no card
+// on file, so the gate blocks on the card requirement (ReasonNoUsableCard)
+// rather than 404-ing — the caller reads one Blocked flag and never has to
+// special-case "not set up". An ORG resolves through its funding designation
+// (ResolveOrgFundedAccount); an org without a resolvable designation gets the
+// SAME blocked-on-card verdict — no funding, no standing. A resolved account
+// gathers the signals from the store and hands them to the pure Evaluate; a
+// sponsor-funded org's CARD signal is read on the FUNDING account (the
+// sponsor owns the cards — the same hop the charge legs apply), while the
+// invoice-derived signals stay on the org's own account (invoices are
+// attributed there regardless of who pays).
 func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequest) (*GetServiceStatusResponse, error) {
-	if req.UserID == uuid.Nil {
-		return nil, InvalidInput("user_id required")
+	if err := validateOwner(req.UserID, req.OrgID); err != nil {
+		return nil, err
 	}
 
-	accountID, found, err := s.store.AccountByUser(ctx, req.UserID)
+	var accountID uuid.UUID
+	var found bool
+	var err error
+	if req.OrgID != uuid.Nil {
+		accountID, found, err = s.store.ResolveOrgFundedAccount(ctx, req.OrgID)
+	} else {
+		accountID, found, err = s.store.AccountByUser(ctx, req.UserID)
+	}
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
 	}
 	if !found {
-		// No account ⇒ no card ⇒ blocked on the (unconditional) card gate.
+		// No account (or unfunded org) ⇒ no card ⇒ blocked on the
+		// (unconditional) card gate.
 		return serviceStatusResponse(eligibility.Verdict{
 			Blocked: true,
 			Reason:  eligibility.ReasonNoUsableCard,
@@ -351,10 +366,31 @@ func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequ
 	if err != nil {
 		return nil, Internal("service-block signals read failed", err)
 	}
+	if req.OrgID != uuid.Nil {
+		// Sponsor hop: a sponsor-funded org account owns no PM rows — its
+		// usable-card signal lives on the funding account. Identity for
+		// funding='org' accounts, so the extra read is skipped then.
+		fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
+		if err != nil {
+			return nil, Internal("funding account lookup failed", err)
+		}
+		if fundingID != accountID {
+			fsig, err := s.store.ServiceBlockSignals(ctx, fundingID)
+			if err != nil {
+				return nil, Internal("funding service-block signals read failed", err)
+			}
+			sig.UsableCardCount = fsig.UsableCardCount
+		}
+	}
+	unpaid, err := s.store.UnpaidInvoiceCount(ctx, accountID)
+	if err != nil {
+		return nil, Internal("unpaid invoice count read failed", err)
+	}
 	verdict := eligibility.Evaluate(eligibility.Signals{
 		UsableNonFraudCardCount: sig.UsableCardCount,
 		FirstCharge:             firstChargeState(sig.FirstChargeStatus),
 		FailedChargeStreak:      sig.FailedChargeStreak,
+		UnpaidInvoiceCount:      unpaid,
 	})
 	return serviceStatusResponse(verdict), nil
 }

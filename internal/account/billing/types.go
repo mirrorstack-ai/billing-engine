@@ -7,7 +7,11 @@
 // both serialize against.
 package billing
 
-import "github.com/google/uuid"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // Capability is a typed string for the EnsureRequest.Require vocabulary.
 // Typing the slice prevents callers from passing arbitrary strings;
@@ -208,10 +212,33 @@ type ServiceSignals struct {
 	FirstChargeStatus  string
 }
 
+// UnpaidInvoiceRow is the store projection of one unpaid mirror invoice
+// (open/uncollectible, amount_due > 0) — the read behind ListUnpaidInvoices.
+// Money is int64 micro-dollars (the store converts the mirror's whole Stripe
+// cents ×10_000, the same boundary usage's invoice reads use).
+type UnpaidInvoiceRow struct {
+	ID              uuid.UUID
+	Number          string
+	AmountDueMicros int64
+	CreatedAt       time.Time
+}
+
+// InvoicePayTarget is the store projection PayInvoice resolves an owned
+// mirror invoice to: the Stripe-side id to pay and the mirror's current
+// status (for the paid short-circuit / non-payable rejection).
+type InvoicePayTarget struct {
+	StripeInvoiceID string
+	Status          string
+}
+
 // GetServiceStatusRequest is the payload of GetServiceStatus — the account is
-// addressed by owner, the same as Ensure / GetPaymentMethods.
+// addressed by owner, the same as Ensure / GetPaymentMethods (exactly one of
+// UserID / OrgID). An org resolves through its funding designation
+// (ResolveOrgFundedAccount); an org without a resolvable designation is
+// BLOCKED — unfunded orgs have no serving standing (funding-gates design).
 type GetServiceStatusRequest struct {
-	UserID uuid.UUID `json:"user_id"`
+	UserID uuid.UUID `json:"user_id,omitempty"`
+	OrgID  uuid.UUID `json:"org_id,omitempty"`
 }
 
 // GetServiceStatusResponse is the service-block verdict for the account. Blocked

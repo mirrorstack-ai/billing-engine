@@ -163,6 +163,12 @@ func (f *fakeStripe) DetachPaymentMethod(context.Context, string) error {
 func (f *fakeStripe) SetDefaultPaymentMethod(context.Context, string, string) error {
 	panic("SetDefaultPaymentMethod must not be called by the charge cycle")
 }
+func (f *fakeStripe) GetInvoice(context.Context, string) (billingstripe.Invoice, error) {
+	panic("GetInvoice must not be called by the charge cycle")
+}
+func (f *fakeStripe) PayInvoice(context.Context, string) (billingstripe.Invoice, error) {
+	panic("PayInvoice must not be called by the charge cycle")
+}
 
 // Compile-time check: fakeStripe satisfies the full Client interface.
 var _ billingstripe.Client = (*fakeStripe)(nil)

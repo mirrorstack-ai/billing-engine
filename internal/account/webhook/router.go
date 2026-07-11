@@ -205,10 +205,24 @@ type ChargeRetriever interface {
 	RetrieveCharge(ctx context.Context, chargeID string) (billingstripe.ChargeCardRef, error)
 }
 
+// ServingBlockNotifier is the optional standing-transition hook (funding-gates
+// C6, satisfied by *standing.Notifier): after every standing-relevant event —
+// invoice lifecycle, card attach/detach, fraud flag — the router pushes the
+// owner's CURRENT serving-block verdict to api-platform, best-effort. The
+// methods never return errors; the notifier logs and swallows every failure
+// so a notify can never fail or delay webhook processing (Stripe must get its
+// 200 regardless). nil = disabled.
+type ServingBlockNotifier interface {
+	NotifyStripeCustomer(ctx context.Context, stripeCustomerID string)
+	NotifyStripeInvoice(ctx context.Context, stripeInvoiceID string)
+	NotifyStripePaymentMethod(ctx context.Context, stripePaymentMethodID string)
+}
+
 type Router struct {
 	verifier billingstripe.Verifier
 	store    Store
 	charges  ChargeRetriever
+	notify   ServingBlockNotifier // nil = serving-block pushes disabled
 	log      *slog.Logger
 }
 
@@ -230,6 +244,35 @@ func NewRouter(verifier billingstripe.Verifier, store Store, charges ChargeRetri
 		panic("webhook.NewRouter: log must not be nil")
 	}
 	return &Router{verifier: verifier, store: store, charges: charges, log: log}
+}
+
+// WithServingBlockNotifier attaches the optional serving-block notifier
+// (nil-tolerant: the hooks no-op without one, so the constructor's strict
+// non-nil posture doesn't apply). Returns the Router for chaining.
+func (r *Router) WithServingBlockNotifier(n ServingBlockNotifier) *Router {
+	r.notify = n
+	return r
+}
+
+// notifyCustomer / notifyInvoice / notifyPaymentMethod are the nil-guarded
+// hook call sites the handlers use — one line at each standing-relevant
+// event, after its store writes succeeded.
+func (r *Router) notifyCustomer(ctx context.Context, stripeCustomerID string) {
+	if r.notify != nil {
+		r.notify.NotifyStripeCustomer(ctx, stripeCustomerID)
+	}
+}
+
+func (r *Router) notifyInvoice(ctx context.Context, stripeInvoiceID string) {
+	if r.notify != nil {
+		r.notify.NotifyStripeInvoice(ctx, stripeInvoiceID)
+	}
+}
+
+func (r *Router) notifyPaymentMethod(ctx context.Context, stripePaymentMethodID string) {
+	if r.notify != nil {
+		r.notify.NotifyStripePaymentMethod(ctx, stripePaymentMethodID)
+	}
 }
 
 // Process verifies the signature, performs the idempotency check,

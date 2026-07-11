@@ -283,57 +283,82 @@ func TestRegisterApp_RetryKeepsFirstRegistrationsAnchor(t *testing.T) {
 	require.Equal(t, created, store.apps[appID].CreatedAt)
 }
 
-func TestRegisterApp_RecordsRowRegardlessOfAccountState(t *testing.T) {
-	// RegisterApp no longer gates on activation / PM (that moved to the charge
-	// sweep). It records the roster row unconditionally — even for an
-	// unactivated account with no PM — so the sweep can price it once the
-	// account becomes chargeable. No charge, ever, in this RPC.
+// --- RegisterApp: funding gate (docs-temp/billing-funding-gates/design.md) ----
+
+func TestRegisterApp_UnfundedOwnerRejected(t *testing.T) {
+	// The create gate (DECIDED 2026-07-11, inverting "creation never blocks on
+	// billing"): every unfunded owner shape — no billing account at all, an
+	// unactivated account, no usable card — is PAYMENT_REQUIRED, and NO roster
+	// row (or timer) is written.
+	for _, tc := range []struct {
+		name string
+		seed func(store *fakeStore) uuid.UUID // returns the owner user id
+	}{
+		{"no billing account", func(store *fakeStore) uuid.UUID {
+			return uuid.New() // never visited billing → no accounts row
+		}},
+		{"unactivated account", func(store *fakeStore) uuid.UUID {
+			user, acct := registeredAccount(store)
+			delete(store.activation, acct) // never bound a card
+			return user
+		}},
+		{"no usable card", func(store *fakeStore) uuid.UUID {
+			user, acct := registeredAccount(store)
+			store.cardCount[acct] = 0 // activated once, card since removed/fraud-flagged
+			return user
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			user := tc.seed(store)
+			sc := newFakeStripe()
+			appID := uuid.New()
+
+			_, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+				OwnerUserID: user, AppID: appID,
+			})
+			requireCode(t, err, billing.CodePaymentRequired)
+			require.NotContains(t, store.apps, appID, "a rejected create must not leave a roster row")
+			require.Empty(t, store.timers, "a rejected create must not synthesize timers")
+			require.Empty(t, sc.itemCalls)
+			require.Empty(t, sc.invoiceCalls)
+		})
+	}
+}
+
+func TestRegisterApp_RetryAfterFundingLapseStaysIdempotent(t *testing.T) {
+	// A RE-register of an existing app_id skips the gate: the platform's
+	// fire-and-forget retry must not suddenly fail because the owner's funding
+	// lapsed between the first registration and the retry.
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
-	delete(store.activation, acct) // never bound a card
-	store.hasPM = false
 	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
+	req := cycle.RegisterAppRequest{OwnerUserID: user, AppID: appID, ModuleCount: 2}
 
-	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user, AppID: appID,
-	})
+	first, err := svc.RegisterApp(context.Background(), req)
 	require.NoError(t, err)
-	require.Contains(t, store.apps, appID)
-	require.Empty(t, resp.ProrationInvoiceID)
-	require.Empty(t, sc.itemCalls)
-	require.Empty(t, sc.invoiceCalls)
+
+	store.cardCount[acct] = 0 // funding lapses after the first registration
+	retry, err := svc.RegisterApp(context.Background(), req)
+	require.NoError(t, err, "a re-register must never hit the funding gate")
+	require.Equal(t, first.AccountID, retry.AccountID)
+	require.Equal(t, 2, liveTimerCount(store, appID))
 }
 
 // --- RegisterApp: account resolution + validation -----------------------------
 
-func TestRegisterApp_CreatesMissingAccount(t *testing.T) {
-	// A lazy owner (never visited billing) still gets the mirror row: the
-	// account is get-or-created via the SAME EnsureAccount path billing.Ensure
-	// uses. Fresh account → unactivated → no charge.
-	store := newFakeStore()
-	sc := newFakeStripe()
-	user, appID := uuid.New(), uuid.New()
-
-	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user, AppID: appID,
-	})
-	require.NoError(t, err)
-	require.NotEqual(t, uuid.Nil, resp.AccountID)
-	require.Equal(t, resp.AccountID, store.accountsByUser[user])
-	require.Equal(t, resp.AccountID, store.apps[appID].AccountID)
-	require.Empty(t, sc.itemCalls)
-}
-
 func TestRegisterApp_FundedOrgResolvesOrgAccount(t *testing.T) {
 	// An ORG owner resolves through the funding designation (migration 041):
-	// a designated + activated org registers straight onto the org account —
-	// still no charge (creation grace applies identically).
+	// a designated + activated org with a usable card registers straight onto
+	// the org account — still no charge (creation grace applies identically).
 	store := newFakeStore()
 	org, acct := uuid.New(), uuid.New()
 	store.accountsByOrg[org] = acct
 	store.orgDesignations[org] = cycle.OrgDesignation{OrgID: org, Funding: cycle.OrgFundingOrg}
 	store.activation[acct] = time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)
+	store.cardCount[acct] = 1 // funded: a usable card on the org account
 	sc := newFakeStripe()
 	appID := uuid.New()
 
@@ -348,27 +373,52 @@ func TestRegisterApp_FundedOrgResolvesOrgAccount(t *testing.T) {
 	require.Empty(t, sc.itemCalls)
 }
 
-func TestRegisterApp_UnfundedOrgRegistersUnbilled(t *testing.T) {
-	// An org that never designated (or has not activated yet) registers an
-	// UNBILLED roster row: Nil account, owner_org_id stamped for the later
-	// attach sweep — and NO error, app creation must not block on billing.
+func TestRegisterApp_UnfundedOrgRejected(t *testing.T) {
+	// The old UNBILLED org registration path (NULL-account roster row awaiting
+	// the attach sweep) is RETIRED for new creates (funding-gates design): an
+	// org that never designated — or designated but hasn't activated — is
+	// PAYMENT_REQUIRED, with no roster row and no timers.
 	store := newFakeStore()
 	org := uuid.New() // no designation, no account
 	sc := newFakeStripe()
 	appID := uuid.New()
 
-	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+	_, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
 		OwnerOrgID: org, AppID: appID, ModuleCount: 3,
 	})
-	require.NoError(t, err)
-	require.Equal(t, uuid.Nil, resp.AccountID)
-	require.Equal(t, uuid.Nil, store.apps[appID].AccountID)
-	require.Equal(t, org, store.appOwnerOrg[appID])
-	// Timers still synthesize (each rides its own grace, Nil-account until the
-	// attach sweep backfills the roster row); nothing charges.
-	require.Equal(t, 3, liveTimerCount(store, appID))
+	requireCode(t, err, billing.CodePaymentRequired)
+	require.NotContains(t, store.apps, appID)
+	require.NotContains(t, store.appOwnerOrg, appID)
+	require.Empty(t, store.timers)
 	require.Empty(t, sc.itemCalls)
 	require.Empty(t, sc.invoiceCalls)
+}
+
+func TestRegisterApp_SponsorFundedOrgGatesOnSponsorCard(t *testing.T) {
+	// A sponsor-funded org owns no cards — the create gate's card predicate
+	// hops to the SPONSOR's account (ChargeFundingAccount), exactly like the
+	// charge legs. Sponsor has a card → funded; sponsor's card gone → 402.
+	store := newFakeStore()
+	org, orgAcct, sponsorAcct := uuid.New(), uuid.New(), uuid.New()
+	store.accountsByOrg[org] = orgAcct
+	store.orgDesignations[org] = cycle.OrgDesignation{OrgID: org, Funding: cycle.OrgFundingSponsor, SponsorAccountID: sponsorAcct}
+	store.activation[orgAcct] = time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)
+	store.cardCount[orgAcct] = 0 // the org account itself never holds cards
+	store.cardCount[sponsorAcct] = 1
+	sc := newFakeStripe()
+	appID := uuid.New()
+
+	resp, err := appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerOrgID: org, AppID: appID,
+	})
+	require.NoError(t, err)
+	require.Equal(t, orgAcct, resp.AccountID, "attribution stays on the org account; only the card gate hops")
+
+	store.cardCount[sponsorAcct] = 0
+	_, err = appsSvc(store, sc).RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerOrgID: org, AppID: uuid.New(),
+	})
+	requireCode(t, err, billing.CodePaymentRequired)
 }
 
 func TestRegisterApp_Validation(t *testing.T) {
