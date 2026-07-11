@@ -382,6 +382,78 @@ func (q *Queries) ModuleTimerStillPending(ctx context.Context, id string) (bool,
 	return pending, err
 }
 
+const pendingAddonModuleCharges = `-- name: PendingAddonModuleCharges :many
+SELECT ranked.app_id,
+       a.name,
+       count(*)::bigint AS addon_count,
+       min(ranked.grace_expires_at)::timestamptz AS charge_eta
+FROM (
+    SELECT id, app_id, installed_at, grace_expires_at, grace_resolved,
+           row_number() OVER (ORDER BY installed_at, id) AS rn
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = $1::uuid
+      AND removed_at IS NULL
+) ranked
+JOIN ms_billing.apps a ON a.app_id = ranked.app_id
+WHERE ranked.rn > $2::int
+  AND ranked.grace_resolved = false
+  AND ranked.grace_expires_at > $3::timestamptz
+  AND ranked.installed_at <> a.created_at
+GROUP BY ranked.app_id, a.name
+ORDER BY min(ranked.grace_expires_at), ranked.app_id
+`
+
+type PendingAddonModuleChargesParams struct {
+	AccountID       string    `json:"account_id"`
+	IncludedModules int32     `json:"included_modules"`
+	Now             time.Time `json:"now"`
+}
+
+type PendingAddonModuleChargesRow struct {
+	AppID      string      `json:"app_id"`
+	Name       pgtype.Text `json:"name"`
+	AddonCount int64       `json:"addon_count"`
+	ChargeEta  time.Time   `json:"charge_eta"`
+}
+
+// PendingAddonModuleCharges is the pending ADD-ON half of the ListNewCreationCharges
+// read (本期新建立): the account's live, unresolved install timers still INSIDE
+// their own grace window as of @now — add-on charges that WILL fire (Leg 1 /
+// cycle/overage.go) but haven't yet — grouped per app. Only timers "over" per
+// the live FIFO rank (rn > @included_modules) are add-on charges at all.
+// Co-created timers (installed_at = the app's created_at) are EXCLUDED: their
+// pending charge is already represented by the app's own pending creation row
+// (the scenario-3 combined invoice bills them together), and a co-created timer
+// is in grace iff its app is — listing both would double-show one upcoming
+// charge. Deleted apps cannot appear (deletion soft-removes every timer).
+// One row per app: the frozen name, the count of pending add-on timers, and the
+// EARLIEST grace expiry as the charge ETA. Ordered soonest-first, app_id
+// breaking ties for a deterministic scan.
+func (q *Queries) PendingAddonModuleCharges(ctx context.Context, arg PendingAddonModuleChargesParams) ([]PendingAddonModuleChargesRow, error) {
+	rows, err := q.db.Query(ctx, pendingAddonModuleCharges, arg.AccountID, arg.IncludedModules, arg.Now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PendingAddonModuleChargesRow{}
+	for rows.Next() {
+		var i PendingAddonModuleChargesRow
+		if err := rows.Scan(
+			&i.AppID,
+			&i.Name,
+			&i.AddonCount,
+			&i.ChargeEta,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const softRemoveAllModuleTimersForApp = `-- name: SoftRemoveAllModuleTimersForApp :exec
 UPDATE ms_billing.app_module_overage_timers
 SET removed_at = $2
