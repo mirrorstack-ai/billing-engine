@@ -136,6 +136,13 @@ type Store interface {
 	// usable mirror card must exist on the FUNDING account before we ask
 	// Stripe to collect.
 	HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error)
+
+	// AccountStripeCustomer returns the account's Stripe Customer id ("" when
+	// none yet) — the charge legs' customer resolution (cycle.sql), reused by
+	// PayInvoice's gate/charge coherence check: the pay-time funding account's
+	// customer must still be the invoice's Stripe customer before Stripe is
+	// asked to collect (the invoice's payer was frozen at creation).
+	AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error)
 }
 
 // AddCardRequestStatus is the projection of an add_card_requests row
@@ -505,6 +512,10 @@ func (s *pgxStore) InvoiceForPayment(ctx context.Context, invoiceID, accountID u
 
 func (s *pgxStore) HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error) {
 	return s.q.HasUsableDefaultPM(ctx, accountID.String())
+}
+
+func (s *pgxStore) AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error) {
+	return s.q.AccountStripeCustomer(ctx, accountID.String())
 }
 
 // centsNumericToMicros converts the invoices mirror's NUMERIC whole Stripe
