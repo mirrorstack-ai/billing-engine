@@ -68,7 +68,15 @@ func main() {
 // buildRouter reads env vars and wires the pgxpool + verifier + store
 // + router.
 func buildRouter() *webhook.Router {
-	webhookSecret := config.MustEnv("STRIPE_WEBHOOK_SECRET")
+	// STRIPE_WEBHOOK_SECRET is OPTIONAL: EventBridge is the trusted
+	// delivery path, so an unfilled secret slot must not crash-loop this
+	// binary (which feeds the deploy canary's error alarm). Empty →
+	// stripe.NewVerifier returns the fail-closed reject-all verifier and
+	// every signed HTTP delivery is rejected until the secret is set.
+	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
+	if webhookSecret == "" {
+		slog.Warn("STRIPE_WEBHOOK_SECRET not set — HTTP webhook path is fail-closed (EventBridge is the trusted delivery path)")
+	}
 	// The fraud handlers (charge.dispute.created / radar.early_fraud_warning.created)
 	// carry only a charge id, so the webhook must retrieve the charge to resolve
 	// the disputed card — this binary now also loads the Stripe API key (a
