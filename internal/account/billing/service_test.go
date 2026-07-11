@@ -36,6 +36,17 @@ type fakeStore struct {
 	fundingOf     map[uuid.UUID]uuid.UUID
 	orgPMTargets  map[uuid.UUID]pmTarget
 
+	// unpaid-invoice surface (funding-gates wave). unpaidCount feeds
+	// GetServiceStatus's gate 4; unpaidInvoices the ListUnpaidInvoices read;
+	// payTargets the (invoice, account)-scoped PayInvoice ownership lookup;
+	// hasUsableDefPM the PayInvoice card gate; stripeCustomerOf the
+	// AccountStripeCustomer read behind the gate/charge coherence check.
+	unpaidCount      map[uuid.UUID]int
+	unpaidInvoices   map[uuid.UUID][]billing.UnpaidInvoiceRow
+	payTargets       map[uuid.UUID]fakePayTarget
+	hasUsableDefPM   map[uuid.UUID]bool
+	stripeCustomerOf map[uuid.UUID]string
+
 	// Injected failures (set per-test as needed).
 	errEnsureAccount        error
 	errSetStripeCustomer    error
@@ -48,6 +59,18 @@ type fakeStore struct {
 	errInsertAddCardRequest error
 	errSetSetupIntent       error
 	errGetAddCardRequest    error
+	errUnpaidCount          error
+	errListUnpaid           error
+	errInvoiceForPayment    error
+	errHasUsableDefPM       error
+	errAccountStripeCust    error
+}
+
+// fakePayTarget models one invoices-mirror row for InvoiceForPayment: the
+// owning account (the ownership scope) plus the pay projection.
+type fakePayTarget struct {
+	accountID uuid.UUID
+	target    billing.InvoicePayTarget
 }
 
 type fakeAddCardRequest struct {
@@ -81,6 +104,11 @@ func newFakeStore() *fakeStore {
 		fundedOrgs:       map[uuid.UUID]bool{},
 		fundingOf:        map[uuid.UUID]uuid.UUID{},
 		orgPMTargets:     map[uuid.UUID]pmTarget{},
+		unpaidCount:      map[uuid.UUID]int{},
+		unpaidInvoices:   map[uuid.UUID][]billing.UnpaidInvoiceRow{},
+		payTargets:       map[uuid.UUID]fakePayTarget{},
+		hasUsableDefPM:   map[uuid.UUID]bool{},
+		stripeCustomerOf: map[uuid.UUID]string{},
 	}
 }
 
@@ -242,6 +270,48 @@ func (s *fakeStore) PaymentMethodTargetForOrg(_ context.Context, _, paymentMetho
 	return t.stripePMID, t.stripeCustomerID, t.isDefault, true, nil
 }
 
+func (s *fakeStore) UnpaidInvoiceCount(_ context.Context, accountID uuid.UUID) (int, error) {
+	if s.errUnpaidCount != nil {
+		return 0, s.errUnpaidCount
+	}
+	return s.unpaidCount[accountID], nil
+}
+
+func (s *fakeStore) ListUnpaidInvoices(_ context.Context, accountID uuid.UUID) ([]billing.UnpaidInvoiceRow, error) {
+	if s.errListUnpaid != nil {
+		return nil, s.errListUnpaid
+	}
+	if rows, ok := s.unpaidInvoices[accountID]; ok {
+		return rows, nil
+	}
+	return []billing.UnpaidInvoiceRow{}, nil
+}
+
+func (s *fakeStore) InvoiceForPayment(_ context.Context, invoiceID, accountID uuid.UUID) (billing.InvoicePayTarget, bool, error) {
+	if s.errInvoiceForPayment != nil {
+		return billing.InvoicePayTarget{}, false, s.errInvoiceForPayment
+	}
+	t, ok := s.payTargets[invoiceID]
+	if !ok || t.accountID != accountID {
+		return billing.InvoicePayTarget{}, false, nil
+	}
+	return t.target, true, nil
+}
+
+func (s *fakeStore) HasUsableDefaultPM(_ context.Context, accountID uuid.UUID) (bool, error) {
+	if s.errHasUsableDefPM != nil {
+		return false, s.errHasUsableDefPM
+	}
+	return s.hasUsableDefPM[accountID], nil
+}
+
+func (s *fakeStore) AccountStripeCustomer(_ context.Context, accountID uuid.UUID) (string, error) {
+	if s.errAccountStripeCust != nil {
+		return "", s.errAccountStripeCust
+	}
+	return s.stripeCustomerOf[accountID], nil
+}
+
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
@@ -253,11 +323,16 @@ type fakeStripe struct {
 	customerIDToReturn       string
 	checkoutSecretToReturn   string
 	setupIntentIDToReturn    string
+	paidInvoices             []string // stripeInvoiceID per PayInvoice call
+	payStatusToReturn        string   // Stripe post-pay status; "" → "paid"
+	getInvoiceCustomer       string   // CustomerID GetInvoice reports (the invoice's frozen payer)
 	errCreateCustomer        error
 	errCreateCheckoutSession error
 	errUpdateCustomerEmail   error
 	errDetach                error
 	errSetDefault            error
+	errPayInvoice            error
+	errGetInvoice            error
 }
 
 func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID, email string) (*stripego.Customer, error) {
@@ -338,6 +413,25 @@ func (f *fakeStripe) FinalizeInvoice(context.Context, string, string) (billingst
 
 func (f *fakeStripe) FindInvoiceByRef(context.Context, string, string) (billingstripe.Invoice, bool, error) {
 	panic("FindInvoiceByRef must not be called by the billing package")
+}
+
+func (f *fakeStripe) GetInvoice(_ context.Context, stripeInvoiceID string) (billingstripe.Invoice, error) {
+	if f.errGetInvoice != nil {
+		return billingstripe.Invoice{}, f.errGetInvoice
+	}
+	return billingstripe.Invoice{ID: stripeInvoiceID, Status: "open", CustomerID: f.getInvoiceCustomer}, nil
+}
+
+func (f *fakeStripe) PayInvoice(_ context.Context, stripeInvoiceID string) (billingstripe.Invoice, error) {
+	if f.errPayInvoice != nil {
+		return billingstripe.Invoice{}, f.errPayInvoice
+	}
+	f.paidInvoices = append(f.paidInvoices, stripeInvoiceID)
+	status := f.payStatusToReturn
+	if status == "" {
+		status = "paid"
+	}
+	return billingstripe.Invoice{ID: stripeInvoiceID, Status: status}, nil
 }
 
 // --- tests ----------------------------------------------------------------

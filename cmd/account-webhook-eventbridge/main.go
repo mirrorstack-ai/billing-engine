@@ -33,6 +33,7 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	stripego "github.com/stripe/stripe-go/v85"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -65,7 +66,11 @@ func buildRouter() *webhook.Router {
 	verifier := billingstripe.NewVerifier(webhookSecret)
 	store := webhook.NewStore(pool)
 	charges := billingstripe.NewClient(stripeKey)
-	return webhook.NewRouter(verifier, store, charges, slog.Default())
+	// Serving-block notifier (funding-gates C6): pushes standing verdicts to
+	// api-platform after standing-relevant events. Disabled (log-and-skip)
+	// when APPLICATIONS_INTERNAL_URL / INTERNAL_SECRET are unset.
+	notifier := standing.NewNotifierFromEnv(pool, slog.Default())
+	return webhook.NewRouter(verifier, store, charges, slog.Default()).WithServingBlockNotifier(notifier)
 }
 
 // eventBridgeHandler is the Lambda entrypoint. It unmarshals the Stripe

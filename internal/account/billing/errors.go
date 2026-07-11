@@ -12,6 +12,13 @@ const (
 	CodeNotFound     Code = "NOT_FOUND"
 	CodeStripeError  Code = "STRIPE_ERROR"
 	CodeInternal     Code = "INTERNAL"
+	// CodePaymentRequired is the funding-gates rejection (design:
+	// docs-temp/billing-funding-gates/design.md, DECIDED 2026-07-11): the
+	// requested action needs a funded billing account (activated + usable
+	// non-fraud card) the owner doesn't have. RegisterApp returns it for
+	// unfunded creates; PayInvoice for a pay attempt with no usable default
+	// card. api-platform surfaces it as HTTP 402.
+	CodePaymentRequired Code = "PAYMENT_REQUIRED"
 )
 
 // Error is the typed error returned by every service method. The RPC
@@ -52,6 +59,14 @@ func InvalidInput(msg string) *Error {
 // to HTTP 404 on the local path.
 func NotFound(msg string) *Error {
 	return &Error{Code: CodeNotFound, Message: msg}
+}
+
+// PaymentRequired is returned when an action is gated on funding the caller
+// doesn't have (no activated account, no usable non-fraud card, or an org
+// without a resolvable funding designation). The dispatch layer maps it to
+// HTTP 402 on the local path; api-platform relays the same 402 outward.
+func PaymentRequired(msg string) *Error {
+	return &Error{Code: CodePaymentRequired, Message: msg}
 }
 
 func StripeError(msg string, wrapped error) *Error {

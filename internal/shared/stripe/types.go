@@ -96,6 +96,28 @@ type Client interface {
 	// path, so a synchronous call in the webhook handler is fine.
 	RetrieveCharge(ctx context.Context, chargeID string) (ChargeCardRef, error)
 
+	// GetInvoice retrieves one invoice by Stripe id — billing.PayInvoice's
+	// pre-pay read: the invoice's Customer was frozen at invoice creation,
+	// so the service compares Invoice.CustomerID against the pay-time
+	// funding account's customer before asking Stripe to collect (an org
+	// funding-designation switch since creation would otherwise charge the
+	// previous funding account's card behind a gate that checked the new one).
+	GetInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error)
+
+	// PayInvoice pays a finalized Stripe invoice off-session with the
+	// Customer's default payment method — the customer-initiated "Pay"
+	// action behind billing.PayInvoice (funding-gates design). Deliberately
+	// sent with NO Idempotency-Key, unlike the other money calls here:
+	// Stripe replays the SAVED response on an identical key for ~24h, so a
+	// deterministic key would replay a card DECLINE after the user fixed
+	// their card — dead-ending the pay-down recovery flow exactly when it's
+	// needed. Double-charge safety is resource-level instead: Stripe rejects
+	// paying an already-paid invoice (invoice_already_paid), which the
+	// caller absorbs as success on top of its mirror-'paid' short-circuit.
+	// Returns the post-pay invoice projection; the mirror settles via the
+	// invoice.paid webhook, never from this return value.
+	PayInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error)
+
 	// FindInvoiceByRef looks a Customer's invoice up by its ms_charge_ref
 	// metadata anchor (stamped by CreateDraftInvoice) — the crash-recovery read
 	// (review 2026-07-06, H5): Stripe prunes idempotency keys after ~24h, so a
@@ -115,12 +137,15 @@ type InvoiceItem struct {
 }
 
 // Invoice is the trust-boundary-edge projection of a Stripe invoice the charge
-// path mirrors into ms_billing.invoices: id, status, and the amounts (whole
-// cents — Stripe minor units). Kept stripe-go-free so the cycle consumer stays
-// off the SDK; the webhook reconciliation path (PR #7) reads the full stripe-go
-// Event separately.
+// path mirrors into ms_billing.invoices: id, owning customer, status, and the
+// amounts (whole cents — Stripe minor units). Kept stripe-go-free so the cycle
+// consumer stays off the SDK; the webhook reconciliation path (PR #7) reads the
+// full stripe-go Event separately. CustomerID rides the default (unexpanded)
+// retrieve — an id-only *Customer — which is all the pre-pay coherence check
+// reads.
 type Invoice struct {
 	ID         string
+	CustomerID string
 	Status     string
 	AmountDue  int64
 	AmountPaid int64

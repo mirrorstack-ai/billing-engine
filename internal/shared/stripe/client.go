@@ -213,6 +213,39 @@ func (c *realClient) FinalizeInvoice(ctx context.Context, invoiceID, idemKey str
 	return projectInvoice(inv), nil
 }
 
+// GetInvoice retrieves an invoice and projects it. The default (unexpanded)
+// retrieve carries customer as an id-only *Customer — all the pre-pay
+// gate/charge coherence check needs (see the interface comment).
+func (c *realClient) GetInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error) {
+	params := &stripego.InvoiceParams{}
+	params.Context = ctx
+	inv, err := c.sc.Invoices.Get(stripeInvoiceID, params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
+// PayInvoice pays a finalized invoice with the Customer's default payment
+// method (Stripe's default when no payment_method param is sent). NO
+// Idempotency-Key — deliberately, unlike the other money calls here: Stripe
+// replays the saved response on an identical key for ~24h, declines included,
+// so a deterministic key would replay the original decline after the user
+// fixed their card (the exact retry this RPC exists for). Double-charge
+// protection is resource-level: Stripe errors invoice_already_paid on a paid
+// invoice (see the interface comment). Projected to a plain Invoice — the
+// caller reads status ("paid" vs still-processing) and nothing else; the
+// mirror is settled by the invoice webhook.
+func (c *realClient) PayInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error) {
+	params := &stripego.InvoicePayParams{}
+	params.Context = ctx
+	inv, err := c.sc.Invoices.Pay(stripeInvoiceID, params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
 // FindInvoiceByRef searches the Customer's invoices for the ms_charge_ref
 // metadata anchor — the crash-recovery read for retries past Stripe's ~24h
 // idempotency-key window (see the interface comment). Uses the Stripe Search
@@ -237,15 +270,20 @@ func (c *realClient) FindInvoiceByRef(ctx context.Context, custID, ref string) (
 }
 
 // projectInvoice maps a stripe-go invoice to the trust-boundary-edge Invoice
-// projection the cycle consumer mirrors.
+// projection the cycle consumer mirrors. Customer arrives unexpanded (only
+// .ID set), which is all CustomerID carries.
 func projectInvoice(inv *stripego.Invoice) Invoice {
-	return Invoice{
+	out := Invoice{
 		ID:         inv.ID,
 		Status:     string(inv.Status),
 		AmountDue:  inv.AmountDue,
 		AmountPaid: inv.AmountPaid,
 		Currency:   string(inv.Currency),
 	}
+	if inv.Customer != nil {
+		out.CustomerID = inv.Customer.ID
+	}
+	return out
 }
 
 // NewVerifier returns a Verifier for the configured webhook signing

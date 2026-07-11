@@ -39,3 +39,45 @@ WHERE account_id = @account_id::uuid
        OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid))
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
+
+-- The UNPAID predicate (funding-gates design, DECIDED 2026-07-11) shared by
+-- the two queries below: still-collectible-but-not-collected mirror rows —
+-- status 'open' (finalized, Stripe smart-retrying) or 'uncollectible' (Stripe
+-- gave up, the account still owes) — with amount_due > 0 (a zero-total
+-- invoice was never money owed). 'draft' (never finalized), 'paid' and 'void'
+-- (debt forgiven) are clean. Narrower than AccountHasUnpaidInvoice
+-- (billing.sql) only by the amount_due > 0 term: standing and the Pay flow
+-- must never block on / offer to pay a zero-amount row.
+
+-- CountUnpaidInvoicesForAccount feeds GetServiceStatus's unpaid gate
+-- (eligibility gate 4: >= 2 unpaid → blocked).
+-- name: CountUnpaidInvoicesForAccount :one
+SELECT COUNT(*)::int AS unpaid_count
+FROM ms_billing.invoices
+WHERE account_id = $1
+  AND status IN ('open', 'uncollectible')
+  AND amount_due > 0;
+
+-- ListUnpaidInvoicesForAccount is the read behind the ListUnpaidInvoices RPC
+-- (the post-card-bind "pay N unpaid invoices?" prompt + the invoices table's
+-- Pay affordance). Oldest-first so a sequential pay-all settles the oldest
+-- debt first. Unpaid counts are gate-bounded small (the serving gate blocks
+-- at 2), so no pagination.
+-- name: ListUnpaidInvoicesForAccount :many
+SELECT id, COALESCE(number, '')::text AS number, amount_due, created_at
+FROM ms_billing.invoices
+WHERE account_id = $1
+  AND status IN ('open', 'uncollectible')
+  AND amount_due > 0
+ORDER BY created_at ASC, id ASC;
+
+-- InvoiceForPayment resolves a mirror invoice by (id, account) for the
+-- PayInvoice RPC — the account scope IS the ownership check (a foreign or
+-- unknown id returns no row → NOT_FOUND, never leaking existence). Status
+-- rides along so the service can short-circuit an already-paid row and
+-- reject non-payable states before touching Stripe.
+-- name: InvoiceForPayment :one
+SELECT stripe_invoice_id, status
+FROM ms_billing.invoices
+WHERE id = $1
+  AND account_id = $2;

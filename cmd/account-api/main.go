@@ -134,6 +134,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.svc.SetDefaultPaymentMethod(ctx, req)
 
+	case "ListUnpaidInvoices":
+		var req billing.ListUnpaidInvoicesRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.ListUnpaidInvoices(ctx, req)
+
+	case "PayInvoice":
+		var req billing.PayInvoiceRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.PayInvoice(ctx, req)
+
 	case "RecordUsage":
 		var req usage.RecordUsageRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -340,6 +354,8 @@ func httpStatusForError(err error) int {
 		switch be.Code {
 		case billing.CodeInvalidInput:
 			return http.StatusBadRequest
+		case billing.CodePaymentRequired:
+			return http.StatusPaymentRequired
 		case billing.CodeNotFound:
 			return http.StatusNotFound
 		case billing.CodeStripeError:
@@ -455,6 +471,13 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// owns; NO Stripe round-trip), so it shares the control-plane
 		// credential + route group with the other account-billing reads.
 		r.Post("/v1/billing.ListInvoices", makeHTTPHandler(d, "ListInvoices"))
+		// Unpaid-invoice surface (funding-gates wave): the post-card-bind
+		// "pay N unpaid invoices?" prompt reads ListUnpaidInvoices; PayInvoice
+		// pays ONE open invoice with the default card (mirror settles via the
+		// invoice webhook). Control-plane calls from api-platform → the
+		// internal secret + this route group, like the other billing RPCs.
+		r.Post("/v1/billing.ListUnpaidInvoices", makeHTTPHandler(d, "ListUnpaidInvoices"))
+		r.Post("/v1/billing.PayInvoice", makeHTTPHandler(d, "PayInvoice"))
 		// New-app charges (本期新建立): the apps CREATED in the resolved period
 		// whose base is charged via the creation-proration leg — settled (invoice
 		// fired) + in-grace pending. Read-only over the apps + invoices mirrors
