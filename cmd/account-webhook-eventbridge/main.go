@@ -45,15 +45,15 @@ func main() {
 }
 
 // buildRouter reads env vars and wires the pgxpool + verifier + store +
-// router. Mirrors cmd/account-webhook's buildRouter() exactly, including
-// still requiring STRIPE_WEBHOOK_SECRET: ProcessTrusted never calls the
-// verifier, but Router's constructor still requires a non-nil one (all
-// three dependencies are required, nil panics at construction — see
-// webhook.NewRouter), and the HTTPS binary alongside this one still needs a
-// live verifier during dual-run. Leave this alone until a later, separate
-// cleanup PR removes the HTTPS path entirely (per the migration plan).
+// router. Mirrors cmd/account-webhook's buildRouter() exactly.
+// STRIPE_WEBHOOK_SECRET is OPTIONAL here by construction: ProcessTrusted
+// never calls the verifier (EventBridge partner events arrive pre-trusted),
+// but Router's constructor requires a non-nil one — an empty secret wires
+// stripe.NewVerifier's fail-closed reject-all verifier, which this binary
+// never reaches. The HTTPS binary stays deployed for dual-run; removing it
+// entirely remains the later cleanup (per the migration plan).
 func buildRouter() *webhook.Router {
-	webhookSecret := config.MustEnv("STRIPE_WEBHOOK_SECRET")
+	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
 	// The fraud handlers (charge.dispute.created / radar.early_fraud_warning.created)
 	// carry only a charge id, so the webhook must retrieve the charge to resolve
 	// the disputed card — this binary also loads the Stripe API key (a

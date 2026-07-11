@@ -2,6 +2,7 @@ package stripe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	stripego "github.com/stripe/stripe-go/v85"
@@ -251,8 +252,28 @@ func projectInvoice(inv *stripego.Invoice) Invoice {
 // secret. webhookSecret is distinct from the main Stripe secret key
 // and is rotated independently (Stripe Dashboard → Developers →
 // Webhooks → signing secret).
+//
+// An EMPTY secret returns a fail-closed Verifier that rejects every
+// event. This branch is load-bearing, not a convenience: an empty-key
+// realVerifier would be fail-OPEN — ConstructEvent HMACs with "" and an
+// attacker who guesses the secret is unset can sign payloads that PASS.
+// It also lets the webhook binaries boot on a deployment whose secret
+// slot is not yet filled (EventBridge is the trusted delivery path;
+// ProcessTrusted never calls the verifier), instead of crash-looping at
+// init and feeding the canary error alarm.
 func NewVerifier(webhookSecret string) Verifier {
+	if webhookSecret == "" {
+		return rejectAllVerifier{}
+	}
 	return &realVerifier{secret: webhookSecret}
+}
+
+// rejectAllVerifier is the no-secret posture: every signed-delivery
+// verification fails. Trusted (EventBridge) processing never reaches it.
+type rejectAllVerifier struct{}
+
+func (rejectAllVerifier) Verify([]byte, string) (stripego.Event, error) {
+	return stripego.Event{}, errors.New("stripe webhook signing secret not configured — signed deliveries are rejected (fail closed)")
 }
 
 type realVerifier struct {
