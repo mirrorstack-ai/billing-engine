@@ -25,11 +25,11 @@ import (
 //     on the SAME combined invoice, proration.go scenario 3), the invoice
 //     number/id, and the invoice created_at as the "recorded at".
 //   - PENDING: the app is still in its creation grace (uncharged, live,
-//     un-skipped) — shown with a charge ETA (created_at + GraceDays) and NO
-//     amount (there is no side-effect-free proration-preview helper; inventing a
-//     second money formula would risk diverging from what actually charges, so
-//     the UI shows the ETA, not a number). Pending rows exist ONLY for the
-//     CURRENT live window — a past period has no still-in-grace apps.
+//     un-skipped) — shown with a charge ETA (created_at + GraceDays) and the
+//     PROJECTED accruing base fee (the flat plan base; the exact prorated
+//     amount is the sweep's to mint, so this is an estimate like every other
+//     un-invoiced line). Pending rows exist ONLY for the CURRENT live window —
+//     a past period has no still-in-grace apps.
 //
 // Read-only over the apps mirror + the invoices mirror this service already
 // owns; NO Stripe round-trip, NO schema change.
@@ -74,8 +74,10 @@ type ListNewCreationChargesRequest struct {
 // IncludedModules), the count of add-on modules beyond the bundled allowance;
 // BaseFeeMicros + AddonMicros partition AmountMicros for a settled row
 // (BaseFeeMicros is the settled creation base, AddonMicros the co-created
-// over-module component on the same invoice). A pending row reports both money
-// components as 0 (nothing charged yet) but still surfaces Name + AddonModuleCount.
+// over-module component on the same invoice). A pending row carries the
+// projected flat base in AmountMicros/BaseFeeMicros and AddonMicros 0 (the
+// overage is not projected — only its COUNT surfaces), plus Name +
+// AddonModuleCount.
 type NewCreationCharge struct {
 	AppID            uuid.UUID  `json:"app_id"`
 	Status           string     `json:"status"`
