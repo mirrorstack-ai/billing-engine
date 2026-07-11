@@ -617,9 +617,13 @@ func TestGetAppBill_AppDeletedBeforePeriodShowsZeroBase(t *testing.T) {
 	require.EqualValues(t, 700, resp.TotalMicros, "usage still renders; only the base zeroes")
 }
 
-func TestGetAppBill_AppDeletedDuringPeriodKeepsSpentBase(t *testing.T) {
-	// Deleted DURING the period → that period's base was already charged in
-	// advance and is spent (no refunds, D1e): the display keeps the full base.
+func TestGetAppBill_AppDeletedDuringPeriodZeroesEstimatedBase(t *testing.T) {
+	// Deleted DURING the period with NO snapshot (base never charged) → the
+	// estimate previews the charge legs, and both skip deleted apps (advance leg
+	// rosters live apps only; the creation sweep re-checks not-deleted), so the
+	// base shows 0 regardless of when the deletion happened. A base that WAS
+	// charged before the deletion is the snapshot path and keeps displaying what
+	// was invoiced (TestGetAccountBill_FrozenNameAndDeletedFlagOnChargedPeriod).
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -634,7 +638,7 @@ func TestGetAppBill_AppDeletedDuringPeriodKeepsSpentBase(t *testing.T) {
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, PeriodID: pid})
 	require.NoError(t, err)
-	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros)
+	require.Zero(t, resp.BaseFeeMicros, "an uncharged base never bills after deletion → preview 0")
 }
 
 func TestGetAppBill_UnmirroredAppShowsFlatBase(t *testing.T) {
