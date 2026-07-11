@@ -62,7 +62,9 @@ const (
 //  4. computes each app through computeAppBill — EXACTLY what GetAppBill
 //     computes for that (owner, app, window): snapshot-first base fee, module
 //     usage, infra with the same 1.2× markup source — and sums the totals
-//     (apps[].total_micros are PRE-credit, see AccountAppBill),
+//     (apps[].total_micros are PRE-credit, see AccountAppBill); a DELETED app
+//     whose row totals zero (base estimate zeroed, no usage/infra arrears) is
+//     dropped from the roster — nothing of it will ever reach an invoice,
 //  5. applies the PaaS credit ONCE at the ACCOUNT level: the same ACTIVE-SaaS
 //     gate as the per-app credit (v1 has no subscription system → always 0),
 //     capped at ModuleUsageTotal + InfraTotal so it never eats base fees,
@@ -157,6 +159,14 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		if err != nil {
 			return nil, err
 		}
+		total := parts.BaseFeeMicros + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros
+		// A deleted app contributes NOTHING to this bill once its estimated base
+		// zeroes (computeAppBill) and it has no usage/infra arrears — drop the
+		// row rather than rendering a dead $0 line. A deleted app WITH arrears
+		// stays: its usage still bills at the boundary (cycle/charge.go).
+		if parts.IsDeleted && total == 0 {
+			continue
+		}
 		apps = append(apps, AccountAppBill{
 			AppID:             appID,
 			Name:              parts.Name,
@@ -166,7 +176,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			InfraMicros:       parts.InfraTotalMicros,
 			// PRE-credit by contract: the account-level credit below is never
 			// allocated back per-app.
-			TotalMicros: parts.BaseFeeMicros + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros,
+			TotalMicros: total,
 		})
 		baseFeeTotal += parts.BaseFeeMicros
 		moduleUsageTotal += parts.ModuleUsageTotalMicros
