@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 )
@@ -176,18 +177,21 @@ func TestListUnpaidInvoices_OrgResolvesThroughDesignation(t *testing.T) {
 
 // --- PayInvoice (C5) -----------------------------------------------------------
 
-// paySetup seeds a funded user account owning one unpaid invoice and returns
-// (store, userID, invoiceID). Tests weaken from this payable baseline.
-func paySetup(status string) (*fakeStore, uuid.UUID, uuid.UUID) {
+// paySetup seeds a funded user account owning one unpaid invoice, plus a
+// Stripe fake whose invoice customer matches the funding account's (the
+// gate/charge coherence baseline), and returns (store, sc, userID, invoiceID).
+// Tests weaken from this payable baseline.
+func paySetup(status string) (*fakeStore, *fakeStripe, uuid.UUID, uuid.UUID) {
 	store := newFakeStore()
 	userID, accountID, invoiceID := uuid.New(), uuid.New(), uuid.New()
 	store.accountsByUser[userID] = fakeAccount{id: accountID, stripeCustomerID: "cus_pay"}
+	store.stripeCustomerOf[accountID] = "cus_pay"
 	store.hasUsableDefPM[accountID] = true
 	store.payTargets[invoiceID] = fakePayTarget{
 		accountID: accountID,
 		target:    billing.InvoicePayTarget{StripeInvoiceID: "in_123", Status: status},
 	}
-	return store, userID, invoiceID
+	return store, &fakeStripe{getInvoiceCustomer: "cus_pay"}, userID, invoiceID
 }
 
 func TestPayInvoice_Validation(t *testing.T) {
@@ -198,23 +202,20 @@ func TestPayInvoice_Validation(t *testing.T) {
 	requireBillingCode(t, err, billing.CodeInvalidInput)
 }
 
-func TestPayInvoice_HappyPath_PaysWithDeterministicIdemKey(t *testing.T) {
-	store, userID, invoiceID := paySetup("open")
-	sc := &fakeStripe{}
+func TestPayInvoice_HappyPath_PaysStripeInvoice(t *testing.T) {
+	store, sc, userID, invoiceID := paySetup("open")
 	svc := billing.NewService(store, sc, "")
 
 	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
 	require.NoError(t, err)
 	require.Equal(t, "paid", resp.Status)
-	require.Equal(t, []string{"in_123|payinv-" + invoiceID.String()}, sc.paidInvoices,
-		"pays the Stripe invoice under the deterministic payinv-<mirror uuid> idempotency key")
+	require.Equal(t, []string{"in_123"}, sc.paidInvoices)
 }
 
 func TestPayInvoice_UncollectibleIsPayable(t *testing.T) {
 	// 'uncollectible' means Stripe gave up retrying, not that the debt is
 	// gone — the manual Pay action is exactly the recovery for it.
-	store, userID, invoiceID := paySetup("uncollectible")
-	sc := &fakeStripe{}
+	store, sc, userID, invoiceID := paySetup("uncollectible")
 	svc := billing.NewService(store, sc, "")
 
 	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
@@ -224,8 +225,8 @@ func TestPayInvoice_UncollectibleIsPayable(t *testing.T) {
 }
 
 func TestPayInvoice_PendingWhenStripeReportsUnsettled(t *testing.T) {
-	store, userID, invoiceID := paySetup("open")
-	sc := &fakeStripe{payStatusToReturn: "open"} // async PM: pay accepted, not settled
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.payStatusToReturn = "open" // async PM: pay accepted, not settled
 	svc := billing.NewService(store, sc, "")
 
 	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
@@ -234,12 +235,11 @@ func TestPayInvoice_PendingWhenStripeReportsUnsettled(t *testing.T) {
 }
 
 func TestPayInvoice_ForeignOrUnknownInvoice_NotFound(t *testing.T) {
-	store, userID, _ := paySetup("open")
+	store, sc, userID, _ := paySetup("open")
 	// A second user's account, so the owner resolves but owns nothing.
 	stranger, strangerAcct := uuid.New(), uuid.New()
 	store.accountsByUser[stranger] = fakeAccount{id: strangerAcct}
 	store.hasUsableDefPM[strangerAcct] = true
-	sc := &fakeStripe{}
 	svc := billing.NewService(store, sc, "")
 
 	// Unknown id.
@@ -262,11 +262,10 @@ func TestPayInvoice_ForeignOrUnknownInvoice_NotFound(t *testing.T) {
 }
 
 func TestPayInvoice_NoUsableCard_PaymentRequired(t *testing.T) {
-	store, userID, invoiceID := paySetup("open")
+	store, sc, userID, invoiceID := paySetup("open")
 	for k := range store.hasUsableDefPM {
 		store.hasUsableDefPM[k] = false
 	}
-	sc := &fakeStripe{}
 	svc := billing.NewService(store, sc, "")
 
 	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
@@ -277,8 +276,7 @@ func TestPayInvoice_NoUsableCard_PaymentRequired(t *testing.T) {
 func TestPayInvoice_AlreadyPaid_ShortCircuitsWithoutStripe(t *testing.T) {
 	// The retry-after-success path: the mirror already settled 'paid' (via the
 	// webhook) → answer "paid" idempotently, never re-hit Stripe.
-	store, userID, invoiceID := paySetup("paid")
-	sc := &fakeStripe{}
+	store, sc, userID, invoiceID := paySetup("paid")
 	svc := billing.NewService(store, sc, "")
 
 	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
@@ -289,8 +287,7 @@ func TestPayInvoice_AlreadyPaid_ShortCircuitsWithoutStripe(t *testing.T) {
 
 func TestPayInvoice_NonPayableStates_InvalidInput(t *testing.T) {
 	for _, status := range []string{"void", "draft"} {
-		store, userID, invoiceID := paySetup(status)
-		sc := &fakeStripe{}
+		store, sc, userID, invoiceID := paySetup(status)
 		svc := billing.NewService(store, sc, "")
 
 		_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
@@ -300,18 +297,117 @@ func TestPayInvoice_NonPayableStates_InvalidInput(t *testing.T) {
 }
 
 func TestPayInvoice_StripeError_Surfaced(t *testing.T) {
-	store, userID, invoiceID := paySetup("open")
-	sc := &fakeStripe{errPayInvoice: errors.New("card_declined")}
+	// A non-card Stripe failure (outage, auth, API error) stays STRIPE_ERROR —
+	// the 502 posture is honest for problems that are Stripe's, not the card's.
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = errors.New("stripe: connection reset")
 	svc := billing.NewService(store, sc, "")
 
 	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
 	requireBillingCode(t, err, billing.CodeStripeError)
 }
 
+func TestPayInvoice_CardDecline_MapsToPaymentRequired(t *testing.T) {
+	// A decline is the USER's card problem: it must surface as
+	// PAYMENT_REQUIRED (402, rendered as a payment problem) carrying the
+	// issuer's decline reason — not STRIPE_ERROR (502, reads as an outage).
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = &stripego.Error{
+		Type:        stripego.ErrorTypeCard,
+		Code:        stripego.ErrorCodeCardDeclined,
+		DeclineCode: "insufficient_funds",
+		Msg:         "Your card has insufficient funds.",
+	}
+	svc := billing.NewService(store, sc, "")
+
+	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	requireBillingCode(t, err, billing.CodePaymentRequired)
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Contains(t, be.Message, "insufficient_funds", "the decline reason must reach the client")
+}
+
+func TestPayInvoice_OffSession3DSRequired_MapsToPaymentRequired(t *testing.T) {
+	// An off-session 3DS challenge is also the card needing the user, not a
+	// Stripe fault — same 402 posture as a decline.
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = &stripego.Error{
+		Type: stripego.ErrorTypeInvalidRequest,
+		Code: stripego.ErrorCodeInvoicePaymentIntentRequiresAction,
+	}
+	svc := billing.NewService(store, sc, "")
+
+	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	requireBillingCode(t, err, billing.CodePaymentRequired)
+}
+
+func TestPayInvoice_DeclineThenRetry_ReachesStripeAgain(t *testing.T) {
+	// The unblock-recovery flow PayInvoice exists for: a decline, the user
+	// fixes their card, the retry must reach Stripe as a FRESH attempt. (This
+	// is why the Stripe call carries no idempotency key — a deterministic key
+	// would make Stripe replay the saved decline for ~24h.)
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = &stripego.Error{Type: stripego.ErrorTypeCard, DeclineCode: "insufficient_funds"}
+	svc := billing.NewService(store, sc, "")
+
+	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	requireBillingCode(t, err, billing.CodePaymentRequired)
+
+	sc.errPayInvoice = nil // card fixed
+	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	require.NoError(t, err)
+	require.Equal(t, "paid", resp.Status)
+	require.Equal(t, []string{"in_123"}, sc.paidInvoices, "the retry charged for real")
+}
+
+func TestPayInvoice_ConcurrentLoser_AlreadyPaidAbsorbedAsPaid(t *testing.T) {
+	// Concurrent double-submit: both requests pass the mirror 'paid'
+	// short-circuit before the webhook settles it; Stripe's resource-level
+	// guard rejects the loser with invoice_already_paid — absorbed as the
+	// same {"status":"paid"} echo the winner got, never an error.
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = &stripego.Error{
+		Type: stripego.ErrorTypeInvalidRequest,
+		Code: "invoice_already_paid",
+	}
+	svc := billing.NewService(store, sc, "")
+
+	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	require.NoError(t, err)
+	require.Equal(t, "paid", resp.Status)
+}
+
+func TestPayInvoice_FundingSwitch_CustomerMismatch_Rejected(t *testing.T) {
+	// The invoice's Stripe customer was frozen at creation; after an org
+	// funding-designation switch the gates check the NEW funding account
+	// while Stripe would collect from the OLD customer's card. PayInvoice
+	// must refuse — never silently charge the stale customer.
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.getInvoiceCustomer = "cus_previous_sponsor"
+	svc := billing.NewService(store, sc, "")
+
+	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	requireBillingCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, sc.paidInvoices, "no money moves on a gate/charge mismatch")
+}
+
+func TestPayInvoice_InvoiceCustomerLookupFails_StripeError(t *testing.T) {
+	// The coherence check is load-bearing: if the pre-pay invoice read fails,
+	// the pay is refused rather than attempted unverified.
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errGetInvoice = errors.New("stripe: connection reset")
+	svc := billing.NewService(store, sc, "")
+
+	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	requireBillingCode(t, err, billing.CodeStripeError)
+	require.Empty(t, sc.paidInvoices)
+}
+
 func TestPayInvoice_SponsorFundedOrg_CardGateHopsToSponsor(t *testing.T) {
 	// The org's invoice is paid with the SPONSOR's default card: the card gate
 	// must check the funding account (the invoice's Stripe customer lives
-	// there — same hop as the charge legs).
+	// there — same hop as the charge legs), and the coherence check compares
+	// the invoice's customer against the SPONSOR's.
 	store := newFakeStore()
 	orgID, orgAcct, sponsorAcct, invoiceID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	store.accountsByOrg[orgID] = fakeAccount{id: orgAcct}
@@ -319,11 +415,12 @@ func TestPayInvoice_SponsorFundedOrg_CardGateHopsToSponsor(t *testing.T) {
 	store.fundingOf[orgAcct] = sponsorAcct
 	store.hasUsableDefPM[orgAcct] = false // org account owns no cards
 	store.hasUsableDefPM[sponsorAcct] = true
+	store.stripeCustomerOf[sponsorAcct] = "cus_sponsor"
 	store.payTargets[invoiceID] = fakePayTarget{
 		accountID: orgAcct,
 		target:    billing.InvoicePayTarget{StripeInvoiceID: "in_org", Status: "open"},
 	}
-	sc := &fakeStripe{}
+	sc := &fakeStripe{getInvoiceCustomer: "cus_sponsor"}
 	svc := billing.NewService(store, sc, "")
 
 	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerOrgID: orgID, InvoiceID: invoiceID})

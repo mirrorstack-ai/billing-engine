@@ -2,9 +2,11 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
+	stripego "github.com/stripe/stripe-go/v85"
 )
 
 // ============================================================================
@@ -126,9 +128,19 @@ type PayInvoiceResponse struct {
 //  3. require a usable default card on the FUNDING account (the sponsor hop
 //     for sponsor-funded orgs — Stripe collects from the invoice customer's
 //     default PM, which lives there) — else PAYMENT_REQUIRED;
-//  4. pay via Stripe under the deterministic idempotency key
-//     "payinv-<mirror uuid>": a client retry replays the original attempt
-//     instead of double-charging.
+//  4. verify the Stripe invoice's customer IS the pay-time funding account's
+//     customer — the invoice's payer was frozen at creation, so an org
+//     funding-designation switch since then would otherwise charge the
+//     PREVIOUS funding account's card behind a gate that checked the new
+//     one; a mismatch is INVALID_INPUT, never a silent stale charge;
+//  5. pay via Stripe with NO idempotency key: Stripe replays a keyed
+//     response — a decline included — for ~24h, which would dead-end the
+//     fix-card-then-retry recovery this RPC exists for. Double-pay safety is
+//     resource-level instead: the mirror 'paid' short-circuit (step 2)
+//     absorbs the client double-tap, and a concurrent double-submit loses to
+//     Stripe's invoice_already_paid, absorbed as {"status":"paid"}. Card
+//     declines map to PAYMENT_REQUIRED (a 402 the UI renders as a payment
+//     problem), never STRIPE_ERROR (a 502 that reads as a Stripe outage).
 //
 // The mirror row is NOT touched here — the invoice.paid webhook settles it
 // (the webhook is the mirror's single status writer).
@@ -176,15 +188,69 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 		return nil, PaymentRequired("no usable payment card on file; add a card before paying")
 	}
 
-	inv, err := s.stripe.PayInvoice(ctx, target.StripeInvoiceID, "payinv-"+req.InvoiceID.String())
+	// Gate/charge coherence: Stripe collects from the INVOICE's customer,
+	// frozen at invoice creation — while the gates above checked the owner's
+	// CURRENT funding account. After an org funding-designation switch the
+	// two diverge, and paying would charge the previous funding account's
+	// card. The mirror doesn't carry the invoice's customer, so read it from
+	// Stripe and compare before any money moves.
+	fundingCustomer, err := s.store.AccountStripeCustomer(ctx, fundingID)
 	if err != nil {
-		return nil, StripeError("pay invoice failed", err)
+		return nil, Internal("funding customer lookup failed", err)
+	}
+	stripeInv, err := s.stripe.GetInvoice(ctx, target.StripeInvoiceID)
+	if err != nil {
+		return nil, StripeError("invoice lookup failed", err)
+	}
+	if fundingCustomer == "" || stripeInv.CustomerID != fundingCustomer {
+		return nil, InvalidInput("invoice belongs to a previous funding account — contact support")
+	}
+
+	inv, err := s.stripe.PayInvoice(ctx, target.StripeInvoiceID)
+	if err != nil {
+		return payFailure(err)
 	}
 	status := "pending"
 	if inv.Status == "paid" {
 		status = "paid"
 	}
 	return &PayInvoiceResponse{Status: status}, nil
+}
+
+// payFailure maps a failed Stripe Invoices.Pay to the RPC surface. Declines
+// and off-session 3DS challenges are the USER's card problem — mapped to
+// PAYMENT_REQUIRED (402, which web-account's pay path renders as a payment
+// problem), never STRIPE_ERROR (502, indistinguishable from a Stripe outage).
+// The concurrent double-submit loser (both requests passed the mirror 'paid'
+// short-circuit before the webhook settled it) hits Stripe's resource-level
+// guard, invoice_already_paid, and is absorbed as the same {"status":"paid"}
+// echo the winner got — not an error.
+func payFailure(err error) (*PayInvoiceResponse, error) {
+	var se *stripego.Error
+	if !errors.As(err, &se) {
+		return nil, StripeError("pay invoice failed", err)
+	}
+	// Not in v85's generated ErrorCode enum; match Stripe's wire string.
+	if se.Code == "invoice_already_paid" {
+		return &PayInvoiceResponse{Status: "paid"}, nil
+	}
+	if se.Type == stripego.ErrorTypeCard || se.DeclineCode != "" {
+		// Prefer the issuer's decline reason; fall back to the error code
+		// (e.g. expired_card arrives without a decline_code).
+		reason := string(se.DeclineCode)
+		if reason == "" {
+			reason = string(se.Code)
+		}
+		if reason == "" {
+			reason = "card_declined"
+		}
+		return nil, PaymentRequired("card declined: " + reason)
+	}
+	if se.Code == stripego.ErrorCodeInvoicePaymentIntentRequiresAction {
+		// Off-session 3DS challenge — the card needs the user, not Stripe.
+		return nil, PaymentRequired("card declined: authentication_required")
+	}
+	return nil, StripeError("pay invoice failed", err)
 }
 
 // invoiceOwnerAccount resolves the account whose invoices the (user XOR org)
