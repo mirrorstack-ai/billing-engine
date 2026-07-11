@@ -126,6 +126,10 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 		r.log.ErrorContext(ctx, "payment_method.attached resolve add-card request failed", "event_id", event.ID, "error", err)
 		return Result{HTTPStatus: 500, Status: StatusInternal}
 	}
+
+	// A new card can flip the standing verdict (no-card → unblocked): push the
+	// owner's current serving-block verdict, best-effort (C6).
+	r.notifyCustomer(ctx, pm.Customer.ID)
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 
@@ -190,7 +194,14 @@ func (r *Router) handlePaymentMethodDetached(ctx context.Context, event stripego
 	}
 	if !found {
 		r.log.InfoContext(ctx, "payment_method.detached no-op: pm not in mirror", "event_id", event.ID, "stripe_payment_method_id", pm.ID)
+		return Result{HTTPStatus: 200, Status: StatusOK}
 	}
+
+	// Losing a card can flip the standing verdict (last card gone → blocked):
+	// push the owner's current serving-block verdict, best-effort (C6). The
+	// detached event's customer field is unreliable post-detach, so the owner
+	// resolves through the just-soft-deleted mirror row instead.
+	r.notifyPaymentMethod(ctx, pm.ID)
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 
@@ -286,6 +297,12 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 			r.log.InfoContext(ctx, "invoice.paid relaxed account prepaid → arrears", "event_id", event.ID, "stripe_invoice_id", inv.ID)
 		}
 	}
+
+	// Any invoice status move can flip the standing verdict (unpaid count,
+	// streak, first-charge): push the owner's current serving-block verdict,
+	// best-effort (C6). Fired on every lifecycle event rather than diffed —
+	// the receiving side is idempotent (see package standing).
+	r.notifyInvoice(ctx, inv.ID)
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 
@@ -363,6 +380,11 @@ func (r *Router) flagFraudForCharge(ctx context.Context, event stripego.Event, c
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
 	}
 	r.log.InfoContext(ctx, "card fraud-blocked", "event_id", event.ID, "type", event.Type, "reason", reason)
+
+	// A fraud-flagged card stops counting as usable, which can flip the
+	// standing verdict: push the owner's current serving-block verdict,
+	// best-effort (C6).
+	r.notifyCustomer(ctx, ref.StripeCustomerID)
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 

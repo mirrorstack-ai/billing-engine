@@ -12,6 +12,61 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countUnpaidInvoicesForAccount = `-- name: CountUnpaidInvoicesForAccount :one
+
+SELECT COUNT(*)::int AS unpaid_count
+FROM ms_billing.invoices
+WHERE account_id = $1
+  AND status IN ('open', 'uncollectible')
+  AND amount_due > 0
+`
+
+// The UNPAID predicate (funding-gates design, DECIDED 2026-07-11) shared by
+// the two queries below: still-collectible-but-not-collected mirror rows —
+// status 'open' (finalized, Stripe smart-retrying) or 'uncollectible' (Stripe
+// gave up, the account still owes) — with amount_due > 0 (a zero-total
+// invoice was never money owed). 'draft' (never finalized), 'paid' and 'void'
+// (debt forgiven) are clean. Narrower than AccountHasUnpaidInvoice
+// (billing.sql) only by the amount_due > 0 term: standing and the Pay flow
+// must never block on / offer to pay a zero-amount row.
+// CountUnpaidInvoicesForAccount feeds GetServiceStatus's unpaid gate
+// (eligibility gate 4: >= 2 unpaid → blocked).
+func (q *Queries) CountUnpaidInvoicesForAccount(ctx context.Context, accountID string) (int32, error) {
+	row := q.db.QueryRow(ctx, countUnpaidInvoicesForAccount, accountID)
+	var unpaid_count int32
+	err := row.Scan(&unpaid_count)
+	return unpaid_count, err
+}
+
+const invoiceForPayment = `-- name: InvoiceForPayment :one
+SELECT stripe_invoice_id, status
+FROM ms_billing.invoices
+WHERE id = $1
+  AND account_id = $2
+`
+
+type InvoiceForPaymentParams struct {
+	ID        string `json:"id"`
+	AccountID string `json:"account_id"`
+}
+
+type InvoiceForPaymentRow struct {
+	StripeInvoiceID string `json:"stripe_invoice_id"`
+	Status          string `json:"status"`
+}
+
+// InvoiceForPayment resolves a mirror invoice by (id, account) for the
+// PayInvoice RPC — the account scope IS the ownership check (a foreign or
+// unknown id returns no row → NOT_FOUND, never leaking existence). Status
+// rides along so the service can short-circuit an already-paid row and
+// reject non-payable states before touching Stripe.
+func (q *Queries) InvoiceForPayment(ctx context.Context, arg InvoiceForPaymentParams) (InvoiceForPaymentRow, error) {
+	row := q.db.QueryRow(ctx, invoiceForPayment, arg.ID, arg.AccountID)
+	var i InvoiceForPaymentRow
+	err := row.Scan(&i.StripeInvoiceID, &i.Status)
+	return i, err
+}
+
 const listInvoicesForAccount = `-- name: ListInvoicesForAccount :many
 
 SELECT id, stripe_invoice_id, number, status,
@@ -108,6 +163,52 @@ func (q *Queries) ListInvoicesForAccount(ctx context.Context, arg ListInvoicesFo
 			&i.HostedInvoiceUrl,
 			&i.InvoicePdf,
 			&i.IsLargeAutoCollect,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUnpaidInvoicesForAccount = `-- name: ListUnpaidInvoicesForAccount :many
+SELECT id, COALESCE(number, '')::text AS number, amount_due, created_at
+FROM ms_billing.invoices
+WHERE account_id = $1
+  AND status IN ('open', 'uncollectible')
+  AND amount_due > 0
+ORDER BY created_at ASC, id ASC
+`
+
+type ListUnpaidInvoicesForAccountRow struct {
+	ID        string         `json:"id"`
+	Number    string         `json:"number"`
+	AmountDue pgtype.Numeric `json:"amount_due"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+
+// ListUnpaidInvoicesForAccount is the read behind the ListUnpaidInvoices RPC
+// (the post-card-bind "pay N unpaid invoices?" prompt + the invoices table's
+// Pay affordance). Oldest-first so a sequential pay-all settles the oldest
+// debt first. Unpaid counts are gate-bounded small (the serving gate blocks
+// at 2), so no pagination.
+func (q *Queries) ListUnpaidInvoicesForAccount(ctx context.Context, accountID string) ([]ListUnpaidInvoicesForAccountRow, error) {
+	rows, err := q.db.Query(ctx, listUnpaidInvoicesForAccount, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUnpaidInvoicesForAccountRow{}
+	for rows.Next() {
+		var i ListUnpaidInvoicesForAccountRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Number,
+			&i.AmountDue,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

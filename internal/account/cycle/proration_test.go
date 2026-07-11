@@ -434,13 +434,15 @@ func TestChargeCreationProration_SkipsDeleted(t *testing.T) {
 
 func TestChargeCreationProration_SkipsUnactivatedAndNoPM(t *testing.T) {
 	// Unactivated account → skipped_unactivated (D1d, no retroactive catch-up).
+	// Registered while funded (the create gate), then the activation is dropped
+	// to model a LEGACY pre-gate roster row — the sweep must keep handling those.
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
-	delete(store.activation, acct)
 	sc := newFakeStripe()
 	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), 0)
+	delete(store.activation, acct)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
@@ -625,12 +627,12 @@ func TestChargeCreationProration_SkipsPermanentlyWhenActivatedAfterPeriodClosed(
 	// gets set for a skipped charge).
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
-	delete(store.activation, acct) // unactivated at creation
 	sc := newFakeStripe()
 	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	created := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, created, 0)
+	delete(store.activation, acct) // legacy pre-gate row: unactivated at creation
 
 	// Past grace, still unactivated → correctly pending, no charge (D1d's
 	// existing unactivated gate — unchanged by this fix).
@@ -676,11 +678,11 @@ func TestChargeCreationProration_ActivatedBeforePeriodClosesStillCharges(t *test
 	// full month out, safely after activation.
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
-	delete(store.activation, acct)
 	sc := newFakeStripe()
 	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 1, 10, 6, 0, 0, 0, time.UTC), 0)
+	delete(store.activation, acct) // legacy pre-gate row: unactivated at creation
 
 	first, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
