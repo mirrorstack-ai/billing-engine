@@ -74,8 +74,10 @@ type ListNewCreationChargesRequest struct {
 // IncludedModules), the count of add-on modules beyond the bundled allowance;
 // BaseFeeMicros + AddonMicros partition AmountMicros for a settled row
 // (BaseFeeMicros is the settled creation base, AddonMicros the co-created
-// over-module component on the same invoice). A pending row reports both money
-// components as 0 (nothing charged yet) but still surfaces Name + AddonModuleCount.
+// over-module component on the same invoice). A pending row carries the
+// projected flat base in AmountMicros/BaseFeeMicros and AddonMicros 0 (the
+// overage is not projected — only its COUNT surfaces), plus Name +
+// AddonModuleCount.
 type NewCreationCharge struct {
 	AppID            uuid.UUID  `json:"app_id"`
 	Status           string     `json:"status"`
