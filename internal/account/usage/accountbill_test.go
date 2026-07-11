@@ -149,36 +149,46 @@ func TestGetAccountBill_DeterministicAppOrdering(t *testing.T) {
 
 func TestGetAccountBill_MirrorLifecycleAcrossTheWindow(t *testing.T) {
 	// The mirror half enumerates [created_at, deleted_at) ∩ window:
-	//   deleted BEFORE the period  → excluded entirely (base 0, no new usage),
-	//   deleted DURING the period  → included, full spent base (D1e),
-	//   created DURING the period  → included, PRORATED base,
-	//   created AFTER the period   → excluded.
+	//   deleted BEFORE the period       → excluded entirely (base 0, no new usage),
+	//   deleted DURING, no arrears      → base estimate 0 (nothing will ever bill
+	//                                     for it — the charge legs skip deleted
+	//                                     apps) and the all-zero row is DROPPED,
+	//   deleted DURING, with usage      → kept, usage-only total (base 0): the
+	//                                     arrears still bill at the boundary,
+	//   created DURING the period       → included, FULL advance base,
+	//   created AFTER the period        → excluded.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
 	pid := mirrorPeriod(store) // [May 1, Jun 1), 31 days
 
-	deletedBefore, deletedDuring, createdDuring, createdAfter := seqUUID(1), seqUUID(2), seqUUID(3), seqUUID(4)
+	deletedBefore, deletedDuring, deletedWithUsage, createdDuring, createdAfter :=
+		seqUUID(1), seqUUID(2), seqUUID(3), seqUUID(4), seqUUID(5)
 	jan := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	may20 := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
 	store.appMirrors[deletedBefore] = usage.AppMirrorInfo{CreatedAt: jan, Deleted: true, DeletedAt: time.Date(2026, 4, 2, 0, 0, 0, 0, time.UTC)}
-	store.appMirrors[deletedDuring] = usage.AppMirrorInfo{CreatedAt: jan, Deleted: true, DeletedAt: time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)}
+	store.appMirrors[deletedDuring] = usage.AppMirrorInfo{CreatedAt: jan, Deleted: true, DeletedAt: may20}
+	store.appMirrors[deletedWithUsage] = usage.AppMirrorInfo{CreatedAt: jan, Deleted: true, DeletedAt: may20}
 	store.appMirrors[createdDuring] = usage.AppMirrorInfo{CreatedAt: time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC)}
 	store.appMirrors[createdAfter] = usage.AppMirrorInfo{CreatedAt: time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)}
+	store.appBillRowsByApp[deletedWithUsage] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "orders.placed", "", 700)}
 
 	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
 		OwnerUserID: owner, PeriodID: pid.String(),
 	})
 	require.NoError(t, err)
-	require.Len(t, resp.Apps, 2, "only the apps alive at some point inside the window")
-	require.Equal(t, deletedDuring, resp.Apps[0].AppID)
-	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "deleted mid-period keeps the spent base")
+	require.Len(t, resp.Apps, 2, "deleted apps render only while they still owe arrears")
+	require.Equal(t, deletedWithUsage, resp.Apps[0].AppID)
+	require.Zero(t, resp.Apps[0].BaseFeeMicros, "a deleted app's uncharged base previews 0 (the charge legs skip deleted apps)")
+	require.EqualValues(t, 700, resp.Apps[0].TotalMicros, "its accrued usage still renders (and bills) — usage-only row")
+	require.True(t, resp.Apps[0].IsDeleted)
 	require.Equal(t, createdDuring, resp.Apps[1].AppID)
 	// Regression #63: mid-period creation must NOT prorate the recurring
 	// estimate — the (created_at → period-end) proration is the one-time "New
 	// creation" charge; this line previews the advance-base leg, always the
 	// full fee. (Prod symptom: $20 plan showed 20×22/31 = $14.19 per app.)
 	require.EqualValues(t, usage.BaseFeeMicros, resp.Apps[1].BaseFeeMicros, "created mid-period still previews the FULL advance base")
-	require.Equal(t, usage.BaseFeeMicros*2, resp.TotalMicros)
+	require.Equal(t, usage.BaseFeeMicros+700, resp.TotalMicros)
 }
 
 // --- snapshot-first base ----------------------------------------------------

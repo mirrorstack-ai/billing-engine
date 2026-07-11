@@ -417,10 +417,16 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		baseFee = snap.BaseMicros
 	} else {
 		switch {
-		case mirrored && mirror.Deleted && !mirror.DeletedAt.After(periodStart):
-			// Deleted BEFORE this period opened → no base was (or will be) charged
-			// for it (D1e: deletion stops FUTURE base fees). A deletion DURING the
-			// period leaves that period's base spent, so it falls through below.
+		case mirrored && mirror.Deleted:
+			// Deleted → no base will be charged (D1e: deletion stops FUTURE base
+			// fees). The un-snapshotted estimate previews the charge legs, and
+			// BOTH skip deleted apps: the advance leg rosters LIVE apps only
+			// (cycle/charge.go LiveAppsCreatedBefore) and the creation sweep
+			// re-checks not-deleted under lock (cycle/proration.go) — so a $20
+			// preview here would never materialize on the invoice, whenever the
+			// deletion happened. A base that WAS charged before the deletion is
+			// the snapshot branch above and still displays what was invoiced;
+			// usage arrears still render (and bill) below regardless.
 			baseFee = 0
 		case mirrored:
 			// No snapshot → estimate the FLAT per-app base from the plan (module
