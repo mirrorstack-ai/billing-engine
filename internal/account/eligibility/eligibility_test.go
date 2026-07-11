@@ -94,6 +94,32 @@ func TestEvaluate(t *testing.T) {
 			wantReasons: []Reason{ReasonTooManyFailures},
 		},
 
+		// --- gate 4: unpaid-invoice boundary (< 2, so 2 excluded) ---
+		{
+			name:       "no unpaid invoices is allowed",
+			in:         Signals{UsableNonFraudCardCount: 1, FirstCharge: FirstChargeSucceeded, UnpaidInvoiceCount: 0},
+			wantReason: ReasonEligible,
+		},
+		{
+			name:       "one unpaid invoice is allowed (boundary, still under 2)",
+			in:         Signals{UsableNonFraudCardCount: 1, FirstCharge: FirstChargeSucceeded, UnpaidInvoiceCount: 1},
+			wantReason: ReasonEligible,
+		},
+		{
+			name:        "exactly two unpaid invoices block (2 excluded by < 2)",
+			in:          Signals{UsableNonFraudCardCount: 1, FirstCharge: FirstChargeSucceeded, UnpaidInvoiceCount: 2},
+			wantBlocked: true,
+			wantReason:  ReasonUnpaidInvoices,
+			wantReasons: []Reason{ReasonUnpaidInvoices},
+		},
+		{
+			name:        "many unpaid invoices block",
+			in:          Signals{UsableNonFraudCardCount: 1, FirstCharge: FirstChargeSucceeded, UnpaidInvoiceCount: 7},
+			wantBlocked: true,
+			wantReason:  ReasonUnpaidInvoices,
+			wantReasons: []Reason{ReasonUnpaidInvoices},
+		},
+
 		// --- multiple gates fail: priority + all-reasons ---
 		{
 			name:        "no card AND first charge failed: primary is card, both reported",
@@ -103,11 +129,11 @@ func TestEvaluate(t *testing.T) {
 			wantReasons: []Reason{ReasonNoUsableCard, ReasonFirstChargeFailed},
 		},
 		{
-			name:        "all three gates fail: card is primary, all three reported in order",
-			in:          Signals{UsableNonFraudCardCount: 0, FirstCharge: FirstChargeFailed, FailedChargeStreak: 3},
+			name:        "all four gates fail: card is primary, all four reported in order",
+			in:          Signals{UsableNonFraudCardCount: 0, FirstCharge: FirstChargeFailed, FailedChargeStreak: 3, UnpaidInvoiceCount: 2},
 			wantBlocked: true,
 			wantReason:  ReasonNoUsableCard,
-			wantReasons: []Reason{ReasonNoUsableCard, ReasonFirstChargeFailed, ReasonTooManyFailures},
+			wantReasons: []Reason{ReasonNoUsableCard, ReasonFirstChargeFailed, ReasonTooManyFailures, ReasonUnpaidInvoices},
 		},
 		{
 			name:        "first charge failed AND too many failures (card ok): first-charge is primary",

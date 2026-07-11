@@ -112,6 +112,13 @@ type Store interface {
 	// at the charge leg is an anomaly the caller surfaces.
 	AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error)
 
+	// UsableNonFraudCardCount is THE standing card predicate — the SAME
+	// usable_card_count the service-block gate reads (billing.sql
+	// ServiceBlockSignals: active, NOT fraud_blocked, not expired), reused
+	// verbatim so RegisterApp's create gate (funding-gates design) and
+	// GetServiceStatus can never disagree on card quality.
+	UsableNonFraudCardCount(ctx context.Context, accountID uuid.UUID) (int, error)
+
 	// AccountCollection loads the account's risk-graded collection state (PR #9):
 	// the usage_billing_mode, credit_limit, optional spend_ceiling, and the
 	// account's created_at (so the risk-judge derives tenure WITHOUT a
@@ -190,15 +197,6 @@ type Store interface {
 	// account and whether one exists — the cutover STRADDLE-CLAMP input. found=
 	// false (no period yet) means no clamp is needed. Read-only.
 	LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID) (end time.Time, found bool, err error)
-
-	// EnsureAccountForUser resolves the user's billing account, creating the
-	// row if none exists yet — the SAME per-user-advisory-lock get-or-create
-	// billing.Ensure uses (the one established account-creation path; no
-	// Stripe Customer is created here). RegisterApp needs it because the apps
-	// mirror row carries a NOT NULL account FK and app creation must never be
-	// blocked on the user having visited billing first (D1c: the platform
-	// fires RegisterApp fire-and-forget).
-	EnsureAccountForUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
 
 	// AccountActivation returns the account's activated_at anchor (migration
 	// 025) and whether it is set. activated=false → the account never bound a
@@ -965,6 +963,17 @@ func (s *pgxStore) AccountStripeCustomer(ctx context.Context, accountID uuid.UUI
 	return s.q.AccountStripeCustomer(ctx, accountID.String())
 }
 
+// UsableNonFraudCardCount projects the usable_card_count leg of the generated
+// ServiceBlockSignals read — deliberately NOT a new SQL predicate (see the
+// Store interface doc: one card-quality rule, shared with the standing gate).
+func (s *pgxStore) UsableNonFraudCardCount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	row, err := s.q.ServiceBlockSignals(ctx, accountID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(row.UsableCardCount), nil
+}
+
 func (s *pgxStore) AccountCollection(ctx context.Context, accountID uuid.UUID) (AccountCollection, error) {
 	row, err := s.q.AccountCollectionFields(ctx, accountID.String())
 	if err != nil {
@@ -1181,41 +1190,6 @@ func (s *pgxStore) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUI
 		return time.Time{}, false, err
 	}
 	return end, true, nil
-}
-
-func (s *pgxStore) EnsureAccountForUser(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
-	var id string
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		qtx := s.q.WithTx(tx)
-		// billing.EnsureAccount and this get-or-create insert the SAME
-		// accounts row, so both serialize on the single exported
-		// (namespace, key) pair — the accounts table has no owner UNIQUE
-		// constraint; the advisory lock IS the uniqueness guard.
-		if err := qtx.AcquireBillingAccountUserLock(ctx, db.AcquireBillingAccountUserLockParams{
-			Column1: billing.AdvisoryLockNamespaceBillingAccountUser,
-			Column2: userID.String(),
-		}); err != nil {
-			return err
-		}
-		existing, err := qtx.SelectAccountByUser(ctx, pgtype.UUID{Bytes: userID, Valid: true})
-		if err == nil {
-			id = existing.ID
-			return nil
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		inserted, err := qtx.InsertUserAccount(ctx, pgtype.UUID{Bytes: userID, Valid: true})
-		if err != nil {
-			return err
-		}
-		id = inserted.ID
-		return nil
-	})
-	if err != nil {
-		return uuid.Nil, err
-	}
-	return uuid.Parse(id)
 }
 
 func (s *pgxStore) AccountActivation(ctx context.Context, accountID uuid.UUID) (time.Time, bool, error) {

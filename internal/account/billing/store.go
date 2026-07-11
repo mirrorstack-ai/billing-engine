@@ -3,7 +3,9 @@ package billing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -113,6 +115,27 @@ type Store interface {
 	// PaymentMethodTargetForOrg is PaymentMethodTarget's org twin: the PM must
 	// belong to the ORG account (detach / set-default ownership gate).
 	PaymentMethodTargetForOrg(ctx context.Context, orgID, paymentMethodID uuid.UUID) (stripePMID, stripeCustomerID string, isDefault, found bool, err error)
+
+	// UnpaidInvoiceCount counts the account's unpaid (open/uncollectible,
+	// amount_due > 0) mirror invoices — GetServiceStatus's gate-4 signal
+	// (blocked at >= eligibility.MaxUnpaidInvoices).
+	UnpaidInvoiceCount(ctx context.Context, accountID uuid.UUID) (int, error)
+
+	// ListUnpaidInvoices returns the account's unpaid mirror invoices
+	// oldest-first (the same predicate as UnpaidInvoiceCount). Empty slice
+	// (not nil) when none.
+	ListUnpaidInvoices(ctx context.Context, accountID uuid.UUID) ([]UnpaidInvoiceRow, error)
+
+	// InvoiceForPayment resolves a mirror invoice by (id, account) — the
+	// PayInvoice ownership gate. found=false when no row matches both (wrong
+	// owner or unknown id), which the service maps to NOT_FOUND.
+	InvoiceForPayment(ctx context.Context, invoiceID, accountID uuid.UUID) (InvoicePayTarget, bool, error)
+
+	// HasUsableDefaultPM is the charge legs' no-PM gate (cycle.sql), reused by
+	// PayInvoice: Stripe pays an invoice with the Customer's default PM, so a
+	// usable mirror card must exist on the FUNDING account before we ask
+	// Stripe to collect.
+	HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error)
 }
 
 // AddCardRequestStatus is the projection of an add_card_requests row
@@ -434,6 +457,73 @@ func (s *pgxStore) PaymentMethodTargetForOrg(ctx context.Context, orgID, payment
 		return "", "", false, false, err
 	}
 	return row.StripePaymentMethodID, row.StripeCustomerID, row.IsDefault, true, nil
+}
+
+func (s *pgxStore) UnpaidInvoiceCount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	n, err := s.q.CountUnpaidInvoicesForAccount(ctx, accountID.String())
+	return int(n), err
+}
+
+func (s *pgxStore) ListUnpaidInvoices(ctx context.Context, accountID uuid.UUID) ([]UnpaidInvoiceRow, error) {
+	rows, err := s.q.ListUnpaidInvoicesForAccount(ctx, accountID.String())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UnpaidInvoiceRow, 0, len(rows))
+	for _, r := range rows {
+		id, err := uuid.Parse(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		due, err := centsNumericToMicros(r.AmountDue)
+		if err != nil {
+			return nil, fmt.Errorf("decode amount_due for invoice %s: %w", r.ID, err)
+		}
+		out = append(out, UnpaidInvoiceRow{
+			ID:              id,
+			Number:          r.Number,
+			AmountDueMicros: due,
+			CreatedAt:       r.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) InvoiceForPayment(ctx context.Context, invoiceID, accountID uuid.UUID) (InvoicePayTarget, bool, error) {
+	row, err := s.q.InvoiceForPayment(ctx, db.InvoiceForPaymentParams{
+		ID:        invoiceID.String(),
+		AccountID: accountID.String(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return InvoicePayTarget{}, false, nil
+	}
+	if err != nil {
+		return InvoicePayTarget{}, false, err
+	}
+	return InvoicePayTarget{StripeInvoiceID: row.StripeInvoiceID, Status: row.Status}, true, nil
+}
+
+func (s *pgxStore) HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error) {
+	return s.q.HasUsableDefaultPM(ctx, accountID.String())
+}
+
+// centsNumericToMicros converts the invoices mirror's NUMERIC whole Stripe
+// cents to int64 micro-dollars (×10_000) — the same store-boundary conversion
+// usage's invoice reads perform (usage can't be imported here: it depends on
+// this package). Mirror amounts are whole cents by construction, so the
+// strict integer decode (Int64Value errors on any fractional value) is
+// honest, never a silent rounding.
+func centsNumericToMicros(n pgtype.Numeric) (int64, error) {
+	v, err := n.Int64Value()
+	if err != nil {
+		return 0, err
+	}
+	cents := v.Int64
+	const microsPerCent = 10_000
+	if cents > math.MaxInt64/microsPerCent || cents < math.MinInt64/microsPerCent {
+		return 0, fmt.Errorf("cents amount %d overflows int64 micros", cents)
+	}
+	return cents * microsPerCent, nil
 }
 
 // uuidRowFound decodes the (uuid-as-string, error) shape every single-row

@@ -213,6 +213,23 @@ func (c *realClient) FinalizeInvoice(ctx context.Context, invoiceID, idemKey str
 	return projectInvoice(inv), nil
 }
 
+// PayInvoice pays a finalized invoice with the Customer's default payment
+// method (Stripe's default when no payment_method param is sent). The
+// deterministic Idempotency-Key (payinv-<mirror uuid>) makes a re-run replay
+// the original attempt instead of charging twice. Projected to a plain
+// Invoice — the caller reads status ("paid" vs still-processing) and nothing
+// else; the mirror is settled by the invoice webhook.
+func (c *realClient) PayInvoice(ctx context.Context, stripeInvoiceID, idemKey string) (Invoice, error) {
+	params := &stripego.InvoicePayParams{}
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	inv, err := c.sc.Invoices.Pay(stripeInvoiceID, params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
 // FindInvoiceByRef searches the Customer's invoices for the ms_charge_ref
 // metadata anchor — the crash-recovery read for retries past Stripe's ~24h
 // idempotency-key window (see the interface comment). Uses the Stripe Search

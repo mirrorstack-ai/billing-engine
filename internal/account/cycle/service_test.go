@@ -68,7 +68,7 @@ type fakeStore struct {
 	updatedCollection *cycle.AccountCollection // last UpdateAccountCollection arg
 
 	// apps mirror state (migration 027 / base-fee v1). accountsByUser models
-	// the EnsureAccountForUser get-or-create; activation the activated_at
+	// the AccountIDByUser resolution; activation the activated_at
 	// anchor (absent → unactivated, never charged). baseSnapshots models the
 	// migration-028 per-app-period base ledger, keyed (app, period_start) like
 	// the PRIMARY KEY, with the source recorded so tests can assert which
@@ -83,6 +83,9 @@ type fakeStore struct {
 	// funding-hop tests need the sponsor and org accounts to differ.
 	hasPMByAccount          map[uuid.UUID]bool
 	stripeCustomerByAccount map[uuid.UUID]string
+	// cardCount overrides UsableNonFraudCardCount per account (the create
+	// gate's card predicate); absent → derived from the usable-PM state above.
+	cardCount map[uuid.UUID]int
 
 	// org-billing state (migration 041). accountsByOrg models the
 	// EnsureOrgAccount get-or-create; orgDesignations the designation rows;
@@ -135,7 +138,7 @@ type fakeStore struct {
 	errCollection       error // AccountCollection
 	errUpdateColl       error // UpdateAccountCollection
 	errUnpaid           error // HasUnpaidInvoice
-	errEnsureAcct       error // EnsureAccountForUser
+	errCardCount        error // UsableNonFraudCardCount
 	errActivation       error // AccountActivation
 	errAppInsert        error // InsertAppMirror
 	errAppMirror        error // AppMirror
@@ -236,6 +239,7 @@ func newFakeStore() *fakeStore {
 		timers:              map[uuid.UUID]*fakeTimer{},
 
 		hasPMByAccount:          map[uuid.UUID]bool{},
+		cardCount:               map[uuid.UUID]int{},
 		stripeCustomerByAccount: map[uuid.UUID]string{},
 		accountsByOrg:           map[uuid.UUID]uuid.UUID{},
 		orgDesignations:         map[uuid.UUID]cycle.OrgDesignation{},
@@ -525,16 +529,28 @@ func (f *fakeStore) LatestClosedPeriodEnd(_ context.Context, accountID uuid.UUID
 
 // --- apps mirror fake (migration 027 / base-fee v1) -------------------------
 
-func (f *fakeStore) EnsureAccountForUser(_ context.Context, userID uuid.UUID) (uuid.UUID, error) {
-	if f.errEnsureAcct != nil {
-		return uuid.Nil, f.errEnsureAcct
+// UsableNonFraudCardCount mirrors the pgxStore's reuse of the standing card
+// predicate: an explicit cardCount override wins; otherwise the count derives
+// from the usable-PM state (hasPMByAccount / hasPM → 1 card) so the existing
+// fully-chargeable fixtures (registeredAccount and friends) stay FUNDED under
+// the create gate without every test re-declaring a card.
+func (f *fakeStore) UsableNonFraudCardCount(_ context.Context, accountID uuid.UUID) (int, error) {
+	if f.errCardCount != nil {
+		return 0, f.errCardCount
 	}
-	if id, ok := f.accountsByUser[userID]; ok {
-		return id, nil // get-or-create: the same user always resolves the same account
+	if n, ok := f.cardCount[accountID]; ok {
+		return n, nil
 	}
-	id := uuid.New()
-	f.accountsByUser[userID] = id
-	return id, nil
+	if has, ok := f.hasPMByAccount[accountID]; ok {
+		if has {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	if f.hasPM {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (time.Time, bool, error) {

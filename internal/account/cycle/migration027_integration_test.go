@@ -119,12 +119,4 @@ func TestAppsMirror_Integration_LiveRosterScan(t *testing.T) {
 	apps, err = store.LiveAppsCreatedBefore(ctx, acct, mustTime(t, "2026-08-01T00:00:00Z"), usage.GraceDays)
 	require.NoError(t, err)
 	require.Len(t, apps, 4)
-
-	// EnsureAccountForUser: get-or-create resolves the SAME account twice.
-	userID := uuid.New()
-	first, err := store.EnsureAccountForUser(ctx, userID)
-	require.NoError(t, err)
-	second, err := store.EnsureAccountForUser(ctx, userID)
-	require.NoError(t, err)
-	require.Equal(t, first, second)
 }

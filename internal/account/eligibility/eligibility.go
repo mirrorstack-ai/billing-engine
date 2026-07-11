@@ -11,11 +11,13 @@
 // The gate (product spec): an account is ELIGIBLE for service iff ALL of —
 //
 //	(1) it has at least one NON-FRAUD card on file,
-//	(2) its FIRST charge did not fail, and
-//	(3) its consecutive failed-charge streak is < 2.
+//	(2) its FIRST charge did not fail,
+//	(3) its consecutive failed-charge streak is < 2, and
+//	(4) it has fewer than 2 unpaid invoices (funding-gates design,
+//	    DECIDED 2026-07-11 — docs-temp/billing-funding-gates/design.md).
 //
-// If any gate fails, the account is BLOCKED. The three gates map one-for-one to
-// the three Signals fields; see Evaluate for the exact boolean logic and the
+// If any gate fails, the account is BLOCKED. The four gates map one-for-one to
+// the four Signals fields; see Evaluate for the exact boolean logic and the
 // grace edges (a brand-new account with no charge yet is graced, not blocked).
 package eligibility
 
@@ -27,6 +29,15 @@ package eligibility
 // Hardcoded (mirrors collection's inline finance thresholds); promote to a
 // per-account column only if a knob is needed.
 const MaxFailedChargeStreak = 2
+
+// MaxUnpaidInvoices is the unpaid-invoice count at which services are blocked
+// (funding-gates design, DECIDED 2026-07-11): "block services when the account
+// has >= 2 unpaid invoices". Unpaid = a mirror invoice still collectible but
+// not collected ('open' or 'uncollectible') with amount_due > 0 — derived at
+// read time from the invoices mirror, like the streak, so paying an invoice
+// self-heals the block as soon as the invoice.paid webhook lands. 0 or 1
+// unpaid passes; 2+ blocks.
+const MaxUnpaidInvoices = 2
 
 // FirstChargeState is the outcome of the account's EARLIEST real charge — the
 // oldest invoice that is not draft (never finalized) or void (cancelled). It is
@@ -61,6 +72,10 @@ type Signals struct {
 	// FailedChargeStreak is the account's consecutive failed-charge counter
 	// (resets to 0 on a successful charge). Gate 3 blocks at >= MaxFailedChargeStreak.
 	FailedChargeStreak int
+	// UnpaidInvoiceCount is the number of unpaid (open/uncollectible,
+	// amount_due > 0) invoices on the account's mirror. Gate 4 blocks at
+	// >= MaxUnpaidInvoices.
+	UnpaidInvoiceCount int
 }
 
 // Reason is a stable, machine-readable code for a Verdict — the primary block
@@ -78,6 +93,9 @@ const (
 	// ReasonTooManyFailures: gate 3 failed — the consecutive failed-charge streak
 	// reached MaxFailedChargeStreak.
 	ReasonTooManyFailures Reason = "TOO_MANY_FAILURES"
+	// ReasonUnpaidInvoices: gate 4 failed — the account carries
+	// MaxUnpaidInvoices or more unpaid invoices.
+	ReasonUnpaidInvoices Reason = "UNPAID_INVOICES"
 )
 
 // Verdict is the gate's decision. Blocked is the single field a caller must read
@@ -90,18 +108,19 @@ type Verdict struct {
 	Reasons []Reason
 }
 
-// Evaluate applies the three gates in a fixed priority order and returns the
+// Evaluate applies the four gates in a fixed priority order and returns the
 // Verdict. The gates, and the exact boolean each checks:
 //
 //	gate 1 (card):         UsableNonFraudCardCount >= 1
 //	gate 2 (first charge): FirstCharge != FirstChargeFailed
 //	gate 3 (failures):     FailedChargeStreak < MaxFailedChargeStreak
-//	Blocked = NOT (gate1 AND gate2 AND gate3)
+//	gate 4 (unpaid):       UnpaidInvoiceCount < MaxUnpaidInvoices
+//	Blocked = NOT (gate1 AND gate2 AND gate3 AND gate4)
 //
-// Priority (card → first charge → failures) fixes which cause becomes the
-// primary Reason when more than one gate fails; Reasons collects them all in the
-// same order. The order is purely presentational — Blocked is the AND of all
-// three regardless.
+// Priority (card → first charge → failures → unpaid) fixes which cause becomes
+// the primary Reason when more than one gate fails; Reasons collects them all in
+// the same order. The order is purely presentational — Blocked is the AND of all
+// four regardless.
 //
 // Grace edges (why gate 2 is "!= failed", not "== succeeded"): a brand-new
 // account (FirstChargeNone) and one whose first invoice is still retrying
@@ -120,6 +139,9 @@ func Evaluate(s Signals) Verdict {
 	}
 	if s.FailedChargeStreak >= MaxFailedChargeStreak {
 		reasons = append(reasons, ReasonTooManyFailures)
+	}
+	if s.UnpaidInvoiceCount >= MaxUnpaidInvoices {
+		reasons = append(reasons, ReasonUnpaidInvoices)
 	}
 
 	if len(reasons) == 0 {

@@ -96,6 +96,15 @@ type Client interface {
 	// path, so a synchronous call in the webhook handler is fine.
 	RetrieveCharge(ctx context.Context, chargeID string) (ChargeCardRef, error)
 
+	// PayInvoice pays a finalized Stripe invoice off-session with the
+	// Customer's default payment method — the customer-initiated "Pay"
+	// action behind billing.PayInvoice (funding-gates design). idemKey is
+	// the deterministic "payinv-<mirror uuid>" so a client retry replays the
+	// original pay attempt instead of double-charging. Returns the post-pay
+	// invoice projection; the mirror settles via the invoice.paid webhook,
+	// never from this return value.
+	PayInvoice(ctx context.Context, stripeInvoiceID, idemKey string) (Invoice, error)
+
 	// FindInvoiceByRef looks a Customer's invoice up by its ms_charge_ref
 	// metadata anchor (stamped by CreateDraftInvoice) — the crash-recovery read
 	// (review 2026-07-06, H5): Stripe prunes idempotency keys after ~24h, so a

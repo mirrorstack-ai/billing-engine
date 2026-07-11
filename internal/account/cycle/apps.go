@@ -30,13 +30,14 @@ import (
 const maxModuleCount = 100_000
 
 // RegisterAppRequest is the payload of the RegisterApp RPC. Owner fields
-// mirror the other owner-keyed RPCs (exactly one set). A USER owner resolves
-// through the advisory-locked get-or-create as always. An ORG owner resolves
-// through the org's funding designation (migration 041): funded → the org
-// account; not designated / not activated → an UNBILLED roster row (NULL
-// account_id, owner_org_id stamped) that the RepointOrgUsage sweep attaches
-// once funding lands. Org owners are never rejected anymore (the old D6 rule
-// is retired by the org-billing wave).
+// mirror the other owner-keyed RPCs (exactly one set). Both owner kinds pass
+// the FUNDING GATE for a NEW app_id (docs-temp/billing-funding-gates/design.md,
+// DECIDED 2026-07-11): a USER owner's account must be activated with a usable
+// non-fraud card; an ORG owner must resolve through its funding designation
+// (migration 041) to such an account — unresolved designation → PAYMENT_
+// REQUIRED. The old UNBILLED org registration path (NULL account_id roster
+// row awaiting the attach sweep) is retired for NEW creates; the attach-sweep
+// machinery stays for legacy rows.
 type RegisterAppRequest struct {
 	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
 	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
@@ -98,12 +99,19 @@ type SyncAppModulesResponse struct {
 // newly created app enters a grace window and is charged its creation-period
 // base only later, by the sweep (ChargeCreationProration / SweepCreationProrations
 // in proration.go), and only if it SURVIVES grace — so an app deleted within
-// grace is never billed. RegisterApp:
+// grace is never billed. The grace keeps its original meaning (create→delete
+// inside it is never billed); it no longer implies create-without-card.
+// RegisterApp:
 //
-//  1. resolve-or-create the owner's billing account via the SAME
-//     advisory-locked get-or-create billing.Ensure uses (no Stripe Customer is
-//     created — just the accounts row, so app creation is never blocked on the
-//     user having visited billing);
+//  1. for a NEW app_id, resolve the owner's billing account and apply the
+//     FUNDING GATE (docs-temp/billing-funding-gates/design.md, DECIDED
+//     2026-07-11, inverting the earlier "creation never blocks on billing"
+//     invariant): the account must be activated (activated_at NOT NULL) with
+//     >= 1 usable non-fraud card — the standing gate's card predicate, reused
+//     — else billing.PaymentRequired. A RE-register of an existing app_id
+//     SKIPS the gate entirely (the platform's fire-and-forget retry must stay
+//     idempotent even if the owner's funding lapsed since the first
+//     registration);
 //
 //  2. insert the roster row idempotently (ON CONFLICT (app_id) DO NOTHING —
 //     a retry keeps the FIRST registration's created_at / module_count, the
@@ -144,40 +152,34 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		createdAt = s.nowFn().UTC()
 	}
 
-	var accountID uuid.UUID
-	if req.OwnerUserID != uuid.Nil {
-		id, err := s.store.EnsureAccountForUser(ctx, req.OwnerUserID)
-		if err != nil {
-			return nil, billing.Internal("ensure billing account failed", err)
-		}
-		accountID = id
-	} else {
-		// Org leg: resolve the org's funded account through its designation.
-		// Not designated / not activated → accountID stays Nil and the roster
-		// row registers UNBILLED (owner_org_id stamped for the later attach
-		// sweep). Never an error — app creation must not block on billing.
-		id, funded, err := s.store.ResolveOrgFundedAccount(ctx, req.OwnerOrgID)
-		if err != nil {
-			return nil, billing.Internal("org account resolution failed", err)
-		}
-		if funded {
-			accountID = id
-		}
-	}
-
-	if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, createdAt, req.Name); err != nil {
-		return nil, billing.Internal("insert app mirror failed", err)
-	}
-
-	// Read the row BACK so the response reflects the FIRST registration's stable
-	// account + guard state (the insert's ON CONFLICT DO NOTHING preserved them):
-	// a retry that lands after the sweep charged echoes the armed invoice id.
+	// Idempotency first: an app_id that is ALREADY mirrored is a fire-and-forget
+	// retry — it must never suddenly fail the funding gate (the owner's funding
+	// may have lapsed since the first registration; serving standing, not
+	// registration, polices that). Only a genuinely NEW app_id is gated.
 	app, found, err := s.store.AppMirror(ctx, req.AppID)
 	if err != nil {
 		return nil, billing.Internal("app mirror lookup failed", err)
 	}
 	if !found {
-		return nil, billing.Internal("app mirror row missing immediately after insert", nil)
+		accountID, err := s.fundedOwnerAccount(ctx, req.OwnerUserID, req.OwnerOrgID)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, createdAt, req.Name); err != nil {
+			return nil, billing.Internal("insert app mirror failed", err)
+		}
+
+		// Read the row BACK so the response reflects the FIRST registration's
+		// stable account + guard state (a concurrent duplicate may have won the
+		// ON CONFLICT DO NOTHING insert; its values stand).
+		app, found, err = s.store.AppMirror(ctx, req.AppID)
+		if err != nil {
+			return nil, billing.Internal("app mirror lookup failed", err)
+		}
+		if !found {
+			return nil, billing.Internal("app mirror row missing immediately after insert", nil)
+		}
 	}
 	resp := &RegisterAppResponse{
 		AppID:              app.AppID,
@@ -290,4 +292,62 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 		Deleted:     app.Deleted,
 		Name:        app.Name,
 	}, nil
+}
+
+// fundedOwnerAccount is RegisterApp's create gate (funding-gates design,
+// DECIDED 2026-07-11): resolve the (user XOR org) owner's billing account and
+// verify it is FUNDED — activated (activated_at NOT NULL, the first-card-bind
+// anchor) with >= 1 usable non-fraud card on the FUNDING account (the sponsor
+// hop for sponsor-funded orgs: the org account owns no cards, the sponsor's
+// does — the same ChargeFundingAccount hop every charge leg applies). Any
+// unfunded shape returns billing.PaymentRequired, which api-platform maps to
+// HTTP 402 on the create-app path.
+//
+// Deliberately read-only: a rejected create never get-or-creates an accounts
+// row (a funded owner necessarily already has one — activation happens at
+// card bind), and the card predicate is the standing gate's usable_card_count
+// reused verbatim (Store.UsableNonFraudCardCount), never a second rule.
+func (s *Service) fundedOwnerAccount(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (uuid.UUID, error) {
+	var accountID uuid.UUID
+	if ownerUserID != uuid.Nil {
+		id, found, err := s.store.AccountIDByUser(ctx, ownerUserID)
+		if err != nil {
+			return uuid.Nil, billing.Internal("owner account lookup failed", err)
+		}
+		if !found {
+			return uuid.Nil, billing.PaymentRequired("billing account not set up: add a payment card before creating an app")
+		}
+		_, activated, err := s.store.AccountActivation(ctx, id)
+		if err != nil {
+			return uuid.Nil, billing.Internal("account activation lookup failed", err)
+		}
+		if !activated {
+			return uuid.Nil, billing.PaymentRequired("billing account not activated: add a payment card before creating an app")
+		}
+		accountID = id
+	} else {
+		// Org leg: ResolveOrgFundedAccount already gates designation existence
+		// AND activation ("the pointer never flips to an unfunded account").
+		id, funded, err := s.store.ResolveOrgFundedAccount(ctx, ownerOrgID)
+		if err != nil {
+			return uuid.Nil, billing.Internal("org account resolution failed", err)
+		}
+		if !funded {
+			return uuid.Nil, billing.PaymentRequired("organization has no funding: designate funding before creating an app")
+		}
+		accountID = id
+	}
+
+	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
+	if err != nil {
+		return uuid.Nil, billing.Internal("funding account lookup failed", err)
+	}
+	cards, err := s.store.UsableNonFraudCardCount(ctx, fundingID)
+	if err != nil {
+		return uuid.Nil, billing.Internal("usable card count read failed", err)
+	}
+	if cards < 1 {
+		return uuid.Nil, billing.PaymentRequired("no usable payment card on file: add a card before creating an app")
+	}
+	return accountID, nil
 }
