@@ -141,6 +141,10 @@ func (f *fakeStore) PendingNewCreationCharges(_ context.Context, _ uuid.UUID, _,
 	return nil, nil
 }
 
+func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, _ int, _ time.Time) ([]usage.PendingAddonChargeRaw, error) {
+	return nil, nil
+}
+
 func newSvc(store usage.Store) *usage.Service { return usage.NewService(store) }
 
 // at is a fixed trigger time mid-hour so the closed-window math is unambiguous.

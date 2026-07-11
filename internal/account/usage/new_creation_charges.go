@@ -1,7 +1,9 @@
 package usage
 
 import (
+	"bytes"
 	"context"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +32,11 @@ import (
 //     amount is the sweep's to mint, so this is an estimate like every other
 //     un-invoiced line). Pending rows exist ONLY for the CURRENT live window —
 //     a past period has no still-in-grace apps.
+//   - PENDING ADD-ON: over-modules installed AFTER an app's creation carry
+//     their own in-grace overage timers (migration 033, Leg 1) — surfaced as a
+//     per-app pending row with base 0, the projected flat surcharge per timer,
+//     and the earliest timer expiry as the ETA. Current live window only, like
+//     the creation pendings.
 //
 // Read-only over the apps mirror + the invoices mirror this service already
 // owns; NO Stripe round-trip, NO schema change.
@@ -74,10 +81,13 @@ type ListNewCreationChargesRequest struct {
 // IncludedModules), the count of add-on modules beyond the bundled allowance;
 // BaseFeeMicros + AddonMicros partition AmountMicros for a settled row
 // (BaseFeeMicros is the settled creation base, AddonMicros the co-created
-// over-module component on the same invoice). A pending row carries the
-// projected flat base in AmountMicros/BaseFeeMicros and AddonMicros 0 (the
-// overage is not projected — only its COUNT surfaces), plus Name +
-// AddonModuleCount.
+// over-module component on the same invoice). A pending CREATION row carries
+// the projected flat base in AmountMicros/BaseFeeMicros and AddonMicros 0
+// (the co-created overage is not projected — only its COUNT surfaces); a
+// pending ADD-ON row (post-creation installs) is the inverse: BaseFeeMicros 0,
+// AmountMicros/AddonMicros the projected flat surcharge × AddonModuleCount.
+// The UI derives the descriptor from the partition: base only, base + N
+// add-ons, or N add-ons only.
 type NewCreationCharge struct {
 	AppID            uuid.UUID  `json:"app_id"`
 	Status           string     `json:"status"`
@@ -188,15 +198,18 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 	}
 
 	// PENDING rows exist only in the CURRENT live window (resolved id == ""): a
-	// past period has no still-in-grace apps. graceCutoff = now − GraceDays,
-	// mirroring SweepCreationProrations' createdBefore from the other side, so an
-	// app is "in grace" here iff it has NOT yet elapsed grace there.
+	// past period has no still-in-grace apps or in-grace install timers.
+	// graceCutoff = now − GraceDays, mirroring SweepCreationProrations'
+	// createdBefore from the other side, so an app is "in grace" here iff it
+	// has NOT yet elapsed grace there.
 	if periodID == "" {
-		graceCutoff := s.nowFn().UTC().AddDate(0, 0, -GraceDays)
+		now := s.nowFn().UTC()
+		graceCutoff := now.AddDate(0, 0, -GraceDays)
 		pending, err := s.store.PendingNewCreationCharges(ctx, accountID, periodStart, periodEnd, graceCutoff)
 		if err != nil {
 			return nil, billing.Internal("pending new-app charges query failed", err)
 		}
+		pendingStart := len(charges)
 		for _, r := range pending {
 			eta := r.CreatedAt.AddDate(0, 0, GraceDays)
 			charges = append(charges, NewCreationCharge{
@@ -215,6 +228,39 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 				AddonMicros:      0,
 			})
 		}
+		// Pending ADD-ON rows: over-modules installed AFTER creation (never
+		// co-created — those ride the app's own pending row above) whose own
+		// grace timers (migration 033) have not yet elapsed. One row per app,
+		// PROJECTED at the steady flat surcharge per timer ($3 each — Leg 1's
+		// exact proration is the sweep's to mint), base 0, ETA = the earliest
+		// timer expiry. An app past ITS creation grace can still surface here —
+		// installing a 6th+ module later mints a new upcoming charge.
+		addons, err := s.store.PendingAddonModuleCharges(ctx, accountID, IncludedModules, now)
+		if err != nil {
+			return nil, billing.Internal("pending add-on module charges query failed", err)
+		}
+		for _, r := range addons {
+			eta := r.ChargeETA
+			amount := ModuleOverageFeeMicros * int64(r.AddonCount)
+			charges = append(charges, NewCreationCharge{
+				AppID:            r.AppID,
+				Status:           NewCreationChargeStatusPending,
+				AmountMicros:     amount,
+				ChargeETA:        &eta,
+				Name:             r.Name,
+				BaseFeeMicros:    0,
+				AddonModuleCount: r.AddonCount,
+				AddonMicros:      amount,
+			})
+		}
+		// Keep the pending tail soonest-first ACROSS both sources (creation +
+		// add-on), app_id tie-break — the contract the response documents.
+		slices.SortStableFunc(charges[pendingStart:], func(a, b NewCreationCharge) int {
+			if c := a.ChargeETA.Compare(*b.ChargeETA); c != 0 {
+				return c
+			}
+			return bytes.Compare(a.AppID[:], b.AppID[:])
+		})
 	}
 
 	return &ListNewCreationChargesResponse{Charges: charges}, nil

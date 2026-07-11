@@ -98,6 +98,9 @@ func (stubUsageStore) SettledNewCreationCharges(context.Context, uuid.UUID, time
 func (stubUsageStore) PendingNewCreationCharges(context.Context, uuid.UUID, time.Time, time.Time, time.Time) ([]usage.PendingNewCreationChargeRaw, error) {
 	return nil, nil
 }
+func (stubUsageStore) PendingAddonModuleCharges(context.Context, uuid.UUID, int, time.Time) ([]usage.PendingAddonChargeRaw, error) {
+	return nil, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()
