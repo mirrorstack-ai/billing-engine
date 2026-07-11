@@ -327,3 +327,64 @@ func TestListNewCreationCharges_Ordering(t *testing.T) {
 	require.Equal(t, older, resp.Charges[1].AppID)
 	require.Equal(t, pending, resp.Charges[2].AppID, "pending after every settled row")
 }
+
+// TestListNewCreationCharges_PendingAddonRows: post-creation over-module installs
+// surface as per-app pending ADD-ON rows — base 0, amount = flat surcharge ×
+// count, ETA = earliest timer expiry — merged soonest-first with the creation
+// pendings.
+func TestListNewCreationCharges_PendingAddonRows(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	now := time.Now().UTC()
+
+	// A creation pending whose ETA lands AFTER the addon row's (created now →
+	// eta now+3d; the addon timer expires tomorrow) — the merge must interleave.
+	creationPending := uuid.New()
+	store.appMirrors[creationPending] = usage.AppMirrorInfo{CreatedAt: now, Name: "Draft App"}
+
+	addonApp := uuid.New()
+	store.pendingAddonCharges = []usage.PendingAddonChargeRaw{
+		{AppID: addonApp, Name: "老 App", AddonCount: 2, ChargeETA: now.Add(24 * time.Hour)},
+	}
+
+	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner, // current window
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 2)
+
+	addon := resp.Charges[0]
+	require.Equal(t, addonApp, addon.AppID, "soonest ETA first across BOTH pending sources")
+	require.Equal(t, usage.NewCreationChargeStatusPending, addon.Status)
+	require.Equal(t, "老 App", addon.Name)
+	require.Zero(t, addon.BaseFeeMicros, "an add-on row carries no base fee")
+	require.Equal(t, 2, addon.AddonModuleCount)
+	require.EqualValues(t, 2*usage.ModuleOverageFeeMicros, addon.AddonMicros)
+	require.EqualValues(t, 2*usage.ModuleOverageFeeMicros, addon.AmountMicros, "amount == projected flat surcharge × count")
+	require.NotNil(t, addon.ChargeETA)
+	require.True(t, addon.ChargeETA.Equal(now.Add(24*time.Hour)), "ETA = the earliest timer expiry")
+
+	require.Equal(t, creationPending, resp.Charges[1].AppID, "creation pending (eta +3d) sorts after")
+	require.True(t, store.gotPendingAddonNow.After(now.Add(-time.Minute)), "service passed its own now to the timer read")
+}
+
+// TestListNewCreationCharges_PendingAddonSkippedOnPastPeriod: like the creation
+// pendings, add-on pendings exist only in the CURRENT live window — resolving a
+// frozen billing_periods id must not even issue the timer read.
+func TestListNewCreationCharges_PendingAddonSkippedOnPastPeriod(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	store.pendingAddonCharges = []usage.PendingAddonChargeRaw{
+		{AppID: uuid.New(), Name: "X", AddonCount: 1, ChargeETA: time.Now().UTC()},
+	}
+
+	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Empty(t, resp.Charges)
+	require.True(t, store.gotPendingAddonNow.IsZero(), "past period: the timer read is never issued")
+}

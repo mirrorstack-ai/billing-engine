@@ -53,6 +53,13 @@ type fakeStore struct {
 	errPendingNewApp         error
 	gotPendingGraceCutoff    time.Time // captured graceCutoff the service resolved (now − GraceDays)
 
+	// Pending ADD-ON rows (post-creation in-grace over-module timers): the timer
+	// table has no other representation in this fake, so tests set the exact
+	// per-app rows the query would return (soonest-first, the SQL's ORDER BY).
+	pendingAddonCharges []usage.PendingAddonChargeRaw
+	errPendingAddon     error
+	gotPendingAddonNow  time.Time // captured `now` the service passed
+
 	// per-module overage display (migration 033): LiveModuleTimerCountForAccount
 	// counts the account's live install timers — the sole input to
 	// GetAccountBill's steady-state account-overage estimate. The single-account
@@ -276,6 +283,17 @@ func (f *fakeStore) PendingNewCreationCharges(_ context.Context, _ uuid.UUID, st
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+// PendingAddonModuleCharges returns the fixture rows verbatim (the timer table
+// has no other fake representation); captures `now` so a test can assert the
+// service passed its own nowFn instant.
+func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, _ int, now time.Time) ([]usage.PendingAddonChargeRaw, error) {
+	f.gotPendingAddonNow = now
+	if f.errPendingAddon != nil {
+		return nil, f.errPendingAddon
+	}
+	return f.pendingAddonCharges, nil
 }
 
 // baseSnapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).

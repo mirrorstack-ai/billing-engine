@@ -251,6 +251,18 @@ type Store interface {
 	// The service issues this ONLY for the current live window (a past period
 	// holds no still-in-grace apps). Ordered by created_at (equivalently ETA).
 	PendingNewCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd, graceCutoff time.Time) ([]PendingNewCreationChargeRaw, error)
+
+	// PendingAddonModuleCharges reads the pending ADD-ON half of
+	// ListNewCreationCharges: the account's live, unresolved install timers
+	// (migration 033) still inside their own grace window as of now — add-on
+	// charges Leg 1 WILL fire but hasn't yet — grouped per app. Only timers
+	// "over" per the live FIFO rank count; co-created timers (installed_at ==
+	// the app's created_at) are excluded, as their upcoming charge is already
+	// represented by the app's own pending creation row (the scenario-3
+	// combined invoice). The service issues this ONLY for the current live
+	// window, like PendingNewCreationCharges. Ordered soonest-first by the
+	// per-app earliest grace expiry (the charge ETA), app_id tie-break.
+	PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error)
 }
 
 // SettledNewCreationChargeRaw is one decoded SettledNewCreationCharges row: a settled
@@ -286,6 +298,19 @@ type PendingNewCreationChargeRaw struct {
 	CreatedAt          time.Time
 	Name               string
 	CreatedModuleCount int
+}
+
+// PendingAddonChargeRaw is one decoded PendingAddonModuleCharges row: an app
+// with AddonCount live over-module install timers still in their own grace
+// (installed after creation — never co-created rows). ChargeETA is the
+// EARLIEST of those timers' grace_expires_at (the soonest the Leg-1 sweep can
+// charge). Name is the app's frozen display name ("" when NULL). No money is
+// read — the service projects the steady flat surcharge per timer.
+type PendingAddonChargeRaw struct {
+	AppID      uuid.UUID
+	Name       string
+	AddonCount int
+	ChargeETA  time.Time
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -814,6 +839,34 @@ func (s *pgxStore) PendingNewCreationCharges(ctx context.Context, accountID uuid
 			CreatedAt:          r.CreatedAt,
 			Name:               r.Name.String, // "" when NULL (pre-037 / unnamed)
 			CreatedModuleCount: int(r.CreatedModuleCount),
+		})
+	}
+	return out, nil
+}
+
+// PendingAddonModuleCharges reads the in-grace over-module timers grouped per
+// app — see the Store interface doc. Money-free (the service projects the
+// steady flat surcharge per timer).
+func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error) {
+	rows, err := s.q.PendingAddonModuleCharges(ctx, db.PendingAddonModuleChargesParams{
+		AccountID:       accountID.String(),
+		IncludedModules: int32(includedModules),
+		Now:             now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PendingAddonChargeRaw, 0, len(rows))
+	for _, r := range rows {
+		appID, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return nil, fmt.Errorf("decode app_id %q: %w", r.AppID, err)
+		}
+		out = append(out, PendingAddonChargeRaw{
+			AppID:      appID,
+			Name:       r.Name.String, // "" when NULL (pre-037 / unnamed)
+			AddonCount: int(r.AddonCount),
+			ChargeETA:  r.ChargeEta,
 		})
 	}
 	return out, nil

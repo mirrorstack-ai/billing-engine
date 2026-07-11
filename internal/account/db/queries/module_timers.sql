@@ -213,3 +213,36 @@ SELECT COALESCE(count(*), 0)::bigint AS live_count
 FROM ms_billing.app_module_overage_timers
 WHERE account_id = $1
   AND removed_at IS NULL;
+
+-- PendingAddonModuleCharges is the pending ADD-ON half of the ListNewCreationCharges
+-- read (本期新建立): the account's live, unresolved install timers still INSIDE
+-- their own grace window as of @now — add-on charges that WILL fire (Leg 1 /
+-- cycle/overage.go) but haven't yet — grouped per app. Only timers "over" per
+-- the live FIFO rank (rn > @included_modules) are add-on charges at all.
+-- Co-created timers (installed_at = the app's created_at) are EXCLUDED: their
+-- pending charge is already represented by the app's own pending creation row
+-- (the scenario-3 combined invoice bills them together), and a co-created timer
+-- is in grace iff its app is — listing both would double-show one upcoming
+-- charge. Deleted apps cannot appear (deletion soft-removes every timer).
+-- One row per app: the frozen name, the count of pending add-on timers, and the
+-- EARLIEST grace expiry as the charge ETA. Ordered soonest-first, app_id
+-- breaking ties for a deterministic scan.
+-- name: PendingAddonModuleCharges :many
+SELECT ranked.app_id,
+       a.name,
+       count(*)::bigint AS addon_count,
+       min(ranked.grace_expires_at)::timestamptz AS charge_eta
+FROM (
+    SELECT id, app_id, installed_at, grace_expires_at, grace_resolved,
+           row_number() OVER (ORDER BY installed_at, id) AS rn
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = @account_id::uuid
+      AND removed_at IS NULL
+) ranked
+JOIN ms_billing.apps a ON a.app_id = ranked.app_id
+WHERE ranked.rn > @included_modules::int
+  AND ranked.grace_resolved = false
+  AND ranked.grace_expires_at > @now::timestamptz
+  AND ranked.installed_at <> a.created_at
+GROUP BY ranked.app_id, a.name
+ORDER BY min(ranked.grace_expires_at), ranked.app_id;
