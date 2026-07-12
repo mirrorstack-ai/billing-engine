@@ -102,8 +102,17 @@ var datasetNamePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 // under-count once sampling kicks in (sampling is keyed on index1 = app_id,
 // so this would bite hardest on exactly the highest-traffic single app_id).
 // %[1]s = dataset name (pre-validated against datasetNamePattern), %[2]s /
-// %[3]s = RFC3339 UTC window bounds, %[4]d = queryRowLimit.
+// %[3]s = UTC window bounds formatted as cfDateTimeLayout, %[4]d = queryRowLimit.
 const sqlQueryTemplate = `SELECT blob1 AS app_id, blob2 AS module_id, SUM(_sample_interval * double1) AS bytes FROM %[1]s WHERE timestamp >= toDateTime('%[2]s') AND timestamp < toDateTime('%[3]s') GROUP BY blob1, blob2 LIMIT %[4]d FORMAT JSON`
+
+// cfDateTimeLayout is the ONLY format ClickHouse's toDateTime() accepts:
+// "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS" — no trailing 'Z', no UTC
+// offset. Confirmed directly against the live SQL API: a plain time.RFC3339
+// timestamp (with the trailing 'Z') is rejected with HTTP 422 "Input was
+// invalid: toDateTime() string must be in the format...". Windows are always
+// UTC already (callers pass .UTC() times), so dropping the 'Z' loses no
+// information here.
+const cfDateTimeLayout = "2006-01-02T15:04:05"
 
 // EgressRow is one aggregated egress group from the CF Analytics dataset: the
 // summed bytes for a single (app_id, module_id) over the queried window.
@@ -163,8 +172,8 @@ func buildSQLQuery(datasetName string, windowStart, windowEnd time.Time) (string
 	}
 	return fmt.Sprintf(sqlQueryTemplate,
 		datasetName,
-		windowStart.UTC().Format(time.RFC3339),
-		windowEnd.UTC().Format(time.RFC3339),
+		windowStart.UTC().Format(cfDateTimeLayout),
+		windowEnd.UTC().Format(cfDateTimeLayout),
 		queryRowLimit,
 	), nil
 }
@@ -206,7 +215,7 @@ func sqlErrorMessage(raw []byte) string {
 }
 
 // QueryEgressWindow POSTs the SQL pull and maps the grouped result into
-// EgressRows. The window is passed straight through as RFC3339 UTC bounds; the
+// EgressRows. The window is rendered as cfDateTimeLayout UTC bounds; the
 // caller guarantees it is fully closed.
 func (c *realClient) QueryEgressWindow(ctx context.Context, datasetName string, windowStart, windowEnd time.Time) ([]EgressRow, error) {
 	query, err := buildSQLQuery(datasetName, windowStart, windowEnd)
