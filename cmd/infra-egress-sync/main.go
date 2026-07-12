@@ -7,9 +7,24 @@
 // ("cdn_egress") via writeDataPoint, and THIS binary periodically PULLS the
 // aggregated totals back: it holds a READ-ONLY Cloudflare API token, queries the
 // CF GraphQL Analytics API for FULLY-CLOSED hour windows, and for each
-// (app_id, module_id, window) calls billing-engine's RecordInfraUsage
-// (metric="infra.egress.bytes"). Direction is billing-engine → Cloudflare
-// (outbound pull); Cloudflare never calls back (design §3a / §5 PR #10c).
+// (app_id, module_id, window) calls billing-engine's RecordInfraUsage.
+// Direction is billing-engine → Cloudflare (outbound pull); Cloudflare never
+// calls back (design §3a / §5 PR #10c).
+//
+// SSR-origin vs static-file egress (migration 046): the dataset carries BOTH
+// static-file egress (cdn-worker's static paths, blob2 = "" or a real
+// module_id) and SSR-origin egress (cdn-worker's meter_ssr_egress, cdn-worker
+// PR #16, blob2 = the literal string "ssr") — the two are otherwise
+// shape-identical rows in the same dataset. A row's blob2 value alone
+// distinguishes them: blob2=="ssr" records under the NEW
+// infra.compute.ssr.egress.bytes metric (a real, non-trivial COGS — the SSR
+// Lambda's response leaves AWS's network to reach cdn-worker on Cloudflare's
+// network); every other row keeps recording under the existing
+// infra.egress.bytes metric EXACTLY as before (that metric is deliberately
+// zeroed for static-file egress by migration 019 — an accepted, separately
+// tracked gap this PR does not touch). The GROUPING/QUERY logic is unchanged;
+// only the metric name (and, for the ssr branch only, a GiB unit conversion —
+// see egressMetricAndValue) branches on blob2.
 //
 // Idempotency by construction: the event_id is a DETERMINISTIC hash of
 // (metric, app_id, module_id, window_start), so re-querying an already-ingested
@@ -52,10 +67,31 @@ import (
 // wrangler.toml [[analytics_engine_datasets]] dataset binding exactly.
 const egressDataset = "cdn_egress"
 
-// egressMetric is the reserved platform-infra metric the puller records each
-// window under. RecordInfraUsage resolves its kind (sum) + per-unit COGS from
-// the platform-owned registry / seeded catalog (migration 017).
+// egressMetric is the reserved platform-infra metric the puller records
+// static-file egress under (blob2 empty or a real module_id). RecordInfraUsage
+// resolves its kind (sum) + per-unit COGS from the platform-owned registry /
+// seeded catalog (migration 017; zeroed by migration 019 — a separate,
+// already-tracked gap).
 const egressMetric = "infra.egress.bytes"
+
+// ssrEgressMetric is the reserved platform-infra metric the puller records
+// SSR-origin egress under — rows whose blob2 (module_id) dimension is exactly
+// the literal string "ssr" (cdn-worker's meter_ssr_egress, cdn-worker PR #16).
+// Priced per migration 046, distinct from and NOT co-mingled with the static
+// egressMetric above.
+const ssrEgressMetric = "infra.compute.ssr.egress.bytes"
+
+// ssrModuleIDSentinel is the exact blob2 value cdn-worker's meter_ssr_egress
+// writes for an SSR-origin egress datapoint. It is the ONLY signal that
+// distinguishes an SSR row from a static-file row in the shape-identical
+// cdn_egress dataset — the shared contract with cdn-worker PR #16.
+const ssrModuleIDSentinel = "ssr"
+
+// bytesPerGiB converts raw bytes to GiB (2^30 bytes) — the unit
+// infra.compute.ssr.egress.bytes is priced in (migration 046), matching every
+// other platform-infra `.bytes` metric's GiB-basis convention
+// (infra.egress.api.bytes / infra.event.bytes, migration 020).
+const bytesPerGiB = 1024 * 1024 * 1024
 
 // lookbackHours is how many CLOSED hour buckets each run sweeps, ending at the
 // top of the trigger hour. Chosen > the schedule interval so a missed/late run
@@ -172,21 +208,28 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 				continue
 			}
 
+			// Branch the METRIC (and, for the ssr branch only, the emitted
+			// VALUE's unit) on blob2 alone — the grouping/query above is
+			// untouched, every row still yields exactly one RecordInfraUsage
+			// call. Static-file rows (blob2 empty or a real module_id) are
+			// byte-for-byte unchanged from before this PR.
+			metric, value := egressMetricAndValue(row.ModuleID, row.Bytes)
+
 			// No owner: egress rows carry no principal; the event records as a
 			// lazy NULL-account event backfilled on conversion (design §8). The
 			// omitted OwnerUserID/OwnerOrgID (uuid.Nil) is deliberate, not missing.
 			resp, err := svc.RecordInfraUsage(ctx, usage.RecordInfraUsageRequest{
-				EventID:    egressEventID(appID, row.ModuleID, w.start),
+				EventID:    egressEventID(metric, appID, row.ModuleID, w.start),
 				AppID:      appID,
-				Metric:     egressMetric,
-				Value:      row.Bytes,
+				Metric:     metric,
+				Value:      value,
 				RecordedAt: w.start, // the window the egress occurred in, not now()
 			})
 			if err != nil {
 				// Non-fatal: log + continue so one bad row doesn't abort the run.
 				res.RowErrors++
 				slog.ErrorContext(ctx, "record infra egress failed",
-					"app_id", appID, "module_id", row.ModuleID,
+					"app_id", appID, "module_id", row.ModuleID, "metric", metric,
 					"window_start", w.start, "bytes", row.Bytes, "error", err)
 				continue
 			}
@@ -200,16 +243,38 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 	return res
 }
 
-// egressEventID is the DETERMINISTIC idempotency key for one (app, module,
-// window) egress fact. It is a UUIDv5 (SHA-1) over the canonical colon-joined
-// tuple (metric, app_id, module_id, window_start-RFC3339-UTC), so re-querying an
-// already-ingested window produces the SAME id and RecordInfraUsage's ON
-// CONFLICT(event_id) DO NOTHING dedupes the re-run. The window_start anchors the
-// id to the bucket (not now()), so the id is stable across re-runs. moduleID is
-// the raw CF blob2 string (kept verbatim so the id is reproducible from the
-// dataset alone); an empty module_id still yields a stable per-app-per-window id.
-func egressEventID(appID uuid.UUID, moduleID string, windowStart time.Time) string {
-	data := egressMetric + ":" + appID.String() + ":" + moduleID + ":" + windowStart.UTC().Format(time.RFC3339)
+// egressMetricAndValue decides, from a single row's blob2 (module_id) alone,
+// which reserved metric it records under and what value to emit — the
+// grouping/query logic upstream never changes.
+//
+//   - blob2 == "ssr" (ssrModuleIDSentinel): SSR-origin egress (cdn-worker's
+//     meter_ssr_egress). Records under ssrEgressMetric, converted from raw
+//     bytes to GiB (migration 046 prices infra.compute.ssr.egress.bytes per
+//     GiB — the raw per-byte COGS floors to 0 at the integer column).
+//   - anything else (empty, or a real module_id): static-file egress, EXACTLY
+//     as before this PR — records under egressMetric with the raw byte total,
+//     unconverted.
+func egressMetricAndValue(moduleID string, bytesTotal float64) (metric string, value float64) {
+	if moduleID == ssrModuleIDSentinel {
+		return ssrEgressMetric, bytesTotal / bytesPerGiB
+	}
+	return egressMetric, bytesTotal
+}
+
+// egressEventID is the DETERMINISTIC idempotency key for one (metric, app,
+// module, window) egress fact. It is a UUIDv5 (SHA-1) over the canonical
+// colon-joined tuple (metric, app_id, module_id, window_start-RFC3339-UTC), so
+// re-querying an already-ingested window produces the SAME id and
+// RecordInfraUsage's ON CONFLICT(event_id) DO NOTHING dedupes the re-run. The
+// window_start anchors the id to the bucket (not now()), so the id is stable
+// across re-runs. moduleID is the raw CF blob2 string (kept verbatim so the id
+// is reproducible from the dataset alone); an empty module_id still yields a
+// stable per-app-per-window id. metric is included explicitly (rather than
+// relying on the egressMetric constant, as before this PR) so the SSR and
+// static-file metrics can never collide on event_id even if a future change
+// made their (app, module, window) tuples otherwise overlap.
+func egressEventID(metric string, appID uuid.UUID, moduleID string, windowStart time.Time) string {
+	data := metric + ":" + appID.String() + ":" + moduleID + ":" + windowStart.UTC().Format(time.RFC3339)
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(data)).String()
 }
 
