@@ -390,6 +390,35 @@ func TestRecordInfraUsage_AcceptsP1SumByteMetrics(t *testing.T) {
 	}
 }
 
+func TestRecordInfraUsage_AcceptsSSRComputeMetrics(t *testing.T) {
+	// SSR compute metering (migration 045, docs-temp/app-hosting/
+	// ssr-metering-design.md §1/§4). gb_seconds is additive kind=sum
+	// (mirrors AWS's own Duration x Memory dimension); request.count is
+	// additive kind=count (per-1k, producer pre-scales the value).
+	for _, tc := range []struct {
+		metric string
+		kind   usage.Kind
+	}{
+		{"infra.compute.ssr.gb_seconds", usage.KindSum},
+		{"infra.compute.ssr.request.count", usage.KindCount},
+	} {
+		t.Run(tc.metric, func(t *testing.T) {
+			store := newFakeStore()
+			req := validInfra()
+			req.EventID = "ssr-" + tc.metric
+			req.Metric = tc.metric
+
+			resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			ev := store.events[req.EventID]
+			require.Equal(t, tc.kind, ev.Kind)
+			require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+			require.Equal(t, tc.metric, ev.Metric)
+		})
+	}
+}
+
 func TestRecordInfraUsage_RejectsModelOnP1Metric(t *testing.T) {
 	// Model is a pricing dimension EXCLUSIVE to infra.ai.* — none of the P1
 	// metrics are AI, so a stray model must be rejected (it would persist a

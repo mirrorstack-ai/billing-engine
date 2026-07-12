@@ -37,7 +37,8 @@ jobs:
             account-webhook:billing-webhook \
             account-webhook-eventbridge:billing-webhook-eventbridge \
             billing-cycle:billing-cycle \
-            infra-egress-sync:billing-egress-sync
+            infra-egress-sync:billing-egress-sync \
+            infra-ssr-compute-sync:billing-infra-ssr-compute-sync
           do
             cmd="${pair%%:*}"
             artifact="${pair##*:}"

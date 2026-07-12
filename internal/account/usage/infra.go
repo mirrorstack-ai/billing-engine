@@ -64,6 +64,8 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.storage.put.count      S3 tier-1 PUT/COPY ops (per-1k)           → count
 //	infra.storage.list.count     S3 tier-1 LIST ops (per-1k)               → count
 //	infra.storage.gib_hours      S3 stored volume (GiB-hours integral)     → time_weighted
+//	infra.compute.ssr.gb_seconds SSR Lambda duration x memory (per app-hr) → sum
+//	infra.compute.ssr.request.count SSR Lambda per-invocation fee (per-1k) → count
 //
 // The eight P1 metrics (migration 020, design §2.2/§2.4/§2.5/§2.7) are
 // PRODUCER-TARGET: seeded + registered here so the producer PRs (#5/#6/#7) emit
@@ -163,6 +165,21 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// GiB-hours integral of the stored-bytes gauge (how much × how long), NOT
 		// a peak and NOT an op count. Priced per GiB-hour (~31.5 µ$ >= 1, no floor).
 		return KindTimeWeighted, true
+
+	// --- SSR compute metering (migration 045, docs-temp/app-hosting/
+	// ssr-metering-design.md §1/§4). Producer: cmd/infra-ssr-compute-sync, a
+	// CloudWatch/Lambda puller mirroring cmd/infra-egress-sync's dual-transport,
+	// closed-window, deterministic-idempotency shape.
+	case "infra.compute.ssr.gb_seconds":
+		// §1/§4 SSR Lambda GB-seconds — mirrors AWS's own Lambda Duration x
+		// Memory billing dimension exactly. sum; producer value =
+		// Σ(Duration_ms)/1000 * MemorySize_GB per (app, env, hour).
+		return KindSum, true
+	case "infra.compute.ssr.request.count":
+		// Per-invocation Lambda-ONLY request fee (NOT infra.request.count's
+		// APIGW+Lambda basis — SSR bypasses API Gateway entirely). count;
+		// priced per-1k (rule 5) → producer value = invocations/1000.0.
+		return KindCount, true
 
 	default:
 		return "", false
