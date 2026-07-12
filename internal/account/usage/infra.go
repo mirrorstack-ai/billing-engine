@@ -66,6 +66,7 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.storage.gib_hours      S3 stored volume (GiB-hours integral)     → time_weighted
 //	infra.compute.ssr.gb_seconds SSR Lambda duration x memory (per app-hr) → sum
 //	infra.compute.ssr.request.count SSR Lambda per-invocation fee (per-1k) → count
+//	infra.compute.ssr.egress.bytes  SSR response-body egress (per-GiB)     → sum
 //
 // The eight P1 metrics (migration 020, design §2.2/§2.4/§2.5/§2.7) are
 // PRODUCER-TARGET: seeded + registered here so the producer PRs (#5/#6/#7) emit
@@ -180,6 +181,20 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// APIGW+Lambda basis — SSR bypasses API Gateway entirely). count;
 		// priced per-1k (rule 5) → producer value = invocations/1000.0.
 		return KindCount, true
+
+	// --- SSR-origin egress metering (migration 046). The response-body bytes
+	// an SSR Lambda's InvokeFunction result carries OUT of AWS's network to
+	// cdn-worker — a real, non-trivial COGS distinct from the compute cost
+	// above. Producer: cmd/infra-egress-sync, which already pulls the whole
+	// cdn_egress Analytics Engine dataset for static-file egress; rows tagged
+	// blob2="ssr" (cdn-worker's meter_ssr_egress) route HERE instead of
+	// infra.egress.bytes, leaving static-file rows untouched.
+	case "infra.compute.ssr.egress.bytes":
+		// NAMED bytes but priced/emitted PER GiB (rule 5; the raw per-byte
+		// COGS floors to 0) → producer value = bytes/1024^3, for blob2="ssr"
+		// rows only. See migration 046 for the full $/GB-decimal → µ$/GiB
+		// conversion math.
+		return KindSum, true
 
 	default:
 		return "", false
