@@ -59,6 +59,42 @@ type ssrSyncResult struct {
 	Err         error
 }
 
+// allWindowsConfirmedIdle reports whether EVERY window in this run's batch
+// has its OWN immediately-preceding hour confirmed idle (a recorded
+// request.count event with value == 0) for fn. This is a per-window check,
+// not a single stale-hour check for the whole batch (design doc §8 MEDIUM;
+// see the HIGH-severity fix this replaces): a function is only skipped for
+// this run if NONE of its windows could possibly hold real activity, i.e.
+// the hour immediately before window[0], AND the hour immediately before
+// window[1] (which is window[0] itself), AND so on, were ALL confirmed idle.
+//
+// This matters because window[1]'s own preceding hour is window[0] — if
+// window[0] hasn't been recorded yet (e.g. this is the very run that would
+// first observe a resumption), WasIdle correctly returns "not confirmed
+// idle" (not found defaults to not-idle), so the whole function stays
+// eligible and every window — including the exact hour activity resumed in
+// — is genuinely queried this run rather than silently dropped for the
+// entire 3-window batch and permanently aging out of the lookback before any
+// later run's (also single-hour) check could catch it.
+//
+// A WasIdle lookup error is treated the same conservative way as before:
+// never let a lookup failure cause a function to be silently skipped.
+func allWindowsConfirmedIdle(ctx context.Context, idle idleChecker, fn awslambdainv.SSRFunction, windows []hourWindow) bool {
+	for _, w := range windows {
+		priorEventID := ssrEventID(ssrRequestCountMetric, fn.AppID, fn.Env, w.start.Add(-time.Hour))
+		idleYes, err := idle.WasIdle(ctx, priorEventID)
+		if err != nil {
+			slog.WarnContext(ctx, "ssr-compute-sync: idle pre-filter lookup failed, querying anyway",
+				"function_name", fn.FunctionName, "error", err)
+			return false
+		}
+		if !idleYes {
+			return false
+		}
+	}
+	return true
+}
+
 // syncSSR enumerates the ms-apphost-* Lambda fleet, pre-filters confirmed-
 // idle functions, batches the rest into GetMetricData calls across the
 // lookback's closed hour windows, and records BOTH SSR compute metrics per
@@ -88,20 +124,9 @@ func syncSSR(ctx context.Context, svc *usage.Service, lister lambdaLister, queri
 		return res
 	}
 
-	priorWindowStart := windows[0].start.Add(-time.Hour)
 	eligible := make([]awslambdainv.SSRFunction, 0, len(fns))
 	for _, fn := range fns {
-		priorEventID := ssrEventID(ssrRequestCountMetric, fn.AppID, fn.Env, priorWindowStart)
-		idleYes, err := idle.WasIdle(ctx, priorEventID)
-		if err != nil {
-			// Conservative: a lookup failure must never silently DROP a
-			// function from metering, so treat it as not-idle (query it).
-			slog.WarnContext(ctx, "ssr-compute-sync: idle pre-filter lookup failed, querying anyway",
-				"function_name", fn.FunctionName, "error", err)
-			eligible = append(eligible, fn)
-			continue
-		}
-		if idleYes {
+		if allWindowsConfirmedIdle(ctx, idle, fn, windows) {
 			res.SkippedIdle++
 			continue
 		}

@@ -59,6 +59,22 @@ func (f *fakeIdle) WasIdle(_ context.Context, eventID string) (bool, error) {
 	return f.idle[eventID], nil
 }
 
+// storeBackedIdle is a REALISTIC idleChecker fake: unlike fakeIdle's static
+// map, it derives WasIdle from a live *fakeStore's recorded events — exactly
+// how the real pgxIdleChecker derives it from ms_billing.usage_events. This
+// is what lets a test simulate MULTIPLE sequential runs sharing one store and
+// observe how each run's recordings feed the NEXT run's idle pre-filter, the
+// way production actually behaves across scheduled invocations.
+type storeBackedIdle struct{ store *fakeStore }
+
+func (s *storeBackedIdle) WasIdle(_ context.Context, eventID string) (bool, error) {
+	ev, ok := s.store.events[eventID]
+	if !ok {
+		return false, nil
+	}
+	return ev.Value == 0, nil
+}
+
 // --- fake usage.Store (mirrors cmd/infra-egress-sync's fakeStore) --------
 
 type fakeStore struct {
@@ -213,10 +229,18 @@ func TestSyncSSR_IdlePrefilterSkipsConfirmedIdleFunctions(t *testing.T) {
 	lister := &fakeLister{fns: []awslambdainv.SSRFunction{idleFn, activeFn}}
 
 	windows := closedHourWindowsWithLag(at, ssrLookbackHours, propagationLag)
-	priorStart := windows[0].start.Add(-time.Hour)
-	idleEventID := ssrEventID(ssrRequestCountMetric, idleFn.AppID, idleFn.Env, priorStart)
+	// A function is only pre-filtered out when EVERY window's own
+	// immediately-preceding hour is confirmed idle — not just window[0]'s.
+	// window[1]'s preceding hour is window[0] itself, window[2]'s is
+	// window[1], etc., so all of them must be seeded here.
+	idleEvents := map[string]bool{}
+	prior := windows[0].start.Add(-time.Hour)
+	idleEvents[ssrEventID(ssrRequestCountMetric, idleFn.AppID, idleFn.Env, prior)] = true
+	for _, w := range windows {
+		idleEvents[ssrEventID(ssrRequestCountMetric, idleFn.AppID, idleFn.Env, w.start)] = true
+	}
 
-	idle := &fakeIdle{idle: map[string]bool{idleEventID: true}}
+	idle := &fakeIdle{idle: idleEvents}
 	ts := windows[0].start
 	querier := &fakeQuerier{resultsByCall: map[int][]cwtypes.MetricDataResult{
 		0: {
@@ -237,6 +261,112 @@ func TestSyncSSR_IdlePrefilterSkipsConfirmedIdleFunctions(t *testing.T) {
 	// API cost, design doc §8 MEDIUM).
 	if querier.batchSizes[0] != 1 {
 		t.Errorf("batch function count = %d, want 1 (idle function pre-filtered out)", querier.batchSizes[0])
+	}
+}
+
+// TestSyncSSR_IdleThenResumeAcrossRuns is the direct regression test for the
+// HIGH-severity permanent-data-loss bug: the OLD idle pre-filter computed
+// eligibility ONCE per run from a single stale hour (window[0]'s own
+// preceding hour) and skipped a function's ENTIRE 3-window batch if that one
+// hour was idle — even when the function had already resumed activity in
+// window[0] itself (or later). By the time a later run's own single-hour
+// check would have re-included the function, the exact resumption window had
+// already aged out of the shifted 3-hour lookback, and — because the event_id
+// is idempotent/permanent (ON CONFLICT DO NOTHING) — that hour's usage could
+// never be recorded, ever.
+//
+// This test uses storeBackedIdle (not the static fakeIdle) so run 2's idle
+// check is driven by what run 1 ACTUALLY recorded, exactly as production's
+// pgxIdleChecker reads back its own prior writes.
+func TestSyncSSR_IdleThenResumeAcrossRuns(t *testing.T) {
+	fn := testFn("ms-apphost-resume", 512)
+	store := newFakeStore()
+	idle := &storeBackedIdle{store: store}
+
+	// --- Run 1: function has been idle for a long time (confirmed idle one
+	// hour before this run's earliest window), then resumes activity starting
+	// in exactly that earliest window and stays active through the rest of
+	// the batch. ---
+	run1At := at
+	windows1 := closedHourWindowsWithLag(run1At, ssrLookbackHours, propagationLag)
+	longIdleHour := windows1[0].start.Add(-time.Hour)
+	priorEventID := ssrEventID(ssrRequestCountMetric, fn.AppID, fn.Env, longIdleHour)
+	if _, err := store.InsertUsageEvent(context.Background(), usage.UsageEvent{
+		EventID: priorEventID, AppID: fn.AppID, Metric: ssrRequestCountMetric,
+		Value: 0, RecordedAt: longIdleHour,
+	}); err != nil {
+		t.Fatalf("seeding long-idle history event: %v", err)
+	}
+
+	lister := &fakeLister{fns: []awslambdainv.SSRFunction{fn}}
+	querier1 := &fakeQuerier{resultsByCall: map[int][]cwtypes.MetricDataResult{
+		0: {
+			{Id: aws.String("d0"), StatusCode: cwtypes.StatusCodeComplete,
+				Timestamps: []time.Time{windows1[0].start, windows1[1].start, windows1[2].start},
+				Values:     []float64{1000, 1200, 1300}},
+			{Id: aws.String("i0"), StatusCode: cwtypes.StatusCodeComplete,
+				Timestamps: []time.Time{windows1[0].start, windows1[1].start, windows1[2].start},
+				Values:     []float64{50, 60, 70}}, // resumption: 50 invocations in window[0]
+		},
+	}}
+
+	res1 := syncSSR(context.Background(), newSvc(store), lister, querier1, idle, run1At)
+	if res1.SkippedIdle != 0 {
+		t.Fatalf("run1 SkippedIdle = %d, want 0 — the function must NOT be skipped: window[1]/window[2]'s own preceding hours (window[0]/window[1]) have no recorded history yet, so they cannot be confirmed idle", res1.SkippedIdle)
+	}
+	if querier1.calls != 1 {
+		t.Fatalf("run1 querier.calls = %d, want 1 — the resumption window must be genuinely queried this run", querier1.calls)
+	}
+
+	resumptionEventID := ssrEventID(ssrRequestCountMetric, fn.AppID, fn.Env, windows1[0].start)
+	ev, ok := store.events[resumptionEventID]
+	if !ok {
+		t.Fatalf("resumption window (%v) usage was never recorded — permanently dropped", windows1[0].start)
+	}
+	if ev.Value != 0.05 { // 50 invocations / 1000
+		t.Errorf("resumption window request.count = %v, want 0.05", ev.Value)
+	}
+
+	// --- Run 2: one hour later, the lookback shifts. The function stays
+	// active. Confirm the sweep continues normally and the run-1 resumption
+	// data is still intact (nothing about run 2 should retroactively lose
+	// it). ---
+	run2At := run1At.Add(time.Hour)
+	windows2 := closedHourWindowsWithLag(run2At, ssrLookbackHours, propagationLag)
+	if windows2[0].start != windows1[1].start {
+		t.Fatalf("test setup assumption broken: windows2[0]=%v, want windows1[1]=%v", windows2[0].start, windows1[1].start)
+	}
+
+	querier2 := &fakeQuerier{resultsByCall: map[int][]cwtypes.MetricDataResult{
+		0: {
+			{Id: aws.String("d0"), StatusCode: cwtypes.StatusCodeComplete,
+				Timestamps: []time.Time{windows2[0].start, windows2[1].start, windows2[2].start},
+				Values:     []float64{1200, 1300, 1400}},
+			{Id: aws.String("i0"), StatusCode: cwtypes.StatusCodeComplete,
+				Timestamps: []time.Time{windows2[0].start, windows2[1].start, windows2[2].start},
+				Values:     []float64{60, 70, 80}},
+		},
+	}}
+
+	res2 := syncSSR(context.Background(), newSvc(store), lister, querier2, idle, run2At)
+	if res2.SkippedIdle != 0 {
+		t.Fatalf("run2 SkippedIdle = %d, want 0 — the function is genuinely active", res2.SkippedIdle)
+	}
+	if querier2.calls != 1 {
+		t.Fatalf("run2 querier.calls = %d, want 1", querier2.calls)
+	}
+
+	// The original resumption event from run 1 must still be present and
+	// untouched — proving it was durably recorded, not just transiently
+	// visible.
+	if ev, ok := store.events[resumptionEventID]; !ok || ev.Value != 0.05 {
+		t.Fatalf("resumption window event lost or changed after run 2: %+v, ok=%v", ev, ok)
+	}
+	// And the new window run 2 introduces (windows2[2], not seen by run 1)
+	// must also be recorded.
+	newWindowEventID := ssrEventID(ssrRequestCountMetric, fn.AppID, fn.Env, windows2[2].start)
+	if _, ok := store.events[newWindowEventID]; !ok {
+		t.Fatalf("run2's new window (%v) usage was never recorded", windows2[2].start)
 	}
 }
 

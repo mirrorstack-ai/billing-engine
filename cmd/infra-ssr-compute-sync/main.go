@@ -42,6 +42,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"time"
@@ -102,10 +103,25 @@ func handler(svc *usage.Service, lister lambdaLister, querier metricsQuerier, id
 		res := syncSSR(ctx, svc, lister, querier, idle, at.UTC())
 		logResult(ctx, "infra-ssr-compute-sync lambda run complete", res)
 		// Enumeration failure fails the run (surfaces for EventBridge
-		// retry/alerting); per-batch and per-row errors are logged + counted
-		// but never abort the sweep.
+		// retry/alerting); per-row errors are logged + counted but never abort
+		// the sweep or fail the invocation (a single bad row is not worth
+		// redoing the whole run for).
 		if res.Failed {
 			return res.Err
+		}
+		// A GetMetricData batch failure is NON-FATAL to the sweep itself
+		// (syncSSR isolates it and keeps processing remaining batches), but it
+		// DOES leave that batch's windows unrecorded this run. Returning a
+		// retryable error here — even though res.Failed is false — lets
+		// EventBridge Scheduler's own retry policy (short in-hour backoff)
+		// give the failed batch more chances before its data ages out of the
+		// lookback window, rather than waiting a full hour for the next
+		// scheduled run. Safe to retry the whole invocation: every recorded
+		// event is idempotent (ON CONFLICT DO NOTHING on the deterministic
+		// event_id), so redundantly reprocessing already-succeeded batches on
+		// retry is a no-op cost, not a correctness risk.
+		if res.BatchErrors > 0 {
+			return fmt.Errorf("infra-ssr-compute-sync: %d GetMetricData batch(es) failed this run (retryable)", res.BatchErrors)
 		}
 		return nil
 	}
