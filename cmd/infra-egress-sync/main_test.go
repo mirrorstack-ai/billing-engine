@@ -178,8 +178,8 @@ func TestSyncEgress_AggregatesRowsIntoRecordInfraUsage(t *testing.T) {
 		require.True(t, win.Equal(ev.RecordedAt), "recorded_at must be the window start")
 	}
 	// Values land on the right app.
-	require.Equal(t, float64(1024), store.events[egressEventID(app1, mod, win)].Value)
-	require.Equal(t, float64(2048), store.events[egressEventID(app2, "", win)].Value)
+	require.Equal(t, float64(1024), store.events[egressEventID(egressMetric, app1, mod, win)].Value)
+	require.Equal(t, float64(2048), store.events[egressEventID(egressMetric, app2, "", win)].Value)
 }
 
 func TestSyncEgress_DeterministicEventIDIsIdempotent(t *testing.T) {
@@ -209,11 +209,14 @@ func TestEgressEventID_StableAndDistinct(t *testing.T) {
 	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
 
 	// Stable: same tuple → same id (the idempotency contract).
-	require.Equal(t, egressEventID(app, "m", win), egressEventID(app, "m", win))
+	require.Equal(t, egressEventID(egressMetric, app, "m", win), egressEventID(egressMetric, app, "m", win))
 	// Distinct on each tuple component.
-	require.NotEqual(t, egressEventID(app, "m", win), egressEventID(uuid.New(), "m", win))
-	require.NotEqual(t, egressEventID(app, "m", win), egressEventID(app, "n", win))
-	require.NotEqual(t, egressEventID(app, "m", win), egressEventID(app, "m", win.Add(time.Hour)))
+	require.NotEqual(t, egressEventID(egressMetric, app, "m", win), egressEventID(egressMetric, uuid.New(), "m", win))
+	require.NotEqual(t, egressEventID(egressMetric, app, "m", win), egressEventID(egressMetric, app, "n", win))
+	require.NotEqual(t, egressEventID(egressMetric, app, "m", win), egressEventID(egressMetric, app, "m", win.Add(time.Hour)))
+	// Distinct on the metric itself — the SSR and static-file metrics must
+	// never collide on event_id even for an otherwise-identical tuple.
+	require.NotEqual(t, egressEventID(egressMetric, app, "m", win), egressEventID(ssrEgressMetric, app, "m", win))
 }
 
 func TestSyncEgress_OnlyClosedWindowsQueried(t *testing.T) {
@@ -254,7 +257,7 @@ func TestSyncEgress_SkipsUnparseableAppID(t *testing.T) {
 	require.Equal(t, 3, res.Skipped)
 	require.Equal(t, 1, res.Recorded)
 	require.Equal(t, 1, len(store.events))
-	require.Equal(t, float64(4), store.events[egressEventID(good, "m", win)].Value)
+	require.Equal(t, float64(4), store.events[egressEventID(egressMetric, good, "m", win)].Value)
 }
 
 func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
@@ -269,7 +272,7 @@ func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
 	}}
 	store := newFakeStore()
 	store.insertErr = errors.New("transient db error")
-	store.failEventID = egressEventID(bad, mod, win)
+	store.failEventID = egressEventID(egressMetric, bad, mod, win)
 
 	res := syncEgress(context.Background(), newSvc(store), cf, at)
 	// A per-row RecordInfraUsage error is logged + counted but never aborts the
@@ -278,7 +281,7 @@ func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
 	require.Equal(t, 1, res.RowErrors)
 	require.Equal(t, 1, res.Recorded)
 	require.Equal(t, 1, len(store.events))
-	require.Equal(t, float64(200), store.events[egressEventID(good, mod, win)].Value)
+	require.Equal(t, float64(200), store.events[egressEventID(egressMetric, good, mod, win)].Value)
 }
 
 func TestSyncEgress_CFQueryErrorFailsCleanly(t *testing.T) {
@@ -293,6 +296,104 @@ func TestSyncEgress_CFQueryErrorFailsCleanly(t *testing.T) {
 	require.Equal(t, 0, res.Recorded)
 	require.Empty(t, store.events)
 	require.Len(t, cf.queried, 1, "must abort the sweep on the first query error")
+}
+
+// --- SSR-origin vs static-file egress routing (migration 046) -------------
+
+func TestSyncEgress_SSRRowRecordsUnderNewMetricInGiB(t *testing.T) {
+	app := uuid.New()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	const rawBytes = float64(2 * bytesPerGiB) // exactly 2 GiB, for an exact expected value
+	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{
+		win: {{AppID: app.String(), ModuleID: ssrModuleIDSentinel, Bytes: rawBytes}},
+	}}
+	store := newFakeStore()
+
+	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.False(t, res.Failed)
+	require.Equal(t, 1, res.Recorded)
+	require.Equal(t, 1, len(store.events))
+
+	ev := store.events[egressEventID(ssrEgressMetric, app, ssrModuleIDSentinel, win)]
+	require.Equal(t, ssrEgressMetric, ev.Metric)
+	require.Equal(t, usage.KindSum, ev.Kind)
+	require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+	// Producer converts raw bytes to GiB for the ssr branch only.
+	require.InDelta(t, 2.0, ev.Value, 1e-9)
+	require.True(t, win.Equal(ev.RecordedAt))
+}
+
+// TestSyncEgress_StaticFileRowsUnchanged is a REGRESSION guard: a row with
+// blob2="" and a row with a real module_id must keep recording under the
+// existing infra.egress.bytes metric with the RAW (unconverted) byte total —
+// exactly the pre-this-PR behavior — even in a window that ALSO contains an
+// SSR row. The SSR branch must never leak into the static-file path.
+func TestSyncEgress_StaticFileRowsUnchanged(t *testing.T) {
+	appEmpty, appMod, appSSR := uuid.New(), uuid.New(), uuid.New()
+	mod := uuid.New().String()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{
+		win: {
+			{AppID: appEmpty.String(), ModuleID: "", Bytes: 2048},
+			{AppID: appMod.String(), ModuleID: mod, Bytes: 4096},
+			{AppID: appSSR.String(), ModuleID: ssrModuleIDSentinel, Bytes: float64(bytesPerGiB)},
+		},
+	}}
+	store := newFakeStore()
+
+	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.False(t, res.Failed)
+	require.Equal(t, 3, res.Recorded)
+	require.Equal(t, 3, len(store.events))
+
+	emptyEv := store.events[egressEventID(egressMetric, appEmpty, "", win)]
+	require.Equal(t, egressMetric, emptyEv.Metric)
+	require.Equal(t, float64(2048), emptyEv.Value, "static-file bytes must be RAW, unconverted")
+
+	modEv := store.events[egressEventID(egressMetric, appMod, mod, win)]
+	require.Equal(t, egressMetric, modEv.Metric)
+	require.Equal(t, float64(4096), modEv.Value, "static-file bytes must be RAW, unconverted")
+
+	ssrEv := store.events[egressEventID(ssrEgressMetric, appSSR, ssrModuleIDSentinel, win)]
+	require.Equal(t, ssrEgressMetric, ssrEv.Metric)
+	require.InDelta(t, 1.0, ssrEv.Value, 1e-9, "ssr bytes must be GiB-converted")
+}
+
+// TestSyncEgress_SSRAndStaticEventIDsNeverCollide proves the idempotent
+// event_id scheme holds independently for both metrics: re-running the same
+// window dedupes each row exactly once (no double-recording), and the SSR row
+// and a static row sharing the same app_id + window never collide on
+// event_id even though they are, in the raw dataset, adjacent groups.
+func TestSyncEgress_SSRAndStaticEventIDsNeverCollide(t *testing.T) {
+	app := uuid.New() // SAME app_id emits both a static row and an ssr row
+	mod := uuid.New().String()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	rows := map[time.Time][]cloudflare.EgressRow{
+		win: {
+			{AppID: app.String(), ModuleID: mod, Bytes: 4096},
+			{AppID: app.String(), ModuleID: ssrModuleIDSentinel, Bytes: float64(bytesPerGiB)},
+		},
+	}
+	store := newFakeStore()
+	svc := newSvc(store)
+
+	first := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, at)
+	require.Equal(t, 2, first.Recorded)
+	require.Equal(t, 0, first.Deduped)
+	require.Equal(t, 2, len(store.events), "the static and ssr rows must record as TWO distinct events")
+
+	staticID := egressEventID(egressMetric, app, mod, win)
+	ssrID := egressEventID(ssrEgressMetric, app, ssrModuleIDSentinel, win)
+	require.NotEqual(t, staticID, ssrID)
+	require.Equal(t, float64(4096), store.events[staticID].Value)
+	require.InDelta(t, 1.0, store.events[ssrID].Value, 1e-9)
+
+	// Re-run the SAME window: both dedupe via ON CONFLICT, neither
+	// double-records, and no cross-metric collision is introduced.
+	second := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, at)
+	require.Equal(t, 0, second.Recorded)
+	require.Equal(t, 2, second.Deduped)
+	require.Equal(t, 2, len(store.events), "re-run must not double-write either metric")
 }
 
 func TestClosedHourWindows(t *testing.T) {

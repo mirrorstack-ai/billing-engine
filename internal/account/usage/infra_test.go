@@ -391,16 +391,20 @@ func TestRecordInfraUsage_AcceptsP1SumByteMetrics(t *testing.T) {
 }
 
 func TestRecordInfraUsage_AcceptsSSRComputeMetrics(t *testing.T) {
-	// SSR compute metering (migration 045, docs-temp/app-hosting/
-	// ssr-metering-design.md §1/§4). gb_seconds is additive kind=sum
+	// SSR compute + egress metering (migrations 045/046, docs-temp/app-hosting/
+	// ssr-metering-design.md §1/§4/§7). gb_seconds is additive kind=sum
 	// (mirrors AWS's own Duration x Memory dimension); request.count is
-	// additive kind=count (per-1k, producer pre-scales the value).
+	// additive kind=count (per-1k, producer pre-scales the value);
+	// egress.bytes is additive kind=sum (NAMED bytes but priced/emitted PER
+	// GiB, mirroring the P1 byte metrics above — producer pre-scales the
+	// value to GiB for blob2="ssr" rows only, cmd/infra-egress-sync).
 	for _, tc := range []struct {
 		metric string
 		kind   usage.Kind
 	}{
 		{"infra.compute.ssr.gb_seconds", usage.KindSum},
 		{"infra.compute.ssr.request.count", usage.KindCount},
+		{"infra.compute.ssr.egress.bytes", usage.KindSum},
 	} {
 		t.Run(tc.metric, func(t *testing.T) {
 			store := newFakeStore()

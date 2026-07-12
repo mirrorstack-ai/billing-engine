@@ -1,0 +1,87 @@
+-- Migration 046 — SSR-origin egress metering catalog seed.
+--
+-- Companion to migration 045 (SSR compute metering): 045 priced the Lambda
+-- COMPUTE side of an SSR invocation (GB-seconds + per-request fee); this seeds
+-- the EGRESS side — the response body bytes the SSR Lambda's InvokeFunction
+-- result carries OUT of AWS's network to cdn-worker (external, on Cloudflare's
+-- network). That hop is a real, non-trivial COGS distinct from compute and was
+-- previously landing, unpriced, in the retired infra.egress.bytes bucket
+-- (migration 019 zeroed it — an accepted, separately-tracked gap for STATIC
+-- file egress; this migration does NOT touch that row or that gap).
+--
+-- cmd/infra-egress-sync (this PR) now branches on the cdn_egress dataset's
+-- blob2 dimension: rows tagged blob2="ssr" (cdn-worker's meter_ssr_egress,
+-- cdn-worker PR #16) record under the NEW metric below instead of
+-- infra.egress.bytes; every other row (blob2 empty or a real module_id, i.e.
+-- static-file egress) is completely unchanged.
+--
+-- NAMED under the infra.compute.ssr.* family (not infra.egress.*) so every
+-- SSR-attributable COGS — compute (045) and this egress hop — groups under one
+-- prefix for reporting, even though this particular cost is a network charge,
+-- not a compute charge. This mirrors how migration 045 itself introduced the
+-- family; the fourth member (this metric) rounds it out.
+--
+-- ===========================================================================
+-- COST + CONVERSION MATH (VERIFIED 2026-07-12 via
+-- `aws pricing get-products --service-code AWSDataTransfer`, effective
+-- 2026-07-01): AWS Data Transfer OUT from ap-northeast-1 to the internet, Tier
+-- 1 (first 10 TB/month) = $0.114 / GB, where AWS's own billing convention for
+-- data transfer is DECIMAL GB (10^9 bytes) — NOT binary GiB (2^30 bytes).
+--
+-- cmd/infra-egress-sync does NOT pre-scale the value it hands to
+-- RecordInfraUsage today for the existing infra.egress.bytes metric (it passes
+-- raw summed bytes straight through — see main.go's `Value: row.Bytes`); that
+-- metric simply happens to be priced at 0 so the lack of scaling never
+-- mattered. For THIS metric the raw per-byte COGS floors to 0 at the integer
+-- BIGINT column (see below), so this PR adds scaling for the ssr branch ONLY
+-- (the static-file branch keeps emitting raw `row.Bytes`, byte-for-byte
+-- unchanged) — the producer converts bytes to GiB before calling
+-- RecordInfraUsage, matching the GiB-basis convention every other `.bytes`
+-- platform-infra metric already uses (infra.egress.api.bytes, migration 020;
+-- infra.event.bytes, migration 020) rather than inventing a decimal-GB-native
+-- unit for just this one row.
+--
+-- Step 1 — raw COGS in µ$/byte (decimal GB, AWS's own convention):
+--   $0.114/GB = 114,000 µ$ / 1,000,000,000 bytes = 0.000114 µ$/byte
+--   0.000114 µ$/byte < 1 µ$ → floors to 0 at the integer column → CANNOT bill
+--   raw bytes (rule 5, migration 020 header: any per-unit COGS < 1 µ$ must
+--   move to a coarser unit before it silently zeroes).
+--
+-- Step 2 — convert the decimal-GB rate to a GiB rate (1 GiB = 1,073,741,824
+-- bytes, 1 GB-decimal = 1,000,000,000 bytes — these are NOT the same base and
+-- must be converted via the per-byte rate, never by a naive 1.024/1.074
+-- shortcut):
+--   0.000114 µ$/byte * 1,073,741,824 bytes/GiB = 122,406.567936 µ$/GiB
+--   >= 1 µ$ → bill PER GiB. Floored to the integer column (same floor
+--   convention migration 045 used for its GB-second rate): 122,406 µ$/GiB
+--   (≈ $0.122406567936/GiB COGS — the exact GiB-equivalent of $0.114/GB-decimal,
+--   not a rounded "clean number").
+--
+-- PRODUCER value = bytes / 1,073,741,824 (GiB, float64) — for blob2="ssr" rows
+-- ONLY. Static-file rows are untouched and keep emitting raw bytes under
+-- infra.egress.bytes (still priced 0, per 019 — a separate, already-tracked
+-- gap).
+--
+-- Effective customer price after the automatic 1.2x reserved-metric markup
+-- (never stored, only ever computed at rollup, cycle/money.go
+-- isReservedMetric): 122,406 x 1.2 = 146,887.2 µ$/GiB.
+-- ===========================================================================
+--
+-- RAW COGS is seeded here, NEVER pre-multiplied — same rule every other
+-- infra.* row follows (017/018/020/045).
+--
+-- KIND is platform-owned and matches the platformInfraKind() registry case
+-- added alongside this migration (internal/account/usage/infra.go):
+--   infra.compute.ssr.egress.bytes -> sum
+--
+-- Idempotent seed: ON CONFLICT DO NOTHING (NOT DO UPDATE) — the INITIAL value
+-- only; a finance correction lands as a follow-up UPDATE migration, same
+-- convention as 017/018/019/020/045.
+--
+-- Spec: docs-temp/app-hosting/ssr-metering-design.md §7 Open Question 4;
+-- companion mirrorstack-docs/db/ms_billing/ update tracked alongside this PR.
+INSERT INTO ms_billing.metric_definitions (
+    module_id, metric, kind, unit, unit_price_micros, active
+) VALUES
+    ('00000000-0000-0000-0000-000000000000', 'infra.compute.ssr.egress.bytes', 'sum', 'GiB', 122406, true)
+ON CONFLICT (module_id, metric) DO NOTHING;
