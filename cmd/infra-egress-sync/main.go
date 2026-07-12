@@ -4,7 +4,7 @@
 // Egress is extreme-volume and the CDN edge runs OUTSIDE the VPC holding no
 // platform secret, so the cdn-worker does NOT call billing per request. Instead
 // the Rust worker accumulates bytes into a Cloudflare Analytics Engine dataset
-// ("cdn_egress") via writeDataPoint, and THIS binary periodically PULLS the
+// ("cdn_egress_prod", see egressDataset below) via writeDataPoint, and THIS binary periodically PULLS the
 // aggregated totals back: it holds a READ-ONLY Cloudflare API token, queries the
 // CF GraphQL Analytics API for FULLY-CLOSED hour windows, and for each
 // (app_id, module_id, window) calls billing-engine's RecordInfraUsage.
@@ -64,8 +64,14 @@ import (
 
 // egressDataset is the Cloudflare Analytics Engine dataset name the cdn-worker
 // writes to and this puller reads from. It MUST match the worker's
-// wrangler.toml [[analytics_engine_datasets]] dataset binding exactly.
-const egressDataset = "cdn_egress"
+// wrangler.toml [[analytics_engine_datasets]] dataset binding exactly — it did
+// NOT (cdn-worker PR #8 stage-suffixed the dataset to "cdn_egress_prod", this
+// constant was never updated to follow), so every run of this puller since
+// that rename queried a dataset with zero rows: CF's GraphQL API returns an
+// empty result set for a dataset-name miss with HTTP 200, no error, so this
+// was never surfaced. Fixed here — verify against the live wrangler.toml
+// before ever renaming either side again.
+const egressDataset = "cdn_egress_prod"
 
 // egressMetric is the reserved platform-infra metric the puller records
 // static-file egress under (blob2 empty or a real module_id). RecordInfraUsage
