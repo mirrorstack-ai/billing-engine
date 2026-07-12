@@ -2,7 +2,6 @@ package cloudflare
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,10 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These tests exercise the GraphQL request/response mapping against a LOCAL
+// These tests exercise the SQL API request/response mapping against a LOCAL
 // httptest server — never the real Cloudflare API (hard rule). The server
-// stands in for api.cloudflare.com so the auth header, query variables, and
-// response decoding are all verified without leaving the process.
+// stands in for api.cloudflare.com so the auth header, request body (raw
+// SQL text), and response decoding are all verified without leaving the
+// process.
 
 // newTestClient points a realClient at a local httptest server instead of the
 // real CF endpoint by swapping the http.Client's transport to rewrite the host.
@@ -38,7 +38,7 @@ func newTestClient(t *testing.T, srv *httptest.Server) *realClient {
 
 // rewriteTransport redirects every request to the test server's host while
 // preserving the original method, path, body, and headers, so realClient's
-// hard-coded graphqlEndpoint is transparently routed to httptest. It mutates
+// hard-coded sqlEndpointFormat is transparently routed to httptest. It mutates
 // only req.URL.Scheme/Host — a clean redirect that cannot lose the path and has
 // no error to discard (unlike rebuilding the request from scratch).
 type rewriteTransport struct {
@@ -58,19 +58,18 @@ func (rt rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 func TestQueryEgressWindow_ParsesGroupedRows(t *testing.T) {
-	var gotAuth string
-	var gotVars map[string]interface{}
+	var gotAuth, gotContentType, gotPath, gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
+		gotContentType = r.Header.Get("Content-Type")
+		gotPath = r.URL.Path
 		body, _ := io.ReadAll(r.Body)
-		var req graphqlRequest
-		_ = json.Unmarshal(body, &req)
-		gotVars = req.Variables
+		gotBody = string(body)
 
-		_, _ = w.Write([]byte(`{"data":{"viewer":{"accounts":[{"egress":[
-			{"sum":{"double1":1024},"dimensions":{"blob1":"app-a","blob2":"mod-x"}},
-			{"sum":{"double1":2048},"dimensions":{"blob1":"app-b","blob2":""}}
-		]}]}}}`))
+		_, _ = w.Write([]byte(`{"meta":[{"name":"app_id","type":"String"},{"name":"module_id","type":"String"},{"name":"bytes","type":"Float64"}],"data":[
+			{"app_id":"app-a","module_id":"mod-x","bytes":1024},
+			{"app_id":"app-b","module_id":"","bytes":2048}
+		],"rows":2}`))
 	}))
 	defer srv.Close()
 
@@ -84,19 +83,40 @@ func TestQueryEgressWindow_ParsesGroupedRows(t *testing.T) {
 		{AppID: "app-b", ModuleID: "", Bytes: 2048},
 	}, rows)
 
-	// Bearer auth + the dataset/window/account variables are wired correctly.
+	// Bearer auth + the SQL API's raw-SQL-body / account-scoped-path shape.
 	require.Equal(t, "Bearer test-token", gotAuth)
-	require.Equal(t, "cdn_egress", gotVars["dataset"])
-	require.Equal(t, "acct-123", gotVars["account"])
-	require.Equal(t, "2026-06-15T11:00:00Z", gotVars["start"])
-	require.Equal(t, "2026-06-15T12:00:00Z", gotVars["end"])
+	require.Equal(t, "text/plain", gotContentType)
+	require.Equal(t, "/client/v4/accounts/acct-123/analytics_engine/sql", gotPath)
+	require.Contains(t, gotBody, "FROM cdn_egress")
+	require.Contains(t, gotBody, "SUM(_sample_interval * double1)")
+	require.Contains(t, gotBody, "GROUP BY blob1, blob2")
+	require.Contains(t, gotBody, "toDateTime('2026-06-15T11:00:00Z')")
+	require.Contains(t, gotBody, "toDateTime('2026-06-15T12:00:00Z')")
+	require.Contains(t, gotBody, fmt.Sprintf("LIMIT %d", queryRowLimit))
 }
 
-func TestQueryEgressWindow_GraphQLErrorsAreFatal(t *testing.T) {
-	// CF reports auth/query failures with HTTP 200 + an errors[] array — these
-	// must surface as a hard error, not a silent zero-row result.
+func TestQueryEgressWindow_InvalidDatasetNameIsRejected(t *testing.T) {
+	// datasetName is interpolated directly into the raw SQL body (the SQL API
+	// has no parameter binding), so an unexpected value must be rejected
+	// before ever making a request.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"data":null,"errors":[{"message":"authentication error"}]}`))
+		t.Fatal("must not make a request for an invalid dataset name")
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	_, err := c.QueryEgressWindow(context.Background(), "cdn_egress'; DROP TABLE x --", time.Now(), time.Now().Add(time.Hour))
+	require.ErrorContains(t, err, "invalid cloudflare analytics dataset name")
+}
+
+func TestQueryEgressWindow_ErrorEnvelopeIsFatal(t *testing.T) {
+	// Cloudflare error responses (auth failure, bad query, etc.) come back as
+	// a non-200 status with the standard v4 {errors: [...]} envelope — this
+	// must surface as a hard error with the underlying message, not a silent
+	// zero-row result.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":10000,"message":"authentication error"}]}`))
 	}))
 	defer srv.Close()
 
@@ -106,18 +126,19 @@ func TestQueryEgressWindow_GraphQLErrorsAreFatal(t *testing.T) {
 }
 
 func TestQueryEgressWindow_TruncatedResultIsFatal(t *testing.T) {
-	// CF AE returns at most queryRowLimit rows with no pagination cursor and no
-	// truncation flag, so a result set AT the limit must fail loudly rather than
-	// silently under-bill the dropped overflow groups.
+	// The query caps at queryRowLimit distinct (app_id, module_id) groups via
+	// an explicit SQL LIMIT, and this puller does not paginate, so a result
+	// set AT the limit must fail loudly rather than silently under-bill the
+	// dropped overflow groups.
 	var sb strings.Builder
-	sb.WriteString(`{"data":{"viewer":{"accounts":[{"egress":[`)
+	sb.WriteString(`{"data":[`)
 	for i := 0; i < queryRowLimit; i++ {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		fmt.Fprintf(&sb, `{"sum":{"double1":1},"dimensions":{"blob1":"app-%d","blob2":"m"}}`, i)
+		fmt.Fprintf(&sb, `{"app_id":"app-%d","module_id":"m","bytes":1}`, i)
 	}
-	sb.WriteString(`]}]}}}`)
+	sb.WriteString(`],"rows":` + fmt.Sprint(queryRowLimit) + `}`)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, sb.String())
@@ -139,4 +160,5 @@ func TestQueryEgressWindow_Non200IsFatal(t *testing.T) {
 	c := newTestClient(t, srv)
 	_, err := c.QueryEgressWindow(context.Background(), "cdn_egress", time.Now(), time.Now().Add(time.Hour))
 	require.ErrorContains(t, err, "status 500")
+	require.ErrorContains(t, err, "upstream boom")
 }
