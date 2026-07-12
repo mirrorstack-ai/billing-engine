@@ -90,8 +90,9 @@ func TestQueryEgressWindow_ParsesGroupedRows(t *testing.T) {
 	require.Contains(t, gotBody, "FROM cdn_egress")
 	require.Contains(t, gotBody, "SUM(_sample_interval * double1)")
 	require.Contains(t, gotBody, "GROUP BY blob1, blob2")
-	require.Contains(t, gotBody, "toDateTime('2026-06-15T11:00:00Z')")
-	require.Contains(t, gotBody, "toDateTime('2026-06-15T12:00:00Z')")
+	require.Contains(t, gotBody, "toDateTime('2026-06-15T11:00:00')")
+	require.Contains(t, gotBody, "toDateTime('2026-06-15T12:00:00')")
+	require.NotContains(t, gotBody, "Z')", "ClickHouse's toDateTime() rejects a trailing 'Z' (HTTP 422) — must never regress")
 	require.Contains(t, gotBody, fmt.Sprintf("LIMIT %d", queryRowLimit))
 }
 
