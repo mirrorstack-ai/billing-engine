@@ -1,4 +1,4 @@
-.PHONY: db db-init db-reset test test-integration lint build dev-webhook dev-cycle dev-egress-sync
+.PHONY: db db-init db-reset test test-integration lint build dev-webhook dev-cycle dev-egress-sync dev-ssr-compute-sync
 
 # Start infrastructure (Postgres)
 db:
@@ -57,3 +57,16 @@ dev-cycle:
 # EventBridge schedule.
 dev-egress-sync:
 	cd cmd/infra-egress-sync && go run .
+
+# Run the SSR-compute puller once locally (app-hosting SSR metering,
+# docs-temp/app-hosting/ssr-metering-design.md). Enumerates the ms-apphost-*
+# Lambda fleet via lambda:ListFunctions, pulls Duration/Invocations sums from
+# cloudwatch:GetMetricData over the last few CLOSED hour windows, and records
+# both infra.compute.ssr.gb_seconds / infra.compute.ssr.request.count via
+# RecordInfraUsage (idempotent on a deterministic event_id), then exits.
+# Requires DATABASE_URL (+ optional DB_AUTH) — AWS auth resolves through the
+# ambient SDK credential chain (no separate secret, unlike the CF puller).
+# Prod runs the same binary on an EventBridge schedule (created disabled
+# pending design doc §3 Decision B / §7 Open Question 1b).
+dev-ssr-compute-sync:
+	cd cmd/infra-ssr-compute-sync && go run .
