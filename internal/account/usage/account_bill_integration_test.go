@@ -39,7 +39,8 @@ func seedMirrorApp(t *testing.T, pool *pgxpool.Pool, acct, app uuid.UUID, create
 
 // TestAppIDsWithUsage_Integration: the usage half enumerates the UNION of
 // rolled (usage_aggregates for the period) and live (usage_events in the
-// window) app_ids, deduped, account-gated, window-bounded on the live half.
+// window) app_ids, deduped, account-gated, window-bounded on the live half,
+// with the zero-UUID account-agent sentinel excluded from BOTH ledgers.
 func TestAppIDsWithUsage_Integration(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := usage.NewStore(pool)
@@ -54,12 +55,22 @@ func TestAppIDsWithUsage_Integration(t *testing.T) {
 
 	// Live-only app: raw events in the window.
 	appSeedEvent(t, pool, acct, appLive, mod, "orders.placed", usage.KindCount, 4, "2026-06-05T00:00:00Z", "", "")
+	// Account-agent live usage: the zero UUID must not enter the app roster.
+	appSeedEvent(t, pool, acct, uuid.Nil, mod, "orders.placed", usage.KindCount, 1, "2026-06-08T00:00:00Z", "", "")
 	// Rolled-only app: a frozen aggregate row for the period, no live events.
 	periodID := appSeedPeriod(t, pool, acct, appPeriodStart, appPeriodEnd)
 	appSeedAggregate(t, pool, periodID, acct, appRolled, mod, "orders.placed", usage.KindCount, "", "", 10, 100, 1000, 1000)
+	// Historical account-agent usage: filtering only live events would leak this
+	// frozen zero-UUID aggregate into the app roster and its base-fee path.
+	appSeedAggregate(t, pool, periodID, acct, uuid.Nil, mod, "orders.placed", usage.KindCount, "", "", 3, 100, 300, 300)
 	// Both halves: must dedup to ONE entry.
 	appSeedEvent(t, pool, acct, appBoth, mod, "orders.placed", usage.KindCount, 1, "2026-06-06T00:00:00Z", "", "")
 	appSeedAggregate(t, pool, periodID, acct, appBoth, mod, "orders.placed", usage.KindCount, "", "", 2, 100, 200, 200)
+	// Make the aggregate-bearing window a genuinely closed/frozen period.
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.billing_periods SET status = 'invoiced' WHERE id = $1`,
+		periodID.String())
+	require.NoError(t, err)
 	// Another account's event in the window: the account gate must drop it.
 	appSeedEvent(t, pool, foreign, appForeign, mod, "orders.placed", usage.KindCount, 9, "2026-06-07T00:00:00Z", "", "")
 	// Same account, event OUTSIDE the window: the live bounds must drop it.
@@ -69,6 +80,8 @@ func TestAppIDsWithUsage_Integration(t *testing.T) {
 		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
 	require.NoError(t, err)
 	require.ElementsMatch(t, []uuid.UUID{appLive, appRolled, appBoth}, ids)
+	require.NotContains(t, ids, uuid.Nil,
+		"the account-agent sentinel is excluded from both live and historical roster branches")
 }
 
 // TestMirroredAppIDs_Integration: the mirror half enumerates rows whose

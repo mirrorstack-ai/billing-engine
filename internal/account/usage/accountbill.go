@@ -58,21 +58,25 @@ const (
 //     (AppIDsWithUsage) and (b) ms_billing.apps mirror rows overlapping the
 //     window (MirroredAppIDs) — so a just-created zero-usage app still shows
 //     its base and a pre-mirror app with usage still appears — deduped and
-//     sorted by app_id (bytewise) for a deterministic response,
-//  4. computes each app through computeAppBill — EXACTLY what GetAppBill
+//     sorted by app_id (bytewise) for a deterministic response; the zero-UUID
+//     account-agent sentinel is excluded in SQL and defensively after the union,
+//  4. computes each real app through computeAppBill — EXACTLY what GetAppBill
 //     computes for that (owner, app, window): snapshot-first base fee, module
 //     usage, infra with the same 1.2× markup source — and sums the totals
 //     (apps[].total_micros are PRE-credit, see AccountAppBill); a DELETED app
 //     whose row totals zero (base estimate zeroed, no usage/infra arrears) is
 //     dropped from the roster — nothing of it will ever reach an invoice,
-//  5. applies the PaaS credit ONCE at the ACCOUNT level: the same ACTIVE-SaaS
+//  5. computes the zero-UUID account-agent scope through that same pricing path,
+//     exposes module usage + infra in Agent, and deliberately discards its app
+//     base-fee result because agent activity is not an app,
+//  6. applies the PaaS credit ONCE at the ACCOUNT level: the same ACTIVE-SaaS
 //     gate as the per-app credit (v1 has no subscription system → always 0),
-//     capped at ModuleUsageTotal + InfraTotal so it never eats base fees,
-//  6. adds the account-wide POOLED module overage (migration 032) once,
+//     capped at the combined app + agent usage plane so it never eats base fees,
+//  7. adds the account-wide POOLED module overage (migration 032) once,
 //     snapshot-first (the frozen charge, else a live estimate from the pool),
-//  7. TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal + AccountOverage
-//     − PaasCredit (≥ 0 by the cap), plus the v1 plan stub with RenewsAt = the
-//     period end.
+//  8. TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal +
+//     AccountOverage + Agent.TotalMicros − PaasCredit (≥ 0 by the cap), plus the
+//     v1 plan stub with RenewsAt = the period end.
 func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest) (*GetAccountBillResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -151,6 +155,12 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		return bytes.Compare(appIDs[i][:], appIDs[j][:]) < 0
 	})
 	appIDs = slices.Compact(appIDs)
+	// Account-level agent usage is stored under uuid.Nil for metering, but the
+	// sentinel is never an app. SQL excludes it from both ledgers; this protects
+	// alternate stores and test fakes from ever routing it through app base fees.
+	appIDs = slices.DeleteFunc(appIDs, func(appID uuid.UUID) bool {
+		return appID == uuid.Nil
+	})
 
 	apps := make([]AccountAppBill, 0, len(appIDs))
 	var baseFeeTotal, moduleUsageTotal, infraTotal int64
@@ -183,6 +193,20 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		infraTotal += parts.InfraTotalMicros
 	}
 
+	// Account-level agent scope (metered under uuid.Nil): the SAME pricing path
+	// as an app, but its resolved app base fee is DISCARDED — agent activity is
+	// not an app and never incurs a base fee. Runs unconditionally like the app
+	// loop above: a lazy (!found) owner already returned a zero-Agent bill.
+	agentParts, err := s.computeAppBill(ctx, accountID, found, plan, uuid.Nil, periodStart, periodEnd)
+	if err != nil {
+		return nil, err
+	}
+	agent := AccountAgentBill{
+		ModuleUsageMicros: agentParts.ModuleUsageTotalMicros,
+		InfraMicros:       agentParts.InfraTotalMicros,
+		TotalMicros:       agentParts.ModuleUsageTotalMicros + agentParts.InfraTotalMicros,
+	}
+
 	// Account overage line (migration 033): the steady-state monthly estimate
 	// from the CURRENT live install timers — $3 × max(0, live − IncludedModules).
 	// Under the per-module-instance model overage is billed per install on its own
@@ -201,7 +225,11 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	// TODO(subscription): same gate as GetAppBill — v1 has no subscription
 	// system, so the credit is subscription-gated OFF and resolves to 0.
 	const subscriptionActive = false
-	paasCredit, err := accountPaasCreditMicros(subscriptionActive, moduleUsageTotal, infraTotal)
+	paasCredit, err := accountPaasCreditMicros(
+		subscriptionActive,
+		moduleUsageTotal+agent.ModuleUsageMicros,
+		infraTotal+agent.InfraMicros,
+	)
 	if err != nil {
 		return nil, billing.Internal("compute paas credit failed", err)
 	}
@@ -212,12 +240,13 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		PeriodEnd:              periodEnd,
 		Plan:                   planStub,
 		Apps:                   apps,
+		Agent:                  agent,
 		BaseFeeTotalMicros:     baseFeeTotal,
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,
 		AccountOverageMicros:   accountOverage,
 		PaasCreditMicros:       paasCredit,
-		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage - paasCredit,
+		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + agent.TotalMicros - paasCredit,
 	}, nil
 }
 
@@ -239,12 +268,12 @@ func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID)
 
 // accountPaasCreditMicros is the ACCOUNT-level PaaS credit: the same
 // subscription-gated pct-of-infra magnitude as GetAppBill's per-app
-// paasCreditMicros, computed over the ACCOUNT-WIDE infra total and applied
-// exactly once, then CAPPED at moduleUsageTotal + infraTotal — the credit
-// offsets usage-plane charges only and can never eat the base fees, matching
-// the charge spine's allowance posture (arrears = max(0, Σcharged − allowance),
-// base fees added ON TOP — DESIGN.md "Base fee — v1 spec"). The cap keeps
-// TotalMicros ≥ BaseFeeTotal ≥ 0 by construction.
+// paasCreditMicros, computed over the combined app + agent ACCOUNT-WIDE infra
+// total and applied exactly once, then CAPPED at their combined module usage +
+// infra totals — the credit offsets usage-plane charges only and can never eat
+// the base fees, matching the charge spine's allowance posture (arrears =
+// max(0, Σcharged − allowance), base fees added ON TOP — DESIGN.md "Base fee —
+// v1 spec"). The cap keeps TotalMicros ≥ BaseFeeTotal ≥ 0 by construction.
 //
 // Under today's pct formula the cap cannot bind (PaasCreditPct% of infra ≤
 // infra ≤ usage + infra), but it is pinned here — not left to the formula —

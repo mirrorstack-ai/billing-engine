@@ -99,15 +99,14 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.Equal(t,
 		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+resp.AccountOverageMicros,
 		resp.TotalMicros)
-	// apps[].total_micros are PRE-credit AND exclude the account-level pooled
-	// overage (it is never allocated per-app), so Σ apps == account total −
-	// overage + credit.
+	// apps[].total_micros are the app plane only: agent, pooled overage, and
+	// account credit are never allocated back into these rows.
 	var perApp int64
 	for _, a := range resp.Apps {
 		perApp += a.TotalMicros
 	}
-	require.Equal(t, resp.TotalMicros-resp.AccountOverageMicros+resp.PaasCreditMicros, perApp,
-		"Σ apps[].total (pre-credit) == account total − pooled overage + credit")
+	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, perApp,
+		"Σ apps[].total == base fee total + module usage total + infra total")
 }
 
 func TestGetAccountBill_DeterministicAppOrdering(t *testing.T) {
@@ -143,6 +142,149 @@ func TestGetAccountBill_DeterministicAppOrdering(t *testing.T) {
 			}
 		}
 	}
+}
+
+// --- account-level agent bucket --------------------------------------------
+
+func TestGetAccountBill_AgentOnlyHasNoAppRowOrBaseFee(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	// The fake roster deliberately returns the sentinel verbatim, exercising
+	// the service's defensive filter in addition to the real SQL exclusion.
+	store.usageAppIDs = []uuid.UUID{uuid.Nil}
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "agent.work.units", "", 1100),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 100, 5, 600),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.NotNil(t, resp.Apps)
+	require.Empty(t, resp.Apps, "the zero UUID is account scope, never an app row")
+	for _, app := range resp.Apps {
+		require.NotEqual(t, uuid.Nil, app.AppID)
+	}
+	require.Zero(t, resp.BaseFeeTotalMicros)
+	require.Zero(t, resp.ModuleUsageTotalMicros)
+	require.Zero(t, resp.InfraTotalMicros)
+
+	require.EqualValues(t, 1100, resp.Agent.ModuleUsageMicros)
+	require.EqualValues(t, 600, resp.Agent.InfraMicros)
+	require.Positive(t, resp.Agent.TotalMicros)
+	require.Equal(t, resp.Agent.ModuleUsageMicros+resp.Agent.InfraMicros, resp.Agent.TotalMicros,
+		"agent total is module usage + infra only; there is no base-fee term")
+	require.Equal(t, resp.Agent.TotalMicros, resp.TotalMicros,
+		"agent-only spend appears exactly once in the account total")
+
+	var perApp int64
+	for _, app := range resp.Apps {
+		perApp += app.TotalMicros
+	}
+	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, perApp,
+		"the app-plane identity excludes agent spend")
+}
+
+func TestGetAccountBill_MixedAppsAndAgentReconcileExactly(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	activeApp, deletedUnnamedApp := seqUUID(1), seqUUID(2)
+	created := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	store.appMirrors[activeApp] = usage.AppMirrorInfo{
+		Name: "Live app", ModuleCount: 6, CreatedAt: created,
+	}
+	store.appMirrors[deletedUnnamedApp] = usage.AppMirrorInfo{
+		CreatedAt: created, Deleted: true,
+		DeletedAt: time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
+	}
+	store.usageAppIDs = []uuid.UUID{deletedUnnamedApp, uuid.Nil, activeApp}
+
+	store.appBillRowsByApp[activeApp] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "orders.placed", "", 700),
+	}
+	store.appInfraBillRowsByApp[activeApp] = []usage.AppInfraUsage{
+		appInfraLine("infra.request.count", "requests", 1, 80, 80),
+	}
+	store.appBillRowsByApp[deletedUnnamedApp] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "views.count", "", 300),
+	}
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "agent.work.units", "", 500),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.output.tokens", "ai", 100, 1, 120),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Len(t, resp.Apps, 2)
+	require.Equal(t, activeApp, resp.Apps[0].AppID)
+	require.Equal(t, deletedUnnamedApp, resp.Apps[1].AppID)
+	require.True(t, resp.Apps[1].IsDeleted)
+	require.Empty(t, resp.Apps[1].Name, "a historical unnamed app remains a real app row")
+	for _, app := range resp.Apps {
+		require.NotEqual(t, uuid.Nil, app.AppID, "the agent sentinel never enters apps[]")
+	}
+
+	require.EqualValues(t, 500, resp.Agent.ModuleUsageMicros)
+	require.EqualValues(t, 120, resp.Agent.InfraMicros)
+	require.Equal(t, resp.Agent.ModuleUsageMicros+resp.Agent.InfraMicros, resp.Agent.TotalMicros,
+		"agent total has no base-fee term")
+
+	var perApp int64
+	for _, app := range resp.Apps {
+		perApp += app.TotalMicros
+	}
+	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, perApp,
+		"Σ apps[].total == base fee total + module usage total + infra total")
+	require.Equal(t,
+		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
+			resp.AccountOverageMicros+resp.Agent.TotalMicros-resp.PaasCreditMicros,
+		resp.TotalMicros,
+		"agent spend is included exactly once alongside the app plane")
+}
+
+func TestGetAccountBill_AgentBucketDiscardsDefaultAppBaseFee(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	store.usageAppIDs = []uuid.UUID{uuid.Nil}
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "agent.work.units", "", 17),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 1, 23, 23),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	// computeAppBill(uuid.Nil) has no mirror row and therefore resolves the
+	// default $20 app base internally. The account-agent projection must drop it.
+	require.Empty(t, resp.Apps)
+	require.Zero(t, resp.BaseFeeTotalMicros)
+	require.EqualValues(t, 40, resp.Agent.TotalMicros)
+	require.Equal(t, resp.Agent.ModuleUsageMicros+resp.Agent.InfraMicros, resp.Agent.TotalMicros)
+	require.EqualValues(t, 40, resp.TotalMicros)
+	require.NotEqual(t, usage.BaseFeeMicros, resp.TotalMicros)
+	require.NotEqual(t, usage.BaseFeeMicros+resp.Agent.TotalMicros, resp.TotalMicros,
+		"the default app base is discarded, not folded into the agent bucket")
 }
 
 // --- mirror window semantics ------------------------------------------------
@@ -327,6 +469,7 @@ func TestGetAccountBill_LazyAccountZeroBill(t *testing.T) {
 	require.Zero(t, resp.BaseFeeTotalMicros)
 	require.Zero(t, resp.ModuleUsageTotalMicros)
 	require.Zero(t, resp.InfraTotalMicros)
+	require.Equal(t, usage.AccountAgentBill{}, resp.Agent)
 	require.Zero(t, resp.PaasCreditMicros)
 	require.Zero(t, resp.TotalMicros)
 	// The plan stub still renders (the card shows Hobby even pre-activation).

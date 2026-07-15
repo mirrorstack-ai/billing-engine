@@ -718,6 +718,9 @@ WHERE id = @period_id::uuid AND account_id = @account_id::uuid;
 -- arrived after the account's rollup (no aggregate rows of its own yet) still
 -- enumerates here and still bills through GetAppBill's live branch.
 --
+-- The all-zero account-agent sentinel is deliberately excluded from BOTH ledger
+-- branches: it is account-level spend, never an app roster/base-fee candidate.
+--
 -- UNINSTALL-SAFE / ledger-only like every bill read: never joins an install or
 -- roster table (a deleted app's accrued usage still bills — D1e), and gated on
 -- account_id so a caller only ever enumerates its own apps. ORDER BY app_id
@@ -730,11 +733,13 @@ SELECT app_id FROM (
     JOIN ms_billing.billing_periods bp
         ON bp.id = ua.period_id
     WHERE ua.account_id   = @account_id::uuid
+      AND ua.app_id      <> '00000000-0000-0000-0000-000000000000'::uuid
       AND bp.period_start = @period_start::timestamptz
     UNION
     SELECT e.app_id AS app_id
     FROM ms_billing.usage_events e
     WHERE e.account_id  = @account_id::uuid
+      AND e.app_id     <> '00000000-0000-0000-0000-000000000000'::uuid
       AND e.recorded_at >= @period_start::timestamptz
       AND e.recorded_at <  @period_end::timestamptz
 ) apps_with_usage

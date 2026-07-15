@@ -535,17 +535,26 @@ type AccountAppBill struct {
 	// the 1.2× infra markup applied once, in SQL).
 	InfraMicros int64 `json:"infra_micros"`
 	// TotalMicros = BaseFee + ModuleUsage + Infra for THIS app, PRE-CREDIT: the
-	// account-level PaaS credit (GetAccountBillResponse.PaasCreditMicros) is
-	// applied once across the account, never allocated back per-app, so
-	// Σ apps[].total_micros == the response's total_micros + paas_credit_micros.
+	// account-level agent bucket, overage, and PaaS credit are never allocated
+	// back per-app, so Σ apps[].total_micros == BaseFeeTotalMicros +
+	// ModuleUsageTotalMicros + InfraTotalMicros on GetAccountBillResponse.
 	TotalMicros int64 `json:"total_micros"`
+}
+
+// AccountAgentBill is account-level agent spend (zero-UUID app scope): module
+// usage + infra ONLY. There is deliberately NO base_fee_micros — agent activity
+// is not an app and never incurs an app base fee.
+type AccountAgentBill struct {
+	ModuleUsageMicros int64 `json:"module_usage_micros"`
+	InfraMicros       int64 `json:"infra_micros"`
+	TotalMicros       int64 `json:"total_micros"` // == ModuleUsageMicros + InfraMicros
 }
 
 // GetAccountBillResponse is the account-owner's FULL bill for ONE period — the
 // account-level aggregate of the per-app GetAppBill math (ONE pricing path,
 // summed — never a second one):
 //
-//	TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal − PaasCredit
+//	TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal + AccountOverage + Agent.TotalMicros − PaasCredit
 //
 // Every amount is integer micro-USD. Apps enumerates the UNION of (a) apps
 // with usage in the window (the same rolled-up-else-live gate the per-app bill
@@ -571,6 +580,8 @@ type GetAccountBillResponse struct {
 	// app_name here — see AccountAppBill.
 	Apps []AccountAppBill `json:"apps"`
 
+	Agent AccountAgentBill `json:"agent"` // always emitted; zeros when no agent usage
+
 	// BaseFeeTotalMicros / ModuleUsageTotalMicros / InfraTotalMicros are the
 	// account-wide sums of the corresponding Apps[] columns.
 	BaseFeeTotalMicros     int64 `json:"base_fee_total_micros"`
@@ -587,13 +598,14 @@ type GetAccountBillResponse struct {
 
 	// PaasCreditMicros is the ACCOUNT-level PaaS credit, applied ONCE here
 	// (never per-app): the same ACTIVE-SaaS-subscription gate as GetAppBill's
-	// per-app credit (v1 has no subscription system → always 0), CAPPED at
-	// ModuleUsageTotal + InfraTotal so a credit can never eat the base fees —
-	// the same usage-only offset posture as the charge spine's allowance.
+	// per-app credit (v1 has no subscription system → always 0), CAPPED at the
+	// combined app + agent module-usage and infra planes so a credit can never
+	// eat the base fees — the same usage-only offset posture as the charge spine's
+	// allowance.
 	PaasCreditMicros int64 `json:"paas_credit_micros"`
 
 	// TotalMicros is 最終費用 = BaseFeeTotal + ModuleUsageTotal + InfraTotal +
-	// AccountOverage − PaasCredit, ≥ 0 by the credit cap.
+	// AccountOverage + Agent.TotalMicros − PaasCredit, ≥ 0 by the credit cap.
 	TotalMicros int64 `json:"total_micros"`
 }
 
