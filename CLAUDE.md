@@ -56,6 +56,18 @@ git config --local user.email "nothingchang@mirrorstack.ai"
 4. **Open a PR against `main`**. Never push directly to `main`.
 5. **`Closes #N`** in the PR body for auto-close when a tracking issue exists.
 
+## Core manifest pointer automation
+
+After a PR merges to protected `main`, a successful terminal `Publish` run triggers
+`.github/workflows/notify-core-pointer.yml`. The workflow sends the exact
+`billing-engine` main SHA to `mirrorstack-ai/mirrorstack-core-v2`, where
+`mirrorstack-core-bot` opens or updates the commit-bound pointer PR.
+
+Claude must not manually edit or push the core gitlink during the normal flow.
+The automation only opens/updates a reviewable PR; it never reviews, merges,
+promotes, or deploys. If the PR is missing, inspect the terminal CI/CD run and
+`Notify core pointer` run first; core's scheduled scan remains the fallback.
+
 ## Cross-repo coordination
 
 A schema change here typically spans two repos:
