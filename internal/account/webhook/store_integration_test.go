@@ -93,10 +93,10 @@ func TestPgxStore_InsertPaymentMethod_Drift_NoAccountsRow(t *testing.T) {
 	require.Equal(t, 0, count, "no mirror row should have been inserted")
 }
 
-func TestPgxStore_InsertPaymentMethod_Idempotent_AccountExistsPMExists(t *testing.T) {
-	// PM already in mirror → ON CONFLICT DO NOTHING → pgx.ErrNoRows,
-	// BUT the follow-up existence check confirms the accounts row IS
-	// present, so found=true (idempotent retry; mirror unchanged).
+func TestPgxStore_InsertPaymentMethod_DefaultRedeliveryReturnsPersistedDefault(t *testing.T) {
+	// A redelivered attach for the same first-card PM hits ON CONFLICT DO
+	// NOTHING. The store must recover the persisted advisory is_default=true
+	// so the router can retry an earlier failed Stripe default sync.
 	pool := testutil.NewTestDB(t)
 	store := webhook.NewStore(pool)
 	_ = seedAccount(t, pool, "cus_idem")
@@ -121,8 +121,8 @@ func TestPgxStore_InsertPaymentMethod_Idempotent_AccountExistsPMExists(t *testin
 		ExpYear:               2099,
 	})
 	require.NoError(t, err)
-	require.True(t, found, "duplicate insert should return found=true (idempotent)")
-	require.False(t, becameDefault)
+	require.True(t, found, "redelivered insert should return found=true")
+	require.True(t, becameDefault, "redelivery should return the persisted advisory default")
 
 	var count int
 	err = pool.QueryRow(context.Background(),
@@ -130,6 +130,94 @@ func TestPgxStore_InsertPaymentMethod_Idempotent_AccountExistsPMExists(t *testin
 		"pm_idem_1").Scan(&count)
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
+}
+
+func TestPgxStore_InsertPaymentMethod_NonDefaultRedeliveryReturnsPersistedFalse(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	_ = seedAccount(t, pool, "cus_idem_nondefault")
+	ctx := context.Background()
+
+	found, becameDefault, err := store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
+		StripePaymentMethodID: "pm_idem_first",
+		Brand:                 "visa",
+		Last4:                 "4242",
+		ExpMonth:              12,
+		ExpYear:               2099,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, becameDefault)
+
+	found, becameDefault, err = store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
+		StripePaymentMethodID: "pm_idem_second",
+		Brand:                 "mastercard",
+		Last4:                 "4444",
+		ExpMonth:              6,
+		ExpYear:               2098,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.False(t, becameDefault)
+
+	// Redelivery of the same second-card PM takes the ON CONFLICT path and
+	// returns its persisted advisory is_default=false.
+	found, becameDefault, err = store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
+		StripePaymentMethodID: "pm_idem_second",
+		Brand:                 "mastercard",
+		Last4:                 "4444",
+		ExpMonth:              6,
+		ExpYear:               2098,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.False(t, becameDefault)
+
+	var count int
+	err = pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.payment_methods_mirror WHERE stripe_payment_method_id = $1`,
+		"pm_idem_second").Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
+func TestPgxStore_InsertPaymentMethod_DedupeSkipHasNoPMRow(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	_ = seedAccount(t, pool, "cus_insert_dedupe")
+	ctx := context.Background()
+
+	found, becameDefault, err := store.InsertPaymentMethod(ctx, "cus_insert_dedupe", webhook.InsertPaymentMethodParams{
+		StripePaymentMethodID: "pm_dedupe_original",
+		Brand:                 "visa",
+		Last4:                 "4242",
+		ExpMonth:              12,
+		ExpYear:               2099,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, becameDefault)
+
+	// A different Stripe PM id with the same card tuple is skipped by the
+	// insert-time dedupe. No row exists under this PM id, so the persisted
+	// default lookup yields ErrNoRows and the store reports false.
+	found, becameDefault, err = store.InsertPaymentMethod(ctx, "cus_insert_dedupe", webhook.InsertPaymentMethodParams{
+		StripePaymentMethodID: "pm_dedupe_skipped",
+		Brand:                 "visa",
+		Last4:                 "4242",
+		ExpMonth:              12,
+		ExpYear:               2099,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.False(t, becameDefault)
+
+	var count int
+	err = pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.payment_methods_mirror WHERE stripe_payment_method_id = $1`,
+		"pm_dedupe_skipped").Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "dedupe skip must not mirror the new Stripe PM id")
 }
 
 func TestPgxStore_SoftDeletePaymentMethod_FoundAndIdempotent(t *testing.T) {

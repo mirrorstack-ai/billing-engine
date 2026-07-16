@@ -320,6 +320,31 @@ func (q *Queries) MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string)
 	return result.RowsAffected(), nil
 }
 
+const mirrorDefaultByStripePM = `-- name: MirrorDefaultByStripePM :one
+SELECT is_default
+FROM ms_billing.payment_methods_mirror
+WHERE stripe_payment_method_id = $1 AND deleted_at IS NULL
+`
+
+// MirrorDefaultByStripePM reads the advisory is_default flag of the ACTIVE mirror
+// row for a Stripe PM id. It backstops InsertPaymentMethod's 0-row path
+// (ON CONFLICT redelivery of payment_method.attached): re-deriving becameDefault
+// from the persisted row — instead of hard-coding false — lets a redelivered
+// attach re-issue the idempotent Stripe SetDefaultPaymentMethod after a prior
+// setter failure returned 500. Keyed on the PM id (not the customer), so a dedupe
+// skip (a DIFFERENT pm id already covers this card) or a detached row yields
+// pgx.ErrNoRows → the Go layer treats that as becameDefault=false (this pm id was
+// never mirrored, so there is nothing to sync). Safe against stale replays: a later
+// user default change flips this row's is_default to false via
+// customer.updated → SetDefaultPaymentMethodByCustomer, so an old attach redelivery
+// then reports false and never clobbers the newer choice.
+func (q *Queries) MirrorDefaultByStripePM(ctx context.Context, stripePaymentMethodID string) (bool, error) {
+	row := q.db.QueryRow(ctx, mirrorDefaultByStripePM, stripePaymentMethodID)
+	var is_default bool
+	err := row.Scan(&is_default)
+	return is_default, err
+}
+
 const mirrorRowByStripePM = `-- name: MirrorRowByStripePM :one
 SELECT id, account_id, fingerprint
 FROM ms_billing.payment_methods_mirror

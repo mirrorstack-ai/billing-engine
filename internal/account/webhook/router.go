@@ -79,9 +79,10 @@ type Store interface {
 
 	// InsertPaymentMethod inserts a row into payment_methods_mirror.
 	// Resolves account_id from stripeCustomerID inline. found=false signals
-	// Stripe→DB drift (customer.id has no matching accounts row);
-	// becameDefault=true means the inserted row was the advisory first-card
-	// default and must also be written to the Stripe Customer.
+	// Stripe→DB drift (customer.id has no matching accounts row). becameDefault
+	// reflects the row's advisory first-card default on insert and same-PM replay,
+	// and means it must also be written to the Stripe Customer. An insert-time
+	// dedupe skip returns false because that PM id was never mirrored.
 	InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (found bool, becameDefault bool, err error)
 
 	// StampAccountActivated freezes the billing-period anchor (migration 025):

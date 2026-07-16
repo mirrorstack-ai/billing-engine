@@ -81,6 +81,23 @@ RETURNING is_default;
 -- name: AccountExistsByStripeCustomer :one
 SELECT EXISTS (SELECT 1 FROM ms_billing.accounts WHERE stripe_customer_id = $1) AS account_exists;
 
+-- MirrorDefaultByStripePM reads the advisory is_default flag of the ACTIVE mirror
+-- row for a Stripe PM id. It backstops InsertPaymentMethod's 0-row path
+-- (ON CONFLICT redelivery of payment_method.attached): re-deriving becameDefault
+-- from the persisted row — instead of hard-coding false — lets a redelivered
+-- attach re-issue the idempotent Stripe SetDefaultPaymentMethod after a prior
+-- setter failure returned 500. Keyed on the PM id (not the customer), so a dedupe
+-- skip (a DIFFERENT pm id already covers this card) or a detached row yields
+-- pgx.ErrNoRows → the Go layer treats that as becameDefault=false (this pm id was
+-- never mirrored, so there is nothing to sync). Safe against stale replays: a later
+-- user default change flips this row's is_default to false via
+-- customer.updated → SetDefaultPaymentMethodByCustomer, so an old attach redelivery
+-- then reports false and never clobbers the newer choice.
+-- name: MirrorDefaultByStripePM :one
+SELECT is_default
+FROM ms_billing.payment_methods_mirror
+WHERE stripe_payment_method_id = $1 AND deleted_at IS NULL;
+
 -- StampAccountActivated freezes the billing-period ANCHOR (migration 025): the
 -- UTC instant the account bound its FIRST credit card. Called from
 -- payment_method.attached — the moment Stripe CONFIRMS the card is bound, not the

@@ -85,8 +85,10 @@ func (s *pgxStore) SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID
 //     customer); webhook handler converts to drift_warning response.
 //   - found=true on either successful insert OR a no-op (ON CONFLICT,
 //     or the insert-time dedupe skip) when the account does exist.
-//   - becameDefault=true only when this call inserted the first active card;
-//     no-op/dedupe paths always return false.
+//   - becameDefault reflects the inserted row's advisory default, or on an
+//     ON CONFLICT redelivery, the persisted advisory default for this PM id.
+//     An insert-time dedupe skip still returns false because this PM id has
+//     no active mirror row.
 //
 // First active card on the account becomes the default; subsequent cards
 // insert is_default=false. The INSERT…SELECT also skips when an active
@@ -118,7 +120,23 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 	if err != nil {
 		return false, false, err
 	}
-	return exists, false, nil
+	if !exists {
+		return false, false, nil // Stripe→DB drift: no accounts row for this customer.
+	}
+	// The account exists, so this 0-row result is an ON CONFLICT redelivery or a
+	// dedupe skip. Re-derive becameDefault from the persisted mirror row's advisory
+	// is_default (keyed on THIS pm id) so a redelivered payment_method.attached
+	// re-issues the idempotent Stripe SetDefaultPaymentMethod after a prior 500.
+	// A dedupe skip has no row for this pm id (ErrNoRows) → false, correct: we never
+	// mirrored this pm id so there is nothing to sync to Stripe.
+	isDefault, err := s.q.MirrorDefaultByStripePM(ctx, pm.StripePaymentMethodID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, false, nil
+		}
+		return false, false, err
+	}
+	return true, isDefault, nil
 }
 
 // StampAccountActivated freezes the account's billing-period anchor (migration

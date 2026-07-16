@@ -233,6 +233,29 @@ func TestProcess_PaymentMethodAttached_DefaultSetterErrorIsInternal(t *testing.T
 	require.Equal(t, []string{"cus_first=pm_first"}, stripe.DefaultsSet)
 }
 
+func TestProcess_PaymentMethodAttached_RedeliveryReissuesStripeDefault(t *testing.T) {
+	event := cardPMEvent("evt_pma_default_retry", "payment_method.attached", "pm_first", "cus_first", "visa", "4242", 12, 2029)
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	s.InsertBecameDefault = true
+	stripe := &webhooktest.FakeChargeRetriever{ErrSetDefault: errors.New("stripe down")}
+	r := newRouterWithCharges(v, s, stripe)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+	require.Equal(t, []string{"cus_first=pm_first"}, stripe.DefaultsSet)
+	require.NotContains(t, s.Processed, event.ID)
+
+	stripe.ErrSetDefault = nil
+	res = r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Equal(t, []string{"cus_first=pm_first", "cus_first=pm_first"}, stripe.DefaultsSet)
+}
+
 func TestProcess_PaymentMethodAttached_NoAccountRow_DriftWarning(t *testing.T) {
 	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma2", "payment_method.attached", "pm_x", "cus_orphan", "visa", "4242", 12, 2029)}
 	s := webhooktest.NewFakeStore()

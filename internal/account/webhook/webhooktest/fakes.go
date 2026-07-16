@@ -48,10 +48,11 @@ type FakeStore struct {
 	ResolvedPMs        []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
 	ActivatedCustomers []string                            // stripe_customer_id values from StampAccountActivated
 
-	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
-	RelaxedInvoices []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
-	FailedInvoices  []string                           // stripe_invoice_id values from MarkInvoiceFailed
-	FraudFlags      []FraudFlag                        // captured calls to FlagPaymentMethodFraud
+	AppliedInvoices  []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
+	RelaxedInvoices  []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
+	FailedInvoices   []string                           // stripe_invoice_id values from MarkInvoiceFailed
+	FraudFlags       []FraudFlag                        // captured calls to FlagPaymentMethodFraud
+	insertedDefaults map[string]bool                    // advisory is_default by stripe_payment_method_id
 
 	// Found-flag knobs
 	TouchedFound        bool // returned by TouchAccountByStripeCustomer
@@ -144,6 +145,13 @@ func (s *FakeStore) InsertPaymentMethod(_ context.Context, _ string, params webh
 		return false, false, s.ErrInsert
 	}
 	s.Inserts = append(s.Inserts, params)
+	if s.insertedDefaults == nil {
+		s.insertedDefaults = map[string]bool{}
+	}
+	if isDefault, ok := s.insertedDefaults[params.StripePaymentMethodID]; ok {
+		return s.InsertFound, isDefault, nil
+	}
+	s.insertedDefaults[params.StripePaymentMethodID] = s.InsertBecameDefault
 	return s.InsertFound, s.InsertBecameDefault, nil
 }
 
