@@ -363,6 +363,7 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	x := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 	store.timers[x].chargeAttemptedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
 	sc.setFindByRef("timer:"+x.String(), billingstripe.Invoice{ID: "in_orphan_draft", Status: "draft", AmountDue: 0, Currency: "usd"})
+	sc.invoiceStatus = "open"
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
@@ -374,6 +375,7 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	require.Len(t, sc.finalizeCalls, 1)
 	require.Equal(t, "in_orphan_draft", sc.finalizeCalls[0].invoiceID)
 	require.True(t, store.timers[x].graceCharged)
+	require.True(t, store.invoices["in_orphan_draft"].EverFailed)
 }
 
 // The recovery no-op arm: the marker is set but Stripe has NOTHING under the

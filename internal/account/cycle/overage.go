@@ -365,6 +365,7 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		PeriodStart:        coverageStart,
 		PeriodEnd:          coverageEnd,
 		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
+		EverFailed:         chargeFailedStatus(inv.Status),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
@@ -539,6 +540,7 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 		PeriodStart:        coverageStart,
 		PeriodEnd:          coverageEnd,
 		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
+		EverFailed:         chargeFailedStatus(inv.Status),
 	}); err != nil {
 		return false, billing.Internal("invoice mirror upsert failed (module overage recovery)", err)
 	}

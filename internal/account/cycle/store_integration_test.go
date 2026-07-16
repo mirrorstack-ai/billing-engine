@@ -267,6 +267,47 @@ func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
 	require.True(t, shouldOther, "a different window is a distinct run")
 }
 
+func TestUpsertInvoice_Integration_EverFailedIsSticky(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+	acct := seedAccount(t, pool)
+
+	open := cycle.InvoiceMirror{
+		AccountID: acct, StripeInvoiceID: "in_failed", Status: "open",
+		AmountDueCents: 200, Currency: "usd", EverFailed: true,
+	}
+	paid := cycle.InvoiceMirror{
+		AccountID: acct, StripeInvoiceID: "in_paid", Status: "paid",
+		AmountDueCents: 200, AmountPaidCents: 200, Currency: "usd",
+	}
+	require.NoError(t, store.UpsertInvoice(ctx, open))
+	require.NoError(t, store.UpsertInvoice(ctx, paid))
+
+	var failedStatus string
+	var everFailed bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, ever_failed FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		open.StripeInvoiceID).Scan(&failedStatus, &everFailed))
+	require.Equal(t, "open", failedStatus)
+	require.True(t, everFailed)
+
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT ever_failed FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		paid.StripeInvoiceID).Scan(&everFailed))
+	require.False(t, everFailed)
+
+	open.Status = "paid"
+	open.AmountPaidCents = open.AmountDueCents
+	open.EverFailed = false
+	require.NoError(t, store.UpsertInvoice(ctx, open))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, ever_failed FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		open.StripeInvoiceID).Scan(&failedStatus, &everFailed))
+	require.Equal(t, "paid", failedStatus)
+	require.True(t, everFailed, "a later paid mirror must not clear a latched failure")
+}
+
 // TestAccountCollection_Integration_DefaultsAndUpdate verifies migration 016's
 // born-clean column defaults (arrears mode, $25 credit floor, NULL ceiling) and
 // the UpdateAccountCollection round-trip (mode + ceiling persisted and read

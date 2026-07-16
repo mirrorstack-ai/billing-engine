@@ -31,6 +31,15 @@ import (
 
 func ptrI64(v int64) *int64 { return &v }
 
+func onlyInvoiceMirror(t *testing.T, store *fakeStore) cycle.InvoiceMirror {
+	t.Helper()
+	require.Len(t, store.invoices, 1)
+	for _, mirror := range store.invoices {
+		return mirror
+	}
+	return cycle.InvoiceMirror{}
+}
+
 var scenarioCreatedAt = timeUTC(2026, 6, 19, 12) // mid-period create (anchor 4)
 
 // scenarioSweepAt is past scenarioCreatedAt + GraceDays (Jun 22), so both the
@@ -296,14 +305,6 @@ func TestScenario5_LargeAutoCollectFlagAtEveryChargeSite(t *testing.T) {
 	// per-module grace leg (Leg 1), and the boundary leg (Leg 2) — resolved AT CHARGE
 	// TIME against the account's threshold. A per-account override BELOW the charged
 	// amount flags it; the default $100 (nil override) does not, at every site.
-	onlyMirror := func(store *fakeStore) cycle.InvoiceMirror {
-		require.Len(t, store.invoices, 1)
-		for _, m := range store.invoices {
-			return m
-		}
-		return cycle.InvoiceMirror{}
-	}
-
 	t.Run("creation/combined leg", func(t *testing.T) {
 		run := func(threshold *int64) cycle.InvoiceMirror {
 			store := newFakeStore()
@@ -315,7 +316,7 @@ func TestScenario5_LargeAutoCollectFlagAtEveryChargeSite(t *testing.T) {
 			registerMirror(t, svc, user, appID, scenarioCreatedAt, 0) // $10 base charge
 			_, err := svc.SweepCreationProrations(context.Background(), scenarioSweepAt)
 			require.NoError(t, err)
-			return onlyMirror(store)
+			return onlyInvoiceMirror(t, store)
 		}
 		require.True(t, run(ptrI64(5_000_000)).IsLargeAutoCollect, "$10 base > $5 threshold → flagged")
 		require.False(t, run(nil).IsLargeAutoCollect, "$10 base < $100 default → not flagged")
@@ -332,7 +333,7 @@ func TestScenario5_LargeAutoCollectFlagAtEveryChargeSite(t *testing.T) {
 			seedTimer(store, acct, uuid.New(), timeUTC(2026, 6, 19, 0)) // over, $1.50
 			_, err := svc.SweepModuleOverage(context.Background(), timeUTC(2026, 6, 25, 9))
 			require.NoError(t, err)
-			return onlyMirror(store)
+			return onlyInvoiceMirror(t, store)
 		}
 		require.True(t, run(ptrI64(1_000_000)).IsLargeAutoCollect, "$1.50 overage > $1 threshold → flagged")
 		require.False(t, run(nil).IsLargeAutoCollect, "$1.50 overage < $100 default → not flagged")
@@ -348,11 +349,81 @@ func TestScenario5_LargeAutoCollectFlagAtEveryChargeSite(t *testing.T) {
 			sc := newFakeStripe()
 			_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 			require.NoError(t, err)
-			return onlyMirror(store)
+			return onlyInvoiceMirror(t, store)
 		}
 		require.True(t, run(ptrI64(5_000_000)).IsLargeAutoCollect, "$20 boundary > $5 threshold → flagged")
 		require.False(t, run(nil).IsLargeAutoCollect, "$20 boundary < $100 default → not flagged")
 	})
+}
+
+func TestEverFailedDerivedAtEveryChargeSite(t *testing.T) {
+	sites := []struct {
+		name string
+		run  func(*testing.T, string) cycle.InvoiceMirror
+	}{
+		{
+			name: "creation/combined leg",
+			run: func(t *testing.T, status string) cycle.InvoiceMirror {
+				store := newFakeStore()
+				user, _ := registeredAccount(store)
+				sc := newFakeStripe()
+				sc.invoiceStatus = status
+				svc := appsSvc(store, sc)
+				registerMirror(t, svc, user, uuid.New(), scenarioCreatedAt, 0)
+				_, err := svc.SweepCreationProrations(context.Background(), scenarioSweepAt)
+				require.NoError(t, err)
+				return onlyInvoiceMirror(t, store)
+			},
+		},
+		{
+			name: "per-module grace leg",
+			run: func(t *testing.T, status string) cycle.InvoiceMirror {
+				store := newFakeStore()
+				_, acct := registeredAccount(store)
+				sc := newFakeStripe()
+				sc.invoiceStatus = status
+				svc := cycle.NewService(store, sc)
+				seedIncluded(store, acct, uuid.New(), timeUTC(2026, 5, 4, 0), 5)
+				seedTimer(store, acct, uuid.New(), timeUTC(2026, 6, 19, 0))
+				_, err := svc.SweepModuleOverage(context.Background(), timeUTC(2026, 6, 25, 9))
+				require.NoError(t, err)
+				return onlyInvoiceMirror(t, store)
+			},
+		},
+		{
+			name: "boundary leg",
+			run: func(t *testing.T, status string) cycle.InvoiceMirror {
+				store := newFakeStore()
+				store.hasPM = true
+				store.stripeCustomer = "cus_ever_failed"
+				seedApp(store, chargeAccount, 0, false)
+				sc := newFakeStripe()
+				sc.invoiceStatus = status
+				_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+				require.NoError(t, err)
+				return onlyInvoiceMirror(t, store)
+			},
+		},
+	}
+	statuses := []struct {
+		status string
+		failed bool
+	}{
+		{status: "paid", failed: false},
+		{status: "open", failed: true},
+		{status: "uncollectible", failed: true},
+	}
+	for _, site := range sites {
+		t.Run(site.name, func(t *testing.T) {
+			for _, status := range statuses {
+				t.Run(status.status, func(t *testing.T) {
+					mirror := site.run(t, status.status)
+					require.Equal(t, status.status, mirror.Status)
+					require.Equal(t, status.failed, mirror.EverFailed)
+				})
+			}
+		})
+	}
 }
 
 // --- Scenario 6: boundary = arrears + base + ongoing-over-module overage -------
