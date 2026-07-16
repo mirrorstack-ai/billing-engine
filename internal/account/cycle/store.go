@@ -1331,6 +1331,7 @@ func (s *pgxStore) lockAndReadChargeableApp(ctx context.Context, appID uuid.UUID
 		ModuleCount:        int(row.ModuleCount),
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
+		Name:               row.Name.String,
 		ProrationAttempted: row.ProrationAttemptedAt.Valid,
 	}
 
