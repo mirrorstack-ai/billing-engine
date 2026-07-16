@@ -2,6 +2,7 @@ package usage_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -237,6 +238,37 @@ func TestListInvoices_RowPassthrough(t *testing.T) {
 	require.Equal(t, &pe, got.PeriodEnd)
 	require.Equal(t, row.HostedInvoiceURL, got.HostedInvoiceURL)
 	require.Equal(t, row.InvoicePDF, got.InvoicePDF)
+}
+
+func TestListInvoices_EverFailedAlwaysMarshaled(t *testing.T) {
+	store := newFakeStore()
+	owner := seedOwnerAccount(store)
+	failed := invAt(t, "2026-06-19T00:00:00Z", 12_340_000)
+	failed.Status = "open"
+	failed.AmountPaidMicros = 0
+	failed.EverFailed = true
+	paid := invAt(t, "2026-05-19T00:00:00Z", 12_340_000)
+	store.invoiceRows = []usage.InvoiceMirrorRaw{failed, paid}
+
+	resp, err := newService(store).ListInvoices(context.Background(), usage.ListInvoicesRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	body, err := json.Marshal(resp)
+	require.NoError(t, err)
+
+	var wire struct {
+		Invoices []struct {
+			Status     string `json:"status"`
+			EverFailed *bool  `json:"ever_failed"`
+		} `json:"invoices"`
+	}
+	require.NoError(t, json.Unmarshal(body, &wire))
+	require.Len(t, wire.Invoices, 2)
+	require.Equal(t, "open", wire.Invoices[0].Status)
+	require.NotNil(t, wire.Invoices[0].EverFailed)
+	require.True(t, *wire.Invoices[0].EverFailed)
+	require.Equal(t, "paid", wire.Invoices[1].Status)
+	require.NotNil(t, wire.Invoices[1].EverFailed, "false must still be present on the wire")
+	require.False(t, *wire.Invoices[1].EverFailed)
 }
 
 func TestListInvoices_InternalOnStoreError(t *testing.T) {

@@ -624,6 +624,14 @@ type InvoiceMirror struct {
 	// resolved auto-collect threshold WHEN THE CHARGE FIRED. Set by every
 	// off-session charge call site; false for anything below the threshold.
 	IsLargeAutoCollect bool
+	// EverFailed feeds the sticky ever_failed OR-latch in UpsertInvoice. The
+	// charge spine ALWAYS passes false here: finalize (auto_advance) returns
+	// "open" for a success-bound async off-session charge too, so finalize
+	// status cannot distinguish failure. ever_failed is authored solely by the
+	// webhook latch (invoice.payment_failed / marked_uncollectible); this field
+	// exists only so a later spine mirror racing that webhook can't clear a
+	// latched true (existing OR EXCLUDED) — core#135.
+	EverFailed bool
 }
 
 // RawAggregate is one per-kind aggregated row from the rollup SELECTs, before
@@ -1075,6 +1083,7 @@ func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {
 		PeriodStart:        pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
 		PeriodEnd:          pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
 		IsLargeAutoCollect: inv.IsLargeAutoCollect,
+		EverFailed:         inv.EverFailed,
 	})
 }
 
@@ -1380,6 +1389,7 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 		// combined debit (base + co-created overage lines). Dropping it here would
 		// silently write false for every creation/combined invoice.
 		IsLargeAutoCollect: pc.Invoice.IsLargeAutoCollect,
+		EverFailed:         pc.Invoice.EverFailed,
 	}); err != nil {
 		return 0, "", err
 	}

@@ -94,6 +94,10 @@ type InvoiceRow struct {
 	// section. Always present (defaults false); api-client-shared's Invoice type
 	// should add a matching `is_large_auto_collect` field to consume it.
 	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
+	// EverFailed is sticky: the invoice has failed a charge attempt at least
+	// once; web derives the failed display state from (status, ever_failed) —
+	// core#135. Always present, like is_large_auto_collect.
+	EverFailed bool `json:"ever_failed"`
 }
 
 // ListInvoicesResponse is one page of the invoice history, newest-first.
@@ -185,6 +189,7 @@ func (s *Service) ListInvoices(ctx context.Context, req ListInvoicesRequest) (*L
 			HostedInvoiceURL:   r.HostedInvoiceURL,
 			InvoicePDF:         r.InvoicePDF,
 			IsLargeAutoCollect: r.IsLargeAutoCollect,
+			EverFailed:         r.EverFailed,
 		})
 	}
 

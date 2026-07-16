@@ -26,7 +26,7 @@ import (
 // seedInvoiceMirror inserts one ms_billing.invoices row with an explicit id +
 // created_at (the keyset the query pages on). number/hostedURL/pdf empty →
 // stored NULL (the pre-enrichment state migration 026 documents).
-func seedInvoiceMirror(t *testing.T, pool *pgxpool.Pool, acct, id uuid.UUID, stripeID, status string, dueCents, paidCents int64, createdAt time.Time, number, hostedURL, pdf string) {
+func seedInvoiceMirror(t *testing.T, pool *pgxpool.Pool, acct, id uuid.UUID, stripeID, status string, dueCents, paidCents int64, createdAt time.Time, number, hostedURL, pdf string, everFailed bool) {
 	t.Helper()
 	var numberArg, hostedArg, pdfArg any
 	if number != "" {
@@ -41,10 +41,10 @@ func seedInvoiceMirror(t *testing.T, pool *pgxpool.Pool, acct, id uuid.UUID, str
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO ms_billing.invoices
 		   (id, account_id, stripe_invoice_id, status, amount_due, amount_paid, currency,
-		    created_at, number, hosted_invoice_url, invoice_pdf)
-		 VALUES ($1,$2,$3,$4,$5,$6,'usd',$7,$8,$9,$10)`,
+		    created_at, number, hosted_invoice_url, invoice_pdf, ever_failed)
+		 VALUES ($1,$2,$3,$4,$5,$6,'usd',$7,$8,$9,$10,$11)`,
 		id.String(), acct.String(), stripeID, status, dueCents, paidCents, createdAt,
-		numberArg, hostedArg, pdfArg)
+		numberArg, hostedArg, pdfArg, everFailed)
 	require.NoError(t, err)
 }
 
@@ -65,13 +65,13 @@ func TestListInvoices_Integration_KeysetPaginationAndDraftExclusion(t *testing.T
 	for i := range ids {
 		ids[i] = uuid.New()
 	}
-	seedInvoiceMirror(t, pool, acct, ids[0], "in_a", "paid", 2000, 2000, base, "", "", "")
-	seedInvoiceMirror(t, pool, acct, ids[1], "in_b", "open", 2000, 0, base.AddDate(0, -1, 0), "", "", "")
-	seedInvoiceMirror(t, pool, acct, ids[2], "in_c1", "paid", 2000, 2000, base.AddDate(0, -2, 0), "", "", "")
-	seedInvoiceMirror(t, pool, acct, ids[3], "in_c2", "void", 2000, 0, base.AddDate(0, -2, 0), "", "", "") // created_at tie with in_c1
-	seedInvoiceMirror(t, pool, acct, ids[4], "in_d", "uncollectible", 2000, 0, base.AddDate(0, -3, 0), "", "", "")
+	seedInvoiceMirror(t, pool, acct, ids[0], "in_a", "paid", 2000, 2000, base, "", "", "", false)
+	seedInvoiceMirror(t, pool, acct, ids[1], "in_b", "open", 2000, 0, base.AddDate(0, -1, 0), "", "", "", true)
+	seedInvoiceMirror(t, pool, acct, ids[2], "in_c1", "paid", 2000, 2000, base.AddDate(0, -2, 0), "", "", "", false)
+	seedInvoiceMirror(t, pool, acct, ids[3], "in_c2", "void", 2000, 0, base.AddDate(0, -2, 0), "", "", "", false) // created_at tie with in_c1
+	seedInvoiceMirror(t, pool, acct, ids[4], "in_d", "uncollectible", 2000, 0, base.AddDate(0, -3, 0), "", "", "", true)
 	// The draft must never surface, even though it is the newest row.
-	seedInvoiceMirror(t, pool, acct, uuid.New(), "in_draft", "draft", 2000, 0, base.AddDate(0, 0, 1), "", "", "")
+	seedInvoiceMirror(t, pool, acct, uuid.New(), "in_draft", "draft", 2000, 0, base.AddDate(0, 0, 1), "", "", "", false)
 
 	seen := map[uuid.UUID]bool{}
 	var cursor *usage.InvoiceCursor
@@ -113,12 +113,12 @@ func TestListInvoices_Integration_CentsToMicrosAndNullDecodes(t *testing.T) {
 	acct := appSeedAccount(t, pool)
 	bare := uuid.New()
 	seedInvoiceMirror(t, pool, acct, bare, "in_bare", "open", 1234, 0,
-		time.Date(2026, 5, 19, 0, 0, 0, 0, time.UTC), "", "", "")
+		time.Date(2026, 5, 19, 0, 0, 0, 0, time.UTC), "", "", "", true)
 
 	enriched := uuid.New()
 	seedInvoiceMirror(t, pool, acct, enriched, "in_rich", "paid", 1234, 1234,
 		time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC),
-		"813C8918-0001", "https://invoice.stripe.com/i/in_rich", "https://pay.stripe.com/invoice/in_rich/pdf")
+		"813C8918-0001", "https://invoice.stripe.com/i/in_rich", "https://pay.stripe.com/invoice/in_rich/pdf", false)
 
 	rows, err := store.ListInvoices(ctx, acct, 10, nil)
 	require.NoError(t, err)
@@ -134,6 +134,8 @@ func TestListInvoices_Integration_CentsToMicrosAndNullDecodes(t *testing.T) {
 	require.EqualValues(t, 12_340_000, rich.AmountPaidMicros)
 	require.EqualValues(t, 12_340_000, plain.AmountDueMicros)
 	require.EqualValues(t, 0, plain.AmountPaidMicros)
+	require.False(t, rich.EverFailed)
+	require.True(t, plain.EverFailed)
 
 	require.Equal(t, "813C8918-0001", rich.Number)
 	require.Equal(t, "https://invoice.stripe.com/i/in_rich", rich.HostedInvoiceURL)
@@ -156,9 +158,9 @@ func TestListInvoices_Integration_AccountScoped(t *testing.T) {
 	mine := appSeedAccount(t, pool)
 	other := appSeedAccount(t, pool)
 	seedInvoiceMirror(t, pool, mine, uuid.New(), "in_mine", "paid", 100, 100,
-		time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC), "", "", "")
+		time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC), "", "", "", false)
 	seedInvoiceMirror(t, pool, other, uuid.New(), "in_other", "paid", 100, 100,
-		time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC), "", "", "")
+		time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC), "", "", "", false)
 
 	rows, err := store.ListInvoices(ctx, mine, 10, nil)
 	require.NoError(t, err)

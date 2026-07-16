@@ -31,7 +31,7 @@
 SELECT id, stripe_invoice_id, number, status,
        amount_due, amount_paid, currency,
        period_start, period_end, created_at,
-       hosted_invoice_url, invoice_pdf, is_large_auto_collect
+       hosted_invoice_url, invoice_pdf, is_large_auto_collect, ever_failed
 FROM ms_billing.invoices
 WHERE account_id = @account_id::uuid
   AND status <> 'draft'

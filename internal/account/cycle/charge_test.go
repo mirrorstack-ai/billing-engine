@@ -80,8 +80,9 @@ type finalizeCall struct {
 
 func newFakeStripe() *fakeStripe {
 	return &fakeStripe{
-		invoiceID:        "in_test_" + uuid.NewString(),
-		invoiceStatus:    "paid",
+		invoiceID: "in_test_" + uuid.NewString(),
+		// Finalize settles asynchronously, so a healthy finalize returns "open".
+		invoiceStatus:    "open",
 		invoiceAmountDue: 0, // overridden per test where the charged amount matters
 	}
 }

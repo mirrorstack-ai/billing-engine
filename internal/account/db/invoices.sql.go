@@ -72,7 +72,7 @@ const listInvoicesForAccount = `-- name: ListInvoicesForAccount :many
 SELECT id, stripe_invoice_id, number, status,
        amount_due, amount_paid, currency,
        period_start, period_end, created_at,
-       hosted_invoice_url, invoice_pdf, is_large_auto_collect
+       hosted_invoice_url, invoice_pdf, is_large_auto_collect, ever_failed
 FROM ms_billing.invoices
 WHERE account_id = $1::uuid
   AND status <> 'draft'
@@ -104,6 +104,7 @@ type ListInvoicesForAccountRow struct {
 	HostedInvoiceUrl   pgtype.Text        `json:"hosted_invoice_url"`
 	InvoicePdf         pgtype.Text        `json:"invoice_pdf"`
 	IsLargeAutoCollect bool               `json:"is_large_auto_collect"`
+	EverFailed         bool               `json:"ever_failed"`
 }
 
 // Account-scoped READS over the ms_billing.invoices Stripe mirror (011 + 026)
@@ -163,6 +164,7 @@ func (q *Queries) ListInvoicesForAccount(ctx context.Context, arg ListInvoicesFo
 			&i.HostedInvoiceUrl,
 			&i.InvoicePdf,
 			&i.IsLargeAutoCollect,
+			&i.EverFailed,
 		); err != nil {
 			return nil, err
 		}

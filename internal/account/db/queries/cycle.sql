@@ -217,9 +217,9 @@ WHERE id = $1;
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
-    period_start, period_end, is_large_auto_collect
+    period_start, period_end, is_large_auto_collect, ever_failed
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
@@ -229,7 +229,8 @@ DO UPDATE SET
     currency              = EXCLUDED.currency,
     period_start          = EXCLUDED.period_start,
     period_end            = EXCLUDED.period_end,
-    is_large_auto_collect = EXCLUDED.is_large_auto_collect;
+    is_large_auto_collect = EXCLUDED.is_large_auto_collect,
+    ever_failed           = ms_billing.invoices.ever_failed OR EXCLUDED.ever_failed;
 
 -- HasUsableDefaultPM is the no-PM charge gate: true iff the account has at
 -- least one active (not soft-deleted), not-expired payment_methods_mirror row.

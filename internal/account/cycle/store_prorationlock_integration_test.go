@@ -26,7 +26,7 @@ func mkProrationCharge(acct, appID uuid.UUID, invID string, periodEnd time.Time)
 		Cents:     200,
 		Invoice: cycle.InvoiceMirror{
 			AccountID: acct, StripeInvoiceID: invID, Status: "open",
-			AmountDueCents: 200, Currency: "usd",
+			AmountDueCents: 200, Currency: "usd", EverFailed: true,
 			PeriodStart: periodEnd.AddDate(0, 0, -3), PeriodEnd: periodEnd,
 		},
 		Snapshot: cycle.AppBaseSnapshot{
@@ -141,14 +141,10 @@ func TestChargeProrationLocked_Integration_ConcurrentDeleteDoesNotBlockOnLock(t 
 	require.Equal(t, "in_slow_del", app.ProrationInvoiceID, "the already-succeeded Stripe charge is still recorded, not silently dropped")
 }
 
-// Regression (review 2026-07-06): persistProrationCharge dropped the
-// IsLargeAutoCollect field from its UpsertInvoiceParams, so the combined
-// creation invoice (scenario 3/5a) was ALWAYS persisted with
-// is_large_auto_collect = false in production even when the charge callback
-// computed true — the unit suite never caught it because the fake store
-// carries the InvoiceMirror struct through verbatim. Assert against the REAL
-// pgx persist path.
-func TestChargeProrationLocked_Integration_PersistsLargeAutoCollectFlag(t *testing.T) {
+// persistProrationCharge must carry invoice flags through its separate
+// transactional UpsertInvoice params; the fake store cannot detect omissions
+// from that pgx-only mapping.
+func TestChargeProrationLocked_Integration_PersistsInvoiceFlags(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := cycle.NewStore(pool)
 	ctx := context.Background()
@@ -167,9 +163,10 @@ func TestChargeProrationLocked_Integration_PersistsLargeAutoCollectFlag(t *testi
 	require.Equal(t, cycle.ProrationLockedCharged, outcome)
 	require.Equal(t, "in_large_flag", invID)
 
-	var flagged bool
+	var largeAutoCollect, everFailed bool
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT is_large_auto_collect FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
-		"in_large_flag").Scan(&flagged))
-	require.True(t, flagged, "the charge callback's IsLargeAutoCollect must survive the pgx persist path")
+		`SELECT is_large_auto_collect, ever_failed FROM ms_billing.invoices WHERE stripe_invoice_id = $1`,
+		"in_large_flag").Scan(&largeAutoCollect, &everFailed))
+	require.True(t, largeAutoCollect, "the charge callback's IsLargeAutoCollect must survive the pgx persist path")
+	require.True(t, everFailed, "the charge callback's EverFailed must survive the pgx persist path")
 }
