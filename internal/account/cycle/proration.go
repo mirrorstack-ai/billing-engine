@@ -494,12 +494,12 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 					}
 				}
 			case draft.AmountDue == 0:
-				desc := fmt.Sprintf("MirrorStack app base fee (prorated) — app %s", locked.AppID)
+				desc := fmt.Sprintf("MirrorStack app base fee (prorated) — %s", appLineLabel(locked.Name, locked.AppID))
 				if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
 					return nil, billing.StripeError("proration invoice item failed", err)
 				}
 				if overageCents > 0 {
-					overDesc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", locked.AppID)
+					overDesc := fmt.Sprintf("MirrorStack module overage (prorated) — %s", appLineLabel(locked.Name, locked.AppID))
 					for _, timerID := range overTimers {
 						item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, overageCents, chargeCurrency, overDesc, moduleOverageItemIdemKey(timerID))
 						if err != nil {
@@ -670,6 +670,18 @@ func (s *Service) SweepCreationProrations(ctx context.Context, at time.Time) (*S
 			"invoice_id", r.ProrationInvoiceID, "cents", r.ProrationCents)
 	}
 	return res, nil
+}
+
+// appLineLabel renders the app suffix for an invoice-line description. It always
+// carries the app id (stable machine attribution) and prepends the frozen display
+// name (AppMirror.Name, migration 037 — a deleted app keeps its last-known name)
+// when known, so a Stripe invoice line reads e.g. "My App (app <uuid>)" instead of
+// a bare "app <uuid>".
+func appLineLabel(name string, appID uuid.UUID) string {
+	if name == "" {
+		return fmt.Sprintf("app %s", appID)
+	}
+	return fmt.Sprintf("%s (app %s)", name, appID)
 }
 
 // appProrationItemIdemKey / appProrationInvoiceIdemKey /

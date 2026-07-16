@@ -329,7 +329,7 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// reuses the SAME Stripe objects. The item is PINNED to this timer's own
 	// draft (C2 — a floating pending item could be swept onto another leg's
 	// invoice); only the finalize step moves money.
-	desc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", cand.AppID)
+	desc := fmt.Sprintf("MirrorStack module overage (prorated) — %s", appLineLabel(app.Name, cand.AppID))
 	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, moduleOverageChargeRef(cand.ID), moduleOverageInvoiceIdemKey(cand.ID))
 	if err != nil {
 		return nil, billing.StripeError("module overage draft invoice failed", err)
@@ -500,7 +500,12 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 		// was tampered with or the deterministic math changed — refuse loudly.
 		switch found.AmountDue {
 		case 0:
-			desc := fmt.Sprintf("MirrorStack module overage (prorated) — app %s", cand.AppID)
+			app, _, mErr := s.store.AppMirror(ctx, cand.AppID)
+			appName := ""
+			if mErr == nil {
+				appName = app.Name
+			}
+			desc := fmt.Sprintf("MirrorStack module overage (prorated) — %s", appLineLabel(appName, cand.AppID))
 			if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, desc, moduleOverageItemIdemKey(cand.ID)); err != nil {
 				return false, billing.StripeError("module overage recovery invoice item failed", err)
 			}
