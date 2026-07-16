@@ -78,10 +78,12 @@ type Store interface {
 	SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID, defaultStripePMID string) error
 
 	// InsertPaymentMethod inserts a row into payment_methods_mirror.
-	// Resolves account_id from stripeCustomerID inline; returns
-	// (found bool, error) where found=false signals Stripe→DB drift
-	// (customer.id has no matching accounts row).
-	InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (found bool, err error)
+	// Resolves account_id from stripeCustomerID inline. found=false signals
+	// Stripe→DB drift (customer.id has no matching accounts row). becameDefault
+	// reflects the row's advisory first-card default on insert and same-PM replay,
+	// and means it must also be written to the Stripe Customer. An insert-time
+	// dedupe skip returns false because that PM id was never mirrored.
+	InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (found bool, becameDefault bool, err error)
 
 	// StampAccountActivated freezes the billing-period anchor (migration 025):
 	// the first-card-bind instant, keyed by stripe_customer_id. FIRST-BIND-WINS
@@ -205,6 +207,14 @@ type ChargeRetriever interface {
 	RetrieveCharge(ctx context.Context, chargeID string) (billingstripe.ChargeCardRef, error)
 }
 
+// DefaultPMSetter sets a Stripe Customer's invoice-settings default
+// payment method. Narrow on purpose (the Router only needs this one
+// Stripe write for the first-card-bind default sync); *billingstripe.realClient
+// satisfies it structurally, tests pass a fake.
+type DefaultPMSetter interface {
+	SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID, stripePaymentMethodID string) error
+}
+
 // ServingBlockNotifier is the optional standing-transition hook (funding-gates
 // C6, satisfied by *standing.Notifier): after every standing-relevant event —
 // invoice lifecycle, card attach/detach, fraud flag — the router pushes the
@@ -222,15 +232,16 @@ type Router struct {
 	verifier billingstripe.Verifier
 	store    Store
 	charges  ChargeRetriever
+	pmSetter DefaultPMSetter
 	notify   ServingBlockNotifier // nil = serving-block pushes disabled
 	log      *slog.Logger
 }
 
-// NewRouter wires a Router. All three dependencies are required; nil
+// NewRouter wires a Router. All dependencies are required; nil
 // values panic at construction. The strict checks catch wiring bugs
 // at startup rather than silently falling back to defaults that would
 // mask the misconfiguration in production.
-func NewRouter(verifier billingstripe.Verifier, store Store, charges ChargeRetriever, log *slog.Logger) *Router {
+func NewRouter(verifier billingstripe.Verifier, store Store, charges ChargeRetriever, pmSetter DefaultPMSetter, log *slog.Logger) *Router {
 	if verifier == nil {
 		panic("webhook.NewRouter: verifier must not be nil")
 	}
@@ -240,10 +251,13 @@ func NewRouter(verifier billingstripe.Verifier, store Store, charges ChargeRetri
 	if charges == nil {
 		panic("webhook.NewRouter: charges must not be nil")
 	}
+	if pmSetter == nil {
+		panic("webhook.NewRouter: pmSetter must not be nil")
+	}
 	if log == nil {
 		panic("webhook.NewRouter: log must not be nil")
 	}
-	return &Router{verifier: verifier, store: store, charges: charges, log: log}
+	return &Router{verifier: verifier, store: store, charges: charges, pmSetter: pmSetter, log: log}
 }
 
 // WithServingBlockNotifier attaches the optional serving-block notifier

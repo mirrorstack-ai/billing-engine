@@ -33,7 +33,7 @@ func (f *FakeVerifier) Verify(_ []byte, _ string) (stripego.Event, error) {
 // FakeStore implements webhook.Store. The recording fields (Processed,
 // DefaultsSet, Inserts, SoftDeletes) capture every call so tests can
 // assert post-conditions; the boolean fields (TouchedFound, InsertFound,
-// SoftDelFound) drive the "found" return value of each method; the
+// InsertBecameDefault, SoftDelFound) drive method return values; the
 // Err* fields force a particular error path on demand.
 //
 // Use NewFakeStore() for sensible defaults — every "found" boolean
@@ -48,19 +48,21 @@ type FakeStore struct {
 	ResolvedPMs        []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
 	ActivatedCustomers []string                            // stripe_customer_id values from StampAccountActivated
 
-	AppliedInvoices []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
-	RelaxedInvoices []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
-	FailedInvoices  []string                           // stripe_invoice_id values from MarkInvoiceFailed
-	FraudFlags      []FraudFlag                        // captured calls to FlagPaymentMethodFraud
+	AppliedInvoices  []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
+	RelaxedInvoices  []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
+	FailedInvoices   []string                           // stripe_invoice_id values from MarkInvoiceFailed
+	FraudFlags       []FraudFlag                        // captured calls to FlagPaymentMethodFraud
+	insertedDefaults map[string]bool                    // advisory is_default by stripe_payment_method_id
 
 	// Found-flag knobs
-	TouchedFound bool // returned by TouchAccountByStripeCustomer
-	InsertFound  bool // returned by InsertPaymentMethod
-	SoftDelFound bool // returned by SoftDeletePaymentMethod
-	InvoiceFound bool // returned by ApplyInvoiceStatus
-	Relaxed      bool // returned by RelaxCollectionOnPaidInvoice
-	FraudFound   bool // returned by FlagPaymentMethodFraud
-	ActivatedNew bool // returned by StampAccountActivated (firstBind)
+	TouchedFound        bool // returned by TouchAccountByStripeCustomer
+	InsertFound         bool // returned by InsertPaymentMethod
+	InsertBecameDefault bool // returned by InsertPaymentMethod
+	SoftDelFound        bool // returned by SoftDeletePaymentMethod
+	InvoiceFound        bool // returned by ApplyInvoiceStatus
+	Relaxed             bool // returned by RelaxCollectionOnPaidInvoice
+	FraudFound          bool // returned by FlagPaymentMethodFraud
+	ActivatedNew        bool // returned by StampAccountActivated (firstBind)
 
 	// Error injection
 	ErrMark         error // from MarkEventProcessed
@@ -138,12 +140,19 @@ func (s *FakeStore) SetDefaultPaymentMethod(_ context.Context, customerID, defau
 	return nil
 }
 
-func (s *FakeStore) InsertPaymentMethod(_ context.Context, _ string, params webhook.InsertPaymentMethodParams) (bool, error) {
+func (s *FakeStore) InsertPaymentMethod(_ context.Context, _ string, params webhook.InsertPaymentMethodParams) (bool, bool, error) {
 	if s.ErrInsert != nil {
-		return false, s.ErrInsert
+		return false, false, s.ErrInsert
 	}
 	s.Inserts = append(s.Inserts, params)
-	return s.InsertFound, nil
+	if s.insertedDefaults == nil {
+		s.insertedDefaults = map[string]bool{}
+	}
+	if isDefault, ok := s.insertedDefaults[params.StripePaymentMethodID]; ok {
+		return s.InsertFound, isDefault, nil
+	}
+	s.insertedDefaults[params.StripePaymentMethodID] = s.InsertBecameDefault
+	return s.InsertFound, s.InsertBecameDefault, nil
 }
 
 func (s *FakeStore) StampAccountActivated(_ context.Context, customerID string) (bool, error) {
@@ -215,13 +224,15 @@ func (s *FakeStore) FlagPaymentMethodFraud(_ context.Context, stripeCustomerID, 
 	return s.FraudFound, nil
 }
 
-// FakeChargeRetriever implements webhook.ChargeRetriever. Refs maps a charge id
-// to the card ref it resolves to; Err forces a retrieve failure. A charge id
-// absent from Refs resolves to the zero ChargeCardRef (empty pm+fingerprint —
-// the non-card / drift path).
+// FakeChargeRetriever implements webhook.ChargeRetriever and
+// webhook.DefaultPMSetter. Refs maps a charge id to the card ref it resolves
+// to; Err forces a retrieve failure. A charge id absent from Refs resolves to
+// the zero ChargeCardRef (empty pm+fingerprint — the non-card / drift path).
 type FakeChargeRetriever struct {
-	Refs map[string]billingstripe.ChargeCardRef
-	Err  error
+	Refs          map[string]billingstripe.ChargeCardRef
+	Err           error
+	DefaultsSet   []string
+	ErrSetDefault error
 }
 
 func (f *FakeChargeRetriever) RetrieveCharge(_ context.Context, chargeID string) (billingstripe.ChargeCardRef, error) {
@@ -229,6 +240,11 @@ func (f *FakeChargeRetriever) RetrieveCharge(_ context.Context, chargeID string)
 		return billingstripe.ChargeCardRef{}, f.Err
 	}
 	return f.Refs[chargeID], nil
+}
+
+func (f *FakeChargeRetriever) SetDefaultPaymentMethod(_ context.Context, customerID, paymentMethodID string) error {
+	f.DefaultsSet = append(f.DefaultsSet, customerID+"="+paymentMethodID)
+	return f.ErrSetDefault
 }
 
 // SilentLogger returns a slog.Logger that discards all output. Useful
