@@ -284,7 +284,11 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	sc := newFakeStripe()
 	svc := appsSvc(store, sc)
 	appID := uuid.New()
-	registerMirror(t, svc, user, appID, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), 0)
+	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+		OwnerUserID: user, AppID: appID, ModuleCount: 0,
+		CreatedAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), Name: "My App",
+	})
+	require.NoError(t, err)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
@@ -296,6 +300,8 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
 	require.Equal(t, "cus_apps_1", sc.itemCalls[0].custID)
 	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
+	require.Contains(t, sc.itemCalls[0].desc, "My App")
+	require.Contains(t, sc.itemCalls[0].desc, appID.String())
 	require.Equal(t, "app-inv-"+appID.String(), sc.invoiceCalls[0].idemKey)
 	require.Len(t, sc.finalizeCalls, 1, "the draft is finalized (auto_advance) — the money-moving step")
 
