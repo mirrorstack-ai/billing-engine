@@ -58,8 +58,8 @@ func buildRouter() *webhook.Router {
 	// The fraud handlers (charge.dispute.created / radar.early_fraud_warning.created)
 	// carry only a charge id, so the webhook must retrieve the charge to resolve
 	// the disputed card — this binary also loads the Stripe API key (a
-	// restricted rk_* with charges:read is sufficient). Still inside the
-	// billing-engine trust boundary (CLAUDE.md).
+	// restricted rk_* needs charges:read and customers:write). Still inside
+	// the billing-engine trust boundary (CLAUDE.md).
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 	pool := config.MustPgxPool()
 
@@ -70,7 +70,7 @@ func buildRouter() *webhook.Router {
 	// api-platform after standing-relevant events. Disabled (log-and-skip)
 	// when APPLICATIONS_INTERNAL_URL / INTERNAL_SECRET are unset.
 	notifier := standing.NewNotifierFromEnv(pool, slog.Default())
-	return webhook.NewRouter(verifier, store, charges, slog.Default()).WithServingBlockNotifier(notifier)
+	return webhook.NewRouter(verifier, store, charges, charges, slog.Default()).WithServingBlockNotifier(notifier)
 }
 
 // eventBridgeHandler is the Lambda entrypoint. It unmarshals the Stripe

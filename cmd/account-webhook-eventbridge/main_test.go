@@ -18,13 +18,13 @@ import (
 // verifier is intentionally a FakeVerifier that always errors, since a
 // correctly-wired eventBridgeHandler must never call it (ProcessTrusted
 // skips verification entirely — see router.go).
-func makeRouter(t *testing.T, store *webhooktest.FakeStore, charges webhook.ChargeRetriever) *webhook.Router {
+func makeRouter(t *testing.T, store *webhooktest.FakeStore, charges *webhooktest.FakeChargeRetriever) *webhook.Router {
 	t.Helper()
 	v := &webhooktest.FakeVerifier{Err: errors.New("eventbridge handler must never call the verifier")}
 	if charges == nil {
 		charges = &webhooktest.FakeChargeRetriever{}
 	}
-	return webhook.NewRouter(v, store, charges, webhooktest.SilentLogger())
+	return webhook.NewRouter(v, store, charges, charges, webhooktest.SilentLogger())
 }
 
 func customerCreatedDetail(t *testing.T, eventID, customerID string) []byte {

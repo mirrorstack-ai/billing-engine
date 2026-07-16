@@ -139,6 +139,14 @@ func (c *realClient) SetDefaultPaymentMethod(ctx context.Context, stripeCustomer
 	return err
 }
 
+// GetCustomer retrieves a Customer for the pay-time invoice-settings default
+// payment-method gate.
+func (c *realClient) GetCustomer(ctx context.Context, stripeCustomerID string) (*stripego.Customer, error) {
+	params := &stripego.CustomerParams{}
+	params.Context = ctx
+	return c.sc.Customers.Get(stripeCustomerID, params)
+}
+
 // CreateDraftInvoice creates an EMPTY draft invoice line items are then
 // pinned to (CreateInvoiceItem) and that charges only on FinalizeInvoice.
 // PendingInvoiceItemsBehavior=exclude is load-bearing (review 2026-07-06, C2):

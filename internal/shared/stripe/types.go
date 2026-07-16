@@ -51,6 +51,13 @@ type Client interface {
 	// webhook syncs is_default across the account's mirror rows.
 	SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID, stripePaymentMethodID string) error
 
+	// GetCustomer retrieves a Stripe Customer by id — billing.PayInvoice's
+	// pre-pay default-PM read: Invoices.Pay charges the Customer's
+	// invoice-settings default PM, so a Customer with none set makes Pay fail
+	// with a non-card invalid_request. Reading it lets PayInvoice return a
+	// deterministic 402 (PAYMENT_REQUIRED) instead of a 502 STRIPE_ERROR.
+	GetCustomer(ctx context.Context, stripeCustomerID string) (*stripego.Customer, error)
+
 	// CreateDraftInvoice creates an EMPTY draft invoice
 	// (collection_method=charge_automatically, auto_advance=false,
 	// pending_invoice_items_behavior=exclude) that line items are then PINNED

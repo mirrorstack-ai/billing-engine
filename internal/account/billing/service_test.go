@@ -326,6 +326,7 @@ type fakeStripe struct {
 	paidInvoices             []string // stripeInvoiceID per PayInvoice call
 	payStatusToReturn        string   // Stripe post-pay status; "" → "paid"
 	getInvoiceCustomer       string   // CustomerID GetInvoice reports (the invoice's frozen payer)
+	customerNoDefaultPM      bool
 	errCreateCustomer        error
 	errCreateCheckoutSession error
 	errUpdateCustomerEmail   error
@@ -333,6 +334,7 @@ type fakeStripe struct {
 	errSetDefault            error
 	errPayInvoice            error
 	errGetInvoice            error
+	errGetCustomer           error
 }
 
 func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID, email string) (*stripego.Customer, error) {
@@ -392,6 +394,20 @@ func (f *fakeStripe) SetDefaultPaymentMethod(_ context.Context, stripeCustomerID
 	}
 	f.defaultsSet = append(f.defaultsSet, stripeCustomerID+"="+stripePaymentMethodID)
 	return nil
+}
+
+func (f *fakeStripe) GetCustomer(_ context.Context, _ string) (*stripego.Customer, error) {
+	if f.errGetCustomer != nil {
+		return nil, f.errGetCustomer
+	}
+	if f.customerNoDefaultPM {
+		return &stripego.Customer{}, nil
+	}
+	return &stripego.Customer{
+		InvoiceSettings: &stripego.CustomerInvoiceSettings{
+			DefaultPaymentMethod: &stripego.PaymentMethod{ID: "pm_default"},
+		},
+	}, nil
 }
 
 // CreateDraftInvoice / CreateInvoiceItem / FinalizeInvoice are the charge

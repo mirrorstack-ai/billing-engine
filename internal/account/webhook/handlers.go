@@ -65,11 +65,10 @@ func (r *Router) handleCustomerDeleted(ctx context.Context, event stripego.Event
 // handlePaymentMethodAttached mirrors the new payment method into
 // payment_methods_mirror. is_default on this INSERT is ADVISORY: the
 // first active card on an account auto-defaults (#14's feature) so a
-// new account has a usable default, but the authoritative default is
-// owned by customer.updated → SetDefaultPaymentMethod. The follow-on
-// customer.updated event syncs the real default. This keeps webhook
-// processing to a single DB write per event (no synchronous Stripe
-// API call inside the transaction).
+// new account has a usable default. That advisory first-card default is
+// also written to the Stripe Customer's invoice settings here so invoice
+// payment and auto-collection can use it; the follow-on customer.updated
+// still owns the authoritative mirror sync.
 func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego.Event) Result {
 	pm, err := decodePaymentMethod(event)
 	if err != nil {
@@ -96,7 +95,7 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 		// on the same account to set status='duplicate'.
 		Fingerprint: pm.Card.Fingerprint,
 	}
-	found, err := r.store.InsertPaymentMethod(ctx, pm.Customer.ID, params)
+	found, becameDefault, err := r.store.InsertPaymentMethod(ctx, pm.Customer.ID, params)
 	if err != nil {
 		r.log.ErrorContext(ctx, "payment_method.attached insert failed", "event_id", event.ID, "error", err)
 		return Result{HTTPStatus: 500, Status: StatusInternal}
@@ -104,6 +103,12 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 	if !found {
 		r.log.WarnContext(ctx, "payment_method.attached drift: no accounts row for customer", "event_id", event.ID, "stripe_customer_id", pm.Customer.ID)
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
+	}
+	if becameDefault {
+		if err := r.pmSetter.SetDefaultPaymentMethod(ctx, pm.Customer.ID, pm.ID); err != nil {
+			r.log.ErrorContext(ctx, "payment_method.attached Stripe default sync failed", "event_id", event.ID, "stripe_customer_id", pm.Customer.ID, "stripe_payment_method_id", pm.ID, "error", err)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
 	}
 
 	// Freeze the billing-period ANCHOR (migration 025) on FIRST card bind: this is
