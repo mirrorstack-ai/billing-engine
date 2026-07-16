@@ -68,7 +68,7 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 			Cents:     200,
 			Invoice: cycle.InvoiceMirror{
 				AccountID: acct, StripeInvoiceID: invID, Status: "open",
-				AmountDueCents: 200, Currency: "usd",
+				AmountDueCents: 200, Currency: "usd", EverFailed: true,
 				PeriodStart: mustTime(t, "2026-07-01T00:00:00Z"), PeriodEnd: periodEnd,
 			},
 			Snapshot: cycle.AppBaseSnapshot{

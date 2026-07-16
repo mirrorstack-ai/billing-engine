@@ -509,9 +509,9 @@ const upsertInvoice = `-- name: UpsertInvoice :exec
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
-    period_start, period_end, is_large_auto_collect
+    period_start, period_end, is_large_auto_collect, ever_failed
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
@@ -521,7 +521,8 @@ DO UPDATE SET
     currency              = EXCLUDED.currency,
     period_start          = EXCLUDED.period_start,
     period_end            = EXCLUDED.period_end,
-    is_large_auto_collect = EXCLUDED.is_large_auto_collect
+    is_large_auto_collect = EXCLUDED.is_large_auto_collect,
+    ever_failed           = ms_billing.invoices.ever_failed OR EXCLUDED.ever_failed
 `
 
 type UpsertInvoiceParams struct {
@@ -534,6 +535,7 @@ type UpsertInvoiceParams struct {
 	PeriodStart        pgtype.Timestamptz `json:"period_start"`
 	PeriodEnd          pgtype.Timestamptz `json:"period_end"`
 	IsLargeAutoCollect bool               `json:"is_large_auto_collect"`
+	EverFailed         bool               `json:"ever_failed"`
 }
 
 // UpsertInvoice mirrors a Stripe invoice into ms_billing.invoices, keyed on the
@@ -556,6 +558,7 @@ func (q *Queries) UpsertInvoice(ctx context.Context, arg UpsertInvoiceParams) er
 		arg.PeriodStart,
 		arg.PeriodEnd,
 		arg.IsLargeAutoCollect,
+		arg.EverFailed,
 	)
 	return err
 }

@@ -530,6 +530,8 @@ type InvoiceMirrorRaw struct {
 	// account's auto-collect threshold that applied when it fired. Read-through
 	// from the mirror for the billing page's large-charge disclosure surface.
 	IsLargeAutoCollect bool
+	// EverFailed is sticky: true once the invoice has failed a charge attempt.
+	EverFailed bool
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -1268,6 +1270,7 @@ func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit 
 			HostedInvoiceURL:   r.HostedInvoiceUrl.String,
 			InvoicePDF:         r.InvoicePdf.String,
 			IsLargeAutoCollect: r.IsLargeAutoCollect,
+			EverFailed:         r.EverFailed,
 		})
 	}
 	return out, nil
