@@ -564,7 +564,6 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				PeriodStart:        coverageStart,
 				PeriodEnd:          coverageEnd,
 				IsLargeAutoCollect: flagLargeAutoCollect(prorated+overageTotalMicros, acct),
-				EverFailed:         chargeFailedStatus(inv.Status),
 			},
 			// Freeze what was billed keyed by the FULL anchored period_start (the
 			// display identity, migration 028); BaseMicros is the prorated BASE amount

@@ -356,7 +356,7 @@ func TestScenario5_LargeAutoCollectFlagAtEveryChargeSite(t *testing.T) {
 	})
 }
 
-func TestEverFailedDerivedAtEveryChargeSite(t *testing.T) {
+func TestFreshFinalizeMirrorNeverLatchesEverFailed(t *testing.T) {
 	sites := []struct {
 		name string
 		run  func(*testing.T, string) cycle.InvoiceMirror
@@ -405,21 +405,14 @@ func TestEverFailedDerivedAtEveryChargeSite(t *testing.T) {
 			},
 		},
 	}
-	statuses := []struct {
-		status string
-		failed bool
-	}{
-		{status: "paid", failed: false},
-		{status: "open", failed: true},
-		{status: "uncollectible", failed: true},
-	}
+	statuses := []string{"paid", "open", "uncollectible"}
 	for _, site := range sites {
 		t.Run(site.name, func(t *testing.T) {
 			for _, status := range statuses {
-				t.Run(status.status, func(t *testing.T) {
-					mirror := site.run(t, status.status)
-					require.Equal(t, status.status, mirror.Status)
-					require.Equal(t, status.failed, mirror.EverFailed)
+				t.Run(status, func(t *testing.T) {
+					mirror := site.run(t, status)
+					require.Equal(t, status, mirror.Status)
+					require.False(t, mirror.EverFailed, "fresh finalize mirror must never latch ever_failed")
 				})
 			}
 		})

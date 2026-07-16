@@ -501,7 +501,6 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		PeriodStart:        periodStart,
 		PeriodEnd:          periodEnd,
 		IsLargeAutoCollect: flagLargeAutoCollect(chargedMicros, postChargeAcct),
-		EverFailed:         chargeFailedStatus(inv.Status),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
@@ -704,10 +703,6 @@ func invoiceFinalizeIdemKey(runID uuid.UUID) string { return "fin-" + runID.Stri
 // same way at every site.
 func flagLargeAutoCollect(chargedMicros int64, acct AccountCollection) bool {
 	return collection.IsLargeAutoCollect(chargedMicros, acct.AutoCollectThresholdMicros)
-}
-
-func chargeFailedStatus(status string) bool {
-	return status == "open" || status == "uncollectible"
 }
 
 // toCollectionAccount maps the cycle store's AccountCollection to the pure-policy

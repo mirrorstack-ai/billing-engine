@@ -624,9 +624,13 @@ type InvoiceMirror struct {
 	// resolved auto-collect threshold WHEN THE CHARGE FIRED. Set by every
 	// off-session charge call site; false for anything below the threshold.
 	IsLargeAutoCollect bool
-	// EverFailed is true when the issuance-time off-session charge did not
-	// settle (status open/uncollectible); latched sticky, drives the failed
-	// display state — core#135.
+	// EverFailed feeds the sticky ever_failed OR-latch in UpsertInvoice. The
+	// charge spine ALWAYS passes false here: finalize (auto_advance) returns
+	// "open" for a success-bound async off-session charge too, so finalize
+	// status cannot distinguish failure. ever_failed is authored solely by the
+	// webhook latch (invoice.payment_failed / marked_uncollectible); this field
+	// exists only so a later spine mirror racing that webhook can't clear a
+	// latched true (existing OR EXCLUDED) — core#135.
 	EverFailed bool
 }
 

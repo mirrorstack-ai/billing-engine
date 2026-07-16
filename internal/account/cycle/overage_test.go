@@ -375,7 +375,7 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	require.Len(t, sc.finalizeCalls, 1)
 	require.Equal(t, "in_orphan_draft", sc.finalizeCalls[0].invoiceID)
 	require.True(t, store.timers[x].graceCharged)
-	require.True(t, store.invoices["in_orphan_draft"].EverFailed)
+	require.False(t, store.invoices["in_orphan_draft"].EverFailed, "a fresh open finalize must not latch ever_failed")
 }
 
 // The recovery no-op arm: the marker is set but Stripe has NOTHING under the
