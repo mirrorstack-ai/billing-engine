@@ -163,6 +163,9 @@ func (f *fakeStripe) DetachPaymentMethod(context.Context, string) error {
 func (f *fakeStripe) SetDefaultPaymentMethod(context.Context, string, string) error {
 	panic("SetDefaultPaymentMethod must not be called by the charge cycle")
 }
+func (f *fakeStripe) GetCustomer(context.Context, string) (*stripego.Customer, error) {
+	return &stripego.Customer{}, nil
+}
 func (f *fakeStripe) GetInvoice(context.Context, string) (billingstripe.Invoice, error) {
 	panic("GetInvoice must not be called by the charge cycle")
 }

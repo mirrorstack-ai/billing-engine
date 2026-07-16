@@ -204,7 +204,7 @@ func (q *Queries) FlagPaymentMethodFraud(ctx context.Context, arg FlagPaymentMet
 	return result.RowsAffected(), nil
 }
 
-const insertPaymentMethod = `-- name: InsertPaymentMethod :execrows
+const insertPaymentMethod = `-- name: InsertPaymentMethod :one
 WITH acct AS (
     SELECT id FROM ms_billing.accounts WHERE stripe_customer_id = $1
 )
@@ -229,6 +229,7 @@ WHERE NOT EXISTS (
       AND p2.exp_year = $6
 )
 ON CONFLICT (stripe_payment_method_id) DO NOTHING
+RETURNING is_default
 `
 
 type InsertPaymentMethodParams struct {
@@ -244,8 +245,9 @@ type InsertPaymentMethodParams struct {
 // InsertPaymentMethod mirrors a Stripe PM into payment_methods_mirror.
 // First active card on the account becomes the default (NOT EXISTS).
 // Skips when an active row already shares brand/last4/exp (best-effort
-// insert-time dedupe). fingerprint stored via NULLIF($7,”). No RETURNING
-// → :execrows; the Go layer disambiguates 0 rows via AccountExists.
+// insert-time dedupe). fingerprint stored via NULLIF($7,”). RETURNING
+// is_default lets the Go layer sync an advisory first-card default to Stripe.
+// The Go layer disambiguates a 0-row result via AccountExists.
 //
 // is_default on INSERT is ADVISORY (the first-card auto-default feature
 // from #14): it gives a brand-new account a usable default without an
@@ -254,8 +256,8 @@ type InsertPaymentMethodParams struct {
 // which PM is default. This INSERT-time value matches #14's raw
 // InsertPaymentMethod exactly (NOT EXISTS over non-soft-deleted rows);
 // do not "promote" it to authoritative here.
-func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMethodParams) (int64, error) {
-	result, err := q.db.Exec(ctx, insertPaymentMethod,
+func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMethodParams) (bool, error) {
+	row := q.db.QueryRow(ctx, insertPaymentMethod,
 		arg.StripeCustomerID,
 		arg.StripePaymentMethodID,
 		arg.Brand,
@@ -264,10 +266,9 @@ func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMeth
 		arg.ExpYear,
 		arg.Column7,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var is_default bool
+	err := row.Scan(&is_default)
+	return is_default, err
 }
 
 const markEventProcessed = `-- name: MarkEventProcessed :execrows

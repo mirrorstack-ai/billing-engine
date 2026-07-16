@@ -80,8 +80,8 @@ func newRouter(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore) *webhook.R
 	return newRouterWithCharges(v, s, &webhooktest.FakeChargeRetriever{})
 }
 
-func newRouterWithCharges(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore, c webhook.ChargeRetriever) *webhook.Router {
-	return webhook.NewRouter(v, s, c, webhooktest.SilentLogger())
+func newRouterWithCharges(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore, c *webhooktest.FakeChargeRetriever) *webhook.Router {
+	return webhook.NewRouter(v, s, c, c, webhooktest.SilentLogger())
 }
 
 // --- tests ----------------------------------------------------------------
@@ -189,6 +189,48 @@ func TestProcess_PaymentMethodAttached_InsertsMirror(t *testing.T) {
 	// The attach also freezes the billing-period anchor (migration 025) for the
 	// customer's account — the confirmed first-card-bind moment.
 	require.Equal(t, []string{"cus_x"}, s.ActivatedCustomers)
+}
+
+func TestProcess_PaymentMethodAttached_FirstCardSetsStripeDefault(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma_default", "payment_method.attached", "pm_first", "cus_first", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
+	s.InsertBecameDefault = true
+	stripe := &webhooktest.FakeChargeRetriever{}
+	r := newRouterWithCharges(v, s, stripe)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Equal(t, []string{"cus_first=pm_first"}, stripe.DefaultsSet)
+}
+
+func TestProcess_PaymentMethodAttached_NonDefaultCardSkipsStripeDefault(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma_nondefault", "payment_method.attached", "pm_second", "cus_cards", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
+	s.InsertBecameDefault = false
+	stripe := &webhooktest.FakeChargeRetriever{}
+	r := newRouterWithCharges(v, s, stripe)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Empty(t, stripe.DefaultsSet)
+}
+
+func TestProcess_PaymentMethodAttached_DefaultSetterErrorIsInternal(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma_default_error", "payment_method.attached", "pm_first", "cus_first", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
+	s.InsertBecameDefault = true
+	stripe := &webhooktest.FakeChargeRetriever{ErrSetDefault: errors.New("stripe down")}
+	r := newRouterWithCharges(v, s, stripe)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+	require.Equal(t, []string{"cus_first=pm_first"}, stripe.DefaultsSet)
 }
 
 func TestProcess_PaymentMethodAttached_NoAccountRow_DriftWarning(t *testing.T) {

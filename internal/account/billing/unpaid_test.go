@@ -273,6 +273,18 @@ func TestPayInvoice_NoUsableCard_PaymentRequired(t *testing.T) {
 	require.Empty(t, sc.paidInvoices)
 }
 
+func TestPayInvoice_StripeCustomerWithoutDefault_PaymentRequired(t *testing.T) {
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.customerNoDefaultPM = true
+	svc := billing.NewService(store, sc, "")
+
+	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	var be *billing.Error
+	require.ErrorAs(t, err, &be)
+	require.Equal(t, billing.CodePaymentRequired, be.Code)
+	require.Empty(t, sc.paidInvoices, "no Stripe payment call without a Customer default PM")
+}
+
 func TestPayInvoice_AlreadyPaid_ShortCircuitsWithoutStripe(t *testing.T) {
 	// The retry-after-success path: the mirror already settled 'paid' (via the
 	// webhook) → answer "paid" idempotently, never re-hit Stripe.

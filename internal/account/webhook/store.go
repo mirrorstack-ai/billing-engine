@@ -79,22 +79,25 @@ func (s *pgxStore) SetDefaultPaymentMethod(ctx context.Context, stripeCustomerID
 }
 
 // InsertPaymentMethod inserts a row into payment_methods_mirror after
-// resolving account_id from stripeCustomerID. Returns (found, error):
+// resolving account_id from stripeCustomerID. Returns (found,
+// becameDefault, error):
 //   - found=false signals Stripe→DB drift (no accounts row for this
 //     customer); webhook handler converts to drift_warning response.
 //   - found=true on either successful insert OR a no-op (ON CONFLICT,
 //     or the insert-time dedupe skip) when the account does exist.
+//   - becameDefault=true only when this call inserted the first active card;
+//     no-op/dedupe paths always return false.
 //
 // First active card on the account becomes the default; subsequent cards
 // insert is_default=false. The INSERT…SELECT also skips when an active
 // row already shares brand/last4/exp (best-effort insert-time dedupe);
 // fingerprint-equality dedupe is the canonical check, applied later in
 // ResolvePendingAddCardRequest.
-func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (bool, error) {
+func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (found bool, becameDefault bool, err error) {
 	// Column7 is the NULLIF($7,'') fingerprint argument: the empty string
 	// becomes SQL NULL so legacy/non-card PMs don't pollute the dedupe
 	// index. sqlc types it as interface{}; pass the raw string.
-	rows, err := s.q.InsertPaymentMethod(ctx, db.InsertPaymentMethodParams{
+	becameDefault, err = s.q.InsertPaymentMethod(ctx, db.InsertPaymentMethodParams{
 		StripeCustomerID:      text(stripeCustomerID),
 		StripePaymentMethodID: pm.StripePaymentMethodID,
 		Brand:                 pm.Brand,
@@ -103,19 +106,19 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 		ExpYear:               int32(pm.ExpYear),
 		Column7:               pm.Fingerprint,
 	})
-	if err != nil {
-		return false, err
+	if err == nil {
+		return true, becameDefault, nil
 	}
-	if rows == 1 {
-		return true, nil
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, false, err
 	}
 	// 0 rows: either drift (no accounts row) or a no-op (ON CONFLICT /
 	// dedupe skip). Disambiguate; the drift case needs a different status.
 	exists, err := s.q.AccountExistsByStripeCustomer(ctx, text(stripeCustomerID))
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return exists, nil
+	return exists, false, nil
 }
 
 // StampAccountActivated freezes the account's billing-period anchor (migration

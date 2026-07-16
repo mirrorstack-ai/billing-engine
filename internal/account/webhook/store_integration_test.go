@@ -47,7 +47,7 @@ func TestPgxStore_InsertPaymentMethod_Success(t *testing.T) {
 	store := webhook.NewStore(pool)
 	_ = seedAccount(t, pool, "cus_pm_x")
 
-	found, err := store.InsertPaymentMethod(context.Background(), "cus_pm_x", webhook.InsertPaymentMethodParams{
+	found, becameDefault, err := store.InsertPaymentMethod(context.Background(), "cus_pm_x", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_new_1",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -56,6 +56,7 @@ func TestPgxStore_InsertPaymentMethod_Success(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, found)
+	require.True(t, becameDefault)
 
 	var count int
 	err = pool.QueryRow(context.Background(),
@@ -68,12 +69,12 @@ func TestPgxStore_InsertPaymentMethod_Success(t *testing.T) {
 func TestPgxStore_InsertPaymentMethod_Drift_NoAccountsRow(t *testing.T) {
 	// The CTE inserts via `SELECT acct.id ... FROM acct` — if the acct
 	// CTE produces zero rows (no matching stripe_customer_id), nothing
-	// is inserted and RowsAffected=0. The follow-up existence check
-	// confirms drift; store returns found=false.
+	// is returned and the :one query yields pgx.ErrNoRows. The follow-up
+	// existence check confirms drift; store returns found=false.
 	pool := testutil.NewTestDB(t)
 	store := webhook.NewStore(pool)
 
-	found, err := store.InsertPaymentMethod(context.Background(), "cus_orphan", webhook.InsertPaymentMethodParams{
+	found, becameDefault, err := store.InsertPaymentMethod(context.Background(), "cus_orphan", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_orphan",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -82,6 +83,7 @@ func TestPgxStore_InsertPaymentMethod_Drift_NoAccountsRow(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.False(t, found, "expected drift signal (no accounts row)")
+	require.False(t, becameDefault)
 
 	var count int
 	err = pool.QueryRow(context.Background(),
@@ -92,14 +94,14 @@ func TestPgxStore_InsertPaymentMethod_Drift_NoAccountsRow(t *testing.T) {
 }
 
 func TestPgxStore_InsertPaymentMethod_Idempotent_AccountExistsPMExists(t *testing.T) {
-	// PM already in mirror → ON CONFLICT DO NOTHING → RowsAffected=0
+	// PM already in mirror → ON CONFLICT DO NOTHING → pgx.ErrNoRows,
 	// BUT the follow-up existence check confirms the accounts row IS
 	// present, so found=true (idempotent retry; mirror unchanged).
 	pool := testutil.NewTestDB(t)
 	store := webhook.NewStore(pool)
 	_ = seedAccount(t, pool, "cus_idem")
 
-	found, err := store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
+	found, becameDefault, err := store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_idem_1",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -108,9 +110,10 @@ func TestPgxStore_InsertPaymentMethod_Idempotent_AccountExistsPMExists(t *testin
 	})
 	require.NoError(t, err)
 	require.True(t, found)
+	require.True(t, becameDefault)
 
 	// Duplicate insert (simulated Stripe webhook retry).
-	found, err = store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
+	found, becameDefault, err = store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_idem_1",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -119,6 +122,7 @@ func TestPgxStore_InsertPaymentMethod_Idempotent_AccountExistsPMExists(t *testin
 	})
 	require.NoError(t, err)
 	require.True(t, found, "duplicate insert should return found=true (idempotent)")
+	require.False(t, becameDefault)
 
 	var count int
 	err = pool.QueryRow(context.Background(),

@@ -206,6 +206,19 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 		return nil, InvalidInput("invoice belongs to a previous funding account — contact support")
 	}
 
+	// The mirror usable-PM gate can pass while Stripe's Customer has no actual
+	// invoice-settings default; Invoices.Pay would then fail as a non-card
+	// invalid request and surface as a misleading 502. Refuse deterministically
+	// as PAYMENT_REQUIRED before any payment attempt.
+	cust, err := s.stripe.GetCustomer(ctx, fundingCustomer)
+	if err != nil {
+		return nil, StripeError("customer lookup failed", err)
+	}
+	if cust.InvoiceSettings == nil || cust.InvoiceSettings.DefaultPaymentMethod == nil ||
+		cust.InvoiceSettings.DefaultPaymentMethod.ID == "" {
+		return nil, PaymentRequired("no default payment method on file; re-add or set a default card")
+	}
+
 	inv, err := s.stripe.PayInvoice(ctx, target.StripeInvoiceID)
 	if err != nil {
 		return payFailure(err)

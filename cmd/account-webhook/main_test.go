@@ -20,7 +20,8 @@ import (
 
 func makeRouter(t *testing.T, verifier *webhooktest.FakeVerifier, store *webhooktest.FakeStore) *webhook.Router {
 	t.Helper()
-	return webhook.NewRouter(verifier, store, &webhooktest.FakeChargeRetriever{}, webhooktest.SilentLogger())
+	stripe := &webhooktest.FakeChargeRetriever{}
+	return webhook.NewRouter(verifier, store, stripe, stripe, webhooktest.SilentLogger())
 }
 
 // --- httpHandler ----------------------------------------------------------
