@@ -36,6 +36,29 @@ func AccountOverageMicros(liveModuleCount int) int64 {
 	return 0
 }
 
+// GraceExpiry is the single home of the "grace elapses at t + GraceDays" rule
+// (creation grace AND per-module install timers use the same window).
+func GraceExpiry(t time.Time) time.Time {
+	return t.Add(GraceDays * 24 * time.Hour)
+}
+
+// CreationChargeBaseMicros is the EXACT base amount the creation-proration
+// sweep (cycle.ChargeCreationProration) charges an app created at createdAt
+// whose anchored creation window is [periodStart, periodEnd): the
+// creation-period proration, plus the straddled period's FULL base when the
+// creation grace elapses at/after periodEnd (coverage contract H2 — the
+// boundary advance leg excludes an in-grace app, so this charge owns that
+// period). The preview (ListNewCreationCharges pending rows) and the charge
+// callback both price through THIS function, so they agree to the micro by
+// construction.
+func CreationChargeBaseMicros(createdAt, periodStart, periodEnd time.Time) int64 {
+	m := ProratedBaseMicros(BaseFeeMicros, createdAt, periodStart, periodEnd)
+	if !GraceExpiry(createdAt.UTC()).Before(periodEnd) {
+		m += BaseFeeMicros
+	}
+	return m
+}
+
 // ProratedBaseMicros prorates an app's per-period base fee for the period
 // [periodStart, periodEnd) given the app's creation instant:
 //

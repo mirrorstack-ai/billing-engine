@@ -49,6 +49,12 @@ func NewService(store Store) *Service {
 	return &Service{store: store, nowFn: time.Now}
 }
 
+// WithNow overrides the Service clock for deterministic tests.
+func (s *Service) WithNow(now func() time.Time) *Service {
+	s.nowFn = now
+	return s
+}
+
 // WithBudgetEvaluator attaches the per-app budget hook fired on the ingest
 // path. Returns the receiver for chaining at construction. A nil evaluator
 // leaves budgets unwired (the hook is skipped).

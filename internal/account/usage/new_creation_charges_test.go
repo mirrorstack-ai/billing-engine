@@ -153,28 +153,35 @@ func TestListNewCreationCharges_SettledNoAddons(t *testing.T) {
 	require.EqualValues(t, 12_000_000, c.BaseFeeMicros)
 }
 
-// TestListNewCreationCharges_PendingBreakdown: a pending (in-grace) app reports
-// no money in either component (base 0, addon 0) but still surfaces its name and
-// the add-on-module count known from the frozen registration count.
+// TestListNewCreationCharges_PendingBreakdown: a pending (in-grace) app previews
+// the exact creation base the sweep will charge, reports no add-on money, and
+// still surfaces its name and frozen registration-time add-on count.
 func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
-	store.accounts[owner] = uuid.New()
-	now := time.Now().UTC()
+	accountID := uuid.New()
+	store.accounts[owner] = accountID
+	store.anchorDays[accountID] = 11
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	periodStart := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	createdAt := time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)
 
 	app := uuid.New()
-	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: now, Name: "Draft App", ModuleCount: 8}
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Draft App", ModuleCount: 8}
 
-	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+	resp, err := newService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
 		OwnerUserID: owner, // current window
 	})
 	require.NoError(t, err)
 	require.Len(t, resp.Charges, 1)
 	c := resp.Charges[0]
+	expected := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
 	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
 	require.Equal(t, "Draft App", c.Name)
-	require.EqualValues(t, usage.BaseFeeMicros, c.BaseFeeMicros, "pending projects its accruing base fee")
-	require.EqualValues(t, usage.BaseFeeMicros, c.AmountMicros, "amount == projected base for pending")
+	require.EqualValues(t, expected, c.BaseFeeMicros, "pending previews the sweep's exact base amount")
+	require.EqualValues(t, expected, c.AmountMicros, "amount == exact base preview for pending")
+	require.NotEqualValues(t, usage.BaseFeeMicros, c.AmountMicros, "mid-period fixture must discriminate from the old flat preview")
 	require.Zero(t, c.AddonMicros, "pending projects base only, not add-on overage")
 	require.Equal(t, 3, c.AddonModuleCount, "8 − IncludedModules(5) = 3, known even while uncharged")
 }
@@ -206,8 +213,13 @@ func TestListNewCreationCharges_SettledInvoiceIDFallsBackToUUID(t *testing.T) {
 func TestListNewCreationCharges_CurrentWindowSettledAndPending(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
-	store.accounts[owner] = uuid.New()
-	now := time.Now().UTC() // created_at == now is always inside the current window AND in grace
+	accountID := uuid.New()
+	store.accounts[owner] = accountID
+	store.anchorDays[accountID] = 11
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	periodStart := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	pendingCreatedAt := time.Date(2026, 7, 17, 12, 34, 0, 0, time.UTC)
 
 	appValid := uuid.New()
 	seedSettledApp(store, appValid, now, "in_valid", "INV-1", "paid", 22_000_000, now)
@@ -219,7 +231,7 @@ func TestListNewCreationCharges_CurrentWindowSettledAndPending(t *testing.T) {
 	seedSettledApp(store, appVoid, now, "in_void", "INV-V", "void", 22_000_000, now)
 
 	appPending := uuid.New() // uncharged, live, in grace → pending
-	store.appMirrors[appPending] = usage.AppMirrorInfo{CreatedAt: now}
+	store.appMirrors[appPending] = usage.AppMirrorInfo{CreatedAt: pendingCreatedAt}
 
 	appSkipped := uuid.New() // permanently skipped → excluded from pending
 	store.appMirrors[appSkipped] = usage.AppMirrorInfo{CreatedAt: now}
@@ -228,7 +240,7 @@ func TestListNewCreationCharges_CurrentWindowSettledAndPending(t *testing.T) {
 	appDeleted := uuid.New() // soft-deleted → excluded from pending
 	store.appMirrors[appDeleted] = usage.AppMirrorInfo{CreatedAt: now, Deleted: true, DeletedAt: now}
 
-	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+	resp, err := newService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
 		OwnerUserID: owner, // current window (no PeriodID)
 	})
 	require.NoError(t, err)
@@ -241,16 +253,49 @@ func TestListNewCreationCharges_CurrentWindowSettledAndPending(t *testing.T) {
 
 	require.Equal(t, appPending, resp.Charges[1].AppID)
 	require.Equal(t, usage.NewCreationChargeStatusPending, resp.Charges[1].Status)
-	require.EqualValues(t, usage.BaseFeeMicros, resp.Charges[1].AmountMicros, "pending projects its accruing base fee")
+	expected := usage.CreationChargeBaseMicros(pendingCreatedAt, periodStart, periodEnd)
+	require.EqualValues(t, expected, resp.Charges[1].AmountMicros, "pending previews the sweep's exact base amount")
+	require.EqualValues(t, expected, resp.Charges[1].BaseFeeMicros)
+	require.NotEqualValues(t, usage.BaseFeeMicros, resp.Charges[1].AmountMicros, "mid-period fixture must discriminate from the old flat preview")
 	require.Nil(t, resp.Charges[1].RecordedAt)
 	require.Empty(t, resp.Charges[1].InvoiceID)
 	require.NotNil(t, resp.Charges[1].ChargeETA)
-	require.True(t, resp.Charges[1].ChargeETA.Equal(now.AddDate(0, 0, usage.GraceDays)),
+	require.True(t, resp.Charges[1].ChargeETA.Equal(usage.GraceExpiry(pendingCreatedAt)),
 		"charge_eta == created_at + GraceDays")
 
 	// The service resolved graceCutoff = now − GraceDays and passed it through.
-	require.False(t, store.gotPendingGraceCutoff.IsZero())
-	require.WithinDuration(t, time.Now().UTC().AddDate(0, 0, -usage.GraceDays), store.gotPendingGraceCutoff, time.Minute)
+	require.Equal(t, now.AddDate(0, 0, -usage.GraceDays), store.gotPendingGraceCutoff)
+}
+
+// TestListNewCreationCharges_PendingPreviewEqualsSweepCharge covers the
+// reporter's anchored 7/11→8/11 window: a 7/17 creation previews the exact
+// 25/31 creation-period amount the sweep will charge, not the flat $20 base.
+func TestListNewCreationCharges_PendingPreviewEqualsSweepCharge(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	accountID := uuid.New()
+	store.accounts[owner] = accountID
+	store.anchorDays[accountID] = 11
+
+	periodStart := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	createdAt := time.Date(2026, 7, 17, 12, 34, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	appID := uuid.New()
+	store.appMirrors[appID] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Reporter App"}
+
+	resp, err := newService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+
+	expected := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	require.EqualValues(t, 16_129_032, expected, "25/31 of $20, rounded half-up in micros")
+	require.Equal(t, appID, resp.Charges[0].AppID)
+	require.EqualValues(t, expected, resp.Charges[0].AmountMicros)
+	require.EqualValues(t, expected, resp.Charges[0].BaseFeeMicros)
+	require.NotEqualValues(t, usage.BaseFeeMicros, resp.Charges[0].AmountMicros)
 }
 
 // TestListNewCreationCharges_PendingOnlyInCurrentWindow: a past period holds no
