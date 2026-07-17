@@ -326,6 +326,72 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), straddleSnap.snap.PeriodEnd)
 }
 
+func TestChargeCreationProration_ChargesExactlyThePreviewedAmount(t *testing.T) {
+	periodStart := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name              string
+		createdAt         time.Time
+		wantPreviewMicros int64
+	}{
+		{
+			name:              "period start",
+			createdAt:         periodStart,
+			wantPreviewMicros: 20_000_000,
+		},
+		{
+			name:              "mid-period reporter case",
+			createdAt:         time.Date(2026, 7, 17, 12, 34, 0, 0, time.UTC),
+			wantPreviewMicros: 16_129_032,
+		},
+		{
+			name:              "period-end eve",
+			createdAt:         time.Date(2026, 8, 10, 23, 0, 0, 0, time.UTC),
+			wantPreviewMicros: 20_645_161,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeStore()
+			user, acct := registeredAccount(store)
+			// Anchor day 11 makes every creation instant in the table belong to
+			// the exact preview/sweep window [2026-07-11, 2026-08-11).
+			store.activation[acct] = time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+
+			sc := newFakeStripe()
+			previewMicros := usage.CreationChargeBaseMicros(tt.createdAt, periodStart, periodEnd)
+			require.EqualValues(t, tt.wantPreviewMicros, previewMicros)
+			// centsFromMicros is package-private; for these non-negative amounts,
+			// adding half a cent before division is its exact round-half-up rule.
+			previewCents := (previewMicros + 5_000) / 10_000
+			sc.invoiceAmountDue = previewCents
+
+			now := usage.GraceExpiry(tt.createdAt).Add(time.Hour)
+			svc := cycle.NewService(store, sc).WithNow(func() time.Time { return now })
+			appID := uuid.New()
+			registerMirror(t, svc, user, appID, tt.createdAt, 0)
+
+			resp, err := svc.ChargeCreationProration(context.Background(), appID)
+			require.NoError(t, err)
+			require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+			require.Equal(t, previewCents, resp.ProrationCents)
+			require.Len(t, sc.itemCalls, 1)
+			require.Equal(t, previewCents, sc.itemCalls[0].amountCfg,
+				"Stripe receives the preview amount converted to cents only at its boundary")
+			require.Equal(t, previewCents, store.invoices[sc.invoiceID].AmountDueCents)
+
+			// The sweep's micro snapshots sum to the preview exactly, including
+			// the full-base straddle snapshot for the period-end-eve case.
+			var sweptBaseMicros int64
+			for _, snapshot := range store.baseSnapshots {
+				sweptBaseMicros += snapshot.snap.BaseMicros
+			}
+			require.Equal(t, previewMicros, sweptBaseMicros)
+		})
+	}
+}
+
 func TestChargeCreationProration_ChargesFlatBaseNotFoldedOverage(t *testing.T) {
 	// Migration 032: module overage is NO LONGER folded into the per-app base —
 	// the creation proration is the FLAT $20 base regardless of module_count (a

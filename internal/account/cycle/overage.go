@@ -44,17 +44,10 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
-// moduleOverageGraceWindow is the per-install grace window: a module's own timer
-// starts at its install instant and its overage is only charged once this window
-// has elapsed (owner spec 2026-07-05: 3 days, the SAME GraceDays as the creation
-// grace). A module removed before its own grace elapses is never charged.
-const moduleOverageGraceWindow = usage.GraceDays * 24 * time.Hour
-
-// moduleGraceExpiry is the single home of the "grace_expires_at = installed_at +
-// window" rule, used by RegisterApp / SyncAppModules when they synthesize timer
-// rows and (implicitly, via the stored column) by the sweep's work-list.
+// moduleGraceExpiry keeps the cycle's module-timer call sites named locally
+// while delegating the shared creation/install grace rule to usage.GraceExpiry.
 func moduleGraceExpiry(installedAt time.Time) time.Time {
-	return installedAt.Add(moduleOverageGraceWindow)
+	return usage.GraceExpiry(installedAt)
 }
 
 // ModuleOverageStatus is the terminal classification of one ChargeModuleOverage

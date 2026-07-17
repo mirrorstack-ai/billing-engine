@@ -126,3 +126,69 @@ func TestProratedBaseMicros_ClampedAnchorMonth(t *testing.T) {
 	got = usage.ProratedBaseMicros(usage.BaseFeeMicros, day(2026, 3, 1), day(2026, 2, 28), day(2026, 3, 31))
 	require.EqualValues(t, 19_354_839, got)
 }
+
+func TestCreationChargeBaseMicros_MatchesSweepMath(t *testing.T) {
+	periodStart := day(2026, 7, 11)
+	periodEnd := day(2026, 8, 11)
+
+	for _, tc := range []struct {
+		name      string
+		createdAt time.Time
+		want      int64
+	}{
+		{
+			name:      "period start is a full period without straddle",
+			createdAt: day(2026, 7, 11),
+			want:      20_000_000,
+		},
+		{
+			name:      "reporter case is 25 of 31 days",
+			createdAt: time.Date(2026, 7, 17, 12, 34, 0, 0, time.UTC),
+			want:      16_129_032,
+		},
+		{
+			name:      "grace ending exactly at period end adds the straddled full base",
+			createdAt: day(2026, 8, 8),
+			want:      21_935_484,
+		},
+		{
+			name:      "period-end eve is one covered day plus the straddled full base",
+			createdAt: time.Date(2026, 8, 10, 23, 0, 0, 0, time.UTC),
+			want:      20_645_161,
+		},
+		{
+			name:      "grace ending just before period end does not straddle",
+			createdAt: time.Date(2026, 8, 7, 23, 59, 0, 0, time.UTC),
+			want:      2_580_645,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, usage.CreationChargeBaseMicros(tc.createdAt, periodStart, periodEnd))
+		})
+	}
+}
+
+func TestCreationChargeBaseMicros_EqualsSweepInputsAcrossWindow(t *testing.T) {
+	periodStart := day(2026, 7, 11)
+	periodEnd := day(2026, 8, 11)
+	creationInstants := []time.Time{
+		periodStart,
+		time.Date(2026, 7, 11, 23, 59, 0, 0, time.UTC),
+		time.Date(2026, 7, 17, 12, 34, 0, 0, time.UTC),
+		day(2026, 7, 24),
+		day(2026, 7, 31),
+		day(2026, 8, 1),
+		time.Date(2026, 8, 7, 23, 59, 0, 0, time.UTC),
+		day(2026, 8, 8),
+		time.Date(2026, 8, 9, 16, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 10, 23, 0, 0, 0, time.UTC),
+	}
+
+	for _, createdAt := range creationInstants {
+		want := usage.ProratedBaseMicros(usage.BaseFeeMicros, createdAt, periodStart, periodEnd)
+		if !usage.GraceExpiry(createdAt.UTC()).Before(periodEnd) {
+			want += usage.BaseFeeMicros
+		}
+		require.Equal(t, want, usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd), createdAt.Format(time.RFC3339))
+	}
+}
