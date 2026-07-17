@@ -168,38 +168,6 @@ func TestCreationChargeBaseMicros_MatchesSweepMath(t *testing.T) {
 	}
 }
 
-// TestCreationChargeAddonMicros_MatchesSweepOverageMath pins the pending
-// preview's co-created add-on projection to the EXACT per-timer overage the
-// sweep charges (cycle/proration.go): ProratedBaseMicros(ModuleOverageFeeMicros,
-// created_at, window) plus the straddle top-up, times the over-count.
-func TestCreationChargeAddonMicros_MatchesSweepOverageMath(t *testing.T) {
-	periodStart := day(2026, 7, 11)
-	periodEnd := day(2026, 8, 11)
-	creationInstants := []time.Time{
-		periodStart,
-		time.Date(2026, 7, 17, 12, 34, 0, 0, time.UTC),
-		day(2026, 7, 31),
-		time.Date(2026, 8, 7, 23, 59, 0, 0, time.UTC), // no straddle (grace 8/10 < 8/11)
-		day(2026, 8, 8),                               // straddles (grace 8/11 ≥ 8/11)
-		time.Date(2026, 8, 10, 23, 0, 0, 0, time.UTC), // straddles
-	}
-	for _, createdAt := range creationInstants {
-		for _, addonCount := range []int{0, 1, 3} {
-			// Mirror the sweep's per-timer leg (proration.go overageMicros).
-			perTimer := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, createdAt, periodStart, periodEnd)
-			if !usage.GraceExpiry(createdAt.UTC()).Before(periodEnd) {
-				perTimer += usage.ModuleOverageFeeMicros
-			}
-			want := perTimer * int64(addonCount)
-			require.Equal(t, want, usage.CreationChargeAddonMicros(createdAt, periodStart, periodEnd, addonCount),
-				"%s ×%d", createdAt.Format(time.RFC3339), addonCount)
-		}
-	}
-	// A non-positive over-count contributes nothing (an app at/under the pool).
-	require.Zero(t, usage.CreationChargeAddonMicros(periodStart, periodStart, periodEnd, 0))
-	require.Zero(t, usage.CreationChargeAddonMicros(periodStart, periodStart, periodEnd, -2))
-}
-
 func TestCreationChargeBaseMicros_EqualsSweepInputsAcrossWindow(t *testing.T) {
 	periodStart := day(2026, 7, 11)
 	periodEnd := day(2026, 8, 11)
