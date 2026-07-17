@@ -153,9 +153,10 @@ func TestListNewCreationCharges_SettledNoAddons(t *testing.T) {
 	require.EqualValues(t, 12_000_000, c.BaseFeeMicros)
 }
 
-// TestListNewCreationCharges_PendingBreakdown: a pending (in-grace) app previews
-// the exact creation base the sweep will charge, reports no add-on money, and
-// still surfaces its name and frozen registration-time add-on count.
+// TestListNewCreationCharges_PendingBreakdown: a pending (in-grace) app created
+// with >IncludedModules modules previews the sweep's FULL combined charge — the
+// prorated base PLUS the co-created over-module overage the same invoice mints —
+// and surfaces its name and frozen registration-time add-on count.
 func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
@@ -176,14 +177,16 @@ func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.Charges, 1)
 	c := resp.Charges[0]
-	expected := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	expectedBase := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	expectedAddon := usage.CreationChargeAddonMicros(createdAt, periodStart, periodEnd, 3)
 	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
 	require.Equal(t, "Draft App", c.Name)
-	require.EqualValues(t, expected, c.BaseFeeMicros, "pending previews the sweep's exact base amount")
-	require.EqualValues(t, expected, c.AmountMicros, "amount == exact base preview for pending")
-	require.NotEqualValues(t, usage.BaseFeeMicros, c.AmountMicros, "mid-period fixture must discriminate from the old flat preview")
-	require.Zero(t, c.AddonMicros, "pending projects base only, not add-on overage")
 	require.Equal(t, 3, c.AddonModuleCount, "8 − IncludedModules(5) = 3, known even while uncharged")
+	require.EqualValues(t, expectedBase, c.BaseFeeMicros, "pending previews the sweep's exact base amount")
+	require.Positive(t, expectedAddon, "3 add-on modules must project a non-zero overage")
+	require.EqualValues(t, expectedAddon, c.AddonMicros, "pending previews the co-created over-module overage the sweep bills on the same invoice")
+	require.EqualValues(t, expectedBase+expectedAddon, c.AmountMicros, "amount == base + co-created add-on preview")
+	require.NotEqualValues(t, usage.BaseFeeMicros, c.AmountMicros, "mid-period fixture must discriminate from the old flat preview")
 }
 
 // TestListNewCreationCharges_SettledInvoiceIDFallsBackToUUID: an invoice not yet

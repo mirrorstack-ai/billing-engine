@@ -42,6 +42,23 @@ func GraceExpiry(t time.Time) time.Time {
 	return t.Add(GraceDays * 24 * time.Hour)
 }
 
+// creationChargeMicros is the shared per-fee creation-charge shape both the base
+// leg and each co-created over-module line of the creation-proration sweep bill:
+// feeMicros prorated to the creation window [periodStart, periodEnd), plus the
+// straddled period's FULL fee when the creation grace elapses at/after periodEnd
+// (coverage contract H2 — the boundary advance leg excludes an in-grace app, so
+// this charge owns that period). CreationChargeBaseMicros passes BaseFeeMicros;
+// CreationChargeAddonMicros passes ModuleOverageFeeMicros per over-module — the
+// exact ProratedBaseMicros(fee,…)+straddle top-up the charge callback computes
+// for each leg (proration.go), so preview and charge agree to the micro.
+func creationChargeMicros(feeMicros int64, createdAt, periodStart, periodEnd time.Time) int64 {
+	m := ProratedBaseMicros(feeMicros, createdAt, periodStart, periodEnd)
+	if !GraceExpiry(createdAt.UTC()).Before(periodEnd) {
+		m += feeMicros
+	}
+	return m
+}
+
 // CreationChargeBaseMicros is the EXACT base amount the creation-proration
 // sweep (cycle.ChargeCreationProration) charges an app created at createdAt
 // whose anchored creation window is [periodStart, periodEnd): the
@@ -52,11 +69,24 @@ func GraceExpiry(t time.Time) time.Time {
 // callback both price through THIS function, so they agree to the micro by
 // construction.
 func CreationChargeBaseMicros(createdAt, periodStart, periodEnd time.Time) int64 {
-	m := ProratedBaseMicros(BaseFeeMicros, createdAt, periodStart, periodEnd)
-	if !GraceExpiry(createdAt.UTC()).Before(periodEnd) {
-		m += BaseFeeMicros
+	return creationChargeMicros(BaseFeeMicros, createdAt, periodStart, periodEnd)
+}
+
+// CreationChargeAddonMicros is the co-created over-module overage the SAME
+// combined creation invoice bills alongside the base (proration.go scenario 3):
+// each module co-created with the app (install date == created_at) that is
+// "over" the account's IncludedModules allowance rides its own $3 line at the
+// IDENTICAL coverage window as the base — ProratedBaseMicros(ModuleOverageFeeMicros,
+// createdAt, window) plus the straddle top-up, times the over-count. addonCount
+// is the app's frozen add-on module count (addonModuleCount(created_module_count));
+// like the base preview, this is the projection the sweep will charge under the
+// frozen count — an over-module uninstalled mid-grace drops its timer and shrinks
+// the actual charge (D1e), the same caveat the displayed count already carries.
+func CreationChargeAddonMicros(createdAt, periodStart, periodEnd time.Time, addonCount int) int64 {
+	if addonCount <= 0 {
+		return 0
 	}
-	return m
+	return creationChargeMicros(ModuleOverageFeeMicros, createdAt, periodStart, periodEnd) * int64(addonCount)
 }
 
 // ProratedBaseMicros prorates an app's per-period base fee for the period
