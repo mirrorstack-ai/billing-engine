@@ -132,6 +132,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			PeriodStart: periodStart,
 			PeriodEnd:   periodEnd,
 			Plan:        planStub,
+			Agent:       AccountAgentBill{Models: []AgentModelUsage{}},
 			Apps:        []AccountAppBill{},
 		}, nil
 	}
@@ -205,6 +206,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		ModuleUsageMicros: agentParts.ModuleUsageTotalMicros,
 		InfraMicros:       agentParts.InfraTotalMicros,
 		TotalMicros:       agentParts.ModuleUsageTotalMicros + agentParts.InfraTotalMicros,
+		Models:            agentParts.ModelLines,
 	}
 
 	// Account overage line (migration 033): the steady-state monthly estimate
