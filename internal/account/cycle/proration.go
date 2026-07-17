@@ -361,12 +361,11 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		// NEXT boundary. Deterministic across retries (created_at + activation
 		// anchor are immutable) — the app-keyed Stripe idem keys stay stable.
 		coverageEnd := periodEnd
-		prorated := creationPeriodMicros
 		straddle := !moduleGraceExpiry(locked.CreatedAt.UTC()).Before(periodEnd)
 		if straddle {
 			_, coverageEnd = billingperiod.AnchoredPeriodWindow(moduleGraceExpiry(locked.CreatedAt.UTC()), billingperiod.AnchorDay(activatedAt))
-			prorated += usage.BaseFeeMicros
 		}
+		prorated := usage.CreationChargeBaseMicros(locked.CreatedAt, periodStart, periodEnd)
 		// D1d straddle narrowing (wave 2, D4). With a pre-activation-closed
 		// creation period this point is only reachable when the grace straddles
 		// into a post-activation period (the outer period-closed gate permanently

@@ -293,13 +293,20 @@ ORDER BY i.created_at DESC, a.app_id;
 -- now − GraceDays, matching AppsPendingProration's cutoff from the other side).
 -- Only the CURRENT live window can hold in-grace apps (a past period's apps have
 -- all elapsed grace), so the service issues this query only for the current
--- window. No money is derived here — the display shows the charge ETA
--- (created_at + GraceDays), not an invented proration amount. Ordered by
--- created_at (equivalently by the ETA) for a stable, soonest-first scan.
+-- window. This query carries no amount columns (there is no invoice or base
+-- snapshot for an in-grace app yet); the service DERIVES the base preview from
+-- created_at through usage.CreationChargeBaseMicros — the creation-period
+-- proration plus the straddle top-up, the EXACT base the sweep will charge,
+-- deterministic because it is anchored to created_at. Ordered by created_at
+-- (equivalently by the ETA, created_at + GraceDays) for a stable, soonest-first
+-- scan.
 --
--- name + created_module_count are surfaced for the breakdown display (the
--- add-on-module count is known at creation even though nothing is charged yet);
--- there is no base snapshot for an in-grace app, so the service reports base 0.
+-- name feeds the breakdown label; created_module_count sets the add-on-module
+-- COUNT (max(0, count − IncludedModules), known at creation). Only the base
+-- MONEY is previewed — the co-created add-on overage is NOT projected (its count
+-- surfaces, AddonMicros stays 0): the sweep counts over-modules by an
+-- account-level FIFO rank that can shift before it fires, so unlike the
+-- created_at-anchored base that dollar amount is not deterministic here.
 -- name: PendingNewCreationCharges :many
 SELECT app_id, name, created_module_count, created_at
 FROM ms_billing.apps
