@@ -162,10 +162,7 @@ func TestGetAccountBill_Integration_RolledAgentModelsUseFrozenCharges(t *testing
 		{Model: haiku, BillableQuantity: 2, ChargedMicros: 2400},
 	}, resp.Agent.Models, "models sort by charged_micros descending")
 
-	var modelMicros int64
-	for _, model := range resp.Agent.Models {
-		modelMicros += model.ChargedMicros
-	}
+	modelMicros := sumModelCharges(resp.Agent.Models)
 	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
 	require.EqualValues(t, 20400, modelMicros)
 	require.EqualValues(t, 500, resp.Agent.ModuleUsageMicros)

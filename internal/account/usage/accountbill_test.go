@@ -37,6 +37,16 @@ func modelLine(mod uuid.UUID, metric, model string, quantity float64, charged in
 	return line
 }
 
+// sumModelCharges totals ChargedMicros across the per-model rollup — the left
+// side of the Σ models ≤ Agent.TotalMicros reconciliation invariant.
+func sumModelCharges(models []usage.AgentModelUsage) int64 {
+	var total int64
+	for _, model := range models {
+		total += model.ChargedMicros
+	}
+	return total
+}
+
 // --- aggregation across apps ------------------------------------------------
 
 func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
@@ -250,11 +260,7 @@ func TestGetAccountBill_AgentModelsDecomposeModelCarryingLines(t *testing.T) {
 		{Model: modelA, BillableQuantity: 4, ChargedMicros: 1000},
 		{Model: modelB, BillableQuantity: 5, ChargedMicros: 1000},
 	}, resp.Agent.Models, "equal charges sort by raw model id after per-model summing")
-	var modelMicros int64
-	for _, model := range resp.Agent.Models {
-		modelMicros += model.ChargedMicros
-	}
-	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros,
+	require.LessOrEqual(t, sumModelCharges(resp.Agent.Models), resp.Agent.TotalMicros,
 		"model lines decompose only the model-carrying subset of agent spend")
 
 	// Existing scalars are unchanged: model-less module and infra charges remain
@@ -302,12 +308,7 @@ func TestGetAccountBill_AgentModelsClampedWhenLiveRoundingExceedsInfraTotal(t *t
 		{Model: modelA, BillableQuantity: 2, ChargedMicros: 5},
 		{Model: modelB, BillableQuantity: 3, ChargedMicros: 2},
 	}, resp.Agent.Models, "only the smaller tail model charge is trimmed")
-	var modelMicros int64
-	for _, model := range resp.Agent.Models {
-		modelMicros += model.ChargedMicros
-	}
-	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
-	require.EqualValues(t, 5, resp.Agent.Models[0].ChargedMicros, "the larger model row stays intact")
+	require.LessOrEqual(t, sumModelCharges(resp.Agent.Models), resp.Agent.TotalMicros)
 	require.EqualValues(t, 7, resp.Agent.TotalMicros)
 }
 
@@ -339,13 +340,7 @@ func TestGetAccountBill_AgentModelsDropReservedRealModuleAttributedLines(t *test
 	require.Equal(t, []usage.AgentModelUsage{{
 		Model: sentinelModel, BillableQuantity: 2, ChargedMicros: 12,
 	}}, resp.Agent.Models)
-	for _, model := range resp.Agent.Models {
-		require.NotEqual(t, realModuleModel, model.Model)
-	}
-	var modelMicros int64
-	for _, model := range resp.Agent.Models {
-		modelMicros += model.ChargedMicros
-	}
+	modelMicros := sumModelCharges(resp.Agent.Models)
 	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
 	require.EqualValues(t, 42, resp.Agent.InfraMicros)
 	require.EqualValues(t, 30, resp.Agent.TotalMicros-modelMicros,
@@ -378,11 +373,7 @@ func TestGetAccountBill_AgentModelsClampedWhenFrozenMetricDeactivated(t *testing
 	require.Equal(t, []usage.AgentModelUsage{{
 		Model: modelA, BillableQuantity: 12, ChargedMicros: 100_000,
 	}}, resp.Agent.Models, "a model fully trimmed to zero is dropped")
-	var modelMicros int64
-	for _, model := range resp.Agent.Models {
-		modelMicros += model.ChargedMicros
-	}
-	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
+	require.LessOrEqual(t, sumModelCharges(resp.Agent.Models), resp.Agent.TotalMicros)
 	require.EqualValues(t, 100_000, resp.Agent.TotalMicros)
 }
 
