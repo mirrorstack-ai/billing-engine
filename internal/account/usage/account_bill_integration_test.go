@@ -111,3 +111,65 @@ func TestMirroredAppIDs_Integration(t *testing.T) {
 	require.NoError(t, err)
 	require.ElementsMatch(t, []uuid.UUID{longLived, createdInside, deletedInside}, ids)
 }
+
+// TestGetAccountBill_Integration_RolledAgentModelsUseFrozenCharges proves the
+// account-agent model decomposition reads the authoritative charged_micros from
+// a frozen usage_aggregates period. A model-less custom row remains in the
+// agent total as the consumer-computed "Other" residual, never as a model row.
+func TestGetAccountBill_Integration_RolledAgentModelsUseFrozenCharges(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	owner := uuid.New()
+	acct := uuid.New()
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.accounts (id, owner_kind, owner_user_id) VALUES ($1, 'user', $2)`,
+		acct.String(), owner.String())
+	require.NoError(t, err)
+
+	periodID := appSeedPeriod(t, pool, acct, appPeriodStart, appPeriodEnd)
+	sentinel := usage.PlatformInfraModuleID()
+	const (
+		haiku  = "anthropic.claude-haiku-4-5-20251001-v1:0"
+		sonnet = "anthropic.claude-sonnet-4-6"
+	)
+
+	// These charged amounts are already frozen by rollup and must be forwarded
+	// exactly, without looking up or re-applying current model prices.
+	appSeedAggregate(t, pool, periodID, acct, uuid.Nil, sentinel,
+		"infra.ai.input.tokens", usage.KindSum, haiku, "", 2, 1000, 2000, 2400)
+	appSeedAggregate(t, pool, periodID, acct, uuid.Nil, sentinel,
+		"infra.ai.output.tokens", usage.KindSum, sonnet, "", 1, 15000, 15000, 18000)
+	// Model-less agent spend contributes to Agent.TotalMicros only; web-account
+	// derives it as the positive residual instead of receiving an "other" row.
+	appSeedAggregate(t, pool, periodID, acct, uuid.Nil, uuid.New(),
+		"agent.work.units", usage.KindCount, "", "", 5, 100, 500, 500)
+
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.billing_periods SET status = 'invoiced' WHERE id = $1`,
+		periodID.String())
+	require.NoError(t, err)
+
+	resp, err := usage.NewService(store).GetAccountBill(ctx, usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+		PeriodID:    periodID.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{
+		{Model: sonnet, BillableQuantity: 1, ChargedMicros: 18000},
+		{Model: haiku, BillableQuantity: 2, ChargedMicros: 2400},
+	}, resp.Agent.Models, "models sort by charged_micros descending")
+
+	var modelMicros int64
+	for _, model := range resp.Agent.Models {
+		modelMicros += model.ChargedMicros
+	}
+	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
+	require.EqualValues(t, 20400, modelMicros)
+	require.EqualValues(t, 500, resp.Agent.ModuleUsageMicros)
+	require.EqualValues(t, 20400, resp.Agent.InfraMicros)
+	require.EqualValues(t, 20900, resp.Agent.TotalMicros,
+		"model-less spend remains in the agent total as the consumer's residual")
+}

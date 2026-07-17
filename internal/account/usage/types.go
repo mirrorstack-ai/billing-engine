@@ -541,6 +541,14 @@ type AccountAppBill struct {
 	TotalMicros int64 `json:"total_micros"`
 }
 
+// AgentModelUsage is a display-only decomposition of the agent bucket by raw
+// model wire id. It reflects already-priced bill lines and is never re-priced.
+type AgentModelUsage struct {
+	Model            string  `json:"model"`
+	BillableQuantity float64 `json:"billable_quantity"`
+	ChargedMicros    int64   `json:"charged_micros"`
+}
+
 // AccountAgentBill is account-level agent spend (zero-UUID app scope): module
 // usage + infra ONLY. There is deliberately NO base_fee_micros — agent activity
 // is not an app and never incurs an app base fee.
@@ -548,6 +556,9 @@ type AccountAgentBill struct {
 	ModuleUsageMicros int64 `json:"module_usage_micros"`
 	InfraMicros       int64 `json:"infra_micros"`
 	TotalMicros       int64 `json:"total_micros"` // == ModuleUsageMicros + InfraMicros
+	// Models is always emitted; an account with no model usage gets an empty,
+	// never-nil slice.
+	Models []AgentModelUsage `json:"models"`
 }
 
 // GetAccountBillResponse is the account-owner's FULL bill for ONE period — the

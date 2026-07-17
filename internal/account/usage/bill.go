@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"math/big"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -286,6 +287,9 @@ type appBillParts struct {
 	InfraTotalMicros int64
 	InfraLines       []AppInfraUsage
 	ModuleInfraLines []AppModuleInfraUsage
+	// ModelLines is the per-model rollup of every returned line carrying a
+	// model, reserved or custom. It is display-only and never re-priced.
+	ModelLines []AgentModelUsage
 	// Name is the frozen app display name (migration 037) — "" when the app was
 	// never mirrored or was registered pre-037. IsDeleted is the server-
 	// authoritative removal flag; the bill page reads it to show a deleted app's
@@ -319,8 +323,16 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	// pooled (migration 032), so the per-app base no longer needs a
 	// distinct-module proxy count here.
 	moduleUsage := make([]AppMetricUsage, 0, len(lines))
+	modelBuckets := make(map[string]AgentModelUsage)
 	var moduleUsageTotal int64
 	for _, r := range lines {
+		if r.Model != "" {
+			modelLine := modelBuckets[r.Model]
+			modelLine.Model = r.Model
+			modelLine.BillableQuantity += r.BillableQuantity
+			modelLine.ChargedMicros += r.ChargedMicros
+			modelBuckets[r.Model] = modelLine
+		}
 		if isReservedMetric(r.Metric) {
 			// Reserved infra.* / platform.* lines are sourced AUTHORITATIVELY from
 			// the catalog-anchored AppInfraBill query below (so every declared infra
@@ -342,6 +354,16 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		})
 		moduleUsageTotal += r.ChargedMicros
 	}
+	modelLines := make([]AgentModelUsage, 0, len(modelBuckets))
+	for _, modelLine := range modelBuckets {
+		modelLines = append(modelLines, modelLine)
+	}
+	sort.Slice(modelLines, func(i, j int) bool {
+		if modelLines[i].ChargedMicros != modelLines[j].ChargedMicros {
+			return modelLines[i].ChargedMicros > modelLines[j].ChargedMicros
+		}
+		return modelLines[i].Model < modelLines[j].Model
+	})
 
 	// 基礎設施: source infra per-metric from the CATALOG (metric_definitions), NOT
 	// the usage ledger — so EVERY active declared infra metric renders as its own
@@ -454,6 +476,7 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		InfraTotalMicros:       infraTotal,
 		InfraLines:             infraLines,
 		ModuleInfraLines:       moduleInfraLines,
+		ModelLines:             modelLines,
 		Name:                   mirror.Name, // "" when not mirrored / pre-037
 		IsDeleted:              mirrored && mirror.Deleted,
 	}, nil
