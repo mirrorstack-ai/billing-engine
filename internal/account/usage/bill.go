@@ -287,8 +287,12 @@ type appBillParts struct {
 	InfraTotalMicros int64
 	InfraLines       []AppInfraUsage
 	ModuleInfraLines []AppModuleInfraUsage
-	// ModelLines is the per-model rollup of every returned line carrying a
-	// model, reserved or custom. It is display-only and never re-priced.
+	// ModelLines is the display-only per-model rollup of every non-reserved line
+	// carrying a model plus reserved model lines attributed to the platform-infra
+	// sentinel. Reserved lines attributed to real modules are excluded because
+	// their authoritative per-module infra charge has no model dimension. The
+	// rollup is charge-reconciled so its sum never exceeds the usage total; it is
+	// never re-priced.
 	ModelLines []AgentModelUsage
 	// Name is the frozen app display name (migration 037) — "" when the app was
 	// never mirrored or was registered pre-037. IsDeleted is the server-
@@ -296,6 +300,55 @@ type appBillParts struct {
 	// charges in a dialog instead of linking to the (gone) app page.
 	Name      string
 	IsDeleted bool
+}
+
+// clampModelChargesToTotal reconciles the display-only per-model rollup with the
+// authoritative usage total. The model buckets sum AppBill line charges rounded
+// per (metric, model, version); the usage total sums the catalog-anchored infra
+// queries rounded per metric (model collapsed) plus the module-usage lines. On a
+// LIVE period the two rounding granularities can disagree by a few micros, and an
+// operator deactivating a reserved metric against a frozen period drops it from
+// the catalog-anchored total while the ledger-sourced model rows keep it — either
+// way Σ models[].charged can drift ABOVE the total. models[] is a decomposition OF
+// that total, so trim it from the TAIL (smallest charges first; lines are sorted
+// charged desc) until Σ ≤ limit, dropping any row trimmed to a non-positive
+// charge. It is a no-op when the rollup already fits (the common case: exact
+// reconciliation on the frozen path, sub-cent drift on live). Returns the
+// possibly-shortened slice.
+func clampModelChargesToTotal(lines []AgentModelUsage, limit int64) []AgentModelUsage {
+	if limit < 0 {
+		limit = 0
+	}
+
+	var sum int64
+	for _, line := range lines {
+		sum += line.ChargedMicros
+	}
+	if sum <= limit {
+		return lines
+	}
+
+	trimmed := append([]AgentModelUsage(nil), lines...)
+	excess := sum - limit
+	for i := len(trimmed) - 1; i >= 0 && excess > 0; i-- {
+		if trimmed[i].ChargedMicros <= 0 {
+			continue
+		}
+		reduction := trimmed[i].ChargedMicros
+		if reduction > excess {
+			reduction = excess
+		}
+		trimmed[i].ChargedMicros -= reduction
+		excess -= reduction
+	}
+
+	compacted := trimmed[:0]
+	for _, line := range trimmed {
+		if line.ChargedMicros > 0 {
+			compacted = append(compacted, line)
+		}
+	}
+	return compacted
 }
 
 // computeAppBill computes one app's pre-credit bill parts for the resolved
@@ -319,21 +372,28 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 
 	// Keep only the non-reserved rows → module usage (displayed lines); the
 	// reserved infra.* / platform.* rows are dropped here (infra is sourced
-	// per-metric from the catalog below). Module overage is now account-wide
-	// pooled (migration 032), so the per-app base no longer needs a
-	// distinct-module proxy count here.
+	// per-metric from the catalog below). For the display-only model rollup,
+	// exclude reserved rows attributed to real modules: their authoritative
+	// charge lives in the model-less per-module infra plane below. Sentinel-
+	// attributed reserved rows and all non-reserved model rows still accrue, then
+	// the completed rollup is reconciled to the usage total so Σ model charges ≤
+	// that total by construction. Module overage is now account-wide pooled
+	// (migration 032), so the per-app base no longer needs a distinct-module
+	// proxy count here.
 	moduleUsage := make([]AppMetricUsage, 0, len(lines))
 	modelBuckets := make(map[string]AgentModelUsage)
 	var moduleUsageTotal int64
 	for _, r := range lines {
-		if r.Model != "" {
+		reserved := isReservedMetric(r.Metric)
+		reservedRealModule := reserved && r.ModuleID != PlatformInfraModuleID()
+		if r.Model != "" && !reservedRealModule {
 			modelLine := modelBuckets[r.Model]
 			modelLine.Model = r.Model
 			modelLine.BillableQuantity += r.BillableQuantity
 			modelLine.ChargedMicros += r.ChargedMicros
 			modelBuckets[r.Model] = modelLine
 		}
-		if isReservedMetric(r.Metric) {
+		if reserved {
 			// Reserved infra.* / platform.* lines are sourced AUTHORITATIVELY from
 			// the catalog-anchored AppInfraBill query below (so every declared infra
 			// metric renders as its own line, including the $0 / unused ones).
@@ -468,6 +528,8 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 			baseFee = resolveBaseFeeMicros(plan)
 		}
 	}
+
+	modelLines = clampModelChargesToTotal(modelLines, moduleUsageTotal+infraTotal)
 
 	return &appBillParts{
 		BaseFeeMicros:          baseFee,

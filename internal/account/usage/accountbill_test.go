@@ -277,6 +277,115 @@ func TestGetAccountBill_AgentModelsDecomposeModelCarryingLines(t *testing.T) {
 	require.NotContains(t, appWire, "models", "the per-app wire contract is unchanged")
 }
 
+func TestGetAccountBill_AgentModelsClampedWhenLiveRoundingExceedsInfraTotal(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	modelA := "openai.gpt-5-mini"
+	modelB := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelA, 2, 5),
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelB, 3, 3),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 1, 5, 7),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{
+		{Model: modelA, BillableQuantity: 2, ChargedMicros: 5},
+		{Model: modelB, BillableQuantity: 3, ChargedMicros: 2},
+	}, resp.Agent.Models, "only the smaller tail model charge is trimmed")
+	var modelMicros int64
+	for _, model := range resp.Agent.Models {
+		modelMicros += model.ChargedMicros
+	}
+	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
+	require.EqualValues(t, 5, resp.Agent.Models[0].ChargedMicros, "the larger model row stays intact")
+	require.EqualValues(t, 7, resp.Agent.TotalMicros)
+}
+
+func TestGetAccountBill_AgentModelsDropReservedRealModuleAttributedLines(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	realModule := seqUUID(7)
+	realModuleModel := "openai.gpt-5-mini"
+	sentinelModel := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		modelLine(realModule, "infra.ai.input.tokens", realModuleModel, 25, 0),
+		modelLine(uuid.Nil, "infra.ai.output.tokens", sentinelModel, 2, 12),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.output.tokens", "ai", 5, 2, 12),
+	}
+	store.appModuleInfraBillRowsByApp[uuid.Nil] = []usage.AppModuleInfraUsage{
+		moduleInfraLine(realModule, "infra.ai.input.tokens", "", 1, nil, 25, 30),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{{
+		Model: sentinelModel, BillableQuantity: 2, ChargedMicros: 12,
+	}}, resp.Agent.Models)
+	for _, model := range resp.Agent.Models {
+		require.NotEqual(t, realModuleModel, model.Model)
+	}
+	var modelMicros int64
+	for _, model := range resp.Agent.Models {
+		modelMicros += model.ChargedMicros
+	}
+	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
+	require.EqualValues(t, 42, resp.Agent.InfraMicros)
+	require.EqualValues(t, 30, resp.Agent.TotalMicros-modelMicros,
+		"the authoritative real-module charge stays in the Other residual")
+}
+
+func TestGetAccountBill_AgentModelsClampedWhenFrozenMetricDeactivated(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	modelA := "openai.gpt-5-mini"
+	modelB := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelA, 12, 1_200_000),
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelB, 8, 800_000),
+	}
+	// The frozen ledger rows remain, but the deactivated metric is absent from
+	// the catalog-anchored infra result. Only an unrelated active metric remains.
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.egress.api.bytes", "network", 1, 100_000, 100_000),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{{
+		Model: modelA, BillableQuantity: 12, ChargedMicros: 100_000,
+	}}, resp.Agent.Models, "a model fully trimmed to zero is dropped")
+	var modelMicros int64
+	for _, model := range resp.Agent.Models {
+		modelMicros += model.ChargedMicros
+	}
+	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
+	require.EqualValues(t, 100_000, resp.Agent.TotalMicros)
+}
+
 func TestGetAccountBill_AgentModelsEmptyForModelLessUsage(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
