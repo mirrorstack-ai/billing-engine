@@ -15,6 +15,7 @@ import (
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // requireBillingCode asserts err is a *billing.Error carrying the code.
@@ -210,6 +211,59 @@ func TestPayInvoice_HappyPath_PaysStripeInvoice(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "paid", resp.Status)
 	require.Equal(t, []string{"in_123"}, sc.paidInvoices)
+}
+
+func TestPayInvoice_SyncsMirrorFromStripeReturn(t *testing.T) {
+	store, sc, userID, invoiceID := paySetup("open")
+	want := billingstripe.Invoice{
+		ID:         "in_x",
+		Status:     "paid",
+		AmountPaid: 500,
+		AmountDue:  500,
+	}
+	sc.payInvoiceToReturn = want
+	svc := billing.NewService(store, sc, "")
+
+	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	require.NoError(t, err)
+	require.Equal(t, "paid", resp.Status)
+	require.Equal(t, []billingstripe.Invoice{want}, store.syncedMirrors)
+}
+
+func TestPayInvoice_MirrorSyncFailureStillReturnsPaid(t *testing.T) {
+	store, sc, userID, invoiceID := paySetup("open")
+	store.errSyncInvoiceMirror = errors.New("mirror unavailable")
+	svc := billing.NewService(store, sc, "")
+
+	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	require.NoError(t, err)
+	require.Equal(t, "paid", resp.Status)
+	require.Len(t, store.syncedMirrors, 1)
+}
+
+func TestPayInvoice_PendingStatusSyncedVerbatim(t *testing.T) {
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.payInvoiceToReturn = billingstripe.Invoice{ID: "in_123", Status: "open"}
+	svc := billing.NewService(store, sc, "")
+
+	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	require.NoError(t, err)
+	require.Equal(t, "pending", resp.Status)
+	require.Equal(t, []billingstripe.Invoice{{ID: "in_123", Status: "open"}}, store.syncedMirrors)
+}
+
+func TestPayInvoice_DeclineWritesNoMirror(t *testing.T) {
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = &stripego.Error{
+		Type:        stripego.ErrorTypeCard,
+		Code:        stripego.ErrorCodeCardDeclined,
+		DeclineCode: "insufficient_funds",
+	}
+	svc := billing.NewService(store, sc, "")
+
+	_, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	requireBillingCode(t, err, billing.CodePaymentRequired)
+	require.Empty(t, store.syncedMirrors)
 }
 
 func TestPayInvoice_UncollectibleIsPayable(t *testing.T) {

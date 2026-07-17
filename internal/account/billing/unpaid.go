@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,10 +21,10 @@ import (
 // blocks on (open/uncollectible mirror rows with amount_due > 0) — paying
 // them down through PayInvoice is the unblock-recovery flow.
 //
-// PayInvoice pays ONE open Stripe invoice with the owner's default card. The
-// mirror row settles via the existing invoice.* webhook reconciliation — this
-// RPC NEVER hand-updates mirror status (single-writer rule: the webhook owns
-// status transitions).
+// PayInvoice pays ONE open Stripe invoice with the owner's default card and
+// applies Stripe's returned post-pay snapshot through the same monotonic guard
+// the webhook uses. The webhook remains the policy writer for relax/notify and
+// ever_failed; its later status re-apply is idempotent.
 // ============================================================================
 
 // ListUnpaidInvoicesRequest is the payload of ListUnpaidInvoices: the owner
@@ -111,8 +112,8 @@ type PayInvoiceRequest struct {
 // PayInvoiceResponse reports Stripe's post-pay invoice state: "paid" when the
 // charge settled synchronously, "pending" when Stripe accepted the pay but
 // the payment is still processing (e.g. asynchronous payment methods). Either
-// way the mirror row settles via the invoice webhook — the client refetches
-// rather than trusting this echo as the mirror state.
+// way the returned snapshot is synchronously applied to the mirror; on the
+// paid path, the client's first refetch can observe the settled state.
 type PayInvoiceResponse struct {
 	Status string `json:"status"`
 }
@@ -142,8 +143,9 @@ type PayInvoiceResponse struct {
 //     declines map to PAYMENT_REQUIRED (a 402 the UI renders as a payment
 //     problem), never STRIPE_ERROR (a 502 that reads as a Stripe outage).
 //
-// The mirror row is NOT touched here — the invoice.paid webhook settles it
-// (the webhook is the mirror's single status writer).
+// After Stripe succeeds, its returned snapshot is applied synchronously through
+// the webhook's monotonic status guard. A later invoice.paid webhook re-apply is
+// idempotent and still owns policy side effects (relax/notify/ever_failed).
 func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayInvoiceResponse, error) {
 	if err := validateOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
 		return nil, err
@@ -222,6 +224,16 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 	inv, err := s.stripe.PayInvoice(ctx, target.StripeInvoiceID)
 	if err != nil {
 		return payFailure(err)
+	}
+	// Settle the mirror NOW from Stripe's returned snapshot so the first
+	// post-pay refetch reads 'paid' (core#162 — the webhook's later
+	// invoice.paid re-apply is an idempotent no-op via the monotonic
+	// guard's identical-re-apply branch; relax/notify still run there).
+	// Best-effort: the money moved — never fail the RPC on a mirror miss;
+	// the webhook settles the row seconds later.
+	if _, err := s.store.SyncInvoiceMirror(ctx, inv); err != nil {
+		slog.WarnContext(ctx, "PayInvoice mirror sync failed; webhook will settle",
+			"stripe_invoice_id", target.StripeInvoiceID, "error", err)
 	}
 	status := "pending"
 	if inv.Status == "paid" {

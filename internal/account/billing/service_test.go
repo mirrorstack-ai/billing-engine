@@ -46,6 +46,7 @@ type fakeStore struct {
 	payTargets       map[uuid.UUID]fakePayTarget
 	hasUsableDefPM   map[uuid.UUID]bool
 	stripeCustomerOf map[uuid.UUID]string
+	syncedMirrors    []billingstripe.Invoice
 
 	// Injected failures (set per-test as needed).
 	errEnsureAccount        error
@@ -64,6 +65,7 @@ type fakeStore struct {
 	errInvoiceForPayment    error
 	errHasUsableDefPM       error
 	errAccountStripeCust    error
+	errSyncInvoiceMirror    error
 }
 
 // fakePayTarget models one invoices-mirror row for InvoiceForPayment: the
@@ -312,6 +314,14 @@ func (s *fakeStore) AccountStripeCustomer(_ context.Context, accountID uuid.UUID
 	return s.stripeCustomerOf[accountID], nil
 }
 
+func (s *fakeStore) SyncInvoiceMirror(_ context.Context, inv billingstripe.Invoice) (bool, error) {
+	s.syncedMirrors = append(s.syncedMirrors, inv)
+	if s.errSyncInvoiceMirror != nil {
+		return false, s.errSyncInvoiceMirror
+	}
+	return true, nil
+}
+
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
@@ -325,7 +335,8 @@ type fakeStripe struct {
 	setupIntentIDToReturn    string
 	paidInvoices             []string // stripeInvoiceID per PayInvoice call
 	payStatusToReturn        string   // Stripe post-pay status; "" → "paid"
-	getInvoiceCustomer       string   // CustomerID GetInvoice reports (the invoice's frozen payer)
+	payInvoiceToReturn       billingstripe.Invoice
+	getInvoiceCustomer       string // CustomerID GetInvoice reports (the invoice's frozen payer)
 	customerNoDefaultPM      bool
 	errCreateCustomer        error
 	errCreateCheckoutSession error
@@ -443,11 +454,17 @@ func (f *fakeStripe) PayInvoice(_ context.Context, stripeInvoiceID string) (bill
 		return billingstripe.Invoice{}, f.errPayInvoice
 	}
 	f.paidInvoices = append(f.paidInvoices, stripeInvoiceID)
-	status := f.payStatusToReturn
-	if status == "" {
-		status = "paid"
+	inv := f.payInvoiceToReturn
+	if inv.ID == "" {
+		inv.ID = stripeInvoiceID
 	}
-	return billingstripe.Invoice{ID: stripeInvoiceID, Status: status}, nil
+	if inv.Status == "" {
+		inv.Status = f.payStatusToReturn
+		if inv.Status == "" {
+			inv.Status = "paid"
+		}
+	}
+	return inv, nil
 }
 
 // --- tests ----------------------------------------------------------------

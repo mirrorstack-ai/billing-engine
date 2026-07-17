@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
@@ -301,4 +303,73 @@ func TestPgxStore_InvoiceForPayment_OwnershipScope(t *testing.T) {
 	_, found, err = store.InvoiceForPayment(ctx, uuid.New(), owner)
 	require.NoError(t, err)
 	require.False(t, found)
+}
+
+func TestPgxStore_SyncInvoiceMirror_Integration(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := billing.NewStore(pool)
+	ctx := context.Background()
+
+	accountID := seedAccount(t, pool, "cus_pay_sync")
+	stripeInvoiceID := "in_pay_sync"
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.invoices
+		   (id, account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, ever_failed)
+		 VALUES ($1, $2, $3, 'open', 200, 0, 'usd', true)`,
+		uuid.New(), accountID, stripeInvoiceID,
+	)
+	require.NoError(t, err)
+
+	type invoiceState struct {
+		status                string
+		amountPaid, amountDue int64
+		everFailed            bool
+	}
+	readState := func() invoiceState {
+		t.Helper()
+		var state invoiceState
+		err := pool.QueryRow(ctx,
+			`SELECT status, amount_paid, amount_due, ever_failed
+			 FROM ms_billing.invoices
+			 WHERE stripe_invoice_id = $1`,
+			stripeInvoiceID,
+		).Scan(&state.status, &state.amountPaid, &state.amountDue, &state.everFailed)
+		require.NoError(t, err)
+		return state
+	}
+
+	applied, err := store.SyncInvoiceMirror(ctx, billingstripe.Invoice{
+		ID:         stripeInvoiceID,
+		Status:     "paid",
+		AmountPaid: 200,
+		AmountDue:  200,
+	})
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	paidState := invoiceState{
+		status:     "paid",
+		amountPaid: 200,
+		amountDue:  200,
+		everFailed: true,
+	}
+	require.Equal(t, paidState, readState(), "sync settle must retain the webhook-authored failure latch")
+
+	found, err := webhook.NewStore(pool).ApplyInvoiceStatus(ctx, webhook.ApplyInvoiceStatusParams{
+		StripeInvoiceID: stripeInvoiceID,
+		Status:          "paid",
+		AmountPaidCents: 200,
+		AmountDueCents:  200,
+	})
+	require.NoError(t, err)
+	require.True(t, found, "identical webhook replay must pass the guard so policy effects can still run")
+	require.Equal(t, paidState, readState(), "webhook replay must leave the settled mirror unchanged")
+
+	applied, err = store.SyncInvoiceMirror(ctx, billingstripe.Invoice{
+		ID:     stripeInvoiceID,
+		Status: "open",
+	})
+	require.NoError(t, err)
+	require.False(t, applied, "an open snapshot must not regress a paid mirror")
+	require.Equal(t, paidState, readState(), "rejected regression must not alter the settled mirror")
 }
