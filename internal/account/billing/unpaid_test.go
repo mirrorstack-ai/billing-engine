@@ -436,11 +436,54 @@ func TestPayInvoice_ConcurrentLoser_AlreadyPaidAbsorbedAsPaid(t *testing.T) {
 		Type: stripego.ErrorTypeInvalidRequest,
 		Code: "invoice_already_paid",
 	}
+	sc.getInvoiceStatus = "paid" // the winner already settled it in Stripe
 	svc := billing.NewService(store, sc, "")
 
 	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
 	require.NoError(t, err)
 	require.Equal(t, "paid", resp.Status)
+}
+
+func TestPayInvoice_AlreadyPaidOutOfBand_SyncsMirrorFromReread(t *testing.T) {
+	// The invoice was settled OUT-OF-BAND during the webhook-lag window (the
+	// hosted invoice page one click from the same row, a second org payer, the
+	// Stripe dashboard) — so THIS pay hits invoice_already_paid but never ran
+	// the success-path sync. Without the re-read+sync the mirror stays
+	// open+ever_failed and the first post-pay refetch renders Failed under the
+	// success snackbar (core#162). Assert the paid snapshot is synced so the
+	// refetch reads 'paid'.
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = &stripego.Error{
+		Type: stripego.ErrorTypeInvalidRequest,
+		Code: "invoice_already_paid",
+	}
+	sc.getInvoiceStatus = "paid"
+	svc := billing.NewService(store, sc, "")
+
+	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	require.NoError(t, err)
+	require.Equal(t, "paid", resp.Status)
+	require.Len(t, store.syncedMirrors, 1, "the already-paid branch must settle the mirror")
+	require.Equal(t, "paid", store.syncedMirrors[0].Status)
+}
+
+func TestPayInvoice_AlreadyPaidMirrorSyncFails_StillReturnsPaid(t *testing.T) {
+	// Best-effort sync on the already-paid branch too: the money is in, so a
+	// mirror-store failure never fails the RPC — it still echoes paid and the
+	// webhook settles the row seconds later.
+	store, sc, userID, invoiceID := paySetup("open")
+	sc.errPayInvoice = &stripego.Error{
+		Type: stripego.ErrorTypeInvalidRequest,
+		Code: "invoice_already_paid",
+	}
+	sc.getInvoiceStatus = "paid"
+	store.errSyncInvoiceMirror = errors.New("mirror unavailable")
+	svc := billing.NewService(store, sc, "")
+
+	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
+	require.NoError(t, err)
+	require.Equal(t, "paid", resp.Status)
+	require.Len(t, store.syncedMirrors, 1, "sync was attempted; its failure is absorbed")
 }
 
 func TestPayInvoice_FundingSwitch_CustomerMismatch_Rejected(t *testing.T) {

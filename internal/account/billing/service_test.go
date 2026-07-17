@@ -337,6 +337,7 @@ type fakeStripe struct {
 	payStatusToReturn        string   // Stripe post-pay status; "" → "paid"
 	payInvoiceToReturn       billingstripe.Invoice
 	getInvoiceCustomer       string // CustomerID GetInvoice reports (the invoice's frozen payer)
+	getInvoiceStatus         string // Status GetInvoice reports; "" → "open"
 	customerNoDefaultPM      bool
 	errCreateCustomer        error
 	errCreateCheckoutSession error
@@ -446,7 +447,11 @@ func (f *fakeStripe) GetInvoice(_ context.Context, stripeInvoiceID string) (bill
 	if f.errGetInvoice != nil {
 		return billingstripe.Invoice{}, f.errGetInvoice
 	}
-	return billingstripe.Invoice{ID: stripeInvoiceID, Status: "open", CustomerID: f.getInvoiceCustomer}, nil
+	status := f.getInvoiceStatus
+	if status == "" {
+		status = "open"
+	}
+	return billingstripe.Invoice{ID: stripeInvoiceID, Status: status, CustomerID: f.getInvoiceCustomer}, nil
 }
 
 func (f *fakeStripe) PayInvoice(_ context.Context, stripeInvoiceID string) (billingstripe.Invoice, error) {
