@@ -111,6 +111,8 @@ func TestScenario2_SurvivesGracePoolWithinIncludedBaseOnly(t *testing.T) {
 	require.Len(t, sc.itemCalls, 1)
 	require.EqualValues(t, 1000, sc.itemCalls[0].amountCfg, "$20 × 15/30 = $10.00")
 	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		timeUTC(2026, 6, 19, 0), timeUTC(2026, 7, 4, 0))
 
 	// The 3 co-created timers all resolved as included, none charged.
 	for _, tm := range store.timers {
@@ -152,6 +154,10 @@ func TestScenario3_PoolOverFromDayZeroOneCombinedInvoice(t *testing.T) {
 	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
 	require.EqualValues(t, 150, sc.itemCalls[1].amountCfg, "overage: $3 × 15/30 = $1.50")
 	require.EqualValues(t, 150, sc.itemCalls[2].amountCfg)
+	for _, item := range sc.itemCalls {
+		requireLinePeriod(t, item.period,
+			timeUTC(2026, 6, 19, 0), timeUTC(2026, 7, 4, 0))
+	}
 	// Overage line items use the SAME per-timer idem keys Leg 1 would use, so a
 	// racing sweep can never double-charge them.
 	require.Contains(t, sc.itemCalls[1].idemKey, "mod-overage-ii-")

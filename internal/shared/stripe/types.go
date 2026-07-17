@@ -10,6 +10,7 @@ package stripe
 
 import (
 	"context"
+	"time"
 
 	stripego "github.com/stripe/stripe-go/v85"
 )
@@ -78,12 +79,14 @@ type Client interface {
 	// the whole-cent customer charge (micro-dollars are converted to cents
 	// round-half-up by the caller BEFORE reaching Stripe — Stripe amounts are
 	// integer minor units, never float). desc is the line description shown on
-	// the invoice. idemKey is a deterministic Stripe Idempotency-Key
+	// the invoice. period is the billed coverage window, half-open [Start, End);
+	// its zero value omits Stripe's native invoice-item period. idemKey is a
+	// deterministic Stripe Idempotency-Key
 	// (ii-<run> / mod-overage-ii-<timer> / app-ii-<app>) so a re-run /
 	// partial-failure resume never creates a duplicate line (the replayed item
 	// is already pinned to the same replayed draft). Returns a plain
 	// InvoiceItem so the cycle consumer stays free of stripe-go imports.
-	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc, idemKey string) (InvoiceItem, error)
+	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error)
 
 	// FinalizeInvoice finalizes a draft invoice with auto_advance=true: Stripe
 	// runs the off-session PaymentIntent against the Customer's default payment
@@ -134,6 +137,14 @@ type Client interface {
 	// to ~1 minute, which the retry cadences (daily sweeps) sit far above —
 	// short-window retries are still covered by idem-key replay.
 	FindInvoiceByRef(ctx context.Context, custID, ref string) (Invoice, bool, error)
+}
+
+// LinePeriod is the coverage window an invoice line bills, half-open [Start, End).
+// Mapped to Stripe's native invoice-item period (rendered on the hosted invoice).
+// The zero value omits the period.
+type LinePeriod struct {
+	Start time.Time
+	End   time.Time
 }
 
 // InvoiceItem is the trust-boundary-edge projection of a Stripe invoice item

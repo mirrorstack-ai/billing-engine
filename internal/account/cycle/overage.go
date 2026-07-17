@@ -42,6 +42,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // moduleGraceExpiry keeps the cycle's module-timer call sites named locally
@@ -327,7 +328,8 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	if err != nil {
 		return nil, billing.StripeError("module overage draft invoice failed", err)
 	}
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, moduleOverageItemIdemKey(cand.ID))
+	linePeriod := billingstripe.LinePeriod{Start: coverageStart, End: coverageEnd}
+	item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, linePeriod, moduleOverageItemIdemKey(cand.ID))
 	if err != nil {
 		return nil, billing.StripeError("module overage invoice item failed", err)
 	}
@@ -499,7 +501,8 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 				appName = app.Name
 			}
 			desc := fmt.Sprintf("MirrorStack module overage (prorated) — %s", appLineLabel(appName, cand.AppID))
-			if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, desc, moduleOverageItemIdemKey(cand.ID)); err != nil {
+			linePeriod := billingstripe.LinePeriod{Start: coverageStart, End: coverageEnd}
+			if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, desc, linePeriod, moduleOverageItemIdemKey(cand.ID)); err != nil {
 				return false, billing.StripeError("module overage recovery invoice item failed", err)
 			}
 		case cents:

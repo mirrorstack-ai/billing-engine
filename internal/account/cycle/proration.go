@@ -494,13 +494,14 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				}
 			case draft.AmountDue == 0:
 				desc := fmt.Sprintf("MirrorStack app base fee (prorated) — %s", appLineLabel(locked.Name, locked.AppID))
-				if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, c, chargeCurrency, desc, appProrationItemIdemKey(locked.AppID)); err != nil {
+				linePeriod := billingstripe.LinePeriod{Start: coverageStart, End: coverageEnd}
+				if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, c, chargeCurrency, desc, linePeriod, appProrationItemIdemKey(locked.AppID)); err != nil {
 					return nil, billing.StripeError("proration invoice item failed", err)
 				}
 				if overageCents > 0 {
 					overDesc := fmt.Sprintf("MirrorStack module overage (prorated) — %s", appLineLabel(locked.Name, locked.AppID))
 					for _, timerID := range overTimers {
-						item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, overageCents, chargeCurrency, overDesc, moduleOverageItemIdemKey(timerID))
+						item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, overageCents, chargeCurrency, overDesc, linePeriod, moduleOverageItemIdemKey(timerID))
 						if err != nil {
 							return nil, billing.StripeError("combined module overage invoice item failed", err)
 						}
