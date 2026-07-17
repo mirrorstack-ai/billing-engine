@@ -3,6 +3,7 @@ package usage_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -25,6 +26,25 @@ func seqUUID(n byte) uuid.UUID {
 	u[15] = n
 	u[0] = 0x10 // keep it non-Nil even for n=0 and clear of the sentinel
 	return u
+}
+
+// modelLine builds one AppBill row carrying the raw model wire id. It mirrors
+// customLine while exposing the two values aggregated into Agent.Models.
+func modelLine(mod uuid.UUID, metric, model string, quantity float64, charged int64) usage.AppMetricUsageRaw {
+	line := customLine(mod, metric, "", charged)
+	line.Model = model
+	line.BillableQuantity = quantity
+	return line
+}
+
+// sumModelCharges totals ChargedMicros across the per-model rollup — the left
+// side of the Σ models ≤ Agent.TotalMicros reconciliation invariant.
+func sumModelCharges(models []usage.AgentModelUsage) int64 {
+	var total int64
+	for _, model := range models {
+		total += model.ChargedMicros
+	}
+	return total
 }
 
 // --- aggregation across apps ------------------------------------------------
@@ -190,6 +210,196 @@ func TestGetAccountBill_AgentOnlyHasNoAppRowOrBaseFee(t *testing.T) {
 	}
 	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, perApp,
 		"the app-plane identity excludes agent spend")
+}
+
+func TestGetAccountBill_AgentModelsDecomposeModelCarryingLines(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	modelA := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	modelB := "openai.gpt-5-mini"
+	app := seqUUID(9)
+	store.usageAppIDs = []uuid.UUID{uuid.Nil, app}
+
+	// modelA is split across two metrics, while modelB ties its summed charge.
+	// The response must aggregate modelA and resolve the tie by raw model id.
+	// Model-less custom and reserved rows stay in the agent total as the
+	// consumer-rendered "Other" residual.
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelA, 1.25, 400),
+		modelLine(uuid.Nil, "infra.ai.output.tokens", modelA, 2.75, 600),
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelB, 5, 1000),
+		infraLine("infra.egress.api.bytes", 300),
+		customLine(uuid.New(), "agent.work.units", "", 200),
+	}
+	// AppInfraBill remains authoritative for the existing infra scalar. These
+	// charges mirror the reserved AppBill rows without changing its old math.
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 1, 6.25, 1400),
+		appInfraLine("infra.ai.output.tokens", "ai", 1, 2.75, 600),
+		appInfraLine("infra.egress.api.bytes", "network", 1, 300, 300),
+	}
+
+	// A real app in the same account proves this is only an additive projection
+	// on the account-agent bucket; AccountAppBill has no models concept.
+	store.appBillRowsByApp[app] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "orders.placed", "", 700),
+	}
+	store.appInfraBillRowsByApp[app] = []usage.AppInfraUsage{
+		appInfraLine("infra.request.count", "requests", 1, 80, 80),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{
+		{Model: modelA, BillableQuantity: 4, ChargedMicros: 1000},
+		{Model: modelB, BillableQuantity: 5, ChargedMicros: 1000},
+	}, resp.Agent.Models, "equal charges sort by raw model id after per-model summing")
+	require.LessOrEqual(t, sumModelCharges(resp.Agent.Models), resp.Agent.TotalMicros,
+		"model lines decompose only the model-carrying subset of agent spend")
+
+	// Existing scalars are unchanged: model-less module and infra charges remain
+	// in the total, producing the residual the consumer labels "Other".
+	require.EqualValues(t, 200, resp.Agent.ModuleUsageMicros)
+	require.EqualValues(t, 2300, resp.Agent.InfraMicros)
+	require.EqualValues(t, 2500, resp.Agent.TotalMicros)
+
+	require.Equal(t, []usage.AccountAppBill{{
+		AppID:             app,
+		BaseFeeMicros:     usage.BaseFeeMicros,
+		ModuleUsageMicros: 700,
+		InfraMicros:       80,
+		TotalMicros:       usage.BaseFeeMicros + 780,
+	}}, resp.Apps)
+	appJSON, err := json.Marshal(resp.Apps[0])
+	require.NoError(t, err)
+	var appWire map[string]any
+	require.NoError(t, json.Unmarshal(appJSON, &appWire))
+	require.NotContains(t, appWire, "models", "the per-app wire contract is unchanged")
+}
+
+func TestGetAccountBill_AgentModelsClampedWhenLiveRoundingExceedsInfraTotal(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	modelA := "openai.gpt-5-mini"
+	modelB := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelA, 2, 5),
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelB, 3, 3),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 1, 5, 7),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{
+		{Model: modelA, BillableQuantity: 2, ChargedMicros: 5},
+		{Model: modelB, BillableQuantity: 3, ChargedMicros: 2},
+	}, resp.Agent.Models, "only the smaller tail model charge is trimmed")
+	require.LessOrEqual(t, sumModelCharges(resp.Agent.Models), resp.Agent.TotalMicros)
+	require.EqualValues(t, 7, resp.Agent.TotalMicros)
+}
+
+func TestGetAccountBill_AgentModelsDropReservedRealModuleAttributedLines(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	realModule := seqUUID(7)
+	realModuleModel := "openai.gpt-5-mini"
+	sentinelModel := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		modelLine(realModule, "infra.ai.input.tokens", realModuleModel, 25, 0),
+		modelLine(uuid.Nil, "infra.ai.output.tokens", sentinelModel, 2, 12),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.output.tokens", "ai", 5, 2, 12),
+	}
+	store.appModuleInfraBillRowsByApp[uuid.Nil] = []usage.AppModuleInfraUsage{
+		moduleInfraLine(realModule, "infra.ai.input.tokens", "", 1, nil, 25, 30),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{{
+		Model: sentinelModel, BillableQuantity: 2, ChargedMicros: 12,
+	}}, resp.Agent.Models)
+	modelMicros := sumModelCharges(resp.Agent.Models)
+	require.LessOrEqual(t, modelMicros, resp.Agent.TotalMicros)
+	require.EqualValues(t, 42, resp.Agent.InfraMicros)
+	require.EqualValues(t, 30, resp.Agent.TotalMicros-modelMicros,
+		"the authoritative real-module charge stays in the Other residual")
+}
+
+func TestGetAccountBill_AgentModelsClampedWhenFrozenMetricDeactivated(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+
+	modelA := "openai.gpt-5-mini"
+	modelB := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelA, 12, 1_200_000),
+		modelLine(uuid.Nil, "infra.ai.input.tokens", modelB, 8, 800_000),
+	}
+	// The frozen ledger rows remain, but the deactivated metric is absent from
+	// the catalog-anchored infra result. Only an unrelated active metric remains.
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.egress.api.bytes", "network", 1, 100_000, 100_000),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, []usage.AgentModelUsage{{
+		Model: modelA, BillableQuantity: 12, ChargedMicros: 100_000,
+	}}, resp.Agent.Models, "a model fully trimmed to zero is dropped")
+	require.LessOrEqual(t, sumModelCharges(resp.Agent.Models), resp.Agent.TotalMicros)
+	require.EqualValues(t, 100_000, resp.Agent.TotalMicros)
+}
+
+func TestGetAccountBill_AgentModelsEmptyForModelLessUsage(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store)
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "agent.work.units", "", 321),
+		infraLine("infra.egress.api.bytes", 654),
+	}
+	store.appInfraBillRowsByApp[uuid.Nil] = []usage.AppInfraUsage{
+		appInfraLine("infra.egress.api.bytes", "network", 1, 654, 654),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.Agent.Models)
+	require.Empty(t, resp.Agent.Models)
+	require.EqualValues(t, 321, resp.Agent.ModuleUsageMicros)
+	require.EqualValues(t, 654, resp.Agent.InfraMicros)
+	require.EqualValues(t, 975, resp.Agent.TotalMicros)
+	require.Equal(t, resp.Agent.TotalMicros, resp.TotalMicros)
 }
 
 func TestGetAccountBill_MixedAppsAndAgentReconcileExactly(t *testing.T) {
@@ -469,12 +679,63 @@ func TestGetAccountBill_LazyAccountZeroBill(t *testing.T) {
 	require.Zero(t, resp.BaseFeeTotalMicros)
 	require.Zero(t, resp.ModuleUsageTotalMicros)
 	require.Zero(t, resp.InfraTotalMicros)
-	require.Equal(t, usage.AccountAgentBill{}, resp.Agent)
+	require.Zero(t, resp.Agent.ModuleUsageMicros)
+	require.Zero(t, resp.Agent.InfraMicros)
+	require.Zero(t, resp.Agent.TotalMicros)
+	require.NotNil(t, resp.Agent.Models)
+	require.Empty(t, resp.Agent.Models)
 	require.Zero(t, resp.PaasCreditMicros)
 	require.Zero(t, resp.TotalMicros)
 	// The plan stub still renders (the card shows Hobby even pre-activation).
 	require.Equal(t, usage.PlanStubName, resp.Plan.Name)
 	require.True(t, resp.Plan.RenewsAt.Equal(resp.PeriodEnd))
+}
+
+func TestGetAccountBill_AgentModelsJSONContract(t *testing.T) {
+	modelID := "anthropic.claude-haiku-4-5-20251001-v1:0"
+	encoded, err := json.Marshal(usage.GetAccountBillResponse{
+		Agent: usage.AccountAgentBill{
+			Models: []usage.AgentModelUsage{{
+				Model: modelID, BillableQuantity: 1.5, ChargedMicros: 42,
+			}},
+		},
+	})
+	require.NoError(t, err)
+
+	var wire map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &wire))
+	agent, ok := wire["agent"].(map[string]any)
+	require.True(t, ok)
+	models, ok := agent["models"].([]any)
+	require.True(t, ok, "agent.models must be present as an array")
+	require.Len(t, models, 1)
+	row, ok := models[0].(map[string]any)
+	require.True(t, ok)
+	rowKeys := make([]string, 0, len(row))
+	for key := range row {
+		rowKeys = append(rowKeys, key)
+	}
+	require.ElementsMatch(t, []string{"model", "billable_quantity", "charged_micros"}, rowKeys,
+		"model-row JSON keys must match the deployed decoder exactly")
+	require.Equal(t, modelID, row["model"])
+	require.Equal(t, 1.5, row["billable_quantity"])
+	require.Equal(t, float64(42), row["charged_micros"])
+
+	// Exercise the actual lazy response too: its models key must encode as [],
+	// never null, on every zero-bill response.
+	lazy, err := newService(newFakeStore()).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: uuid.New(),
+	})
+	require.NoError(t, err)
+	encoded, err = json.Marshal(lazy)
+	require.NoError(t, err)
+	wire = nil
+	require.NoError(t, json.Unmarshal(encoded, &wire))
+	agent, ok = wire["agent"].(map[string]any)
+	require.True(t, ok)
+	lazyModels, ok := agent["models"].([]any)
+	require.True(t, ok, "lazy agent.models must encode as [] rather than null")
+	require.Empty(t, lazyModels)
 }
 
 func TestGetAccountBill_PlanStubFields(t *testing.T) {
