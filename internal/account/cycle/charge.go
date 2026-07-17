@@ -497,6 +497,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if cents != liveCents {
 		chargedMicros = cents * microsPerCent
 	}
+	// Mirror the SAME window the Stripe line discloses (linePeriod) — [periodStart,
+	// periodEnd) for a pure-usage run, widened to [periodStart, newPeriodEnd) when
+	// the final charge shape includes advance base/overage. Reusing linePeriod (not
+	// the closed usage window alone) keeps the web-account billing display fed from
+	// ms_billing.invoices in lockstep with the hosted Stripe invoice, so the boundary
+	// leg never shows a narrower window than Stripe disclosed for the same invoice.
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
 		AccountID:          accountID,
 		StripeInvoiceID:    inv.ID,
@@ -504,8 +510,8 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		AmountDueCents:     inv.AmountDue,
 		AmountPaidCents:    inv.AmountPaid,
 		Currency:           chargeCurrency,
-		PeriodStart:        periodStart,
-		PeriodEnd:          periodEnd,
+		PeriodStart:        linePeriod.Start,
+		PeriodEnd:          linePeriod.End,
 		IsLargeAutoCollect: flagLargeAutoCollect(chargedMicros, postChargeAcct),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)

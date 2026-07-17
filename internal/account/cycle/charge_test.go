@@ -256,7 +256,16 @@ func TestRunBillingCycle_WithAdvanceBaseLineCoversThroughNewPeriodEnd(t *testing
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.EqualValues(t, usage.BaseFeeMicros, resp.AdvanceBaseMicros)
 	require.Len(t, sc.itemCalls, 1)
-	requireLinePeriod(t, sc.itemCalls[0].period, closedStart, time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC))
+	newPeriodEnd := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	requireLinePeriod(t, sc.itemCalls[0].period, closedStart, newPeriodEnd)
+
+	// The mirror row MUST record the SAME window the Stripe line disclosed —
+	// widened through the new period's anchored end because this run carries
+	// advance base — so the web-account billing display never disagrees with the
+	// hosted Stripe invoice for this invoice.
+	mirror := store.invoices[resp.StripeInvoiceID]
+	require.Equal(t, closedStart, mirror.PeriodStart)
+	require.Equal(t, newPeriodEnd, mirror.PeriodEnd)
 }
 
 // --- org-billing D1: the funding hop (resolveChargeableCustomer) --------------
