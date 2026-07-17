@@ -194,9 +194,7 @@ func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID st
 	if desc != "" {
 		params.Description = stripego.String(desc)
 	}
-	if p := itemPeriodParams(period); p != nil {
-		params.Period = p
-	}
+	params.Period = itemPeriodParams(period)
 	params.Context = ctx
 	params.SetIdempotencyKey(idemKey)
 	item, err := c.sc.InvoiceItems.New(params)
