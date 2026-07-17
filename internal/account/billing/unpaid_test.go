@@ -280,7 +280,7 @@ func TestPayInvoice_UncollectibleIsPayable(t *testing.T) {
 
 func TestPayInvoice_PendingWhenStripeReportsUnsettled(t *testing.T) {
 	store, sc, userID, invoiceID := paySetup("open")
-	sc.payStatusToReturn = "open" // async PM: pay accepted, not settled
+	sc.payInvoiceToReturn = billingstripe.Invoice{Status: "open"} // async PM: pay accepted, not settled
 	svc := billing.NewService(store, sc, "")
 
 	resp, err := svc.PayInvoice(context.Background(), billing.PayInvoiceRequest{OwnerUserID: userID, InvoiceID: invoiceID})
