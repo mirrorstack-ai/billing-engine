@@ -3,10 +3,13 @@ package billing
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 	stripego "github.com/stripe/stripe-go/v85"
+
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // ============================================================================
@@ -20,10 +23,10 @@ import (
 // blocks on (open/uncollectible mirror rows with amount_due > 0) — paying
 // them down through PayInvoice is the unblock-recovery flow.
 //
-// PayInvoice pays ONE open Stripe invoice with the owner's default card. The
-// mirror row settles via the existing invoice.* webhook reconciliation — this
-// RPC NEVER hand-updates mirror status (single-writer rule: the webhook owns
-// status transitions).
+// PayInvoice pays ONE open Stripe invoice with the owner's default card and
+// applies Stripe's returned post-pay snapshot through the same monotonic guard
+// the webhook uses. The webhook remains the policy writer for relax/notify and
+// ever_failed; its later status re-apply is idempotent.
 // ============================================================================
 
 // ListUnpaidInvoicesRequest is the payload of ListUnpaidInvoices: the owner
@@ -111,8 +114,8 @@ type PayInvoiceRequest struct {
 // PayInvoiceResponse reports Stripe's post-pay invoice state: "paid" when the
 // charge settled synchronously, "pending" when Stripe accepted the pay but
 // the payment is still processing (e.g. asynchronous payment methods). Either
-// way the mirror row settles via the invoice webhook — the client refetches
-// rather than trusting this echo as the mirror state.
+// way the returned snapshot is synchronously applied to the mirror; on the
+// paid path, the client's first refetch can observe the settled state.
 type PayInvoiceResponse struct {
 	Status string `json:"status"`
 }
@@ -142,8 +145,9 @@ type PayInvoiceResponse struct {
 //     declines map to PAYMENT_REQUIRED (a 402 the UI renders as a payment
 //     problem), never STRIPE_ERROR (a 502 that reads as a Stripe outage).
 //
-// The mirror row is NOT touched here — the invoice.paid webhook settles it
-// (the webhook is the mirror's single status writer).
+// After Stripe succeeds, its returned snapshot is applied synchronously through
+// the webhook's monotonic status guard. A later invoice.paid webhook re-apply is
+// idempotent and still owns policy side effects (relax/notify/ever_failed).
 func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayInvoiceResponse, error) {
 	if err := validateOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
 		return nil, err
@@ -221,8 +225,13 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 
 	inv, err := s.stripe.PayInvoice(ctx, target.StripeInvoiceID)
 	if err != nil {
-		return payFailure(err)
+		return s.payFailure(ctx, target.StripeInvoiceID, err)
 	}
+	// Settle the mirror NOW from Stripe's returned snapshot so the first
+	// post-pay refetch reads 'paid' (core#162 — the webhook's later
+	// invoice.paid re-apply is an idempotent no-op via the monotonic
+	// guard's identical-re-apply branch; relax/notify still run there).
+	s.syncPaidMirror(ctx, inv)
 	status := "pending"
 	if inv.Status == "paid" {
 		status = "paid"
@@ -230,21 +239,54 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 	return &PayInvoiceResponse{Status: status}, nil
 }
 
+// syncPaidMirror applies a post-pay Stripe invoice snapshot onto the mirror
+// through the webhook's monotonic status guard, so the first post-pay refetch
+// reads the settled status instead of the still-open row's Failed badge
+// (core#162 — the webhook's later invoice.paid re-apply is idempotent; it still
+// owns policy side effects like relax/notify/ever_failed). Best-effort by
+// contract: the money already moved, so a mirror miss must NEVER fail the RPC —
+// the webhook settles the row seconds later regardless. Both a store error and a
+// guard no-op (applied=false: no mirror row, or a transition the guard rejected)
+// are logged, since on the pay path the row provably exists (InvoiceForPayment
+// just read it) and 'paid' outranks open/uncollectible, so a no-op is unexpected.
+func (s *Service) syncPaidMirror(ctx context.Context, inv billingstripe.Invoice) {
+	switch applied, err := s.store.SyncInvoiceMirror(ctx, inv); {
+	case err != nil:
+		slog.WarnContext(ctx, "PayInvoice mirror sync failed; webhook will settle",
+			"stripe_invoice_id", inv.ID, "error", err)
+	case !applied:
+		slog.WarnContext(ctx, "PayInvoice mirror sync not applied; webhook will settle",
+			"stripe_invoice_id", inv.ID)
+	}
+}
+
 // payFailure maps a failed Stripe Invoices.Pay to the RPC surface. Declines
 // and off-session 3DS challenges are the USER's card problem — mapped to
 // PAYMENT_REQUIRED (402, which web-account's pay path renders as a payment
 // problem), never STRIPE_ERROR (502, indistinguishable from a Stripe outage).
-// The concurrent double-submit loser (both requests passed the mirror 'paid'
-// short-circuit before the webhook settled it) hits Stripe's resource-level
-// guard, invoice_already_paid, and is absorbed as the same {"status":"paid"}
-// echo the winner got — not an error.
-func payFailure(err error) (*PayInvoiceResponse, error) {
+// The invoice_already_paid loser — a concurrent double-submit, OR an invoice
+// settled out-of-band during the webhook-lag window (the hosted invoice page one
+// click from the same row, a second org payer, the Stripe dashboard) — is
+// absorbed as the same {"status":"paid"} echo the winner got, not an error.
+func (s *Service) payFailure(ctx context.Context, stripeInvoiceID string, err error) (*PayInvoiceResponse, error) {
 	var se *stripego.Error
 	if !errors.As(err, &se) {
 		return nil, StripeError("pay invoice failed", err)
 	}
 	// Not in v85's generated ErrorCode enum; match Stripe's wire string.
 	if se.Code == "invoice_already_paid" {
+		// The money is in, but THIS request never ran the success-path sync, so
+		// the mirror can still be open+ever_failed → the first post-pay refetch
+		// renders Failed under the success snackbar (core#162). Re-read the
+		// now-settled snapshot and sync it before echoing paid; best-effort like
+		// the success path (the pure double-submit case is already settled by the
+		// winner, so this re-apply is an idempotent no-op there).
+		if inv, gerr := s.stripe.GetInvoice(ctx, stripeInvoiceID); gerr != nil {
+			slog.WarnContext(ctx, "PayInvoice already-paid re-read failed; webhook will settle",
+				"stripe_invoice_id", stripeInvoiceID, "error", gerr)
+		} else {
+			s.syncPaidMirror(ctx, inv)
+		}
 		return &PayInvoiceResponse{Status: "paid"}, nil
 	}
 	if se.Type == stripego.ErrorTypeCard || se.DeclineCode != "" {
