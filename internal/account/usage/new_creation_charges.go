@@ -28,10 +28,10 @@ import (
 //     number/id, and the invoice created_at as the "recorded at".
 //   - PENDING: the app is still in its creation grace (uncharged, live,
 //     un-skipped) — shown with a charge ETA (created_at + GraceDays) and the
-//     PROJECTED accruing base fee (the flat plan base; the exact prorated
-//     amount is the sweep's to mint, so this is an estimate like every other
-//     un-invoiced line). Pending rows exist ONLY for the CURRENT live window —
-//     a past period has no still-in-grace apps.
+//     exact base amount the sweep will charge, priced through
+//     CreationChargeBaseMicros (creation-period proration plus the full-base
+//     straddle top-up when applicable). Pending rows exist ONLY for the
+//     CURRENT live window — a past period has no still-in-grace apps.
 //   - PENDING ADD-ON: over-modules installed AFTER an app's creation carry
 //     their own in-grace overage timers (migration 033, Leg 1) — surfaced as a
 //     per-app pending row with base 0, the projected flat surcharge per timer,
@@ -48,7 +48,7 @@ const (
 	// row carries the invoice's real settled amount + number/id + recorded_at.
 	NewCreationChargeStatusSettled = "settled"
 	// NewCreationChargeStatusPending: the app is still in creation grace (uncharged);
-	// the row carries a charge_eta and its PROJECTED (accruing) base fee.
+	// the row carries a charge_eta and the exact CreationChargeBaseMicros preview.
 	NewCreationChargeStatusPending = "pending"
 )
 
@@ -71,9 +71,10 @@ type ListNewCreationChargesRequest struct {
 // base is (or will be) charged via the creation-proration leg. For a SETTLED row
 // AmountMicros is the invoice's actual settled total, RecordedAt is the invoice
 // created_at, and InvoiceID is the invoice Number (else the mirror UUID); for a
-// PENDING row AmountMicros/BaseFeeMicros is the PROJECTED base fee it will
-// accrue (the whole cycle bills at period close), ChargeETA is created_at +
-// GraceDays, and RecordedAt/InvoiceID are absent. Money is integer micro-USD.
+// PENDING row AmountMicros/BaseFeeMicros previews CreationChargeBaseMicros —
+// the sweep's exact base amount, including a straddled period's full-base
+// top-up when applicable. ChargeETA is GraceExpiry(created_at), and
+// RecordedAt/InvoiceID are absent. Money is integer micro-USD.
 //
 // The per-component BREAKDOWN lets the UI render "App · <Name> · 基礎費用" and
 // "App · <Name> · <AddonModuleCount> 加購模組": Name is the app's display name
@@ -82,10 +83,11 @@ type ListNewCreationChargesRequest struct {
 // BaseFeeMicros + AddonMicros partition AmountMicros for a settled row
 // (BaseFeeMicros is the settled creation base, AddonMicros the co-created
 // over-module component on the same invoice). A pending CREATION row carries
-// the projected flat base in AmountMicros/BaseFeeMicros and AddonMicros 0
-// (the co-created overage is not projected — only its COUNT surfaces); a
-// pending ADD-ON row (post-creation installs) is the inverse: BaseFeeMicros 0,
-// AmountMicros/AddonMicros the projected flat surcharge × AddonModuleCount.
+// the exact CreationChargeBaseMicros preview in AmountMicros/BaseFeeMicros and
+// AddonMicros 0 (the co-created overage is not projected — only its COUNT
+// surfaces); a pending ADD-ON row (post-creation installs) is the inverse:
+// BaseFeeMicros 0, AmountMicros/AddonMicros the projected flat surcharge ×
+// AddonModuleCount.
 // The UI derives the descriptor from the partition: base only, base + N
 // add-ons, or N add-ons only.
 type NewCreationCharge struct {
@@ -131,7 +133,8 @@ type ListNewCreationChargesResponse struct {
 //     proration guard, joined to the invoice mirror) — newest-first from SQL,
 //  5. for the CURRENT live window ONLY (resolved period id == ""), reads the
 //     PENDING rows (still-in-grace apps) and appends them with a charge ETA
-//     (created_at + GraceDays) and amount 0; a past period skips this entirely.
+//     (GraceExpiry(created_at)) and the exact CreationChargeBaseMicros amount
+//     the sweep will charge; a past period skips this entirely.
 func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreationChargesRequest) (*ListNewCreationChargesResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -211,19 +214,24 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 		}
 		pendingStart := len(charges)
 		for _, r := range pending {
-			eta := r.CreatedAt.AddDate(0, 0, GraceDays)
+			// Pending rows exist only for this current [periodStart, periodEnd)
+			// window, and PendingNewCreationCharges constrains created_at to that
+			// same window. resolveBillPeriod anchors it from now with the account's
+			// anchor day; the sweep anchors from created_at with that same day, so
+			// an in-window created_at resolves to these identical bounds.
+			eta := GraceExpiry(r.CreatedAt)
+			projected := CreationChargeBaseMicros(r.CreatedAt, periodStart, periodEnd)
 			charges = append(charges, NewCreationCharge{
 				AppID:  r.AppID,
 				Status: NewCreationChargeStatusPending,
-				// PROJECTED base fee: the whole cycle bills at period close, so a
-				// still-in-grace app shows its accruing base fee (BaseFeeMicros),
-				// not 0 — it is an unpaid estimate, like every other line. Base
-				// only; the add-on overage is not projected here (its COUNT is
-				// still surfaced from the frozen registration count).
-				AmountMicros:     BaseFeeMicros,
+				// Exact CreationChargeBaseMicros preview: creation-period
+				// proration plus the full-base straddle top-up when applicable.
+				// Base only; the add-on overage is not projected here (its COUNT
+				// is still surfaced from the frozen registration count).
+				AmountMicros:     projected,
 				ChargeETA:        &eta,
 				Name:             r.Name,
-				BaseFeeMicros:    BaseFeeMicros,
+				BaseFeeMicros:    projected,
 				AddonModuleCount: addonModuleCount(r.CreatedModuleCount),
 				AddonMicros:      0,
 			})
