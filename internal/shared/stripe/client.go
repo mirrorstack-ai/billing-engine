@@ -179,11 +179,12 @@ func (c *realClient) CreateDraftInvoice(ctx context.Context, custID, ref, idemKe
 // (never a floating customer-level pending item — see CreateDraftInvoice).
 // amountCents is whole cents (the caller converts micro-dollars → cents
 // round-half-up before this call; Stripe amounts are integer minor units). The
-// deterministic Idempotency-Key makes a re-run safe — Stripe returns the
-// original item (already pinned to the same replayed draft) instead of
-// creating a second one. We project to a plain InvoiceItem (id only) so
-// consumers stay off stripe-go.
-func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc, idemKey string) (InvoiceItem, error) {
+// period is the half-open [Start, End) coverage window; its zero value omits
+// Stripe's native invoice-item period. A deterministic Idempotency-Key makes a
+// re-run safe: Stripe returns the original item (already pinned to the same
+// replayed draft) instead of creating a second one. We project to a plain
+// InvoiceItem (id only) so consumers stay off stripe-go.
+func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error) {
 	params := &stripego.InvoiceItemParams{
 		Customer: stripego.String(custID),
 		Invoice:  stripego.String(invoiceID),
@@ -193,6 +194,7 @@ func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID st
 	if desc != "" {
 		params.Description = stripego.String(desc)
 	}
+	params.Period = itemPeriodParams(period)
 	params.Context = ctx
 	params.SetIdempotencyKey(idemKey)
 	item, err := c.sc.InvoiceItems.New(params)
@@ -200,6 +202,17 @@ func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID st
 		return InvoiceItem{}, err
 	}
 	return InvoiceItem{ID: item.ID}, nil
+}
+
+// itemPeriodParams maps a LinePeriod to Stripe params; nil when either bound is unset.
+func itemPeriodParams(p LinePeriod) *stripego.InvoiceItemPeriodParams {
+	if p.Start.IsZero() || p.End.IsZero() {
+		return nil
+	}
+	return &stripego.InvoiceItemPeriodParams{
+		Start: stripego.Int64(p.Start.UTC().Unix()),
+		End:   stripego.Int64(p.End.UTC().Unix()),
+	}
 }
 
 // FinalizeInvoice finalizes the draft with auto_advance=true — Stripe runs the
