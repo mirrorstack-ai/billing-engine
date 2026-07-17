@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // Store is the persistence interface Service depends on. The shape
@@ -130,6 +132,14 @@ type Store interface {
 	// PayInvoice ownership gate. found=false when no row matches both (wrong
 	// owner or unknown id), which the service maps to NOT_FOUND.
 	InvoiceForPayment(ctx context.Context, invoiceID, accountID uuid.UUID) (InvoicePayTarget, bool, error)
+
+	// SyncInvoiceMirror applies a Stripe invoice snapshot onto the mirror row
+	// through the SAME monotonic guard as the webhook's ApplyInvoiceStatus
+	// (db.ApplyInvoiceStatus): forward transitions only, identical re-apply
+	// allowed. Presentment fields pass "" (COALESCE keeps stored values);
+	// ever_failed is never touched. applied=false = no mirror row or the
+	// guard rejected the transition — a safe no-op for the caller.
+	SyncInvoiceMirror(ctx context.Context, inv billingstripe.Invoice) (applied bool, err error)
 
 	// HasUsableDefaultPM is the charge legs' no-PM gate (cycle.sql), reused by
 	// PayInvoice: Stripe pays an invoice with the Customer's default PM, so a
@@ -510,6 +520,30 @@ func (s *pgxStore) InvoiceForPayment(ctx context.Context, invoiceID, accountID u
 	return InvoicePayTarget{StripeInvoiceID: row.StripeInvoiceID, Status: row.Status}, true, nil
 }
 
+func (s *pgxStore) SyncInvoiceMirror(ctx context.Context, inv billingstripe.Invoice) (bool, error) {
+	paid, err := centsNumeric(inv.AmountPaid)
+	if err != nil {
+		return false, err
+	}
+	due, err := centsNumeric(inv.AmountDue)
+	if err != nil {
+		return false, err
+	}
+	rows, err := s.q.ApplyInvoiceStatus(ctx, db.ApplyInvoiceStatusParams{
+		StripeInvoiceID:  inv.ID,
+		Status:           inv.Status,
+		AmountPaid:       paid,
+		AmountDue:        due,
+		Number:           "",
+		HostedInvoiceUrl: "",
+		InvoicePdf:       "",
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 func (s *pgxStore) HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error) {
 	return s.q.HasUsableDefaultPM(ctx, accountID.String())
 }
@@ -535,6 +569,17 @@ func centsNumericToMicros(n pgtype.Numeric) (int64, error) {
 		return 0, fmt.Errorf("cents amount %d overflows int64 micros", cents)
 	}
 	return cents * microsPerCent, nil
+}
+
+// centsNumeric encodes whole Stripe minor units as an exact NUMERIC with no
+// scale. It mirrors webhook.centsNumeric so both callers feed
+// db.ApplyInvoiceStatus the same representation without coupling packages.
+func centsNumeric(cents int64) (pgtype.Numeric, error) {
+	var n pgtype.Numeric
+	if err := n.Scan(strconv.FormatInt(cents, 10)); err != nil {
+		return pgtype.Numeric{}, err
+	}
+	return n, nil
 }
 
 // uuidRowFound decodes the (uuid-as-string, error) shape every single-row

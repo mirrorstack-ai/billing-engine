@@ -241,9 +241,9 @@ func (c *realClient) GetInvoice(ctx context.Context, stripeInvoiceID string) (In
 // so a deterministic key would replay the original decline after the user
 // fixed their card (the exact retry this RPC exists for). Double-charge
 // protection is resource-level: Stripe errors invoice_already_paid on a paid
-// invoice (see the interface comment). Projected to a plain Invoice — the
-// caller reads status ("paid" vs still-processing) and nothing else; the
-// mirror is settled by the invoice webhook.
+// invoice (see the interface comment). Projected to a plain Invoice so the
+// caller can settle the mirror from the returned post-pay snapshot; the
+// invoice webhook's later re-apply is idempotent.
 func (c *realClient) PayInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error) {
 	params := &stripego.InvoicePayParams{}
 	params.Context = ctx

@@ -46,6 +46,7 @@ type fakeStore struct {
 	payTargets       map[uuid.UUID]fakePayTarget
 	hasUsableDefPM   map[uuid.UUID]bool
 	stripeCustomerOf map[uuid.UUID]string
+	syncedMirrors    []billingstripe.Invoice
 
 	// Injected failures (set per-test as needed).
 	errEnsureAccount        error
@@ -64,6 +65,7 @@ type fakeStore struct {
 	errInvoiceForPayment    error
 	errHasUsableDefPM       error
 	errAccountStripeCust    error
+	errSyncInvoiceMirror    error
 }
 
 // fakePayTarget models one invoices-mirror row for InvoiceForPayment: the
@@ -312,6 +314,14 @@ func (s *fakeStore) AccountStripeCustomer(_ context.Context, accountID uuid.UUID
 	return s.stripeCustomerOf[accountID], nil
 }
 
+func (s *fakeStore) SyncInvoiceMirror(_ context.Context, inv billingstripe.Invoice) (bool, error) {
+	s.syncedMirrors = append(s.syncedMirrors, inv)
+	if s.errSyncInvoiceMirror != nil {
+		return false, s.errSyncInvoiceMirror
+	}
+	return true, nil
+}
+
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
@@ -323,9 +333,10 @@ type fakeStripe struct {
 	customerIDToReturn       string
 	checkoutSecretToReturn   string
 	setupIntentIDToReturn    string
-	paidInvoices             []string // stripeInvoiceID per PayInvoice call
-	payStatusToReturn        string   // Stripe post-pay status; "" → "paid"
-	getInvoiceCustomer       string   // CustomerID GetInvoice reports (the invoice's frozen payer)
+	paidInvoices             []string              // stripeInvoiceID per PayInvoice call
+	payInvoiceToReturn       billingstripe.Invoice // zero ID/Status default to stripeInvoiceID/"paid"
+	getInvoiceCustomer       string                // CustomerID GetInvoice reports (the invoice's frozen payer)
+	getInvoiceStatus         string                // Status GetInvoice reports; "" → "open"
 	customerNoDefaultPM      bool
 	errCreateCustomer        error
 	errCreateCheckoutSession error
@@ -435,7 +446,11 @@ func (f *fakeStripe) GetInvoice(_ context.Context, stripeInvoiceID string) (bill
 	if f.errGetInvoice != nil {
 		return billingstripe.Invoice{}, f.errGetInvoice
 	}
-	return billingstripe.Invoice{ID: stripeInvoiceID, Status: "open", CustomerID: f.getInvoiceCustomer}, nil
+	status := f.getInvoiceStatus
+	if status == "" {
+		status = "open"
+	}
+	return billingstripe.Invoice{ID: stripeInvoiceID, Status: status, CustomerID: f.getInvoiceCustomer}, nil
 }
 
 func (f *fakeStripe) PayInvoice(_ context.Context, stripeInvoiceID string) (billingstripe.Invoice, error) {
@@ -443,11 +458,14 @@ func (f *fakeStripe) PayInvoice(_ context.Context, stripeInvoiceID string) (bill
 		return billingstripe.Invoice{}, f.errPayInvoice
 	}
 	f.paidInvoices = append(f.paidInvoices, stripeInvoiceID)
-	status := f.payStatusToReturn
-	if status == "" {
-		status = "paid"
+	inv := f.payInvoiceToReturn
+	if inv.ID == "" {
+		inv.ID = stripeInvoiceID
 	}
-	return billingstripe.Invoice{ID: stripeInvoiceID, Status: status}, nil
+	if inv.Status == "" {
+		inv.Status = "paid"
+	}
+	return inv, nil
 }
 
 // --- tests ----------------------------------------------------------------

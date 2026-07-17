@@ -121,8 +121,8 @@ type Client interface {
 	// needed. Double-charge safety is resource-level instead: Stripe rejects
 	// paying an already-paid invoice (invoice_already_paid), which the
 	// caller absorbs as success on top of its mirror-'paid' short-circuit.
-	// Returns the post-pay invoice projection; the mirror settles via the
-	// invoice.paid webhook, never from this return value.
+	// Returns the post-pay invoice projection; the caller settles the mirror
+	// from this snapshot, and the invoice.paid webhook re-apply is idempotent.
 	PayInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error)
 
 	// FindInvoiceByRef looks a Customer's invoice up by its ms_charge_ref
