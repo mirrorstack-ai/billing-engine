@@ -154,6 +154,10 @@ func TestChargeCreationProration_D1dStraddleChargesThePostActivationPeriod(t *te
 	require.NoError(t, err)
 	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
 	require.EqualValues(t, 2000, resp.ProrationCents, "the straddled period's FULL $20 base — the creation period is forgiven")
+	require.Len(t, sc.itemCalls, 1)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC))
 	mirror := store.invoices[sc.invoiceID]
 	require.Equal(t, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodStart, "window narrowed to the straddled period")
 	require.Equal(t, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
@@ -298,6 +302,9 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	require.Len(t, sc.itemCalls, 1)
 	require.Len(t, sc.invoiceCalls, 1)
 	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC))
 	require.Equal(t, "cus_apps_1", sc.itemCalls[0].custID)
 	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
 	require.Contains(t, sc.itemCalls[0].desc, "My App")

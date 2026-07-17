@@ -364,23 +364,20 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		}
 	}
 
-	// Resolve the NEW period's window for the base snapshots BEFORE any Stripe
-	// call (fail early on a lookup error). periodEnd is always the anchored
-	// boundary (the straddle-clamp only ever moves the START), so the new
+	// Resolve the NEW period's window for the boundary line and base snapshots
+	// BEFORE any Stripe call (fail early on a lookup error). periodEnd is always
+	// the anchored boundary (the straddle-clamp only ever moves the START), so the new
 	// window is AnchoredPeriodWindow(periodEnd, anchorDay) = [periodEnd, next
 	// boundary). The anchor day comes from activated_at (ADR 0005); the
 	// boundary's own day-of-month is the defensive fallback for the
 	// direct-call-on-an-unactivated-account case the cron never produces.
-	var newPeriodEnd time.Time
-	if len(apps) > 0 {
-		anchorDay := billingperiod.AnchorDay(periodEnd)
-		if activatedAt, activated, err := s.store.AccountActivation(ctx, accountID); err != nil {
-			return nil, billing.Internal("account activation lookup failed", err)
-		} else if activated {
-			anchorDay = billingperiod.AnchorDay(activatedAt)
-		}
-		_, newPeriodEnd = billingperiod.AnchoredPeriodWindow(periodEnd, anchorDay)
+	anchorDay := billingperiod.AnchorDay(periodEnd)
+	if activatedAt, activated, err := s.store.AccountActivation(ctx, accountID); err != nil {
+		return nil, billing.Internal("account activation lookup failed", err)
+	} else if activated {
+		anchorDay = billingperiod.AnchorDay(activatedAt)
 	}
+	_, newPeriodEnd := billingperiod.AnchoredPeriodWindow(periodEnd, anchorDay)
 
 	// One invoice: closed period's netted usage arrears + the new period's advance
 	// base + the new period's advance overage, converted micros → whole cents ONCE
@@ -438,6 +435,15 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 	summary.ChargedCents = cents
 
+	// The aggregated boundary line always begins with the closed usage period.
+	// Pure usage covers only that closed window; when the final, post-freeze
+	// charge shape includes advance base/overage, the same line also covers the
+	// new period and therefore extends through its next anchored boundary.
+	linePeriod := billingstripe.LinePeriod{Start: periodStart, End: periodEnd}
+	if withBase {
+		linePeriod.End = newPeriodEnd
+	}
+
 	// Charge — or, on a frozen reclaim, RECONCILE against Stripe first (H5): the
 	// frozen marker means a prior attempt reached its Stripe section, and past
 	// the ~24h idempotency-key window a bare "replay" would mint brand-new
@@ -446,7 +452,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// read — D6); with nothing recovered it charges fresh (through the gates
 	// above). A failure after the PM gate marks the run 'failed' (auditable)
 	// and returns the error.
-	inv, err := s.boundaryInvoice(ctx, runID, custID, cents, withBase, recovered)
+	inv, err := s.boundaryInvoice(ctx, runID, custID, cents, withBase, linePeriod, recovered)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is
@@ -538,17 +544,16 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 // deterministic Idempotency-Keys (inv-<run>, ii-<run>, fin-<run>) so a re-run
 // reuses the same Stripe objects. The item is PINNED to this run's own draft
 // (never a floating pending item another leg's invoice could sweep up — C2),
-// and only the finalize step moves money. withBase only widens the line
-// DESCRIPTION when the total includes an advance base fee and/or
-// ongoing-module overage — a pure-usage invoice keeps the historical line
-// text. Returns the finalized invoice projection (id/status/amounts) for the
-// mirror upsert.
-func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool) (billingstripe.Invoice, error) {
+// and only the finalize step moves money. withBase preserves the historical
+// description choice; RunBillingCycle separately uses that same final charge
+// shape to set linePeriod through the new period's anchored end. Returns the
+// finalized invoice projection (id/status/amounts) for the mirror upsert.
+func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool, linePeriod billingstripe.LinePeriod) (billingstripe.Invoice, error) {
 	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, boundaryChargeRef(runID), invoiceIdemKey(runID))
 	if err != nil {
 		return billingstripe.Invoice{}, err
 	}
-	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), invoiceItemIdemKey(runID)); err != nil {
+	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), linePeriod, invoiceItemIdemKey(runID)); err != nil {
 		return billingstripe.Invoice{}, err
 	}
 	return s.stripe.FinalizeInvoice(ctx, draft.ID, invoiceFinalizeIdemKey(runID))
@@ -564,7 +569,7 @@ func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, ce
 // mismatched draft is refused loudly. recovered == nil (nothing on Stripe, or
 // a fresh run) charges through s.charge — that path re-entered every
 // collection gate in RunBillingCycle.
-func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool, recovered *billingstripe.Invoice) (billingstripe.Invoice, error) {
+func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool, linePeriod billingstripe.LinePeriod, recovered *billingstripe.Invoice) (billingstripe.Invoice, error) {
 	if recovered != nil {
 		found := *recovered
 		if found.Status == "void" {
@@ -577,7 +582,7 @@ func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID s
 		}
 		switch found.AmountDue {
 		case 0:
-			if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), invoiceItemIdemKey(runID)); err != nil {
+			if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), linePeriod, invoiceItemIdemKey(runID)); err != nil {
 				return billingstripe.Invoice{}, err
 			}
 		case cents:
@@ -589,7 +594,7 @@ func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID s
 		}
 		return s.stripe.FinalizeInvoice(ctx, found.ID, invoiceFinalizeIdemKey(runID))
 	}
-	return s.charge(ctx, runID, custID, cents, withBase)
+	return s.charge(ctx, runID, custID, cents, withBase, linePeriod)
 }
 
 // boundaryChargeRef is the deterministic ms_charge_ref metadata anchor for one

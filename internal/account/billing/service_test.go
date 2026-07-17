@@ -430,7 +430,7 @@ func (f *fakeStripe) CreateDraftInvoice(context.Context, string, string, string)
 	panic("CreateDraftInvoice must not be called by the billing package")
 }
 
-func (f *fakeStripe) CreateInvoiceItem(context.Context, string, string, int64, string, string, string) (billingstripe.InvoiceItem, error) {
+func (f *fakeStripe) CreateInvoiceItem(context.Context, string, string, int64, string, string, billingstripe.LinePeriod, string) (billingstripe.InvoiceItem, error) {
 	panic("CreateInvoiceItem must not be called by the billing package")
 }
 

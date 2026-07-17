@@ -12,6 +12,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -64,6 +65,7 @@ type itemCall struct {
 	amountCfg int64
 	currency  string
 	desc      string
+	period    billingstripe.LinePeriod
 	idemKey   string
 }
 
@@ -99,8 +101,11 @@ func (f *fakeStripe) CreateDraftInvoice(_ context.Context, custID, ref, idemKey 
 	return billingstripe.Invoice{ID: f.invoiceID, Status: "draft", Currency: "usd"}, nil
 }
 
-func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID string, amountCents int64, currency, desc, idemKey string) (billingstripe.InvoiceItem, error) {
-	f.itemCalls = append(f.itemCalls, itemCall{custID, invoiceID, amountCents, currency, desc, idemKey})
+func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period billingstripe.LinePeriod, idemKey string) (billingstripe.InvoiceItem, error) {
+	f.itemCalls = append(f.itemCalls, itemCall{
+		custID: custID, invoiceID: invoiceID, amountCfg: amountCents,
+		currency: currency, desc: desc, period: period, idemKey: idemKey,
+	})
 	if f.errItem != nil {
 		return billingstripe.InvoiceItem{}, f.errItem
 	}
@@ -185,6 +190,12 @@ func chargeSvc(store *fakeStore, sc billingstripe.Client) *cycle.Service {
 	return cycle.NewService(store, sc)
 }
 
+func requireLinePeriod(t *testing.T, got billingstripe.LinePeriod, wantStart, wantEnd time.Time) {
+	t.Helper()
+	require.True(t, got.Start.Equal(wantStart), "line period start = %s, want %s", got.Start, wantStart)
+	require.True(t, got.End.Equal(wantEnd), "line period end = %s, want %s", got.End, wantEnd)
+}
+
 // --- RunBillingCycle: happy path ------------------------------------------
 
 func TestRunBillingCycle_ChargesArrears(t *testing.T) {
@@ -209,6 +220,7 @@ func TestRunBillingCycle_ChargesArrears(t *testing.T) {
 	require.Equal(t, "cus_test_1", sc.itemCalls[0].custID)
 	require.EqualValues(t, 123, sc.itemCalls[0].amountCfg)
 	require.Equal(t, "usd", sc.itemCalls[0].currency)
+	requireLinePeriod(t, sc.itemCalls[0].period, periodStart, periodEnd)
 	require.Len(t, sc.finalizeCalls, 1, "the draft is finalized (auto_advance) — the money-moving step")
 
 	// Invoice mirrored + run marked invoiced.
@@ -224,6 +236,27 @@ func TestRunBillingCycle_ChargesArrears(t *testing.T) {
 		require.EqualValues(t, 123, m.totalCents)
 		require.NotEmpty(t, m.invoiceID)
 	}
+}
+
+func TestRunBillingCycle_WithAdvanceBaseLineCoversThroughNewPeriodEnd(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_coverage_base"
+	// Anchor 31 demonstrates that the line ends at the actual next anchored
+	// boundary, including independent short-month clamping.
+	store.activation[chargeAccount] = time.Date(2026, 1, 31, 9, 0, 0, 0, time.UTC)
+	seedApp(store, chargeAccount, 0, false)
+	sc := newFakeStripe()
+	closedStart := time.Date(2026, 5, 31, 0, 0, 0, 0, time.UTC)
+	closedEnd := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC)
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, closedStart, closedEnd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.EqualValues(t, usage.BaseFeeMicros, resp.AdvanceBaseMicros)
+	require.Len(t, sc.itemCalls, 1)
+	requireLinePeriod(t, sc.itemCalls[0].period, closedStart, time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC))
 }
 
 // --- org-billing D1: the funding hop (resolveChargeableCustomer) --------------
@@ -382,6 +415,8 @@ func TestRunBillingCycle_FrozenRunChargesEvenWhenLiveTotalCollapsesToZero(t *tes
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.EqualValues(t, 2100, resp.ChargedCents, "the frozen $21, not the collapsed live $0")
+	require.Len(t, sc.itemCalls, 2)
+	requireLinePeriod(t, sc.itemCalls[1].period, periodStart, periodEnd.AddDate(0, 1, 0))
 	require.Len(t, store.invoices, 1, "the crashed attempt's charge is mirrored")
 	for _, m := range store.markedRuns {
 		require.EqualValues(t, 2100, m.totalCents)
@@ -482,6 +517,7 @@ func TestRunBillingCycle_LostFreezeRaceAdoptsWinnersAmount(t *testing.T) {
 		"the loser of the freeze race must charge the winner's frozen amount, never its own")
 	require.Len(t, sc.itemCalls, 1)
 	require.EqualValues(t, 4700, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period, periodStart, periodEnd.AddDate(0, 1, 0))
 }
 
 // Regression (review 2026-07-06, H5): a frozen reclaim past Stripe's ~24h

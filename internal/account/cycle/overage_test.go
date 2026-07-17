@@ -206,6 +206,9 @@ func TestModuleOverage_D1dStraddleChargesThePostActivationPeriod(t *testing.T) {
 	// Full $3 for the straddled period alone, window narrowed to it.
 	require.Len(t, sc.itemCalls, 1)
 	require.EqualValues(t, 300, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC))
 	require.Len(t, store.invoices, 1)
 	for _, inv := range store.invoices {
 		require.Equal(t, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), inv.PeriodStart)
@@ -266,6 +269,9 @@ func TestModuleOverage_GraceStraddlingBoundaryCoversStraddledPeriod(t *testing.T
 	require.Len(t, sc.itemCalls, 1)
 	require.EqualValues(t, 320, sc.itemCalls[0].amountCfg,
 		"install-period proration + the full straddled period")
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC))
 
 	// The mirrored window agrees with the amount: coverage runs through the END
 	// of the period the grace elapsed into.
@@ -297,6 +303,9 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 	// $3 × 24/30 days (Jun 10 → Jul 4) = $2.40 — and nothing more.
 	require.Len(t, sc.itemCalls, 1)
 	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC))
 	require.Len(t, store.invoices, 1)
 	for _, inv := range store.invoices {
 		require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd,
@@ -372,6 +381,9 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	require.Len(t, sc.itemCalls, 1)
 	require.Equal(t, "in_orphan_draft", sc.itemCalls[0].invoiceID, "the line lands on the crashed attempt's own draft")
 	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC))
 	require.Len(t, sc.finalizeCalls, 1)
 	require.Equal(t, "in_orphan_draft", sc.finalizeCalls[0].invoiceID)
 	require.True(t, store.timers[x].graceCharged)
