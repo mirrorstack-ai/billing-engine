@@ -2,6 +2,8 @@ package usage
 
 import "time"
 
+const microsPerCent = 10_000
+
 // This file is the SINGLE home of the base-fee + overage display math (owner
 // spec 2026-07-05, DESIGN.md "Base fee — v2: creation grace + per-module overage
 // timers"). Both consumers — the display read (GetAppBill / GetAccountBill, this
@@ -57,6 +59,26 @@ func CreationChargeBaseMicros(createdAt, periodStart, periodEnd time.Time) int64
 		m += BaseFeeMicros
 	}
 	return m
+}
+
+// CreationChargeOverageMicros is the per-co-created-over-module surcharge the
+// creation-proration sweep bills on the combined creation invoice for ONE
+// timer: ModuleOverageFeeMicros prorated to the creation window (the same
+// shape as CreationChargeBaseMicros), plus the full fee for the straddled
+// period when the creation grace crosses the period boundary — then ROUNDED
+// TO WHOLE CENTS (the Stripe boundary the sweep charges at). Returned back in
+// micros (cents × microsPerCent) so a multi-timer projection is
+// per-timer-cents × count, never round(micros × count) — matching the sweep's
+// overageCents × len(overTimers) to the micro.
+func CreationChargeOverageMicros(createdAt, periodStart, periodEnd time.Time) int64 {
+	m := ProratedBaseMicros(ModuleOverageFeeMicros, createdAt, periodStart, periodEnd)
+	if !GraceExpiry(createdAt.UTC()).Before(periodEnd) {
+		m += ModuleOverageFeeMicros
+	}
+	// Round-half-up micros→cents. m is a non-negative surcharge, so integer
+	// half-up is exact and equals cycle.centsFromMicros' big.Rat rounding.
+	cents := (m + microsPerCent/2) / microsPerCent
+	return cents * microsPerCent
 }
 
 // ProratedBaseMicros prorates an app's per-period base fee for the period
