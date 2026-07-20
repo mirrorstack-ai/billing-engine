@@ -263,6 +263,14 @@ type Store interface {
 	// window, like PendingNewCreationCharges. Ordered soonest-first by the
 	// per-app earliest grace expiry (the charge ETA), app_id tie-break.
 	PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error)
+
+	// CoCreatedOverModuleTimerCount returns how many of an app's co-created
+	// (installed_at == createdAt) module install timers are "over" per the
+	// account-level live FIFO rank — the EXACT set the creation-proration sweep
+	// (cycle.ChargeCreationProration) bills as add-on lines on the app's combined
+	// creation invoice. Backed by the SAME db.CoCreatedOverModuleTimers query the
+	// sweep uses, so the preview and the charge count identical rows by construction.
+	CoCreatedOverModuleTimerCount(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) (int, error)
 }
 
 // SettledNewCreationChargeRaw is one decoded SettledNewCreationCharges row: a settled
@@ -872,6 +880,23 @@ func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid
 		})
 	}
 	return out, nil
+}
+
+// CoCreatedOverModuleTimerCount counts the app's co-created live FIFO-over
+// timers — see the Store interface doc. It deliberately reads through the same
+// query as the creation-proration sweep so the preview counts the exact rows
+// that sweep will charge.
+func (s *pgxStore) CoCreatedOverModuleTimerCount(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) (int, error) {
+	ids, err := s.q.CoCreatedOverModuleTimers(ctx, db.CoCreatedOverModuleTimersParams{
+		AccountID:       accountID.String(),
+		AppID:           appID.String(),
+		CreatedAt:       createdAt,
+		IncludedModules: int32(includedModules),
+	})
+	if err != nil {
+		return 0, err
+	}
+	return len(ids), nil
 }
 
 // LiveModuleTimerCountForAccount counts the account's currently-live install

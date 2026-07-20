@@ -101,6 +101,9 @@ func (stubUsageStore) PendingNewCreationCharges(context.Context, uuid.UUID, time
 func (stubUsageStore) PendingAddonModuleCharges(context.Context, uuid.UUID, int, time.Time) ([]usage.PendingAddonChargeRaw, error) {
 	return nil, nil
 }
+func (stubUsageStore) CoCreatedOverModuleTimerCount(context.Context, uuid.UUID, uuid.UUID, time.Time, int) (int, error) {
+	return 0, nil
+}
 
 func newRouterForTest(t *testing.T) http.Handler {
 	t.Helper()

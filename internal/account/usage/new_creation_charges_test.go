@@ -120,6 +120,7 @@ func TestListNewCreationCharges_SettledBreakdown(t *testing.T) {
 	require.EqualValues(t, 16_000_000, c.BaseFeeMicros)
 	require.EqualValues(t, 6_000_000, c.AddonMicros)
 	require.Equal(t, 2, c.AddonModuleCount, "7 − IncludedModules(5) = 2 add-on modules")
+	require.Zero(t, c.ProjectedAddonMicros, "settled rows never carry a pending add-on projection")
 	require.EqualValues(t, c.AmountMicros, c.BaseFeeMicros+c.AddonMicros, "base + addon == amount")
 }
 
@@ -154,8 +155,8 @@ func TestListNewCreationCharges_SettledNoAddons(t *testing.T) {
 }
 
 // TestListNewCreationCharges_PendingBreakdown: a pending (in-grace) app previews
-// the exact creation base the sweep will charge, reports no add-on money, and
-// still surfaces its name and frozen registration-time add-on count.
+// the exact creation base plus the FIFO-derived co-created add-on projection,
+// while its existing amount/add-on fields and frozen per-app count stay intact.
 func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
@@ -169,21 +170,62 @@ func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 
 	app := uuid.New()
 	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Draft App", ModuleCount: 8}
+	store.coCreatedOverTimerCounts[app] = 5 // account FIFO, deliberately != per-app 8 − 5
 
 	resp, err := newService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
 		OwnerUserID: owner, // current window
 	})
 	require.NoError(t, err)
 	require.Len(t, resp.Charges, 1)
+	require.True(t, usage.GraceExpiry(createdAt).Before(periodEnd), "fixture must stay within one period")
 	c := resp.Charges[0]
 	expected := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	expectedAddon := int64(5) * usage.CreationChargeOverageMicros(createdAt, periodStart, periodEnd)
 	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
 	require.Equal(t, "Draft App", c.Name)
 	require.EqualValues(t, expected, c.BaseFeeMicros, "pending previews the sweep's exact base amount")
 	require.EqualValues(t, expected, c.AmountMicros, "amount == exact base preview for pending")
 	require.NotEqualValues(t, usage.BaseFeeMicros, c.AmountMicros, "mid-period fixture must discriminate from the old flat preview")
-	require.Zero(t, c.AddonMicros, "pending projects base only, not add-on overage")
+	require.Zero(t, c.AddonMicros, "the existing add-on field remains zero on a pending creation")
 	require.Equal(t, 3, c.AddonModuleCount, "8 − IncludedModules(5) = 3, known even while uncharged")
+	require.EqualValues(t, expectedAddon, c.ProjectedAddonMicros, "projection uses per-timer cents × account-FIFO count")
+}
+
+// TestListNewCreationCharges_PendingProjectedAddonStraddle covers a creation
+// whose grace crosses the period boundary. The projected surcharge includes
+// the sweep's full-fee straddle top-up and still keeps the legacy pending-row
+// amount base-only; the FIFO money count may differ from the per-app surface.
+func TestListNewCreationCharges_PendingProjectedAddonStraddle(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	accountID := uuid.New()
+	store.accounts[owner] = accountID
+	store.anchorDays[accountID] = 11
+	periodStart := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	createdAt := time.Date(2026, 8, 9, 9, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+
+	app := uuid.New()
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Boundary App", ModuleCount: 6}
+	store.coCreatedOverTimerCounts[app] = 4 // earlier account timers push four co-created timers over
+
+	resp, err := newService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+	require.False(t, usage.GraceExpiry(createdAt).Before(periodEnd), "fixture must exercise the straddle top-up")
+
+	c := resp.Charges[0]
+	expectedBase := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	perTimer := usage.CreationChargeOverageMicros(createdAt, periodStart, periodEnd)
+	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
+	require.EqualValues(t, expectedBase, c.AmountMicros, "amount remains base-only")
+	require.EqualValues(t, expectedBase, c.BaseFeeMicros)
+	require.Zero(t, c.AddonMicros)
+	require.Equal(t, 1, c.AddonModuleCount, "the frozen per-app count remains 6 − 5")
+	require.EqualValues(t, int64(4)*perTimer, c.ProjectedAddonMicros, "FIFO over-count applies after per-timer cents rounding")
 }
 
 // TestListNewCreationCharges_SettledInvoiceIDFallsBackToUUID: an invoice not yet
@@ -407,6 +449,7 @@ func TestListNewCreationCharges_PendingAddonRows(t *testing.T) {
 	require.Equal(t, 2, addon.AddonModuleCount)
 	require.EqualValues(t, 2*usage.ModuleOverageFeeMicros, addon.AddonMicros)
 	require.EqualValues(t, 2*usage.ModuleOverageFeeMicros, addon.AmountMicros, "amount == projected flat surcharge × count")
+	require.Zero(t, addon.ProjectedAddonMicros, "pending add-on rows do not carry the creation-only projection")
 	require.NotNil(t, addon.ChargeETA)
 	require.True(t, addon.ChargeETA.Equal(now.Add(24*time.Hour)), "ETA = the earliest timer expiry")
 

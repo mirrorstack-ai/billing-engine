@@ -192,3 +192,42 @@ func TestCreationChargeBaseMicros_EqualsSweepInputsAcrossWindow(t *testing.T) {
 		require.Equal(t, want, usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd), createdAt.Format(time.RFC3339))
 	}
 }
+
+func TestCreationChargeOverageMicros_MatchesPerTimerSweepRounding(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		createdAt time.Time
+		start     time.Time
+		end       time.Time
+		want      int64
+	}{
+		{
+			name:      "clean half-period proration",
+			createdAt: day(2026, 6, 19),
+			start:     day(2026, 6, 4),
+			end:       day(2026, 7, 4),
+			want:      1_500_000,
+		},
+		{
+			// $3 × 5/8 = $1.875, which the sweep rounds half-up to $1.88.
+			name:      "non-straddle exact half-cent rounds up",
+			createdAt: day(2026, 1, 4),
+			start:     day(2026, 1, 1),
+			end:       day(2026, 1, 9),
+			want:      1_880_000,
+		},
+		{
+			// The three-day creation proration is 290,323 micros; adding the
+			// full $3 straddle fee yields 3,290,323 micros, rounded once to $3.29.
+			name:      "straddle rounds the combined per-timer amount once",
+			createdAt: day(2026, 8, 8),
+			start:     day(2026, 7, 11),
+			end:       day(2026, 8, 11),
+			want:      3_290_000,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, usage.CreationChargeOverageMicros(tc.createdAt, tc.start, tc.end))
+		})
+	}
+}
