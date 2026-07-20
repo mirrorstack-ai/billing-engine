@@ -92,6 +92,10 @@ func (stubUsageStore) MirroredAppIDs(context.Context, uuid.UUID, time.Time, time
 func (stubUsageStore) LiveModuleTimerCountForAccount(context.Context, uuid.UUID) (int, error) {
 	return 0, nil
 }
+
+func (stubUsageStore) LiveDomainCountForAccount(context.Context, uuid.UUID) (int, error) {
+	return 0, nil
+}
 func (stubUsageStore) SettledNewCreationCharges(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.SettledNewCreationChargeRaw, error) {
 	return nil, nil
 }

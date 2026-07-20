@@ -159,6 +159,10 @@ func (f *fakeStore) MirroredAppIDs(_ context.Context, _ uuid.UUID, _, _ time.Tim
 func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, _ uuid.UUID) (int, error) {
 	return 0, nil
 }
+
+func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (int, error) {
+	return 0, nil
+}
 func (f *fakeStore) SettledNewCreationCharges(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]usage.SettledNewCreationChargeRaw, error) {
 	return nil, nil
 }

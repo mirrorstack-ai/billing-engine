@@ -76,6 +76,7 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	store.appModuleInfraBillRowsByApp[appC] = []usage.AppModuleInfraUsage{
 		moduleInfraLine(uuid.New(), "infra.compute.walltime.ms", "", 20, nil, 100, 24),
 	}
+	store.liveDomainCount = 3
 
 	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
 		OwnerUserID: owner, PeriodID: pid.String(),
@@ -115,9 +116,12 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.EqualValues(t, 224, resp.InfraTotalMicros)
 	require.Equal(t, usage.AccountOverageMicros(7), resp.AccountOverageMicros)
 	require.EqualValues(t, 6_000_000, resp.AccountOverageMicros) // 2 over × $3
+	require.EqualValues(t, 3*usage.DomainFeeMicros, resp.CustomDomainsMicros)
+	require.EqualValues(t, 6_000_000, resp.CustomDomainsMicros) // 3 domains × $2
 	require.Zero(t, resp.PaasCreditMicros)
 	require.Equal(t,
-		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+resp.AccountOverageMicros,
+		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
+			resp.AccountOverageMicros+resp.CustomDomainsMicros,
 		resp.TotalMicros)
 	// apps[].total_micros are the app plane only: agent, pooled overage, and
 	// account credit are never allocated back into these rows.
@@ -462,7 +466,8 @@ func TestGetAccountBill_MixedAppsAndAgentReconcileExactly(t *testing.T) {
 		"Σ apps[].total == base fee total + module usage total + infra total")
 	require.Equal(t,
 		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
-			resp.AccountOverageMicros+resp.Agent.TotalMicros-resp.PaasCreditMicros,
+			resp.AccountOverageMicros+resp.CustomDomainsMicros+
+			resp.Agent.TotalMicros-resp.PaasCreditMicros,
 		resp.TotalMicros,
 		"agent spend is included exactly once alongside the app plane")
 }
@@ -796,8 +801,9 @@ func TestGetAccountBill_RejectsBothOwners(t *testing.T) {
 
 func TestGetAccountBill_InternalOnEnumerationErrors(t *testing.T) {
 	for name, arm := range map[string]func(*fakeStore){
-		"usage half":  func(f *fakeStore) { f.errAppIDsWithUsage = errors.New("boom") },
-		"mirror half": func(f *fakeStore) { f.errMirroredApps = errors.New("boom") },
+		"usage half":        func(f *fakeStore) { f.errAppIDsWithUsage = errors.New("boom") },
+		"mirror half":       func(f *fakeStore) { f.errMirroredApps = errors.New("boom") },
+		"live domain count": func(f *fakeStore) { f.errLiveDomainCount = errors.New("boom") },
 		"per-app bill": func(f *fakeStore) {
 			f.usageAppIDs = []uuid.UUID{uuid.New()}
 			f.errAppBill = errors.New("boom")
