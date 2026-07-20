@@ -162,12 +162,15 @@ type InvoiceItem struct {
 // retrieve — an id-only *Customer — which is all the pre-pay coherence check
 // reads.
 type Invoice struct {
-	ID         string
-	CustomerID string
-	Status     string
-	AmountDue  int64
-	AmountPaid int64
-	Currency   string
+	ID               string
+	CustomerID       string
+	Status           string
+	AmountDue        int64
+	AmountPaid       int64
+	Currency         string
+	Number           string
+	HostedInvoiceURL string
+	InvoicePDF       string
 }
 
 // ChargeCardRef is the trust-boundary-edge projection of a Stripe charge the

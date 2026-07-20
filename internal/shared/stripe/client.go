@@ -295,11 +295,14 @@ func (c *realClient) FindInvoiceByRef(ctx context.Context, custID, ref string) (
 // .ID set), which is all CustomerID carries.
 func projectInvoice(inv *stripego.Invoice) Invoice {
 	out := Invoice{
-		ID:         inv.ID,
-		Status:     string(inv.Status),
-		AmountDue:  inv.AmountDue,
-		AmountPaid: inv.AmountPaid,
-		Currency:   string(inv.Currency),
+		ID:               inv.ID,
+		Status:           string(inv.Status),
+		AmountDue:        inv.AmountDue,
+		AmountPaid:       inv.AmountPaid,
+		Currency:         string(inv.Currency),
+		Number:           inv.Number,
+		HostedInvoiceURL: inv.HostedInvoiceURL,
+		InvoicePDF:       inv.InvoicePDF,
 	}
 	if inv.Customer != nil {
 		out.CustomerID = inv.Customer.ID

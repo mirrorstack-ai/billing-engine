@@ -421,9 +421,23 @@ func serviceStatusResponse(v eligibility.Verdict) *GetServiceStatusResponse {
 		reasons[i] = string(r)
 	}
 	return &GetServiceStatusResponse{
-		Blocked: v.Blocked,
-		Reason:  string(v.Reason),
-		Reasons: reasons,
+		Blocked:     v.Blocked,
+		Reason:      string(v.Reason),
+		Reasons:     reasons,
+		BlockReason: blockReason(v.Reason),
+	}
+}
+
+func blockReason(reason eligibility.Reason) string {
+	switch reason {
+	case eligibility.ReasonOutOfCredits:
+		return "out_of_credits"
+	case eligibility.ReasonNoUsableCard, eligibility.ReasonFirstChargeFailed:
+		return "card_gate"
+	case eligibility.ReasonTooManyFailures, eligibility.ReasonUnpaidInvoices:
+		return "streak_gate"
+	default:
+		return ""
 	}
 }
 

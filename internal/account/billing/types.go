@@ -246,9 +246,10 @@ type GetServiceStatusRequest struct {
 // machine-readable cause (eligibility.Reason, "ELIGIBLE" when not blocked);
 // Reasons lists every failing gate (omitted when eligible).
 type GetServiceStatusResponse struct {
-	Blocked bool     `json:"blocked"`
-	Reason  string   `json:"reason"`
-	Reasons []string `json:"reasons,omitempty"`
+	Blocked     bool     `json:"blocked"`
+	Reason      string   `json:"reason"`
+	Reasons     []string `json:"reasons,omitempty"`
+	BlockReason string   `json:"block_reason,omitempty"`
 }
 
 // PaymentMethod is the projection of a payment_methods_mirror row
