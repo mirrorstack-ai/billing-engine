@@ -225,6 +225,7 @@ func (c *realClient) FinalizeInvoice(ctx context.Context, invoiceID, idemKey str
 	params := &stripego.InvoiceFinalizeInvoiceParams{
 		AutoAdvance: stripego.Bool(true),
 	}
+	params.AddExpand("confirmation_secret")
 	params.Context = ctx
 	params.SetIdempotencyKey(idemKey)
 	inv, err := c.sc.Invoices.FinalizeInvoice(invoiceID, params)
@@ -234,11 +235,13 @@ func (c *realClient) FinalizeInvoice(ctx context.Context, invoiceID, idemKey str
 	return projectInvoice(inv), nil
 }
 
-// GetInvoice retrieves an invoice and projects it. The default (unexpanded)
-// retrieve carries customer as an id-only *Customer — all the pre-pay
-// gate/charge coherence check needs (see the interface comment).
+// GetInvoice retrieves an invoice and projects it. confirmation_secret must be
+// expanded for Stripe to return its PaymentIntent client_secret. Customer stays
+// unexpanded as an id-only *Customer — all the pre-pay gate/charge coherence
+// check needs (see the interface comment).
 func (c *realClient) GetInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error) {
 	params := &stripego.InvoiceParams{}
+	params.AddExpand("confirmation_secret")
 	params.Context = ctx
 	inv, err := c.sc.Invoices.Get(stripeInvoiceID, params)
 	if err != nil {
@@ -306,6 +309,9 @@ func projectInvoice(inv *stripego.Invoice) Invoice {
 	}
 	if inv.Customer != nil {
 		out.CustomerID = inv.Customer.ID
+	}
+	if inv.ConfirmationSecret != nil {
+		out.ClientSecret = inv.ConfirmationSecret.ClientSecret
 	}
 	return out
 }

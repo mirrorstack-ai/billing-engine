@@ -12,6 +12,511 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const attachCreditPurchaseInvoice = `-- name: AttachCreditPurchaseInvoice :one
+UPDATE ms_billing.credit_ledger
+SET stripe_invoice_id = $1::text,
+    receipt_url = COALESCE(
+        NULLIF($2::text, ''),
+        receipt_url
+    )
+WHERE id = $3::uuid
+  AND account_id = $4::uuid
+  AND type = 'purchase'
+  AND status = 'pending'
+  AND (
+      stripe_invoice_id IS NULL
+      OR stripe_invoice_id = $1::text
+  )
+RETURNING
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at
+`
+
+type AttachCreditPurchaseInvoiceParams struct {
+	StripeInvoiceID string `json:"stripe_invoice_id"`
+	ReceiptUrl      string `json:"receipt_url"`
+	PurchaseID      string `json:"purchase_id"`
+	AccountID       string `json:"account_id"`
+}
+
+type AttachCreditPurchaseInvoiceRow struct {
+	ID                 string    `json:"id"`
+	AccountID          string    `json:"account_id"`
+	AmountMicros       int64     `json:"amount_micros"`
+	Type               string    `json:"type"`
+	Status             string    `json:"status"`
+	BalanceAfterMicros int64     `json:"balance_after_micros"`
+	Actor              string    `json:"actor"`
+	IdempotencyKey     string    `json:"idempotency_key"`
+	StripeInvoiceID    string    `json:"stripe_invoice_id"`
+	ReceiptUrl         string    `json:"receipt_url"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// AttachCreditPurchaseInvoice records Stripe's durable invoice identity and
+// hosted URL without allowing a retry to replace an already-attached invoice.
+// The Stripe call uses the same client idempotency key, so a legitimate retry
+// resolves the same invoice id.
+func (q *Queries) AttachCreditPurchaseInvoice(ctx context.Context, arg AttachCreditPurchaseInvoiceParams) (AttachCreditPurchaseInvoiceRow, error) {
+	row := q.db.QueryRow(ctx, attachCreditPurchaseInvoice,
+		arg.StripeInvoiceID,
+		arg.ReceiptUrl,
+		arg.PurchaseID,
+		arg.AccountID,
+	)
+	var i AttachCreditPurchaseInvoiceRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AmountMicros,
+		&i.Type,
+		&i.Status,
+		&i.BalanceAfterMicros,
+		&i.Actor,
+		&i.IdempotencyKey,
+		&i.StripeInvoiceID,
+		&i.ReceiptUrl,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const finalizeCreditPurchase = `-- name: FinalizeCreditPurchase :one
+UPDATE ms_billing.credit_ledger
+SET status = $1::text,
+    balance_after_micros = $2::bigint,
+    receipt_url = COALESCE(
+        NULLIF($3::text, ''),
+        receipt_url
+    )
+WHERE id = $4::uuid
+  AND account_id = $5::uuid
+  AND type = 'purchase'
+  AND status = 'pending'
+  AND $1::text IN ('settled', 'failed')
+RETURNING
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at
+`
+
+type FinalizeCreditPurchaseParams struct {
+	Status             string `json:"status"`
+	BalanceAfterMicros int64  `json:"balance_after_micros"`
+	ReceiptUrl         string `json:"receipt_url"`
+	PurchaseID         string `json:"purchase_id"`
+	AccountID          string `json:"account_id"`
+}
+
+type FinalizeCreditPurchaseRow struct {
+	ID                 string    `json:"id"`
+	AccountID          string    `json:"account_id"`
+	AmountMicros       int64     `json:"amount_micros"`
+	Type               string    `json:"type"`
+	Status             string    `json:"status"`
+	BalanceAfterMicros int64     `json:"balance_after_micros"`
+	Actor              string    `json:"actor"`
+	IdempotencyKey     string    `json:"idempotency_key"`
+	StripeInvoiceID    string    `json:"stripe_invoice_id"`
+	ReceiptUrl         string    `json:"receipt_url"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// FinalizeCreditPurchase is the sole purchase status transition primitive.
+// Only pending rows may move, and the target is constrained to the two terminal
+// outcomes accepted by the RPC. Retrying a terminal result is a read through
+// GetCreditPurchaseByID, never a second balance mutation.
+func (q *Queries) FinalizeCreditPurchase(ctx context.Context, arg FinalizeCreditPurchaseParams) (FinalizeCreditPurchaseRow, error) {
+	row := q.db.QueryRow(ctx, finalizeCreditPurchase,
+		arg.Status,
+		arg.BalanceAfterMicros,
+		arg.ReceiptUrl,
+		arg.PurchaseID,
+		arg.AccountID,
+	)
+	var i FinalizeCreditPurchaseRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AmountMicros,
+		&i.Type,
+		&i.Status,
+		&i.BalanceAfterMicros,
+		&i.Actor,
+		&i.IdempotencyKey,
+		&i.StripeInvoiceID,
+		&i.ReceiptUrl,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getCreditLedgerEntryByIdempotencyKey = `-- name: GetCreditLedgerEntryByIdempotencyKey :one
+SELECT
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    expires_at,
+    created_at
+FROM ms_billing.credit_ledger
+WHERE idempotency_key = $1::text
+`
+
+type GetCreditLedgerEntryByIdempotencyKeyRow struct {
+	ID                 string             `json:"id"`
+	AccountID          string             `json:"account_id"`
+	AmountMicros       int64              `json:"amount_micros"`
+	Type               string             `json:"type"`
+	Status             string             `json:"status"`
+	BalanceAfterMicros int64              `json:"balance_after_micros"`
+	Actor              string             `json:"actor"`
+	IdempotencyKey     string             `json:"idempotency_key"`
+	StripeInvoiceID    string             `json:"stripe_invoice_id"`
+	ReceiptUrl         string             `json:"receipt_url"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt          time.Time          `json:"created_at"`
+}
+
+// GetCreditLedgerEntryByIdempotencyKey resolves the migration-048 global
+// idempotency boundary. It intentionally returns ownership, amount, type,
+// actor, and expiry so callers can reject key reuse with different semantics
+// without disclosing or mutating the conflicting row.
+func (q *Queries) GetCreditLedgerEntryByIdempotencyKey(ctx context.Context, idempotencyKey string) (GetCreditLedgerEntryByIdempotencyKeyRow, error) {
+	row := q.db.QueryRow(ctx, getCreditLedgerEntryByIdempotencyKey, idempotencyKey)
+	var i GetCreditLedgerEntryByIdempotencyKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AmountMicros,
+		&i.Type,
+		&i.Status,
+		&i.BalanceAfterMicros,
+		&i.Actor,
+		&i.IdempotencyKey,
+		&i.StripeInvoiceID,
+		&i.ReceiptUrl,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getCreditPurchaseByID = `-- name: GetCreditPurchaseByID :one
+SELECT
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at
+FROM ms_billing.credit_ledger
+WHERE id = $1::uuid
+  AND account_id = $2::uuid
+  AND type = 'purchase'
+FOR UPDATE
+`
+
+type GetCreditPurchaseByIDParams struct {
+	PurchaseID string `json:"purchase_id"`
+	AccountID  string `json:"account_id"`
+}
+
+type GetCreditPurchaseByIDRow struct {
+	ID                 string    `json:"id"`
+	AccountID          string    `json:"account_id"`
+	AmountMicros       int64     `json:"amount_micros"`
+	Type               string    `json:"type"`
+	Status             string    `json:"status"`
+	BalanceAfterMicros int64     `json:"balance_after_micros"`
+	Actor              string    `json:"actor"`
+	IdempotencyKey     string    `json:"idempotency_key"`
+	StripeInvoiceID    string    `json:"stripe_invoice_id"`
+	ReceiptUrl         string    `json:"receipt_url"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// GetCreditPurchaseByID scopes the Finish RPC handle to its owning account.
+// FOR UPDATE stabilizes the pending status and presentment fields through a
+// transaction that may post the purchase into the settled balance.
+func (q *Queries) GetCreditPurchaseByID(ctx context.Context, arg GetCreditPurchaseByIDParams) (GetCreditPurchaseByIDRow, error) {
+	row := q.db.QueryRow(ctx, getCreditPurchaseByID, arg.PurchaseID, arg.AccountID)
+	var i GetCreditPurchaseByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AmountMicros,
+		&i.Type,
+		&i.Status,
+		&i.BalanceAfterMicros,
+		&i.Actor,
+		&i.IdempotencyKey,
+		&i.StripeInvoiceID,
+		&i.ReceiptUrl,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getCreditStandingSnapshot = `-- name: GetCreditStandingSnapshot :one
+
+SELECT
+    account.billing_mode,
+    account.credit_limit_micros,
+    COALESCE((
+        SELECT SUM(entry.amount_micros)
+        FROM ms_billing.credit_ledger entry
+        WHERE entry.account_id = account.id
+          AND entry.status = 'settled'
+    ), 0)::bigint AS balance_micros,
+    (auto_topup.account_id IS NOT NULL)::boolean AS auto_topup_configured,
+    COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
+    COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
+    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+FROM ms_billing.accounts account
+LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
+       ON auto_topup.account_id = account.id
+WHERE account.id = $1::uuid
+`
+
+type GetCreditStandingSnapshotRow struct {
+	BillingMode              string `json:"billing_mode"`
+	CreditLimitMicros        int64  `json:"credit_limit_micros"`
+	BalanceMicros            int64  `json:"balance_micros"`
+	AutoTopupConfigured      bool   `json:"auto_topup_configured"`
+	AutoTopupEnabled         bool   `json:"auto_topup_enabled"`
+	AutoTopupThresholdMicros int64  `json:"auto_topup_threshold_micros"`
+	AutoTopupAmountMicros    int64  `json:"auto_topup_amount_micros"`
+	AutoTopupPaymentMethodID string `json:"auto_topup_payment_method_id"`
+}
+
+// ---------------------------------------------------------------------------
+// Credit-wallet RPC reads and writes.
+//
+// Mutating balance snapshots are serialized through LockCreditAccountBalance.
+// The account-row FOR UPDATE lock also conflicts with the KEY SHARE lock taken
+// by the credit_ledger account_id FK, so same-account journal INSERTs cannot
+// race the balance read. Callers that transition an existing pending purchase
+// additionally lock that ledger row through GetCreditPurchaseByID before using
+// FinalizeCreditPurchase.
+// ---------------------------------------------------------------------------
+// GetCreditStandingSnapshot returns the durable wallet policy, authoritative
+// posted balance, and optional auto-top-up config in one round-trip. The
+// explicit configured bit distinguishes a missing config from a disabled row
+// while keeping the remaining generated fields non-null and easy to map onto
+// the optional RPC object.
+func (q *Queries) GetCreditStandingSnapshot(ctx context.Context, accountID string) (GetCreditStandingSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, getCreditStandingSnapshot, accountID)
+	var i GetCreditStandingSnapshotRow
+	err := row.Scan(
+		&i.BillingMode,
+		&i.CreditLimitMicros,
+		&i.BalanceMicros,
+		&i.AutoTopupConfigured,
+		&i.AutoTopupEnabled,
+		&i.AutoTopupThresholdMicros,
+		&i.AutoTopupAmountMicros,
+		&i.AutoTopupPaymentMethodID,
+	)
+	return i, err
+}
+
+const getDistributorCustomerAccount = `-- name: GetDistributorCustomerAccount :one
+SELECT customer.id AS account_id
+FROM ms_billing.org_billing_designations designation
+JOIN ms_billing.accounts distributor
+  ON distributor.id = designation.sponsor_account_id
+ AND distributor.owner_kind = 'org'
+ AND distributor.owner_org_id = $1::uuid
+JOIN ms_billing.accounts customer
+  ON customer.owner_kind = 'org'
+ AND customer.owner_org_id = designation.org_id
+WHERE designation.org_id = $2::uuid
+  AND designation.funding = 'sponsor'
+`
+
+type GetDistributorCustomerAccountParams struct {
+	DistributorOrgID string `json:"distributor_org_id"`
+	CustomerOrgID    string `json:"customer_org_id"`
+}
+
+// GetDistributorCustomerAccount validates the distributor -> customer
+// relationship and returns the customer's wallet account in one lookup. A
+// distributor is represented by an org-owned account named by the customer's
+// sponsor_account_id; personal sponsorship never passes this join.
+func (q *Queries) GetDistributorCustomerAccount(ctx context.Context, arg GetDistributorCustomerAccountParams) (string, error) {
+	row := q.db.QueryRow(ctx, getDistributorCustomerAccount, arg.DistributorOrgID, arg.CustomerOrgID)
+	var account_id string
+	err := row.Scan(&account_id)
+	return account_id, err
+}
+
+const insertPendingCreditPurchase = `-- name: InsertPendingCreditPurchase :one
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key
+) VALUES (
+    $1::uuid,
+    $2::bigint,
+    'purchase',
+    'pending',
+    $3::bigint,
+    'self',
+    $4::text
+)
+ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+RETURNING
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at
+`
+
+type InsertPendingCreditPurchaseParams struct {
+	AccountID          string `json:"account_id"`
+	AmountMicros       int64  `json:"amount_micros"`
+	BalanceAfterMicros int64  `json:"balance_after_micros"`
+	IdempotencyKey     string `json:"idempotency_key"`
+}
+
+type InsertPendingCreditPurchaseRow struct {
+	ID                 string    `json:"id"`
+	AccountID          string    `json:"account_id"`
+	AmountMicros       int64     `json:"amount_micros"`
+	Type               string    `json:"type"`
+	Status             string    `json:"status"`
+	BalanceAfterMicros int64     `json:"balance_after_micros"`
+	Actor              string    `json:"actor"`
+	IdempotencyKey     string    `json:"idempotency_key"`
+	StripeInvoiceID    string    `json:"stripe_invoice_id"`
+	ReceiptUrl         string    `json:"receipt_url"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// InsertPendingCreditPurchase creates the durable handle before Stripe is
+// called. A global idempotency collision returns pgx.ErrNoRows; the caller then
+// resolves and validates it through GetCreditLedgerEntryByIdempotencyKey.
+func (q *Queries) InsertPendingCreditPurchase(ctx context.Context, arg InsertPendingCreditPurchaseParams) (InsertPendingCreditPurchaseRow, error) {
+	row := q.db.QueryRow(ctx, insertPendingCreditPurchase,
+		arg.AccountID,
+		arg.AmountMicros,
+		arg.BalanceAfterMicros,
+		arg.IdempotencyKey,
+	)
+	var i InsertPendingCreditPurchaseRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AmountMicros,
+		&i.Type,
+		&i.Status,
+		&i.BalanceAfterMicros,
+		&i.Actor,
+		&i.IdempotencyKey,
+		&i.StripeInvoiceID,
+		&i.ReceiptUrl,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertSettledCreditGrant = `-- name: InsertSettledCreditGrant :one
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key,
+    expires_at
+) VALUES (
+    $1::uuid,
+    $2::bigint,
+    'grant',
+    'settled',
+    $3::bigint,
+    $4::text,
+    $5::text,
+    $6::timestamptz
+)
+ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+RETURNING id, balance_after_micros
+`
+
+type InsertSettledCreditGrantParams struct {
+	AccountID          string             `json:"account_id"`
+	AmountMicros       int64              `json:"amount_micros"`
+	BalanceAfterMicros int64              `json:"balance_after_micros"`
+	Actor              string             `json:"actor"`
+	IdempotencyKey     string             `json:"idempotency_key"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+}
+
+type InsertSettledCreditGrantRow struct {
+	ID                 string `json:"id"`
+	BalanceAfterMicros int64  `json:"balance_after_micros"`
+}
+
+// InsertSettledCreditGrant appends a posted distributor/system grant. The
+// caller holds LockCreditAccountBalance and supplies the resulting snapshot.
+// A global idempotency collision returns pgx.ErrNoRows for validation through
+// GetCreditLedgerEntryByIdempotencyKey; no existing journal row is rewritten.
+func (q *Queries) InsertSettledCreditGrant(ctx context.Context, arg InsertSettledCreditGrantParams) (InsertSettledCreditGrantRow, error) {
+	row := q.db.QueryRow(ctx, insertSettledCreditGrant,
+		arg.AccountID,
+		arg.AmountMicros,
+		arg.BalanceAfterMicros,
+		arg.Actor,
+		arg.IdempotencyKey,
+		arg.ExpiresAt,
+	)
+	var i InsertSettledCreditGrantRow
+	err := row.Scan(&i.ID, &i.BalanceAfterMicros)
+	return i, err
+}
+
 const insertWalletDraw = `-- name: InsertWalletDraw :exec
 INSERT INTO ms_billing.credit_ledger (
     account_id,
@@ -61,6 +566,206 @@ func (q *Queries) InsertWalletDraw(ctx context.Context, arg InsertWalletDrawPara
 	return err
 }
 
+const listCreditLedgerPage = `-- name: ListCreditLedgerPage :many
+SELECT
+    id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    receipt_url,
+    expires_at,
+    created_at
+FROM ms_billing.credit_ledger
+WHERE account_id = $1::uuid
+  AND (
+      (
+          $2::timestamptz IS NULL
+          AND $3::uuid IS NULL
+      )
+      OR
+      (
+          $2::timestamptz IS NOT NULL
+          AND $3::uuid IS NOT NULL
+          AND (created_at, id) < (
+              $2::timestamptz,
+              $3::uuid
+          )
+      )
+  )
+ORDER BY created_at DESC, id DESC
+LIMIT $4::int
+`
+
+type ListCreditLedgerPageParams struct {
+	AccountID       string             `json:"account_id"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        pgtype.UUID        `json:"cursor_id"`
+	PageLimit       int32              `json:"page_limit"`
+}
+
+type ListCreditLedgerPageRow struct {
+	ID                 string             `json:"id"`
+	AmountMicros       int64              `json:"amount_micros"`
+	Type               string             `json:"type"`
+	Status             string             `json:"status"`
+	BalanceAfterMicros int64              `json:"balance_after_micros"`
+	Actor              string             `json:"actor"`
+	ReceiptUrl         pgtype.Text        `json:"receipt_url"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt          time.Time          `json:"created_at"`
+}
+
+// ListCreditLedgerPage is stable newest-first keyset pagination over the
+// migration-048 (account_id, created_at DESC, id DESC) index. A cursor is
+// either wholly absent or a complete (created_at,id) pair; a half cursor
+// deliberately matches no rows rather than silently restarting page one.
+func (q *Queries) ListCreditLedgerPage(ctx context.Context, arg ListCreditLedgerPageParams) ([]ListCreditLedgerPageRow, error) {
+	rows, err := q.db.Query(ctx, listCreditLedgerPage,
+		arg.AccountID,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCreditLedgerPageRow{}
+	for rows.Next() {
+		var i ListCreditLedgerPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AmountMicros,
+			&i.Type,
+			&i.Status,
+			&i.BalanceAfterMicros,
+			&i.Actor,
+			&i.ReceiptUrl,
+			&i.ExpiresAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDistributorCustomerSnapshots = `-- name: ListDistributorCustomerSnapshots :many
+SELECT
+    designation.org_id AS customer_org_id,
+    customer.id AS account_id,
+    customer.billing_mode,
+    customer.credit_limit_micros,
+    COALESCE(balance.balance_micros, 0)::bigint AS balance_micros,
+    (auto_topup.account_id IS NOT NULL)::boolean AS auto_topup_configured,
+    COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
+    COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
+    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+FROM ms_billing.org_billing_designations designation
+JOIN ms_billing.accounts distributor
+  ON distributor.id = designation.sponsor_account_id
+ AND distributor.owner_kind = 'org'
+ AND distributor.owner_org_id = $1::uuid
+JOIN ms_billing.accounts customer
+  ON customer.owner_kind = 'org'
+ AND customer.owner_org_id = designation.org_id
+LEFT JOIN LATERAL (
+    SELECT SUM(entry.amount_micros)::bigint AS balance_micros
+    FROM ms_billing.credit_ledger entry
+    WHERE entry.account_id = customer.id
+      AND entry.status = 'settled'
+) balance ON true
+LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
+       ON auto_topup.account_id = customer.id
+WHERE designation.funding = 'sponsor'
+ORDER BY designation.org_id
+`
+
+type ListDistributorCustomerSnapshotsRow struct {
+	CustomerOrgID            string `json:"customer_org_id"`
+	AccountID                string `json:"account_id"`
+	BillingMode              string `json:"billing_mode"`
+	CreditLimitMicros        int64  `json:"credit_limit_micros"`
+	BalanceMicros            int64  `json:"balance_micros"`
+	AutoTopupConfigured      bool   `json:"auto_topup_configured"`
+	AutoTopupEnabled         bool   `json:"auto_topup_enabled"`
+	AutoTopupThresholdMicros int64  `json:"auto_topup_threshold_micros"`
+	AutoTopupAmountMicros    int64  `json:"auto_topup_amount_micros"`
+	AutoTopupPaymentMethodID string `json:"auto_topup_payment_method_id"`
+}
+
+// ListDistributorCustomerSnapshots lists every customer whose designation
+// names the distributor's org account, including the wallet fields needed for
+// service-side ok/low/blocked classification.
+func (q *Queries) ListDistributorCustomerSnapshots(ctx context.Context, distributorOrgID string) ([]ListDistributorCustomerSnapshotsRow, error) {
+	rows, err := q.db.Query(ctx, listDistributorCustomerSnapshots, distributorOrgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDistributorCustomerSnapshotsRow{}
+	for rows.Next() {
+		var i ListDistributorCustomerSnapshotsRow
+		if err := rows.Scan(
+			&i.CustomerOrgID,
+			&i.AccountID,
+			&i.BillingMode,
+			&i.CreditLimitMicros,
+			&i.BalanceMicros,
+			&i.AutoTopupConfigured,
+			&i.AutoTopupEnabled,
+			&i.AutoTopupThresholdMicros,
+			&i.AutoTopupAmountMicros,
+			&i.AutoTopupPaymentMethodID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockCreditAccountBalance = `-- name: LockCreditAccountBalance :one
+SELECT
+    account.billing_mode,
+    account.credit_limit_micros,
+    COALESCE((
+        SELECT SUM(entry.amount_micros)
+        FROM ms_billing.credit_ledger entry
+        WHERE entry.account_id = account.id
+          AND entry.status = 'settled'
+    ), 0)::bigint AS balance_micros
+FROM ms_billing.accounts account
+WHERE account.id = $1::uuid
+FOR UPDATE OF account
+`
+
+type LockCreditAccountBalanceRow struct {
+	BillingMode       string `json:"billing_mode"`
+	CreditLimitMicros int64  `json:"credit_limit_micros"`
+	BalanceMicros     int64  `json:"balance_micros"`
+}
+
+// LockCreditAccountBalance is the RPC write serialization point and the
+// authoritative posted balance immediately before inserting or settling a
+// journal entry. FOR UPDATE OF account avoids trying to lock aggregate rows.
+func (q *Queries) LockCreditAccountBalance(ctx context.Context, accountID string) (LockCreditAccountBalanceRow, error) {
+	row := q.db.QueryRow(ctx, lockCreditAccountBalance, accountID)
+	var i LockCreditAccountBalanceRow
+	err := row.Scan(&i.BillingMode, &i.CreditLimitMicros, &i.BalanceMicros)
+	return i, err
+}
+
 const lockWalletAccount = `-- name: LockWalletAccount :one
 SELECT billing_mode
 FROM ms_billing.accounts
@@ -108,6 +813,97 @@ func (q *Queries) LockWalletLedgerEntries(ctx context.Context, accountID string)
 		return nil, err
 	}
 	return items, nil
+}
+
+const setCreditAccountBillingMode = `-- name: SetCreditAccountBillingMode :one
+UPDATE ms_billing.accounts
+SET billing_mode = $1::text,
+    credit_limit_micros = $2::bigint
+WHERE id = $3::uuid
+RETURNING billing_mode, credit_limit_micros
+`
+
+type SetCreditAccountBillingModeParams struct {
+	BillingMode       string `json:"billing_mode"`
+	CreditLimitMicros int64  `json:"credit_limit_micros"`
+	AccountID         string `json:"account_id"`
+}
+
+type SetCreditAccountBillingModeRow struct {
+	BillingMode       string `json:"billing_mode"`
+	CreditLimitMicros int64  `json:"credit_limit_micros"`
+}
+
+// SetCreditAccountBillingMode applies a service-resolved concrete credit limit.
+// In particular, the service resolves an omitted credits-mode value to the
+// $5.00 wallet default before calling this query.
+func (q *Queries) SetCreditAccountBillingMode(ctx context.Context, arg SetCreditAccountBillingModeParams) (SetCreditAccountBillingModeRow, error) {
+	row := q.db.QueryRow(ctx, setCreditAccountBillingMode, arg.BillingMode, arg.CreditLimitMicros, arg.AccountID)
+	var i SetCreditAccountBillingModeRow
+	err := row.Scan(&i.BillingMode, &i.CreditLimitMicros)
+	return i, err
+}
+
+const upsertCreditAutoTopUp = `-- name: UpsertCreditAutoTopUp :one
+INSERT INTO ms_billing.credit_auto_topup_configs (
+    account_id,
+    enabled,
+    threshold_micros,
+    amount_micros,
+    payment_method_id
+) VALUES (
+    $1::uuid,
+    $2::boolean,
+    $3::bigint,
+    $4::bigint,
+    NULLIF($5::text, '')
+)
+ON CONFLICT (account_id) DO UPDATE SET
+    enabled = EXCLUDED.enabled,
+    threshold_micros = EXCLUDED.threshold_micros,
+    amount_micros = EXCLUDED.amount_micros,
+    payment_method_id = EXCLUDED.payment_method_id
+RETURNING
+    enabled,
+    threshold_micros,
+    amount_micros,
+    COALESCE(payment_method_id, '')::text AS payment_method_id
+`
+
+type UpsertCreditAutoTopUpParams struct {
+	AccountID       string `json:"account_id"`
+	Enabled         bool   `json:"enabled"`
+	ThresholdMicros int64  `json:"threshold_micros"`
+	AmountMicros    int64  `json:"amount_micros"`
+	PaymentMethodID string `json:"payment_method_id"`
+}
+
+type UpsertCreditAutoTopUpRow struct {
+	Enabled         bool   `json:"enabled"`
+	ThresholdMicros int64  `json:"threshold_micros"`
+	AmountMicros    int64  `json:"amount_micros"`
+	PaymentMethodID string `json:"payment_method_id"`
+}
+
+// UpsertCreditAutoTopUp owns the one-row-per-account mutable configuration.
+// The table CHECK enforces that enabled configs carry a payment method and
+// that amount stays within the same $5-$5,000 bounds as manual purchases.
+func (q *Queries) UpsertCreditAutoTopUp(ctx context.Context, arg UpsertCreditAutoTopUpParams) (UpsertCreditAutoTopUpRow, error) {
+	row := q.db.QueryRow(ctx, upsertCreditAutoTopUp,
+		arg.AccountID,
+		arg.Enabled,
+		arg.ThresholdMicros,
+		arg.AmountMicros,
+		arg.PaymentMethodID,
+	)
+	var i UpsertCreditAutoTopUpRow
+	err := row.Scan(
+		&i.Enabled,
+		&i.ThresholdMicros,
+		&i.AmountMicros,
+		&i.PaymentMethodID,
+	)
+	return i, err
 }
 
 const walletCreditState = `-- name: WalletCreditState :one

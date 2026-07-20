@@ -94,7 +94,8 @@ type Client interface {
 	// a crash before it leaves an inert draft that can never charge and never
 	// pollute another leg's invoice. idemKey (fin-<id>) makes a re-run replay
 	// the original finalization. Returns the finalized invoice projection
-	// (id/status/amounts) for the mirror.
+	// (id/status/amounts/client secret) for the mirror and any caller that must
+	// complete an invoice payment client-side.
 	FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
 
 	// RetrieveCharge fetches a charge by id and projects the card-identifying
@@ -156,14 +157,16 @@ type InvoiceItem struct {
 
 // Invoice is the trust-boundary-edge projection of a Stripe invoice the charge
 // path mirrors into ms_billing.invoices: id, owning customer, status, and the
-// amounts (whole cents — Stripe minor units). Kept stripe-go-free so the cycle
-// consumer stays off the SDK; the webhook reconciliation path (PR #7) reads the
-// full stripe-go Event separately. CustomerID rides the default (unexpanded)
-// retrieve — an id-only *Customer — which is all the pre-pay coherence check
-// reads.
+// amounts (whole cents — Stripe minor units). ClientSecret is the PaymentIntent
+// client secret returned by Stripe's expanded confirmation_secret after invoice
+// finalization. Kept stripe-go-free so the cycle consumer stays off the SDK;
+// the webhook reconciliation path (PR #7) reads the full stripe-go Event
+// separately. CustomerID rides the default (unexpanded) customer field — an
+// id-only *Customer — which is all the pre-pay coherence check reads.
 type Invoice struct {
 	ID               string
 	CustomerID       string
+	ClientSecret     string
 	Status           string
 	AmountDue        int64
 	AmountPaid       int64

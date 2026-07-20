@@ -120,6 +120,62 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.svc.GetServiceStatus(ctx, req)
 
+	case "GetCreditStanding":
+		var req billing.GetCreditStandingRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.GetCreditStanding(ctx, req)
+
+	case "ListCreditLedger":
+		var req billing.ListCreditLedgerRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.ListCreditLedger(ctx, req)
+
+	case "StartCreditPurchase":
+		var req billing.StartCreditPurchaseRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.StartCreditPurchase(ctx, req)
+
+	case "FinishCreditPurchase":
+		var req billing.FinishCreditPurchaseRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.FinishCreditPurchase(ctx, req)
+
+	case "SetAutoTopUp":
+		var req billing.SetAutoTopUpRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.SetAutoTopUp(ctx, req)
+
+	case "SetCustomerBillingMode":
+		var req billing.SetCustomerBillingModeRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.SetCustomerBillingMode(ctx, req)
+
+	case "ListDistributorCustomers":
+		var req billing.ListDistributorCustomersRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.ListDistributorCustomers(ctx, req)
+
+	case "GrantCredits":
+		var req billing.GrantCreditsRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.GrantCredits(ctx, req)
+
 	case "DetachPaymentMethod":
 		var req billing.DetachPaymentMethodRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -449,6 +505,14 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.FinishAddPaymentMethod", makeHTTPHandler(d, "FinishAddPaymentMethod"))
 		r.Post("/v1/billing.GetPaymentMethods", makeHTTPHandler(d, "GetPaymentMethods"))
 		r.Post("/v1/billing.GetServiceStatus", makeHTTPHandler(d, "GetServiceStatus"))
+		r.Post("/v1/billing.GetCreditStanding", makeHTTPHandler(d, "GetCreditStanding"))
+		r.Post("/v1/billing.ListCreditLedger", makeHTTPHandler(d, "ListCreditLedger"))
+		r.Post("/v1/billing.StartCreditPurchase", makeHTTPHandler(d, "StartCreditPurchase"))
+		r.Post("/v1/billing.FinishCreditPurchase", makeHTTPHandler(d, "FinishCreditPurchase"))
+		r.Post("/v1/billing.SetAutoTopUp", makeHTTPHandler(d, "SetAutoTopUp"))
+		r.Post("/v1/billing.SetCustomerBillingMode", makeHTTPHandler(d, "SetCustomerBillingMode"))
+		r.Post("/v1/billing.ListDistributorCustomers", makeHTTPHandler(d, "ListDistributorCustomers"))
+		r.Post("/v1/billing.GrantCredits", makeHTTPHandler(d, "GrantCredits"))
 		r.Post("/v1/billing.DetachPaymentMethod", makeHTTPHandler(d, "DetachPaymentMethod"))
 		r.Post("/v1/billing.SetDefaultPaymentMethod", makeHTTPHandler(d, "SetDefaultPaymentMethod"))
 		// Usage RPCs invoked by the platform control plane (manifest metric

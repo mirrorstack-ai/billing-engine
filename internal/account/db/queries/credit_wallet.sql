@@ -232,3 +232,347 @@ INSERT INTO ms_billing.credit_ledger (
     sqlc.arg(period_id)::uuid,
     sqlc.narg(source_credit_id)::uuid
 );
+
+-- ---------------------------------------------------------------------------
+-- Credit-wallet RPC reads and writes.
+--
+-- Mutating balance snapshots are serialized through LockCreditAccountBalance.
+-- The account-row FOR UPDATE lock also conflicts with the KEY SHARE lock taken
+-- by the credit_ledger account_id FK, so same-account journal INSERTs cannot
+-- race the balance read. Callers that transition an existing pending purchase
+-- additionally lock that ledger row through GetCreditPurchaseByID before using
+-- FinalizeCreditPurchase.
+-- ---------------------------------------------------------------------------
+
+-- GetCreditStandingSnapshot returns the durable wallet policy, authoritative
+-- posted balance, and optional auto-top-up config in one round-trip. The
+-- explicit configured bit distinguishes a missing config from a disabled row
+-- while keeping the remaining generated fields non-null and easy to map onto
+-- the optional RPC object.
+-- name: GetCreditStandingSnapshot :one
+SELECT
+    account.billing_mode,
+    account.credit_limit_micros,
+    COALESCE((
+        SELECT SUM(entry.amount_micros)
+        FROM ms_billing.credit_ledger entry
+        WHERE entry.account_id = account.id
+          AND entry.status = 'settled'
+    ), 0)::bigint AS balance_micros,
+    (auto_topup.account_id IS NOT NULL)::boolean AS auto_topup_configured,
+    COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
+    COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
+    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+FROM ms_billing.accounts account
+LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
+       ON auto_topup.account_id = account.id
+WHERE account.id = sqlc.arg(account_id)::uuid;
+
+-- ListCreditLedgerPage is stable newest-first keyset pagination over the
+-- migration-048 (account_id, created_at DESC, id DESC) index. A cursor is
+-- either wholly absent or a complete (created_at,id) pair; a half cursor
+-- deliberately matches no rows rather than silently restarting page one.
+-- name: ListCreditLedgerPage :many
+SELECT
+    id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    receipt_url,
+    expires_at,
+    created_at
+FROM ms_billing.credit_ledger
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND (
+      (
+          sqlc.narg(cursor_created_at)::timestamptz IS NULL
+          AND sqlc.narg(cursor_id)::uuid IS NULL
+      )
+      OR
+      (
+          sqlc.narg(cursor_created_at)::timestamptz IS NOT NULL
+          AND sqlc.narg(cursor_id)::uuid IS NOT NULL
+          AND (created_at, id) < (
+              sqlc.narg(cursor_created_at)::timestamptz,
+              sqlc.narg(cursor_id)::uuid
+          )
+      )
+  )
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg(page_limit)::int;
+
+-- GetCreditLedgerEntryByIdempotencyKey resolves the migration-048 global
+-- idempotency boundary. It intentionally returns ownership, amount, type,
+-- actor, and expiry so callers can reject key reuse with different semantics
+-- without disclosing or mutating the conflicting row.
+-- name: GetCreditLedgerEntryByIdempotencyKey :one
+SELECT
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    expires_at,
+    created_at
+FROM ms_billing.credit_ledger
+WHERE idempotency_key = sqlc.arg(idempotency_key)::text;
+
+-- GetCreditPurchaseByID scopes the Finish RPC handle to its owning account.
+-- FOR UPDATE stabilizes the pending status and presentment fields through a
+-- transaction that may post the purchase into the settled balance.
+-- name: GetCreditPurchaseByID :one
+SELECT
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at
+FROM ms_billing.credit_ledger
+WHERE id = sqlc.arg(purchase_id)::uuid
+  AND account_id = sqlc.arg(account_id)::uuid
+  AND type = 'purchase'
+FOR UPDATE;
+
+-- LockCreditAccountBalance is the RPC write serialization point and the
+-- authoritative posted balance immediately before inserting or settling a
+-- journal entry. FOR UPDATE OF account avoids trying to lock aggregate rows.
+-- name: LockCreditAccountBalance :one
+SELECT
+    account.billing_mode,
+    account.credit_limit_micros,
+    COALESCE((
+        SELECT SUM(entry.amount_micros)
+        FROM ms_billing.credit_ledger entry
+        WHERE entry.account_id = account.id
+          AND entry.status = 'settled'
+    ), 0)::bigint AS balance_micros
+FROM ms_billing.accounts account
+WHERE account.id = sqlc.arg(account_id)::uuid
+FOR UPDATE OF account;
+
+-- InsertPendingCreditPurchase creates the durable handle before Stripe is
+-- called. A global idempotency collision returns pgx.ErrNoRows; the caller then
+-- resolves and validates it through GetCreditLedgerEntryByIdempotencyKey.
+-- name: InsertPendingCreditPurchase :one
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key
+) VALUES (
+    sqlc.arg(account_id)::uuid,
+    sqlc.arg(amount_micros)::bigint,
+    'purchase',
+    'pending',
+    sqlc.arg(balance_after_micros)::bigint,
+    'self',
+    sqlc.arg(idempotency_key)::text
+)
+ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+RETURNING
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at;
+
+-- AttachCreditPurchaseInvoice records Stripe's durable invoice identity and
+-- hosted URL without allowing a retry to replace an already-attached invoice.
+-- The Stripe call uses the same client idempotency key, so a legitimate retry
+-- resolves the same invoice id.
+-- name: AttachCreditPurchaseInvoice :one
+UPDATE ms_billing.credit_ledger
+SET stripe_invoice_id = sqlc.arg(stripe_invoice_id)::text,
+    receipt_url = COALESCE(
+        NULLIF(sqlc.arg(receipt_url)::text, ''),
+        receipt_url
+    )
+WHERE id = sqlc.arg(purchase_id)::uuid
+  AND account_id = sqlc.arg(account_id)::uuid
+  AND type = 'purchase'
+  AND status = 'pending'
+  AND (
+      stripe_invoice_id IS NULL
+      OR stripe_invoice_id = sqlc.arg(stripe_invoice_id)::text
+  )
+RETURNING
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at;
+
+-- FinalizeCreditPurchase is the sole purchase status transition primitive.
+-- Only pending rows may move, and the target is constrained to the two terminal
+-- outcomes accepted by the RPC. Retrying a terminal result is a read through
+-- GetCreditPurchaseByID, never a second balance mutation.
+-- name: FinalizeCreditPurchase :one
+UPDATE ms_billing.credit_ledger
+SET status = sqlc.arg(status)::text,
+    balance_after_micros = sqlc.arg(balance_after_micros)::bigint,
+    receipt_url = COALESCE(
+        NULLIF(sqlc.arg(receipt_url)::text, ''),
+        receipt_url
+    )
+WHERE id = sqlc.arg(purchase_id)::uuid
+  AND account_id = sqlc.arg(account_id)::uuid
+  AND type = 'purchase'
+  AND status = 'pending'
+  AND sqlc.arg(status)::text IN ('settled', 'failed')
+RETURNING
+    id,
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    COALESCE(idempotency_key, '')::text AS idempotency_key,
+    COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+    COALESCE(receipt_url, '')::text AS receipt_url,
+    created_at;
+
+-- UpsertCreditAutoTopUp owns the one-row-per-account mutable configuration.
+-- The table CHECK enforces that enabled configs carry a payment method and
+-- that amount stays within the same $5-$5,000 bounds as manual purchases.
+-- name: UpsertCreditAutoTopUp :one
+INSERT INTO ms_billing.credit_auto_topup_configs (
+    account_id,
+    enabled,
+    threshold_micros,
+    amount_micros,
+    payment_method_id
+) VALUES (
+    sqlc.arg(account_id)::uuid,
+    sqlc.arg(enabled)::boolean,
+    sqlc.arg(threshold_micros)::bigint,
+    sqlc.arg(amount_micros)::bigint,
+    NULLIF(sqlc.arg(payment_method_id)::text, '')
+)
+ON CONFLICT (account_id) DO UPDATE SET
+    enabled = EXCLUDED.enabled,
+    threshold_micros = EXCLUDED.threshold_micros,
+    amount_micros = EXCLUDED.amount_micros,
+    payment_method_id = EXCLUDED.payment_method_id
+RETURNING
+    enabled,
+    threshold_micros,
+    amount_micros,
+    COALESCE(payment_method_id, '')::text AS payment_method_id;
+
+-- SetCreditAccountBillingMode applies a service-resolved concrete credit limit.
+-- In particular, the service resolves an omitted credits-mode value to the
+-- $5.00 wallet default before calling this query.
+-- name: SetCreditAccountBillingMode :one
+UPDATE ms_billing.accounts
+SET billing_mode = sqlc.arg(billing_mode)::text,
+    credit_limit_micros = sqlc.arg(credit_limit_micros)::bigint
+WHERE id = sqlc.arg(account_id)::uuid
+RETURNING billing_mode, credit_limit_micros;
+
+-- GetDistributorCustomerAccount validates the distributor -> customer
+-- relationship and returns the customer's wallet account in one lookup. A
+-- distributor is represented by an org-owned account named by the customer's
+-- sponsor_account_id; personal sponsorship never passes this join.
+-- name: GetDistributorCustomerAccount :one
+SELECT customer.id AS account_id
+FROM ms_billing.org_billing_designations designation
+JOIN ms_billing.accounts distributor
+  ON distributor.id = designation.sponsor_account_id
+ AND distributor.owner_kind = 'org'
+ AND distributor.owner_org_id = sqlc.arg(distributor_org_id)::uuid
+JOIN ms_billing.accounts customer
+  ON customer.owner_kind = 'org'
+ AND customer.owner_org_id = designation.org_id
+WHERE designation.org_id = sqlc.arg(customer_org_id)::uuid
+  AND designation.funding = 'sponsor';
+
+-- ListDistributorCustomerSnapshots lists every customer whose designation
+-- names the distributor's org account, including the wallet fields needed for
+-- service-side ok/low/blocked classification.
+-- name: ListDistributorCustomerSnapshots :many
+SELECT
+    designation.org_id AS customer_org_id,
+    customer.id AS account_id,
+    customer.billing_mode,
+    customer.credit_limit_micros,
+    COALESCE(balance.balance_micros, 0)::bigint AS balance_micros,
+    (auto_topup.account_id IS NOT NULL)::boolean AS auto_topup_configured,
+    COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
+    COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
+    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+FROM ms_billing.org_billing_designations designation
+JOIN ms_billing.accounts distributor
+  ON distributor.id = designation.sponsor_account_id
+ AND distributor.owner_kind = 'org'
+ AND distributor.owner_org_id = sqlc.arg(distributor_org_id)::uuid
+JOIN ms_billing.accounts customer
+  ON customer.owner_kind = 'org'
+ AND customer.owner_org_id = designation.org_id
+LEFT JOIN LATERAL (
+    SELECT SUM(entry.amount_micros)::bigint AS balance_micros
+    FROM ms_billing.credit_ledger entry
+    WHERE entry.account_id = customer.id
+      AND entry.status = 'settled'
+) balance ON true
+LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
+       ON auto_topup.account_id = customer.id
+WHERE designation.funding = 'sponsor'
+ORDER BY designation.org_id;
+
+-- InsertSettledCreditGrant appends a posted distributor/system grant. The
+-- caller holds LockCreditAccountBalance and supplies the resulting snapshot.
+-- A global idempotency collision returns pgx.ErrNoRows for validation through
+-- GetCreditLedgerEntryByIdempotencyKey; no existing journal row is rewritten.
+-- name: InsertSettledCreditGrant :one
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key,
+    expires_at
+) VALUES (
+    sqlc.arg(account_id)::uuid,
+    sqlc.arg(amount_micros)::bigint,
+    'grant',
+    'settled',
+    sqlc.arg(balance_after_micros)::bigint,
+    sqlc.arg(actor)::text,
+    sqlc.arg(idempotency_key)::text,
+    sqlc.narg(expires_at)::timestamptz
+)
+ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+RETURNING id, balance_after_micros;
