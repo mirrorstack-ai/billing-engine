@@ -49,6 +49,7 @@ type fakeStore struct {
 	newAppProrationSkipped   map[uuid.UUID]bool     // app_id → proration_skipped_at set (permanent skip)
 	newAppInvoices           map[string]fakeInvoice // stripe_invoice_id → the mirror row the settled join lands on
 	newAppProrationBase      map[uuid.UUID]int64    // app_id → 'proration' base snapshot base_micros (settled breakdown; absent → 0)
+	coCreatedOverTimerCounts map[uuid.UUID]int      // app_id → account-FIFO over-count for pending creation preview
 	errSettledNewApp         error
 	errPendingNewApp         error
 	gotPendingGraceCutoff    time.Time // captured graceCutoff the service resolved (now − GraceDays)
@@ -157,6 +158,7 @@ func newFakeStore() *fakeStore {
 		newAppProrationSkipped:      map[uuid.UUID]bool{},
 		newAppInvoices:              map[string]fakeInvoice{},
 		newAppProrationBase:         map[uuid.UUID]int64{},
+		coCreatedOverTimerCounts:    map[uuid.UUID]int{},
 	}
 }
 
@@ -283,6 +285,12 @@ func (f *fakeStore) PendingNewCreationCharges(_ context.Context, _ uuid.UUID, st
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+// CoCreatedOverModuleTimerCount returns the configured account-FIFO over-count
+// for an app's co-created module timers; absent fixtures default to zero.
+func (f *fakeStore) CoCreatedOverModuleTimerCount(_ context.Context, _, appID uuid.UUID, _ time.Time, _ int) (int, error) {
+	return f.coCreatedOverTimerCounts[appID], nil
 }
 
 // PendingAddonModuleCharges returns the fixture rows verbatim (the timer table

@@ -5,12 +5,14 @@ package usage_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
@@ -110,6 +112,118 @@ func TestMirroredAppIDs_Integration(t *testing.T) {
 		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
 	require.NoError(t, err)
 	require.ElementsMatch(t, []uuid.UUID{longLived, createdInside, deletedInside}, ids)
+}
+
+// TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO proves the
+// pending creation preview counts the exact co-created timer rows the creation
+// sweep charges. Three older timers consume three of the account's five bundled
+// FIFO slots, so five of appA's seven co-created timers are over; the per-app
+// heuristic (7 - 5 = 2) would materially under-project the combined invoice.
+func TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	owner, acct := uuid.New(), uuid.New()
+	activatedAt := appMustTime(t, "2026-05-04T00:00:00Z")
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.accounts (id, owner_kind, owner_user_id, activated_at)
+		 VALUES ($1, 'user', $2, $3)`,
+		acct.String(), owner.String(), activatedAt)
+	require.NoError(t, err)
+
+	appA, appB := uuid.New(), uuid.New()
+	createdAt := appMustTime(t, "2026-06-19T00:00:00Z")
+	seedMirrorApp(t, pool, acct, appA, createdAt.Format(time.RFC3339), "")
+	seedMirrorApp(t, pool, acct, appB, "2026-05-20T00:00:00Z", "")
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.apps
+		 SET module_count = 7, created_module_count = 7, name = 'FIFO app A'
+		 WHERE app_id = $1`, appA.String())
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.apps
+		 SET module_count = 3, created_module_count = 3, name = 'earlier app B'
+		 WHERE app_id = $1`, appB.String())
+	require.NoError(t, err)
+
+	seedTimers := func(appID uuid.UUID, installedAt time.Time, count int) {
+		t.Helper()
+		_, seedErr := pool.Exec(ctx,
+			`INSERT INTO ms_billing.app_module_overage_timers
+			   (account_id, app_id, installed_at, grace_expires_at)
+			 SELECT $1, $2, $3, $4
+			 FROM generate_series(1, $5::int)`,
+			acct.String(), appID.String(), installedAt, usage.GraceExpiry(installedAt), count)
+		require.NoError(t, seedErr)
+	}
+
+	// Account FIFO ranks 1-3 are appB's older live timers. appA's seven
+	// co-created timers occupy ranks 4-10, so ranks 6-10 are the five over rows.
+	seedTimers(appB, appMustTime(t, "2026-06-01T00:00:00Z"), 3)
+	seedTimers(appA, createdAt, 7)
+
+	const (
+		wantOverCount      = 5
+		perAppOverCount    = 7 - usage.IncludedModules
+		testMicrosPerCent  = int64(10_000)
+		wantPerTimerMicros = int64(1_500_000)
+	)
+	overCount, err := store.CoCreatedOverModuleTimerCount(ctx, acct, appA, createdAt, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Equal(t, wantOverCount, overCount,
+		"the shared account-FIFO query returns five over timers, not the per-app heuristic's two")
+	require.Equal(t, 2, perAppOverCount)
+	require.NotEqual(t, perAppOverCount, overCount)
+
+	// The real account read derives anchor day 4 from activated_at. Both the
+	// service's current window (anchored from now) and the sweep's creation
+	// window (anchored from created_at) therefore resolve to the same 30 days.
+	anchorDay, err := store.AccountAnchorDay(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, 4, anchorDay)
+	now := appMustTime(t, "2026-06-21T00:00:00Z") // still inside appA's creation grace
+	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(now, anchorDay)
+	sweepStart, sweepEnd := billingperiod.AnchoredPeriodWindow(createdAt, billingperiod.AnchorDay(activatedAt))
+	require.Equal(t, appMustTime(t, "2026-06-04T00:00:00Z"), periodStart)
+	require.Equal(t, appMustTime(t, "2026-07-04T00:00:00Z"), periodEnd)
+	require.Equal(t, periodStart, sweepStart)
+	require.Equal(t, periodEnd, sweepEnd)
+
+	perTimerMicros := usage.CreationChargeOverageMicros(createdAt, periodStart, periodEnd)
+	require.Equal(t, wantPerTimerMicros, perTimerMicros, "$3 x 15/30 = $1.50 per timer")
+	wantProjectedMicros := int64(wantOverCount) * perTimerMicros
+	perAppProjectedMicros := int64(perAppOverCount) * perTimerMicros
+	require.Equal(t, int64(7_500_000), wantProjectedMicros)
+	require.Equal(t, int64(3_000_000), perAppProjectedMicros)
+	require.NotEqual(t, perAppProjectedMicros, wantProjectedMicros,
+		"a regression to created_module_count - IncludedModules must fail")
+
+	resp, err := usage.NewService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(ctx, usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+	charge := resp.Charges[0]
+	require.Equal(t, appA, charge.AppID)
+	require.Equal(t, usage.NewCreationChargeStatusPending, charge.Status)
+	require.Equal(t, usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd), charge.AmountMicros)
+	require.Equal(t, charge.AmountMicros, charge.BaseFeeMicros)
+	require.Equal(t, perAppOverCount, charge.AddonModuleCount,
+		"the existing frozen per-app count surface remains unchanged")
+	require.Zero(t, charge.AddonMicros)
+	require.Equal(t, wantProjectedMicros, charge.ProjectedAddonMicros)
+
+	// Reproduce cycle.centsFromMicros' non-negative round-half-up boundary on
+	// the full per-timer amount, then compare it with the preview's cents.
+	sweepPerTimerMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, createdAt, periodStart, periodEnd)
+	if !usage.GraceExpiry(createdAt.UTC()).Before(periodEnd) {
+		sweepPerTimerMicros += usage.ModuleOverageFeeMicros
+	}
+	sweepPerTimerCents := (sweepPerTimerMicros + testMicrosPerCent/2) / testMicrosPerCent
+	require.Equal(t, int64(150), sweepPerTimerCents)
+	require.Equal(t, sweepPerTimerCents, perTimerMicros/testMicrosPerCent,
+		"preview rounds one timer to cents exactly where the sweep does")
 }
 
 // TestGetAccountBill_Integration_RolledAgentModelsUseFrozenCharges proves the
