@@ -375,6 +375,21 @@ type MsBillingAppBaseSnapshot struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type MsBillingAppCustomDomain struct {
+	ID                  string             `json:"id"`
+	AccountID           string             `json:"account_id"`
+	AppID               string             `json:"app_id"`
+	Hostname            string             `json:"hostname"`
+	ActivatedAt         time.Time          `json:"activated_at"`
+	RemovedAt           pgtype.Timestamptz `json:"removed_at"`
+	ChargeAttemptedAt   pgtype.Timestamptz `json:"charge_attempted_at"`
+	ChargedAt           pgtype.Timestamptz `json:"charged_at"`
+	ChargeResolved      bool               `json:"charge_resolved"`
+	ChargeInvoiceID     pgtype.Text        `json:"charge_invoice_id"`
+	ChargeInvoiceItemID pgtype.Text        `json:"charge_invoice_item_id"`
+	CreatedAt           time.Time          `json:"created_at"`
+}
+
 type MsBillingAppModuleOverageTimer struct {
 	ID                 string             `json:"id"`
 	AccountID          string             `json:"account_id"`

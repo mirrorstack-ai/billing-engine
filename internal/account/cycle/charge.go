@@ -231,12 +231,29 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 	advanceOverage := usage.ModuleOverageFeeMicros * int64(overCount)
 
-	// The whole boundary invoice: closed period's netted usage arrears + the new
-	// period's advance base + the new period's advance overage. The allowance nets
-	// USAGE only (never base or overage — both ride ON TOP, matching bill.go).
-	boundaryTotal := arrears + advanceBase + advanceOverage
+	// ADVANCE DOMAINS leg: every live custom domain activated before the new
+	// period opened contributes one full $2 fee for that new period. Deliberately
+	// ignore charge_resolved: the sweep owns only the activation-containing
+	// period, while this leg owns every subsequent period, so the windows are
+	// disjoint without depending on sweep ordering.
+	domainCount, err := s.store.CountLiveDomainsActivatedBefore(ctx, accountID, periodEnd)
+	if err != nil {
+		return nil, billing.Internal("live custom-domain count failed", err)
+	}
+	advanceDomains := usage.DomainFeeMicros * int64(domainCount)
 
-	summary := &ChargeSummary{FirstRun: true, ArrearsMicros: arrears, AdvanceBaseMicros: advanceBase, AdvanceOverageMicros: advanceOverage}
+	// The whole boundary invoice: closed period's netted usage arrears + the new
+	// period's advance base + module overage + custom domains. The allowance nets
+	// USAGE only; all recurring account fees ride on top.
+	boundaryTotal := arrears + advanceBase + advanceOverage + advanceDomains
+
+	summary := &ChargeSummary{
+		FirstRun:             true,
+		ArrearsMicros:        arrears,
+		AdvanceBaseMicros:    advanceBase,
+		AdvanceOverageMicros: advanceOverage,
+		AdvanceDomainsMicros: advanceDomains,
+	}
 
 	// Zero-skip: only when arrears, base AND overage are all zero (empty/zero
 	// period with no live apps or ongoing over-modules) is there nothing to
@@ -387,7 +404,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
 	liveCents := cents // what the LIVE state says; may be replaced by a frozen amount below
-	withBase := advanceBase+advanceOverage > 0
+	withBase := advanceBase+advanceOverage+advanceDomains > 0
 
 	// FREEZE-OR-REUSE the boundary Stripe request (crash-safe idempotency,
 	// migration 035). The idem keys inv-/ii-/fin-<run> are STABLE across a
@@ -663,6 +680,21 @@ func (s *Service) AccountHasLiveApps(ctx context.Context, accountID uuid.UUID, c
 		return false, billing.Internal("live app roster read failed", err)
 	}
 	return len(apps) > 0, nil
+}
+
+// AccountHasLiveDomains reports whether a no-usage account still needs a
+// boundary run for at least one custom domain. The cutoff matches the charge
+// leg exactly: a domain activated at the boundary belongs to its activation
+// sweep for that period and joins the boundary leg at the next one.
+func (s *Service) AccountHasLiveDomains(ctx context.Context, accountID uuid.UUID, activatedBefore time.Time) (bool, error) {
+	if accountID == uuid.Nil {
+		return false, billing.InvalidInput("account_id required")
+	}
+	count, err := s.store.CountLiveDomainsActivatedBefore(ctx, accountID, activatedBefore)
+	if err != nil {
+		return false, billing.Internal("live custom-domain count failed", err)
+	}
+	return count > 0, nil
 }
 
 // ActivatedAccounts returns every card-bound account with its billing-period
