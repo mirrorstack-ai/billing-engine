@@ -565,7 +565,7 @@ type AccountAgentBill struct {
 // account-level aggregate of the per-app GetAppBill math (ONE pricing path,
 // summed — never a second one):
 //
-//	TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal + AccountOverage + Agent.TotalMicros − PaasCredit
+//	TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal + AccountOverage + CustomDomains + Agent.TotalMicros − PaasCredit
 //
 // Every amount is integer micro-USD. Apps enumerates the UNION of (a) apps
 // with usage in the window (the same rolled-up-else-live gate the per-app bill
@@ -607,6 +607,11 @@ type GetAccountBillResponse struct {
 	// from the CURRENT live pool. Included in TotalMicros below.
 	AccountOverageMicros int64 `json:"account_overage_micros"`
 
+	// CustomDomainsMicros is the account's steady-state custom-domain fee:
+	// $2 times the current live-domain count. It is an ACCOUNT line, never
+	// allocated back to Apps, and is included in TotalMicros below.
+	CustomDomainsMicros int64 `json:"custom_domains_micros"`
+
 	// PaasCreditMicros is the ACCOUNT-level PaaS credit, applied ONCE here
 	// (never per-app): the same ACTIVE-SaaS-subscription gate as GetAppBill's
 	// per-app credit (v1 has no subscription system → always 0), CAPPED at the
@@ -616,7 +621,8 @@ type GetAccountBillResponse struct {
 	PaasCreditMicros int64 `json:"paas_credit_micros"`
 
 	// TotalMicros is 最終費用 = BaseFeeTotal + ModuleUsageTotal + InfraTotal +
-	// AccountOverage + Agent.TotalMicros − PaasCredit, ≥ 0 by the credit cap.
+	// AccountOverage + CustomDomains + Agent.TotalMicros − PaasCredit, ≥ 0 by
+	// the credit cap.
 	TotalMicros int64 `json:"total_micros"`
 }
 

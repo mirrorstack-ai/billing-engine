@@ -81,13 +81,16 @@ func main() {
 	// co-created over-module is billed on the combined invoice, not a second one.
 	sweepFailed := runProrationSweep(context.Background(), svc, at)
 	runOverageSweep(context.Background(), svc, at, &res)
+	runDomainSweep(context.Background(), svc, at, &res)
 	slog.Info("billing-cycle local run complete",
 		"as_of", res.AsOf,
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 		"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
 		"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
-		"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
+		"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed,
+		"domain_candidates", res.DomainCandidates, "domain_charged", res.DomainCharged,
+		"domain_skipped", res.DomainSkipped, "domain_failed", res.DomainFailed)
 	if res.Failed > 0 || sweepFailed {
 		os.Exit(1)
 	}
@@ -136,13 +139,16 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 		// the overage sweep (Leg 1) skips them — one combined invoice, not two.
 		runProrationSweep(ctx, svc, at.UTC())
 		runOverageSweep(ctx, svc, at.UTC(), &res)
+		runDomainSweep(ctx, svc, at.UTC(), &res)
 		slog.InfoContext(ctx, "billing-cycle lambda run complete",
 			"as_of", res.AsOf,
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 			"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
 			"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
-			"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed)
+			"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed,
+			"domain_candidates", res.DomainCandidates, "domain_charged", res.DomainCharged,
+			"domain_skipped", res.DomainSkipped, "domain_failed", res.DomainFailed)
 		// A per-account charge failure (or a per-app proration failure) is recorded
 		// (billing_runs status='failed')
 		// and does NOT fail the batch — the next cycle retries it. The handler
@@ -169,6 +175,12 @@ type cycleResult struct {
 	OverageCharged    int // "over" installs whose overage was invoiced mid-period
 	OverageSkipped    int // evaluated but not charged (resolved-included / no PM / 0 cents)
 	OverageFailed     int // per-timer overage-charge errors (counted, never abort)
+
+	// Mid-period custom-domain activation-period sweep (migration 047).
+	DomainCandidates int // live unresolved domains activated by this sweep instant
+	DomainCharged    int // activation-period prorations invoiced this sweep
+	DomainSkipped    int // resolved without charge or transiently skipped
+	DomainFailed     int // per-domain errors (counted, never abort)
 }
 
 // runCycle closes every card-bound account's just-ended ANCHORED period as of
@@ -243,7 +255,15 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 				continue
 			}
 			if !hasApps {
-				continue
+				hasDomains, err := svc.AccountHasLiveDomains(ctx, a.ID, end)
+				if err != nil {
+					slog.ErrorContext(ctx, "live custom-domain check failed", "account_id", a.ID, "error", err)
+					res.Failed++
+					continue
+				}
+				if !hasDomains {
+					continue
+				}
 			}
 		} else {
 			res.RolledUp++
@@ -287,6 +307,26 @@ func runOverageSweep(ctx context.Context, svc *cycle.Service, at time.Time, res 
 	slog.InfoContext(ctx, "module overage sweep complete",
 		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
 		"included", sweep.Included, "skipped", sweep.Skipped, "failed", sweep.Failed)
+}
+
+// runDomainSweep runs the activation-period custom-domain charge sweep after
+// the module-overage sweep. Each domain is independently resumable through its
+// deterministic Stripe keys and durable charge-attempt marker.
+func runDomainSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *cycleResult) {
+	sweep, err := svc.SweepDomainCharges(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "custom-domain sweep failed", "as_of", at, "error", err)
+		res.Failed++
+		return
+	}
+	res.DomainCandidates = sweep.Pending
+	res.DomainCharged = sweep.Charged
+	res.DomainSkipped = sweep.Resolved + sweep.Skipped
+	res.DomainFailed = sweep.Failed
+	res.Failed += sweep.Failed
+	slog.InfoContext(ctx, "custom-domain sweep complete",
+		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
+		"resolved", sweep.Resolved, "skipped", sweep.Skipped, "failed", sweep.Failed)
 }
 
 // tally classifies one account's charge summary for the run totals + a

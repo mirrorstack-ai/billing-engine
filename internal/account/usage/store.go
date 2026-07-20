@@ -230,6 +230,11 @@ type Store interface {
 	// stays tied to the exact rows the charge legs tier on.
 	LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
 
+	// LiveDomainCountForAccount returns the account's currently-live custom-
+	// domain count (removed_at IS NULL) — the DISPLAY input to the flat per-domain
+	// fee line on GetAccountBill.
+	LiveDomainCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
+
 	// SettledNewCreationCharges reads the SETTLED half of ListNewCreationCharges: every
 	// app CREATED in [periodStart, periodEnd) whose creation-proration leg has
 	// already minted its one invoice (proration_invoice_id armed, migration
@@ -907,6 +912,16 @@ func (s *pgxStore) CoCreatedOverModuleTimerCount(ctx context.Context, accountID,
 // shown overage stays tied to the exact rows the charge legs tier on.
 func (s *pgxStore) LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
 	n, err := s.q.CountLiveModuleTimersForAccount(ctx, accountID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// LiveDomainCountForAccount counts the account's currently-live custom-domain
+// activations (removed_at IS NULL) for GetAccountBill's flat domain-fee line.
+func (s *pgxStore) LiveDomainCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	n, err := s.q.CountLiveDomainsForAccount(ctx, accountID.String())
 	if err != nil {
 		return 0, err
 	}

@@ -478,6 +478,75 @@ type Store interface {
 	// rank >= includedModules) — the co-created over-modules folded onto the app's
 	// own creation-proration invoice, priced from the same day-0 window.
 	CoCreatedOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error)
+
+	// --- custom-domain charges (migration 047) -------------------------------
+
+	// InsertDomain records one custom-domain activation idempotently on the
+	// partial live-hostname key. A retry never rewrites the winning row's stable
+	// account/app/activation identity.
+	InsertDomain(ctx context.Context, accountID, appID uuid.UUID, hostname string, activatedAt time.Time) error
+
+	// DomainByHostname returns the currently-live activation when one exists,
+	// otherwise the newest historical activation. found=false means the hostname
+	// has never been mirrored.
+	DomainByHostname(ctx context.Context, hostname string) (Domain, bool, error)
+
+	// RemoveDomain soft-removes a live (app, hostname) activation. Idempotent:
+	// the first removal instant is kept, and an already-removed row is untouched.
+	RemoveDomain(ctx context.Context, appID uuid.UUID, hostname string, removedAt time.Time) error
+
+	// DomainsPendingCharge is the activation-period work list: live, unresolved
+	// domains activated by at on card-bound accounts. Each candidate includes
+	// the owning account's activation anchor and charge-attempt recovery marker.
+	DomainsPendingCharge(ctx context.Context, at time.Time) ([]DomainChargeCandidate, error)
+
+	// DomainStillPending re-verifies immediately before a sweep action that the
+	// domain remains live and unresolved.
+	DomainStillPending(ctx context.Context, domainID uuid.UUID) (bool, error)
+
+	// MarkDomainChargeAttempted stamps the durable recovery marker before the
+	// first Stripe call. First-write-wins and is never cleared.
+	MarkDomainChargeAttempted(ctx context.Context, domainID uuid.UUID, at time.Time) error
+
+	// MarkDomainChargeResolved stamps the terminal no-charge D1d verdict for an
+	// activation period that closed before the owning account activated.
+	MarkDomainChargeResolved(ctx context.Context, domainID uuid.UUID) error
+
+	// MarkDomainCharged terminally records a successful activation-period charge
+	// and its genuine Stripe invoice/invoice-item ids.
+	MarkDomainCharged(ctx context.Context, domainID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error
+
+	// CountLiveDomainsActivatedBefore is the boundary advance input. It counts
+	// live domains activated before periodEnd and deliberately ignores mutable
+	// charge_resolved state so sweep ordering cannot create a coverage gap.
+	CountLiveDomainsActivatedBefore(ctx context.Context, accountID uuid.UUID, periodEnd time.Time) (int, error)
+}
+
+// Domain is one custom-domain mirror row (migration 047). RemovedAt is
+// meaningful only when Removed is true.
+type Domain struct {
+	ID          uuid.UUID
+	AccountID   uuid.UUID
+	AppID       uuid.UUID
+	Hostname    string
+	ActivatedAt time.Time
+	Removed     bool
+	RemovedAt   time.Time
+	CreatedAt   time.Time
+}
+
+// DomainChargeCandidate is one live, unresolved domain activation the
+// activation-period sweep evaluates. ActivatedAt is the domain activation;
+// AccountActivatedAt is the account's anchored-period activation instant.
+type DomainChargeCandidate struct {
+	ID                 uuid.UUID
+	AccountID          uuid.UUID
+	AppID              uuid.UUID
+	Hostname           string
+	ActivatedAt        time.Time
+	AccountActivatedAt time.Time
+	// ChargeAttemptedAt is zero until an attempt reaches its Stripe section.
+	ChargeAttemptedAt time.Time
 }
 
 // ModuleOverageCandidate is one per-module-instance install timer the Leg 1
@@ -1799,6 +1868,136 @@ func (s *pgxStore) CoCreatedOverModuleTimers(ctx context.Context, accountID, app
 		return nil, err
 	}
 	return parseUUIDs(ids)
+}
+
+// --- custom-domain charges (migration 047) --------------------------------
+
+func (s *pgxStore) InsertDomain(ctx context.Context, accountID, appID uuid.UUID, hostname string, activatedAt time.Time) error {
+	return s.q.InsertDomain(ctx, db.InsertDomainParams{
+		AccountID:   accountID.String(),
+		AppID:       appID.String(),
+		Hostname:    hostname,
+		ActivatedAt: activatedAt,
+	})
+}
+
+func (s *pgxStore) DomainByHostname(ctx context.Context, hostname string) (Domain, bool, error) {
+	row, err := s.q.DomainByHostname(ctx, hostname)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Domain{}, false, nil
+	}
+	if err != nil {
+		return Domain{}, false, err
+	}
+	id, err := uuid.Parse(row.ID)
+	if err != nil {
+		return Domain{}, false, err
+	}
+	accountID, err := uuid.Parse(row.AccountID)
+	if err != nil {
+		return Domain{}, false, err
+	}
+	appID, err := uuid.Parse(row.AppID)
+	if err != nil {
+		return Domain{}, false, err
+	}
+	return Domain{
+		ID:          id,
+		AccountID:   accountID,
+		AppID:       appID,
+		Hostname:    row.Hostname,
+		ActivatedAt: row.ActivatedAt,
+		Removed:     row.RemovedAt.Valid,
+		RemovedAt:   row.RemovedAt.Time,
+		CreatedAt:   row.CreatedAt,
+	}, true, nil
+}
+
+func (s *pgxStore) RemoveDomain(ctx context.Context, appID uuid.UUID, hostname string, removedAt time.Time) error {
+	return s.q.RemoveDomain(ctx, db.RemoveDomainParams{
+		AppID:     appID.String(),
+		Hostname:  hostname,
+		RemovedAt: removedAt,
+	})
+}
+
+func (s *pgxStore) DomainsPendingCharge(ctx context.Context, at time.Time) ([]DomainChargeCandidate, error) {
+	rows, err := s.q.DomainsPendingCharge(ctx, at)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DomainChargeCandidate, 0, len(rows))
+	for _, row := range rows {
+		id, err := uuid.Parse(row.ID)
+		if err != nil {
+			return nil, err
+		}
+		accountID, err := uuid.Parse(row.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		appID, err := uuid.Parse(row.AppID)
+		if err != nil {
+			return nil, err
+		}
+		// The query filters account activated_at IS NOT NULL. Skip a driver
+		// anomaly defensively rather than derive periods from the zero time.
+		if !row.AccountActivatedAt.Valid {
+			continue
+		}
+		cand := DomainChargeCandidate{
+			ID:                 id,
+			AccountID:          accountID,
+			AppID:              appID,
+			Hostname:           row.Hostname,
+			ActivatedAt:        row.ActivatedAt,
+			AccountActivatedAt: row.AccountActivatedAt.Time,
+		}
+		if row.ChargeAttemptedAt.Valid {
+			cand.ChargeAttemptedAt = row.ChargeAttemptedAt.Time
+		}
+		out = append(out, cand)
+	}
+	return out, nil
+}
+
+func (s *pgxStore) DomainStillPending(ctx context.Context, domainID uuid.UUID) (bool, error) {
+	pending, err := s.q.DomainStillPending(ctx, domainID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return pending, err
+}
+
+func (s *pgxStore) MarkDomainChargeAttempted(ctx context.Context, domainID uuid.UUID, at time.Time) error {
+	return s.q.MarkDomainChargeAttempted(ctx, db.MarkDomainChargeAttemptedParams{
+		ID:                domainID.String(),
+		ChargeAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
+	})
+}
+
+func (s *pgxStore) MarkDomainChargeResolved(ctx context.Context, domainID uuid.UUID) error {
+	return s.q.MarkDomainChargeResolved(ctx, domainID.String())
+}
+
+func (s *pgxStore) MarkDomainCharged(ctx context.Context, domainID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error {
+	return s.q.MarkDomainCharged(ctx, db.MarkDomainChargedParams{
+		DomainID:            domainID.String(),
+		ChargedAt:           chargedAt,
+		ChargeInvoiceID:     pgtype.Text{String: invoiceID, Valid: invoiceID != ""},
+		ChargeInvoiceItemID: pgtype.Text{String: invoiceItemID, Valid: invoiceItemID != ""},
+	})
+}
+
+func (s *pgxStore) CountLiveDomainsActivatedBefore(ctx context.Context, accountID uuid.UUID, periodEnd time.Time) (int, error) {
+	n, err := s.q.CountLiveDomainsActivatedBefore(ctx, db.CountLiveDomainsActivatedBeforeParams{
+		AccountID: accountID.String(),
+		PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
 }
 
 // EnsureOrgAccount mirrors EnsureAccountForUser on the org leg: the SAME

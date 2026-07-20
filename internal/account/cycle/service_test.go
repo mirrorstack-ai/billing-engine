@@ -77,6 +77,10 @@ type fakeStore struct {
 	accountsByUser map[uuid.UUID]uuid.UUID
 	activation     map[uuid.UUID]time.Time
 	baseSnapshots  map[snapKey]fakeBaseSnapshot
+	// custom-domain mirror state (migration 047). The map is keyed by the
+	// surrogate domain id; InsertDomain enforces the live-hostname partial
+	// unique constraint by scanning the currently-live rows.
+	domains map[uuid.UUID]*fakeDomain
 
 	// per-account overrides for HasUsableDefaultPM / AccountStripeCustomer
 	// (absent → the flat hasPM / stripeCustomer defaults above). The org
@@ -142,6 +146,15 @@ type fakeStore struct {
 	errActivation       error // AccountActivation
 	errAppInsert        error // InsertAppMirror
 	errAppMirror        error // AppMirror
+	errDomainInsert     error // InsertDomain
+	errDomainLookup     error // DomainByHostname
+	errDomainRemove     error // RemoveDomain
+	errDomainsPending   error // DomainsPendingCharge
+	errDomainPending    error // DomainStillPending
+	errDomainAttempted  error // MarkDomainChargeAttempted
+	errDomainResolved   error // MarkDomainChargeResolved
+	errDomainCharged    error // MarkDomainCharged
+	errLiveDomainCount  error // CountLiveDomainsActivatedBefore
 	errSetProration     error // SetAppProrationInvoice
 	errSetSkipped       error // SetAppProrationSkipped
 	errSetCount         error // SetAppModuleCount
@@ -187,6 +200,17 @@ type fakeTimer struct {
 	graceInvoiceID     string
 	graceInvoiceItemID string
 	chargeAttemptedAt  time.Time // migration-036 recovery marker
+}
+
+// fakeDomain carries the migration-047 mirror plus the one-shot activation
+// charge state used by the domain sweep tests.
+type fakeDomain struct {
+	domain              cycle.Domain
+	chargeAttemptedAt   time.Time
+	chargeResolved      bool
+	chargedAt           time.Time
+	chargeInvoiceID     string
+	chargeInvoiceItemID string
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -236,6 +260,7 @@ func newFakeStore() *fakeStore {
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
 		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
+		domains:             map[uuid.UUID]*fakeDomain{},
 		timers:              map[uuid.UUID]*fakeTimer{},
 
 		hasPMByAccount:          map[uuid.UUID]bool{},
@@ -708,6 +733,139 @@ func (f *fakeStore) AppMirror(_ context.Context, appID uuid.UUID) (cycle.AppMirr
 	}
 	app, ok := f.apps[appID]
 	return app, ok, nil
+}
+
+// --- custom-domain mirror fake (migration 047) -----------------------------
+
+func (f *fakeStore) InsertDomain(_ context.Context, accountID, appID uuid.UUID, hostname string, activatedAt time.Time) error {
+	if f.errDomainInsert != nil {
+		return f.errDomainInsert
+	}
+	for _, d := range f.domains {
+		if d.domain.Hostname == hostname && !d.domain.Removed {
+			return nil // partial unique conflict: the existing live row wins
+		}
+	}
+	id := uuid.New()
+	f.domains[id] = &fakeDomain{domain: cycle.Domain{
+		ID: id, AccountID: accountID, AppID: appID, Hostname: hostname, ActivatedAt: activatedAt,
+	}}
+	return nil
+}
+
+func (f *fakeStore) DomainByHostname(_ context.Context, hostname string) (cycle.Domain, bool, error) {
+	if f.errDomainLookup != nil {
+		return cycle.Domain{}, false, f.errDomainLookup
+	}
+	var best *fakeDomain
+	for _, d := range f.domains {
+		if d.domain.Hostname != hostname {
+			continue
+		}
+		if best == nil || (!d.domain.Removed && best.domain.Removed) ||
+			(d.domain.Removed == best.domain.Removed && d.domain.ActivatedAt.After(best.domain.ActivatedAt)) {
+			best = d
+		}
+	}
+	if best == nil {
+		return cycle.Domain{}, false, nil
+	}
+	return best.domain, true, nil
+}
+
+func (f *fakeStore) RemoveDomain(_ context.Context, appID uuid.UUID, hostname string, removedAt time.Time) error {
+	if f.errDomainRemove != nil {
+		return f.errDomainRemove
+	}
+	for _, d := range f.domains {
+		if d.domain.AppID == appID && d.domain.Hostname == hostname && !d.domain.Removed {
+			d.domain.Removed = true
+			d.domain.RemovedAt = removedAt
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) DomainsPendingCharge(_ context.Context, activatedBefore time.Time) ([]cycle.DomainChargeCandidate, error) {
+	if f.errDomainsPending != nil {
+		return nil, f.errDomainsPending
+	}
+	var out []cycle.DomainChargeCandidate
+	for _, d := range f.domains {
+		if d.domain.Removed || d.chargeResolved || d.domain.ActivatedAt.After(activatedBefore) {
+			continue
+		}
+		out = append(out, cycle.DomainChargeCandidate{
+			ID:                 d.domain.ID,
+			AccountID:          d.domain.AccountID,
+			AppID:              d.domain.AppID,
+			Hostname:           d.domain.Hostname,
+			ActivatedAt:        d.domain.ActivatedAt,
+			AccountActivatedAt: f.activation[d.domain.AccountID],
+			ChargeAttemptedAt:  d.chargeAttemptedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ActivatedAt.Equal(out[j].ActivatedAt) {
+			return out[i].ID.String() < out[j].ID.String()
+		}
+		return out[i].ActivatedAt.Before(out[j].ActivatedAt)
+	})
+	return out, nil
+}
+
+func (f *fakeStore) DomainStillPending(_ context.Context, domainID uuid.UUID) (bool, error) {
+	if f.errDomainPending != nil {
+		return false, f.errDomainPending
+	}
+	d, ok := f.domains[domainID]
+	return ok && !d.domain.Removed && !d.chargeResolved, nil
+}
+
+func (f *fakeStore) MarkDomainChargeAttempted(_ context.Context, domainID uuid.UUID, at time.Time) error {
+	if f.errDomainAttempted != nil {
+		return f.errDomainAttempted
+	}
+	if d, ok := f.domains[domainID]; ok && d.chargeAttemptedAt.IsZero() {
+		d.chargeAttemptedAt = at
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkDomainChargeResolved(_ context.Context, domainID uuid.UUID) error {
+	if f.errDomainResolved != nil {
+		return f.errDomainResolved
+	}
+	if d, ok := f.domains[domainID]; ok {
+		d.chargeResolved = true
+	}
+	return nil
+}
+
+func (f *fakeStore) MarkDomainCharged(_ context.Context, domainID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error {
+	if f.errDomainCharged != nil {
+		return f.errDomainCharged
+	}
+	if d, ok := f.domains[domainID]; ok {
+		d.chargeResolved = true
+		d.chargedAt = chargedAt
+		d.chargeInvoiceID = invoiceID
+		d.chargeInvoiceItemID = invoiceItemID
+	}
+	return nil
+}
+
+func (f *fakeStore) CountLiveDomainsActivatedBefore(_ context.Context, accountID uuid.UUID, activatedBefore time.Time) (int, error) {
+	if f.errLiveDomainCount != nil {
+		return 0, f.errLiveDomainCount
+	}
+	var count int
+	for _, d := range f.domains {
+		if d.domain.AccountID == accountID && !d.domain.Removed && d.domain.ActivatedAt.Before(activatedBefore) {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (f *fakeStore) SetAppProrationInvoice(_ context.Context, appID uuid.UUID, stripeInvoiceID string) error {

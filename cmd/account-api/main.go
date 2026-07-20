@@ -267,6 +267,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.SyncAppModules(ctx, req)
 
+	case "RegisterDomain":
+		var req cycle.RegisterDomainRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.RegisterDomain(ctx, req)
+
+	case "RemoveDomain":
+		var req cycle.RemoveDomainRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.RemoveDomain(ctx, req)
+
 	case "SetOrgDesignation":
 		var req cycle.SetOrgDesignationRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -508,6 +522,8 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// route group, same as the other billing writes.
 		r.Post("/v1/billing.RegisterApp", makeHTTPHandler(d, "RegisterApp"))
 		r.Post("/v1/billing.SyncAppModules", makeHTTPHandler(d, "SyncAppModules"))
+		r.Post("/v1/billing.RegisterDomain", makeHTTPHandler(d, "RegisterDomain"))
+		r.Post("/v1/billing.RemoveDomain", makeHTTPHandler(d, "RemoveDomain"))
 
 		// Org funding designation + attach sweep (org-billing W0, migration 041).
 		r.Post("/v1/billing.SetOrgDesignation", makeHTTPHandler(d, "SetOrgDesignation"))

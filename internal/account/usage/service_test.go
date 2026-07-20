@@ -66,7 +66,9 @@ type fakeStore struct {
 	// GetAccountBill's steady-state account-overage estimate. The single-account
 	// usage fake models it as Σ module_count over its live appMirrors (one live
 	// timer per installed module), so display tests set counts on appMirrors.
-	errLiveTimerCount error
+	errLiveTimerCount  error
+	liveDomainCount    int
+	errLiveDomainCount error
 
 	// usageAppIDs is what AppIDsWithUsage enumerates (the usage half of
 	// GetAccountBill's roster); the mirror half is DERIVED from appMirrors with
@@ -346,6 +348,15 @@ func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, _ uuid.UUI
 		}
 	}
 	return sum, nil
+}
+
+// LiveDomainCountForAccount returns the configured current live-domain count
+// used by GetAccountBill's steady-state custom-domain estimate.
+func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (int, error) {
+	if f.errLiveDomainCount != nil {
+		return 0, f.errLiveDomainCount
+	}
+	return f.liveDomainCount, nil
 }
 
 // AccountAnchorDay returns the configured anchor day for an account, defaulting

@@ -58,6 +58,11 @@ const (
 	// that formula lives. Tunable; becomes plan-resolved later.
 	ModuleOverageFeeMicros int64 = 3_000_000 // $3.00
 
+	// DomainFeeMicros is the recurring fee for EACH active custom domain.
+	// Domains have no included allowance; every live domain contributes this
+	// full steady-state amount to the account bill. Tunable. Default $2.
+	DomainFeeMicros int64 = 2_000_000 // $2.00
+
 	// PaasCreditPct is PaaS 額度 — the percentage of the 基礎設施 InfraTotal credited
 	// back (offsetting infra) as a SaaS-subscription benefit. Tunable. Default 30%.
 	// (It replaced an earlier flat −$7 credit with an infra-proportional one.)

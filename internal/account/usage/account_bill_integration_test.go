@@ -241,6 +241,17 @@ func TestGetAccountBill_Integration_RolledAgentModelsUseFrozenCharges(t *testing
 		`INSERT INTO ms_billing.accounts (id, owner_kind, owner_user_id) VALUES ($1, 'user', $2)`,
 		acct.String(), owner.String())
 	require.NoError(t, err)
+	appID := uuid.New()
+	seedMirrorApp(t, pool, acct, appID, "2026-05-01T00:00:00Z", "")
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.app_custom_domains
+		   (account_id, app_id, hostname, activated_at, removed_at)
+		 VALUES
+		   ($1, $2, 'one.example.test',   '2026-05-10T00:00:00Z', NULL),
+		   ($1, $2, 'two.example.test',   '2026-05-15T00:00:00Z', NULL),
+		   ($1, $2, 'gone.example.test',  '2026-05-05T00:00:00Z', '2026-05-20T00:00:00Z')`,
+		acct.String(), appID.String())
+	require.NoError(t, err)
 
 	periodID := appSeedPeriod(t, pool, acct, appPeriodStart, appPeriodEnd)
 	sentinel := usage.PlatformInfraModuleID()
@@ -283,4 +294,12 @@ func TestGetAccountBill_Integration_RolledAgentModelsUseFrozenCharges(t *testing
 	require.EqualValues(t, 20400, resp.Agent.InfraMicros)
 	require.EqualValues(t, 20900, resp.Agent.TotalMicros,
 		"model-less spend remains in the agent total as the consumer's residual")
+	require.EqualValues(t, 2*usage.DomainFeeMicros, resp.CustomDomainsMicros,
+		"only currently-live custom domains contribute to the account line")
+	require.Equal(t,
+		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
+			resp.AccountOverageMicros+resp.CustomDomainsMicros+
+			resp.Agent.TotalMicros-resp.PaasCreditMicros,
+		resp.TotalMicros,
+		"all account lines reconcile exactly into total_micros")
 }

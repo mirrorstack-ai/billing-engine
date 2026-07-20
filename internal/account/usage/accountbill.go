@@ -74,9 +74,10 @@ const (
 //     capped at the combined app + agent usage plane so it never eats base fees,
 //  7. adds the account-wide POOLED module overage (migration 032) once,
 //     snapshot-first (the frozen charge, else a live estimate from the pool),
-//  8. TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal +
-//     AccountOverage + Agent.TotalMicros − PaasCredit (≥ 0 by the cap), plus the
-//     v1 plan stub with RenewsAt = the period end.
+//  8. adds the live custom-domain account line ($2 per domain) once,
+//  9. TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal +
+//     AccountOverage + CustomDomains + Agent.TotalMicros − PaasCredit (≥ 0 by
+//     the cap), plus the v1 plan stub with RenewsAt = the period end.
 func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest) (*GetAccountBillResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -223,6 +224,10 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	if err != nil {
 		return nil, err
 	}
+	customDomains, err := s.customDomainsMicros(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
 
 	// TODO(subscription): same gate as GetAppBill — v1 has no subscription
 	// system, so the credit is subscription-gated OFF and resolves to 0.
@@ -247,8 +252,9 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,
 		AccountOverageMicros:   accountOverage,
+		CustomDomainsMicros:    customDomains,
 		PaasCreditMicros:       paasCredit,
-		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + agent.TotalMicros - paasCredit,
+		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + customDomains + agent.TotalMicros - paasCredit,
 	}, nil
 }
 
@@ -266,6 +272,18 @@ func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID)
 		return 0, billing.Internal("live module timer count lookup failed", err)
 	}
 	return AccountOverageMicros(live), nil
+}
+
+// customDomainsMicros resolves the account's steady-state custom-domain line:
+// every currently-live custom domain costs DomainFeeMicros, with no included
+// allowance. Proration belongs exclusively to the activation charge sweep; the
+// bill display is the full-period live estimate, matching account overage above.
+func (s *Service) customDomainsMicros(ctx context.Context, accountID uuid.UUID) (int64, error) {
+	live, err := s.store.LiveDomainCountForAccount(ctx, accountID)
+	if err != nil {
+		return 0, billing.Internal("live domain count lookup failed", err)
+	}
+	return int64(live) * DomainFeeMicros, nil
 }
 
 // accountPaasCreditMicros is the ACCOUNT-level PaaS credit: the same

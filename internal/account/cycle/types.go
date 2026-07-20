@@ -232,9 +232,15 @@ type ChargeSummary struct {
 	// ongoing over-module continues into the new period.
 	AdvanceOverageMicros int64
 
+	// AdvanceDomainsMicros is the NEW period's full custom-domain fee:
+	// DomainFeeMicros times the number of live domains activated before the
+	// period opened. The activation-period proration is charged separately by
+	// SweepDomainCharges.
+	AdvanceDomainsMicros int64
+
 	// ChargedCents is the whole-cent amount sent to Stripe (micros → cents
-	// round-half-up over arrears + advance base + advance overage). 0 when no
-	// charge happened.
+	// round-half-up over arrears + advance base + advance overage + domains). 0
+	// when no charge happened.
 	ChargedCents int64
 
 	// StripeInvoiceID is the created Stripe invoice id, empty when no charge
