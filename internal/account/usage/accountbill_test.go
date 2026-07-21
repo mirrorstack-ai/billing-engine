@@ -626,6 +626,12 @@ func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
 	require.Equal(t, expectedAccruedBase+700, resp.TotalMicros)
 	require.Equal(t, expectedProjectedBase+700, resp.ProjectedTotalMicros)
 	require.Greater(t, resp.ProjectedTotalMicros, resp.TotalMicros)
+	// Invariant: ONLY the base differs between the projected and accrued totals
+	// — every usage/overage/domain/agent/credit component is carried identically.
+	require.Equal(t,
+		resp.ProjectedTotalMicros-resp.TotalMicros,
+		resp.ProjectedBaseFeeTotalMicros-resp.BaseFeeTotalMicros,
+		"projected and accrued totals must differ by exactly the base delta")
 }
 
 // Migration 037: the account bill carries each app's FROZEN name + a deleted
