@@ -343,6 +343,24 @@ type Store interface {
 	// pre-armed) guard's.
 	ChargeProrationLocked(ctx context.Context, appID uuid.UUID, charge func(locked AppMirror) (*ProrationCharge, error)) (ProrationOutcome, string, error)
 
+	// DrawCreationProrationFromWallet settles ONE app's creation proration through
+	// the universal credit wallet (migration 048, billing-engine #99) ATOMICALLY:
+	// under the app row lock it re-verifies the row is still chargeable (deleted_at
+	// IS NULL AND proration_invoice_id IS NULL), draws charge.AmountMicros from the
+	// append-only credit ledger (per-app idempotency keys, credits-mode unsecured
+	// remainder), and — ONLY when the wallet FULLY covers the amount — freezes the
+	// base snapshot(s), marks the co-created over-module timers, and arms the
+	// one-shot guard (with charge.Ref), all in a SINGLE transaction. Because the
+	// draw and the guard-arm commit together, a crash can never strand a partial
+	// settlement: either the whole thing committed (guard armed, never re-swept) or
+	// nothing did (a retry sees the armed guard and short-circuits). A standard-mode
+	// wallet whose spendable balance cannot fully cover draws NOTHING and returns
+	// ProrationWalletShort (guard unarmed) so the charge stays unsettled and NEVER
+	// falls through to Stripe; credits mode always fully covers via the unsecured
+	// remainder. Unlike the boundary draw this debit carries NO period_id — it is
+	// keyed per app, so it never collides with the period's boundary draw.
+	DrawCreationProrationFromWallet(ctx context.Context, appID uuid.UUID, charge ProrationWalletCharge) (ProrationOutcome, string, error)
+
 	// SetAppProrationInvoice arms the ONE-SHOT creation-proration guard: it
 	// records the Stripe invoice id, first-charge-wins (UPDATE … WHERE
 	// proration_invoice_id IS NULL). An already-armed guard is NOT an error —
@@ -1749,6 +1767,203 @@ func (s *pgxStore) ChargeProrationLocked(ctx context.Context, appID uuid.UUID, c
 
 	// Phase 3: persist the successful charge.
 	return s.persistProrationCharge(ctx, appID, pc)
+}
+
+// DrawCreationProrationFromWallet — see the Store interface doc. The draw and the
+// guard-arm share ONE transaction (no Stripe network call to keep outside a lock,
+// unlike ChargeProrationLocked), so idempotency is the atomic guard alone: a
+// committed settlement short-circuits every retry at the proration_invoice_id
+// re-check, and a crash before commit rolls back leaving no ledger rows.
+func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uuid.UUID, pc ProrationWalletCharge) (ProrationOutcome, string, error) {
+	if pc.AmountMicros <= 0 {
+		return ProrationLockedNoCharge, "", nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	// Phase 1: lock + re-verify the app is still chargeable — the SAME terminal
+	// checks as lockAndReadChargeableApp, but in THIS transaction so the draw and
+	// the guard-arm are atomic.
+	row, err := qtx.SelectAppMirrorForUpdate(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProrationLockedNotFound, "", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	if row.DeletedAt.Valid && row.DeletedAt.Time.Before(moduleGraceExpiry(row.CreatedAt.UTC())) {
+		return ProrationLockedDeleted, "", nil
+	}
+	if row.ProrationInvoiceID.Valid {
+		return ProrationLockedAlreadyCharged, row.ProrationInvoiceID.String, nil
+	}
+	accountID := uuidFromPg(row.AccountID)
+
+	// Phase 2: allocate the draw under the wallet account + ledger locks. The
+	// account FOR UPDATE also serializes concurrent child ledger INSERTs through
+	// the FK, exactly as DrawWalletCredits relies on. (App-row lock is taken FIRST,
+	// then the account lock — a consistent order that never inverts the account→
+	// ledger order the boundary draw uses, so the two can not deadlock.)
+	rawMode, err := qtx.LockWalletAccount(ctx, accountID.String())
+	if err != nil {
+		return 0, "", err
+	}
+	mode, err := parseCreditBillingMode(rawMode)
+	if err != nil {
+		return 0, "", err
+	}
+	if _, err := qtx.LockWalletLedgerEntries(ctx, accountID.String()); err != nil {
+		return 0, "", err
+	}
+	balanceAfter, err := qtx.WalletSettledBalance(ctx, accountID.String())
+	if err != nil {
+		return 0, "", err
+	}
+	lots, err := qtx.WalletSpendableLots(ctx, accountID.String())
+	if err != nil {
+		return 0, "", err
+	}
+	var lotSum int64
+	for _, lot := range lots {
+		if lot.RemainingMicros <= 0 {
+			return 0, "", fmt.Errorf(
+				"wallet query returned a non-positive lot remainder: source=%s remaining=%d",
+				lot.ID, lot.RemainingMicros,
+			)
+		}
+		lotSum += lot.RemainingMicros
+	}
+
+	// Standard mode consumes at most its positive spendable balance = min(active
+	// lots, posted balance − unused expired grants). If that cannot FULLY cover the
+	// creation charge, settle NOTHING (unsettled → the standing gate blocks, never
+	// Stripe); credits mode always fully covers via the unsecured remainder below.
+	if mode == CreditBillingModeStandard {
+		expiredMicros, err := qtx.WalletExpiredCreditBalance(ctx, accountID.String())
+		if err != nil {
+			return 0, "", err
+		}
+		if expiredMicros < 0 {
+			return 0, "", fmt.Errorf("wallet expired-credit balance is negative: %d", expiredMicros)
+		}
+		spendable := lotSum
+		if spendCap := balanceAfter - expiredMicros; spendCap < spendable {
+			spendable = spendCap
+		}
+		if spendable < pc.AmountMicros {
+			return ProrationWalletShort, "", nil
+		}
+	}
+
+	insertDraw := func(consume int64, sourceID string) error {
+		if consume <= 0 {
+			return fmt.Errorf("wallet draw allocation must be positive: %d", consume)
+		}
+		if balanceAfter < math.MinInt64+consume {
+			return fmt.Errorf("wallet balance_after_micros underflow: balance=%d draw=%d", balanceAfter, consume)
+		}
+		balanceAfter -= consume
+
+		source := pgtype.UUID{}
+		keySource := "unsecured"
+		if sourceID != "" {
+			id, err := uuid.Parse(sourceID)
+			if err != nil {
+				return fmt.Errorf("parse wallet source credit id: %w", err)
+			}
+			source = pgtype.UUID{Bytes: id, Valid: true}
+			keySource = id.String()
+		}
+		return qtx.InsertCreationWalletDraw(ctx, db.InsertCreationWalletDrawParams{
+			AccountID:          accountID.String(),
+			AmountMicros:       consume,
+			BalanceAfterMicros: balanceAfter,
+			// Per-APP idempotency (period_id is NULL) — the deterministic
+			// app/source key is the sole idempotency guard for a per-app draw.
+			IdempotencyKey: fmt.Sprintf(
+				"wallet-draw:app-creation:%s:usage_draw:%s", appID.String(), keySource,
+			),
+			SourceCreditID: source,
+		})
+	}
+
+	left := pc.AmountMicros
+	for _, lot := range lots {
+		if left == 0 {
+			break
+		}
+		consume := lot.RemainingMicros
+		if consume > left {
+			consume = left
+		}
+		if err := insertDraw(consume, lot.ID); err != nil {
+			return 0, "", err
+		}
+		left -= consume
+	}
+	if left > 0 {
+		if mode != CreditBillingModeCredits {
+			// Standard mode ran out of lots despite the spendable check above — never
+			// partially settle (defensive; the check should already have caught it).
+			return ProrationWalletShort, "", nil
+		}
+		// Credits mode is wallet-only: its configured credit policy owns the
+		// unsecured remainder (the single NULL-source row).
+		if err := insertDraw(left, ""); err != nil {
+			return 0, "", err
+		}
+		left = 0
+	}
+
+	// Phase 3: fully covered — freeze the display snapshot(s), mark the co-created
+	// timers, and arm the one-shot guard, all in this same transaction.
+	if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+		AppID:       pc.Snapshot.AppID.String(),
+		PeriodStart: pc.Snapshot.PeriodStart,
+		PeriodEnd:   pc.Snapshot.PeriodEnd,
+		ModuleCount: int32(pc.Snapshot.ModuleCount), //nolint:gosec // count comes from the locked apps row, whose writers validate 0 ≤ count ≤ maxModuleCount
+		BaseMicros:  pc.Snapshot.BaseMicros,
+	}); err != nil {
+		return 0, "", err
+	}
+	if pc.StraddleSnapshot != nil {
+		if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
+			AppID:       pc.StraddleSnapshot.AppID.String(),
+			PeriodStart: pc.StraddleSnapshot.PeriodStart,
+			PeriodEnd:   pc.StraddleSnapshot.PeriodEnd,
+			ModuleCount: int32(pc.StraddleSnapshot.ModuleCount), //nolint:gosec // same validated apps-row count
+			BaseMicros:  pc.StraddleSnapshot.BaseMicros,
+		}); err != nil {
+			return 0, "", err
+		}
+	}
+	for _, tc := range pc.TimerCharges {
+		if err := qtx.MarkModuleTimerCharged(ctx, db.MarkModuleTimerChargedParams{
+			TimerID:            tc.TimerID.String(),
+			GraceChargedAt:     tc.ChargedAt,
+			GraceInvoiceID:     pgtype.Text{String: tc.InvoiceID, Valid: tc.InvoiceID != ""},
+			GraceInvoiceItemID: pgtype.Text{String: tc.InvoiceItemID, Valid: tc.InvoiceItemID != ""},
+		}); err != nil {
+			return 0, "", err
+		}
+	}
+	// Arm the one-shot guard (first-write-wins WHERE proration_invoice_id IS NULL —
+	// guaranteed NULL under this lock by the re-check above).
+	if _, err := qtx.SetAppProrationInvoice(ctx, db.SetAppProrationInvoiceParams{
+		AppID:              appID.String(),
+		ProrationInvoiceID: pgtype.Text{String: pc.Ref, Valid: true},
+	}); err != nil {
+		return 0, "", err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, "", err
+	}
+	return ProrationLockedCharged, pc.Ref, nil
 }
 
 func (s *pgxStore) SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, stripeInvoiceID string) error {
