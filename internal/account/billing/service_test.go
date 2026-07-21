@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -47,6 +48,21 @@ type fakeStore struct {
 	hasUsableDefPM   map[uuid.UUID]bool
 	stripeCustomerOf map[uuid.UUID]string
 	syncedMirrors    []billingstripe.Invoice
+
+	// credit-wallet state. These maps model the service-facing projections,
+	// not the SQL implementation details: an idempotency key resolves one
+	// immutable ledger record and purchases are separately owner-scoped.
+	creditStanding           map[uuid.UUID]billing.CreditStandingRow
+	creditLedgerEntries      map[uuid.UUID][]billing.CreditLedgerEntry
+	creditLedgerByKey        map[string]billing.CreditLedgerRecord
+	creditPurchases          map[uuid.UUID]billing.CreditPurchaseRow
+	creditAutoTopUps         map[uuid.UUID]billing.AutoTopUpConfig
+	distributorCustomers     map[distributorCustomerKey]uuid.UUID
+	distributorStates        map[uuid.UUID][]billing.DistributorCustomerState
+	creditPurchaseCreates    int
+	creditIdempotencyReads   int
+	distributorRelationReads int
+	creditGrantInserts       int
 
 	// Injected failures (set per-test as needed).
 	errEnsureAccount        error
@@ -95,23 +111,35 @@ type pmTarget struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		accountsByUser:   map[uuid.UUID]fakeAccount{},
-		hasUsablePM:      map[uuid.UUID]bool{},
-		hasUnpaidInvoice: map[uuid.UUID]bool{},
-		paymentMethodsBy: map[uuid.UUID][]billing.PaymentMethod{},
-		serviceSignals:   map[uuid.UUID]billing.ServiceSignals{},
-		pmTargets:        map[uuid.UUID]pmTarget{},
-		addCardRequests:  map[uuid.UUID]*fakeAddCardRequest{},
-		accountsByOrg:    map[uuid.UUID]fakeAccount{},
-		fundedOrgs:       map[uuid.UUID]bool{},
-		fundingOf:        map[uuid.UUID]uuid.UUID{},
-		orgPMTargets:     map[uuid.UUID]pmTarget{},
-		unpaidCount:      map[uuid.UUID]int{},
-		unpaidInvoices:   map[uuid.UUID][]billing.UnpaidInvoiceRow{},
-		payTargets:       map[uuid.UUID]fakePayTarget{},
-		hasUsableDefPM:   map[uuid.UUID]bool{},
-		stripeCustomerOf: map[uuid.UUID]string{},
+		accountsByUser:       map[uuid.UUID]fakeAccount{},
+		hasUsablePM:          map[uuid.UUID]bool{},
+		hasUnpaidInvoice:     map[uuid.UUID]bool{},
+		paymentMethodsBy:     map[uuid.UUID][]billing.PaymentMethod{},
+		serviceSignals:       map[uuid.UUID]billing.ServiceSignals{},
+		pmTargets:            map[uuid.UUID]pmTarget{},
+		addCardRequests:      map[uuid.UUID]*fakeAddCardRequest{},
+		accountsByOrg:        map[uuid.UUID]fakeAccount{},
+		fundedOrgs:           map[uuid.UUID]bool{},
+		fundingOf:            map[uuid.UUID]uuid.UUID{},
+		orgPMTargets:         map[uuid.UUID]pmTarget{},
+		unpaidCount:          map[uuid.UUID]int{},
+		unpaidInvoices:       map[uuid.UUID][]billing.UnpaidInvoiceRow{},
+		payTargets:           map[uuid.UUID]fakePayTarget{},
+		hasUsableDefPM:       map[uuid.UUID]bool{},
+		stripeCustomerOf:     map[uuid.UUID]string{},
+		creditStanding:       map[uuid.UUID]billing.CreditStandingRow{},
+		creditLedgerEntries:  map[uuid.UUID][]billing.CreditLedgerEntry{},
+		creditLedgerByKey:    map[string]billing.CreditLedgerRecord{},
+		creditPurchases:      map[uuid.UUID]billing.CreditPurchaseRow{},
+		creditAutoTopUps:     map[uuid.UUID]billing.AutoTopUpConfig{},
+		distributorCustomers: map[distributorCustomerKey]uuid.UUID{},
+		distributorStates:    map[uuid.UUID][]billing.DistributorCustomerState{},
 	}
+}
+
+type distributorCustomerKey struct {
+	distributorOrgID uuid.UUID
+	customerOrgID    uuid.UUID
 }
 
 func (s *fakeStore) EnsureAccount(_ context.Context, userID uuid.UUID) (uuid.UUID, string, error) {
@@ -322,6 +350,150 @@ func (s *fakeStore) SyncInvoiceMirror(_ context.Context, inv billingstripe.Invoi
 	return true, nil
 }
 
+func (s *fakeStore) CreditStanding(_ context.Context, accountID uuid.UUID) (billing.CreditStandingRow, error) {
+	return s.creditStanding[accountID], nil
+}
+
+func (s *fakeStore) ListCreditLedger(_ context.Context, accountID uuid.UUID, limit int32, _ *billing.CreditLedgerCursor) ([]billing.CreditLedgerEntry, error) {
+	entries := s.creditLedgerEntries[accountID]
+	if int32(len(entries)) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
+}
+
+func (s *fakeStore) CreditLedgerByIdempotencyKey(_ context.Context, key string) (billing.CreditLedgerRecord, bool, error) {
+	s.creditIdempotencyReads++
+	record, ok := s.creditLedgerByKey[key]
+	return record, ok, nil
+}
+
+func (s *fakeStore) CreatePendingCreditPurchase(_ context.Context, accountID uuid.UUID, amountMicros int64, idempotencyKey string) (billing.CreditPurchaseRow, error) {
+	s.creditPurchaseCreates++
+	standing := s.creditStanding[accountID]
+	purchase := billing.CreditPurchaseRow{
+		ID:                 uuid.New(),
+		AccountID:          accountID,
+		AmountMicros:       amountMicros,
+		Type:               "purchase",
+		Status:             "pending",
+		BalanceAfterMicros: standing.BalanceMicros + amountMicros,
+		Actor:              "self",
+		IdempotencyKey:     idempotencyKey,
+		CreatedAt:          time.Now().UTC(),
+	}
+	s.creditPurchases[purchase.ID] = purchase
+	s.putCreditPurchaseRecord(purchase)
+	return purchase, nil
+}
+
+func (s *fakeStore) CreditPurchase(_ context.Context, purchaseID, accountID uuid.UUID) (billing.CreditPurchaseRow, bool, error) {
+	purchase, ok := s.creditPurchases[purchaseID]
+	if !ok || purchase.AccountID != accountID {
+		return billing.CreditPurchaseRow{}, false, nil
+	}
+	return purchase, true, nil
+}
+
+func (s *fakeStore) AttachCreditPurchaseInvoice(_ context.Context, purchaseID, accountID uuid.UUID, stripeInvoiceID, receiptURL string) error {
+	purchase, ok := s.creditPurchases[purchaseID]
+	if !ok || purchase.AccountID != accountID {
+		return errors.New("credit purchase not found")
+	}
+	if purchase.StripeInvoiceID != "" && purchase.StripeInvoiceID != stripeInvoiceID {
+		return errors.New("credit purchase already attached to another invoice")
+	}
+	purchase.StripeInvoiceID = stripeInvoiceID
+	if receiptURL != "" {
+		purchase.ReceiptURL = receiptURL
+	}
+	s.creditPurchases[purchaseID] = purchase
+	s.putCreditPurchaseRecord(purchase)
+	return nil
+}
+
+func (s *fakeStore) FinalizeCreditPurchase(_ context.Context, purchaseID, accountID uuid.UUID, status, receiptURL string) (billing.CreditPurchaseRow, error) {
+	purchase, ok := s.creditPurchases[purchaseID]
+	if !ok || purchase.AccountID != accountID {
+		return billing.CreditPurchaseRow{}, errors.New("credit purchase not found")
+	}
+	if purchase.Status == "pending" {
+		purchase.Status = status
+	}
+	if receiptURL != "" {
+		purchase.ReceiptURL = receiptURL
+	}
+	s.creditPurchases[purchaseID] = purchase
+	s.putCreditPurchaseRecord(purchase)
+	return purchase, nil
+}
+
+func (s *fakeStore) UpsertCreditAutoTopUp(_ context.Context, accountID uuid.UUID, cfg billing.AutoTopUpConfig) (billing.AutoTopUpConfig, error) {
+	s.creditAutoTopUps[accountID] = cfg
+	standing := s.creditStanding[accountID]
+	standing.AutoTopUp = &cfg
+	s.creditStanding[accountID] = standing
+	return cfg, nil
+}
+
+func (s *fakeStore) SetCreditBillingMode(_ context.Context, accountID uuid.UUID, mode billing.BillingMode, creditLimitMicros int64) error {
+	standing := s.creditStanding[accountID]
+	standing.BillingMode = mode
+	standing.CreditLimitMicros = creditLimitMicros
+	s.creditStanding[accountID] = standing
+	return nil
+}
+
+func (s *fakeStore) DistributorCustomerAccount(_ context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {
+	s.distributorRelationReads++
+	accountID, ok := s.distributorCustomers[distributorCustomerKey{
+		distributorOrgID: distributorOrgID,
+		customerOrgID:    customerOrgID,
+	}]
+	return accountID, ok, nil
+}
+
+func (s *fakeStore) ListDistributorCustomerStates(_ context.Context, distributorOrgID uuid.UUID) ([]billing.DistributorCustomerState, error) {
+	return s.distributorStates[distributorOrgID], nil
+}
+
+func (s *fakeStore) InsertCreditGrant(_ context.Context, accountID uuid.UUID, amountMicros int64, actor, idempotencyKey string, expiresAt *time.Time) (billing.CreditLedgerRecord, error) {
+	s.creditGrantInserts++
+	standing := s.creditStanding[accountID]
+	record := billing.CreditLedgerRecord{
+		ID:                 uuid.New(),
+		AccountID:          accountID,
+		AmountMicros:       amountMicros,
+		Type:               "grant",
+		Status:             "settled",
+		BalanceAfterMicros: standing.BalanceMicros + amountMicros,
+		Actor:              actor,
+		IdempotencyKey:     idempotencyKey,
+		ExpiresAt:          expiresAt,
+		CreatedAt:          time.Now().UTC(),
+	}
+	s.creditLedgerByKey[idempotencyKey] = record
+	standing.BalanceMicros = record.BalanceAfterMicros
+	s.creditStanding[accountID] = standing
+	return record, nil
+}
+
+func (s *fakeStore) putCreditPurchaseRecord(purchase billing.CreditPurchaseRow) {
+	s.creditLedgerByKey[purchase.IdempotencyKey] = billing.CreditLedgerRecord{
+		ID:                 purchase.ID,
+		AccountID:          purchase.AccountID,
+		AmountMicros:       purchase.AmountMicros,
+		Type:               purchase.Type,
+		Status:             purchase.Status,
+		BalanceAfterMicros: purchase.BalanceAfterMicros,
+		Actor:              purchase.Actor,
+		IdempotencyKey:     purchase.IdempotencyKey,
+		StripeInvoiceID:    purchase.StripeInvoiceID,
+		ReceiptURL:         purchase.ReceiptURL,
+		CreatedAt:          purchase.CreatedAt,
+	}
+}
+
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
@@ -337,6 +509,14 @@ type fakeStripe struct {
 	payInvoiceToReturn       billingstripe.Invoice // zero ID/Status default to stripeInvoiceID/"paid"
 	getInvoiceCustomer       string                // CustomerID GetInvoice reports (the invoice's frozen payer)
 	getInvoiceStatus         string                // Status GetInvoice reports; "" → "open"
+	creditInvoices           map[string]billingstripe.Invoice
+	creditInvoiceRefs        map[string]string
+	creditDraftCalls         []creditDraftInvoiceCall
+	creditItemCalls          []creditInvoiceItemCall
+	creditFinalizeCalls      []string
+	creditFindCalls          []string
+	creditGetCalls           []string
+	creditFinalizeStatus     string
 	customerNoDefaultPM      bool
 	errCreateCustomer        error
 	errCreateCheckoutSession error
@@ -346,6 +526,24 @@ type fakeStripe struct {
 	errPayInvoice            error
 	errGetInvoice            error
 	errGetCustomer           error
+	errCreateDraftInvoice    error
+	errCreateInvoiceItem     error
+	errFinalizeInvoice       error
+	errFindInvoice           error
+}
+
+type creditDraftInvoiceCall struct {
+	customerID     string
+	ref            string
+	idempotencyKey string
+}
+
+type creditInvoiceItemCall struct {
+	customerID     string
+	invoiceID      string
+	amountCents    int64
+	currency       string
+	idempotencyKey string
 }
 
 func (f *fakeStripe) CreateCustomer(_ context.Context, billingAccountID, email string) (*stripego.Customer, error) {
@@ -421,36 +619,111 @@ func (f *fakeStripe) GetCustomer(_ context.Context, _ string) (*stripego.Custome
 	}, nil
 }
 
-// CreateDraftInvoice / CreateInvoiceItem / FinalizeInvoice are the charge
-// methods (PR #6, draft→pinned-items→finalize since the C2 fix). The billing
-// package never calls them (the charge cycle lives in internal/account/cycle),
-// so these are panic stubs present only to keep this fake satisfying the
-// widened billingstripe.Client interface.
-func (f *fakeStripe) CreateDraftInvoice(context.Context, string, string, string) (billingstripe.Invoice, error) {
-	panic("CreateDraftInvoice must not be called by the billing package")
+// Credit purchases reuse the same safe draft→pinned-item→finalize Stripe
+// sequence as cycle charges. The fake retains resources by invoice id/ref so
+// a service retry exercises resource recovery instead of creating duplicates.
+func (f *fakeStripe) CreateDraftInvoice(_ context.Context, customerID, ref, idempotencyKey string) (billingstripe.Invoice, error) {
+	if f.errCreateDraftInvoice != nil {
+		return billingstripe.Invoice{}, f.errCreateDraftInvoice
+	}
+	f.ensureCreditInvoiceMaps()
+	f.creditDraftCalls = append(f.creditDraftCalls, creditDraftInvoiceCall{
+		customerID:     customerID,
+		ref:            ref,
+		idempotencyKey: idempotencyKey,
+	})
+	invoice := billingstripe.Invoice{
+		ID:         "in_credit_" + uuid.New().String(),
+		CustomerID: customerID,
+		Status:     "draft",
+		Currency:   "usd",
+	}
+	f.creditInvoices[invoice.ID] = invoice
+	f.creditInvoiceRefs[ref] = invoice.ID
+	return invoice, nil
 }
 
-func (f *fakeStripe) CreateInvoiceItem(context.Context, string, string, int64, string, string, billingstripe.LinePeriod, string) (billingstripe.InvoiceItem, error) {
-	panic("CreateInvoiceItem must not be called by the billing package")
+func (f *fakeStripe) CreateInvoiceItem(_ context.Context, customerID, invoiceID string, amountCents int64, currency, _ string, _ billingstripe.LinePeriod, idempotencyKey string) (billingstripe.InvoiceItem, error) {
+	if f.errCreateInvoiceItem != nil {
+		return billingstripe.InvoiceItem{}, f.errCreateInvoiceItem
+	}
+	f.creditItemCalls = append(f.creditItemCalls, creditInvoiceItemCall{
+		customerID:     customerID,
+		invoiceID:      invoiceID,
+		amountCents:    amountCents,
+		currency:       currency,
+		idempotencyKey: idempotencyKey,
+	})
+	return billingstripe.InvoiceItem{ID: "ii_credit_" + uuid.New().String()}, nil
 }
 
-func (f *fakeStripe) FinalizeInvoice(context.Context, string, string) (billingstripe.Invoice, error) {
-	panic("FinalizeInvoice must not be called by the billing package")
+func (f *fakeStripe) FinalizeInvoice(_ context.Context, invoiceID, idempotencyKey string) (billingstripe.Invoice, error) {
+	if f.errFinalizeInvoice != nil {
+		return billingstripe.Invoice{}, f.errFinalizeInvoice
+	}
+	f.ensureCreditInvoiceMaps()
+	f.creditFinalizeCalls = append(f.creditFinalizeCalls, invoiceID+"="+idempotencyKey)
+	invoice := f.creditInvoices[invoiceID]
+	if invoice.ID == "" {
+		invoice.ID = invoiceID
+	}
+	status := f.creditFinalizeStatus
+	if status == "" {
+		status = "open"
+	}
+	invoice.Status = status
+	invoice.ClientSecret = "pi_credit_secret"
+	invoice.HostedInvoiceURL = "https://invoice.test/" + invoiceID
+	if status == "paid" {
+		for _, call := range f.creditItemCalls {
+			if call.invoiceID == invoiceID {
+				invoice.AmountPaid = call.amountCents
+			}
+		}
+	}
+	f.creditInvoices[invoiceID] = invoice
+	return invoice, nil
 }
 
-func (f *fakeStripe) FindInvoiceByRef(context.Context, string, string) (billingstripe.Invoice, bool, error) {
-	panic("FindInvoiceByRef must not be called by the billing package")
+func (f *fakeStripe) FindInvoiceByRef(_ context.Context, customerID, ref string) (billingstripe.Invoice, bool, error) {
+	if f.errFindInvoice != nil {
+		return billingstripe.Invoice{}, false, f.errFindInvoice
+	}
+	f.ensureCreditInvoiceMaps()
+	f.creditFindCalls = append(f.creditFindCalls, customerID+"="+ref)
+	invoiceID, ok := f.creditInvoiceRefs[ref]
+	if !ok {
+		return billingstripe.Invoice{}, false, nil
+	}
+	invoice := f.creditInvoices[invoiceID]
+	if invoice.CustomerID != customerID {
+		return billingstripe.Invoice{}, false, nil
+	}
+	return invoice, true, nil
 }
 
 func (f *fakeStripe) GetInvoice(_ context.Context, stripeInvoiceID string) (billingstripe.Invoice, error) {
 	if f.errGetInvoice != nil {
 		return billingstripe.Invoice{}, f.errGetInvoice
 	}
+	f.creditGetCalls = append(f.creditGetCalls, stripeInvoiceID)
+	if invoice, ok := f.creditInvoices[stripeInvoiceID]; ok {
+		return invoice, nil
+	}
 	status := f.getInvoiceStatus
 	if status == "" {
 		status = "open"
 	}
 	return billingstripe.Invoice{ID: stripeInvoiceID, Status: status, CustomerID: f.getInvoiceCustomer}, nil
+}
+
+func (f *fakeStripe) ensureCreditInvoiceMaps() {
+	if f.creditInvoices == nil {
+		f.creditInvoices = map[string]billingstripe.Invoice{}
+	}
+	if f.creditInvoiceRefs == nil {
+		f.creditInvoiceRefs = map[string]string{}
+	}
 }
 
 func (f *fakeStripe) PayInvoice(_ context.Context, stripeInvoiceID string) (billingstripe.Invoice, error) {

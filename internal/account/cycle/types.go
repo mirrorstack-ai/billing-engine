@@ -238,6 +238,13 @@ type ChargeSummary struct {
 	// SweepDomainCharges.
 	AdvanceDomainsMicros int64
 
+	// WalletDrawnMicros is the portion of this boundary settled by the universal
+	// credit wallet before any collection/risk/payment-method gate. Credits-mode
+	// accounts debit the full boundary total (the wallet may go negative under
+	// their configured credit policy); standard accounts debit only positive,
+	// spendable credit lots and send the remainder through Stripe.
+	WalletDrawnMicros int64
+
 	// ChargedCents is the whole-cent amount sent to Stripe (micros → cents
 	// round-half-up over arrears + advance base + advance overage + domains). 0
 	// when no charge happened.
@@ -246,4 +253,30 @@ type ChargeSummary struct {
 	// StripeInvoiceID is the created Stripe invoice id, empty when no charge
 	// happened (zero arrears or skipped_no_pm).
 	StripeInvoiceID string
+}
+
+// CreditBillingMode is the universal-wallet billing mode stored in
+// ms_billing.accounts.billing_mode. It is intentionally separate from
+// BillingMode, which models the older arrears/prepaid collection-risk state.
+type CreditBillingMode string
+
+const (
+	CreditBillingModeStandard CreditBillingMode = "standard"
+	CreditBillingModeCredits  CreditBillingMode = "credits"
+)
+
+// WalletDrawdown reports the durable debit selected for one account-period.
+// DrawnMicros is always non-negative even though the ledger rows are negative.
+type WalletDrawdown struct {
+	Mode        CreditBillingMode
+	DrawnMicros int64
+}
+
+// WalletCreditState is the read-only eligibility probe for the boundary draw.
+// SpendableBalanceMicros excludes expired/exhausted lots and is never negative;
+// PeriodDrawnMicros is the already-recorded positive magnitude for this window.
+type WalletCreditState struct {
+	Mode                   CreditBillingMode
+	SpendableBalanceMicros int64
+	PeriodDrawnMicros      int64
 }

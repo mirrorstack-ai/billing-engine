@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -152,14 +153,20 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("account collection lookup failed", err)
 	}
+	walletState, err := s.store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+	if err != nil {
+		return nil, billing.Internal("wallet state lookup failed", err)
+	}
+	walletActive := walletState.Mode == CreditBillingModeCredits ||
+		walletState.SpendableBalanceMicros > 0 || walletState.PeriodDrawnMicros > 0
 
-	// Fast path: an account ALREADY in prepaid mode never reads aggregates or
-	// touches Stripe — the off-session arrears leg is not permitted. The usage is
-	// RETAINED (usage_aggregates untouched); the prepaid-credit wallet that would
-	// settle it is a DEFERRED follow-up. Never applied over a frozen charge (H8):
-	// a mode tightened AFTER the crashed attempt charged must not strand the
-	// moved money unmirrored.
-	if !moneyMayHaveMoved && acct.Mode == BillingModePrepaid {
+	// Preserve the historical prepaid fast path byte-for-byte for a standard
+	// account with no spendable wallet balance and no draw already recorded for
+	// this period. A credits account (or a standard account with credit) must
+	// instead price the true boundary and debit it before this collection gate.
+	// Never apply the fast path over a frozen charge (H8): a mode tightened after
+	// a crashed attempt charged must not strand moved money unmirrored.
+	if !moneyMayHaveMoved && acct.Mode == BillingModePrepaid && !walletActive {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
 		}
@@ -246,6 +253,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// period's advance base + module overage + custom domains. The allowance nets
 	// USAGE only; all recurring account fees ride on top.
 	boundaryTotal := arrears + advanceBase + advanceOverage + advanceDomains
+	if s.estimate != nil {
+		if err := s.estimate.Set(ctx, accountID, periodStart, boundaryTotal); err != nil {
+			slog.WarnContext(ctx, "boundary estimate reconciliation failed (continuing)",
+				"account_id", accountID, "period_start", periodStart, "error", err)
+		}
+	}
 
 	summary := &ChargeSummary{
 		FirstRun:             true,
@@ -253,6 +266,46 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		AdvanceBaseMicros:    advanceBase,
 		AdvanceOverageMicros: advanceOverage,
 		AdvanceDomainsMicros: advanceDomains,
+	}
+
+	// UNIVERSAL WALLET DRAWDOWN. The true boundary total is now fixed, so the
+	// wallet is debited before every zero/ceiling/risk/PM gate. The store owns the
+	// atomic lot allocation and period idempotency. A frozen Stripe attempt may
+	// already have moved money, so it may REUSE a prior draw but may never start a
+	// new one beside that frozen charge.
+	stripeTotal := boundaryTotal
+	remainingArrears := arrears
+	walletMode := walletState.Mode
+	if walletActive {
+		draw, err := s.store.DrawWalletCredits(ctx, accountID, periodStart, periodEnd, boundaryTotal, !hasFrozen)
+		if err != nil {
+			return nil, billing.Internal("wallet drawdown failed", err)
+		}
+		if draw.DrawnMicros < 0 {
+			return nil, billing.Internal("wallet drawdown returned a negative magnitude", nil)
+		}
+		walletMode = draw.Mode
+		summary.WalletDrawnMicros = draw.DrawnMicros
+		stripeTotal -= draw.DrawnMicros
+		if stripeTotal < 0 {
+			// A reclaimed period can have a larger already-durable draw than a
+			// later live recomputation. Never refund/reallocate it implicitly and
+			// never turn the difference into a negative Stripe line.
+			stripeTotal = 0
+		}
+		remainingArrears -= draw.DrawnMicros
+		if remainingArrears < 0 {
+			remainingArrears = 0
+		}
+	}
+
+	// Credits mode is wallet-only: the store debits the full boundary amount,
+	// including an unallocated residual when positive lots are exhausted. It
+	// never sends a remainder to Stripe. A pre-existing frozen Stripe request is
+	// the sole exception: recovery must finish money that may already have moved,
+	// and allowNew=false above prevents adding a new wallet debit beside it.
+	if !hasFrozen && walletMode == CreditBillingModeCredits && stripeTotal != 0 {
+		return nil, billing.Internal("credits-mode wallet did not debit the full boundary total", nil)
 	}
 
 	// Zero-skip: only when arrears, base AND overage are all zero (empty/zero
@@ -268,7 +321,30 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// concurrent reclaim may have frozen + charged since — an unguarded terminal
 	// 'invoiced' would bury that charge forever. Guard lost → error out; the run
 	// stays reclaimable and the next reclaim reconciles the frozen charge.
-	if !hasFrozen && boundaryTotal == 0 {
+	if !hasFrozen && stripeTotal == 0 {
+		// A wallet-settled advance base is still a real billed base. Persist the
+		// same display snapshot the Stripe path would have written; a failure
+		// leaves the run reclaimable and the period draw is safely reused.
+		if summary.WalletDrawnMicros > 0 && advanceBase > 0 {
+			anchorDay := billingperiod.AnchorDay(periodEnd)
+			if activatedAt, activated, err := s.store.AccountActivation(ctx, accountID); err != nil {
+				return nil, billing.Internal("account activation lookup failed", err)
+			} else if activated {
+				anchorDay = billingperiod.AnchorDay(activatedAt)
+			}
+			_, walletPeriodEnd := billingperiod.AnchoredPeriodWindow(periodEnd, anchorDay)
+			for _, a := range apps {
+				if err := s.store.InsertAdvanceBaseSnapshot(ctx, AppBaseSnapshot{
+					AppID:       a.AppID,
+					PeriodStart: periodEnd,
+					PeriodEnd:   walletPeriodEnd,
+					ModuleCount: a.ModuleCount,
+					BaseMicros:  usage.BaseFeeMicros,
+				}); err != nil {
+					return nil, billing.Internal("advance base snapshot insert failed", err)
+				}
+			}
+		}
 		ok, err := s.store.MarkBillingRunInvoicedIfUnfrozen(ctx, runID)
 		if err != nil {
 			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
@@ -277,6 +353,17 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			return nil, billing.Internal("zero-skip lost to a concurrent freeze — run left pending for the next reclaim to reconcile", nil)
 		}
 		summary.Status = RunStatusInvoiced
+		return summary, nil
+	}
+
+	// The legacy usage-prepaid gate now runs after wallet drawdown whenever a
+	// wallet was active. Credits already consumed stay settled; only the unpaid
+	// remainder is retained for a later reclaim.
+	if !moneyMayHaveMoved && acct.Mode == BillingModePrepaid {
+		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
+			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
+		}
+		summary.Status = RunStatusSkippedPrepaid
 		return summary, nil
 	}
 
@@ -290,7 +377,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// re-attempt, keeping one-invoice-per-boundary.) Independent of mode/credit-
 	// limit (a hard cap, not a trust judgment). Never applied over a frozen
 	// charge (H8) — the crashed attempt's money may already have moved.
-	if !moneyMayHaveMoved && collection.ExceedsSpendCeiling(toCollectionAccount(acct), arrears) {
+	if !moneyMayHaveMoved && collection.ExceedsSpendCeiling(toCollectionAccount(acct), remainingArrears) {
 		// skipped_ceiling, NOT skipped_prepaid: the ceiling is a per-cycle cap, not
 		// a mode transition — the account stays in arrears mode and the next cycle
 		// re-attempts once the ceiling is raised or the arrears net below it. The
@@ -325,7 +412,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		}
 		decision := collection.RiskAssess(
 			toCollectionAccount(acct),
-			collection.Signals{Delinquent: delinquent, AccruedArrearsMicros: arrears},
+			collection.Signals{Delinquent: delinquent, AccruedArrearsMicros: remainingArrears},
 			false, // cleanStanding: the charge cycle never auto-relaxes (relax is webhook-driven)
 		)
 		if decision.Action == collection.ActionSkipPrepaid {
@@ -399,7 +486,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// One invoice: closed period's netted usage arrears + the new period's advance
 	// base + the new period's advance overage, converted micros → whole cents ONCE
 	// at the Stripe boundary (a single deterministic rounding point for the total).
-	cents, err := centsFromMicros(boundaryTotal)
+	cents, err := centsFromMicros(stripeTotal)
 	if err != nil {
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
@@ -510,7 +597,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// from the live recompute (a reclaim after roster drift, or a lost freeze
 	// race), the live total describes a charge that never happened — flag the
 	// amount actually sent to Stripe instead.
-	chargedMicros := boundaryTotal
+	chargedMicros := stripeTotal
 	if cents != liveCents {
 		chargedMicros = cents * microsPerCent
 	}

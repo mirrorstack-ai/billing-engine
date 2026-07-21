@@ -333,6 +333,8 @@ type MsBillingAccount struct {
 	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
 	// Per-account size threshold (micro-USD) above which a SUCCESSFUL off-session charge is disclosed as "large" on the billing page. NULL = platform default ($100 = 100000000 micros). Resolved at charge time; pure disclosure, changes no charging behaviour.
 	AutoCollectThresholdMicros pgtype.Int8 `json:"auto_collect_threshold_micros"`
+	// Universal-wallet policy: standard applies wallet credit before ordinary collection; credits settles the full boundary through the wallet. Distinct from usage_billing_mode, which is the arrears/prepaid collection-risk state.
+	BillingMode string `json:"billing_mode"`
 }
 
 type MsBillingAddCardRequest struct {
@@ -448,6 +450,33 @@ type MsBillingBudgetAlert struct {
 	SpendMicros int64     `json:"spend_micros"`
 	LimitMicros int64     `json:"limit_micros"`
 	FiredAt     time.Time `json:"fired_at"`
+}
+
+type MsBillingCreditAutoTopupConfig struct {
+	AccountID       string      `json:"account_id"`
+	Enabled         bool        `json:"enabled"`
+	ThresholdMicros int64       `json:"threshold_micros"`
+	AmountMicros    int64       `json:"amount_micros"`
+	PaymentMethodID pgtype.Text `json:"payment_method_id"`
+	CreatedAt       time.Time   `json:"created_at"`
+	UpdatedAt       time.Time   `json:"updated_at"`
+}
+
+type MsBillingCreditLedger struct {
+	ID                 string             `json:"id"`
+	AccountID          string             `json:"account_id"`
+	AmountMicros       int64              `json:"amount_micros"`
+	Type               string             `json:"type"`
+	Status             string             `json:"status"`
+	BalanceAfterMicros int64              `json:"balance_after_micros"`
+	Actor              string             `json:"actor"`
+	IdempotencyKey     pgtype.Text        `json:"idempotency_key"`
+	StripeInvoiceID    pgtype.Text        `json:"stripe_invoice_id"`
+	ReceiptUrl         pgtype.Text        `json:"receipt_url"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	PeriodID           pgtype.UUID        `json:"period_id"`
+	SourceCreditID     pgtype.UUID        `json:"source_credit_id"`
+	CreatedAt          time.Time          `json:"created_at"`
 }
 
 type MsBillingDeveloperSettlement struct {

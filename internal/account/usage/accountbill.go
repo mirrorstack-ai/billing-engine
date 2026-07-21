@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 )
 
 // ============================================================================
@@ -255,6 +256,25 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		CustomDomainsMicros:    customDomains,
 		PaasCreditMicros:       paasCredit,
 		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + customDomains + agent.TotalMicros - paasCredit,
+	}, nil
+}
+
+// ProjectedCreditCharge exposes the existing account-bill calculation through
+// the narrow wallet reconciliation interface. It deliberately delegates to
+// GetAccountBill so the real-time credit gate and UI standing never grow a
+// second pricing implementation.
+func (s *Service) ProjectedCreditCharge(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (credit.Projection, error) {
+	bill, err := s.GetAccountBill(ctx, GetAccountBillRequest{
+		OwnerUserID: ownerUserID,
+		OwnerOrgID:  ownerOrgID,
+	})
+	if err != nil {
+		return credit.Projection{}, err
+	}
+	return credit.Projection{
+		AmountMicros: bill.TotalMicros,
+		PeriodStart:  bill.PeriodStart,
+		PeriodEnd:    bill.PeriodEnd,
 	}, nil
 }
 

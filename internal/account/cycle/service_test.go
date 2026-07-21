@@ -53,6 +53,15 @@ type fakeStore struct {
 	unbilledAccounts []uuid.UUID // AccountsWithUnbilledUsage return
 	usageEventAccts  []uuid.UUID // AccountsWithUsageEvents return
 
+	// universal credit-wallet inputs/captured draw state (billing-engine#95).
+	// Sources retain their remaining amount so reclaimed-cycle tests can prove
+	// period idempotency rather than accidentally consuming a second lot.
+	walletMode        cycle.CreditBillingMode
+	walletSources     map[uuid.UUID]*fakeWalletSource
+	walletDraws       map[string][]fakeWalletDraw
+	walletDrawOrder   []uuid.UUID
+	walletUnallocated int64
+
 	// anchored close-driver inputs (migration 025 / ADR 0005)
 	activatedAccounts []cycle.AccountAnchor   // ActivatedAccounts return
 	latestPeriodEnd   map[uuid.UUID]time.Time // LatestClosedPeriodEnd return (absent → not found)
@@ -202,6 +211,19 @@ type fakeTimer struct {
 	chargeAttemptedAt  time.Time // migration-036 recovery marker
 }
 
+type fakeWalletSource struct {
+	id        uuid.UUID
+	typ       string
+	remaining int64
+	expiresAt time.Time
+	createdAt time.Time
+}
+
+type fakeWalletDraw struct {
+	sourceID uuid.UUID
+	amount   int64 // positive magnitude; the real ledger row is negative
+}
+
 // fakeDomain carries the migration-047 mirror plus the one-shot activation
 // charge state used by the domain sweep tests.
 type fakeDomain struct {
@@ -256,6 +278,9 @@ func newFakeStore() *fakeStore {
 		markedRuns:          map[uuid.UUID]markedRun{},
 		invoices:            map[string]cycle.InvoiceMirror{},
 		frozenCharges:       map[uuid.UUID]cycle.FrozenBoundaryCharge{},
+		walletMode:          cycle.CreditBillingModeStandard,
+		walletSources:       map[uuid.UUID]*fakeWalletSource{},
+		walletDraws:         map[string][]fakeWalletDraw{},
 		apps:                map[uuid.UUID]cycle.AppMirror{},
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
@@ -400,6 +425,106 @@ func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time
 		return 0, f.errTotal
 	}
 	return f.chargedTotal, nil
+}
+
+func (f *fakeStore) WalletCreditState(_ context.Context, accountID uuid.UUID, start, end time.Time) (cycle.WalletCreditState, error) {
+	key := runKey(accountID, start, end)
+	var spendable, drawn int64
+	for _, source := range f.walletSources {
+		if source.remaining <= 0 || (!source.expiresAt.IsZero() && !source.expiresAt.After(time.Now())) {
+			continue
+		}
+		spendable += source.remaining
+	}
+	for _, draw := range f.walletDraws[key] {
+		drawn += draw.amount
+	}
+	return cycle.WalletCreditState{
+		Mode:                   f.walletMode,
+		SpendableBalanceMicros: spendable,
+		PeriodDrawnMicros:      drawn,
+	}, nil
+}
+
+func (f *fakeStore) DrawWalletCredits(_ context.Context, accountID uuid.UUID, start, end time.Time, amountMicros int64, allowNew bool) (cycle.WalletDrawdown, error) {
+	key := runKey(accountID, start, end)
+	if prior := f.walletDraws[key]; len(prior) > 0 {
+		var total int64
+		for _, draw := range prior {
+			total += draw.amount
+		}
+		return cycle.WalletDrawdown{Mode: f.walletMode, DrawnMicros: total}, nil
+	}
+	if !allowNew || amountMicros <= 0 {
+		return cycle.WalletDrawdown{Mode: f.walletMode}, nil
+	}
+
+	sources := make([]*fakeWalletSource, 0, len(f.walletSources))
+	for _, source := range f.walletSources {
+		if source.remaining > 0 && (source.expiresAt.IsZero() || source.expiresAt.After(time.Now())) {
+			sources = append(sources, source)
+		}
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		a, b := sources[i], sources[j]
+		tier := func(source *fakeWalletSource) int {
+			switch {
+			case source.typ == "grant" && !source.expiresAt.IsZero():
+				return 0
+			case source.typ == "grant", source.typ == "preallocation", source.typ == "refund", source.typ == "adjustment":
+				return 1
+			default:
+				return 2
+			}
+		}
+		if ta, tb := tier(a), tier(b); ta != tb {
+			return ta < tb
+		}
+		if !a.expiresAt.Equal(b.expiresAt) {
+			if a.expiresAt.IsZero() {
+				return false
+			}
+			if b.expiresAt.IsZero() {
+				return true
+			}
+			return a.expiresAt.Before(b.expiresAt)
+		}
+		if !a.createdAt.Equal(b.createdAt) {
+			return a.createdAt.Before(b.createdAt)
+		}
+		return a.id.String() < b.id.String()
+	})
+
+	target := amountMicros
+	if f.walletMode == cycle.CreditBillingModeStandard {
+		var available int64
+		for _, source := range sources {
+			available += source.remaining
+		}
+		if target > available {
+			target = available
+		}
+	}
+	left := target
+	for _, source := range sources {
+		if left == 0 {
+			break
+		}
+		consume := source.remaining
+		if consume > left {
+			consume = left
+		}
+		source.remaining -= consume
+		left -= consume
+		f.walletDraws[key] = append(f.walletDraws[key], fakeWalletDraw{sourceID: source.id, amount: consume})
+		f.walletDrawOrder = append(f.walletDrawOrder, source.id)
+	}
+	if left > 0 { // credits mode may spend through zero into its configured limit
+		f.walletDraws[key] = append(f.walletDraws[key], fakeWalletDraw{amount: left})
+		f.walletUnallocated += left
+		left = 0
+	}
+	return cycle.WalletDrawdown{Mode: f.walletMode, DrawnMicros: target}, nil
 }
 
 func (f *fakeStore) HasUsableDefaultPM(_ context.Context, accountID uuid.UUID) (bool, error) {

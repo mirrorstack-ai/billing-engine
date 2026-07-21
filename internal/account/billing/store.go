@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -153,6 +154,53 @@ type Store interface {
 	// customer must still be the invoice's Stripe customer before Stripe is
 	// asked to collect (the invoice's payer was frozen at creation).
 	AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error)
+
+	// CreditStanding returns the account's authoritative posted wallet balance,
+	// billing policy, credit limit, and optional auto-top-up configuration.
+	CreditStanding(ctx context.Context, accountID uuid.UUID) (CreditStandingRow, error)
+
+	// ListCreditLedger returns a newest-first keyset page. limit is already
+	// service-clamped and normally includes one look-ahead row.
+	ListCreditLedger(ctx context.Context, accountID uuid.UUID, limit int32, cursor *CreditLedgerCursor) ([]CreditLedgerEntry, error)
+
+	// CreditLedgerByIdempotencyKey resolves a global client/server idempotency
+	// key across purchases and grants. found=false is the normal fresh-key case.
+	CreditLedgerByIdempotencyKey(ctx context.Context, key string) (CreditLedgerRecord, bool, error)
+
+	// CreatePendingCreditPurchase serializes on the account, computes the
+	// prospective balance snapshot, and appends one pending purchase row.
+	CreatePendingCreditPurchase(ctx context.Context, accountID uuid.UUID, amountMicros int64, idempotencyKey string) (CreditPurchaseRow, error)
+
+	// CreditPurchase returns an owned purchase row. The account scope prevents
+	// purchase-id enumeration across owners.
+	CreditPurchase(ctx context.Context, purchaseID, accountID uuid.UUID) (CreditPurchaseRow, bool, error)
+
+	// AttachCreditPurchaseInvoice durably binds Stripe's invoice before it is
+	// finalized. Reapplying the same invoice is idempotent.
+	AttachCreditPurchaseInvoice(ctx context.Context, purchaseID, accountID uuid.UUID, stripeInvoiceID, receiptURL string) error
+
+	// FinalizeCreditPurchase applies a terminal pending→settled|failed
+	// transition and enriches the receipt URL. Terminal replays are no-ops.
+	FinalizeCreditPurchase(ctx context.Context, purchaseID, accountID uuid.UUID, status, receiptURL string) (CreditPurchaseRow, error)
+
+	// UpsertCreditAutoTopUp stores the already validated account configuration.
+	UpsertCreditAutoTopUp(ctx context.Context, accountID uuid.UUID, cfg AutoTopUpConfig) (AutoTopUpConfig, error)
+
+	// SetCreditBillingMode updates the wallet mode and its resolved non-negative
+	// limit in one statement.
+	SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) error
+
+	// DistributorCustomerAccount validates the distributor→customer relation
+	// represented by org_billing_designations and returns the customer account.
+	DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error)
+
+	// ListDistributorCustomerStates returns wallet snapshots for every related
+	// customer org, sorted deterministically by org id.
+	ListDistributorCustomerStates(ctx context.Context, distributorOrgID uuid.UUID) ([]DistributorCustomerState, error)
+
+	// InsertCreditGrant serializes on the customer account and appends a settled
+	// grant with its post-entry balance snapshot.
+	InsertCreditGrant(ctx context.Context, accountID uuid.UUID, amountMicros int64, actor, idempotencyKey string, expiresAt *time.Time) (CreditLedgerRecord, error)
 }
 
 // AddCardRequestStatus is the projection of an add_card_requests row
@@ -550,6 +598,431 @@ func (s *pgxStore) HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) 
 
 func (s *pgxStore) AccountStripeCustomer(ctx context.Context, accountID uuid.UUID) (string, error) {
 	return s.q.AccountStripeCustomer(ctx, accountID.String())
+}
+
+func (s *pgxStore) CreditStanding(ctx context.Context, accountID uuid.UUID) (CreditStandingRow, error) {
+	row, err := s.q.GetCreditStandingSnapshot(ctx, accountID.String())
+	if err != nil {
+		return CreditStandingRow{}, err
+	}
+	mode, err := parseCreditBillingMode(row.BillingMode)
+	if err != nil {
+		return CreditStandingRow{}, err
+	}
+	out := CreditStandingRow{
+		BillingMode:       mode,
+		BalanceMicros:     row.BalanceMicros,
+		CreditLimitMicros: row.CreditLimitMicros,
+	}
+	if row.AutoTopupConfigured {
+		out.AutoTopUp = &AutoTopUpConfig{
+			Enabled:         row.AutoTopupEnabled,
+			ThresholdMicros: row.AutoTopupThresholdMicros,
+			AmountMicros:    row.AutoTopupAmountMicros,
+			PaymentMethodID: row.AutoTopupPaymentMethodID,
+		}
+	}
+	return out, nil
+}
+
+func (s *pgxStore) ListCreditLedger(ctx context.Context, accountID uuid.UUID, limit int32, cursor *CreditLedgerCursor) ([]CreditLedgerEntry, error) {
+	params := db.ListCreditLedgerPageParams{
+		AccountID: accountID.String(),
+		PageLimit: limit,
+	}
+	if cursor != nil {
+		params.CursorCreatedAt = pgtype.Timestamptz{Time: cursor.CreatedAt, Valid: true}
+		params.CursorID = nullableUUID(cursor.ID)
+	}
+	rows, err := s.q.ListCreditLedgerPage(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CreditLedgerEntry, 0, len(rows))
+	for _, row := range rows {
+		if _, err := uuid.Parse(row.ID); err != nil {
+			return nil, fmt.Errorf("parse credit ledger id %q: %w", row.ID, err)
+		}
+		out = append(out, CreditLedgerEntry{
+			ID:                 row.ID,
+			AmountMicros:       row.AmountMicros,
+			Type:               row.Type,
+			Status:             row.Status,
+			BalanceAfterMicros: row.BalanceAfterMicros,
+			Actor:              row.Actor,
+			ReceiptURL:         nullableTextValue(row.ReceiptUrl),
+			ExpiresAt:          nullableTimeValue(row.ExpiresAt),
+			CreatedAt:          row.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) CreditLedgerByIdempotencyKey(ctx context.Context, key string) (CreditLedgerRecord, bool, error) {
+	row, err := s.q.GetCreditLedgerEntryByIdempotencyKey(ctx, key)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CreditLedgerRecord{}, false, nil
+	}
+	if err != nil {
+		return CreditLedgerRecord{}, false, err
+	}
+	record, err := creditLedgerRecordFromGenerated(
+		row.ID,
+		row.AccountID,
+		row.AmountMicros,
+		row.Type,
+		row.Status,
+		row.BalanceAfterMicros,
+		row.Actor,
+		row.IdempotencyKey,
+		row.StripeInvoiceID,
+		row.ReceiptUrl,
+		row.ExpiresAt,
+		row.CreatedAt,
+	)
+	if err != nil {
+		return CreditLedgerRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func (s *pgxStore) CreatePendingCreditPurchase(ctx context.Context, accountID uuid.UUID, amountMicros int64, idempotencyKey string) (CreditPurchaseRow, error) {
+	var row db.InsertPendingCreditPurchaseRow
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		balance, err := qtx.LockCreditAccountBalance(ctx, accountID.String())
+		if err != nil {
+			return err
+		}
+		balanceAfter, err := checkedAddMicros(balance.BalanceMicros, amountMicros)
+		if err != nil {
+			return err
+		}
+		row, err = qtx.InsertPendingCreditPurchase(ctx, db.InsertPendingCreditPurchaseParams{
+			AccountID:          accountID.String(),
+			AmountMicros:       amountMicros,
+			BalanceAfterMicros: balanceAfter,
+			IdempotencyKey:     idempotencyKey,
+		})
+		return err
+	})
+	if err != nil {
+		return CreditPurchaseRow{}, err
+	}
+	return creditPurchaseRowFromGenerated(
+		row.ID,
+		row.AccountID,
+		row.AmountMicros,
+		row.Type,
+		row.Status,
+		row.BalanceAfterMicros,
+		row.Actor,
+		row.IdempotencyKey,
+		row.StripeInvoiceID,
+		row.ReceiptUrl,
+		row.CreatedAt,
+	)
+}
+
+func (s *pgxStore) CreditPurchase(ctx context.Context, purchaseID, accountID uuid.UUID) (CreditPurchaseRow, bool, error) {
+	row, err := s.q.GetCreditPurchaseByID(ctx, db.GetCreditPurchaseByIDParams{
+		PurchaseID: purchaseID.String(),
+		AccountID:  accountID.String(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CreditPurchaseRow{}, false, nil
+	}
+	if err != nil {
+		return CreditPurchaseRow{}, false, err
+	}
+	out, err := creditPurchaseRowFromGenerated(
+		row.ID,
+		row.AccountID,
+		row.AmountMicros,
+		row.Type,
+		row.Status,
+		row.BalanceAfterMicros,
+		row.Actor,
+		row.IdempotencyKey,
+		row.StripeInvoiceID,
+		row.ReceiptUrl,
+		row.CreatedAt,
+	)
+	if err != nil {
+		return CreditPurchaseRow{}, false, err
+	}
+	return out, true, nil
+}
+
+func (s *pgxStore) AttachCreditPurchaseInvoice(ctx context.Context, purchaseID, accountID uuid.UUID, stripeInvoiceID, receiptURL string) error {
+	_, err := s.q.AttachCreditPurchaseInvoice(ctx, db.AttachCreditPurchaseInvoiceParams{
+		StripeInvoiceID: stripeInvoiceID,
+		ReceiptUrl:      receiptURL,
+		PurchaseID:      purchaseID.String(),
+		AccountID:       accountID.String(),
+	})
+	return err
+}
+
+func (s *pgxStore) FinalizeCreditPurchase(ctx context.Context, purchaseID, accountID uuid.UUID, status, receiptURL string) (CreditPurchaseRow, error) {
+	var out CreditPurchaseRow
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		balance, err := qtx.LockCreditAccountBalance(ctx, accountID.String())
+		if err != nil {
+			return err
+		}
+		purchase, err := qtx.GetCreditPurchaseByID(ctx, db.GetCreditPurchaseByIDParams{
+			PurchaseID: purchaseID.String(),
+			AccountID:  accountID.String(),
+		})
+		if err != nil {
+			return err
+		}
+		if purchase.Status != "pending" {
+			out, err = creditPurchaseRowFromGenerated(
+				purchase.ID,
+				purchase.AccountID,
+				purchase.AmountMicros,
+				purchase.Type,
+				purchase.Status,
+				purchase.BalanceAfterMicros,
+				purchase.Actor,
+				purchase.IdempotencyKey,
+				purchase.StripeInvoiceID,
+				purchase.ReceiptUrl,
+				purchase.CreatedAt,
+			)
+			return err
+		}
+
+		balanceAfter := balance.BalanceMicros
+		if status == "settled" {
+			balanceAfter, err = checkedAddMicros(balanceAfter, purchase.AmountMicros)
+			if err != nil {
+				return err
+			}
+		} else if status != "failed" {
+			return fmt.Errorf("unsupported credit purchase terminal status %q", status)
+		}
+
+		finalized, err := qtx.FinalizeCreditPurchase(ctx, db.FinalizeCreditPurchaseParams{
+			Status:             status,
+			BalanceAfterMicros: balanceAfter,
+			ReceiptUrl:         receiptURL,
+			PurchaseID:         purchaseID.String(),
+			AccountID:          accountID.String(),
+		})
+		if err != nil {
+			return err
+		}
+		out, err = creditPurchaseRowFromGenerated(
+			finalized.ID,
+			finalized.AccountID,
+			finalized.AmountMicros,
+			finalized.Type,
+			finalized.Status,
+			finalized.BalanceAfterMicros,
+			finalized.Actor,
+			finalized.IdempotencyKey,
+			finalized.StripeInvoiceID,
+			finalized.ReceiptUrl,
+			finalized.CreatedAt,
+		)
+		return err
+	})
+	return out, err
+}
+
+func (s *pgxStore) UpsertCreditAutoTopUp(ctx context.Context, accountID uuid.UUID, cfg AutoTopUpConfig) (AutoTopUpConfig, error) {
+	row, err := s.q.UpsertCreditAutoTopUp(ctx, db.UpsertCreditAutoTopUpParams{
+		AccountID:       accountID.String(),
+		Enabled:         cfg.Enabled,
+		ThresholdMicros: cfg.ThresholdMicros,
+		AmountMicros:    cfg.AmountMicros,
+		PaymentMethodID: cfg.PaymentMethodID,
+	})
+	if err != nil {
+		return AutoTopUpConfig{}, err
+	}
+	return AutoTopUpConfig{
+		Enabled:         row.Enabled,
+		ThresholdMicros: row.ThresholdMicros,
+		AmountMicros:    row.AmountMicros,
+		PaymentMethodID: row.PaymentMethodID,
+	}, nil
+}
+
+func (s *pgxStore) SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) error {
+	_, err := s.q.SetCreditAccountBillingMode(ctx, db.SetCreditAccountBillingModeParams{
+		BillingMode:       string(mode),
+		CreditLimitMicros: creditLimitMicros,
+		AccountID:         accountID.String(),
+	})
+	return err
+}
+
+func (s *pgxStore) DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {
+	id, err := s.q.GetDistributorCustomerAccount(ctx, db.GetDistributorCustomerAccountParams{
+		DistributorOrgID: distributorOrgID.String(),
+		CustomerOrgID:    customerOrgID.String(),
+	})
+	return uuidRowFound(id, err)
+}
+
+func (s *pgxStore) ListDistributorCustomerStates(ctx context.Context, distributorOrgID uuid.UUID) ([]DistributorCustomerState, error) {
+	rows, err := s.q.ListDistributorCustomerSnapshots(ctx, distributorOrgID.String())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DistributorCustomerState, 0, len(rows))
+	for _, row := range rows {
+		customerOrgID, err := uuid.Parse(row.CustomerOrgID)
+		if err != nil {
+			return nil, fmt.Errorf("parse distributor customer org id %q: %w", row.CustomerOrgID, err)
+		}
+		mode, err := parseCreditBillingMode(row.BillingMode)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, DistributorCustomerState{
+			CustomerOrgID:            customerOrgID,
+			BillingMode:              mode,
+			CreditLimitMicros:        row.CreditLimitMicros,
+			AutoTopUpEnabled:         row.AutoTopupEnabled,
+			AutoTopUpThresholdMicros: row.AutoTopupThresholdMicros,
+			BalanceMicros:            row.BalanceMicros,
+		})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) InsertCreditGrant(ctx context.Context, accountID uuid.UUID, amountMicros int64, actor, idempotencyKey string, expiresAt *time.Time) (CreditLedgerRecord, error) {
+	var row db.InsertSettledCreditGrantRow
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		balance, err := qtx.LockCreditAccountBalance(ctx, accountID.String())
+		if err != nil {
+			return err
+		}
+		balanceAfter, err := checkedAddMicros(balance.BalanceMicros, amountMicros)
+		if err != nil {
+			return err
+		}
+		row, err = qtx.InsertSettledCreditGrant(ctx, db.InsertSettledCreditGrantParams{
+			AccountID:          accountID.String(),
+			AmountMicros:       amountMicros,
+			BalanceAfterMicros: balanceAfter,
+			Actor:              actor,
+			IdempotencyKey:     idempotencyKey,
+			ExpiresAt:          nullableTimestamptz(expiresAt),
+		})
+		return err
+	})
+	if err != nil {
+		return CreditLedgerRecord{}, err
+	}
+	id, err := uuid.Parse(row.ID)
+	if err != nil {
+		return CreditLedgerRecord{}, err
+	}
+	return CreditLedgerRecord{
+		ID:                 id,
+		AccountID:          accountID,
+		AmountMicros:       amountMicros,
+		Type:               "grant",
+		Status:             "settled",
+		BalanceAfterMicros: row.BalanceAfterMicros,
+		Actor:              actor,
+		IdempotencyKey:     idempotencyKey,
+		ExpiresAt:          expiresAt,
+	}, nil
+}
+
+func parseCreditBillingMode(raw string) (BillingMode, error) {
+	mode := BillingMode(raw)
+	if mode != BillingModeStandard && mode != BillingModeCredits {
+		return "", fmt.Errorf("unknown credit billing mode %q", raw)
+	}
+	return mode, nil
+}
+
+func creditPurchaseRowFromGenerated(idRaw, accountIDRaw string, amountMicros int64, typ, status string, balanceAfterMicros int64, actor, idempotencyKey, stripeInvoiceID, receiptURL string, createdAt time.Time) (CreditPurchaseRow, error) {
+	id, err := uuid.Parse(idRaw)
+	if err != nil {
+		return CreditPurchaseRow{}, err
+	}
+	accountID, err := uuid.Parse(accountIDRaw)
+	if err != nil {
+		return CreditPurchaseRow{}, err
+	}
+	return CreditPurchaseRow{
+		ID:                 id,
+		AccountID:          accountID,
+		AmountMicros:       amountMicros,
+		Type:               typ,
+		Status:             status,
+		BalanceAfterMicros: balanceAfterMicros,
+		Actor:              actor,
+		IdempotencyKey:     idempotencyKey,
+		StripeInvoiceID:    stripeInvoiceID,
+		ReceiptURL:         receiptURL,
+		CreatedAt:          createdAt,
+	}, nil
+}
+
+func creditLedgerRecordFromGenerated(idRaw, accountIDRaw string, amountMicros int64, typ, status string, balanceAfterMicros int64, actor, idempotencyKey, stripeInvoiceID, receiptURL string, expiresAt pgtype.Timestamptz, createdAt time.Time) (CreditLedgerRecord, error) {
+	id, err := uuid.Parse(idRaw)
+	if err != nil {
+		return CreditLedgerRecord{}, err
+	}
+	accountID, err := uuid.Parse(accountIDRaw)
+	if err != nil {
+		return CreditLedgerRecord{}, err
+	}
+	return CreditLedgerRecord{
+		ID:                 id,
+		AccountID:          accountID,
+		AmountMicros:       amountMicros,
+		Type:               typ,
+		Status:             status,
+		BalanceAfterMicros: balanceAfterMicros,
+		Actor:              actor,
+		IdempotencyKey:     idempotencyKey,
+		StripeInvoiceID:    stripeInvoiceID,
+		ReceiptURL:         receiptURL,
+		ExpiresAt:          nullableTimeValue(expiresAt),
+		CreatedAt:          createdAt,
+	}, nil
+}
+
+func checkedAddMicros(a, b int64) (int64, error) {
+	if (b > 0 && a > math.MaxInt64-b) || (b < 0 && a < math.MinInt64-b) {
+		return 0, fmt.Errorf("credit balance overflows int64 micros")
+	}
+	return a + b, nil
+}
+
+func nullableTextValue(value pgtype.Text) string {
+	if !value.Valid {
+		return ""
+	}
+	return value.String
+}
+
+func nullableTimeValue(value pgtype.Timestamptz) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	t := value.Time
+	return &t
+}
+
+func nullableTimestamptz(value *time.Time) pgtype.Timestamptz {
+	if value == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: *value, Valid: true}
 }
 
 // centsNumericToMicros converts the invoices mirror's NUMERIC whole Stripe

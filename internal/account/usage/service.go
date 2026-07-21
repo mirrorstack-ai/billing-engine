@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
@@ -41,6 +43,7 @@ type Service struct {
 	store  Store
 	nowFn  func() time.Time
 	budget BudgetEvaluator
+	credit credit.UsageEvaluator
 }
 
 // NewService wires a Service. store is required; passing nil panics at
@@ -60,6 +63,15 @@ func (s *Service) WithNow(now func() time.Time) *Service {
 // leaves budgets unwired (the hook is skipped).
 func (s *Service) WithBudgetEvaluator(b BudgetEvaluator) *Service {
 	s.budget = b
+	return s
+}
+
+// WithCreditEvaluator attaches the disposable-wallet estimate + auto-top-up
+// hook. Like the budget hook, it is invoked only for a newly inserted event and
+// every error is logged and swallowed so metering never depends on Redis or a
+// payment rail.
+func (s *Service) WithCreditEvaluator(e credit.UsageEvaluator) *Service {
+	s.credit = e
 	return s
 }
 
@@ -169,7 +181,7 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 	// event fell in) so the budget is checked against exactly what the user
 	// sees. A lazy event (accountID == Nil) has no payer account to anchor on,
 	// so it falls back to the calendar month (DefaultAnchorDay).
-	if recorded && s.budget != nil {
+	if recorded && (s.budget != nil || s.credit != nil) {
 		anchorDay := billingperiod.DefaultAnchorDay
 		if accountID != uuid.Nil {
 			if d, err := s.store.AccountAnchorDay(ctx, accountID); err != nil {
@@ -180,13 +192,51 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 			}
 		}
 		start, end := billingperiod.AnchoredPeriodWindow(recordedAt.UTC(), anchorDay)
-		if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, start, end); err != nil {
-			slog.Error("budget evaluation failed (usage still recorded)",
-				"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
+		if s.budget != nil {
+			if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, start, end); err != nil {
+				slog.Error("budget evaluation failed (usage still recorded)",
+					"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
+			}
+		}
+		if s.credit != nil && accountID != uuid.Nil {
+			delta, err := approximateUsageChargeMicros(req.Metric, req.Value, def)
+			if err != nil {
+				slog.Error("credit estimate pricing failed (usage still recorded)",
+					"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
+			} else if err := s.credit.EvaluateCreditUsage(ctx, credit.UsageEvent{
+				AccountID:               accountID,
+				AppID:                   req.AppID,
+				EventID:                 req.EventID,
+				ApproximateChargeMicros: delta,
+				PeriodStart:             start,
+				PeriodEnd:               end,
+			}); err != nil {
+				slog.Error("credit estimate/top-up evaluation failed (usage still recorded)",
+					"app_id", req.AppID, "account_id", accountID, "metric", req.Metric, "error", err)
+			}
 		}
 	}
 
 	return &RecordUsageResponse{Recorded: recorded}, nil
+}
+
+// approximateUsageChargeMicros prices one newly accepted event for the
+// disposable fast-path counter. The authoritative wallet debit still uses the
+// rolled/boundary bill. Count/sum events are naturally additive; peak and
+// time-weighted events intentionally use the same conservative per-event
+// approximation and are overwritten by live bill math at reconciliation.
+func approximateUsageChargeMicros(metric string, value float64, def MetricDefinition) (int64, error) {
+	if !def.Priced || def.UnitPriceMicros == 0 || value == 0 {
+		return 0, nil
+	}
+	charge := value * float64(def.UnitPriceMicros)
+	if isReservedMetric(metric) {
+		charge = charge * 12 / 10
+	}
+	if math.IsNaN(charge) || math.IsInf(charge, 0) || charge > float64(math.MaxInt64) {
+		return 0, fmt.Errorf("approximate charge is outside int64 micros")
+	}
+	return int64(math.Floor(charge + 0.5)), nil
 }
 
 // GetUsageSummary returns the live current-period charged_micros per
