@@ -1,10 +1,15 @@
 package stripe
 
 import (
+	"bytes"
+	"context"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	stripego "github.com/stripe/stripe-go/v85"
+	stripeclient "github.com/stripe/stripe-go/v85/client"
 )
 
 // TestNewClient is a smoke test: NewClient returns a non-nil Client
@@ -71,4 +76,111 @@ func TestItemPeriodParams(t *testing.T) {
 			require.Nil(t, itemPeriodParams(tt.period))
 		})
 	}
+}
+
+func TestProjectInvoice_ConfirmationSecret(t *testing.T) {
+	got := projectInvoice(&stripego.Invoice{
+		ID: "in_credit_purchase",
+		ConfirmationSecret: &stripego.InvoiceConfirmationSecret{
+			ClientSecret: "pi_secret_for_client",
+		},
+	})
+
+	require.Equal(t, "pi_secret_for_client", got.ClientSecret)
+}
+
+func TestFinalizeInvoice_ExpandsAndProjectsConfirmationSecret(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodPost,
+		wantPath:   "/v1/invoices/in_credit_purchase/finalize",
+		response: stripego.Invoice{
+			ID: "in_credit_purchase",
+			ConfirmationSecret: &stripego.InvoiceConfirmationSecret{
+				ClientSecret: "pi_secret_from_finalize",
+			},
+		},
+		checkParams: func(params stripego.ParamsContainer) {
+			got, ok := params.(*stripego.InvoiceFinalizeInvoiceParams)
+			require.True(t, ok)
+			require.Len(t, got.Expand, 1)
+			require.Equal(t, "confirmation_secret", *got.Expand[0])
+			require.Equal(t, "credit-purchase-finalize", *got.IdempotencyKey)
+		},
+	}
+	client := testRealClient(backend)
+	got, err := client.FinalizeInvoice(context.Background(), "in_credit_purchase", "credit-purchase-finalize")
+
+	require.NoError(t, err)
+	require.Equal(t, "pi_secret_from_finalize", got.ClientSecret)
+}
+
+func TestGetInvoice_ExpandsAndProjectsConfirmationSecret(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodGet,
+		wantPath:   "/v1/invoices/in_credit_purchase",
+		response: stripego.Invoice{
+			ID: "in_credit_purchase",
+			ConfirmationSecret: &stripego.InvoiceConfirmationSecret{
+				ClientSecret: "pi_secret_from_get",
+			},
+		},
+		checkParams: func(params stripego.ParamsContainer) {
+			got, ok := params.(*stripego.InvoiceParams)
+			require.True(t, ok)
+			require.Len(t, got.Expand, 1)
+			require.Equal(t, "confirmation_secret", *got.Expand[0])
+		},
+	}
+	client := testRealClient(backend)
+	got, err := client.GetInvoice(context.Background(), "in_credit_purchase")
+
+	require.NoError(t, err)
+	require.Equal(t, "pi_secret_from_get", got.ClientSecret)
+}
+
+type invoiceTestBackend struct {
+	t           *testing.T
+	wantMethod  string
+	wantPath    string
+	checkParams func(stripego.ParamsContainer)
+	response    stripego.Invoice
+}
+
+func (b *invoiceTestBackend) Call(method, path, _ string, params stripego.ParamsContainer, v stripego.LastResponseSetter) error {
+	b.t.Helper()
+	require.Equal(b.t, b.wantMethod, method)
+	require.Equal(b.t, b.wantPath, path)
+	b.checkParams(params)
+	got, ok := v.(*stripego.Invoice)
+	require.True(b.t, ok)
+	*got = b.response
+	return nil
+}
+
+func (*invoiceTestBackend) CallStreaming(string, string, string, stripego.ParamsContainer, stripego.StreamingLastResponseSetter) error {
+	panic("unexpected streaming Stripe call")
+}
+
+func (*invoiceTestBackend) CallRaw(string, string, string, []byte, *stripego.Params, stripego.LastResponseSetter) error {
+	panic("unexpected raw Stripe call")
+}
+
+func (*invoiceTestBackend) CallMultipart(string, string, string, string, *bytes.Buffer, *stripego.Params, stripego.LastResponseSetter) error {
+	panic("unexpected multipart Stripe call")
+}
+
+func (*invoiceTestBackend) SetMaxNetworkRetries(int64) {}
+
+func testRealClient(backend stripego.Backend) *realClient {
+	backends := &stripego.Backends{
+		API:         backend,
+		Connect:     backend,
+		Uploads:     backend,
+		MeterEvents: backend,
+	}
+	sc := &stripeclient.API{}
+	sc.Init("sk_test_dummy", backends)
+	return &realClient{sc: sc}
 }

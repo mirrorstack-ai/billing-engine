@@ -29,6 +29,10 @@ type Service struct {
 	// nil until wired — only ListSponsoredOrgs depends on it (the charge/rollup
 	// legs never touch it), so rollup-only wiring leaves it nil.
 	bill AccountBillReader
+	// estimate is the disposable accrued-estimate cache reconciler. Boundary
+	// pricing is authoritative, so RunBillingCycle overwrites the cache from the
+	// true total best-effort; cache failure must never block billing.
+	estimate BoundaryEstimateReconciler
 }
 
 // AccountBillReader is the account-bill read ListSponsoredOrgs reuses to price
@@ -36,6 +40,12 @@ type Service struct {
 // on purpose: only GetAccountBill's TotalMicros feeds the sponsored roster.
 type AccountBillReader interface {
 	GetAccountBill(ctx context.Context, req usage.GetAccountBillRequest) (*usage.GetAccountBillResponse, error)
+}
+
+// BoundaryEstimateReconciler is the narrow cache seam used at an authoritative
+// cycle boundary. Implementations must treat Set as an overwrite, not a delta.
+type BoundaryEstimateReconciler interface {
+	Set(ctx context.Context, accountID uuid.UUID, periodStart time.Time, amountMicros int64) error
 }
 
 // NewService wires a Service. store is required; passing nil panics at the
@@ -152,6 +162,13 @@ func (s *Service) WithNow(now func() time.Time) *Service {
 // ListSponsoredOrgs needs it. Returns the Service for chaining.
 func (s *Service) WithAccountBill(bill AccountBillReader) *Service {
 	s.bill = bill
+	return s
+}
+
+// WithBoundaryEstimateReconciler injects the disposable usage-estimate cache.
+// It is optional: nil and failed writes both leave the charge path unaffected.
+func (s *Service) WithBoundaryEstimateReconciler(estimate BoundaryEstimateReconciler) *Service {
+	s.estimate = estimate
 	return s
 }
 

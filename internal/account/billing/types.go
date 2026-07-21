@@ -246,9 +246,231 @@ type GetServiceStatusRequest struct {
 // machine-readable cause (eligibility.Reason, "ELIGIBLE" when not blocked);
 // Reasons lists every failing gate (omitted when eligible).
 type GetServiceStatusResponse struct {
-	Blocked bool     `json:"blocked"`
-	Reason  string   `json:"reason"`
-	Reasons []string `json:"reasons,omitempty"`
+	Blocked     bool     `json:"blocked"`
+	Reason      string   `json:"reason"`
+	Reasons     []string `json:"reasons,omitempty"`
+	BlockReason string   `json:"block_reason,omitempty"`
+}
+
+// BillingMode is the universal-wallet policy stored on a billing account.
+// It is deliberately separate from the arrears/prepaid collection-risk mode.
+type BillingMode string
+
+const (
+	BillingModeStandard BillingMode = "standard"
+	BillingModeCredits  BillingMode = "credits"
+)
+
+// AutoTopUpConfig is the public projection of one account's optional credit
+// auto-top-up configuration.
+type AutoTopUpConfig struct {
+	Enabled         bool   `json:"enabled"`
+	ThresholdMicros int64  `json:"threshold_micros"`
+	AmountMicros    int64  `json:"amount_micros"`
+	PaymentMethodID string `json:"payment_method_id,omitempty"`
+}
+
+// GetCreditStandingRequest addresses one wallet by its owning user or org.
+type GetCreditStandingRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+}
+
+// GetCreditStandingResponse combines the wallet snapshot with the existing
+// payment-standing verdict so consumers can render one coherent state.
+type GetCreditStandingResponse struct {
+	BillingMode       BillingMode      `json:"billing_mode"`
+	BalanceMicros     int64            `json:"balance_micros"`
+	CreditLimitMicros int64            `json:"credit_limit_micros"`
+	AutoTopUp         *AutoTopUpConfig `json:"auto_topup,omitempty"`
+	Blocked           bool             `json:"blocked"`
+	BlockReason       string           `json:"block_reason,omitempty"`
+}
+
+// ListCreditLedgerRequest asks for a newest-first keyset page of the wallet
+// journal. Cursor is opaque to callers.
+type ListCreditLedgerRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	Limit       int       `json:"limit,omitempty"`
+	Cursor      string    `json:"cursor,omitempty"`
+}
+
+// CreditLedgerEntry is one immutable money-journal row on the wire.
+type CreditLedgerEntry struct {
+	ID                 string     `json:"id"`
+	AmountMicros       int64      `json:"amount_micros"`
+	Type               string     `json:"type"`
+	Status             string     `json:"status"`
+	BalanceAfterMicros int64      `json:"balance_after_micros"`
+	Actor              string     `json:"actor"`
+	ReceiptURL         string     `json:"receipt_url,omitempty"`
+	ExpiresAt          *time.Time `json:"expires_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+}
+
+// ListCreditLedgerResponse is one journal page. An empty next_cursor means
+// the page exhausted the account's history.
+type ListCreditLedgerResponse struct {
+	Entries    []CreditLedgerEntry `json:"entries"`
+	NextCursor string              `json:"next_cursor"`
+}
+
+// StartCreditPurchaseRequest opens an idempotent Stripe-backed wallet top-up.
+type StartCreditPurchaseRequest struct {
+	OwnerUserID    uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID     uuid.UUID `json:"owner_org_id,omitempty"`
+	AmountMicros   int64     `json:"amount_micros"`
+	IdempotencyKey string    `json:"idempotency_key"`
+}
+
+// StripePurchaseInit is the Stripe rail's client-confirmation payload.
+type StripePurchaseInit struct {
+	ClientSecret     string `json:"client_secret"`
+	HostedInvoiceURL string `json:"hosted_invoice_url,omitempty"`
+}
+
+// NewebPayPurchaseInit reserves the alternate rail's form-post payload.
+type NewebPayPurchaseInit struct {
+	ActionURL string            `json:"action_url"`
+	Fields    map[string]string `json:"fields"`
+}
+
+// StartCreditPurchaseResponse is rail-discriminated. PurchaseID is the
+// durable pending-ledger handle used by FinishCreditPurchase.
+type StartCreditPurchaseResponse struct {
+	PurchaseID string                `json:"purchase_id"`
+	Rail       string                `json:"rail"`
+	Stripe     *StripePurchaseInit   `json:"stripe,omitempty"`
+	NewebPay   *NewebPayPurchaseInit `json:"newebpay,omitempty"`
+}
+
+type FinishCreditPurchaseRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	PurchaseID  string    `json:"purchase_id"`
+}
+
+type FinishCreditPurchaseResponse struct {
+	Status        string `json:"status"`
+	BalanceMicros int64  `json:"balance_micros"`
+	ReceiptURL    string `json:"receipt_url,omitempty"`
+}
+
+type SetAutoTopUpRequest struct {
+	OwnerUserID     uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID      uuid.UUID `json:"owner_org_id,omitempty"`
+	Enabled         bool      `json:"enabled"`
+	ThresholdMicros int64     `json:"threshold_micros"`
+	AmountMicros    int64     `json:"amount_micros"`
+	PaymentMethodID string    `json:"payment_method_id,omitempty"`
+}
+
+type SetAutoTopUpResponse struct {
+	AutoTopUp AutoTopUpConfig `json:"auto_topup"`
+}
+
+// SetCustomerBillingModeRequest supports the pinned owner/distributor fields.
+// CreditLimitMicros is additive and optional: omitting it while enabling
+// credits applies the platform's $5 default; a pointer preserves explicit 0.
+type SetCustomerBillingModeRequest struct {
+	OwnerUserID       uuid.UUID   `json:"owner_user_id,omitempty"`
+	OwnerOrgID        uuid.UUID   `json:"owner_org_id,omitempty"`
+	DistributorOrgID  uuid.UUID   `json:"distributor_org_id,omitempty"`
+	BillingMode       BillingMode `json:"billing_mode"`
+	CreditLimitMicros *int64      `json:"credit_limit_micros,omitempty"`
+}
+
+type SetCustomerBillingModeResponse struct {
+	BillingMode BillingMode `json:"billing_mode"`
+}
+
+type ListDistributorCustomersRequest struct {
+	DistributorOrgID uuid.UUID `json:"distributor_org_id"`
+}
+
+// DistributorCustomerRow mirrors the pinned core fields and includes the
+// richer wallet snapshot required by the distributor billing surface.
+type DistributorCustomerRow struct {
+	CustomerOrgID     uuid.UUID   `json:"customer_org_id"`
+	BillingMode       BillingMode `json:"billing_mode"`
+	CreditLimitMicros int64       `json:"credit_limit_micros"`
+	Standing          string      `json:"standing"`
+	AutoTopUpEnabled  bool        `json:"auto_topup_enabled"`
+	BalanceMicros     int64       `json:"balance_micros"`
+}
+
+type ListDistributorCustomersResponse struct {
+	Customers []DistributorCustomerRow `json:"customers"`
+}
+
+// GrantCreditsRequest accepts the pinned distributor grant shape. ExpiresAt is
+// an additive optional field supported by the ledger's expiring-grant column.
+type GrantCreditsRequest struct {
+	DistributorOrgID uuid.UUID  `json:"distributor_org_id"`
+	CustomerOrgID    uuid.UUID  `json:"customer_org_id"`
+	AmountMicros     int64      `json:"amount_micros"`
+	Actor            string     `json:"actor"`
+	IdempotencyKey   string     `json:"idempotency_key"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+}
+
+type GrantCreditsResponse struct {
+	LedgerID      string `json:"ledger_id"`
+	BalanceMicros int64  `json:"balance_micros"`
+}
+
+// CreditStandingRow and CreditPurchaseRow are store projections used by the
+// RPC service. They intentionally have no JSON tags: only the types above are
+// part of the wire contract.
+type CreditStandingRow struct {
+	BillingMode       BillingMode
+	BalanceMicros     int64
+	CreditLimitMicros int64
+	AutoTopUp         *AutoTopUpConfig
+}
+
+type CreditPurchaseRow struct {
+	ID                 uuid.UUID
+	AccountID          uuid.UUID
+	AmountMicros       int64
+	Type               string
+	Status             string
+	BalanceAfterMicros int64
+	Actor              string
+	IdempotencyKey     string
+	StripeInvoiceID    string
+	ReceiptURL         string
+	CreatedAt          time.Time
+}
+
+type CreditLedgerRecord struct {
+	ID                 uuid.UUID
+	AccountID          uuid.UUID
+	AmountMicros       int64
+	Type               string
+	Status             string
+	BalanceAfterMicros int64
+	Actor              string
+	IdempotencyKey     string
+	StripeInvoiceID    string
+	ReceiptURL         string
+	ExpiresAt          *time.Time
+	CreatedAt          time.Time
+}
+
+type CreditLedgerCursor struct {
+	CreatedAt time.Time
+	ID        uuid.UUID
+}
+
+type DistributorCustomerState struct {
+	CustomerOrgID            uuid.UUID
+	BillingMode              BillingMode
+	CreditLimitMicros        int64
+	AutoTopUpEnabled         bool
+	AutoTopUpThresholdMicros int64
+	BalanceMicros            int64
 }
 
 // PaymentMethod is the projection of a payment_methods_mirror row

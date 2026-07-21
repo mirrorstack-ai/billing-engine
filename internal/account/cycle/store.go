@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -102,6 +103,23 @@ type Store interface {
 	// PeriodChargedTotal returns Σ usage_aggregates.charged_micros for the
 	// account's period window — the arrears input before allowance-netting.
 	PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+
+	// WalletCreditState is the cheap pre-boundary probe used to preserve the
+	// legacy collection fast path for standard accounts with no wallet balance.
+	// PeriodDrawnMicros makes a reclaimed run re-enter the wallet path even when
+	// its first debit exhausted the available lots.
+	WalletCreditState(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (WalletCreditState, error)
+
+	// DrawWalletCredits atomically applies this boundary's wallet debit after
+	// the true boundary total has been priced, but before collection/PM gates.
+	// A debit is idempotent for (account, period): a reclaimed billing run
+	// returns the already-recorded draw instead of consuming newly-added credit.
+	// Standard accounts consume at most their positive spendable lots; credits
+	// accounts debit the full amount and may therefore end with a negative
+	// balance. allowNew=false is the crash-recovery posture for a run whose
+	// Stripe request was already frozen: existing draw rows are returned, but a
+	// new wallet debit must not be introduced beside money that may have moved.
+	DrawWalletCredits(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time, amountMicros int64, allowNew bool) (WalletDrawdown, error)
 
 	// HasUsableDefaultPM is the no-PM charge gate: true iff the account has an
 	// active, not-expired payment method. Mirrors the billing hot-path gate.
@@ -1030,6 +1048,198 @@ func (s *pgxStore) PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, 
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
 	})
+}
+
+func (s *pgxStore) WalletCreditState(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (WalletCreditState, error) {
+	row, err := s.q.WalletCreditState(ctx, db.WalletCreditStateParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return WalletCreditState{}, err
+	}
+	mode, err := parseCreditBillingMode(row.BillingMode)
+	if err != nil {
+		return WalletCreditState{}, err
+	}
+	if row.SpendableBalanceMicros < 0 || row.PeriodDrawnMicros < 0 {
+		return WalletCreditState{}, fmt.Errorf(
+			"wallet state contains a negative magnitude: spendable=%d period_drawn=%d",
+			row.SpendableBalanceMicros, row.PeriodDrawnMicros,
+		)
+	}
+	return WalletCreditState{
+		Mode:                   mode,
+		SpendableBalanceMicros: row.SpendableBalanceMicros,
+		PeriodDrawnMicros:      row.PeriodDrawnMicros,
+	}, nil
+}
+
+// DrawWalletCredits serializes allocation per account, then appends one signed
+// usage_draw row for each funding lot consumed. The boundary amount currently
+// combines usage arrears and advance fees, so this method cannot honestly split
+// usage_draw from subscription_draw; a future category-specific caller should
+// own subscription_draw. Recovery nevertheless recognizes either type so a
+// period can never acquire a second boundary debit.
+func (s *pgxStore) DrawWalletCredits(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time, amountMicros int64, allowNew bool) (WalletDrawdown, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return WalletDrawdown{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := s.q.WithTx(tx)
+
+	rawMode, err := qtx.LockWalletAccount(ctx, accountID.String())
+	if err != nil {
+		return WalletDrawdown{}, err
+	}
+	mode, err := parseCreditBillingMode(rawMode)
+	if err != nil {
+		return WalletDrawdown{}, err
+	}
+	out := WalletDrawdown{Mode: mode}
+	if _, err := qtx.LockWalletLedgerEntries(ctx, accountID.String()); err != nil {
+		return WalletDrawdown{}, err
+	}
+
+	period, err := qtx.WalletPeriodDraw(ctx, db.WalletPeriodDrawParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return WalletDrawdown{}, err
+	}
+	if period.DrawnMicros < 0 {
+		return WalletDrawdown{}, fmt.Errorf("wallet period draw contains a negative magnitude: %d", period.DrawnMicros)
+	}
+	if period.DrawnMicros > 0 {
+		out.DrawnMicros = period.DrawnMicros
+		if err := tx.Commit(ctx); err != nil {
+			return WalletDrawdown{}, err
+		}
+		return out, nil
+	}
+
+	// The existing draw check deliberately comes first: a frozen reclaim passes
+	// allowNew=false but must still recover a debit from the earlier attempt.
+	if !allowNew || amountMicros <= 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return WalletDrawdown{}, err
+		}
+		return out, nil
+	}
+
+	balanceAfter, err := qtx.WalletSettledBalance(ctx, accountID.String())
+	if err != nil {
+		return WalletDrawdown{}, err
+	}
+
+	left := amountMicros
+	if mode == CreditBillingModeStandard {
+		// Positive lots alone are not enough: settled negative adjustments lower
+		// the authoritative account balance, while unused expired grants must be
+		// removed from that balance before it can cap a standard draw.
+		expiredMicros, err := qtx.WalletExpiredCreditBalance(ctx, accountID.String())
+		if err != nil {
+			return WalletDrawdown{}, err
+		}
+		if expiredMicros < 0 {
+			return WalletDrawdown{}, fmt.Errorf("wallet expired-credit balance is negative: %d", expiredMicros)
+		}
+		if balanceAfter <= expiredMicros {
+			left = 0
+		} else if capMicros := balanceAfter - expiredMicros; left > capMicros {
+			left = capMicros
+		}
+	}
+	target := left
+
+	var lots []db.WalletSpendableLotsRow
+	if left > 0 {
+		lots, err = qtx.WalletSpendableLots(ctx, accountID.String())
+		if err != nil {
+			return WalletDrawdown{}, err
+		}
+	}
+
+	insertDraw := func(consume int64, sourceID string) error {
+		if consume <= 0 {
+			return fmt.Errorf("wallet draw allocation must be positive: %d", consume)
+		}
+		if balanceAfter < math.MinInt64+consume {
+			return fmt.Errorf("wallet balance_after_micros underflow: balance=%d draw=%d", balanceAfter, consume)
+		}
+		balanceAfter -= consume
+
+		source := pgtype.UUID{}
+		keySource := "unsecured"
+		if sourceID != "" {
+			id, err := uuid.Parse(sourceID)
+			if err != nil {
+				return fmt.Errorf("parse wallet source credit id: %w", err)
+			}
+			source = pgtype.UUID{Bytes: id, Valid: true}
+			keySource = id.String()
+		}
+		return qtx.InsertWalletDraw(ctx, db.InsertWalletDrawParams{
+			AccountID:          accountID.String(),
+			AmountMicros:       consume,
+			BalanceAfterMicros: balanceAfter,
+			IdempotencyKey: fmt.Sprintf(
+				"wallet-draw:%s:%s:usage_draw:%s",
+				accountID.String(), period.PeriodID, keySource,
+			),
+			PeriodID:       period.PeriodID,
+			SourceCreditID: source,
+		})
+	}
+
+	for _, lot := range lots {
+		if left == 0 {
+			break
+		}
+		if lot.RemainingMicros <= 0 {
+			return WalletDrawdown{}, fmt.Errorf(
+				"wallet query returned a non-positive lot remainder: source=%s remaining=%d",
+				lot.ID, lot.RemainingMicros,
+			)
+		}
+		consume := lot.RemainingMicros
+		if consume > left {
+			consume = left
+		}
+		if err := insertDraw(consume, lot.ID); err != nil {
+			return WalletDrawdown{}, err
+		}
+		left -= consume
+	}
+
+	if mode == CreditBillingModeCredits && left > 0 {
+		// Credits mode is wallet-only. Its configured credit policy owns the
+		// unsecured remainder, represented by the one NULL-source period row.
+		if err := insertDraw(left, ""); err != nil {
+			return WalletDrawdown{}, err
+		}
+		left = 0
+	}
+
+	out.DrawnMicros = target - left
+	if err := tx.Commit(ctx); err != nil {
+		return WalletDrawdown{}, err
+	}
+	return out, nil
+}
+
+func parseCreditBillingMode(raw string) (CreditBillingMode, error) {
+	mode := CreditBillingMode(raw)
+	switch mode {
+	case CreditBillingModeStandard, CreditBillingModeCredits:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unknown account billing_mode %q", raw)
+	}
 }
 
 func (s *pgxStore) HasUsableDefaultPM(ctx context.Context, accountID uuid.UUID) (bool, error) {

@@ -96,6 +96,11 @@ const (
 	// ReasonUnpaidInvoices: gate 4 failed — the account carries
 	// MaxUnpaidInvoices or more unpaid invoices.
 	ReasonUnpaidInvoices Reason = "UNPAID_INVOICES"
+	// ReasonOutOfCredits is the additive wallet gate merged by the billing
+	// service after Evaluate has applied the original four card/standing gates.
+	// Keeping it out of Evaluate preserves those gates' semantics byte-for-byte
+	// for accounts that do not use the credit wallet.
+	ReasonOutOfCredits Reason = "OUT_OF_CREDITS"
 )
 
 // Verdict is the gate's decision. Blocked is the single field a caller must read
