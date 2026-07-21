@@ -624,6 +624,13 @@ type GetAccountBillResponse struct {
 	// AccountOverage + CustomDomains + Agent.TotalMicros − PaasCredit, ≥ 0 by
 	// the credit cap.
 	TotalMicros int64 `json:"total_micros"`
+
+	// ProjectedBaseFeeTotalMicros is the full next-period base fee for every
+	// live app in Apps, without using the current period's accrued base.
+	ProjectedBaseFeeTotalMicros int64 `json:"projected_base_fee_total_micros"`
+	// ProjectedTotalMicros has the same composition as TotalMicros, with
+	// ProjectedBaseFeeTotalMicros substituted for BaseFeeTotalMicros.
+	ProjectedTotalMicros int64 `json:"projected_total_micros"`
 }
 
 // GetBillingPeriodsRequest is the payload of GetBillingPeriods: the owner

@@ -581,6 +581,53 @@ func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 		"un-snapshotted current period estimates the pooled overage from the live pool 8 → 3 over → $9")
 }
 
+func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store) // [May 1, Jun 1), 31 days
+
+	const liveAppCount = 3
+	periodStart := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	createdAt := time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC)
+	proratedBase := usage.ProratedBaseMicros(usage.BaseFeeMicros, createdAt, periodStart, periodEnd)
+	require.Less(t, proratedBase, usage.BaseFeeMicros, "fixture must accrue less than the full period base")
+
+	for i := 1; i <= liveAppCount; i++ {
+		app := seqUUID(byte(i))
+		store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt}
+		store.baseSnapshots[baseSnapKey(app, periodStart)] = usage.AppBaseSnapshotInfo{BaseMicros: proratedBase}
+	}
+
+	// A deleted app with arrears remains in Apps, but must not contribute a
+	// full base to the projected period-end estimate.
+	deletedApp := seqUUID(liveAppCount + 1)
+	store.appMirrors[deletedApp] = usage.AppMirrorInfo{
+		CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+		Deleted:   true,
+		DeletedAt: time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC),
+	}
+	store.appBillRowsByApp[deletedApp] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "orders.placed", "", 700),
+	}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Apps, liveAppCount+1)
+	require.True(t, resp.Apps[liveAppCount].IsDeleted, "deleted app with arrears stays visible")
+
+	expectedAccruedBase := int64(liveAppCount) * proratedBase
+	expectedProjectedBase := int64(liveAppCount) * usage.BaseFeeMicros
+	require.Equal(t, expectedAccruedBase, resp.BaseFeeTotalMicros)
+	require.Equal(t, expectedProjectedBase, resp.ProjectedBaseFeeTotalMicros)
+	require.Equal(t, expectedAccruedBase+700, resp.TotalMicros)
+	require.Equal(t, expectedProjectedBase+700, resp.ProjectedTotalMicros)
+	require.Greater(t, resp.ProjectedTotalMicros, resp.TotalMicros)
+}
+
 // Migration 037: the account bill carries each app's FROZEN name + a deleted
 // flag, and — the hoist guard — they show even on a CHARGED (snapshotted)
 // period, where pre-037 the mirror was never read. A deleted app keeps its
