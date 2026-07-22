@@ -62,6 +62,11 @@ type fakeStore struct {
 	walletDrawOrder   []uuid.UUID
 	walletUnallocated int64
 	walletStateCalls  int
+	// beforeWalletCreditState fires once (one-shot) at the top of WalletCreditState
+	// — the seam a test uses to model a concurrent worker mutating a timer between
+	// the charging worker's pending re-check and its WalletCreditState read (the
+	// Job 3 credits→standard flip window).
+	beforeWalletCreditState func(*fakeStore)
 	// creationDrawn records the per-app creation-proration wallet debit
 	// (billing-engine #99), keyed by app id — the per-CHARGE analogue of the
 	// period-keyed walletDraws above (a creation draw carries NO period_id).
@@ -69,6 +74,13 @@ type fakeStore struct {
 	creationWalletDrawCalls  int
 	beforeCreationWalletDraw func(*fakeStore, uuid.UUID)
 	creationWalletOutcomes   []cycle.ProrationOutcome
+	// moduleOverageDrawn records the per-timer module-overage wallet debit
+	// (billing-engine Job 3), keyed by timer id — the per-CHARGE analogue of
+	// creationDrawn above (a module-overage draw carries NO period_id).
+	moduleOverageDrawn          map[uuid.UUID]int64
+	moduleOverageDrawCalls      int
+	beforeModuleOverageDraw     func(*fakeStore, uuid.UUID)
+	moduleOverageWalletOutcomes []cycle.ModuleOverageWalletOutcome
 
 	// anchored close-driver inputs (migration 025 / ADR 0005)
 	activatedAccounts []cycle.AccountAnchor   // ActivatedAccounts return
@@ -190,17 +202,18 @@ type fakeStore struct {
 	errFreezeCharge       error // FreezeBillingRunCharge
 	errFrozenCharge       error // BillingRunFrozenCharge
 
-	errLiveTimerCount   error // LiveModuleTimerCountForApp
-	errInsertTimers     error // InsertModuleOverageTimers
-	errReconcileTimers  error // ReconcileModuleTimersToTarget
-	errRemoveNewest     error // SoftRemoveNewestModuleTimers
-	errRemoveAllTimers  error // SoftRemoveAllModuleTimersForApp
-	errTimersPastGrace  error // ModuleOverageTimersPastGrace
-	errTimerRank        error // LiveModuleTimerRankBefore
-	errMarkIncluded     error // MarkModuleTimerIncluded
-	errMarkTimerCharged error // MarkModuleTimerCharged
-	errCountOngoingOver error // CountOngoingOverModuleTimers
-	errCoCreatedOver    error // CoCreatedOverModuleTimers
+	errLiveTimerCount          error // LiveModuleTimerCountForApp
+	errInsertTimers            error // InsertModuleOverageTimers
+	errReconcileTimers         error // ReconcileModuleTimersToTarget
+	errRemoveNewest            error // SoftRemoveNewestModuleTimers
+	errRemoveAllTimers         error // SoftRemoveAllModuleTimersForApp
+	errTimersPastGrace         error // ModuleOverageTimersPastGrace
+	errTimerRank               error // LiveModuleTimerRankBefore
+	errMarkIncluded            error // MarkModuleTimerIncluded
+	errMarkTimerCharged        error // MarkModuleTimerCharged
+	errDrawModuleOverageWallet error // DrawModuleOverageFromWallet
+	errCountOngoingOver        error // CountOngoingOverModuleTimers
+	errCoCreatedOver           error // CoCreatedOverModuleTimers
 }
 
 // fakeTimer models one ms_billing.app_module_overage_timers row (migration 033).
@@ -291,6 +304,7 @@ func newFakeStore() *fakeStore {
 		walletSources:       map[uuid.UUID]*fakeWalletSource{},
 		walletDraws:         map[string][]fakeWalletDraw{},
 		creationDrawn:       map[uuid.UUID]int64{},
+		moduleOverageDrawn:  map[uuid.UUID]int64{},
 		apps:                map[uuid.UUID]cycle.AppMirror{},
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
@@ -439,6 +453,11 @@ func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time
 
 func (f *fakeStore) WalletCreditState(_ context.Context, accountID uuid.UUID, start, end time.Time) (cycle.WalletCreditState, error) {
 	f.walletStateCalls++
+	if f.beforeWalletCreditState != nil {
+		hook := f.beforeWalletCreditState
+		f.beforeWalletCreditState = nil
+		hook(f)
+	}
 	key := runKey(accountID, start, end)
 	var spendable, drawn int64
 	for _, source := range f.walletSources {
@@ -1461,11 +1480,21 @@ func (f *fakeStore) LiveModuleTimerRankBefore(_ context.Context, accountID, time
 	return rank, nil
 }
 
-func (f *fakeStore) MarkModuleTimerChargeAttempted(_ context.Context, timerID uuid.UUID, at time.Time) error {
-	if t, ok := f.timers[timerID]; ok && t.chargeAttemptedAt.IsZero() {
-		t.chargeAttemptedAt = at // first-write-wins, mirroring the SQL
+func (f *fakeStore) MarkModuleTimerChargeAttempted(_ context.Context, timerID uuid.UUID, at time.Time) (int64, error) {
+	// Mirrors the SQL: UPDATE ... SET charge_attempted_at = COALESCE(charge_attempted_at, $2)
+	// WHERE id = $1 AND grace_resolved = false. A timer already resolved (e.g. by a
+	// concurrent wallet settlement) matches 0 rows → the Stripe leg aborts stale
+	// (Job 3 hardening). An unresolved timer matches 1 row whether or not the marker
+	// was already set (COALESCE keeps the first-write instant), so a crash-recovery
+	// retry still re-charges.
+	t, ok := f.timers[timerID]
+	if !ok || t.graceResolved {
+		return 0, nil
 	}
-	return nil
+	if t.chargeAttemptedAt.IsZero() {
+		t.chargeAttemptedAt = at // first-write-wins, mirroring COALESCE
+	}
+	return 1, nil
 }
 
 func (f *fakeStore) ModuleTimerStillPending(_ context.Context, timerID uuid.UUID) (bool, error) {
@@ -1506,6 +1535,123 @@ func (f *fakeStore) MarkModuleTimerCharged(_ context.Context, timerID uuid.UUID,
 		t.graceInvoiceItemID = invoiceItemID
 	}
 	return nil
+}
+
+// DrawModuleOverageFromWallet models the pgxStore's atomic wallet-settled module
+// overage (billing-engine Job 3, mirrors the DrawCreationProrationFromWallet fake):
+// it re-checks the terminal timer state UNDER the "lock", then draws from the wallet
+// sources in the SAME consumption order (a credits account spends through zero into
+// its unsecured remainder; a standard account that cannot fully cover draws NOTHING
+// and returns ModuleOverageWalletShort), and only on a full cover arms the SAME
+// per-timer guard the Stripe leg arms — exactly what the real single tx does.
+func (f *fakeStore) DrawModuleOverageFromWallet(_ context.Context, timerID uuid.UUID, mc cycle.ModuleOverageWalletCharge) (cycle.ModuleOverageWalletOutcome, string, error) {
+	f.moduleOverageDrawCalls++
+	if f.errDrawModuleOverageWallet != nil {
+		return 0, "", f.errDrawModuleOverageWallet
+	}
+	if mc.AmountMicros <= 0 {
+		return cycle.ModuleOverageWalletLockedNoCharge, "", nil
+	}
+	if f.beforeModuleOverageDraw != nil {
+		hook := f.beforeModuleOverageDraw
+		f.beforeModuleOverageDraw = nil
+		hook(f, timerID)
+	}
+	t, ok := f.timers[timerID]
+	if !ok || t.removed || t.graceResolved {
+		return cycle.ModuleOverageWalletLockedStale, "", nil
+	}
+	if !t.chargeAttemptedAt.IsZero() {
+		return cycle.ModuleOverageWalletDeferToStripe, "", nil
+	}
+	if len(f.moduleOverageWalletOutcomes) > 0 {
+		outcome := f.moduleOverageWalletOutcomes[0]
+		f.moduleOverageWalletOutcomes = f.moduleOverageWalletOutcomes[1:]
+		if outcome != cycle.ModuleOverageWalletLockedCharged {
+			return outcome, "", nil
+		}
+	}
+
+	sources := make([]*fakeWalletSource, 0, len(f.walletSources))
+	for _, source := range f.walletSources {
+		if source.remaining > 0 && (source.expiresAt.IsZero() || source.expiresAt.After(time.Now())) {
+			sources = append(sources, source)
+		}
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		a, b := sources[i], sources[j]
+		tier := func(source *fakeWalletSource) int {
+			switch {
+			case source.typ == "grant" && !source.expiresAt.IsZero():
+				return 0
+			case source.typ == "grant", source.typ == "preallocation", source.typ == "refund", source.typ == "adjustment":
+				return 1
+			default:
+				return 2
+			}
+		}
+		if ta, tb := tier(a), tier(b); ta != tb {
+			return ta < tb
+		}
+		if !a.expiresAt.Equal(b.expiresAt) {
+			if a.expiresAt.IsZero() {
+				return false
+			}
+			if b.expiresAt.IsZero() {
+				return true
+			}
+			return a.expiresAt.Before(b.expiresAt)
+		}
+		if !a.createdAt.Equal(b.createdAt) {
+			return a.createdAt.Before(b.createdAt)
+		}
+		return a.id.String() < b.id.String()
+	})
+
+	// Standard mode cannot fully cover from its spendable lots → unsettled (no
+	// draw, never Stripe). Credits mode always fully covers via the unsecured
+	// remainder below.
+	if f.walletMode == cycle.CreditBillingModeStandard {
+		var available int64
+		for _, source := range sources {
+			available += source.remaining
+		}
+		if available < mc.AmountMicros {
+			return cycle.ModuleOverageWalletShort, "", nil
+		}
+	}
+
+	left := mc.AmountMicros
+	for _, source := range sources {
+		if left == 0 {
+			break
+		}
+		consume := source.remaining
+		if consume > left {
+			consume = left
+		}
+		source.remaining -= consume
+		left -= consume
+		f.moduleOverageDrawn[timerID] += consume
+		f.walletDrawOrder = append(f.walletDrawOrder, source.id)
+	}
+	if left > 0 {
+		if f.walletMode != cycle.CreditBillingModeCredits {
+			return cycle.ModuleOverageWalletShort, "", nil
+		}
+		f.moduleOverageDrawn[timerID] += left
+		f.walletUnallocated += left
+		left = 0
+	}
+
+	// Full cover — arm the per-timer guard (first-write-wins on grace_resolved,
+	// like the real MarkModuleTimerCharged WHERE grace_resolved = false).
+	t.graceResolved = true
+	t.graceCharged = true
+	t.graceChargedAt = mc.ChargedAt
+	t.graceInvoiceID = mc.Ref
+	t.graceInvoiceItemID = ""
+	return cycle.ModuleOverageWalletLockedCharged, mc.Ref, nil
 }
 
 // liveTimersForAccountFIFO returns the account's live timers ordered (installed_at

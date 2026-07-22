@@ -87,7 +87,61 @@ const (
 	// timer no longer live/unresolved — removed, or resolved by a concurrent
 	// sweep — between the work-list read and this candidate's turn. Nothing done.
 	ModuleOverageSkippedStale ModuleOverageStatus = "skipped_stale"
+	// ModuleOverageWalletCharged (credit mode, billing-engine Job 3): the "over"
+	// install was SETTLED from the credit wallet (an append-only ledger draw), not
+	// a Stripe invoice — the credits-mode analogue of ModuleOverageCharged. The
+	// result's StripeInvoiceID carries the synthetic wallet charge reference that
+	// armed the per-timer guard.
+	ModuleOverageWalletCharged ModuleOverageStatus = "wallet_charged"
+	// ModuleOverageWalletUnsettled (credit mode, billing-engine Job 3): the wallet
+	// could not fully settle the overage. Nothing was drawn or armed, and this call
+	// does NOT fall through to Stripe; the next sweep re-selects the rail from the
+	// durable billing mode.
+	ModuleOverageWalletUnsettled ModuleOverageStatus = "skipped_wallet_unsettled"
 )
+
+// ModuleOverageWalletOutcome is the store's report from the locked module-overage
+// wallet draw (DrawModuleOverageFromWallet), decided UNDER the timer row lock
+// where the terminal removed/resolved/attempted state is authoritative. It mirrors
+// ProrationOutcome for the creation leg (billing-engine #99).
+type ModuleOverageWalletOutcome int
+
+const (
+	// ModuleOverageWalletLockedCharged: the overage was drawn from the wallet and
+	// the per-timer guard armed with the synthetic wallet ref, committed atomically.
+	ModuleOverageWalletLockedCharged ModuleOverageWalletOutcome = iota
+	// ModuleOverageWalletShort: the wallet could not fully cover the overage.
+	// NOTHING was drawn and the guard is UNARMED; the caller stays unsettled
+	// instead of falling through to Stripe. The standard-mode case is a defensive
+	// credits→standard mode-flip race.
+	ModuleOverageWalletShort
+	// ModuleOverageWalletDeferToStripe: the locked timer row shows a concurrent
+	// attempt already reached the Stripe leg (charge_attempted_at set). The wallet
+	// must not draw beside money that may have moved; defer to the Stripe leg.
+	ModuleOverageWalletDeferToStripe
+	// ModuleOverageWalletLockedStale: the timer was removed, or resolved by a
+	// concurrent sweep, under the lock — nothing to settle (the M2 stale posture).
+	ModuleOverageWalletLockedStale
+	// ModuleOverageWalletLockedNoCharge: the amount rounded to nothing (defensive;
+	// unreachable for a real over-module). Nothing drawn, guard unarmed.
+	ModuleOverageWalletLockedNoCharge
+)
+
+// ModuleOverageWalletCharge is the credit-wallet-settled analogue of the Leg-1
+// Stripe charge (billing-engine Job 3, credit mode; mirrors ProrationWalletCharge).
+// For a credits-mode account the per-module overage is DEBITED from the append-only
+// credit wallet instead of billed to Stripe: AmountMicros is drawn from the wallet
+// and the per-timer guard is armed with Ref (a synthetic wallet reference, never a
+// Stripe invoice id) + ChargedAt. The draw + guard arm commit in ONE store
+// transaction.
+type ModuleOverageWalletCharge struct {
+	// Ref arms grace_invoice_id in place of a Stripe invoice id.
+	Ref string
+	// AmountMicros is the prorated overage — the SAME amount the Stripe leg charges.
+	AmountMicros int64
+	// ChargedAt is the sweep instant stamped as grace_charged_at.
+	ChargedAt time.Time
+}
 
 // ModuleOverageResult reports what one ChargeModuleOverage call did.
 type ModuleOverageResult struct {
@@ -289,6 +343,40 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	}
 	res.ChargedCents = cents
 
+	// CREDITS-MODE MODULE-OVERAGE SETTLEMENT (billing-engine Job 3 — mirrors the
+	// creation-proration credit leg, #99). A credits-mode account (durable
+	// ms_billing.accounts.billing_mode = 'credits') settles its per-module overage
+	// through the credit wallet and NEVER creates a Stripe invoice. Standard
+	// accounts — even with a gifted balance — keep the Stripe overage path below;
+	// the rail is keyed off the DURABLE billing_mode, not a transient balance, so a
+	// credits account can never flip to Stripe mid-retry when its balance drains.
+	// Only a FRESH charge routes here — a timer whose prior attempt already reached
+	// Stripe (charge_attempted_at: handled by the recovery leg at the top of this
+	// method, and re-checked UNDER the timer-row lock in the store) defers to
+	// Stripe, so a mid-flight mode flip can never draw the wallet beside money that
+	// may already have moved. The block is dark unless the credit-wallet flag is set
+	// (fail-closed): with the flag off nothing here runs and the OFF path is the
+	// byte-for-byte existing Stripe overage behavior below.
+	if s.walletEnabled && cand.ChargeAttemptedAt.IsZero() {
+		walletStart, walletEnd := billingperiod.AnchoredPeriodWindow(cand.InstalledAt.UTC(), billingperiod.AnchorDay(cand.ActivatedAt))
+		walletState, err := s.store.WalletCreditState(ctx, cand.AccountID, walletStart, walletEnd)
+		if err != nil {
+			return nil, billing.Internal("wallet state lookup failed", err)
+		}
+		if walletState.Mode == CreditBillingModeCredits {
+			wres, deferToStripe, err := s.chargeModuleOverageFromWallet(ctx, cand, proratedMicros, at)
+			if err != nil {
+				return nil, err
+			}
+			if !deferToStripe {
+				return wres, nil
+			}
+			// deferToStripe: the locked timer row showed a concurrent attempt already
+			// reached Stripe — fall through to the Stripe leg below, whose deterministic
+			// per-timer idem keys + first-write-wins grace guard dedupe against it.
+		}
+	}
+
 	// COLLECTION-MODE gate (review 2026-07-06, H10): a prepaid account is never
 	// auto-charged off-session by ANY leg. Skip WITHOUT resolving — a relax back
 	// to arrears re-attempts through the same keys.
@@ -312,9 +400,22 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 
 	// Stamp the migration-036 recovery marker BEFORE the first Stripe call
 	// (first-write-wins): from here on, any retry — however late — reconciles
-	// against Stripe rather than trusting a recomputed live verdict.
-	if err := s.store.MarkModuleTimerChargeAttempted(ctx, cand.ID, at.UTC()); err != nil {
+	// against Stripe rather than trusting a recomputed live verdict. The stamp
+	// ALSO guards grace_resolved = false, making it the serialization point against
+	// a concurrent credit-wallet settlement (billing-engine Job 3 hardening):
+	// DrawModuleOverageFromWallet arms grace_resolved inside its own row-locked
+	// transaction, so if that wallet draw committed between this candidate's
+	// unlocked pre-checks and here, the stamp affects 0 rows. A 0 means the timer
+	// is already settled — ABORT as stale rather than draft/finalize a second charge
+	// (a Stripe charge beside a wallet debit is a double charge). This holds for
+	// standard accounts too: a resolved timer must never be re-charged by any rail.
+	stamped, err := s.store.MarkModuleTimerChargeAttempted(ctx, cand.ID, at.UTC())
+	if err != nil {
 		return nil, billing.Internal("mark module timer charge attempted failed", err)
+	}
+	if stamped == 0 {
+		res.Status = ModuleOverageSkippedStale
+		return res, nil
 	}
 
 	// Charge via a per-timer draft→pinned-item→finalize flow with deterministic
@@ -375,6 +476,63 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	return res, nil
 }
 
+// chargeModuleOverageFromWallet is ChargeModuleOverage's credit-mode leg
+// (billing-engine Job 3 — mirrors chargeCreationProrationFromWallet, #99). It
+// DEBITS the SAME prorated overage amount the Stripe leg would charge from the
+// credit wallet instead of minting a Stripe invoice. The store draws the full
+// amount and, ONLY if the wallet fully covers it, arms the SAME per-timer guard
+// the Stripe leg arms (grace_charged_at + a synthetic wallet grace_invoice_id ref,
+// NULL invoice-item id), all in one transaction. installed_at + the activation
+// anchor are immutable, so amountMicros is deterministic across retries. Returns
+// deferToStripe=true when the locked timer row showed a concurrent Stripe attempt,
+// so the caller falls through to the Stripe leg (mirroring #99's caller).
+func (s *Service) chargeModuleOverageFromWallet(ctx context.Context, cand ModuleOverageCandidate, amountMicros int64, at time.Time) (*ModuleOverageResult, bool, error) {
+	res := &ModuleOverageResult{TimerID: cand.ID}
+	if amountMicros <= 0 {
+		// Unreachable after the caller's cents check (a real over-module owes ≥ 1¢);
+		// resolve as a no-charge zero rather than draw, mirroring the Stripe zero path.
+		res.Status = ModuleOverageSkippedZeroCents
+		return res, false, nil
+	}
+
+	outcome, armedRef, err := s.store.DrawModuleOverageFromWallet(ctx, cand.ID, ModuleOverageWalletCharge{
+		Ref:          appModuleOverageWalletRef(cand.ID),
+		AmountMicros: amountMicros,
+		ChargedAt:    at.UTC(),
+	})
+	if err != nil {
+		// A billing.Error from the store is already classified — surface verbatim;
+		// anything else is a store/tx failure.
+		if _, ok := err.(*billing.Error); ok {
+			return nil, false, err
+		}
+		return nil, false, billing.Internal("wallet module-overage draw failed", err)
+	}
+
+	switch outcome {
+	case ModuleOverageWalletLockedCharged:
+		cents, err := centsFromMicros(amountMicros)
+		if err != nil {
+			return nil, false, billing.Internal("micros to cents conversion failed", err)
+		}
+		res.Status = ModuleOverageWalletCharged
+		res.ChargedCents = cents
+		res.StripeInvoiceID = armedRef
+		return res, false, nil
+	case ModuleOverageWalletShort:
+		res.Status = ModuleOverageWalletUnsettled
+		return res, false, nil
+	case ModuleOverageWalletDeferToStripe:
+		return nil, true, nil
+	case ModuleOverageWalletLockedStale:
+		res.Status = ModuleOverageSkippedStale
+		return res, false, nil
+	default: // ModuleOverageWalletLockedNoCharge
+		res.Status = ModuleOverageSkippedZeroCents
+		return res, false, nil
+	}
+}
+
 // SweepModuleOverageResult tallies one SweepModuleOverage batch for the
 // cmd/billing-cycle log line + exit code.
 type SweepModuleOverageResult struct {
@@ -408,7 +566,7 @@ func (s *Service) SweepModuleOverage(ctx context.Context, at time.Time) (*SweepM
 			continue
 		}
 		switch r.Status {
-		case ModuleOverageCharged:
+		case ModuleOverageCharged, ModuleOverageWalletCharged:
 			res.Charged++
 		case ModuleOverageIncluded:
 			res.Included++
@@ -562,4 +720,13 @@ func moduleOverageInvoiceIdemKey(timerID uuid.UUID) string {
 
 func moduleOverageFinalizeIdemKey(timerID uuid.UUID) string {
 	return "mod-overage-fin-" + timerID.String()
+}
+
+// appModuleOverageWalletRef is the deterministic wallet settlement reference that
+// arms one timer's per-timer guard (grace_invoice_id) when its overage is settled
+// from the credit wallet rather than Stripe (billing-engine Job 3). The "wallet:"
+// prefix keeps it unambiguously NOT a Stripe invoice id for any reader of the guard
+// column, mirroring appProrationWalletRef on the creation leg.
+func appModuleOverageWalletRef(timerID uuid.UUID) string {
+	return "wallet:mod-overage:" + timerID.String()
 }
