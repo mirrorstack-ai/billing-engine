@@ -82,14 +82,14 @@ const (
 	ProrationStatusNotFound ProrationStatus = "not_found"
 	// ProrationStatusWalletCharged (credit mode, billing-engine #99): the
 	// creation proration was SETTLED from the credit wallet (an append-only
-	// ledger draw), not a Stripe invoice — the credit-mode / wallet-active
-	// analogue of ProrationStatusCharged. ProrationInvoiceID carries the
+	// ledger draw), not a Stripe invoice — the credits-mode analogue of
+	// ProrationStatusCharged. ProrationInvoiceID carries the
 	// synthetic wallet charge reference that armed the one-shot guard.
 	ProrationStatusWalletCharged ProrationStatus = "wallet_charged"
-	// ProrationStatusWalletUnsettled (credit mode, billing-engine #99): a
-	// wallet-active STANDARD account could not fully cover the creation base
-	// from the wallet. Unsettled and NEVER routed to Stripe (the standing gate
-	// blocks), retried on the next sweep — see ProrationWalletShort.
+	// ProrationStatusWalletUnsettled (credit mode, billing-engine #99): the
+	// wallet transaction could not fully settle the creation base. Nothing was
+	// drawn or armed, and this call does not fall through to Stripe; the next
+	// sweep selects the rail again from the durable billing mode.
 	ProrationStatusWalletUnsettled ProrationStatus = "skipped_wallet_unsettled"
 	// ProrationStatusPeriodClosed: the account only activated at/after the
 	// app's anchored creation period had already closed — charging it now
@@ -100,8 +100,9 @@ const (
 )
 
 // ProrationResult reports what ChargeCreationProration did. ProrationInvoiceID is
-// set on ProrationStatusCharged (the new invoice) and ProrationStatusAlreadyCharged
-// (the pre-existing one); ProrationCents only on a fresh charge.
+// set on ProrationStatusCharged (the new invoice), ProrationStatusWalletCharged
+// (the wallet settlement reference), and ProrationStatusAlreadyCharged (the
+// pre-existing one); ProrationCents only on a fresh charge.
 type ProrationResult struct {
 	AppID              uuid.UUID
 	Status             ProrationStatus
@@ -128,13 +129,15 @@ const (
 	// ProrationLockedCharged: the charge fired, was mirrored + snapshotted, and
 	// the guard armed, all committed atomically.
 	ProrationLockedCharged
-	// ProrationWalletShort (credit mode, billing-engine #99): a wallet-active
-	// STANDARD account's spendable balance could not fully cover the creation
-	// proration. NOTHING was drawn and the guard is UNARMED — the charge stays
-	// unsettled and NEVER falls through to Stripe (matching the boundary spine's
-	// credits-mode posture, charge.go:307), so the standing gate blocks and the
-	// next sweep re-attempts once the wallet tops up.
+	// ProrationWalletShort (credit mode, billing-engine #99): the wallet could
+	// not fully cover the creation proration. NOTHING was drawn and the guard is
+	// UNARMED; this call stays unsettled instead of falling through to Stripe.
+	// The standard-mode case is a defensive credits→standard mode-flip race.
 	ProrationWalletShort
+	// ProrationWalletDeferToStripe (credit mode, billing-engine #99): the locked
+	// app row shows a prior attempt already reached the Stripe leg. The wallet
+	// must not draw beside money that may have moved; defer to Stripe recovery.
+	ProrationWalletDeferToStripe
 )
 
 // ProrationCharge is the persistence payload the charge callback returns from
@@ -171,26 +174,21 @@ type ModuleTimerCharge struct {
 }
 
 // ProrationWalletCharge is the credit-wallet-settled analogue of ProrationCharge
-// (billing-engine #99, credit mode). For a credit-mode / wallet-active account
-// the creation proration is DEBITED from the append-only credit wallet instead
-// of billed to Stripe: AmountMicros is drawn from the wallet and the one-shot
-// guard is armed with Ref (a synthetic wallet reference, never a Stripe invoice
-// id). Snapshot / StraddleSnapshot freeze the SAME display base rows the Stripe
-// leg writes, and TimerCharges marks the co-created over-module timers settled
-// on this SAME wallet debit (so no part of what the Stripe creation invoice
-// would have billed leaks to Stripe under credit mode). The draw + snapshots +
-// timer marks + guard arm all commit in ONE store transaction.
+// (billing-engine #99, credit mode). For a credits-mode account the creation
+// proration base is DEBITED from the append-only credit wallet instead of billed
+// to Stripe: AmountMicros is drawn from the wallet and the one-shot guard is
+// armed with Ref (a synthetic wallet reference, never a Stripe invoice id).
+// Snapshot / StraddleSnapshot freeze the SAME display base rows the Stripe leg
+// writes. The draw + snapshots + guard arm all commit in ONE store transaction.
 type ProrationWalletCharge struct {
 	// Ref arms apps.proration_invoice_id in place of a Stripe invoice id.
 	Ref string
-	// AmountMicros is the FULL amount to draw: the prorated creation base plus
-	// any co-created over-module overage (what the Stripe invoice would bill).
+	// AmountMicros is the prorated creation base only.
 	AmountMicros int64
 	Snapshot     AppBaseSnapshot
 	// StraddleSnapshot freezes a boundary-straddled period billed in full on the
 	// same debit — nil otherwise, mirroring ProrationCharge.StraddleSnapshot.
 	StraddleSnapshot *AppBaseSnapshot
-	TimerCharges     []ModuleTimerCharge
 }
 
 // ChargeCreationProration charges (once) the creation-period base proration for
@@ -312,26 +310,36 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		}
 	}
 
-	// UNIVERSAL WALLET SETTLEMENT (billing-engine #99, credit mode). A credit-mode
-	// or otherwise wallet-active account settles its creation proration through the
-	// credit wallet and NEVER creates a Stripe invoice — the SAME posture the
-	// boundary spine takes (charge.go:160 derives walletActive; charge.go:307 keeps
-	// credit mode off Stripe). Only a FRESH charge routes here: an app whose prior
-	// attempt already reached Stripe (proration_attempted_at set) finishes through
-	// the Stripe recovery path below, so a mid-flight mode flip can never draw the
-	// wallet beside money that may already have moved (mirroring the spine's
-	// allowNew=false frozen-charge exception). This branch precedes the Stripe-nil
-	// guard: a wallet settlement needs no Stripe client at all.
-	if !app.ProrationAttempted {
+	// CREDITS-MODE CREATION SETTLEMENT (billing-engine #99). A credits-mode account
+	// (durable ms_billing.accounts.billing_mode = 'credits') settles its creation-period
+	// base through the credit wallet and NEVER creates a Stripe invoice. Standard accounts —
+	// even with a gifted balance — keep the Stripe creation path here; their wallet credit is
+	// applied at the boundary spine (charge.go), NOT at creation. This asymmetry is deliberate:
+	// the rail is keyed off the DURABLE billing_mode, not a transient balance, so a credits
+	// account can never flip to Stripe mid-retry when its balance drains. Only a FRESH charge
+	// routes here — an app whose prior attempt already reached Stripe (proration_attempted_at
+	// re-checked UNDER the app-row lock in the store) defers to the Stripe recovery leg below,
+	// so a mid-flight mode flip can never draw the wallet beside money that may already have moved.
+	// The whole block is dark unless the credit-wallet flag + schema capability are BOTH ready.
+	if s.walletEnabled && !app.ProrationAttempted {
 		walletStart, walletEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
 		walletState, err := s.store.WalletCreditState(ctx, app.AccountID, walletStart, walletEnd)
 		if err != nil {
 			return nil, billing.Internal("wallet state lookup failed", err)
 		}
-		walletActive := walletState.Mode == CreditBillingModeCredits ||
-			walletState.SpendableBalanceMicros > 0 || walletState.PeriodDrawnMicros > 0
-		if walletActive {
-			return s.chargeCreationProrationFromWallet(ctx, app, activatedAt)
+		if walletState.Mode == CreditBillingModeCredits {
+			res, deferToStripe, err := s.chargeCreationProrationFromWallet(ctx, app, activatedAt)
+			if err != nil {
+				return nil, err
+			}
+			if !deferToStripe {
+				return res, nil
+			}
+			// The under-lock outcome supersedes this stale unlocked snapshot and
+			// makes the existing Stripe recovery lookup authoritative below.
+			app.ProrationAttempted = true
+			// deferToStripe: a prior attempt already reached Stripe — fall through to the
+			// Stripe recovery leg below (idempotent reconcile by ms_charge_ref).
 		}
 	}
 
@@ -693,15 +701,14 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 // chargeCreationProrationFromWallet is ChargeCreationProration's credit-mode leg
 // (billing-engine #99). It prices the creation proration EXACTLY as the Stripe
 // callback above does — the prorated base, the boundary-straddle full period,
-// the D1d pre-activation narrowing, and any co-created over-module overage — but
-// DEBITS the credit wallet instead of minting a Stripe invoice. The store draws
-// the full amount and, ONLY if the wallet fully covers it, freezes the display
-// snapshot(s), marks the co-created timers, and arms the one-shot guard, all in
-// one transaction. A standard wallet that cannot cover leaves the charge
-// unsettled (never Stripe) so the standing gate blocks and the next sweep
-// retries. created_at + the activation anchor are immutable, so this pricing is
-// deterministic across retries and matches the Stripe leg amount-for-amount.
-func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app AppMirror, activatedAt time.Time) (*ProrationResult, error) {
+// and the D1d pre-activation narrowing — but DEBITS the prorated base only from
+// the credit wallet instead of minting a Stripe invoice. Co-created over-module
+// overage remains for the existing per-module overage sweep. The store draws the
+// full base amount and, ONLY if the wallet fully covers it, freezes the display
+// snapshot(s) and arms the one-shot guard, all in one transaction. created_at +
+// the activation anchor are immutable, so this pricing is deterministic across
+// retries.
+func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app AppMirror, activatedAt time.Time) (*ProrationResult, bool, error) {
 	// Window = the anchored period CONTAINING created_at (ADR 0005), derived from
 	// created_at never from now — identical to the Stripe callback.
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
@@ -726,26 +733,11 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 		prorated = usage.BaseFeeMicros
 	}
 
-	// Co-created over-module overage rides the SAME creation debit (scenario 3), so
-	// credit mode routes NONE of the combined creation charge to Stripe. Same
-	// coverage as the base: creation period prorated, plus the straddled period in
-	// full, narrowed to the straddled period alone when the creation period closed.
-	overTimers, err := s.store.CoCreatedOverModuleTimers(ctx, app.AccountID, app.AppID, app.CreatedAt, usage.IncludedModules)
-	if err != nil {
-		return nil, billing.Internal("co-created over-module timers lookup failed", err)
-	}
-	overageMicros := usage.ProratedBaseMicros(usage.ModuleOverageFeeMicros, app.CreatedAt, periodStart, periodEnd)
-	if straddle {
-		overageMicros += usage.ModuleOverageFeeMicros
-	}
-	if creationPeriodClosed {
-		overageMicros = usage.ModuleOverageFeeMicros
-	}
-	amountMicros := prorated + overageMicros*int64(len(overTimers))
+	amountMicros := prorated
 	if amountMicros <= 0 {
 		// Rounds to nothing (unreachable for a survived app whose base ≥ $20) —
 		// nothing to draw, guard stays unarmed.
-		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, nil
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, false, nil
 	}
 
 	// Freeze the SAME display base snapshot the Stripe leg writes (migration 028,
@@ -778,50 +770,42 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 		}
 	}
 
-	// Mark the co-created over-module timers settled on this SAME wallet debit
-	// (grace_resolved) with the wallet reference — the credit-mode analogue of the
-	// Stripe leg's invoice/item ids, keeping Leg 1 off these timers.
 	ref := appProrationWalletRef(app.AppID)
-	var timerCharges []ModuleTimerCharge
-	for _, timerID := range overTimers {
-		timerCharges = append(timerCharges, ModuleTimerCharge{
-			TimerID: timerID, ChargedAt: s.nowFn().UTC(), InvoiceID: ref,
-		})
-	}
 
 	outcome, armedRef, err := s.store.DrawCreationProrationFromWallet(ctx, app.AppID, ProrationWalletCharge{
 		Ref:              ref,
 		AmountMicros:     amountMicros,
 		Snapshot:         snapshot,
 		StraddleSnapshot: straddleSnapshot,
-		TimerCharges:     timerCharges,
 	})
 	if err != nil {
 		// A billing.Error from the store is already classified — surface verbatim;
 		// anything else is a store/tx failure.
 		if _, ok := err.(*billing.Error); ok {
-			return nil, err
+			return nil, false, err
 		}
-		return nil, billing.Internal("wallet creation-proration draw failed", err)
+		return nil, false, billing.Internal("wallet creation-proration draw failed", err)
 	}
 
 	switch outcome {
 	case ProrationLockedCharged:
 		cents, err := centsFromMicros(amountMicros)
 		if err != nil {
-			return nil, billing.Internal("micros to cents conversion failed", err)
+			return nil, false, billing.Internal("micros to cents conversion failed", err)
 		}
-		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusWalletCharged, ProrationInvoiceID: armedRef, ProrationCents: cents}, nil
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusWalletCharged, ProrationInvoiceID: armedRef, ProrationCents: cents}, false, nil
 	case ProrationWalletShort:
-		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusWalletUnsettled}, nil
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusWalletUnsettled}, false, nil
+	case ProrationWalletDeferToStripe:
+		return nil, true, nil
 	case ProrationLockedAlreadyCharged:
-		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusAlreadyCharged, ProrationInvoiceID: armedRef}, nil
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusAlreadyCharged, ProrationInvoiceID: armedRef}, false, nil
 	case ProrationLockedDeleted:
-		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusDeleted}, nil
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusDeleted}, false, nil
 	case ProrationLockedNotFound:
-		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNotFound}, nil
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNotFound}, false, nil
 	default: // ProrationLockedNoCharge
-		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, nil
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, false, nil
 	}
 }
 
@@ -898,10 +882,10 @@ func appProrationFinalizeIdemKey(appID uuid.UUID) string { return "app-fin-" + a
 // one app's combined creation invoice — what FindInvoiceByRef recovers by.
 func appProrationChargeRef(appID uuid.UUID) string { return "app-proration:" + appID.String() }
 
-// appProrationWalletRef is the deterministic synthetic reference that arms the
+// appProrationWalletRef is the deterministic wallet settlement reference that arms the
 // one-shot creation-proration guard (apps.proration_invoice_id) when the charge
 // is settled from the credit wallet rather than Stripe (billing-engine #99). The
 // "wallet:" prefix keeps it unambiguously NOT a Stripe invoice id for any reader
-// of the guard column (which is only ever compared IS NULL / NOT NULL, never
-// fetched from Stripe).
+// of the guard column; the usage query also uses the prefix to recover wallet
+// settlements without fetching the value from Stripe.
 func appProrationWalletRef(appID uuid.UUID) string { return "wallet:app-proration:" + appID.String() }

@@ -61,10 +61,14 @@ type fakeStore struct {
 	walletDraws       map[string][]fakeWalletDraw
 	walletDrawOrder   []uuid.UUID
 	walletUnallocated int64
+	walletStateCalls  int
 	// creationDrawn records the per-app creation-proration wallet debit
 	// (billing-engine #99), keyed by app id — the per-CHARGE analogue of the
 	// period-keyed walletDraws above (a creation draw carries NO period_id).
-	creationDrawn map[uuid.UUID]int64
+	creationDrawn            map[uuid.UUID]int64
+	creationWalletDrawCalls  int
+	beforeCreationWalletDraw func(*fakeStore, uuid.UUID)
+	creationWalletOutcomes   []cycle.ProrationOutcome
 
 	// anchored close-driver inputs (migration 025 / ADR 0005)
 	activatedAccounts []cycle.AccountAnchor   // ActivatedAccounts return
@@ -434,6 +438,7 @@ func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time
 }
 
 func (f *fakeStore) WalletCreditState(_ context.Context, accountID uuid.UUID, start, end time.Time) (cycle.WalletCreditState, error) {
+	f.walletStateCalls++
 	key := runKey(accountID, start, end)
 	var spendable, drawn int64
 	for _, source := range f.walletSources {
@@ -1125,14 +1130,20 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 // draws the amount from the wallet sources in the SAME consumption order as
 // DrawWalletCredits (a credits account spends through zero into its unsecured
 // remainder; a standard account that cannot fully cover draws NOTHING and returns
-// ProrationWalletShort), and only on a full cover freezes the snapshot(s), marks
-// the co-created timers, and arms the guard — exactly what the real single tx does.
+// ProrationWalletShort), and only on a full cover freezes the snapshot(s) and
+// arms the guard — exactly what the real single tx does.
 func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uuid.UUID, pc cycle.ProrationWalletCharge) (cycle.ProrationOutcome, string, error) {
+	f.creationWalletDrawCalls++
 	if f.errDrawCreationWallet != nil {
 		return 0, "", f.errDrawCreationWallet
 	}
 	if pc.AmountMicros <= 0 {
 		return cycle.ProrationLockedNoCharge, "", nil
+	}
+	if f.beforeCreationWalletDraw != nil {
+		hook := f.beforeCreationWalletDraw
+		f.beforeCreationWalletDraw = nil
+		hook(f, appID)
 	}
 	app, ok := f.apps[appID]
 	if !ok {
@@ -1143,6 +1154,16 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 	}
 	if app.ProrationInvoiceID != "" {
 		return cycle.ProrationLockedAlreadyCharged, app.ProrationInvoiceID, nil
+	}
+	if app.ProrationAttempted {
+		return cycle.ProrationWalletDeferToStripe, "", nil
+	}
+	if len(f.creationWalletOutcomes) > 0 {
+		outcome := f.creationWalletOutcomes[0]
+		f.creationWalletOutcomes = f.creationWalletOutcomes[1:]
+		if outcome != cycle.ProrationLockedCharged {
+			return outcome, "", nil
+		}
 	}
 
 	sources := make([]*fakeWalletSource, 0, len(f.walletSources))
@@ -1217,19 +1238,10 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 		left = 0
 	}
 
-	// Full cover — freeze the snapshot(s), mark the co-created timers, arm the guard.
+	// Full cover — freeze the snapshot(s) and arm the guard.
 	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}
 	if pc.StraddleSnapshot != nil {
 		f.baseSnapshots[snapKey{pc.StraddleSnapshot.AppID, pc.StraddleSnapshot.PeriodStart}] = fakeBaseSnapshot{snap: *pc.StraddleSnapshot, source: "proration"}
-	}
-	for _, tc := range pc.TimerCharges {
-		if t, ok := f.timers[tc.TimerID]; ok && !t.graceResolved {
-			t.graceResolved = true
-			t.graceCharged = true
-			t.graceChargedAt = tc.ChargedAt
-			t.graceInvoiceID = tc.InvoiceID
-			t.graceInvoiceItemID = tc.InvoiceItemID
-		}
 	}
 	app.ProrationInvoiceID = pc.Ref // first-charge-wins, like WHERE … IS NULL under the lock
 	f.apps[appID] = app

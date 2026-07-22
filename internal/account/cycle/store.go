@@ -349,20 +349,22 @@ type Store interface {
 	// IS NULL AND proration_invoice_id IS NULL), draws charge.AmountMicros from the
 	// append-only credit ledger (per-app idempotency keys, credits-mode unsecured
 	// remainder), and — ONLY when the wallet FULLY covers the amount — freezes the
-	// base snapshot(s), marks the co-created over-module timers, and arms the
-	// one-shot guard (with charge.Ref), all in a SINGLE transaction. Because the
-	// draw and the guard-arm commit together, a crash can never strand a partial
-	// settlement: either the whole thing committed (guard armed, never re-swept) or
-	// nothing did (a retry sees the armed guard and short-circuits). A standard-mode
+	// base snapshot(s) and arms the one-shot guard (with charge.Ref), all in a
+	// SINGLE transaction. Because the draw and the guard-arm commit together, a
+	// crash can never strand a partial settlement: either the whole thing committed
+	// (guard armed, never re-swept) or nothing did (the guard remains unarmed and a
+	// later sweep retries). A standard-mode
 	// wallet whose spendable balance cannot fully cover draws NOTHING and returns
-	// ProrationWalletShort (guard unarmed) so the charge stays unsettled and NEVER
-	// falls through to Stripe; credits mode always fully covers via the unsecured
-	// remainder. Unlike the boundary draw this debit carries NO period_id — it is
-	// keyed per app, so it never collides with the period's boundary draw.
+	// ProrationWalletShort (guard unarmed) so this call stays unsettled instead of
+	// falling through to Stripe; credits mode normally fully covers via the
+	// unsecured remainder. Unlike the boundary draw this debit carries NO
+	// period_id — it is keyed per app, so it never collides with the period's
+	// boundary draw.
 	DrawCreationProrationFromWallet(ctx context.Context, appID uuid.UUID, charge ProrationWalletCharge) (ProrationOutcome, string, error)
 
 	// SetAppProrationInvoice arms the ONE-SHOT creation-proration guard: it
-	// records the Stripe invoice id, first-charge-wins (UPDATE … WHERE
+	// records the Stripe invoice id or wallet settlement reference,
+	// first-charge-wins (UPDATE … WHERE
 	// proration_invoice_id IS NULL). An already-armed guard is NOT an error —
 	// the write is a no-op and the original invoice id survives.
 	SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, stripeInvoiceID string) error
@@ -1801,6 +1803,12 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 	if row.ProrationInvoiceID.Valid {
 		return ProrationLockedAlreadyCharged, row.ProrationInvoiceID.String, nil
 	}
+	if row.ProrationAttemptedAt.Valid {
+		// A prior attempt already reached the Stripe leg (stamped attempted before its
+		// network call). Never draw the wallet beside money that may have moved — defer to
+		// the Stripe recovery path, which reconciles idempotently by ms_charge_ref.
+		return ProrationWalletDeferToStripe, "", nil
+	}
 	accountID := uuidFromPg(row.AccountID)
 
 	// Phase 2: allocate the draw under the wallet account + ledger locks. The
@@ -1919,8 +1927,8 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 		left = 0
 	}
 
-	// Phase 3: fully covered — freeze the display snapshot(s), mark the co-created
-	// timers, and arm the one-shot guard, all in this same transaction.
+	// Phase 3: fully covered — freeze the display snapshot(s) and arm the one-shot
+	// guard, all in this same transaction.
 	if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{
 		AppID:       pc.Snapshot.AppID.String(),
 		PeriodStart: pc.Snapshot.PeriodStart,
@@ -1937,16 +1945,6 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 			PeriodEnd:   pc.StraddleSnapshot.PeriodEnd,
 			ModuleCount: int32(pc.StraddleSnapshot.ModuleCount), //nolint:gosec // same validated apps-row count
 			BaseMicros:  pc.StraddleSnapshot.BaseMicros,
-		}); err != nil {
-			return 0, "", err
-		}
-	}
-	for _, tc := range pc.TimerCharges {
-		if err := qtx.MarkModuleTimerCharged(ctx, db.MarkModuleTimerChargedParams{
-			TimerID:            tc.TimerID.String(),
-			GraceChargedAt:     tc.ChargedAt,
-			GraceInvoiceID:     pgtype.Text{String: tc.InvoiceID, Valid: tc.InvoiceID != ""},
-			GraceInvoiceItemID: pgtype.Text{String: tc.InvoiceItemID, Valid: tc.InvoiceItemID != ""},
 		}); err != nil {
 			return 0, "", err
 		}
