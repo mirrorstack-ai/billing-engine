@@ -61,6 +61,14 @@ type fakeStore struct {
 	walletDraws       map[string][]fakeWalletDraw
 	walletDrawOrder   []uuid.UUID
 	walletUnallocated int64
+	walletStateCalls  int
+	// creationDrawn records the per-app creation-proration wallet debit
+	// (billing-engine #99), keyed by app id — the per-CHARGE analogue of the
+	// period-keyed walletDraws above (a creation draw carries NO period_id).
+	creationDrawn            map[uuid.UUID]int64
+	creationWalletDrawCalls  int
+	beforeCreationWalletDraw func(*fakeStore, uuid.UUID)
+	creationWalletOutcomes   []cycle.ProrationOutcome
 
 	// anchored close-driver inputs (migration 025 / ADR 0005)
 	activatedAccounts []cycle.AccountAnchor   // ActivatedAccounts return
@@ -131,48 +139,49 @@ type fakeStore struct {
 	frozenCharges map[uuid.UUID]cycle.FrozenBoundaryCharge // run id → frozen boundary charge (migration 035); survives a reclaim
 
 	// injected errors
-	errOpen             error
-	errRaw              error
-	errPrice            error
-	errUpsert           error
-	errIncome           error
-	errVis              error
-	errSettle           error
-	errInsertRun        error
-	errTotal            error
-	errPM               error
-	errCustomer         error
-	errInvoice          error
-	errMarkRun          error
-	errUnbilled         error
-	errUsageEvents      error
-	errActivated        error // ActivatedAccounts
-	errLatestPeriod     error // LatestClosedPeriodEnd
-	errCollection       error // AccountCollection
-	errUpdateColl       error // UpdateAccountCollection
-	errUnpaid           error // HasUnpaidInvoice
-	errCardCount        error // UsableNonFraudCardCount
-	errActivation       error // AccountActivation
-	errAppInsert        error // InsertAppMirror
-	errAppMirror        error // AppMirror
-	errDomainInsert     error // InsertDomain
-	errDomainLookup     error // DomainByHostname
-	errDomainRemove     error // RemoveDomain
-	errDomainsPending   error // DomainsPendingCharge
-	errDomainPending    error // DomainStillPending
-	errDomainAttempted  error // MarkDomainChargeAttempted
-	errDomainResolved   error // MarkDomainChargeResolved
-	errDomainCharged    error // MarkDomainCharged
-	errLiveDomainCount  error // CountLiveDomainsActivatedBefore
-	errSetProration     error // SetAppProrationInvoice
-	errSetSkipped       error // SetAppProrationSkipped
-	errSetCount         error // SetAppModuleCount
-	errMarkDeleted      error // MarkAppDeleted
-	errLiveCounts       error // LiveAppsCreatedBefore
-	errProrationSnap    error // UpsertProrationBaseSnapshot
-	errAdvanceSnap      error // InsertAdvanceBaseSnapshot
-	errPendingProration error // AppsPendingProration
-	errChargeLocked     error // ChargeProrationLocked
+	errOpen               error
+	errRaw                error
+	errPrice              error
+	errUpsert             error
+	errIncome             error
+	errVis                error
+	errSettle             error
+	errInsertRun          error
+	errTotal              error
+	errPM                 error
+	errCustomer           error
+	errInvoice            error
+	errMarkRun            error
+	errUnbilled           error
+	errUsageEvents        error
+	errActivated          error // ActivatedAccounts
+	errLatestPeriod       error // LatestClosedPeriodEnd
+	errCollection         error // AccountCollection
+	errUpdateColl         error // UpdateAccountCollection
+	errUnpaid             error // HasUnpaidInvoice
+	errCardCount          error // UsableNonFraudCardCount
+	errActivation         error // AccountActivation
+	errAppInsert          error // InsertAppMirror
+	errAppMirror          error // AppMirror
+	errDomainInsert       error // InsertDomain
+	errDomainLookup       error // DomainByHostname
+	errDomainRemove       error // RemoveDomain
+	errDomainsPending     error // DomainsPendingCharge
+	errDomainPending      error // DomainStillPending
+	errDomainAttempted    error // MarkDomainChargeAttempted
+	errDomainResolved     error // MarkDomainChargeResolved
+	errDomainCharged      error // MarkDomainCharged
+	errLiveDomainCount    error // CountLiveDomainsActivatedBefore
+	errSetProration       error // SetAppProrationInvoice
+	errSetSkipped         error // SetAppProrationSkipped
+	errSetCount           error // SetAppModuleCount
+	errMarkDeleted        error // MarkAppDeleted
+	errLiveCounts         error // LiveAppsCreatedBefore
+	errProrationSnap      error // UpsertProrationBaseSnapshot
+	errAdvanceSnap        error // InsertAdvanceBaseSnapshot
+	errPendingProration   error // AppsPendingProration
+	errChargeLocked       error // ChargeProrationLocked
+	errDrawCreationWallet error // DrawCreationProrationFromWallet
 	// errPersistAfterStripe fails ChargeProrationLocked's persist phase (Phase 3)
 	// AFTER the charge callback's Stripe calls already succeeded — modeling a
 	// combined-invoice charge whose guard/timer marks fail to commit (deadlock /
@@ -281,6 +290,7 @@ func newFakeStore() *fakeStore {
 		walletMode:          cycle.CreditBillingModeStandard,
 		walletSources:       map[uuid.UUID]*fakeWalletSource{},
 		walletDraws:         map[string][]fakeWalletDraw{},
+		creationDrawn:       map[uuid.UUID]int64{},
 		apps:                map[uuid.UUID]cycle.AppMirror{},
 		accountsByUser:      map[uuid.UUID]uuid.UUID{},
 		activation:          map[uuid.UUID]time.Time{},
@@ -428,6 +438,7 @@ func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time
 }
 
 func (f *fakeStore) WalletCreditState(_ context.Context, accountID uuid.UUID, start, end time.Time) (cycle.WalletCreditState, error) {
+	f.walletStateCalls++
 	key := runKey(accountID, start, end)
 	var spendable, drawn int64
 	for _, source := range f.walletSources {
@@ -1112,6 +1123,129 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 		}
 	}
 	return cycle.ProrationLockedCharged, pc.InvoiceID, nil
+}
+
+// DrawCreationProrationFromWallet models the pgxStore's atomic wallet-settled
+// creation proration (billing-engine #99): it re-checks the terminal state, then
+// draws the amount from the wallet sources in the SAME consumption order as
+// DrawWalletCredits (a credits account spends through zero into its unsecured
+// remainder; a standard account that cannot fully cover draws NOTHING and returns
+// ProrationWalletShort), and only on a full cover freezes the snapshot(s) and
+// arms the guard — exactly what the real single tx does.
+func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uuid.UUID, pc cycle.ProrationWalletCharge) (cycle.ProrationOutcome, string, error) {
+	f.creationWalletDrawCalls++
+	if f.errDrawCreationWallet != nil {
+		return 0, "", f.errDrawCreationWallet
+	}
+	if pc.AmountMicros <= 0 {
+		return cycle.ProrationLockedNoCharge, "", nil
+	}
+	if f.beforeCreationWalletDraw != nil {
+		hook := f.beforeCreationWalletDraw
+		f.beforeCreationWalletDraw = nil
+		hook(f, appID)
+	}
+	app, ok := f.apps[appID]
+	if !ok {
+		return cycle.ProrationLockedNotFound, "", nil
+	}
+	if app.Deleted && app.DeletedAt.Before(app.CreatedAt.UTC().AddDate(0, 0, 3)) {
+		return cycle.ProrationLockedDeleted, "", nil // deleted WITHIN grace only (D11)
+	}
+	if app.ProrationInvoiceID != "" {
+		return cycle.ProrationLockedAlreadyCharged, app.ProrationInvoiceID, nil
+	}
+	if app.ProrationAttempted {
+		return cycle.ProrationWalletDeferToStripe, "", nil
+	}
+	if len(f.creationWalletOutcomes) > 0 {
+		outcome := f.creationWalletOutcomes[0]
+		f.creationWalletOutcomes = f.creationWalletOutcomes[1:]
+		if outcome != cycle.ProrationLockedCharged {
+			return outcome, "", nil
+		}
+	}
+
+	sources := make([]*fakeWalletSource, 0, len(f.walletSources))
+	for _, source := range f.walletSources {
+		if source.remaining > 0 && (source.expiresAt.IsZero() || source.expiresAt.After(time.Now())) {
+			sources = append(sources, source)
+		}
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		a, b := sources[i], sources[j]
+		tier := func(source *fakeWalletSource) int {
+			switch {
+			case source.typ == "grant" && !source.expiresAt.IsZero():
+				return 0
+			case source.typ == "grant", source.typ == "preallocation", source.typ == "refund", source.typ == "adjustment":
+				return 1
+			default:
+				return 2
+			}
+		}
+		if ta, tb := tier(a), tier(b); ta != tb {
+			return ta < tb
+		}
+		if !a.expiresAt.Equal(b.expiresAt) {
+			if a.expiresAt.IsZero() {
+				return false
+			}
+			if b.expiresAt.IsZero() {
+				return true
+			}
+			return a.expiresAt.Before(b.expiresAt)
+		}
+		if !a.createdAt.Equal(b.createdAt) {
+			return a.createdAt.Before(b.createdAt)
+		}
+		return a.id.String() < b.id.String()
+	})
+
+	// Standard mode cannot fully cover from its spendable lots → unsettled (no
+	// draw, never Stripe). Credits mode always fully covers via the unsecured
+	// remainder below.
+	if f.walletMode == cycle.CreditBillingModeStandard {
+		var available int64
+		for _, source := range sources {
+			available += source.remaining
+		}
+		if available < pc.AmountMicros {
+			return cycle.ProrationWalletShort, "", nil
+		}
+	}
+
+	left := pc.AmountMicros
+	for _, source := range sources {
+		if left == 0 {
+			break
+		}
+		consume := source.remaining
+		if consume > left {
+			consume = left
+		}
+		source.remaining -= consume
+		left -= consume
+		f.creationDrawn[appID] += consume
+		f.walletDrawOrder = append(f.walletDrawOrder, source.id)
+	}
+	if left > 0 {
+		if f.walletMode != cycle.CreditBillingModeCredits {
+			return cycle.ProrationWalletShort, "", nil
+		}
+		f.creationDrawn[appID] += left
+		f.walletUnallocated += left
+		left = 0
+	}
+
+	// Full cover — freeze the snapshot(s) and arm the guard.
+	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}
+	if pc.StraddleSnapshot != nil {
+		f.baseSnapshots[snapKey{pc.StraddleSnapshot.AppID, pc.StraddleSnapshot.PeriodStart}] = fakeBaseSnapshot{snap: *pc.StraddleSnapshot, source: "proration"}
+	}
+	app.ProrationInvoiceID = pc.Ref // first-charge-wins, like WHERE … IS NULL under the lock
+	f.apps[appID] = app
+	return cycle.ProrationLockedCharged, pc.Ref, nil
 }
 
 func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID, createdBefore time.Time, graceDays int) ([]cycle.AppModuleCount, error) {

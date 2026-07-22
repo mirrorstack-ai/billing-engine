@@ -51,7 +51,7 @@ func TestGetCreditStanding_FoldsEligibilityAndCreditLimit(t *testing.T) {
 				BalanceMicros:     tc.balanceMicros,
 				CreditLimitMicros: 5_000_000,
 			}
-			svc := billing.NewService(store, &fakeStripe{}, "")
+			svc := billing.NewService(store, &fakeStripe{}, "").WithCreditWallet(true)
 
 			resp, err := svc.GetCreditStanding(context.Background(), billing.GetCreditStandingRequest{
 				OwnerUserID: userID,
@@ -86,7 +86,7 @@ func TestStartCreditPurchase_EnforcesInclusiveBounds(t *testing.T) {
 			store.accountsByUser[userID] = fakeAccount{id: accountID}
 			store.stripeCustomerOf[accountID] = "cus_credit"
 			stripeFake := &fakeStripe{}
-			svc := billing.NewService(store, stripeFake, "")
+			svc := billing.NewService(store, stripeFake, "").WithCreditWallet(true)
 
 			resp, err := svc.StartCreditPurchase(context.Background(), billing.StartCreditPurchaseRequest{
 				OwnerUserID:    userID,
@@ -120,7 +120,7 @@ func TestStartCreditPurchase_SameKeyRunsOneStripeInvoiceFlow(t *testing.T) {
 	store.accountsByUser[userID] = fakeAccount{id: accountID}
 	store.stripeCustomerOf[accountID] = "cus_credit"
 	stripeFake := &fakeStripe{}
-	svc := billing.NewService(store, stripeFake, "")
+	svc := billing.NewService(store, stripeFake, "").WithCreditWallet(true)
 	req := billing.StartCreditPurchaseRequest{
 		OwnerUserID:    userID,
 		AmountMicros:   12_340_000,
@@ -158,7 +158,7 @@ func TestGrantCredits_InvalidDistributorRelationshipRejectedBeforeInsert(t *test
 		Actor:          "distributor",
 		IdempotencyKey: "grant-invalid-relationship",
 	}
-	svc := billing.NewService(store, &fakeStripe{}, "")
+	svc := billing.NewService(store, &fakeStripe{}, "").WithCreditWallet(true)
 
 	resp, err := svc.GrantCredits(context.Background(), billing.GrantCreditsRequest{
 		DistributorOrgID: uuid.New(),
@@ -173,6 +173,105 @@ func TestGrantCredits_InvalidDistributorRelationshipRejectedBeforeInsert(t *test
 	require.Equal(t, 1, store.distributorRelationReads)
 	require.Zero(t, store.creditIdempotencyReads)
 	require.Zero(t, store.creditGrantInserts)
+}
+
+func TestCreditRPCs_FlagOffReturnUnavailableBeforeStoreAccess(t *testing.T) {
+	ownerUserID := uuid.New()
+	ownerOrgID := uuid.New()
+	distributorOrgID := uuid.New()
+	// A nil store makes the zero-call guarantee executable: any store access
+	// before the fail-closed guard would panic instead of returning this error.
+	svc := billing.NewService(nil, nil, "").WithCreditWallet(false)
+
+	tests := []struct {
+		name string
+		call func(t *testing.T) error
+	}{
+		{
+			name: "GetCreditStanding",
+			call: func(t *testing.T) error {
+				resp, err := svc.GetCreditStanding(context.Background(), billing.GetCreditStandingRequest{OwnerUserID: ownerUserID})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+		{
+			name: "ListCreditLedger",
+			call: func(t *testing.T) error {
+				resp, err := svc.ListCreditLedger(context.Background(), billing.ListCreditLedgerRequest{OwnerUserID: ownerUserID})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+		{
+			name: "StartCreditPurchase",
+			call: func(t *testing.T) error {
+				resp, err := svc.StartCreditPurchase(context.Background(), billing.StartCreditPurchaseRequest{
+					OwnerUserID: ownerUserID, AmountMicros: billing.MinCreditPurchaseMicros, IdempotencyKey: "flag-off",
+				})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+		{
+			name: "FinishCreditPurchase",
+			call: func(t *testing.T) error {
+				resp, err := svc.FinishCreditPurchase(context.Background(), billing.FinishCreditPurchaseRequest{
+					OwnerUserID: ownerUserID, PurchaseID: uuid.New().String(),
+				})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+		{
+			name: "SetAutoTopUp",
+			call: func(t *testing.T) error {
+				resp, err := svc.SetAutoTopUp(context.Background(), billing.SetAutoTopUpRequest{OwnerUserID: ownerUserID})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+		{
+			name: "SetCustomerBillingMode",
+			call: func(t *testing.T) error {
+				resp, err := svc.SetCustomerBillingMode(context.Background(), billing.SetCustomerBillingModeRequest{
+					OwnerUserID: ownerUserID, BillingMode: billing.BillingModeStandard,
+				})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+		{
+			name: "ListDistributorCustomers",
+			call: func(t *testing.T) error {
+				resp, err := svc.ListDistributorCustomers(context.Background(), billing.ListDistributorCustomersRequest{
+					DistributorOrgID: distributorOrgID,
+				})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+		{
+			name: "GrantCredits",
+			call: func(t *testing.T) error {
+				resp, err := svc.GrantCredits(context.Background(), billing.GrantCreditsRequest{
+					CustomerOrgID: ownerOrgID, AmountMicros: 1, Actor: "system", IdempotencyKey: "flag-off",
+				})
+				require.Nil(t, resp)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call(t)
+			requireBillingErrorCode(t, err, billing.CodeUnavailable)
+			var billingErr *billing.Error
+			require.ErrorAs(t, err, &billingErr)
+			require.Equal(t, "credit wallet is not enabled", billingErr.Message)
+		})
+	}
 }
 
 func requireBillingErrorCode(t *testing.T, err error, code billing.Code) {

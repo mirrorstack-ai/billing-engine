@@ -75,9 +75,9 @@ WHERE created_at <= @created_before::timestamptz
 ORDER BY created_at;
 
 -- SetAppProrationInvoice arms the ONE-SHOT proration guard: it records the
--- Stripe invoice id of the creation-proration charge, and the WHERE
+-- settlement reference (a Stripe invoice id or synthetic wallet ref), and the WHERE
 -- proration_invoice_id IS NULL makes the write first-charge-wins — a retry or
--- concurrent double-fire affects 0 rows and the original invoice id survives.
+-- concurrent double-fire affects 0 rows and the original reference survives.
 -- :execrows so the caller can observe (and tolerate) the already-set case.
 -- name: SetAppProrationInvoice :execrows
 UPDATE ms_billing.apps
@@ -241,19 +241,16 @@ ORDER BY app_id;
 
 -- SettledNewCreationCharges is the SETTLED half of the ListNewCreationCharges read (the
 -- web-account bill's 本期新建立 / "new this period" section): every app CREATED
--- in the resolved window whose creation-proration leg has already minted its
--- one invoice (proration_invoice_id armed, migration 027), joined to that
--- invoice in the ms_billing.invoices mirror so the row carries the ACTUAL
--- settled total — which may include co-created over-module line items billed on
--- the SAME combined invoice (proration.go scenario 3), NOT just a base
--- snapshot. Membership is the app's created_at ∈ [@period_start, @period_end);
--- the join is 1:1 (stripe_invoice_id is unique in the mirror). The
--- amount_due > 0 AND status <> 'void' filters drop a $0 / voided invoice —
--- a skipped_period_closed / no_charge proration never arms proration_invoice_id
--- at all (the guard stays NULL), so it is excluded by the join gate here rather
--- than needing a status predicate. amount_due is NUMERIC whole cents (Stripe
--- minor units); the store converts it to int64 micros (×10_000). Ordered by the
--- invoice created_at DESC (the display's "recorded at", newest-first), app_id
+-- in the resolved window whose creation-proration guard is armed. Stripe-settled
+-- rows join their invoice mirror; credit-wallet rows deliberately have no
+-- invoice mirror and instead recover the settled base draw from credit_ledger.
+-- Membership is the app's created_at ∈ [@period_start, @period_end). Stripe's
+-- amount_due > 0 AND status <> 'void' filters apply only to its branch. The
+-- wallet branch exposes its synthetic proration ref as the stable display
+-- identity and converts the ledger's micro-dollar sum to NUMERIC cents so the
+-- store's established cents-to-micros boundary remains unchanged. The wallet
+-- recorded_at fallback is apps.updated_at, which is stamped when the guard is
+-- armed in the same transaction as the draw. Ordered newest-first with app_id
 -- breaking ties for a deterministic scan.
 --
 -- The per-component BREAKDOWN columns let the UI split the row into
@@ -265,6 +262,47 @@ ORDER BY app_id;
 -- whole amount folds into add-ons). The snapshot join is 1:1: there is exactly
 -- one source='proration' row per app (its creation period).
 -- name: SettledNewCreationCharges :many
+SELECT a.app_id,
+       a.name,
+       a.created_module_count,
+       s.base_micros,
+       COALESCE(i.id, a.app_id) AS invoice_id,
+       COALESCE(i.number, NULLIF(a.proration_invoice_id, i.stripe_invoice_id)) AS number,
+       (CASE
+           WHEN a.proration_invoice_id LIKE 'wallet:%' THEN
+               (SELECT COALESCE(-SUM(cl.amount_micros), 0)::numeric
+                  FROM ms_billing.credit_ledger cl
+                 WHERE cl.account_id = a.account_id
+                   AND cl.status = 'settled'
+                   AND cl.type = 'usage_draw'
+                   AND cl.idempotency_key LIKE 'wallet-draw:app-creation:' || a.app_id::text || ':%') / 10000
+           ELSE i.amount_due
+       END)::numeric AS amount_due,
+       COALESCE(i.created_at, a.updated_at) AS recorded_at
+FROM ms_billing.apps a
+LEFT JOIN ms_billing.invoices i ON i.stripe_invoice_id = a.proration_invoice_id
+LEFT JOIN ms_billing.app_base_snapshots s
+       ON s.app_id = a.app_id AND s.source = 'proration'
+WHERE a.account_id = @account_id::uuid
+  AND a.created_at >= @period_start::timestamptz
+  AND a.created_at < @period_end::timestamptz
+  AND a.proration_invoice_id IS NOT NULL
+  AND (
+      a.proration_invoice_id LIKE 'wallet:%'
+      OR (
+          a.proration_invoice_id NOT LIKE 'wallet:%'
+          AND i.status <> 'void'
+          AND i.amount_due > 0
+      )
+  )
+ORDER BY recorded_at DESC, a.app_id;
+
+-- SettledNewCreationChargesLegacy is the migration-048-independent OFF path.
+-- It intentionally preserves the pre-wallet Stripe-only query byte-for-byte so
+-- CREDIT_WALLET_ENABLED=false prepares and executes no SQL naming credit_ledger
+-- or accounts.billing_mode. The usage store selects the wallet-aware query
+-- above only after the startup capability probe succeeds.
+-- name: SettledNewCreationChargesLegacy :many
 SELECT a.app_id,
        a.name,
        a.created_module_count,

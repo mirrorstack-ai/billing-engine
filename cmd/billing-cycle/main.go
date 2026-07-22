@@ -70,15 +70,15 @@ func main() {
 	}
 
 	// Local one-shot run: close every card-bound account's just-ended anchored
-	// period as of now, sweep the creation-proration grace queue (scenario 3 —
-	// combined creation invoice), then sweep the per-module overage grace queue
-	// (Leg 1), then exit. No HTTP listener — the dev cycle is a single batch.
+	// period as of now, sweep the creation-proration grace queue, then sweep the
+	// per-module overage grace queue (Leg 1), then exit. No HTTP listener — the
+	// dev cycle is a single batch.
 	at := time.Now().UTC()
 	res := runCycle(context.Background(), svc, at)
-	// Proration BEFORE the overage sweep: the creation-proration charge folds an
-	// app's co-created over-modules onto ONE combined invoice (scenario 3), then
-	// the overage sweep (Leg 1) finds them already resolved and skips them — so a
-	// co-created over-module is billed on the combined invoice, not a second one.
+	// Proration runs BEFORE the overage sweep. A Stripe creation charge resolves
+	// its co-created overage on the combined invoice; a wallet creation charge
+	// arms the app guard without resolving those timers, so Leg 1 stops deferring
+	// them and charges their overage separately.
 	sweepFailed := runProrationSweep(context.Background(), svc, at)
 	runOverageSweep(context.Background(), svc, at, &res)
 	runDomainSweep(context.Background(), svc, at, &res)
@@ -118,8 +118,17 @@ func runProrationSweep(ctx context.Context, svc *cycle.Service, at time.Time) bo
 // Stripe secret is required (the charge leg cannot run without it).
 func buildService() *cycle.Service {
 	pool := config.MustPgxPool()
+	walletEnabled := config.CreditWalletEnabled()
+	if walletEnabled {
+		ready, err := config.CreditWalletSchemaReady(context.Background(), pool)
+		if err != nil {
+			slog.Error("credit-wallet schema probe failed", "error", err)
+			os.Exit(1)
+		}
+		walletEnabled = ready
+	}
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
-	return cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey))
+	return cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey)).WithCreditWallet(walletEnabled)
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The
@@ -134,9 +143,9 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			at = time.Now().UTC()
 		}
 		res := runCycle(ctx, svc, at.UTC())
-		// Proration BEFORE the overage sweep (see main()): the combined creation
-		// invoice (scenario 3) resolves an app's co-created over-modules first, so
-		// the overage sweep (Leg 1) skips them — one combined invoice, not two.
+		// Proration runs BEFORE the overage sweep (see main): Stripe creations
+		// resolve co-created overage on their combined invoice; wallet creations
+		// arm the guard so Leg 1 charges that overage separately.
 		runProrationSweep(ctx, svc, at.UTC())
 		runOverageSweep(ctx, svc, at.UTC(), &res)
 		runDomainSweep(ctx, svc, at.UTC(), &res)

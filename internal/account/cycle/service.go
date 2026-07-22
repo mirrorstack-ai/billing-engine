@@ -20,9 +20,10 @@ import (
 // injectable for deterministic tests (RegisterApp windows "now" into the
 // account's current anchored period).
 type Service struct {
-	store  Store
-	stripe billingstripe.Client
-	nowFn  func() time.Time
+	store         Store
+	stripe        billingstripe.Client
+	nowFn         func() time.Time
+	walletEnabled bool
 	// bill is the ONE audited account-bill pricing spine (usage.Service),
 	// injected via WithAccountBill. ListSponsoredOrgs reuses it to price each
 	// sponsored org's current-window total instead of growing a second rollup.
@@ -153,6 +154,14 @@ func (s *Service) recoveryCustomer(ctx context.Context, accountID uuid.UUID) (st
 // the usage.Service nowFn seam). Returns the Service for chaining.
 func (s *Service) WithNow(now func() time.Time) *Service {
 	s.nowFn = now
+	return s
+}
+
+// WithCreditWallet enables access to the migration-048 credit-wallet schema.
+// It defaults to false so callers must opt in only after the startup capability
+// probe succeeds. Returns the Service for chaining.
+func (s *Service) WithCreditWallet(enabled bool) *Service {
+	s.walletEnabled = enabled
 	return s
 }
 

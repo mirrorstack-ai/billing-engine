@@ -14,9 +14,10 @@ import (
 // GetPaymentMethods). It composes a Store (Postgres) and a Stripe Client
 // (real Stripe API); both are injected for testability.
 type Service struct {
-	store     Store
-	stripe    billingstripe.Client
-	returnURL string
+	store         Store
+	stripe        billingstripe.Client
+	returnURL     string
+	walletEnabled bool
 }
 
 // NewService wires a Service. store and stripe are required; passing
@@ -25,6 +26,14 @@ type Service struct {
 // billing page); elements mode requires it.
 func NewService(store Store, stripe billingstripe.Client, returnURL string) *Service {
 	return &Service{store: store, stripe: stripe, returnURL: returnURL}
+}
+
+// WithCreditWallet enables access to the migration-048 credit-wallet schema.
+// It defaults to false so callers must opt in only after the startup capability
+// probe succeeds. Returns the Service for chaining.
+func (s *Service) WithCreditWallet(enabled bool) *Service {
+	s.walletEnabled = enabled
+	return s
 }
 
 // Ensure is the read-only gate. Pure DB read; no Stripe API call;

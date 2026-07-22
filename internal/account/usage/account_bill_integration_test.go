@@ -114,6 +114,63 @@ func TestMirroredAppIDs_Integration(t *testing.T) {
 	require.ElementsMatch(t, []uuid.UUID{longLived, createdInside, deletedInside}, ids)
 }
 
+// TestSettledNewCreationCharges_Integration_WalletDraw proves a creation settled
+// without a Stripe invoice remains visible in 本期新建立. The synthetic wallet
+// guard supplies the display identity, while only settled creation usage-draw
+// ledger rows contribute to the base amount.
+func TestSettledNewCreationCharges_Integration_WalletDraw(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStoreWithCreditWallet(pool, true)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	appID := uuid.New()
+	const amountMicros = int64(3_250_123)
+	walletRef := "wallet:app-proration:" + appID.String()
+	recordedAt := appMustTime(t, "2026-06-18T12:30:00Z")
+
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.apps
+		   (app_id, account_id, module_count, created_module_count, name, created_at,
+		    proration_invoice_id, updated_at)
+		 VALUES ($1, $2, 3, 3, 'wallet app', $3, $4, $5)`,
+		appID.String(), acct.String(), "2026-06-15T00:00:00Z", walletRef, recordedAt)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.app_base_snapshots
+		   (app_id, period_start, period_end, module_count, base_micros, source)
+		 VALUES ($1, $2, $3, 3, $4, 'proration')`,
+		appID.String(), appPeriodStart, appPeriodEnd, amountMicros)
+	require.NoError(t, err)
+
+	keyPrefix := "wallet-draw:app-creation:" + appID.String() + ":"
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.credit_ledger
+		   (account_id, amount_micros, type, status, balance_after_micros, actor,
+		    idempotency_key, created_at)
+		 VALUES
+		   ($1, $2, 'usage_draw', 'settled', 0, 'system', $3, $4),
+		   ($1, -9000000, 'usage_draw', 'failed', 0, 'system', $5, $4),
+		   ($1, -7000000, 'subscription_draw', 'settled', 0, 'system', $6, $4)`,
+		acct.String(), -amountMicros, keyPrefix+"usage_draw:base",
+		recordedAt, keyPrefix+"usage_draw:failed", keyPrefix+"subscription_draw:distractor")
+	require.NoError(t, err)
+
+	rows, err := store.SettledNewCreationCharges(ctx, acct,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	row := rows[0]
+	require.Equal(t, appID, row.AppID)
+	require.Equal(t, appID, row.InvoiceID, "the internal UUID fallback remains stable")
+	require.Equal(t, walletRef, row.Number, "the wallet guard is the public charge identity")
+	require.Equal(t, amountMicros, row.AmountDueMicros)
+	require.Equal(t, amountMicros, row.BaseMicros)
+	// pgx decodes timestamptz into time.Local; compare the instant, not the
+	// Location (recordedAt is UTC), so the assertion is timezone-independent.
+	require.Equal(t, recordedAt, row.RecordedAt.UTC())
+}
+
 // TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO proves the
 // pending creation preview counts the exact co-created timer rows the creation
 // sweep charges. Three older timers consume three of the account's five bundled

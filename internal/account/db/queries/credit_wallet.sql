@@ -233,6 +233,37 @@ INSERT INTO ms_billing.credit_ledger (
     sqlc.narg(source_credit_id)::uuid
 );
 
+-- InsertCreationWalletDraw appends one signed creation-proration draw row.
+-- Unlike InsertWalletDraw it carries NO period_id (period_id stays NULL): a
+-- creation-proration charge is keyed per APP, not per billing period, so a
+-- period-scoped guard would collide with the same period's boundary draw AND
+-- with sibling apps' creation draws against the same funding lot. Its
+-- idempotency is therefore the deterministic app-scoped idempotency_key alone
+-- (migration 048's global idempotency_key unique index), which is what the
+-- period/source relational guards can not express for a per-app debit. A
+-- multi-lot draw invokes it once per source; credits mode may append one final
+-- NULL-source unsecured row.
+-- name: InsertCreationWalletDraw :exec
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key,
+    source_credit_id
+) VALUES (
+    sqlc.arg(account_id)::uuid,
+    -sqlc.arg(amount_micros)::bigint,
+    'usage_draw',
+    'settled',
+    sqlc.arg(balance_after_micros)::bigint,
+    'system',
+    sqlc.arg(idempotency_key)::text,
+    sqlc.narg(source_credit_id)::uuid
+);
+
 -- ---------------------------------------------------------------------------
 -- Credit-wallet RPC reads and writes.
 --

@@ -16,16 +16,16 @@ import (
 // web-account /me/billing (and /orgs/{slug}/billing) BillSummaryCard.
 //
 // It maps 1:1 to the CREATION-PRORATION leg (proration.go): a newly created app
-// is NOT charged at RegisterApp; after surviving GraceDays the sweep mints ONE
-// invoice for [creation-day, coverage-end), arms apps.proration_invoice_id
-// (migration 027), and mirrors it in ms_billing.invoices. This read surfaces,
-// for the resolved period, the apps CREATED in it whose base is charged via that
-// leg:
+// is NOT charged at RegisterApp; after surviving GraceDays the sweep settles its
+// base through Stripe or, for credits-mode accounts, the wallet. Both rails arm
+// apps.proration_invoice_id (migration 027); only Stripe settlement writes an
+// ms_billing.invoices mirror. This read surfaces, for the resolved period, the
+// apps CREATED in it whose base is charged via that leg:
 //
-//   - SETTLED: the proration already fired — the row carries the invoice's
-//     ACTUAL settled total (which may include co-created over-module line items
-//     on the SAME combined invoice, proration.go scenario 3), the invoice
-//     number/id, and the invoice created_at as the "recorded at".
+//   - SETTLED: the proration already fired — a Stripe row carries the actual
+//     invoice total (which may include co-created over-module line items),
+//     number/id, and invoice time; a wallet row carries the base-only ledger
+//     draw, synthetic wallet ref, and guard-arm time.
 //   - PENDING: the app is still in its creation grace (uncharged, live,
 //     un-skipped) — shown with a charge ETA (created_at + GraceDays) and the
 //     exact base amount the sweep will charge, priced through
@@ -41,14 +41,14 @@ import (
 //     and the earliest timer expiry as the ETA. Current live window only, like
 //     the creation pendings.
 //
-// Read-only over the apps, invoices, and module-timer billing tables this
-// service already owns; NO Stripe round-trip, NO schema change.
+// Read-only over the apps, invoices, credit ledger (only when enabled), and
+// module-timer billing tables this service already owns; NO Stripe round-trip.
 // ============================================================================
 
 // NewCreationChargeStatus classifies one NewCreationCharge row on the wire.
 const (
-	// NewCreationChargeStatusSettled: the creation-proration invoice has fired; the
-	// row carries the invoice's real settled amount + number/id + recorded_at.
+	// NewCreationChargeStatusSettled: the creation proration has settled through
+	// Stripe or the wallet; the row carries its real amount, identity, and time.
 	NewCreationChargeStatusSettled = "settled"
 	// NewCreationChargeStatusPending: the app is still in creation grace (uncharged);
 	// the row carries a charge_eta and the exact CreationChargeBaseMicros preview.
@@ -72,13 +72,14 @@ type ListNewCreationChargesRequest struct {
 
 // NewCreationCharge is one 本期新建立 row: an app created in the resolved period whose
 // base is (or will be) charged via the creation-proration leg. For a SETTLED row
-// AmountMicros is the invoice's actual settled total, RecordedAt is the invoice
-// created_at, and InvoiceID is the invoice Number (else the mirror UUID); for a
+// AmountMicros is the rail's actual settled total, RecordedAt is its recorded
+// time, and InvoiceID is the invoice number/UUID or synthetic wallet ref; for a
 // PENDING row AmountMicros/BaseFeeMicros previews CreationChargeBaseMicros —
 // the sweep's exact base amount, including a straddled period's full-base
 // top-up when applicable. ProjectedAddonMicros separately previews the
-// co-created add-on amount that will ride the same combined invoice, using the
-// sweep's account-level FIFO timer set and per-timer cents rounding. ChargeETA
+// co-created add-on amount expected when grace elapses, using the sweep's
+// account-level FIFO timer set and per-timer cents rounding. The Stripe rail
+// combines it with the creation invoice; the wallet rail leaves it to Leg 1. ChargeETA
 // is GraceExpiry(created_at), and RecordedAt/InvoiceID are absent. Money is
 // integer micro-USD.
 //
@@ -87,8 +88,9 @@ type ListNewCreationChargesRequest struct {
 // ("" when unknown); AddonModuleCount is max(0, created_module_count −
 // IncludedModules), the count of add-on modules beyond the bundled allowance;
 // BaseFeeMicros + AddonMicros partition AmountMicros for a settled row
-// (BaseFeeMicros is the settled creation base, AddonMicros the co-created
-// over-module component on the same invoice). A pending CREATION row carries
+// (BaseFeeMicros is the settled creation base, AddonMicros any co-created
+// over-module component included by that settlement; wallet rows are base-only).
+// A pending CREATION row carries
 // the exact CreationChargeBaseMicros preview in AmountMicros/BaseFeeMicros,
 // AddonMicros 0, and the point-in-time FIFO-derived co-created overage in
 // ProjectedAddonMicros (per-timer cents × over-count). Its AddonModuleCount
@@ -140,12 +142,13 @@ type ListNewCreationChargesResponse struct {
 //  3. lazy account (no billing account row): an EMPTY list — no app could have
 //     been charged yet, the same posture ListInvoices takes,
 //  4. reads the SETTLED rows (apps created in the window with an armed
-//     proration guard, joined to the invoice mirror) — newest-first from SQL,
+//     proration guard, sourced from the invoice mirror or wallet ledger) —
+//     newest-first from SQL,
 //  5. for the CURRENT live window ONLY (resolved period id == ""), reads the
 //     PENDING rows (still-in-grace apps) and appends them with a charge ETA
 //     (GraceExpiry(created_at)), the exact CreationChargeBaseMicros base amount,
-//     and the FIFO-derived, per-timer-cents co-created overage projection the
-//     sweep would put on the same invoice; a past period skips this entirely.
+//     and the FIFO-derived, per-timer-cents co-created overage projection; a
+//     past period skips this entirely.
 func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreationChargesRequest) (*ListNewCreationChargesResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -187,17 +190,17 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 
 	charges := make([]NewCreationCharge, 0, len(settled))
 	for _, r := range settled {
-		// invoice_id = the customer-facing Number when enriched, else the mirror
-		// UUID (a stable identity for a row not yet number-enriched by a webhook).
+		// invoice_id = the Stripe customer-facing Number when enriched, the mirror
+		// UUID before enrichment, or the synthetic wallet settlement reference.
 		invoiceID := r.Number
 		if invoiceID == "" {
 			invoiceID = r.InvoiceID.String()
 		}
 		recordedAt := r.RecordedAt
-		// base + add-on partition the invoice total: BaseFeeMicros is the settled
-		// creation base (the 'proration' snapshot; 0 when absent), AddonMicros the
-		// co-created over-module component billed on the SAME invoice. By
-		// construction base + addon == AmountMicros (the contract invariant).
+		// BaseFeeMicros is the settled creation base ('proration' snapshot; 0 when
+		// absent). AddonMicros is any remainder included on the same Stripe charge;
+		// a base-only wallet settlement has no remainder. By construction base +
+		// addon == AmountMicros (the contract invariant).
 		charges = append(charges, NewCreationCharge{
 			AppID:            r.AppID,
 			Status:           NewCreationChargeStatusSettled,
