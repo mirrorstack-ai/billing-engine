@@ -242,7 +242,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		return nil, billing.Internal("compute paas credit failed", err)
 	}
 
-	return &GetAccountBillResponse{
+	response := &GetAccountBillResponse{
 		PeriodID:               periodID,
 		PeriodStart:            periodStart,
 		PeriodEnd:              periodEnd,
@@ -256,7 +256,19 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		CustomDomainsMicros:    customDomains,
 		PaasCreditMicros:       paasCredit,
 		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + customDomains + agent.TotalMicros - paasCredit,
-	}, nil
+	}
+
+	var liveAppCount int64
+	for _, app := range response.Apps {
+		if !app.IsDeleted {
+			liveAppCount++
+		}
+	}
+	projectedBaseFeeTotal := liveAppCount * resolveBaseFeeMicros(plan)
+	response.ProjectedBaseFeeTotalMicros = projectedBaseFeeTotal
+	response.ProjectedTotalMicros = projectedBaseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + agent.TotalMicros + customDomains - paasCredit
+
+	return response, nil
 }
 
 // ProjectedCreditCharge exposes the existing account-bill calculation through
