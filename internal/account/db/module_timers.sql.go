@@ -237,11 +237,11 @@ func (q *Queries) LiveModuleTimerRankBefore(ctx context.Context, arg LiveModuleT
 	return rank, err
 }
 
-const markModuleTimerChargeAttempted = `-- name: MarkModuleTimerChargeAttempted :exec
+const markModuleTimerChargeAttempted = `-- name: MarkModuleTimerChargeAttempted :execrows
 UPDATE ms_billing.app_module_overage_timers
-SET charge_attempted_at = $2
+SET charge_attempted_at = COALESCE(charge_attempted_at, $2)
 WHERE id = $1
-  AND charge_attempted_at IS NULL
+  AND grace_resolved = false
 `
 
 type MarkModuleTimerChargeAttemptedParams struct {
@@ -250,11 +250,24 @@ type MarkModuleTimerChargeAttemptedParams struct {
 }
 
 // MarkModuleTimerChargeAttempted stamps the recovery marker (036) BEFORE a
-// charge attempt's first Stripe call. First-write-wins (the FIRST attempt
-// instant is the durable one); never cleared.
-func (q *Queries) MarkModuleTimerChargeAttempted(ctx context.Context, arg MarkModuleTimerChargeAttemptedParams) error {
-	_, err := q.db.Exec(ctx, markModuleTimerChargeAttempted, arg.ID, arg.ChargeAttemptedAt)
-	return err
+// charge attempt's first Stripe call. First-write-wins (the FIRST attempt instant
+// is the durable one, preserved by COALESCE); never cleared. The grace_resolved =
+// false guard (billing-engine Job 3 hardening) makes this stamp the serialization
+// point against a concurrent credit-wallet settlement: DrawModuleOverageFromWallet
+// arms grace_resolved (+ grace_charged_at) inside its own row-locked transaction,
+// so a Stripe worker that lost the race matches 0 rows here and MUST abort as stale
+// rather than draft/finalize a second charge on an already-settled timer. Returns
+// rows-affected so the caller can detect the lost race: 0 rows ⟺ grace_resolved is
+// already true. It deliberately does NOT gate on charge_attempted_at IS NULL — a
+// crash-recovery retry (marker set by a prior attempt that died before creating its
+// invoice, with nothing found on Stripe) must still re-charge, so it matches the
+// row (1 affected) while COALESCE keeps the original attempt instant.
+func (q *Queries) MarkModuleTimerChargeAttempted(ctx context.Context, arg MarkModuleTimerChargeAttemptedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markModuleTimerChargeAttempted, arg.ID, arg.ChargeAttemptedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markModuleTimerCharged = `-- name: MarkModuleTimerCharged :exec
@@ -452,6 +465,41 @@ func (q *Queries) PendingAddonModuleCharges(ctx context.Context, arg PendingAddo
 		return nil, err
 	}
 	return items, nil
+}
+
+const selectModuleTimerForUpdate = `-- name: SelectModuleTimerForUpdate :one
+SELECT account_id, removed_at, grace_resolved, charge_attempted_at
+FROM ms_billing.app_module_overage_timers
+WHERE id = $1
+FOR UPDATE
+`
+
+type SelectModuleTimerForUpdateRow struct {
+	AccountID         string             `json:"account_id"`
+	RemovedAt         pgtype.Timestamptz `json:"removed_at"`
+	GraceResolved     bool               `json:"grace_resolved"`
+	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
+}
+
+// SelectModuleTimerForUpdate reads one install timer under a ROW LOCK
+// (FOR UPDATE) — the credit-wallet module-overage draw's race-safety primitive
+// (Job 3, mirrors apps.sql SelectAppMirrorForUpdate for the creation leg).
+// DrawModuleOverageFromWallet locks the timer row to re-verify, UNDER the lock,
+// that it is still live (removed_at IS NULL) and unresolved (grace_resolved =
+// false) and that no concurrent Stripe attempt is in flight (charge_attempted_at
+// IS NULL) before drawing the wallet and arming the guard atomically. account_id
+// feeds the wallet allocation. Unlike the creation leg there is no Stripe network
+// call to keep outside the lock, so the whole draw + guard-arm runs in one tx.
+func (q *Queries) SelectModuleTimerForUpdate(ctx context.Context, id string) (SelectModuleTimerForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, selectModuleTimerForUpdate, id)
+	var i SelectModuleTimerForUpdateRow
+	err := row.Scan(
+		&i.AccountID,
+		&i.RemovedAt,
+		&i.GraceResolved,
+		&i.ChargeAttemptedAt,
+	)
+	return i, err
 }
 
 const softRemoveAllModuleTimersForApp = `-- name: SoftRemoveAllModuleTimersForApp :exec

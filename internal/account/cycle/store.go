@@ -440,8 +440,12 @@ type Store interface {
 	// BEFORE a charge attempt's first Stripe call — first-write-wins, never
 	// cleared. A later retry seeing it set reconciles against Stripe (the
 	// ms_charge_ref anchor) before recomputing any live verdict or minting new
-	// Stripe objects.
-	MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) error
+	// Stripe objects. It also guards grace_resolved = false (billing-engine Job 3
+	// hardening) so it serializes against a concurrent credit-wallet settlement:
+	// it returns the rows affected, and a 0 means the timer was already resolved
+	// (a concurrent wallet draw armed grace_resolved) — the Stripe leg MUST abort
+	// as stale rather than charge a second time.
+	MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) (int64, error)
 
 	// ModuleTimerStillPending re-verifies, immediately before acting on a sweep
 	// candidate, that the timer is STILL live and unresolved — the work list is
@@ -499,6 +503,25 @@ type Store interface {
 	// the GENUINE Stripe invoice / invoice-item ids (never idempotency-key
 	// strings). WHERE grace_resolved IS false keeps a crash-retry idempotent.
 	MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID, chargedAt time.Time, invoiceID, invoiceItemID string) error
+
+	// DrawModuleOverageFromWallet settles ONE per-module install timer's overage
+	// through the universal credit wallet (billing-engine Job 3, mirrors
+	// DrawCreationProrationFromWallet #99) ATOMICALLY: under the timer row lock it
+	// re-verifies the row is still chargeable (removed_at IS NULL AND grace_resolved
+	// = false) and that no concurrent Stripe attempt is in flight (charge_attempted_at
+	// IS NULL), draws charge.AmountMicros from the append-only credit ledger (per-timer
+	// idempotency key, credits-mode unsecured remainder), and — ONLY when the wallet
+	// FULLY covers the amount — arms the SAME per-timer guard the Stripe leg arms
+	// (grace_charged_at + grace_invoice_id = charge.Ref, grace_invoice_item_id NULL),
+	// all in a SINGLE transaction. Because the draw and the guard-arm commit together,
+	// a committed settlement short-circuits every retry at the grace_resolved re-check,
+	// and a crash before commit rolls back leaving no ledger rows. A standard-mode
+	// wallet whose spendable balance cannot fully cover draws NOTHING and returns
+	// ModuleOverageWalletShort (guard unarmed) so the caller stays unsettled instead
+	// of falling through to Stripe; credits mode normally fully covers via the
+	// unsecured remainder. Like the creation draw this debit carries NO period_id —
+	// it is keyed per timer, so it never collides with the period's boundary draw.
+	DrawModuleOverageFromWallet(ctx context.Context, timerID uuid.UUID, charge ModuleOverageWalletCharge) (ModuleOverageWalletOutcome, string, error)
 
 	// CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario
 	// 6): the count of the account's live timers that are "over" (live-FIFO rank
@@ -2066,7 +2089,7 @@ func (s *pgxStore) InsertModuleOverageTimers(ctx context.Context, accountID, app
 	})
 }
 
-func (s *pgxStore) MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) error {
+func (s *pgxStore) MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) (int64, error) {
 	return s.q.MarkModuleTimerChargeAttempted(ctx, db.MarkModuleTimerChargeAttemptedParams{
 		ID:                timerID.String(),
 		ChargeAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
@@ -2266,6 +2289,185 @@ func (s *pgxStore) MarkModuleTimerCharged(ctx context.Context, timerID uuid.UUID
 		GraceInvoiceID:     pgtype.Text{String: invoiceID, Valid: invoiceID != ""},
 		GraceInvoiceItemID: pgtype.Text{String: invoiceItemID, Valid: invoiceItemID != ""},
 	})
+}
+
+// DrawModuleOverageFromWallet — see the Store interface doc. Mirrors
+// DrawCreationProrationFromWallet: the draw and the guard-arm share ONE
+// transaction (no Stripe network call to keep outside a lock), so idempotency is
+// the atomic grace_resolved guard alone — a committed settlement short-circuits
+// every retry at the timer re-check, and a crash before commit rolls back leaving
+// no ledger rows.
+func (s *pgxStore) DrawModuleOverageFromWallet(ctx context.Context, timerID uuid.UUID, mc ModuleOverageWalletCharge) (ModuleOverageWalletOutcome, string, error) {
+	if mc.AmountMicros <= 0 {
+		return ModuleOverageWalletLockedNoCharge, "", nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	// Phase 1: lock + re-verify the timer is still chargeable — the SAME terminal
+	// checks the sweep's unlocked pre-checks make, but in THIS transaction so the
+	// draw and the guard-arm are atomic.
+	row, err := qtx.SelectModuleTimerForUpdate(ctx, timerID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ModuleOverageWalletLockedStale, "", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	if row.RemovedAt.Valid || row.GraceResolved {
+		// Removed, or resolved by a concurrent sweep between the work-list read and
+		// this lock — nothing to settle (the M2 stale posture).
+		return ModuleOverageWalletLockedStale, "", nil
+	}
+	if row.ChargeAttemptedAt.Valid {
+		// A concurrent attempt already reached the Stripe leg (stamped attempted
+		// before its network call). Never draw beside money that may have moved —
+		// defer to Stripe, reconciled idempotently by the per-timer idem keys.
+		return ModuleOverageWalletDeferToStripe, "", nil
+	}
+	accountID, err := uuid.Parse(row.AccountID)
+	if err != nil {
+		return 0, "", err
+	}
+
+	// Phase 2: allocate the draw under the wallet account + ledger locks. The SAME
+	// lock order the creation draw uses (timer/app row → wallet account → ledger),
+	// which never inverts the account→ledger order the boundary draw uses, so the
+	// wallet legs can not deadlock.
+	rawMode, err := qtx.LockWalletAccount(ctx, accountID.String())
+	if err != nil {
+		return 0, "", err
+	}
+	mode, err := parseCreditBillingMode(rawMode)
+	if err != nil {
+		return 0, "", err
+	}
+	if _, err := qtx.LockWalletLedgerEntries(ctx, accountID.String()); err != nil {
+		return 0, "", err
+	}
+	balanceAfter, err := qtx.WalletSettledBalance(ctx, accountID.String())
+	if err != nil {
+		return 0, "", err
+	}
+	lots, err := qtx.WalletSpendableLots(ctx, accountID.String())
+	if err != nil {
+		return 0, "", err
+	}
+	var lotSum int64
+	for _, lot := range lots {
+		if lot.RemainingMicros <= 0 {
+			return 0, "", fmt.Errorf(
+				"wallet query returned a non-positive lot remainder: source=%s remaining=%d",
+				lot.ID, lot.RemainingMicros,
+			)
+		}
+		lotSum += lot.RemainingMicros
+	}
+
+	// Standard mode consumes at most its positive spendable balance = min(active
+	// lots, posted balance − unused expired grants). If that cannot FULLY cover the
+	// overage, settle NOTHING (unsettled → the standing gate blocks, never Stripe);
+	// credits mode always fully covers via the unsecured remainder below.
+	if mode == CreditBillingModeStandard {
+		expiredMicros, err := qtx.WalletExpiredCreditBalance(ctx, accountID.String())
+		if err != nil {
+			return 0, "", err
+		}
+		if expiredMicros < 0 {
+			return 0, "", fmt.Errorf("wallet expired-credit balance is negative: %d", expiredMicros)
+		}
+		spendable := lotSum
+		if spendCap := balanceAfter - expiredMicros; spendCap < spendable {
+			spendable = spendCap
+		}
+		if spendable < mc.AmountMicros {
+			return ModuleOverageWalletShort, "", nil
+		}
+	}
+
+	insertDraw := func(consume int64, sourceID string) error {
+		if consume <= 0 {
+			return fmt.Errorf("wallet draw allocation must be positive: %d", consume)
+		}
+		if balanceAfter < math.MinInt64+consume {
+			return fmt.Errorf("wallet balance_after_micros underflow: balance=%d draw=%d", balanceAfter, consume)
+		}
+		balanceAfter -= consume
+
+		source := pgtype.UUID{}
+		keySource := "unsecured"
+		if sourceID != "" {
+			id, err := uuid.Parse(sourceID)
+			if err != nil {
+				return fmt.Errorf("parse wallet source credit id: %w", err)
+			}
+			source = pgtype.UUID{Bytes: id, Valid: true}
+			keySource = id.String()
+		}
+		return qtx.InsertCreationWalletDraw(ctx, db.InsertCreationWalletDrawParams{
+			AccountID:          accountID.String(),
+			AmountMicros:       consume,
+			BalanceAfterMicros: balanceAfter,
+			// Per-TIMER idempotency (period_id is NULL) — a module-overage draw is
+			// keyed per install timer, never per billing period, so it never collides
+			// with the period's boundary draw or a sibling creation draw against the
+			// same funding lot. The deterministic timer/source key is the sole guard.
+			IdempotencyKey: fmt.Sprintf(
+				"wallet-draw:module-overage:%s:usage_draw:%s", timerID.String(), keySource,
+			),
+			SourceCreditID: source,
+		})
+	}
+
+	left := mc.AmountMicros
+	for _, lot := range lots {
+		if left == 0 {
+			break
+		}
+		consume := lot.RemainingMicros
+		if consume > left {
+			consume = left
+		}
+		if err := insertDraw(consume, lot.ID); err != nil {
+			return 0, "", err
+		}
+		left -= consume
+	}
+	if left > 0 {
+		if mode != CreditBillingModeCredits {
+			// Standard mode ran out of lots despite the spendable check above — never
+			// partially settle (defensive; the check should already have caught it).
+			return ModuleOverageWalletShort, "", nil
+		}
+		// Credits mode is wallet-only: its configured credit policy owns the
+		// unsecured remainder (the single NULL-source row).
+		if err := insertDraw(left, ""); err != nil {
+			return 0, "", err
+		}
+		left = 0
+	}
+
+	// Phase 3: fully covered — arm the SAME per-timer guard the Stripe leg arms,
+	// with the synthetic wallet ref (grace_invoice_id) and NULL invoice-item id, in
+	// this same transaction. WHERE grace_resolved = false is guaranteed true under
+	// the lock by the re-check above.
+	if err := qtx.MarkModuleTimerCharged(ctx, db.MarkModuleTimerChargedParams{
+		TimerID:            timerID.String(),
+		GraceChargedAt:     mc.ChargedAt,
+		GraceInvoiceID:     pgtype.Text{String: mc.Ref, Valid: true},
+		GraceInvoiceItemID: pgtype.Text{},
+	}); err != nil {
+		return 0, "", err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, "", err
+	}
+	return ModuleOverageWalletLockedCharged, mc.Ref, nil
 }
 
 func (s *pgxStore) CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
