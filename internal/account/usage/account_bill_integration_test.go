@@ -166,7 +166,9 @@ func TestSettledNewCreationCharges_Integration_WalletDraw(t *testing.T) {
 	require.Equal(t, walletRef, row.Number, "the wallet guard is the public charge identity")
 	require.Equal(t, amountMicros, row.AmountDueMicros)
 	require.Equal(t, amountMicros, row.BaseMicros)
-	require.Equal(t, recordedAt, row.RecordedAt)
+	// pgx decodes timestamptz into time.Local; compare the instant, not the
+	// Location (recordedAt is UTC), so the assertion is timezone-independent.
+	require.Equal(t, recordedAt, row.RecordedAt.UTC())
 }
 
 // TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO proves the
