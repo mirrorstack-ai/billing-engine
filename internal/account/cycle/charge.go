@@ -153,9 +153,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("account collection lookup failed", err)
 	}
-	walletState, err := s.store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
-	if err != nil {
-		return nil, billing.Internal("wallet state lookup failed", err)
+	walletState := WalletCreditState{Mode: CreditBillingModeStandard}
+	if s.walletEnabled {
+		walletState, err = s.store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+		if err != nil {
+			return nil, billing.Internal("wallet state lookup failed", err)
+		}
 	}
 	walletActive := walletState.Mode == CreditBillingModeCredits ||
 		walletState.SpendableBalanceMicros > 0 || walletState.PeriodDrawnMicros > 0

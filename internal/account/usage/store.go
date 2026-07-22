@@ -236,15 +236,12 @@ type Store interface {
 	LiveDomainCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
 
 	// SettledNewCreationCharges reads the SETTLED half of ListNewCreationCharges: every
-	// app CREATED in [periodStart, periodEnd) whose creation-proration leg has
-	// already minted its one invoice (proration_invoice_id armed, migration
-	// 027), joined to that invoice in the ms_billing.invoices mirror. The
-	// AmountDueMicros is the invoice's ACTUAL settled total (converted from the
-	// mirror's NUMERIC whole cents ×10_000) — which may include co-created
-	// over-module line items on the SAME combined invoice (proration.go scenario
-	// 3), not just a base snapshot. $0 / voided invoices are excluded in SQL;
-	// skipped / no-charge prorations never armed the guard and drop out via the
-	// join. Ordered by the invoice created_at DESC (newest-first), app_id tie-break.
+	// app CREATED in [periodStart, periodEnd) whose creation-proration guard is
+	// armed. Stripe rows carry the mirrored invoice's actual settled total;
+	// wallet rows carry the settled creation usage-draw sum and synthetic wallet
+	// ref without creating an invoice mirror. $0 / voided filters constrain only
+	// Stripe rows; skipped / no-charge prorations never armed the guard. Ordered
+	// newest-first by the selected recorded_at, app_id tie-break.
 	SettledNewCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]SettledNewCreationChargeRaw, error)
 
 	// PendingNewCreationCharges reads the PENDING half of ListNewCreationCharges: apps
@@ -279,11 +276,12 @@ type Store interface {
 }
 
 // SettledNewCreationChargeRaw is one decoded SettledNewCreationCharges row: a settled
-// creation-proration charge for an app created in the window. InvoiceID is the
-// mirror row's UUID; Number is Stripe's customer-facing invoice number ("" when
-// the row was mirrored before finalization enriched it). AmountDueMicros is the
-// invoice total in int64 micro-USD (cents ×10_000, converted at the store
-// boundary). RecordedAt is the invoice's created_at (the display "recorded at").
+// creation-proration charge for an app created in the window. For Stripe rows,
+// InvoiceID is the mirror UUID and Number is the customer-facing number (""
+// before finalization enrichment). For wallet rows, InvoiceID is the stable app
+// UUID fallback and Number is the synthetic wallet ref exposed as the identity.
+// AmountDueMicros is the selected Stripe invoice total or wallet draw sum.
+// RecordedAt is the invoice creation time or the wallet guard-arm time.
 // Name is the app's frozen display name ("" when NULL). CreatedModuleCount is the
 // module count frozen at registration (the add-on tier's input). BaseMicros is the
 // settled creation base from the app's 'proration' base snapshot (0 when the app
@@ -550,12 +548,25 @@ type InvoiceMirrorRaw struct {
 // NewStore returns a Store backed by the given pgxpool. The pool is
 // retained so the batch catalog sync can run inside a single transaction.
 func NewStore(pool *pgxpool.Pool) Store {
-	return &pgxStore{pool: pool, q: db.New(pool)}
+	return newStore(pool, false)
+}
+
+// NewStoreWithCreditWallet returns a Store whose settled-creation display read
+// may query migration-048's credit ledger. Callers must pass only the resolved
+// boot flag (environment flag AND successful schema capability probe). When
+// disabled, the store uses the pre-wallet Stripe-only query.
+func NewStoreWithCreditWallet(pool *pgxpool.Pool, enabled bool) Store {
+	return newStore(pool, enabled)
+}
+
+func newStore(pool *pgxpool.Pool, walletEnabled bool) Store {
+	return &pgxStore{pool: pool, q: db.New(pool), walletEnabled: walletEnabled}
 }
 
 type pgxStore struct {
-	pool *pgxpool.Pool
-	q    *db.Queries
+	pool          *pgxpool.Pool
+	q             *db.Queries
+	walletEnabled bool
 }
 
 func (s *pgxStore) LookupMetricDefinition(ctx context.Context, moduleID uuid.UUID, metric string) (MetricDefinition, bool, error) {
@@ -785,47 +796,86 @@ func (s *pgxStore) MirroredAppIDs(ctx context.Context, accountID uuid.UUID, peri
 	return parseAppIDs(rows)
 }
 
-// SettledNewCreationCharges reads the settled creation-proration charges for apps
-// created in the window — see the Store interface doc. amount_due is the
-// mirror's NUMERIC whole cents; centsNumericToMicros does the ×10_000 cents →
-// micros conversion once, at this boundary (as ListInvoices does).
+type settledNewCreationDBRow struct {
+	appID              string
+	name               pgtype.Text
+	createdModuleCount int32
+	baseMicros         pgtype.Int8
+	invoiceID          string
+	number             string
+	amountDue          pgtype.Numeric
+	recordedAt         time.Time
+}
+
+// SettledNewCreationCharges reads the settled creation-proration charges for
+// apps created in the window — see the Store interface doc. With the wallet
+// disabled it executes the pre-048 Stripe-only query, which names no wallet
+// object. With the wallet enabled, SQL normalizes both the mirror amount and
+// the wallet ledger sum to NUMERIC cents; centsNumericToMicros performs the
+// single cents → micros conversion at this boundary.
 func (s *pgxStore) SettledNewCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]SettledNewCreationChargeRaw, error) {
-	rows, err := s.q.SettledNewCreationCharges(ctx, db.SettledNewCreationChargesParams{
+	params := db.SettledNewCreationChargesParams{
 		AccountID:   accountID.String(),
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
-	})
-	if err != nil {
-		return nil, err
 	}
-	out := make([]SettledNewCreationChargeRaw, 0, len(rows))
-	for _, r := range rows {
-		appID, err := uuid.Parse(r.AppID)
+	var normalized []settledNewCreationDBRow
+	if s.walletEnabled {
+		rows, err := s.q.SettledNewCreationCharges(ctx, params)
 		if err != nil {
-			return nil, fmt.Errorf("decode app_id %q: %w", r.AppID, err)
+			return nil, err
 		}
-		invoiceID, err := uuid.Parse(r.InvoiceID)
-		if err != nil {
-			return nil, fmt.Errorf("decode invoice id for app %q: %w", r.AppID, err)
+		normalized = make([]settledNewCreationDBRow, 0, len(rows))
+		for _, r := range rows {
+			normalized = append(normalized, settledNewCreationDBRow{
+				appID: r.AppID, name: r.Name, createdModuleCount: r.CreatedModuleCount,
+				baseMicros: r.BaseMicros, invoiceID: r.InvoiceID, number: r.Number.String,
+				amountDue: r.AmountDue, recordedAt: r.RecordedAt,
+			})
 		}
-		amount, err := centsNumericToMicros(r.AmountDue)
+	} else {
+		rows, err := s.q.SettledNewCreationChargesLegacy(ctx, db.SettledNewCreationChargesLegacyParams{
+			AccountID: params.AccountID, PeriodStart: params.PeriodStart, PeriodEnd: params.PeriodEnd,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("decode amount_due for app %q: %w", r.AppID, err)
+			return nil, err
+		}
+		normalized = make([]settledNewCreationDBRow, 0, len(rows))
+		for _, r := range rows {
+			normalized = append(normalized, settledNewCreationDBRow{
+				appID: r.AppID, name: r.Name, createdModuleCount: r.CreatedModuleCount,
+				baseMicros: r.BaseMicros, invoiceID: r.InvoiceID, number: r.Number.String,
+				amountDue: r.AmountDue, recordedAt: r.RecordedAt,
+			})
+		}
+	}
+
+	out := make([]SettledNewCreationChargeRaw, 0, len(normalized))
+	for _, r := range normalized {
+		appID, err := uuid.Parse(r.appID)
+		if err != nil {
+			return nil, fmt.Errorf("decode app_id %q: %w", r.appID, err)
+		}
+		invoiceID, err := uuid.Parse(r.invoiceID)
+		if err != nil {
+			return nil, fmt.Errorf("decode invoice id for app %q: %w", r.appID, err)
+		}
+		amount, err := centsNumericToMicros(r.amountDue)
+		if err != nil {
+			return nil, fmt.Errorf("decode amount_due for app %q: %w", r.appID, err)
 		}
 		out = append(out, SettledNewCreationChargeRaw{
-			AppID:     appID,
-			InvoiceID: invoiceID,
-			// pgtype.Text zero-values String to "" when NULL — the "not yet
-			// number-enriched" contract SettledNewCreationChargeRaw documents.
-			Number:          r.Number.String,
+			AppID:           appID,
+			InvoiceID:       invoiceID,
+			Number:          r.number,
 			AmountDueMicros: amount,
-			RecordedAt:      r.RecordedAt,
-			Name:            r.Name.String, // "" when NULL (pre-037 / unnamed)
+			RecordedAt:      r.recordedAt,
+			Name:            r.name.String, // "" when NULL (pre-037 / unnamed)
 			// pgtype.Int8 zero-values Int64 to 0 when NULL — a settled app with no
 			// 'proration' snapshot (LEFT JOIN miss) folds its whole amount into
 			// add-ons, matching the "base 0" contract.
-			CreatedModuleCount: int(r.CreatedModuleCount),
-			BaseMicros:         r.BaseMicros.Int64,
+			CreatedModuleCount: int(r.createdModuleCount),
+			BaseMicros:         r.baseMicros.Int64,
 		})
 	}
 	return out, nil

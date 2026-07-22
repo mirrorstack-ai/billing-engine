@@ -62,13 +62,14 @@ func CreationChargeBaseMicros(createdAt, periodStart, periodEnd time.Time) int64
 }
 
 // CreationChargeOverageMicros is the per-co-created-over-module surcharge the
-// creation-proration sweep bills on the combined creation invoice for ONE
-// timer: ModuleOverageFeeMicros prorated to the creation window (the same
-// shape as CreationChargeBaseMicros), plus the full fee for the straddled
-// period when the creation grace crosses the period boundary — then ROUNDED
-// TO WHOLE CENTS (the Stripe boundary the sweep charges at). Returned back in
-// micros (cents × microsPerCent) so a multi-timer projection is
-// per-timer-cents × count, never round(micros × count) — matching the sweep's
+// Stripe creation-proration rail bills on the combined creation invoice for ONE
+// timer. The wallet rail draws the base only and leaves this surcharge to Leg 1.
+// The amount is ModuleOverageFeeMicros prorated to the creation window (the same
+// shape as CreationChargeBaseMicros), plus the full fee for the straddled period
+// when the creation grace crosses the period boundary — then ROUNDED TO WHOLE
+// CENTS (the Stripe boundary the sweep charges at). Returned back in micros
+// (cents × microsPerCent) so a multi-timer projection is per-timer-cents × count,
+// never round(micros × count) — matching the Stripe sweep's
 // overageCents × len(overTimers) to the micro.
 func CreationChargeOverageMicros(createdAt, periodStart, periodEnd time.Time) int64 {
 	m := ProratedBaseMicros(ModuleOverageFeeMicros, createdAt, periodStart, periodEnd)

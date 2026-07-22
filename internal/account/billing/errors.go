@@ -12,6 +12,9 @@ const (
 	CodeNotFound     Code = "NOT_FOUND"
 	CodeStripeError  Code = "STRIPE_ERROR"
 	CodeInternal     Code = "INTERNAL"
+	// CodeUnavailable is returned by the credit RPCs while the fail-closed
+	// wallet flag or migration-048 capability probe is off.
+	CodeUnavailable Code = "CREDIT_WALLET_DISABLED"
 	// CodePaymentRequired is the funding-gates rejection (design:
 	// docs-temp/billing-funding-gates/design.md, DECIDED 2026-07-11): the
 	// requested action needs a funded billing account (activated + usable
@@ -67,6 +70,12 @@ func NotFound(msg string) *Error {
 // HTTP 402 on the local path; api-platform relays the same 402 outward.
 func PaymentRequired(msg string) *Error {
 	return &Error{Code: CodePaymentRequired, Message: msg}
+}
+
+// Unavailable reports a deliberately disabled capability. The distinct wire
+// code lets clients distinguish it from invalid input and transient internals.
+func Unavailable(msg string) *Error {
+	return &Error{Code: CodeUnavailable, Message: msg}
 }
 
 func StripeError(msg string, wrapped error) *Error {

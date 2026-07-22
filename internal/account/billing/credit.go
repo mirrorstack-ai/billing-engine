@@ -37,6 +37,9 @@ func (s *Service) GetCreditStanding(ctx context.Context, req GetCreditStandingRe
 	if err := validateCreditOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
 		return nil, err
 	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
+	}
 
 	status, err := s.GetServiceStatus(ctx, GetServiceStatusRequest{
 		UserID: req.OwnerUserID,
@@ -104,6 +107,9 @@ func (s *Service) ListCreditLedger(ctx context.Context, req ListCreditLedgerRequ
 		}
 		cursor = &decoded
 	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
+	}
 
 	accountID, found, err := s.ownerAccount(ctx, req.OwnerUserID, req.OwnerOrgID)
 	if err != nil {
@@ -150,6 +156,9 @@ func (s *Service) StartCreditPurchase(ctx context.Context, req StartCreditPurcha
 	}
 	if strings.TrimSpace(req.IdempotencyKey) == "" {
 		return nil, InvalidInput("idempotency_key required")
+	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
 	}
 
 	accountID, found, err := s.ownerAccount(ctx, req.OwnerUserID, req.OwnerOrgID)
@@ -277,6 +286,9 @@ func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurc
 	if err != nil {
 		return nil, InvalidInput("purchase_id must be a UUID")
 	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
+	}
 	accountID, found, err := s.ownerAccount(ctx, req.OwnerUserID, req.OwnerOrgID)
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
@@ -345,6 +357,17 @@ func (s *Service) SetAutoTopUp(ctx context.Context, req SetAutoTopUpRequest) (*S
 	if req.Enabled && strings.TrimSpace(req.PaymentMethodID) == "" {
 		return nil, InvalidInput("payment_method_id required when auto top-up is enabled")
 	}
+	var paymentMethodID uuid.UUID
+	if req.PaymentMethodID != "" {
+		var err error
+		paymentMethodID, err = uuid.Parse(req.PaymentMethodID)
+		if err != nil {
+			return nil, InvalidInput("payment_method_id must be a UUID")
+		}
+	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
+	}
 
 	accountID, found, err := s.ownerAccount(ctx, req.OwnerUserID, req.OwnerOrgID)
 	if err != nil {
@@ -354,10 +377,6 @@ func (s *Service) SetAutoTopUp(ctx context.Context, req SetAutoTopUpRequest) (*S
 		return nil, NotFound("billing account not found")
 	}
 	if req.PaymentMethodID != "" {
-		paymentMethodID, err := uuid.Parse(req.PaymentMethodID)
-		if err != nil {
-			return nil, InvalidInput("payment_method_id must be a UUID")
-		}
 		_, _, _, owned, err := s.paymentMethodTarget(ctx, req.OwnerUserID, req.OwnerOrgID, paymentMethodID)
 		if err != nil {
 			return nil, Internal("payment method lookup failed", err)
@@ -392,12 +411,19 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 	if req.CreditLimitMicros != nil && *req.CreditLimitMicros < 0 {
 		return nil, InvalidInput("credit_limit_micros must be non-negative")
 	}
-
-	var accountID uuid.UUID
 	if req.DistributorOrgID != uuid.Nil {
 		if req.OwnerOrgID == uuid.Nil || req.OwnerUserID != uuid.Nil {
 			return nil, InvalidInput("distributor calls require owner_org_id")
 		}
+	} else if req.OwnerUserID == uuid.Nil {
+		return nil, InvalidInput("self-scoped billing mode changes require owner_user_id")
+	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
+	}
+
+	var accountID uuid.UUID
+	if req.DistributorOrgID != uuid.Nil {
 		var found bool
 		var err error
 		accountID, found, err = s.store.DistributorCustomerAccount(ctx, req.DistributorOrgID, req.OwnerOrgID)
@@ -408,9 +434,6 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 			return nil, InvalidInput("distributor does not manage customer org")
 		}
 	} else {
-		if req.OwnerUserID == uuid.Nil {
-			return nil, InvalidInput("self-scoped billing mode changes require owner_user_id")
-		}
 		var err error
 		accountID, _, err = s.ensureOwnerAccount(ctx, req.OwnerUserID, uuid.Nil)
 		if err != nil {
@@ -438,6 +461,9 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 func (s *Service) ListDistributorCustomers(ctx context.Context, req ListDistributorCustomersRequest) (*ListDistributorCustomersResponse, error) {
 	if req.DistributorOrgID == uuid.Nil {
 		return nil, InvalidInput("distributor_org_id required")
+	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
 	}
 	states, err := s.store.ListDistributorCustomerStates(ctx, req.DistributorOrgID)
 	if err != nil {
@@ -476,12 +502,15 @@ func (s *Service) GrantCredits(ctx context.Context, req GrantCreditsRequest) (*G
 	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
 		return nil, InvalidInput("expires_at must be in the future")
 	}
+	if req.Actor == "distributor" && req.DistributorOrgID == uuid.Nil {
+		return nil, InvalidInput("distributor_org_id required for distributor grants")
+	}
+	if !s.walletEnabled {
+		return nil, Unavailable("credit wallet is not enabled")
+	}
 
 	var accountID uuid.UUID
 	if req.Actor == "distributor" {
-		if req.DistributorOrgID == uuid.Nil {
-			return nil, InvalidInput("distributor_org_id required for distributor grants")
-		}
 		var found bool
 		var err error
 		accountID, found, err = s.store.DistributorCustomerAccount(ctx, req.DistributorOrgID, req.CustomerOrgID)

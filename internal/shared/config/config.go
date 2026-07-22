@@ -10,10 +10,12 @@ package config
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -35,6 +37,47 @@ const (
 // sentinel.
 func IsLambda() bool {
 	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
+}
+
+// CreditWalletEnabled reports the CREDIT_WALLET_ENABLED env flag, fail-closed:
+// only "1"/"true" enable it; absent/empty/anything else = OFF.
+func CreditWalletEnabled() bool {
+	switch os.Getenv("CREDIT_WALLET_ENABLED") {
+	case "1", "true", "TRUE", "True":
+		return true
+	default:
+		return false
+	}
+}
+
+// CreditWalletSchemaReady probes (once, at boot) that migration 048's objects
+// exist and are readable by the app role. Missing objects are the fail-closed
+// "not ready yet" signal; every other database error is returned so the caller
+// can fail fast. LIMIT 0 plans and validates the columns without moving rows.
+func CreditWalletSchemaReady(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	return creditWalletSchemaReady(ctx, pool)
+}
+
+type creditWalletSchemaExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func creditWalletSchemaReady(ctx context.Context, db creditWalletSchemaExecutor) (bool, error) {
+	if _, err := db.Exec(ctx, "SELECT billing_mode FROM ms_billing.accounts LIMIT 0"); err != nil {
+		var pg *pgconn.PgError
+		if errors.As(err, &pg) && (pg.Code == "42P01" || pg.Code == "42703") {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := db.Exec(ctx, "SELECT 1 FROM ms_billing.credit_ledger LIMIT 0"); err != nil {
+		var pg *pgconn.PgError
+		if errors.As(err, &pg) && pg.Code == "42P01" {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // MustEnv returns the value of the given env var. If unset or empty,

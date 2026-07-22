@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"os"
 	"testing"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
@@ -53,5 +54,41 @@ func TestMustEnv_ReturnsValueWhenSet(t *testing.T) {
 	t.Setenv("TEST_REQUIRED", "hello")
 	if got := config.MustEnv("TEST_REQUIRED"); got != "hello" {
 		t.Errorf("MustEnv() = %q; want %q", got, "hello")
+	}
+}
+
+func TestCreditWalletEnabled_FailClosedTruthTable(t *testing.T) {
+	value := func(v string) *string { return &v }
+	tests := []struct {
+		name  string
+		value *string
+		want  bool
+	}{
+		{name: "unset", value: nil, want: false},
+		{name: "empty", value: value(""), want: false},
+		{name: "one", value: value("1"), want: true},
+		{name: "lowercase true", value: value("true"), want: true},
+		{name: "uppercase true", value: value("TRUE"), want: true},
+		{name: "titlecase true", value: value("True"), want: true},
+		{name: "zero", value: value("0"), want: false},
+		{name: "false", value: value("false"), want: false},
+		{name: "other", value: value("yes"), want: false},
+		{name: "whitespace is not accepted", value: value(" true "), want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.value == nil {
+				t.Setenv("CREDIT_WALLET_ENABLED", "temporary")
+				if err := os.Unsetenv("CREDIT_WALLET_ENABLED"); err != nil {
+					t.Fatalf("Unsetenv() error = %v", err)
+				}
+			} else {
+				t.Setenv("CREDIT_WALLET_ENABLED", *tc.value)
+			}
+			if got := config.CreditWalletEnabled(); got != tc.want {
+				t.Errorf("CreditWalletEnabled() = %v; want %v", got, tc.want)
+			}
+		})
 	}
 }

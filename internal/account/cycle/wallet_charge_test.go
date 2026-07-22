@@ -29,7 +29,7 @@ func TestRunBillingCycle_StandardWalletDrawsThenChargesOnlyRemainder(t *testing.
 	sc := newFakeStripe()
 	sc.invoiceAmountDue = 60
 
-	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	resp, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.EqualValues(t, 400_000, resp.WalletDrawnMicros)
@@ -49,7 +49,7 @@ func TestRunBillingCycle_WalletConsumptionOrderIsDeterministic(t *testing.T) {
 	soonerGrant := seedWalletSource(store, "grant", 1_000_000, timeUTC(2099, 1, 1, 0), created.Add(3*time.Hour))
 	sc := newFakeStripe()
 
-	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	resp, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.EqualValues(t, 7_000_000, resp.WalletDrawnMicros)
@@ -65,7 +65,7 @@ func TestRunBillingCycle_CreditsModeDebitsFullBoundaryWithoutStripe(t *testing.T
 	seedWalletSource(store, "grant", 2_000_000, time.Time{}, timeUTC(2026, 1, 1, 0))
 	sc := newFakeStripe()
 
-	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	resp, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.EqualValues(t, 5_000_000, resp.WalletDrawnMicros)
@@ -81,7 +81,7 @@ func TestRunBillingCycle_WalletDrawIsPeriodIdempotentAcrossNoPMReclaim(t *testin
 	firstSource := seedWalletSource(store, "grant", 400_000, time.Time{}, timeUTC(2026, 1, 1, 0))
 	sc := newFakeStripe()
 
-	first, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	first, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusSkippedNoPM, first.Status)
 	require.EqualValues(t, 400_000, first.WalletDrawnMicros)
@@ -90,7 +90,7 @@ func TestRunBillingCycle_WalletDrawIsPeriodIdempotentAcrossNoPMReclaim(t *testin
 	// Credit arriving after the skipped attempt belongs to future draws. A
 	// reclaim must reuse the period's original debit, not consume it as well.
 	lateSource := seedWalletSource(store, "purchase", 900_000, time.Time{}, timeUTC(2026, 2, 1, 0))
-	second, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	second, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusSkippedNoPM, second.Status)
 	require.EqualValues(t, 400_000, second.WalletDrawnMicros)
@@ -106,17 +106,33 @@ func TestRunBillingCycle_FrozenStripeAttemptNeverStartsNewWalletDraw(t *testing.
 	sc := newFakeStripe()
 	sc.errDraft = errors.New("stripe unavailable after boundary freeze")
 
-	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	_, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.Error(t, err)
 	require.NotEmpty(t, store.frozenCharges)
 
 	lateSource := seedWalletSource(store, "grant", 1_000_000, time.Time{}, timeUTC(2026, 2, 1, 0))
 	sc.errDraft = nil
 	sc.invoiceAmountDue = 100
-	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	resp, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.Zero(t, resp.WalletDrawnMicros)
 	require.EqualValues(t, 1_000_000, store.walletSources[lateSource].remaining)
 	require.EqualValues(t, 100, resp.ChargedCents)
+}
+
+func TestRunBillingCycle_CreditWalletFlagOffSkipsWalletStateAndKeepsLegacyPrepaidPath(t *testing.T) {
+	store := newFakeStore()
+	store.collection.Mode = cycle.BillingModePrepaid
+	store.chargedTotal = 1_000_000
+	source := seedWalletSource(store, "grant", 1_000_000, time.Time{}, timeUTC(2026, 1, 1, 0))
+
+	resp, err := chargeSvc(store, newFakeStripe()).WithCreditWallet(false).RunBillingCycle(
+		context.Background(), chargeAccount, periodStart, periodEnd, 0,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusSkippedPrepaid, resp.Status)
+	require.Zero(t, store.walletStateCalls, "flag OFF must execute no migration-048 wallet-state read")
+	require.EqualValues(t, 1_000_000, store.walletSources[source].remaining, "flag OFF must not draw wallet credit")
 }

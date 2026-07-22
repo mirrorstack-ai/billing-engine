@@ -210,3 +210,47 @@ func TestDrawWalletCredits_Integration_CreditsResidualAndAllowNewGuard(t *testin
 	require.Zero(t, expiryDraw.DrawnMicros)
 	require.Empty(t, persistedWalletDraws(t, pool, expiryAccount, expiryPeriodID))
 }
+
+func TestDrawCreationProrationFromWallet_Integration_AttemptedDefersBeforeDraw(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	accountID := seedAccount(t, pool)
+	_, err := pool.Exec(ctx, `UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`, accountID.String())
+	require.NoError(t, err)
+	appID := uuid.New()
+	createdAt := mustTime(t, "2026-06-19T12:00:00Z")
+	require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, createdAt, "race app"))
+	require.NoError(t, store.MarkAppProrationAttempted(ctx, appID, createdAt.Add(4*time.Hour)))
+	insertWalletEntry(t, pool, accountID, uuid.New(), 5_000_000, "grant", "settled", nil, createdAt)
+
+	periodStart := mustTime(t, "2026-06-04T00:00:00Z")
+	periodEnd := mustTime(t, "2026-07-04T00:00:00Z")
+	outcome, ref, err := store.DrawCreationProrationFromWallet(ctx, appID, cycle.ProrationWalletCharge{
+		Ref:          "wallet:app-proration:" + appID.String(),
+		AmountMicros: 3_250_123,
+		Snapshot: cycle.AppBaseSnapshot{
+			AppID: appID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+			BaseMicros: 3_250_123,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationWalletDeferToStripe, outcome)
+	require.Empty(t, ref)
+
+	var draws, snapshots int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.credit_ledger
+		  WHERE account_id = $1 AND type = 'usage_draw'`, accountID.String()).Scan(&draws))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.app_base_snapshots WHERE app_id = $1`, appID.String()).Scan(&snapshots))
+	require.Zero(t, draws, "the attempted marker must win before any ledger write")
+	require.Zero(t, snapshots, "the deferred wallet transaction persists no snapshot")
+
+	app, found, err := store.AppMirror(ctx, appID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, app.ProrationAttempted)
+	require.Empty(t, app.ProrationInvoiceID, "Stripe recovery, not the wallet, must arm the guard")
+}

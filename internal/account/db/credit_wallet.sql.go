@@ -380,6 +380,57 @@ func (q *Queries) GetDistributorCustomerAccount(ctx context.Context, arg GetDist
 	return account_id, err
 }
 
+const insertCreationWalletDraw = `-- name: InsertCreationWalletDraw :exec
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key,
+    source_credit_id
+) VALUES (
+    $1::uuid,
+    -$2::bigint,
+    'usage_draw',
+    'settled',
+    $3::bigint,
+    'system',
+    $4::text,
+    $5::uuid
+)
+`
+
+type InsertCreationWalletDrawParams struct {
+	AccountID          string      `json:"account_id"`
+	AmountMicros       int64       `json:"amount_micros"`
+	BalanceAfterMicros int64       `json:"balance_after_micros"`
+	IdempotencyKey     string      `json:"idempotency_key"`
+	SourceCreditID     pgtype.UUID `json:"source_credit_id"`
+}
+
+// InsertCreationWalletDraw appends one signed creation-proration draw row.
+// Unlike InsertWalletDraw it carries NO period_id (period_id stays NULL): a
+// creation-proration charge is keyed per APP, not per billing period, so a
+// period-scoped guard would collide with the same period's boundary draw AND
+// with sibling apps' creation draws against the same funding lot. Its
+// idempotency is therefore the deterministic app-scoped idempotency_key alone
+// (migration 048's global idempotency_key unique index), which is what the
+// period/source relational guards can not express for a per-app debit. A
+// multi-lot draw invokes it once per source; credits mode may append one final
+// NULL-source unsecured row.
+func (q *Queries) InsertCreationWalletDraw(ctx context.Context, arg InsertCreationWalletDrawParams) error {
+	_, err := q.db.Exec(ctx, insertCreationWalletDraw,
+		arg.AccountID,
+		arg.AmountMicros,
+		arg.BalanceAfterMicros,
+		arg.IdempotencyKey,
+		arg.SourceCreditID,
+	)
+	return err
+}
+
 const insertPendingCreditPurchase = `-- name: InsertPendingCreditPurchase :one
 INSERT INTO ms_billing.credit_ledger (
     account_id,

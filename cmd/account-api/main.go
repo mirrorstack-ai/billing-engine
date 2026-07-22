@@ -462,6 +462,15 @@ var disp *dispatcher
 // config loads at package load time.
 func buildDispatcher() *dispatcher {
 	pool := config.MustPgxPool()
+	walletEnabled := config.CreditWalletEnabled()
+	if walletEnabled {
+		ready, err := config.CreditWalletSchemaReady(context.Background(), pool)
+		if err != nil {
+			slog.Error("credit-wallet schema probe failed", "error", err)
+			os.Exit(1)
+		}
+		walletEnabled = ready
+	}
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 	// Post-confirmation redirect target for the setup-mode Checkout
 	// Session (the frontend billing page). Required by ui_mode=elements.
@@ -469,12 +478,12 @@ func buildDispatcher() *dispatcher {
 
 	store := billing.NewStore(pool)
 	stripeClient := billingstripe.NewClient(stripeKey)
-	svc := billing.NewService(store, stripeClient, returnURL)
+	svc := billing.NewService(store, stripeClient, returnURL).WithCreditWallet(walletEnabled)
 
 	budgetSvc := budget.NewService(budget.NewStore(pool))
 	// The ingest path fires the per-app budget hook best-effort on a fresh
 	// usage event (design §5 / §10).
-	usageSvc := usage.NewService(usage.NewStore(pool)).WithBudgetEvaluator(budgetSvc)
+	usageSvc := usage.NewService(usage.NewStoreWithCreditWallet(pool, walletEnabled)).WithBudgetEvaluator(budgetSvc)
 
 	// The apps-mirror RPCs (RegisterApp / SyncAppModules) live on the cycle
 	// Service because RegisterApp's creation-proration charge reuses the charge
@@ -483,7 +492,9 @@ func buildDispatcher() *dispatcher {
 	// ListSponsoredOrgs prices each sponsored org through the account-bill
 	// spine (usage.Service.GetAccountBill) — one audited pricing path, no
 	// second rollup — so the cycle Service borrows the usage Service here.
-	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient).WithAccountBill(usageSvc)
+	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient).
+		WithAccountBill(usageSvc).
+		WithCreditWallet(walletEnabled)
 
 	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc}
 }
