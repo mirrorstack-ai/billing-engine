@@ -168,6 +168,128 @@ func (q *Queries) FinalizeCreditPurchase(ctx context.Context, arg FinalizeCredit
 	return i, err
 }
 
+const getCreditAccountSnapshot = `-- name: GetCreditAccountSnapshot :one
+SELECT
+    account.id,
+    account.owner_user_id,
+    account.owner_org_id,
+    account.billing_mode,
+    account.credit_limit_micros,
+    account.activated_at
+FROM ms_billing.accounts account
+WHERE account.id = $1::uuid
+`
+
+type GetCreditAccountSnapshotRow struct {
+	ID                string             `json:"id"`
+	OwnerUserID       pgtype.UUID        `json:"owner_user_id"`
+	OwnerOrgID        pgtype.UUID        `json:"owner_org_id"`
+	BillingMode       string             `json:"billing_mode"`
+	CreditLimitMicros int64              `json:"credit_limit_micros"`
+	ActivatedAt       pgtype.Timestamptz `json:"activated_at"`
+}
+
+// GetCreditAccountSnapshot classifies the account before any ledger read.
+// A standard account returns from the Go provider after this query, keeping
+// credit_ledger completely untouched on that path.
+func (q *Queries) GetCreditAccountSnapshot(ctx context.Context, accountID string) (GetCreditAccountSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, getCreditAccountSnapshot, accountID)
+	var i GetCreditAccountSnapshotRow
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerUserID,
+		&i.OwnerOrgID,
+		&i.BillingMode,
+		&i.CreditLimitMicros,
+		&i.ActivatedAt,
+	)
+	return i, err
+}
+
+const getCreditGateState = `-- name: GetCreditGateState :one
+WITH source_lots AS (
+    SELECT
+        source.id,
+        source.expires_at,
+        (
+            source.amount_micros::numeric
+            + COALESCE((
+                SELECT SUM(draw.amount_micros)
+                FROM ms_billing.credit_ledger draw
+                WHERE draw.source_credit_id = source.id
+                  AND draw.account_id = source.account_id
+                  AND draw.status = 'settled'
+                  AND draw.type IN ('usage_draw', 'subscription_draw')
+            ), 0)
+        ) AS remaining_micros
+    FROM ms_billing.credit_ledger source
+    WHERE source.account_id = $1::uuid
+      AND source.status = 'settled'
+      AND source.amount_micros > 0
+      AND source.type IN (
+          'grant', 'preallocation', 'refund', 'adjustment',
+          'purchase', 'auto_topup'
+      )
+), balances AS (
+    SELECT
+        COALESCE((
+            SELECT SUM(entry.amount_micros)
+            FROM ms_billing.credit_ledger entry
+            WHERE entry.account_id = $1::uuid
+              AND entry.status = 'settled'
+        ), 0) AS settled_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND (lot.expires_at IS NULL OR lot.expires_at > CURRENT_TIMESTAMP)
+        ), 0) AS lot_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND lot.expires_at <= CURRENT_TIMESTAMP
+        ), 0) AS expired_lot_micros
+)
+SELECT
+    balances.settled_micros::bigint AS settled_balance_micros,
+    GREATEST(
+        LEAST(
+            balances.lot_micros,
+            GREATEST(
+                balances.settled_micros - balances.expired_lot_micros,
+                0
+            )
+        ),
+        0
+    )::bigint AS spendable_balance_micros,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = $1::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+    )::boolean AS pending_auto_topup
+FROM balances
+`
+
+type GetCreditGateStateRow struct {
+	SettledBalanceMicros   int64 `json:"settled_balance_micros"`
+	SpendableBalanceMicros int64 `json:"spendable_balance_micros"`
+	PendingAutoTopup       bool  `json:"pending_auto_topup"`
+}
+
+// GetCreditGateState mirrors WalletCreditState's spendable-balance predicate:
+// active positive lot remainder, capped by posted balance after expired lot
+// remainder is removed. Pending manual purchases are neither settled balance
+// nor grace; only a durable pending auto_topup suppresses the real-time block.
+func (q *Queries) GetCreditGateState(ctx context.Context, accountID string) (GetCreditGateStateRow, error) {
+	row := q.db.QueryRow(ctx, getCreditGateState, accountID)
+	var i GetCreditGateStateRow
+	err := row.Scan(&i.SettledBalanceMicros, &i.SpendableBalanceMicros, &i.PendingAutoTopup)
+	return i, err
+}
+
 const getCreditLedgerEntryByIdempotencyKey = `-- name: GetCreditLedgerEntryByIdempotencyKey :one
 SELECT
     id,
@@ -871,6 +993,10 @@ UPDATE ms_billing.accounts
 SET billing_mode = $1::text,
     credit_limit_micros = $2::bigint
 WHERE id = $3::uuid
+  AND (
+      billing_mode IS DISTINCT FROM $1::text
+      OR credit_limit_micros IS DISTINCT FROM $2::bigint
+  )
 RETURNING billing_mode, credit_limit_micros
 `
 

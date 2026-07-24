@@ -11,6 +11,7 @@ import (
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -419,6 +420,9 @@ func (s *fakeStore) FinalizeCreditPurchase(_ context.Context, purchaseID, accoun
 	}
 	if purchase.Status == "pending" {
 		purchase.Status = status
+		purchase.Transitioned = true
+	} else {
+		purchase.Transitioned = false
 	}
 	if receiptURL != "" {
 		purchase.ReceiptURL = receiptURL
@@ -436,12 +440,24 @@ func (s *fakeStore) UpsertCreditAutoTopUp(_ context.Context, accountID uuid.UUID
 	return cfg, nil
 }
 
-func (s *fakeStore) SetCreditBillingMode(_ context.Context, accountID uuid.UUID, mode billing.BillingMode, creditLimitMicros int64) error {
+func (s *fakeStore) CreditGateSnapshot(_ context.Context, accountID uuid.UUID) (credit.Snapshot, error) {
 	standing := s.creditStanding[accountID]
+	return credit.Snapshot{
+		AccountID:              accountID,
+		BillingMode:            string(standing.BillingMode),
+		SettledBalanceMicros:   standing.BalanceMicros,
+		SpendableBalanceMicros: standing.BalanceMicros,
+		CreditLimitMicros:      standing.CreditLimitMicros,
+	}, nil
+}
+
+func (s *fakeStore) SetCreditBillingMode(_ context.Context, accountID uuid.UUID, mode billing.BillingMode, creditLimitMicros int64) (bool, error) {
+	standing := s.creditStanding[accountID]
+	changed := standing.BillingMode != mode || standing.CreditLimitMicros != creditLimitMicros
 	standing.BillingMode = mode
 	standing.CreditLimitMicros = creditLimitMicros
 	s.creditStanding[accountID] = standing
-	return nil
+	return changed, nil
 }
 
 func (s *fakeStore) DistributorCustomerAccount(_ context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {

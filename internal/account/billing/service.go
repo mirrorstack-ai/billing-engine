@@ -2,10 +2,12 @@ package billing
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/eligibility"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -18,6 +20,8 @@ type Service struct {
 	stripe        billingstripe.Client
 	returnURL     string
 	walletEnabled bool
+	creditGate    credit.Gate
+	observer      credit.SettlementObserver
 }
 
 // NewService wires a Service. store and stripe are required; passing
@@ -33,6 +37,15 @@ func NewService(store Store, stripe billingstripe.Client, returnURL string) *Ser
 // probe succeeds. Returns the Service for chaining.
 func (s *Service) WithCreditWallet(enabled bool) *Service {
 	s.walletEnabled = enabled
+	return s
+}
+
+// WithCreditCoordinator attaches the runtime wallet gate and the best-effort
+// post-settlement observer. It is inert unless WithCreditWallet(true) is also
+// set after the fail-closed schema capability probe.
+func (s *Service) WithCreditCoordinator(gate credit.Gate, observer credit.SettlementObserver) *Service {
+	s.creditGate = gate
+	s.observer = observer
 	return s
 }
 
@@ -401,6 +414,19 @@ func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequ
 		FailedChargeStreak:      sig.FailedChargeStreak,
 		UnpaidInvoiceCount:      unpaid,
 	})
+	if s.walletEnabled && s.creditGate != nil {
+		out, gateErr := s.creditGate.OutOfCredits(ctx, accountID)
+		if gateErr != nil {
+			slog.ErrorContext(ctx, "credit gate unavailable; preserving legacy verdict",
+				"account_id", accountID, "error", gateErr)
+		} else if out {
+			if !verdict.Blocked {
+				verdict.Blocked = true
+				verdict.Reason = eligibility.ReasonOutOfCredits
+			}
+			verdict.Reasons = append(verdict.Reasons, eligibility.ReasonOutOfCredits)
+		}
+	}
 	return serviceStatusResponse(verdict), nil
 }
 

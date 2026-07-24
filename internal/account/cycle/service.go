@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math/big"
 	"time"
 
@@ -30,10 +31,15 @@ type Service struct {
 	// nil until wired — only ListSponsoredOrgs depends on it (the charge/rollup
 	// legs never touch it), so rollup-only wiring leaves it nil.
 	bill AccountBillReader
-	// estimate is the disposable accrued-estimate cache reconciler. Boundary
-	// pricing is authoritative, so RunBillingCycle overwrites the cache from the
-	// true total best-effort; cache failure must never block billing.
+	// estimate is the disposable accrued-estimate and standing reconciler.
+	// Boundary pricing is authoritative, so RunBillingCycle seeds the new
+	// period and pushes its post-draw verdict best-effort.
 	estimate BoundaryEstimateReconciler
+	// walletObserver refreshes standing after a first-time mid-period wallet
+	// debit (creation proration or module overage). Those draws can commit an
+	// unsecured residual, so waiting for the next boundary would leave a
+	// credits-only account serving against a negative posted balance.
+	walletObserver WalletMutationObserver
 }
 
 // AccountBillReader is the account-bill read ListSponsoredOrgs reuses to price
@@ -43,10 +49,18 @@ type AccountBillReader interface {
 	GetAccountBill(ctx context.Context, req usage.GetAccountBillRequest) (*usage.GetAccountBillResponse, error)
 }
 
-// BoundaryEstimateReconciler is the narrow cache seam used at an authoritative
-// cycle boundary. Implementations must treat Set as an overwrite, not a delta.
+// BoundaryEstimateReconciler is the narrow post-draw seam used at an
+// authoritative cycle boundary. periodStart is the period that just opened;
+// amountMicros is zero because both closed-period arrears and the new period's
+// recurring advance fees were settled by the durable draw.
 type BoundaryEstimateReconciler interface {
-	Set(ctx context.Context, accountID uuid.UUID, periodStart time.Time, amountMicros int64) error
+	ReconcileBoundary(ctx context.Context, accountID uuid.UUID, periodStart time.Time, amountMicros int64) error
+}
+
+// WalletMutationObserver is the narrow post-commit seam for first-time
+// mid-period credit-wallet draws.
+type WalletMutationObserver interface {
+	ObserveAccount(ctx context.Context, accountID uuid.UUID) error
 }
 
 // NewService wires a Service. store is required; passing nil panics at the
@@ -179,6 +193,25 @@ func (s *Service) WithAccountBill(bill AccountBillReader) *Service {
 func (s *Service) WithBoundaryEstimateReconciler(estimate BoundaryEstimateReconciler) *Service {
 	s.estimate = estimate
 	return s
+}
+
+// WithWalletMutationObserver injects post-commit standing reconciliation for
+// first-time mid-period credit-wallet draws. It is best-effort and optional.
+func (s *Service) WithWalletMutationObserver(observer WalletMutationObserver) *Service {
+	s.walletObserver = observer
+	return s
+}
+
+func (s *Service) observeWalletMutation(ctx context.Context, accountID uuid.UUID) {
+	if s.walletObserver == nil {
+		return
+	}
+	if err := s.walletObserver.ObserveAccount(ctx, accountID); err != nil {
+		// The wallet debit is already committed. Never convert notification or
+		// disposable-cache failure into a money-path retry.
+		slog.ErrorContext(ctx, "wallet mutation committed; standing observation failed",
+			"account_id", accountID, "error", err)
+	}
 }
 
 // RollupPeriod turns the account's raw usage_events for [periodStart,

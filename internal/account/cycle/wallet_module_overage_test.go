@@ -42,7 +42,10 @@ func TestChargeModuleOverage_CreditModeDrawsFromWallet(t *testing.T) {
 	store.walletMode = cycle.CreditBillingModeCredits
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	svc := cycle.NewService(store, sc).WithCreditWallet(true)
+	observer := &fakeWalletMutationObserver{}
+	svc := cycle.NewService(store, sc).
+		WithCreditWallet(true).
+		WithWalletMutationObserver(observer)
 	ctx := context.Background()
 
 	app := uuid.New()
@@ -62,6 +65,8 @@ func TestChargeModuleOverage_CreditModeDrawsFromWallet(t *testing.T) {
 	require.Empty(t, sc.invoiceCalls, "credit mode never creates a Stripe invoice")
 	require.Empty(t, sc.itemCalls)
 	require.Empty(t, sc.finalizeCalls)
+	require.Equal(t, []uuid.UUID{acct}, observer.calls,
+		"the first committed wallet draw immediately refreshes standing")
 
 	// The guard armed with the synthetic wallet reference + charged, item id NULL.
 	require.True(t, store.timers[over].graceResolved)
@@ -76,6 +81,7 @@ func TestChargeModuleOverage_CreditModeDrawsFromWallet(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, second.Pending, "the resolved timer drops out of the work list")
 	require.EqualValues(t, drawnOnce, store.moduleOverageDrawn[over], "a replay never draws a second time")
+	require.Len(t, observer.calls, 1, "an idempotent replay emits no second standing observation")
 }
 
 // (2) standard mode stays on Stripe even with enough gifted credit to cover the
@@ -85,7 +91,10 @@ func TestChargeModuleOverage_StandardModeChargesStripe(t *testing.T) {
 	_, acct := registeredAccount(store) // walletMode defaults to standard
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	svc := cycle.NewService(store, sc).WithCreditWallet(true)
+	observer := &fakeWalletMutationObserver{}
+	svc := cycle.NewService(store, sc).
+		WithCreditWallet(true).
+		WithWalletMutationObserver(observer)
 	ctx := context.Background()
 
 	app := uuid.New()
@@ -105,6 +114,7 @@ func TestChargeModuleOverage_StandardModeChargesStripe(t *testing.T) {
 	// The guard armed with the GENUINE Stripe invoice id, not a wallet ref.
 	require.True(t, store.timers[over].graceCharged)
 	require.False(t, strings.HasPrefix(store.timers[over].graceInvoiceID, "wallet:"))
+	require.Empty(t, observer.calls, "the standard Stripe rail emits no wallet observation")
 }
 
 // (3) the feature flag is fail-closed: even a credits-mode account with spendable
@@ -144,7 +154,10 @@ func TestChargeModuleOverage_CreditModeWalletShortUnsettledRetried(t *testing.T)
 		cycle.ModuleOverageWalletShort,
 	}
 	sc := newFakeStripe()
-	svc := cycle.NewService(store, sc).WithCreditWallet(true)
+	observer := &fakeWalletMutationObserver{}
+	svc := cycle.NewService(store, sc).
+		WithCreditWallet(true).
+		WithWalletMutationObserver(observer)
 	ctx := context.Background()
 
 	app := uuid.New()
@@ -167,6 +180,7 @@ func TestChargeModuleOverage_CreditModeWalletShortUnsettledRetried(t *testing.T)
 	require.Zero(t, second.Charged)
 	require.Equal(t, 2, store.moduleOverageDrawCalls, "both sweeps re-enter the credits wallet rail")
 	require.Empty(t, sc.itemCalls, "a credits-mode short never falls through to Stripe")
+	require.Empty(t, observer.calls, "a transactional no-draw short emits no standing observation")
 }
 
 // (5) under-lock stale: a concurrent sweep resolves the timer between the work-list

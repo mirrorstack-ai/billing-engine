@@ -789,6 +789,10 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 
 	switch outcome {
 	case ProrationLockedCharged:
+		// The store transaction has committed the debit and armed the one-shot
+		// guard. Observe only this winning transition; replay/already/short
+		// outcomes must never emit another standing push.
+		s.observeWalletMutation(ctx, app.AccountID)
 		cents, err := centsFromMicros(amountMicros)
 		if err != nil {
 			return nil, false, billing.Internal("micros to cents conversion failed", err)

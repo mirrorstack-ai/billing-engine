@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/mirrorstack-ai/billing-engine/internal/account/eligibility"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -67,10 +67,6 @@ func (s *Service) GetCreditStanding(ctx context.Context, req GetCreditStandingRe
 	}
 	blocked := status.Blocked
 	blockReason := status.BlockReason
-	if creditLimitExhausted(standing) && !blocked {
-		blocked = true
-		blockReason = blockReasonForEligibility(eligibility.ReasonOutOfCredits)
-	}
 
 	return &GetCreditStandingResponse{
 		BillingMode:       standing.BillingMode,
@@ -272,6 +268,9 @@ func (s *Service) resumeCreditPurchase(ctx context.Context, purchase CreditPurch
 		if err != nil {
 			return nil, Internal("finalize credit purchase ledger failed", err)
 		}
+		if target == "settled" && purchase.Transitioned {
+			s.observeCreditMutation(ctx, purchase.AccountID)
+		}
 	}
 	return creditPurchaseStartResponse(purchase, invoice), nil
 }
@@ -321,6 +320,9 @@ func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurc
 			purchase, err = s.store.FinalizeCreditPurchase(ctx, purchase.ID, purchase.AccountID, target, receiptURL)
 			if err != nil {
 				return nil, Internal("finalize credit purchase ledger failed", err)
+			}
+			if target == "settled" && purchase.Transitioned {
+				s.observeCreditMutation(ctx, purchase.AccountID)
 			}
 		} else if err := s.store.AttachCreditPurchaseInvoice(ctx, purchase.ID, purchase.AccountID, invoice.ID, receiptURL); err != nil {
 			return nil, Internal("enrich credit purchase invoice failed", err)
@@ -451,8 +453,12 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 	} else if req.BillingMode == BillingModeCredits {
 		creditLimit = DefaultCreditsLimitMicros
 	}
-	if err := s.store.SetCreditBillingMode(ctx, accountID, req.BillingMode, creditLimit); err != nil {
+	changed, err := s.store.SetCreditBillingMode(ctx, accountID, req.BillingMode, creditLimit)
+	if err != nil {
 		return nil, Internal("set customer billing mode failed", err)
+	}
+	if changed {
+		s.observeCreditMutation(ctx, accountID)
 	}
 	return &SetCustomerBillingModeResponse{BillingMode: req.BillingMode}, nil
 }
@@ -553,7 +559,18 @@ func (s *Service) GrantCredits(ctx context.Context, req GrantCreditsRequest) (*G
 		}
 		return nil, Internal("insert credit grant failed", err)
 	}
+	s.observeCreditMutation(ctx, accountID)
 	return &GrantCreditsResponse{LedgerID: grant.ID.String(), BalanceMicros: grant.BalanceAfterMicros}, nil
+}
+
+func (s *Service) observeCreditMutation(ctx context.Context, accountID uuid.UUID) {
+	if s.observer == nil {
+		return
+	}
+	if err := s.observer.ObserveAccount(ctx, accountID); err != nil {
+		slog.ErrorContext(ctx, "credit mutation committed; standing observation failed",
+			"account_id", accountID, "error", err)
+	}
 }
 
 func validateCreditOwner(userID, orgID uuid.UUID) error {
@@ -564,14 +581,6 @@ func validateCreditOwner(userID, orgID uuid.UUID) error {
 		return InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
 	}
 	return nil
-}
-
-func creditLimitExhausted(standing CreditStandingRow) bool {
-	return standing.BillingMode == BillingModeCredits && standing.BalanceMicros <= -standing.CreditLimitMicros
-}
-
-func blockReasonForEligibility(reason eligibility.Reason) string {
-	return blockReason(reason)
 }
 
 func creditPurchaseStatusFromInvoice(status string) string {

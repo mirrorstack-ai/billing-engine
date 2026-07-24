@@ -511,6 +511,9 @@ func (s *Service) chargeModuleOverageFromWallet(ctx context.Context, cand Module
 
 	switch outcome {
 	case ModuleOverageWalletLockedCharged:
+		// The wallet debit is durable before this return. Only the first-time
+		// charged outcome observes; stale/short/replay paths are no-ops.
+		s.observeWalletMutation(ctx, cand.AccountID)
 		cents, err := centsFromMicros(amountMicros)
 		if err != nil {
 			return nil, false, billing.Internal("micros to cents conversion failed", err)

@@ -20,6 +20,60 @@ func seedWalletSource(store *fakeStore, typ string, amount int64, expiresAt, cre
 	return id
 }
 
+type boundaryReconcileCall struct {
+	accountID   uuid.UUID
+	periodStart time.Time
+	amount      int64
+}
+
+type fakeBoundaryReconciler struct {
+	calls  []boundaryReconcileCall
+	onCall func()
+}
+
+type fakeWalletMutationObserver struct {
+	calls []uuid.UUID
+	err   error
+}
+
+func (f *fakeWalletMutationObserver) ObserveAccount(_ context.Context, accountID uuid.UUID) error {
+	f.calls = append(f.calls, accountID)
+	return f.err
+}
+
+func (f *fakeBoundaryReconciler) ReconcileBoundary(_ context.Context, accountID uuid.UUID, periodStart time.Time, amountMicros int64) error {
+	if f.onCall != nil {
+		f.onCall()
+	}
+	f.calls = append(f.calls, boundaryReconcileCall{
+		accountID: accountID, periodStart: periodStart, amount: amountMicros,
+	})
+	return nil
+}
+
+func TestRunBillingCycle_ReconcilesNewPeriodAfterDurableCreditsDraw(t *testing.T) {
+	store := newFakeStore()
+	store.walletMode = cycle.CreditBillingModeCredits
+	store.chargedTotal = 1_000_000
+	seedApp(store, chargeAccount, 0, false)
+	reconciler := &fakeBoundaryReconciler{onCall: func() {
+		require.NotEmpty(t, store.walletDraws, "boundary callback must run after the durable wallet draw")
+	}}
+
+	_, err := chargeSvc(store, newFakeStripe()).
+		WithCreditWallet(true).
+		WithBoundaryEstimateReconciler(reconciler).
+		RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+
+	require.NoError(t, err)
+	require.Len(t, reconciler.calls, 1)
+	call := reconciler.calls[0]
+	require.Equal(t, chargeAccount, call.accountID)
+	require.True(t, call.periodStart.Equal(periodEnd), "the cache key is the period that just opened")
+	require.Zero(t, call.amount,
+		"closed-period arrears and already-drawn advance fees must not leak into unpaid exposure")
+}
+
 func TestRunBillingCycle_StandardWalletDrawsThenChargesOnlyRemainder(t *testing.T) {
 	store := newFakeStore()
 	store.chargedTotal = 1_000_000

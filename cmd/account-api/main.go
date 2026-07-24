@@ -42,7 +42,9 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/budget"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
@@ -484,6 +486,22 @@ func buildDispatcher() *dispatcher {
 	// The ingest path fires the per-app budget hook best-effort on a fresh
 	// usage event (design §5 / §10).
 	usageSvc := usage.NewService(usage.NewStoreWithCreditWallet(pool, walletEnabled)).WithBudgetEvaluator(budgetSvc)
+	coordinator := credit.NewCoordinatorIfReady(walletEnabled, func() *credit.Coordinator {
+		counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+		if err != nil {
+			slog.Error("credit estimate cache unavailable; live projection fallback remains active", "error", err)
+		}
+		coordinator := credit.NewCoordinator(counter, store, usageSvc, nil)
+		notifier := standing.NewNotifierFromEnvWithStatus(pool, svc, slog.Default())
+		if notifier.Enabled() {
+			coordinator.WithNotifier(notifier)
+		}
+		return coordinator
+	})
+	if coordinator != nil {
+		svc.WithCreditCoordinator(coordinator, coordinator)
+		usageSvc.WithCreditEvaluator(coordinator)
+	}
 
 	// The apps-mirror RPCs (RegisterApp / SyncAppModules) live on the cycle
 	// Service because RegisterApp's creation-proration charge reuses the charge
@@ -495,6 +513,9 @@ func buildDispatcher() *dispatcher {
 	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient).
 		WithAccountBill(usageSvc).
 		WithCreditWallet(walletEnabled)
+	if coordinator != nil {
+		cycleSvc.WithWalletMutationObserver(coordinator)
+	}
 
 	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc}
 }

@@ -17,9 +17,11 @@
 // no dedicated hook: every Stripe charge emits invoice.* events, which land
 // here through the webhook path.
 //
-// Best-effort by contract: every failure (env unset, owner drift, verdict
-// read error, HTTP error) is logged and swallowed — a standing notify must
-// never fail or delay webhook processing. The stage-activate-time consult on
+// Best-effort by contract: webhook entry points log and swallow every failure
+// so standing notification never changes Stripe processing. The already-
+// resolved NotifyOwner path returns delivery errors to the credit coordinator;
+// its money-path caller still swallows them, but can release a disposable
+// SETNX claim so a later delivery retries. The stage-activate-time consult on
 // the api-platform side backstops any missed transition.
 //
 // Known narrow gap: a SPONSOR's card event changes the standing of the orgs
@@ -45,6 +47,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 )
 
 // servingBlockPath is api-platform's internal endpoint (C6), joined onto
@@ -111,6 +116,13 @@ func NewNotifier(baseURL, secret string, status StatusReader, owners OwnerResolv
 	}
 }
 
+// Enabled reports whether this notifier has a real delivery destination.
+// Production coordinators use it to avoid consuming a long-lived disposable
+// notification claim when local/dev notification env is intentionally absent.
+func (n *Notifier) Enabled() bool {
+	return n != nil && n.baseURL != "" && n.secret != ""
+}
+
 // NewNotifierFromEnv builds the production wiring: verdicts from the real
 // billing.Service over the given pool (GetServiceStatus never touches Stripe,
 // so no Stripe client is needed), owners from the generated standing queries,
@@ -118,32 +130,84 @@ func NewNotifier(baseURL, secret string, status StatusReader, owners OwnerResolv
 // api-platform ↔ billing-engine internal secret). Either env unset → the
 // disabled notifier (log-and-skip).
 func NewNotifierFromEnv(pool *pgxpool.Pool, log *slog.Logger) *Notifier {
+	store := billing.NewStore(pool)
+	svc := billing.NewService(store, nil, "")
+	walletEnabled := config.CreditWalletEnabled()
+	if walletEnabled {
+		ready, err := config.CreditWalletSchemaReady(context.Background(), pool)
+		if err != nil {
+			log.Error("credit-wallet schema probe failed; webhook notifier using legacy standing", "error", err)
+			walletEnabled = false
+		} else {
+			walletEnabled = ready
+		}
+	}
+	svc.WithCreditWallet(walletEnabled)
+	notifier := NewNotifierFromEnvWithStatus(pool, svc, log)
+	coordinator := credit.NewCoordinatorIfReady(walletEnabled, func() *credit.Coordinator {
+		counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+		if err != nil {
+			log.Error("credit estimate cache unavailable; webhook status uses live projection", "error", err)
+		}
+		projection := usage.NewService(usage.NewStoreWithCreditWallet(pool, true))
+		coordinator := credit.NewCoordinator(counter, store, projection, nil)
+		if notifier.Enabled() {
+			coordinator.WithNotifier(notifier)
+		}
+		return coordinator
+	})
+	if coordinator != nil {
+		svc.WithCreditCoordinator(coordinator, coordinator)
+	}
+	return notifier
+}
+
+// NewNotifierFromEnvWithStatus permits production roots to supply the same
+// wallet-capable billing graph used by account-api.
+func NewNotifierFromEnvWithStatus(pool *pgxpool.Pool, status StatusReader, log *slog.Logger) *Notifier {
 	url := os.Getenv("APPLICATIONS_INTERNAL_URL")
 	secret := os.Getenv("INTERNAL_SECRET")
 	if url == "" || secret == "" {
 		log.Info("serving-block notifier disabled (APPLICATIONS_INTERNAL_URL / INTERNAL_SECRET unset) — standing transitions will not push manifest rewrites")
 	}
-	svc := billing.NewService(billing.NewStore(pool), nil, "")
-	return NewNotifier(url, secret, svc, NewStore(pool), log)
+	return NewNotifier(url, secret, status, NewStore(pool), log)
 }
 
 // NotifyStripeCustomer re-evaluates and pushes the verdict for the account
 // owning the Stripe customer (card attach / fraud-flag events).
 func (n *Notifier) NotifyStripeCustomer(ctx context.Context, stripeCustomerID string) {
-	n.notify(ctx, "stripe_customer_id", stripeCustomerID, n.owners.OwnerByStripeCustomer)
+	_, _ = n.notify(ctx, "stripe_customer_id", stripeCustomerID, n.owners.OwnerByStripeCustomer)
 }
 
 // NotifyStripeInvoice re-evaluates and pushes the verdict for the account
 // owning the mirrored invoice (invoice lifecycle events).
 func (n *Notifier) NotifyStripeInvoice(ctx context.Context, stripeInvoiceID string) {
-	n.notify(ctx, "stripe_invoice_id", stripeInvoiceID, n.owners.OwnerByStripeInvoice)
+	_, _ = n.notify(ctx, "stripe_invoice_id", stripeInvoiceID, n.owners.OwnerByStripeInvoice)
 }
 
 // NotifyStripePaymentMethod re-evaluates and pushes the verdict for the
 // account owning the mirrored card (card detach events, which carry only the
 // pm id).
 func (n *Notifier) NotifyStripePaymentMethod(ctx context.Context, stripePaymentMethodID string) {
-	n.notify(ctx, "stripe_payment_method_id", stripePaymentMethodID, n.owners.OwnerByStripePaymentMethod)
+	_, _ = n.notify(ctx, "stripe_payment_method_id", stripePaymentMethodID, n.owners.OwnerByStripePaymentMethod)
+}
+
+// NotifyOwner pushes a verdict for an already-resolved account principal.
+// It reuses the exact status read and POST spine used by webhook notifications,
+// but returns delivery failures so the credit coordinator can release its
+// disposable SETNX claim and make a later retry eligible.
+func (n *Notifier) NotifyOwner(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (bool, error) {
+	owner := Owner{UserID: ownerUserID, OrgID: ownerOrgID}
+	return n.notify(ctx, "account_id", ownerID(owner), func(context.Context, string) (Owner, bool, error) {
+		return owner, owner.UserID != uuid.Nil || owner.OrgID != uuid.Nil, nil
+	})
+}
+
+func ownerID(owner Owner) string {
+	if owner.OrgID != uuid.Nil {
+		return owner.OrgID.String()
+	}
+	return owner.UserID.String()
 }
 
 // servingBlockBody is the C6 wire body: exactly one owner field + the current
@@ -154,25 +218,27 @@ type servingBlockBody struct {
 	Blocked     bool   `json:"blocked"`
 }
 
-// notify is the shared resolve → evaluate → POST spine. Every failure mode
-// logs and returns — never an error to the caller (best-effort contract).
-func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve func(context.Context, string) (Owner, bool, error)) {
+// notify is the shared resolve → evaluate → POST spine. Every failure is logged
+// and returned. Webhook entry points deliberately discard the result to retain
+// their best-effort contract; NotifyOwner propagates it so a disposable credit
+// notification claim is not burned by a transient delivery failure.
+func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve func(context.Context, string) (Owner, bool, error)) (bool, error) {
 	if refID == "" {
-		return
+		return false, nil
 	}
 	if n.baseURL == "" || n.secret == "" {
 		n.log.DebugContext(ctx, "serving-block notify skipped: notifier disabled", refKind, refID)
-		return
+		return false, nil
 	}
 
 	owner, found, err := resolve(ctx, refID)
 	if err != nil {
 		n.log.ErrorContext(ctx, "serving-block notify: owner resolution failed", refKind, refID, "error", err)
-		return
+		return false, err
 	}
 	if !found {
 		n.log.DebugContext(ctx, "serving-block notify skipped: no owning account (drift)", refKind, refID)
-		return
+		return false, nil
 	}
 
 	verdict, err := n.status.GetServiceStatus(ctx, billing.GetServiceStatusRequest{
@@ -181,7 +247,7 @@ func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve fu
 	})
 	if err != nil {
 		n.log.ErrorContext(ctx, "serving-block notify: verdict read failed", refKind, refID, "error", err)
-		return
+		return false, err
 	}
 
 	body := servingBlockBody{Blocked: verdict.Blocked}
@@ -193,10 +259,11 @@ func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve fu
 	if err := n.post(ctx, body); err != nil {
 		n.log.ErrorContext(ctx, "serving-block notify: post failed (best-effort, skipped)",
 			refKind, refID, "blocked", verdict.Blocked, "error", err)
-		return
+		return false, err
 	}
 	n.log.InfoContext(ctx, "serving-block verdict pushed", refKind, refID,
 		"blocked", verdict.Blocked, "reason", verdict.Reason)
+	return verdict.Blocked, nil
 }
 
 func (n *Notifier) post(ctx context.Context, body servingBlockBody) error {

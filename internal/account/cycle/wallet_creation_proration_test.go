@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
@@ -29,6 +30,46 @@ import (
 func creationBaseMicros(store *fakeStore, acct uuid.UUID, created time.Time) int64 {
 	ps, pe := billingperiod.AnchoredPeriodWindow(created.UTC(), billingperiod.AnchorDay(store.activation[acct]))
 	return usage.CreationChargeBaseMicros(created, ps, pe)
+}
+
+type walletCoordinatorSnapshots struct {
+	store     *fakeStore
+	accountID uuid.UUID
+	ownerID   uuid.UUID
+}
+
+func (p walletCoordinatorSnapshots) CreditGateSnapshot(context.Context, uuid.UUID) (credit.Snapshot, error) {
+	settled := -p.store.walletUnallocated
+	for _, source := range p.store.walletSources {
+		settled += source.remaining
+	}
+	spendable := settled
+	if spendable < 0 {
+		spendable = 0
+	}
+	return credit.Snapshot{
+		AccountID:              p.accountID,
+		OwnerUserID:            p.ownerID,
+		BillingMode:            "credits",
+		SettledBalanceMicros:   settled,
+		SpendableBalanceMicros: spendable,
+		ActivatedAt:            p.store.activation[p.accountID],
+	}, nil
+}
+
+type zeroWalletProjection struct{}
+
+func (zeroWalletProjection) ProjectedCreditCharge(context.Context, uuid.UUID, uuid.UUID) (credit.Projection, error) {
+	return credit.Projection{}, nil
+}
+
+type walletOwnerNotifier struct {
+	calls int
+}
+
+func (n *walletOwnerNotifier) NotifyOwner(context.Context, uuid.UUID, uuid.UUID) (bool, error) {
+	n.calls++
+	return true, nil
 }
 
 // (1) credits mode: the creation base alone is DRAWN from a covering grant and
@@ -121,7 +162,16 @@ func TestChargeCreationProration_CreditModeSpendsIntoUnsecuredRemainder(t *testi
 	store.walletMode = cycle.CreditBillingModeCredits
 	small := seedWalletSource(store, "grant", 1_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	svc := appsSvc(store, sc).WithCreditWallet(true)
+	notifier := &walletOwnerNotifier{}
+	coordinator := credit.NewCoordinator(
+		nil,
+		walletCoordinatorSnapshots{store: store, accountID: acct, ownerID: user},
+		zeroWalletProjection{},
+		notifier,
+	)
+	svc := appsSvc(store, sc).
+		WithCreditWallet(true).
+		WithWalletMutationObserver(coordinator)
 
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	appID := uuid.New()
@@ -136,6 +186,16 @@ func TestChargeCreationProration_CreditModeSpendsIntoUnsecuredRemainder(t *testi
 	require.Zero(t, store.walletSources[small].remaining, "the grant lot is fully consumed")
 	require.EqualValues(t, want-1_000_000, store.walletUnallocated, "the residual is unsecured (into the credit policy)")
 	require.Empty(t, sc.invoiceCalls)
+	require.Equal(t, 1, notifier.calls,
+		"the first committed negative draw immediately pushes standing")
+	blocked, err := coordinator.OutOfCredits(context.Background(), acct)
+	require.NoError(t, err)
+	require.True(t, blocked, "the unsecured residual is visible to the real credit gate")
+
+	replay, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusAlreadyCharged, replay.Status)
+	require.Equal(t, 1, notifier.calls, "the idempotent no-draw replay emits no second push")
 }
 
 // (4) a transactional WalletShort remains on the durable credits rail. Nothing

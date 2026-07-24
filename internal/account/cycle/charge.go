@@ -256,12 +256,6 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// period's advance base + module overage + custom domains. The allowance nets
 	// USAGE only; all recurring account fees ride on top.
 	boundaryTotal := arrears + advanceBase + advanceOverage + advanceDomains
-	if s.estimate != nil {
-		if err := s.estimate.Set(ctx, accountID, periodStart, boundaryTotal); err != nil {
-			slog.WarnContext(ctx, "boundary estimate reconciliation failed (continuing)",
-				"account_id", accountID, "period_start", periodStart, "error", err)
-		}
-	}
 
 	summary := &ChargeSummary{
 		FirstRun:             true,
@@ -299,6 +293,16 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		remainingArrears -= draw.DrawnMicros
 		if remainingArrears < 0 {
 			remainingArrears = 0
+		}
+		if walletMode == CreditBillingModeCredits && s.estimate != nil {
+			// The draw above is committed before this best-effort callback.
+			// Seed the NEW period at zero unpaid exposure. Closed-period
+			// arrears and the new period's recurring fees were both settled by
+			// the draw, so neither may leak into the new key.
+			if err := s.estimate.ReconcileBoundary(ctx, accountID, periodEnd, 0); err != nil {
+				slog.WarnContext(ctx, "boundary estimate/standing reconciliation failed (continuing)",
+					"account_id", accountID, "period_start", periodEnd, "error", err)
+			}
 		}
 	}
 

@@ -442,6 +442,9 @@ type CreditPurchaseRow struct {
 	StripeInvoiceID    string
 	ReceiptURL         string
 	CreatedAt          time.Time
+	// Transitioned is true only when this store call performed the
+	// pending-to-terminal transition.
+	Transitioned bool
 }
 
 type CreditLedgerRecord struct {

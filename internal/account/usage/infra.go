@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // PlatformInfraModuleIDString is the canonical text form of the reserved
@@ -395,6 +398,33 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	})
 	if err != nil {
 		return nil, billing.Internal("insert infra usage event failed", err)
+	}
+
+	// Infra/model prices are resolved by the authoritative bill and are not
+	// cheaply or safely reproducible at ingest. After a fresh owner-attributed
+	// insert, force the credit coordinator through a live projection so a warm
+	// low Redis estimate cannot keep serving while infra spend grows. Deduped
+	// and lazy events deliberately do not invoke the hook.
+	if recorded && s.credit != nil && accountID != uuid.Nil {
+		anchorDay, anchorErr := s.store.AccountAnchorDay(ctx, accountID)
+		if anchorErr != nil {
+			slog.Error("anchor day lookup failed (credit infra hook skipped)",
+				"app_id", req.AppID, "account_id", accountID, "error", anchorErr)
+		} else {
+			start, end := billingperiod.AnchoredPeriodWindow(recordedAt.UTC(), anchorDay)
+			if creditErr := s.credit.EvaluateCreditUsage(ctx, credit.UsageEvent{
+				AccountID:           accountID,
+				AppID:               req.AppID,
+				EventID:             req.EventID,
+				PeriodStart:         start,
+				PeriodEnd:           end,
+				ForceLiveProjection: true,
+			}); creditErr != nil {
+				slog.Error("credit infra projection evaluation failed (usage still recorded)",
+					"app_id", req.AppID, "account_id", accountID,
+					"metric", req.Metric, "error", creditErr)
+			}
+		}
 	}
 
 	return &RecordInfraUsageResponse{Recorded: recorded}, nil

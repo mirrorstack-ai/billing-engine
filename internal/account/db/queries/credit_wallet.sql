@@ -84,6 +84,90 @@ FROM ms_billing.accounts account
 CROSS JOIN balances
 WHERE account.id = sqlc.arg(account_id)::uuid;
 
+-- GetCreditAccountSnapshot classifies the account before any ledger read.
+-- A standard account returns from the Go provider after this query, keeping
+-- credit_ledger completely untouched on that path.
+-- name: GetCreditAccountSnapshot :one
+SELECT
+    account.id,
+    account.owner_user_id,
+    account.owner_org_id,
+    account.billing_mode,
+    account.credit_limit_micros,
+    account.activated_at
+FROM ms_billing.accounts account
+WHERE account.id = sqlc.arg(account_id)::uuid;
+
+-- GetCreditGateState mirrors WalletCreditState's spendable-balance predicate:
+-- active positive lot remainder, capped by posted balance after expired lot
+-- remainder is removed. Pending manual purchases are neither settled balance
+-- nor grace; only a durable pending auto_topup suppresses the real-time block.
+-- name: GetCreditGateState :one
+WITH source_lots AS (
+    SELECT
+        source.id,
+        source.expires_at,
+        (
+            source.amount_micros::numeric
+            + COALESCE((
+                SELECT SUM(draw.amount_micros)
+                FROM ms_billing.credit_ledger draw
+                WHERE draw.source_credit_id = source.id
+                  AND draw.account_id = source.account_id
+                  AND draw.status = 'settled'
+                  AND draw.type IN ('usage_draw', 'subscription_draw')
+            ), 0)
+        ) AS remaining_micros
+    FROM ms_billing.credit_ledger source
+    WHERE source.account_id = sqlc.arg(account_id)::uuid
+      AND source.status = 'settled'
+      AND source.amount_micros > 0
+      AND source.type IN (
+          'grant', 'preallocation', 'refund', 'adjustment',
+          'purchase', 'auto_topup'
+      )
+), balances AS (
+    SELECT
+        COALESCE((
+            SELECT SUM(entry.amount_micros)
+            FROM ms_billing.credit_ledger entry
+            WHERE entry.account_id = sqlc.arg(account_id)::uuid
+              AND entry.status = 'settled'
+        ), 0) AS settled_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND (lot.expires_at IS NULL OR lot.expires_at > CURRENT_TIMESTAMP)
+        ), 0) AS lot_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND lot.expires_at <= CURRENT_TIMESTAMP
+        ), 0) AS expired_lot_micros
+)
+SELECT
+    balances.settled_micros::bigint AS settled_balance_micros,
+    GREATEST(
+        LEAST(
+            balances.lot_micros,
+            GREATEST(
+                balances.settled_micros - balances.expired_lot_micros,
+                0
+            )
+        ),
+        0
+    )::bigint AS spendable_balance_micros,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = sqlc.arg(account_id)::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+    )::boolean AS pending_auto_topup
+FROM balances;
+
 -- LockWalletAccount is the serialization point for a draw. The account FK on
 -- credit_ledger also makes concurrent ledger inserts wait behind this lock.
 -- name: LockWalletAccount :one
@@ -528,6 +612,10 @@ UPDATE ms_billing.accounts
 SET billing_mode = sqlc.arg(billing_mode)::text,
     credit_limit_micros = sqlc.arg(credit_limit_micros)::bigint
 WHERE id = sqlc.arg(account_id)::uuid
+  AND (
+      billing_mode IS DISTINCT FROM sqlc.arg(billing_mode)::text
+      OR credit_limit_micros IS DISTINCT FROM sqlc.arg(credit_limit_micros)::bigint
+  )
 RETURNING billing_mode, credit_limit_micros;
 
 -- GetDistributorCustomerAccount validates the distributor -> customer

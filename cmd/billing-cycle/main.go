@@ -48,7 +48,11 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -128,7 +132,28 @@ func buildService() *cycle.Service {
 		walletEnabled = ready
 	}
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
-	return cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey)).WithCreditWallet(walletEnabled)
+	svc := cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey)).WithCreditWallet(walletEnabled)
+	coordinator := credit.NewCoordinatorIfReady(walletEnabled, func() *credit.Coordinator {
+		counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+		if err != nil {
+			slog.Error("credit estimate cache unavailable; boundary live projection fallback remains active", "error", err)
+		}
+		standingStore := billing.NewStore(pool)
+		standingSvc := billing.NewService(standingStore, nil, "").WithCreditWallet(true)
+		projection := usage.NewService(usage.NewStoreWithCreditWallet(pool, true))
+		coordinator := credit.NewCoordinator(counter, standingStore, projection, nil)
+		notifier := standing.NewNotifierFromEnvWithStatus(pool, standingSvc, slog.Default())
+		if notifier.Enabled() {
+			coordinator.WithNotifier(notifier)
+		}
+		standingSvc.WithCreditCoordinator(coordinator, coordinator)
+		return coordinator
+	})
+	if coordinator != nil {
+		svc.WithBoundaryEstimateReconciler(coordinator).
+			WithWalletMutationObserver(coordinator)
+	}
+	return svc
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The

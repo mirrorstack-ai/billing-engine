@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -159,6 +160,10 @@ type Store interface {
 	// billing policy, credit limit, and optional auto-top-up configuration.
 	CreditStanding(ctx context.Context, accountID uuid.UUID) (CreditStandingRow, error)
 
+	// CreditGateSnapshot classifies the account before conditionally reading
+	// spendable wallet state. Standard accounts never read credit_ledger.
+	CreditGateSnapshot(ctx context.Context, accountID uuid.UUID) (credit.Snapshot, error)
+
 	// ListCreditLedger returns a newest-first keyset page. limit is already
 	// service-clamped and normally includes one look-ahead row.
 	ListCreditLedger(ctx context.Context, accountID uuid.UUID, limit int32, cursor *CreditLedgerCursor) ([]CreditLedgerEntry, error)
@@ -187,8 +192,8 @@ type Store interface {
 	UpsertCreditAutoTopUp(ctx context.Context, accountID uuid.UUID, cfg AutoTopUpConfig) (AutoTopUpConfig, error)
 
 	// SetCreditBillingMode updates the wallet mode and its resolved non-negative
-	// limit in one statement.
-	SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) error
+	// limit in one statement. changed=false is an idempotent no-op.
+	SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) (changed bool, err error)
 
 	// DistributorCustomerAccount validates the distributor→customer relation
 	// represented by org_billing_designations and returns the customer account.
@@ -625,6 +630,34 @@ func (s *pgxStore) CreditStanding(ctx context.Context, accountID uuid.UUID) (Cre
 	return out, nil
 }
 
+func (s *pgxStore) CreditGateSnapshot(ctx context.Context, accountID uuid.UUID) (credit.Snapshot, error) {
+	account, err := s.q.GetCreditAccountSnapshot(ctx, accountID.String())
+	if err != nil {
+		return credit.Snapshot{}, err
+	}
+	snapshot := credit.Snapshot{
+		AccountID:         accountID,
+		OwnerUserID:       uuidFromPgtype(account.OwnerUserID),
+		OwnerOrgID:        uuidFromPgtype(account.OwnerOrgID),
+		BillingMode:       account.BillingMode,
+		CreditLimitMicros: account.CreditLimitMicros,
+	}
+	if account.ActivatedAt.Valid {
+		snapshot.ActivatedAt = account.ActivatedAt.Time
+	}
+	if snapshot.BillingMode != string(BillingModeCredits) {
+		return snapshot, nil
+	}
+	state, err := s.q.GetCreditGateState(ctx, accountID.String())
+	if err != nil {
+		return credit.Snapshot{}, err
+	}
+	snapshot.SettledBalanceMicros = state.SettledBalanceMicros
+	snapshot.SpendableBalanceMicros = state.SpendableBalanceMicros
+	snapshot.PendingAutoTopUp = state.PendingAutoTopup
+	return snapshot, nil
+}
+
 func (s *pgxStore) ListCreditLedger(ctx context.Context, accountID uuid.UUID, limit int32, cursor *CreditLedgerCursor) ([]CreditLedgerEntry, error) {
 	params := db.ListCreditLedgerPageParams{
 		AccountID: accountID.String(),
@@ -829,6 +862,7 @@ func (s *pgxStore) FinalizeCreditPurchase(ctx context.Context, purchaseID, accou
 			finalized.ReceiptUrl,
 			finalized.CreatedAt,
 		)
+		out.Transitioned = true
 		return err
 	})
 	return out, err
@@ -853,13 +887,16 @@ func (s *pgxStore) UpsertCreditAutoTopUp(ctx context.Context, accountID uuid.UUI
 	}, nil
 }
 
-func (s *pgxStore) SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) error {
+func (s *pgxStore) SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) (bool, error) {
 	_, err := s.q.SetCreditAccountBillingMode(ctx, db.SetCreditAccountBillingModeParams{
 		BillingMode:       string(mode),
 		CreditLimitMicros: creditLimitMicros,
 		AccountID:         accountID.String(),
 	})
-	return err
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *pgxStore) DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {
@@ -1079,4 +1116,11 @@ func uuidRowFound(id string, err error) (uuid.UUID, bool, error) {
 // (the service layer rejects Nil user ids before reaching the store).
 func nullableUUID(id uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+func uuidFromPgtype(id pgtype.UUID) uuid.UUID {
+	if !id.Valid {
+		return uuid.Nil
+	}
+	return uuid.UUID(id.Bytes)
 }
