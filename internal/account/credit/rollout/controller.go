@@ -25,8 +25,9 @@ func (f ReadOnlyBooleanEvaluatorFunc) EvaluateReadOnly(ctx context.Context, acco
 }
 
 // BooleanResult records one account-scoped comparison. Effective is always the
-// legacy value for off, excluded, shadow, and evaluator-error paths. Only a
-// successful selected enforce evaluation may replace it.
+// legacy value for off, excluded, shadow, and evaluator-error paths. A
+// production adapter may change it only after a successful selected enforce
+// evaluation, using that adapter's documented composition rule.
 type BooleanResult struct {
 	Decision  Decision
 	Legacy    bool
@@ -55,6 +56,20 @@ func (c *Controller) WithNow(nowFn func() time.Time) *Controller {
 		c.nowFn = nowFn
 	}
 	return c
+}
+
+// Mode returns the startup-validated component mode. A nil controller is off.
+func (c *Controller) Mode() Mode {
+	if c == nil {
+		return ModeOff
+	}
+	return c.policy.Mode()
+}
+
+// Active reports whether this controller has a validated shadow or enforce
+// policy. It does not select an account; callers must still use Decide.
+func (c *Controller) Active() bool {
+	return c != nil && c.policy.Active()
 }
 
 // Decide exposes the stable result for mutation gates. A caller may execute a
@@ -104,13 +119,41 @@ func (c *Controller) CompareBoolean(
 	if result.Err == nil && result.Decision.Enforced() {
 		result.Effective = result.Wallet
 	}
-	if c.reporter != nil {
-		_ = c.reporter.Emit(Observation{
-			Decision:       result.Decision,
-			Duration:       duration,
-			Diverged:       result.Diverged,
-			EvaluatorError: result.Err != nil,
-		})
-	}
+	c.emit(Observation{
+		Decision:       result.Decision,
+		Duration:       duration,
+		Diverged:       result.Diverged,
+		EvaluatorError: result.Err != nil,
+	})
 	return result
+}
+
+// Observe reports one already-selected operation, such as a cycle mutation,
+// without requiring callers to route a mutation through the read-only compare
+// seam. Off and excluded decisions do not emit. Decision contains no account
+// identifier, and Reporter keeps the metric dimensions low-cardinality.
+func (c *Controller) Observe(decision Decision, duration time.Duration, evaluatorErr error) {
+	c.emit(Observation{
+		Decision:       decision,
+		Duration:       duration,
+		EvaluatorError: evaluatorErr != nil,
+	})
+}
+
+func (c *Controller) emit(observation Observation) {
+	if c == nil || c.reporter == nil || !c.accepts(observation.Decision) {
+		return
+	}
+	_ = c.reporter.Emit(observation)
+}
+
+func (c *Controller) accepts(decision Decision) bool {
+	return c.policy.Active() &&
+		decision.Selected &&
+		decision.Component == c.policy.component &&
+		decision.Mode == c.policy.mode &&
+		decision.BasisPoints == c.policy.basisPoints &&
+		decision.CoreManifestSHA == c.policy.coreManifestSHA &&
+		decision.BillingSHA == c.policy.billingSHA &&
+		decision.RolloutID == c.policy.rolloutID
 }

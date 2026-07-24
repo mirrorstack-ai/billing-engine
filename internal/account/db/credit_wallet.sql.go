@@ -269,14 +269,29 @@ SELECT
         WHERE pending.account_id = $1::uuid
           AND pending.type = 'auto_topup'
           AND pending.status = 'pending'
-    )::boolean AS pending_auto_topup
+    )::boolean AS auto_topup_attempt_pending,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = $1::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+          AND pending.attempt_expires_at > CURRENT_TIMESTAMP
+    )::boolean AS pending_auto_topup,
+    COALESCE(config.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(config.threshold_micros, 0)::bigint AS auto_topup_threshold_micros
 FROM balances
+LEFT JOIN ms_billing.credit_auto_topup_configs config
+       ON config.account_id = $1::uuid
 `
 
 type GetCreditGateStateRow struct {
-	SettledBalanceMicros   int64 `json:"settled_balance_micros"`
-	SpendableBalanceMicros int64 `json:"spendable_balance_micros"`
-	PendingAutoTopup       bool  `json:"pending_auto_topup"`
+	SettledBalanceMicros     int64 `json:"settled_balance_micros"`
+	SpendableBalanceMicros   int64 `json:"spendable_balance_micros"`
+	AutoTopupAttemptPending  bool  `json:"auto_topup_attempt_pending"`
+	PendingAutoTopup         bool  `json:"pending_auto_topup"`
+	AutoTopupEnabled         bool  `json:"auto_topup_enabled"`
+	AutoTopupThresholdMicros int64 `json:"auto_topup_threshold_micros"`
 }
 
 // GetCreditGateState mirrors WalletCreditState's spendable-balance predicate:
@@ -286,7 +301,14 @@ type GetCreditGateStateRow struct {
 func (q *Queries) GetCreditGateState(ctx context.Context, accountID string) (GetCreditGateStateRow, error) {
 	row := q.db.QueryRow(ctx, getCreditGateState, accountID)
 	var i GetCreditGateStateRow
-	err := row.Scan(&i.SettledBalanceMicros, &i.SpendableBalanceMicros, &i.PendingAutoTopup)
+	err := row.Scan(
+		&i.SettledBalanceMicros,
+		&i.SpendableBalanceMicros,
+		&i.AutoTopupAttemptPending,
+		&i.PendingAutoTopup,
+		&i.AutoTopupEnabled,
+		&i.AutoTopupThresholdMicros,
+	)
 	return i, err
 }
 
@@ -517,6 +539,38 @@ func (q *Queries) GetDistributorCustomerAccount(ctx context.Context, arg GetDist
 	var account_id string
 	err := row.Scan(&account_id)
 	return account_id, err
+}
+
+const hasUninvoicedBillingRunWalletDraw = `-- name: HasUninvoicedBillingRunWalletDraw :one
+SELECT EXISTS (
+    SELECT 1
+    FROM ms_billing.billing_runs run
+    JOIN ms_billing.billing_periods period
+      ON period.account_id = run.account_id
+     AND period.period_start = run.period_start
+     AND period.period_end = run.period_end
+    JOIN ms_billing.credit_ledger draw
+      ON draw.account_id = run.account_id
+     AND draw.period_id = period.id
+     AND draw.type IN ('usage_draw', 'subscription_draw')
+     AND draw.status = 'settled'
+    WHERE run.account_id = $1::uuid
+      AND run.status <> 'invoiced'
+)::boolean
+`
+
+// HasUninvoicedBillingRunWalletDraw protects a boundary that has durably
+// consumed wallet credit but has not yet reached the only non-reclaimable run
+// state. SetCreditBillingMode calls this only for an actual mode change while
+// holding LockWalletAccount's account FOR UPDATE lock. DrawWalletCredits takes
+// that same lock before reading billing_mode and inserting period draw rows, so
+// either the mode change wins before any draw or this exact durable draw wins
+// and keeps its original mode through terminal invoice completion.
+func (q *Queries) HasUninvoicedBillingRunWalletDraw(ctx context.Context, accountID string) (bool, error) {
+	row := q.db.QueryRow(ctx, hasUninvoicedBillingRunWalletDraw, accountID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const insertCreationWalletDraw = `-- name: InsertCreationWalletDraw :exec

@@ -92,7 +92,7 @@ type Store interface {
 	// its id so the deterministic Stripe Idempotency-Keys stay stable across
 	// attempts. shouldCharge=false means the window already has an 'invoiced'
 	// (terminal-success) run and the cycle must NOT re-charge.
-	InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (runID uuid.UUID, shouldCharge bool, err error)
+	InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (runID uuid.UUID, shouldCharge, reclaimed bool, err error)
 
 	// AccountsWithUsageEvents returns the accounts with raw usage_events in the
 	// window [periodStart, periodEnd) — the rollup-phase work list for
@@ -120,6 +120,21 @@ type Store interface {
 	// Stripe request was already frozen: existing draw rows are returned, but a
 	// new wallet debit must not be introduced beside money that may have moved.
 	DrawWalletCredits(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time, amountMicros int64, allowNew bool) (WalletDrawdown, error)
+
+	// DrawBillingRunWalletCredits is the crash-safe boundary variant. In the
+	// SAME transaction as any first wallet debit, it freezes on billing_runs
+	// the exact Stripe remainder (possibly zero) and description determinant.
+	// The marker is deliberately stored on the legacy run row: a later reclaim
+	// can finish safely while true wallet master-off executes zero SQL naming
+	// accounts.billing_mode or credit_ledger. Existing draws are returned
+	// idempotently and acquire the marker when boundaryTotalMicros is supplied.
+	DrawBillingRunWalletCredits(
+		ctx context.Context,
+		runID, accountID uuid.UUID,
+		periodStart, periodEnd time.Time,
+		boundaryTotalMicros int64,
+		withBase, allowNew bool,
+	) (WalletDrawdown, error)
 
 	// HasUsableDefaultPM is the no-PM charge gate: true iff the account has an
 	// active, not-expired payment method. Mirrors the billing hot-path gate.
@@ -353,13 +368,12 @@ type Store interface {
 	// SINGLE transaction. Because the draw and the guard-arm commit together, a
 	// crash can never strand a partial settlement: either the whole thing committed
 	// (guard armed, never re-swept) or nothing did (the guard remains unarmed and a
-	// later sweep retries). A standard-mode
-	// wallet whose spendable balance cannot fully cover draws NOTHING and returns
-	// ProrationWalletShort (guard unarmed) so this call stays unsettled instead of
-	// falling through to Stripe; credits mode normally fully covers via the
-	// unsecured remainder. Unlike the boundary draw this debit carries NO
-	// period_id — it is keyed per app, so it never collides with the period's
-	// boundary draw.
+	// later sweep retries). The account lock re-reads the durable billing mode: if
+	// a concurrent mode change made the account non-credits after the caller's
+	// unlocked classification, this returns ProrationWalletDeferToStripe BEFORE
+	// reading or writing the ledger. Credits mode fully covers via its unsecured
+	// remainder. Unlike the boundary draw this debit carries NO period_id — it is
+	// keyed per app, so it never collides with the period's boundary draw.
 	DrawCreationProrationFromWallet(ctx context.Context, appID uuid.UUID, charge ProrationWalletCharge) (ProrationOutcome, string, error)
 
 	// SetAppProrationInvoice arms the ONE-SHOT creation-proration guard: it
@@ -515,12 +529,13 @@ type Store interface {
 	// (grace_charged_at + grace_invoice_id = charge.Ref, grace_invoice_item_id NULL),
 	// all in a SINGLE transaction. Because the draw and the guard-arm commit together,
 	// a committed settlement short-circuits every retry at the grace_resolved re-check,
-	// and a crash before commit rolls back leaving no ledger rows. A standard-mode
-	// wallet whose spendable balance cannot fully cover draws NOTHING and returns
-	// ModuleOverageWalletShort (guard unarmed) so the caller stays unsettled instead
-	// of falling through to Stripe; credits mode normally fully covers via the
-	// unsecured remainder. Like the creation draw this debit carries NO period_id —
-	// it is keyed per timer, so it never collides with the period's boundary draw.
+	// and a crash before commit rolls back leaving no ledger rows. The account lock
+	// re-reads the durable billing mode: if a concurrent mode change
+	// made the account non-credits after the caller's unlocked classification, this
+	// returns ModuleOverageWalletDeferToStripe BEFORE reading or writing the ledger.
+	// Credits mode fully covers via its unsecured remainder. Like the creation draw
+	// this debit carries NO period_id — it is keyed per timer, so it never collides
+	// with the period's boundary draw.
 	DrawModuleOverageFromWallet(ctx context.Context, timerID uuid.UUID, charge ModuleOverageWalletCharge) (ModuleOverageWalletOutcome, string, error)
 
 	// CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario
@@ -1064,8 +1079,8 @@ func (s *pgxStore) UpsertDeveloperSettlement(ctx context.Context, periodID, acco
 	})
 }
 
-func (s *pgxStore) InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (uuid.UUID, bool, error) {
-	id, err := s.q.InsertBillingRun(ctx, db.InsertBillingRunParams{
+func (s *pgxStore) InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (uuid.UUID, bool, bool, error) {
+	row, err := s.q.InsertBillingRun(ctx, db.InsertBillingRunParams{
 		AccountID:   accountID.String(),
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
@@ -1073,16 +1088,16 @@ func (s *pgxStore) InsertBillingRun(ctx context.Context, accountID uuid.UUID, pe
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The DO UPDATE's WHERE excluded the row → the existing run is 'invoiced'
 		// (terminal success). The window was already charged; do not re-charge.
-		return uuid.Nil, false, nil
+		return uuid.Nil, false, false, nil
 	}
 	if err != nil {
-		return uuid.Nil, false, err
+		return uuid.Nil, false, false, err
 	}
-	runID, err := uuid.Parse(id)
+	runID, err := uuid.Parse(row.ID)
 	if err != nil {
-		return uuid.Nil, false, err
+		return uuid.Nil, false, false, err
 	}
-	return runID, true, nil
+	return runID, true, row.Reclaimed, nil
 }
 
 func (s *pgxStore) PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
@@ -1091,6 +1106,22 @@ func (s *pgxStore) PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, 
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
 	})
+}
+
+// CreditBillingMode is the narrow rollout classifier. Keep this query separate
+// from WalletCreditState: a selected standard account must reach the exact
+// legacy Stripe path without touching credit_ledger.
+func (s *pgxStore) CreditBillingMode(ctx context.Context, accountID uuid.UUID) (CreditBillingMode, error) {
+	var raw string
+	err := s.pool.QueryRow(ctx, `
+		SELECT billing_mode::text
+		FROM ms_billing.accounts
+		WHERE id = $1
+	`, accountID).Scan(&raw)
+	if err != nil {
+		return "", err
+	}
+	return parseCreditBillingMode(raw)
 }
 
 func (s *pgxStore) WalletCreditState(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (WalletCreditState, error) {
@@ -1119,13 +1150,64 @@ func (s *pgxStore) WalletCreditState(ctx context.Context, accountID uuid.UUID, p
 	}, nil
 }
 
-// DrawWalletCredits serializes allocation per account, then appends one signed
-// usage_draw row for each funding lot consumed. The boundary amount currently
-// combines usage arrears and advance fees, so this method cannot honestly split
-// usage_draw from subscription_draw; a future category-specific caller should
-// own subscription_draw. Recovery nevertheless recognizes either type so a
-// period can never acquire a second boundary debit.
+// DrawWalletCredits is the standalone allocation primitive used by focused
+// store tests and non-run callers. The billing-cycle spine uses
+// DrawBillingRunWalletCredits so its debit and crash marker commit atomically.
 func (s *pgxStore) DrawWalletCredits(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time, amountMicros int64, allowNew bool) (WalletDrawdown, error) {
+	return s.drawWalletCredits(
+		ctx,
+		uuid.Nil,
+		accountID,
+		periodStart,
+		periodEnd,
+		amountMicros,
+		false,
+		allowNew,
+	)
+}
+
+// DrawBillingRunWalletCredits serializes allocation per account, then appends
+// one signed usage_draw row for each funding lot consumed. When any debit
+// exists, it also freezes the exact post-wallet Stripe remainder on runID in
+// this SAME transaction. Therefore no observable state can contain a committed
+// wallet debit without the legacy billing_runs recovery marker.
+//
+// The boundary amount currently combines usage arrears and advance fees, so
+// this method cannot honestly split usage_draw from subscription_draw; a future
+// category-specific caller should own subscription_draw. Recovery nevertheless
+// recognizes either type so a period can never acquire a second boundary debit.
+func (s *pgxStore) DrawBillingRunWalletCredits(
+	ctx context.Context,
+	runID, accountID uuid.UUID,
+	periodStart, periodEnd time.Time,
+	boundaryTotalMicros int64,
+	withBase, allowNew bool,
+) (WalletDrawdown, error) {
+	if runID == uuid.Nil {
+		return WalletDrawdown{}, errors.New("billing run id required for boundary wallet draw")
+	}
+	return s.drawWalletCredits(
+		ctx,
+		runID,
+		accountID,
+		periodStart,
+		periodEnd,
+		boundaryTotalMicros,
+		withBase,
+		allowNew,
+	)
+}
+
+func (s *pgxStore) drawWalletCredits(
+	ctx context.Context,
+	runID, accountID uuid.UUID,
+	periodStart, periodEnd time.Time,
+	amountMicros int64,
+	withBase, allowNew bool,
+) (WalletDrawdown, error) {
+	if amountMicros < 0 {
+		return WalletDrawdown{}, fmt.Errorf("wallet draw amount must be non-negative: %d", amountMicros)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return WalletDrawdown{}, err
@@ -1142,6 +1224,77 @@ func (s *pgxStore) DrawWalletCredits(ctx context.Context, accountID uuid.UUID, p
 		return WalletDrawdown{}, err
 	}
 	out := WalletDrawdown{Mode: mode}
+	markerBlocksNew := false
+	if runID != uuid.Nil {
+		run, err := qtx.LockBillingRunCharge(ctx, runID.String())
+		if err != nil {
+			return WalletDrawdown{}, err
+		}
+		if BillingRunStatus(run.Status) == RunStatusInvoiced {
+			return WalletDrawdown{}, fmt.Errorf(
+				"billing run %s is already invoiced; refusing wallet draw",
+				runID,
+			)
+		}
+		if run.FrozenChargeCents.Valid {
+			if !run.FrozenChargeWithBase.Valid {
+				return WalletDrawdown{}, fmt.Errorf(
+					"billing run %s has an incomplete frozen charge",
+					runID,
+				)
+			}
+			out.BoundaryCharge = FrozenBoundaryCharge{
+				Cents:    run.FrozenChargeCents.Int64,
+				WithBase: run.FrozenChargeWithBase.Bool,
+			}
+			out.BoundaryChargeFrozen = true
+			markerBlocksNew = true
+		}
+	}
+	finish := func() (WalletDrawdown, error) {
+		if runID != uuid.Nil && out.DrawnMicros > 0 && amountMicros > 0 {
+			remainderMicros := amountMicros - out.DrawnMicros
+			if remainderMicros < 0 {
+				// A reclaimed period can have a larger already-durable debit
+				// than a later live recomputation. The original wallet money is
+				// never undone implicitly; its Stripe remainder is zero.
+				remainderMicros = 0
+			}
+			remainderCents, err := centsFromMicros(remainderMicros)
+			if err != nil {
+				return WalletDrawdown{}, fmt.Errorf("freeze wallet remainder: %w", err)
+			}
+			if err := qtx.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
+				ID:                   runID.String(),
+				FrozenChargeCents:    pgtype.Int8{Int64: remainderCents, Valid: true},
+				FrozenChargeWithBase: pgtype.Bool{Bool: withBase, Valid: true},
+			}); err != nil {
+				return WalletDrawdown{}, err
+			}
+			row, err := qtx.BillingRunFrozenCharge(ctx, runID.String())
+			if err != nil {
+				return WalletDrawdown{}, err
+			}
+			if !row.FrozenChargeCents.Valid || !row.FrozenChargeWithBase.Valid {
+				// FreezeBillingRunCharge refuses an already-invoiced run. This
+				// error rolls the transaction back, so a concurrent terminal
+				// mark can never leave a debit without its recovery marker.
+				return WalletDrawdown{}, fmt.Errorf(
+					"billing run %s has no frozen charge after wallet draw",
+					runID,
+				)
+			}
+			out.BoundaryCharge = FrozenBoundaryCharge{
+				Cents:    row.FrozenChargeCents.Int64,
+				WithBase: row.FrozenChargeWithBase.Bool,
+			}
+			out.BoundaryChargeFrozen = true
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return WalletDrawdown{}, err
+		}
+		return out, nil
+	}
 	if _, err := qtx.LockWalletLedgerEntries(ctx, accountID.String()); err != nil {
 		return WalletDrawdown{}, err
 	}
@@ -1159,19 +1312,16 @@ func (s *pgxStore) DrawWalletCredits(ctx context.Context, accountID uuid.UUID, p
 	}
 	if period.DrawnMicros > 0 {
 		out.DrawnMicros = period.DrawnMicros
-		if err := tx.Commit(ctx); err != nil {
-			return WalletDrawdown{}, err
-		}
-		return out, nil
+		return finish()
 	}
 
 	// The existing draw check deliberately comes first: a frozen reclaim passes
 	// allowNew=false but must still recover a debit from the earlier attempt.
-	if !allowNew || amountMicros <= 0 {
-		if err := tx.Commit(ctx); err != nil {
-			return WalletDrawdown{}, err
-		}
-		return out, nil
+	// A pre-existing run marker is stronger still: another daemon may already
+	// have started the frozen Stripe request, so a new debit beside it is
+	// forbidden even when this caller's earlier marker read was stale.
+	if markerBlocksNew || !allowNew || amountMicros <= 0 {
+		return finish()
 	}
 
 	balanceAfter, err := qtx.WalletSettledBalance(ctx, accountID.String())
@@ -1269,10 +1419,7 @@ func (s *pgxStore) DrawWalletCredits(ctx context.Context, accountID uuid.UUID, p
 	}
 
 	out.DrawnMicros = target - left
-	if err := tx.Commit(ctx); err != nil {
-		return WalletDrawdown{}, err
-	}
-	return out, nil
+	return finish()
 }
 
 func parseCreditBillingMode(raw string) (CreditBillingMode, error) {
@@ -1431,12 +1578,11 @@ func (s *pgxStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID u
 }
 
 func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error) {
-	// WHERE frozen_charge_cents IS NULL (in the query) makes this first-write-wins:
-	// a run that already froze (an earlier attempt, or a CONCURRENT daemon that got
-	// here first) affects 0 rows and keeps the ORIGINAL frozen amount. The read-back
-	// below returns the SURVIVING value regardless of which write won, and the
-	// caller charges THAT — never its locally computed amount — so two racing
-	// processes can never send different bodies under the shared idem keys.
+	// WHERE frozen_charge_cents IS NULL makes this first-write-wins; the
+	// terminal-status predicate also refuses a stale freeze after another daemon
+	// completed a zero-charge run. The read-back returns the surviving value
+	// regardless of which freeze won. If the terminal predicate won there is no
+	// value and this method errors before the caller can enter Stripe.
 	if err := s.q.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
 		ID:                   runID.String(),
 		FrozenChargeCents:    pgtype.Int8{Int64: charge.Cents, Valid: true},
@@ -1847,6 +1993,14 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 	if err != nil {
 		return 0, "", err
 	}
+	if mode != CreditBillingModeCredits {
+		// The caller selected the wallet rail from an unlocked snapshot. A
+		// concurrent credits→standard change may have committed before this
+		// account lock. The locked mode is authoritative: standard mid-period
+		// charges belong wholly to Stripe, even when spendable lots could cover
+		// them. Return before any ledger read/write so the rails cannot split.
+		return ProrationWalletDeferToStripe, "", nil
+	}
 	if _, err := qtx.LockWalletLedgerEntries(ctx, accountID.String()); err != nil {
 		return 0, "", err
 	}
@@ -1858,35 +2012,12 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 	if err != nil {
 		return 0, "", err
 	}
-	var lotSum int64
 	for _, lot := range lots {
 		if lot.RemainingMicros <= 0 {
 			return 0, "", fmt.Errorf(
 				"wallet query returned a non-positive lot remainder: source=%s remaining=%d",
 				lot.ID, lot.RemainingMicros,
 			)
-		}
-		lotSum += lot.RemainingMicros
-	}
-
-	// Standard mode consumes at most its positive spendable balance = min(active
-	// lots, posted balance − unused expired grants). If that cannot FULLY cover the
-	// creation charge, settle NOTHING (unsettled → the standing gate blocks, never
-	// Stripe); credits mode always fully covers via the unsecured remainder below.
-	if mode == CreditBillingModeStandard {
-		expiredMicros, err := qtx.WalletExpiredCreditBalance(ctx, accountID.String())
-		if err != nil {
-			return 0, "", err
-		}
-		if expiredMicros < 0 {
-			return 0, "", fmt.Errorf("wallet expired-credit balance is negative: %d", expiredMicros)
-		}
-		spendable := lotSum
-		if spendCap := balanceAfter - expiredMicros; spendCap < spendable {
-			spendable = spendCap
-		}
-		if spendable < pc.AmountMicros {
-			return ProrationWalletShort, "", nil
 		}
 	}
 
@@ -1937,11 +2068,6 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 		left -= consume
 	}
 	if left > 0 {
-		if mode != CreditBillingModeCredits {
-			// Standard mode ran out of lots despite the spendable check above — never
-			// partially settle (defensive; the check should already have caught it).
-			return ProrationWalletShort, "", nil
-		}
 		// Credits mode is wallet-only: its configured credit policy owns the
 		// unsecured remainder (the single NULL-source row).
 		if err := insertDraw(left, ""); err != nil {
@@ -2346,6 +2472,14 @@ func (s *pgxStore) DrawModuleOverageFromWallet(ctx context.Context, timerID uuid
 	if err != nil {
 		return 0, "", err
 	}
+	if mode != CreditBillingModeCredits {
+		// The caller selected the wallet rail from an unlocked snapshot. A
+		// concurrent credits→standard change may have committed before this
+		// account lock. The locked mode is authoritative: standard mid-period
+		// charges belong wholly to Stripe, even when spendable lots could cover
+		// them. Return before any ledger read/write so the rails cannot split.
+		return ModuleOverageWalletDeferToStripe, "", nil
+	}
 	if _, err := qtx.LockWalletLedgerEntries(ctx, accountID.String()); err != nil {
 		return 0, "", err
 	}
@@ -2357,35 +2491,12 @@ func (s *pgxStore) DrawModuleOverageFromWallet(ctx context.Context, timerID uuid
 	if err != nil {
 		return 0, "", err
 	}
-	var lotSum int64
 	for _, lot := range lots {
 		if lot.RemainingMicros <= 0 {
 			return 0, "", fmt.Errorf(
 				"wallet query returned a non-positive lot remainder: source=%s remaining=%d",
 				lot.ID, lot.RemainingMicros,
 			)
-		}
-		lotSum += lot.RemainingMicros
-	}
-
-	// Standard mode consumes at most its positive spendable balance = min(active
-	// lots, posted balance − unused expired grants). If that cannot FULLY cover the
-	// overage, settle NOTHING (unsettled → the standing gate blocks, never Stripe);
-	// credits mode always fully covers via the unsecured remainder below.
-	if mode == CreditBillingModeStandard {
-		expiredMicros, err := qtx.WalletExpiredCreditBalance(ctx, accountID.String())
-		if err != nil {
-			return 0, "", err
-		}
-		if expiredMicros < 0 {
-			return 0, "", fmt.Errorf("wallet expired-credit balance is negative: %d", expiredMicros)
-		}
-		spendable := lotSum
-		if spendCap := balanceAfter - expiredMicros; spendCap < spendable {
-			spendable = spendCap
-		}
-		if spendable < mc.AmountMicros {
-			return ModuleOverageWalletShort, "", nil
 		}
 	}
 
@@ -2438,11 +2549,6 @@ func (s *pgxStore) DrawModuleOverageFromWallet(ctx context.Context, timerID uuid
 		left -= consume
 	}
 	if left > 0 {
-		if mode != CreditBillingModeCredits {
-			// Standard mode ran out of lots despite the spendable check above — never
-			// partially settle (defensive; the check should already have caught it).
-			return ModuleOverageWalletShort, "", nil
-		}
 		// Credits mode is wallet-only: its configured credit policy owns the
 		// unsecured remainder (the single NULL-source row).
 		if err := insertDraw(left, ""); err != nil {

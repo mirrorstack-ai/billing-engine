@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
+	"github.com/google/uuid"
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
@@ -249,24 +251,45 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 
 	creditSettlement := creditledger.Settlement{}
 	creditFailure := creditledger.FailureReconciliation{}
+	creditOperation := ""
 	if event.Type == stripego.EventTypeInvoicePaid {
-		if r.creditPaid != nil {
-			creditSettlement, err = r.creditPaid.ReconcileWebhookPaid(ctx, inv.ID)
-		}
-		if err == nil && !creditSettlement.Found {
-			creditSettlement, err = r.store.SettleCreditInvoice(
-				ctx,
-				inv.ID,
-				inv.AmountPaid,
-				string(inv.Currency),
-				inv.HostedInvoiceURL,
+		var routeErr error
+		creditOperation, routeErr = creditInvoiceOperation(inv)
+		if routeErr != nil {
+			r.log.ErrorContext(ctx, "invoice.paid credit routing metadata invalid",
+				"event_id", event.ID,
+				"stripe_invoice_id", inv.ID,
+				"error", routeErr,
 			)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		switch creditOperation {
+		case "auto_topup":
+			if r.creditPaid == nil {
+				err = errors.New("auto-top-up paid reconciler unavailable")
+			} else {
+				creditSettlement, err = r.creditPaid.ReconcileWebhookPaid(ctx, inv.ID)
+			}
+		case "purchase":
+			if r.manualPaid == nil {
+				err = errors.New("manual credit purchase paid reconciler unavailable")
+			} else {
+				creditSettlement, err = r.manualPaid.ReconcileWebhookPaid(ctx, inv.ID)
+			}
 		}
 		if err != nil {
 			r.log.ErrorContext(ctx, "invoice.paid credit settlement failed",
 				"event_id", event.ID,
 				"stripe_invoice_id", inv.ID,
 				"error", err,
+			)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		if creditOperation != "" && !creditSettlement.Found {
+			r.log.ErrorContext(ctx, "invoice.paid authenticated credit invoice has no matching ledger attempt",
+				"event_id", event.ID,
+				"stripe_invoice_id", inv.ID,
+				"credit_operation", creditOperation,
 			)
 			return Result{HTTPStatus: 500, Status: StatusInternal}
 		}
@@ -293,14 +316,42 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		}
 	}
 
-	if failureCode, reconcile := autoTopUpFailureCode(event.Type); reconcile && r.creditFailures != nil {
-		creditFailure, err = r.creditFailures.ReconcileWebhookFailure(
-			ctx,
-			inv.ID,
-			failureCode,
-		)
+	if failureCode, reconcile := creditFailureCode(event.Type); reconcile {
+		var routeErr error
+		creditOperation, routeErr = creditInvoiceOperation(inv)
+		if routeErr != nil {
+			r.log.ErrorContext(ctx, "invoice failure credit routing metadata invalid",
+				"event_id", event.ID,
+				"type", event.Type,
+				"stripe_invoice_id", inv.ID,
+				"error", routeErr,
+			)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		switch creditOperation {
+		case "auto_topup":
+			if r.creditFailures == nil {
+				err = errors.New("auto-top-up failure reconciler unavailable")
+			} else {
+				creditFailure, err = r.creditFailures.ReconcileWebhookFailure(
+					ctx,
+					inv.ID,
+					failureCode,
+				)
+			}
+		case "purchase":
+			if r.manualFailures == nil {
+				err = errors.New("manual credit purchase failure reconciler unavailable")
+			} else {
+				creditFailure, err = r.manualFailures.ReconcileWebhookFailure(
+					ctx,
+					inv.ID,
+					failureCode,
+				)
+			}
+		}
 		if err != nil {
-			r.log.ErrorContext(ctx, "invoice failure auto-top-up reconciliation failed",
+			r.log.ErrorContext(ctx, "invoice failure credit reconciliation failed",
 				"event_id", event.ID,
 				"type", event.Type,
 				"stripe_invoice_id", inv.ID,
@@ -308,9 +359,17 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 			)
 			return Result{HTTPStatus: 500, Status: StatusInternal}
 		}
+		if creditOperation != "" && !creditFailure.Found {
+			r.log.ErrorContext(ctx, "invoice failure authenticated credit invoice has no matching ledger attempt",
+				"event_id", event.ID,
+				"type", event.Type,
+				"stripe_invoice_id", inv.ID,
+			)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
 		r.observeCreditFailure(ctx, creditFailure)
 		if creditFailure.Found && !creditFailure.Transitioned {
-			r.log.InfoContext(ctx, "invoice failure auto-top-up reconciliation retained current state",
+			r.log.InfoContext(ctx, "invoice failure credit reconciliation retained current state",
 				"event_id", event.ID,
 				"type", event.Type,
 				"stripe_invoice_id", inv.ID,
@@ -342,11 +401,15 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		return Result{HTTPStatus: 500, Status: StatusInternal}
 	}
 	if !found {
-		if creditSettlement.Found || creditFailure.Found {
-			// Manual credit purchases and auto-top-ups intentionally live in
-			// credit_ledger even when no ordinary invoice mirror exists. The
-			// notifier's owner lookup falls back to that ledger relationship.
-			r.notifyInvoice(ctx, inv.ID)
+		if creditSettlement.Transitioned || creditFailure.Transitioned {
+			// Credit invoices intentionally live outside the ordinary invoice
+			// mirror. Route their standing notification through the explicit
+			// ledger owner lookup; ordinary invoice notification never names
+			// credit_ledger.
+			r.notifyCreditInvoice(
+				creditledger.WithSettlementObservation(ctx),
+				inv.ID,
+			)
 		}
 		r.log.WarnContext(ctx, "invoice event drift/stale: no mirror row updated", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "status", inv.Status)
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
@@ -372,11 +435,60 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 	// streak, first-charge): push the owner's current serving-block verdict,
 	// best-effort (C6). Fired on every lifecycle event rather than diffed —
 	// the receiving side is idempotent (see package standing).
-	r.notifyInvoice(ctx, inv.ID)
+	if creditOperation != "" {
+		if creditSettlement.Transitioned || creditFailure.Transitioned {
+			r.notifyCreditInvoice(
+				creditledger.WithSettlementObservation(ctx),
+				inv.ID,
+			)
+		}
+	} else {
+		r.notifyInvoice(ctx, inv.ID)
+	}
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 
-func autoTopUpFailureCode(eventType stripego.EventType) (string, bool) {
+func creditInvoiceOperation(invoice *stripego.Invoice) (string, error) {
+	if invoice == nil {
+		return "", nil
+	}
+	operation := invoice.Metadata["ms_credit_operation"]
+	ref := invoice.Metadata["ms_charge_ref"]
+	if operation == "" {
+		if len(ref) >= len("credit-purchase:") &&
+			ref[:len("credit-purchase:")] == "credit-purchase:" {
+			return "", fmt.Errorf(
+				"manual credit purchase ref is missing exact operation/account/ledger metadata",
+			)
+		}
+		return "", nil
+	}
+	if operation != "purchase" && operation != "auto_topup" {
+		// Unknown metadata does not authorize a wallet lookup.
+		return "", nil
+	}
+
+	accountID := invoice.Metadata["ms_credit_account_id"]
+	ledgerID := invoice.Metadata["ms_credit_ledger_id"]
+	accountUUID, accountErr := uuid.Parse(accountID)
+	ledgerUUID, ledgerErr := uuid.Parse(ledgerID)
+	if accountErr != nil || accountUUID == uuid.Nil || accountUUID.String() != accountID {
+		return "", fmt.Errorf("%s metadata has invalid account id", operation)
+	}
+	if ledgerErr != nil || ledgerUUID == uuid.Nil || ledgerUUID.String() != ledgerID {
+		return "", fmt.Errorf("%s metadata has invalid ledger id", operation)
+	}
+	expectedRef := "credit-" + operation + ":" + ledgerID
+	if operation == "auto_topup" {
+		expectedRef = "credit-auto-topup:" + ledgerID
+	}
+	if ref != expectedRef {
+		return "", fmt.Errorf("%s metadata ref %q does not match ledger id", operation, ref)
+	}
+	return operation, nil
+}
+
+func creditFailureCode(eventType stripego.EventType) (string, bool) {
 	switch eventType {
 	case stripego.EventTypeInvoicePaymentFailed:
 		return "payment_failed", true

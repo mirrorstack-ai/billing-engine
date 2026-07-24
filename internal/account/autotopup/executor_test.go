@@ -26,10 +26,11 @@ func TestExecutorTrigger_HappyPathFreezesSelectedCardAndSettlesOnce(t *testing.T
 			ID: "in_topup", CustomerID: attempt.StripeCustomerID, Status: "open",
 			AmountDue: 501, Total: 501, Currency: "usd",
 		}),
-		payResult: billingstripe.Invoice{
+		payResult: controlledInvoice(attempt, billingstripe.Invoice{
 			ID: "in_topup", CustomerID: attempt.StripeCustomerID, Status: "paid",
-			AmountPaid: 501, Total: 501, Currency: "usd", HostedInvoiceURL: "https://stripe.test/in_topup",
-		},
+			AmountDue: 501, AmountPaid: 501, Total: 501, Currency: "usd",
+			HostedInvoiceURL: "https://stripe.test/in_topup",
+		}),
 		listPayments: map[string][]billingstripe.InvoicePaymentProof{
 			"in_topup": {exactInvoicePayment(attempt, "in_topup")},
 		},
@@ -50,7 +51,8 @@ func TestExecutorTrigger_HappyPathFreezesSelectedCardAndSettlesOnce(t *testing.T
 	require.Equal(t, []createCall{{
 		customerID:      attempt.StripeCustomerID,
 		paymentMethodID: attempt.StripePaymentMethodID,
-		ref:             "credit-auto-topup:" + attempt.ID.String(),
+		accountID:       attempt.AccountID.String(),
+		ledgerID:        attempt.ID.String(),
 		idemKey:         "credit-auto-topup-invoice:" + attempt.ID.String(),
 	}}, stripe.createCalls)
 	require.Equal(t, []itemCall{{
@@ -93,6 +95,47 @@ func TestExecutorTrigger_HappyPathFreezesSelectedCardAndSettlesOnce(t *testing.T
 	require.Equal(t, []uuid.UUID{attempt.AccountID}, observer.accounts, "settled replay must not observe twice")
 }
 
+func TestExecutorTrigger_PostSettlementRefreshFailurePreservesTerminalResult(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 1, 30, 0, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	store := newMemoryStore(attempt, AcquireNew)
+	store.getErrors = []error{nil, errors.New("post-settlement read unavailable")}
+	paid := controlledInvoice(attempt, billingstripe.Invoice{
+		ID: "in_settled_read_error", CustomerID: attempt.StripeCustomerID, Status: "paid",
+		AmountDue: 500, AmountPaid: 500, Total: 500, Currency: "usd",
+		HostedInvoiceURL: "https://stripe.test/in_settled_read_error",
+	})
+	stripe := &scriptedStripe{
+		createResult: controlledInvoice(attempt, billingstripe.Invoice{
+			ID: "in_settled_read_error", CustomerID: attempt.StripeCustomerID, Status: "draft",
+		}),
+		finalizeResult: controlledInvoice(attempt, billingstripe.Invoice{
+			ID: "in_settled_read_error", CustomerID: attempt.StripeCustomerID, Status: "open",
+			AmountDue: 500, Total: 500, Currency: "usd",
+		}),
+		payResult: paid,
+		listPayments: map[string][]billingstripe.InvoicePaymentProof{
+			paid.ID: {exactInvoicePayment(attempt, paid.ID)},
+		},
+	}
+	settler := &memorySettler{store: store, transitioned: true}
+	observer := &recordingObserver{}
+	executor := NewExecutor(store, settler, stripe).
+		WithNow(func() time.Time { return now }).
+		WithSettlementObserver(observer)
+
+	result, err := executor.Trigger(context.Background(), attempt.AccountID, 1)
+
+	require.ErrorContains(t, err, "post-settlement read unavailable")
+	require.True(t, result.Triggered)
+	require.True(t, result.NewAttempt)
+	require.Equal(t, "settled", result.Status,
+		"committed paid truth must survive a fallible convenience refresh")
+	require.Empty(t, result.FailureCode)
+	require.Equal(t, "settled", store.mustGet(attempt.ID).Status)
+	require.Equal(t, []uuid.UUID{attempt.AccountID}, observer.accounts)
+}
+
 func TestExecutorTrigger_DeterministicDeclineAndSCAAreVoidedBeforeFailure(t *testing.T) {
 	tests := []struct {
 		name string
@@ -126,12 +169,17 @@ func TestExecutorTrigger_DeterministicDeclineAndSCAAreVoidedBeforeFailure(t *tes
 				}),
 				payErr: tt.err,
 				getResults: map[string]billingstripe.Invoice{
-					"in_decline": {ID: "in_decline", CustomerID: attempt.StripeCustomerID, Status: "open"},
+					"in_decline": controlledInvoice(attempt, billingstripe.Invoice{
+						ID: "in_decline", CustomerID: attempt.StripeCustomerID, Status: "open",
+						AmountDue: 500, Total: 500, Currency: "usd",
+					}),
 				},
-				voidResult: billingstripe.Invoice{
-					ID: "in_decline", CustomerID: attempt.StripeCustomerID, Status: "void",
-					HostedInvoiceURL: "https://stripe.test/in_decline",
-				},
+				voidResult: func() billingstripe.Invoice {
+					invoice := exactTerminalInvoice(attempt, "void")
+					invoice.ID = "in_decline"
+					invoice.HostedInvoiceURL = "https://stripe.test/in_decline"
+					return invoice
+				}(),
 			}
 			settler := &memorySettler{store: store}
 			observer := &recordingObserver{}
@@ -202,10 +250,10 @@ func TestExecutorTrigger_PaidRereadWinsOverPayError(t *testing.T) {
 		}),
 		payErr: errors.New("timeout"),
 		getResults: map[string]billingstripe.Invoice{
-			"in_paid": {
+			"in_paid": controlledInvoice(attempt, billingstripe.Invoice{
 				ID: "in_paid", CustomerID: attempt.StripeCustomerID, Status: "paid",
-				AmountPaid: 500, Total: 500, Currency: "usd",
-			},
+				AmountDue: 500, AmountPaid: 500, Total: 500, Currency: "usd",
+			}),
 		},
 		listPayments: map[string][]billingstripe.InvoicePaymentProof{
 			"in_paid": {exactInvoicePayment(attempt, "in_paid")},
@@ -238,21 +286,24 @@ func TestExecutorTrigger_ExpiredAttemptClosesBeforeReplacement(t *testing.T) {
 	store.acquire = append(store.acquire, acquireResult{attempt: replacement, kind: AcquireNew})
 	stripe := &scriptedStripe{
 		getResults: map[string]billingstripe.Invoice{
-			"in_old": {ID: "in_old", CustomerID: expired.StripeCustomerID, Status: "open"},
+			"in_old": exactOpenInvoice(expired),
 		},
 		createResult: controlledInvoice(replacement, billingstripe.Invoice{ID: "in_new", CustomerID: replacement.StripeCustomerID, Status: "draft"}),
 		finalizeResult: controlledInvoice(replacement, billingstripe.Invoice{
 			ID: "in_new", CustomerID: replacement.StripeCustomerID, Status: "open",
 			AmountDue: 500, Total: 500, Currency: "usd",
 		}),
-		payResult: billingstripe.Invoice{
+		payResult: controlledInvoice(replacement, billingstripe.Invoice{
 			ID: "in_new", CustomerID: replacement.StripeCustomerID, Status: "paid",
-			AmountPaid: 500, Total: 500, Currency: "usd",
-		},
+			AmountDue: 500, AmountPaid: 500, Total: 500, Currency: "usd",
+		}),
 		listPayments: map[string][]billingstripe.InvoicePaymentProof{
 			"in_new": {exactInvoicePayment(replacement, "in_new")},
 		},
-		voidResult: billingstripe.Invoice{ID: "in_old", CustomerID: expired.StripeCustomerID, Status: "void"},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			"in_old": {exactInvoiceItem(expired)},
+		},
+		voidResult: exactTerminalInvoice(expired, "void"),
 	}
 	settler := &memorySettler{store: store, transitioned: true}
 	observer := &recordingObserver{}
@@ -347,19 +398,20 @@ func TestExecutorTrigger_ExpiredMalformedDraftDeletesAndReleasesPendingGuard(t *
 	expired.ExpiresAt = now
 	expired.StripeInvoiceID = "in_expired_malformed"
 	store := newMemoryStore(expired, AcquireExisting)
+	malformed := controlledInvoice(expired, billingstripe.Invoice{
+		ID:         expired.StripeInvoiceID,
+		CustomerID: expired.StripeCustomerID,
+		Status:     "draft",
+		AmountDue:  777,
+		Total:      777,
+		Currency:   "eur",
+	})
+	malformed.CollectionMethod = "send_invoice"
+	malformed.AutoAdvance = true
+	malformed.DefaultPaymentMethodID = "pm_foreign"
 	stripe := &scriptedStripe{
 		getResults: map[string]billingstripe.Invoice{
-			expired.StripeInvoiceID: {
-				ID:                     expired.StripeInvoiceID,
-				CustomerID:             expired.StripeCustomerID,
-				Status:                 "draft",
-				CollectionMethod:       "send_invoice",
-				AutoAdvance:            true,
-				DefaultPaymentMethodID: "pm_foreign",
-				AmountDue:              777,
-				Total:                  777,
-				Currency:               "eur",
-			},
+			expired.StripeInvoiceID: malformed,
 		},
 		deleteResult: billingstripe.Invoice{
 			ID: expired.StripeInvoiceID, Deleted: true,
@@ -383,6 +435,86 @@ func TestExecutorTrigger_ExpiredMalformedDraftDeletesAndReleasesPendingGuard(t *
 	require.Empty(t, stripe.voidCalls)
 	require.Len(t, store.failCalls, 1,
 		"verified deletion must release the partial unique pending guard")
+}
+
+func TestExecutorRecover_ResumesOnlyExistingPendingAttempt(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 5, 46, 0, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	attempt.StripeInvoiceID = "in_explicit_recovery"
+	store := newMemoryStore(attempt, AcquireNone)
+	stripe := &scriptedStripe{
+		getResults: map[string]billingstripe.Invoice{
+			attempt.StripeInvoiceID: exactOpenInvoice(attempt),
+		},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			attempt.StripeInvoiceID: {exactInvoiceItem(attempt)},
+		},
+		payResult: exactPaidInvoice(attempt),
+		listPayments: map[string][]billingstripe.InvoicePaymentProof{
+			attempt.StripeInvoiceID: {
+				exactInvoicePayment(attempt, attempt.StripeInvoiceID),
+			},
+		},
+	}
+	settler := &memorySettler{store: store, transitioned: true}
+	executor := NewExecutor(store, settler, stripe).WithNow(func() time.Time { return now })
+
+	result, err := executor.Recover(context.Background(), attempt.AccountID)
+
+	require.NoError(t, err)
+	require.True(t, result.Triggered)
+	require.False(t, result.NewAttempt)
+	require.Equal(t, attempt.ID, result.AttemptID)
+	require.Equal(t, "settled", result.Status)
+	require.Empty(t, stripe.createCalls, "explicit recovery must never create an attempt invoice")
+	require.Empty(t, stripe.finalizeCalls)
+	require.Len(t, stripe.payCalls, 1)
+	require.Len(t, store.acquire, 1, "explicit recovery must never enter Acquire")
+}
+
+func TestExecutorRecover_ExpiredCrashClosesWithoutReplacement(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 5, 46, 30, 0, time.UTC)
+	attempt := testAttempt(now.Add(-PendingGrace), 5_000_000)
+	attempt.ExpiresAt = now
+	store := newMemoryStore(attempt, AcquireNone)
+	stripe := &scriptedStripe{
+		createResult: controlledInvoice(attempt, billingstripe.Invoice{
+			ID: "in_explicit_expired", CustomerID: attempt.StripeCustomerID, Status: "draft",
+		}),
+		deleteResult: billingstripe.Invoice{
+			ID: "in_explicit_expired", Deleted: true,
+		},
+	}
+	executor := NewExecutor(store, &memorySettler{store: store}, stripe).
+		WithNow(func() time.Time { return now })
+
+	result, err := executor.Recover(context.Background(), attempt.AccountID)
+
+	require.NoError(t, err)
+	require.Equal(t, attempt.ID, result.AttemptID)
+	require.Equal(t, "failed", result.Status)
+	require.Equal(t, "attempt_expired", result.FailureCode)
+	require.Empty(t, stripe.payCalls)
+	require.Len(t, stripe.deleteCalls, 1)
+	require.Len(t, store.acquire, 1,
+		"expired explicit recovery must not create a replacement attempt")
+}
+
+func TestExecutorRecover_NoPendingIsNoOp(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 5, 46, 45, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	attempt.Status = "failed"
+	store := newMemoryStore(attempt, AcquireNone)
+	stripe := &scriptedStripe{}
+	executor := NewExecutor(store, &memorySettler{store: store}, stripe).
+		WithNow(func() time.Time { return now })
+
+	result, err := executor.Recover(context.Background(), attempt.AccountID)
+
+	require.NoError(t, err)
+	require.Equal(t, Result{}, result)
+	require.Empty(t, stripe.sequence)
+	require.Len(t, store.acquire, 1, "no-op recovery must not evaluate policy")
 }
 
 func TestExecutorTrigger_DeleteErrorWithVerifiedMissingDraftReleasesGuard(t *testing.T) {
@@ -487,6 +619,9 @@ func TestExecutorTrigger_DeleteLosesFinalizeRaceVoidsVerifiedOpenInvoice(t *test
 		},
 		deleteErr:  errors.New("invoice is no longer a draft"),
 		voidResult: exactTerminalInvoice(expired, "void"),
+		listItems: map[string][]billingstripe.InvoiceItem{
+			expired.StripeInvoiceID: {exactInvoiceItem(expired)},
+		},
 	}
 	executor := NewExecutor(
 		store,
@@ -581,10 +716,10 @@ func TestExecutorTrigger_DelayedDraftRecoveryReusesExactExistingLine(t *testing.
 		listItems: map[string][]billingstripe.InvoiceItem{
 			"in_delayed": {{ID: "ii_existing", AmountCents: 501, Currency: "usd"}},
 		},
-		payResult: billingstripe.Invoice{
+		payResult: controlledInvoice(attempt, billingstripe.Invoice{
 			ID: "in_delayed", CustomerID: attempt.StripeCustomerID, Status: "paid",
-			AmountPaid: 501, AmountDue: 0, Total: 501, Currency: "usd",
-		},
+			AmountPaid: 501, AmountDue: 501, Total: 501, Currency: "usd",
+		}),
 		listPayments: map[string][]billingstripe.InvoicePaymentProof{
 			"in_delayed": {exactInvoicePayment(attempt, "in_delayed")},
 		},
@@ -655,7 +790,7 @@ func TestExecutorTrigger_DelayedDraftRecoveryRejectsMismatchedOrDuplicateLine(t 
 	}
 }
 
-func TestExecutorTrigger_RecoveredOpenInvariantMismatchVoidsAndNeverPays(t *testing.T) {
+func TestExecutorTrigger_RecoveredOpenInvariantMismatchVoidsAndFailsOwnedInvoice(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*billingstripe.Invoice, *[]billingstripe.InvoiceItem)
@@ -706,7 +841,8 @@ func TestExecutorTrigger_RecoveredOpenInvariantMismatchVoidsAndNeverPays(t *test
 			require.Empty(t, stripe.payCalls,
 				"resource mismatch must be closed before any payment call")
 			require.Len(t, stripe.voidCalls, 1)
-			require.Len(t, store.failCalls, 1)
+			require.Len(t, store.failCalls, 1,
+				"exact irreversible void proof must release the durable guard")
 			require.Empty(t, settler.calls)
 		})
 	}
@@ -803,6 +939,236 @@ func TestExecutorTrigger_VoidLosesPayRaceSettlesExactFrozenPayment(t *testing.T)
 	require.Len(t, stripe.voidCalls, 1)
 	require.Empty(t, store.failCalls)
 	require.Len(t, settler.calls, 1)
+}
+
+func TestExecutorTrigger_UncollectibleRequiresExactVoidProofBeforeFailure(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 6, 44, 10, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	attempt.StripeInvoiceID = "in_foreground_uncollectible_void"
+	store := newMemoryStore(attempt, AcquireExisting)
+	uncollectible := exactTerminalInvoice(attempt, "uncollectible")
+	voided := exactTerminalInvoice(attempt, "void")
+	voided.HostedInvoiceURL = "https://stripe.test/in_foreground_uncollectible_void"
+	stripe := &scriptedStripe{
+		getQueues: map[string][]billingstripe.Invoice{
+			attempt.StripeInvoiceID: {uncollectible, voided},
+		},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			attempt.StripeInvoiceID: {exactInvoiceItem(attempt)},
+		},
+		voidResult:         voided,
+		voidDoesNotPersist: true,
+	}
+	settler := &memorySettler{store: store}
+	executor := NewExecutor(store, settler, stripe).WithNow(func() time.Time { return now })
+
+	result, err := executor.Trigger(context.Background(), attempt.AccountID, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, "failed", result.Status)
+	require.Equal(t, "invoice_uncollectible", result.FailureCode)
+	require.Equal(t, []string{"get", "void", "get"}, stripe.sequence,
+		"the reversible state must be voided and independently re-read before failure")
+	require.Equal(t, []voidCall{{
+		invoiceID: attempt.StripeInvoiceID,
+		idemKey:   "credit-auto-topup-void:" + attempt.ID.String(),
+	}}, stripe.voidCalls)
+	require.Len(t, store.failCalls, 1)
+	require.Empty(t, stripe.payCalls)
+	require.Empty(t, settler.calls)
+}
+
+func TestExecutorTrigger_UncollectibleVoidLosesPayRaceSettlesExactFrozenPayment(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 6, 44, 20, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	attempt.StripeInvoiceID = "in_foreground_uncollectible_paid_race"
+	store := newMemoryStore(attempt, AcquireExisting)
+	uncollectible := exactTerminalInvoice(attempt, "uncollectible")
+	paid := exactPaidInvoice(attempt)
+	stripe := &scriptedStripe{
+		getQueues: map[string][]billingstripe.Invoice{
+			attempt.StripeInvoiceID: {uncollectible, paid},
+		},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			attempt.StripeInvoiceID: {exactInvoiceItem(attempt)},
+		},
+		listPayments: map[string][]billingstripe.InvoicePaymentProof{
+			attempt.StripeInvoiceID: {
+				exactInvoicePayment(attempt, attempt.StripeInvoiceID),
+			},
+		},
+		voidResult:         exactTerminalInvoice(attempt, "void"),
+		voidDoesNotPersist: true,
+	}
+	settler := &memorySettler{store: store, transitioned: true}
+	executor := NewExecutor(store, settler, stripe).WithNow(func() time.Time { return now })
+
+	result, err := executor.Trigger(context.Background(), attempt.AccountID, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, "settled", result.Status)
+	require.Equal(t, []string{"get", "void", "get", "list", "payments"}, stripe.sequence)
+	require.Len(t, stripe.voidCalls, 1)
+	require.Empty(t, store.failCalls,
+		"authoritative paid truth must win over the earlier reversible state")
+	require.Len(t, settler.calls, 1)
+}
+
+func TestExecutorTrigger_UncollectibleRereadRetainsPendingGuard(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 6, 44, 30, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	attempt.StripeInvoiceID = "in_foreground_still_uncollectible"
+	store := newMemoryStore(attempt, AcquireExisting)
+	uncollectible := exactTerminalInvoice(attempt, "uncollectible")
+	stripe := &scriptedStripe{
+		getQueues: map[string][]billingstripe.Invoice{
+			attempt.StripeInvoiceID: {uncollectible, uncollectible},
+		},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			attempt.StripeInvoiceID: {exactInvoiceItem(attempt)},
+		},
+		voidResult:         uncollectible,
+		voidDoesNotPersist: true,
+	}
+	executor := NewExecutor(
+		store,
+		&memorySettler{store: store},
+		stripe,
+	).WithNow(func() time.Time { return now })
+
+	result, err := executor.Trigger(context.Background(), attempt.AccountID, 1)
+
+	require.ErrorContains(t, err, "expected void/0/0")
+	require.Equal(t, "pending", result.Status)
+	require.Len(t, stripe.voidCalls, 1)
+	require.Empty(t, store.failCalls,
+		"an independently re-read reversible state must retain the durable guard")
+}
+
+func TestExecutorRecover_ExpiredUncollectibleUsesVoidBarrierWithoutReplacement(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 6, 44, 40, 0, time.UTC)
+	attempt := testAttempt(now.Add(-PendingGrace), 5_000_000)
+	attempt.ExpiresAt = now
+	attempt.StripeInvoiceID = "in_recover_expired_uncollectible"
+	store := newMemoryStore(attempt, AcquireNone)
+	uncollectible := exactTerminalInvoice(attempt, "uncollectible")
+	voided := exactTerminalInvoice(attempt, "void")
+	stripe := &scriptedStripe{
+		getQueues: map[string][]billingstripe.Invoice{
+			attempt.StripeInvoiceID: {uncollectible, voided},
+		},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			attempt.StripeInvoiceID: {exactInvoiceItem(attempt)},
+		},
+		voidResult:         voided,
+		voidDoesNotPersist: true,
+	}
+	executor := NewExecutor(
+		store,
+		&memorySettler{store: store},
+		stripe,
+	).WithNow(func() time.Time { return now })
+
+	result, err := executor.Recover(context.Background(), attempt.AccountID)
+
+	require.NoError(t, err)
+	require.Equal(t, "failed", result.Status)
+	require.Equal(t, "invoice_uncollectible", result.FailureCode)
+	require.Equal(t, []string{"get", "void", "get"}, stripe.sequence)
+	require.Len(t, stripe.voidCalls, 1)
+	require.Len(t, store.failCalls, 1)
+	require.Len(t, store.acquire, 1,
+		"expired explicit recovery must not create a replacement attempt")
+}
+
+func TestExecutorTrigger_RecoveredInvoicePartialMetadataIsNeverAttachedOrClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   string
+		attached bool
+		mutate   func(*billingstripe.Invoice)
+	}{
+		{
+			name:   "unattached draft missing ledger anchor",
+			status: "draft",
+			mutate: func(invoice *billingstripe.Invoice) {
+				invoice.CreditLedgerID = ""
+			},
+		},
+		{
+			name:   "unattached open missing operation",
+			status: "open",
+			mutate: func(invoice *billingstripe.Invoice) {
+				invoice.CreditOperation = ""
+			},
+		},
+		{
+			name:     "attached draft wrong account anchor",
+			status:   "draft",
+			attached: true,
+			mutate: func(invoice *billingstripe.Invoice) {
+				invoice.CreditAccountID = uuid.NewString()
+			},
+		},
+		{
+			name:     "attached open partial reference",
+			status:   "open",
+			attached: true,
+			mutate: func(invoice *billingstripe.Invoice) {
+				invoice.ChargeRef = "credit-auto-topup:"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Date(2026, time.July, 25, 6, 44, 50, 0, time.UTC)
+			attempt := testAttempt(now.Add(-PendingGrace), 5_000_000)
+			attempt.ExpiresAt = now
+			invoiceID := "in_partial_metadata_" + tt.status
+			if tt.attached {
+				attempt.StripeInvoiceID = invoiceID
+			}
+			store := newMemoryStore(attempt, AcquireExisting)
+			invoice := controlledInvoice(attempt, billingstripe.Invoice{
+				ID:         invoiceID,
+				CustomerID: attempt.StripeCustomerID,
+				Status:     tt.status,
+				AmountDue:  microsToCentsRoundHalfUp(attempt.AmountMicros),
+				Total:      microsToCentsRoundHalfUp(attempt.AmountMicros),
+				Currency:   "usd",
+			})
+			tt.mutate(&invoice)
+			stripe := &scriptedStripe{
+				findFound:  !tt.attached,
+				findResult: invoice,
+				getResults: map[string]billingstripe.Invoice{
+					invoiceID: invoice,
+				},
+				deleteResult: billingstripe.Invoice{ID: invoiceID, Deleted: true},
+				voidResult:   exactTerminalInvoice(attempt, "void"),
+			}
+			executor := NewExecutor(
+				store,
+				&memorySettler{store: store},
+				stripe,
+			).WithNow(func() time.Time { return now })
+
+			result, err := executor.Trigger(context.Background(), attempt.AccountID, 1)
+
+			require.ErrorContains(t, err, "credit metadata does not match")
+			require.Equal(t, "pending", result.Status)
+			require.Equal(t, attempt.StripeInvoiceID, store.mustGet(attempt.ID).StripeInvoiceID,
+				"a recovered foreign resource must not be attached")
+			require.Empty(t, stripe.deleteCalls,
+				"partial ownership metadata must never authorize draft deletion")
+			require.Empty(t, stripe.voidCalls,
+				"partial ownership metadata must never authorize invoice voiding")
+			require.Empty(t, stripe.finalizeCalls)
+			require.Empty(t, stripe.payCalls)
+			require.Empty(t, store.failCalls)
+		})
+	}
 }
 
 func TestExecutorTrigger_RecoveredForeignCustomerStaysPendingWithoutStripeWrite(t *testing.T) {
@@ -1205,10 +1571,94 @@ func TestExecutorReconcileWebhookFailure_VoidLosesPayRaceSettlesExactPayment(t *
 	require.Len(t, settler.calls, 1)
 }
 
-func TestExecutorReconcileWebhookFailure_InvariantMismatchOrPartialRemainsPending(t *testing.T) {
+func TestExecutorReconcileWebhookFailure_UncollectibleRequiresExactVoidProof(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 7, 21, 0, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	attempt.StripeInvoiceID = "in_webhook_uncollectible_void"
+	store := newMemoryStore(attempt, AcquireExisting)
+	uncollectible := exactTerminalInvoice(attempt, "uncollectible")
+	voided := exactTerminalInvoice(attempt, "void")
+	voided.HostedInvoiceURL = "https://stripe.test/in_webhook_uncollectible_void"
+	stripe := &scriptedStripe{
+		getQueues: map[string][]billingstripe.Invoice{
+			attempt.StripeInvoiceID: {uncollectible, voided},
+		},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			attempt.StripeInvoiceID: {exactInvoiceItem(attempt)},
+		},
+		voidResult:         voided,
+		voidDoesNotPersist: true,
+	}
+	settler := &memorySettler{store: store}
+	executor := NewExecutor(store, settler, stripe)
+
+	result, err := executor.ReconcileWebhookFailure(
+		context.Background(),
+		attempt.StripeInvoiceID,
+		"payment_failed",
+	)
+
+	require.NoError(t, err)
+	require.True(t, result.Found)
+	require.True(t, result.Transitioned)
+	require.Equal(t, "failed", result.Status)
+	require.Equal(t, "payment_failed", result.FailureCode)
+	require.Equal(t, []string{"get", "void", "get"}, stripe.sequence)
+	require.Equal(t, []voidCall{{
+		invoiceID: attempt.StripeInvoiceID,
+		idemKey:   "credit-auto-topup-void:" + attempt.ID.String(),
+	}}, stripe.voidCalls)
+	require.Len(t, store.failCalls, 1)
+	require.Empty(t, settler.calls)
+}
+
+func TestExecutorReconcileWebhookFailure_UncollectibleVoidLosesPayRace(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 7, 22, 0, 0, time.UTC)
+	attempt := testAttempt(now, 5_000_000)
+	attempt.StripeInvoiceID = "in_webhook_uncollectible_paid_race"
+	store := newMemoryStore(attempt, AcquireExisting)
+	uncollectible := exactTerminalInvoice(attempt, "uncollectible")
+	paid := exactPaidInvoice(attempt)
+	stripe := &scriptedStripe{
+		getQueues: map[string][]billingstripe.Invoice{
+			attempt.StripeInvoiceID: {uncollectible, paid},
+		},
+		listItems: map[string][]billingstripe.InvoiceItem{
+			attempt.StripeInvoiceID: {exactInvoiceItem(attempt)},
+		},
+		listPayments: map[string][]billingstripe.InvoicePaymentProof{
+			attempt.StripeInvoiceID: {
+				exactInvoicePayment(attempt, attempt.StripeInvoiceID),
+			},
+		},
+		voidResult:         exactTerminalInvoice(attempt, "void"),
+		voidDoesNotPersist: true,
+	}
+	settler := &memorySettler{store: store, transitioned: true}
+	executor := NewExecutor(store, settler, stripe)
+
+	result, err := executor.ReconcileWebhookFailure(
+		context.Background(),
+		attempt.StripeInvoiceID,
+		"payment_failed",
+	)
+
+	require.NoError(t, err)
+	require.True(t, result.Found)
+	require.True(t, result.Transitioned)
+	require.Equal(t, "settled", result.Status)
+	require.Empty(t, result.FailureCode)
+	require.Equal(t, []string{"get", "void", "get", "list", "payments"}, stripe.sequence)
+	require.Len(t, stripe.voidCalls, 1)
+	require.Empty(t, store.failCalls)
+	require.Len(t, settler.calls, 1)
+}
+
+func TestExecutorReconcileWebhookFailure_OwnedUnpaidMismatchClosesButForeignOrPartialStaysPending(t *testing.T) {
 	tests := []struct {
-		name   string
-		mutate func(*billingstripe.Invoice, *[]billingstripe.InvoiceItem)
+		name     string
+		closable bool
+		mutate   func(*billingstripe.Invoice, *[]billingstripe.InvoiceItem)
 	}{
 		{
 			name: "wrong customer",
@@ -1217,21 +1667,24 @@ func TestExecutorReconcileWebhookFailure_InvariantMismatchOrPartialRemainsPendin
 			},
 		},
 		{
-			name: "wrong total",
+			name:     "wrong total",
+			closable: true,
 			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
 				invoice.Total--
 				invoice.AmountDue--
 			},
 		},
 		{
-			name: "wrong currency",
+			name:     "wrong currency",
+			closable: true,
 			mutate: func(invoice *billingstripe.Invoice, items *[]billingstripe.InvoiceItem) {
 				invoice.Currency = "eur"
 				(*items)[0].Currency = "eur"
 			},
 		},
 		{
-			name: "duplicate line",
+			name:     "duplicate line",
+			closable: true,
 			mutate: func(_ *billingstripe.Invoice, items *[]billingstripe.InvoiceItem) {
 				*items = append(*items, (*items)[0])
 			},
@@ -1261,6 +1714,7 @@ func TestExecutorReconcileWebhookFailure_InvariantMismatchOrPartialRemainsPendin
 				listItems: map[string][]billingstripe.InvoiceItem{
 					attempt.StripeInvoiceID: items,
 				},
+				voidResult: exactTerminalInvoice(attempt, "void"),
 			}
 			settler := &memorySettler{store: store}
 			executor := NewExecutor(store, settler, stripe)
@@ -1273,10 +1727,127 @@ func TestExecutorReconcileWebhookFailure_InvariantMismatchOrPartialRemainsPendin
 
 			require.NoError(t, err)
 			require.True(t, result.Found)
-			require.False(t, result.Transitioned)
-			require.Equal(t, "pending", result.Status)
-			require.Empty(t, stripe.voidCalls)
-			require.Empty(t, store.failCalls)
+			if tt.closable {
+				require.True(t, result.Transitioned)
+				require.Equal(t, "failed", result.Status)
+				require.Len(t, stripe.voidCalls, 1)
+				require.Len(t, store.failCalls, 1,
+					"owned unpaid line/presentment mismatch must not strand an irreversible void")
+			} else {
+				require.False(t, result.Transitioned)
+				require.Equal(t, "pending", result.Status)
+				require.Empty(t, stripe.voidCalls)
+				require.Empty(t, store.failCalls)
+			}
+			require.Empty(t, settler.calls)
+		})
+	}
+}
+
+func TestExecutorReconcileWebhookFailure_OnlyTerminalOwnershipMismatchRemainsPending(t *testing.T) {
+	tests := []struct {
+		name              string
+		ownershipMismatch bool
+		mutate            func(*billingstripe.Invoice, *[]billingstripe.InvoiceItem)
+	}{
+		{
+			name:              "missing operation",
+			ownershipMismatch: true,
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.CreditOperation = ""
+			},
+		},
+		{
+			name:              "wrong reference",
+			ownershipMismatch: true,
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.ChargeRef = "credit-auto-topup:" + uuid.NewString()
+			},
+		},
+		{
+			name:              "wrong account anchor",
+			ownershipMismatch: true,
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.CreditAccountID = uuid.NewString()
+			},
+		},
+		{
+			name:              "wrong ledger anchor",
+			ownershipMismatch: true,
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.CreditLedgerID = uuid.NewString()
+			},
+		},
+		{
+			name: "wrong amount",
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.Total--
+			},
+		},
+		{
+			name: "wrong currency",
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.Currency = "eur"
+			},
+		},
+		{
+			name: "duplicate line",
+			mutate: func(_ *billingstripe.Invoice, items *[]billingstripe.InvoiceItem) {
+				*items = append(*items, (*items)[0])
+			},
+		},
+		{
+			name: "wrong collection mode",
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.CollectionMethod = string(stripego.InvoiceCollectionMethodSendInvoice)
+			},
+		},
+		{
+			name: "wrong frozen card",
+			mutate: func(invoice *billingstripe.Invoice, _ *[]billingstripe.InvoiceItem) {
+				invoice.DefaultPaymentMethodID = "pm_foreign"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Date(2026, time.July, 25, 7, 45, 0, 0, time.UTC)
+			attempt := testAttempt(now, 5_000_000)
+			attempt.StripeInvoiceID = "in_terminal_invariant"
+			store := newMemoryStore(attempt, AcquireExisting)
+			invoice := exactTerminalInvoice(attempt, "void")
+			items := []billingstripe.InvoiceItem{exactInvoiceItem(attempt)}
+			tt.mutate(&invoice, &items)
+			stripe := &scriptedStripe{
+				getResults: map[string]billingstripe.Invoice{
+					attempt.StripeInvoiceID: invoice,
+				},
+				listItems: map[string][]billingstripe.InvoiceItem{
+					attempt.StripeInvoiceID: items,
+				},
+			}
+			settler := &memorySettler{store: store}
+			executor := NewExecutor(store, settler, stripe)
+
+			result, err := executor.ReconcileWebhookFailure(
+				context.Background(),
+				attempt.StripeInvoiceID,
+				"payment_failed",
+			)
+
+			require.NoError(t, err)
+			require.True(t, result.Found)
+			if tt.ownershipMismatch {
+				require.False(t, result.Transitioned)
+				require.Equal(t, "pending", store.mustGet(attempt.ID).Status)
+				require.Empty(t, store.failCalls)
+			} else {
+				require.True(t, result.Transitioned)
+				require.Equal(t, "failed", store.mustGet(attempt.ID).Status)
+				require.Len(t, store.failCalls, 1,
+					"irreversibly void owned invoice must release the pending guard")
+			}
 			require.Empty(t, settler.calls)
 		})
 	}
@@ -1440,6 +2011,7 @@ type memoryStore struct {
 	mu        sync.Mutex
 	acquire   []acquireResult
 	attempts  map[uuid.UUID]Attempt
+	getErrors []error
 	failCalls []failCall
 }
 
@@ -1467,9 +2039,27 @@ func (s *memoryStore) Acquire(_ context.Context, _ uuid.UUID, _ int64, _ time.Ti
 	return next.attempt, next.kind, next.err
 }
 
+func (s *memoryStore) Pending(_ context.Context, accountID uuid.UUID) (Attempt, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, attempt := range s.attempts {
+		if attempt.AccountID == accountID && attempt.Status == "pending" {
+			return attempt, true, nil
+		}
+	}
+	return Attempt{}, false, nil
+}
+
 func (s *memoryStore) Get(_ context.Context, _, attemptID uuid.UUID) (Attempt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.getErrors) > 0 {
+		err := s.getErrors[0]
+		s.getErrors = s.getErrors[1:]
+		if err != nil {
+			return Attempt{}, err
+		}
+	}
 	attempt, ok := s.attempts[attemptID]
 	if !ok {
 		return Attempt{}, errors.New("attempt not found")
@@ -1588,7 +2178,8 @@ func (o *recordingObserver) ObserveAccount(ctx context.Context, accountID uuid.U
 type createCall struct {
 	customerID      string
 	paymentMethodID string
-	ref             string
+	accountID       string
+	ledgerID        string
 	idemKey         string
 }
 
@@ -1666,10 +2257,18 @@ type scriptedStripe struct {
 	deletedInvoices    map[string]bool
 }
 
-func (s *scriptedStripe) CreateAutoTopUpInvoice(_ context.Context, customerID, paymentMethodID, ref, idemKey string) (billingstripe.Invoice, error) {
+func (s *scriptedStripe) CreateAutoTopUpInvoice(
+	_ context.Context,
+	customerID string,
+	paymentMethodID string,
+	accountID string,
+	ledgerID string,
+	idemKey string,
+) (billingstripe.Invoice, error) {
 	s.sequence = append(s.sequence, "create")
 	s.createCalls = append(s.createCalls, createCall{
-		customerID: customerID, paymentMethodID: paymentMethodID, ref: ref, idemKey: idemKey,
+		customerID: customerID, paymentMethodID: paymentMethodID,
+		accountID: accountID, ledgerID: ledgerID, idemKey: idemKey,
 	})
 	return s.createResult, s.createErr
 }
@@ -1791,7 +2390,7 @@ func (s *scriptedStripe) VoidInvoice(_ context.Context, invoiceID, idemKey strin
 	s.voidCalls = append(s.voidCalls, voidCall{invoiceID: invoiceID, idemKey: idemKey})
 	if !s.voidDoesNotPersist &&
 		s.voidErr == nil &&
-		(s.voidResult.Status == "void" || s.voidResult.Status == "uncollectible") {
+		s.voidResult.Status == "void" {
 		if s.voided == nil {
 			s.voided = map[string]billingstripe.Invoice{}
 		}
@@ -1864,6 +2463,10 @@ func controlledInvoice(attempt Attempt, invoice billingstripe.Invoice) billingst
 	invoice.CollectionMethod = string(stripego.InvoiceCollectionMethodChargeAutomatically)
 	invoice.AutoAdvance = false
 	invoice.DefaultPaymentMethodID = attempt.StripePaymentMethodID
+	invoice.ChargeRef = "credit-auto-topup:" + attempt.ID.String()
+	invoice.CreditOperation = "auto_topup"
+	invoice.CreditAccountID = attempt.AccountID.String()
+	invoice.CreditLedgerID = attempt.ID.String()
 	return invoice
 }
 
@@ -1881,25 +2484,26 @@ func exactOpenInvoice(attempt Attempt) billingstripe.Invoice {
 
 func exactPaidInvoice(attempt Attempt) billingstripe.Invoice {
 	amountCents := microsToCentsRoundHalfUp(attempt.AmountMicros)
-	return billingstripe.Invoice{
+	return controlledInvoice(attempt, billingstripe.Invoice{
 		ID:         attempt.StripeInvoiceID,
 		CustomerID: attempt.StripeCustomerID,
 		Status:     "paid",
+		AmountDue:  amountCents,
 		AmountPaid: amountCents,
 		Total:      amountCents,
 		Currency:   "usd",
-	}
+	})
 }
 
 func exactTerminalInvoice(attempt Attempt, status string) billingstripe.Invoice {
 	amountCents := microsToCentsRoundHalfUp(attempt.AmountMicros)
-	return billingstripe.Invoice{
+	return controlledInvoice(attempt, billingstripe.Invoice{
 		ID:         attempt.StripeInvoiceID,
 		CustomerID: attempt.StripeCustomerID,
 		Status:     status,
 		Total:      amountCents,
 		Currency:   "usd",
-	}
+	})
 }
 
 type concurrentFailureStripe struct {

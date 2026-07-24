@@ -39,10 +39,16 @@ import (
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/budget"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
@@ -156,6 +162,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
 		}
 		return d.svc.SetAutoTopUp(ctx, req)
+
+	case "RecoverAutoTopUp":
+		var req billing.RecoverAutoTopUpRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.RecoverAutoTopUp(ctx, req)
 
 	case "SetCustomerBillingMode":
 		var req billing.SetCustomerBillingModeRequest
@@ -432,6 +445,8 @@ func httpStatusForError(err error) int {
 			return http.StatusNotFound
 		case billing.CodeStripeError:
 			return http.StatusBadGateway
+		case billing.CodeUnavailable:
+			return http.StatusServiceUnavailable
 		case billing.CodeInternal:
 			return http.StatusInternalServerError
 		}
@@ -464,15 +479,23 @@ var disp *dispatcher
 // config loads at package load time.
 func buildDispatcher() *dispatcher {
 	pool := config.MustPgxPool()
-	walletEnabled := config.CreditWalletEnabled()
-	if walletEnabled {
-		ready, err := config.CreditWalletSchemaReady(context.Background(), pool)
+	candidate := rollout.FromEnv(rollout.ComponentAPI, true)
+	schemaReady := false
+	if candidate.Active() {
+		ready, err := config.CreditRuntimeSchemaReady(context.Background(), pool)
 		if err != nil {
-			slog.Error("credit-wallet schema probe failed", "error", err)
+			slog.Error("credit runtime schema probe failed", "error", err)
 			os.Exit(1)
 		}
-		walletEnabled = ready
+		schemaReady = ready
 	}
+	policy := rollout.FromEnv(rollout.ComponentAPI, schemaReady)
+	controller := rollout.NewController(policy, rollout.NewReporter(os.Stdout))
+	walletEnabled := policy.Active()
+	creditAccess := func(accountID uuid.UUID) bool {
+		return controller.Decide(accountID).Enforced()
+	}
+
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 	// Post-confirmation redirect target for the setup-mode Checkout
 	// Session (the frontend billing page). Required by ui_mode=elements.
@@ -480,27 +503,115 @@ func buildDispatcher() *dispatcher {
 
 	store := billing.NewStore(pool)
 	stripeClient := billingstripe.NewClient(stripeKey)
-	svc := billing.NewService(store, stripeClient, returnURL).WithCreditWallet(walletEnabled)
+	manualCreditPurchases := creditpurchase.NewExecutor(
+		creditpurchase.NewStore(pool),
+		creditledger.NewStore(pool),
+		billingstripe.NewCreditPurchaseClient(stripeKey),
+	)
+	autoTopUpExecutor := autotopup.NewExecutor(
+		autotopup.NewStore(pool),
+		creditledger.NewStore(pool),
+		billingstripe.NewAutoTopUpClient(stripeKey),
+	)
+	recoveryCapability := creditrecovery.NewRuntimeCapability(
+		func(ctx context.Context) (bool, error) {
+			return config.CreditRecoverySchemaReady(ctx, pool)
+		},
+	)
+	svc := billing.NewService(store, stripeClient, returnURL).
+		WithCreditWallet(walletEnabled).
+		WithCreditAccess(creditAccess).
+		WithCreditPurchaseExecutor(creditrecovery.GuardManualPurchaseExecutor(
+			recoveryCapability,
+			manualCreditPurchases,
+		)).
+		WithCreditRecoveryCapability(recoveryCapability).
+		WithAutoTopUpRecovery(creditrecovery.GuardAutoTopUpRecovery(
+			recoveryCapability,
+			autoTopUpExecutor,
+		))
 
 	budgetSvc := budget.NewService(budget.NewStore(pool))
 	// The ingest path fires the per-app budget hook best-effort on a fresh
 	// usage event (design §5 / §10).
-	usageSvc := usage.NewService(usage.NewStoreWithCreditWallet(pool, walletEnabled)).WithBudgetEvaluator(budgetSvc)
-	coordinator := credit.NewCoordinatorIfReady(walletEnabled, func() *credit.Coordinator {
-		counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
-		if err != nil {
-			slog.Error("credit estimate cache unavailable; live projection fallback remains active", "error", err)
-		}
-		coordinator := credit.NewCoordinator(counter, store, usageSvc, nil)
+	usageStore := usage.NewStore(pool)
+	if walletEnabled {
+		usageStore = usage.NewStoreWithCreditAccess(pool, creditAccess)
+	}
+	usageSvc := usage.NewService(usageStore).WithBudgetEvaluator(budgetSvc)
+
+	var shadow *rollout.CreditShadowEvaluator
+	if walletEnabled {
+		shadowProjection := usage.NewService(usage.NewStoreWithCreditAccess(
+			pool,
+			rollout.ReadOnlySelectedAccess(controller),
+		))
+		shadow = rollout.NewCreditShadowEvaluator(
+			rollout.SnapshotProviderFunc(func(ctx context.Context, accountID uuid.UUID) (rollout.CreditSnapshot, error) {
+				snapshot, err := store.CreditGateSnapshot(ctx, accountID)
+				if err != nil {
+					return rollout.CreditSnapshot{}, err
+				}
+				return rollout.CreditSnapshot{
+					OwnerUserID:            snapshot.OwnerUserID,
+					OwnerOrgID:             snapshot.OwnerOrgID,
+					BillingMode:            snapshot.BillingMode,
+					SettledBalanceMicros:   snapshot.SettledBalanceMicros,
+					SpendableBalanceMicros: snapshot.SpendableBalanceMicros,
+					CreditLimitMicros:      snapshot.CreditLimitMicros,
+					PendingAutoTopUp:       snapshot.PendingAutoTopUp,
+				}, nil
+			}),
+			shadowProjection,
+		)
+	}
+
+	coordinator := credit.NewCoordinatorIfReady(
+		walletEnabled && controller.Mode() == rollout.ModeEnforce,
+		func() *credit.Coordinator {
+			counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+			if err != nil {
+				slog.Error("credit estimate cache unavailable; live projection fallback remains active", "error", err)
+			}
+			coordinator := credit.NewCoordinator(counter, store, usageSvc, nil)
+			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
+				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
+					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
+					return credit.AutoTopUpTriggerResult{
+						Attempted:  result.Triggered,
+						NewAttempt: result.NewAttempt,
+						Terminal:   result.Status == "settled" || result.Status == "failed",
+					}, err
+				},
+			))
+			return coordinator
+		})
+
+	if coordinator != nil {
+		autoTopUpExecutor.WithSettlementObserver(
+			rollout.NewSettlementObserver(controller, coordinator),
+		)
+	}
+	if walletEnabled {
+		gate := rollout.NewGate(controller, shadow, coordinator)
+		svc.WithCreditCoordinator(
+			gate,
+			rollout.NewSettlementObserver(controller, coordinator),
+		)
+		usageSvc.WithCreditEvaluator(rollout.NewUsageEvaluator(
+			controller,
+			rollout.ReadOnlyUsageEvaluatorFunc(func(ctx context.Context, event credit.UsageEvent) error {
+				_, err := shadow.EvaluateCreditReadOnly(ctx, event.AccountID)
+				return err
+			}),
+			coordinator,
+		))
+	}
+	if coordinator != nil {
 		notifier := standing.NewNotifierFromEnvWithStatus(pool, svc, slog.Default())
 		if notifier.Enabled() {
 			coordinator.WithNotifier(notifier)
 		}
-		return coordinator
-	})
-	if coordinator != nil {
-		svc.WithCreditCoordinator(coordinator, coordinator)
-		usageSvc.WithCreditEvaluator(coordinator)
 	}
 
 	// The apps-mirror RPCs (RegisterApp / SyncAppModules) live on the cycle
@@ -512,7 +623,8 @@ func buildDispatcher() *dispatcher {
 	// second rollup — so the cycle Service borrows the usage Service here.
 	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient).
 		WithAccountBill(usageSvc).
-		WithCreditWallet(walletEnabled)
+		WithCreditWallet(walletEnabled).
+		WithCreditRollout(controller)
 	if coordinator != nil {
 		cycleSvc.WithWalletMutationObserver(coordinator)
 	}
@@ -542,6 +654,7 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.StartCreditPurchase", makeHTTPHandler(d, "StartCreditPurchase"))
 		r.Post("/v1/billing.FinishCreditPurchase", makeHTTPHandler(d, "FinishCreditPurchase"))
 		r.Post("/v1/billing.SetAutoTopUp", makeHTTPHandler(d, "SetAutoTopUp"))
+		r.Post("/v1/billing.RecoverAutoTopUp", makeHTTPHandler(d, "RecoverAutoTopUp"))
 		r.Post("/v1/billing.SetCustomerBillingMode", makeHTTPHandler(d, "SetCustomerBillingMode"))
 		r.Post("/v1/billing.ListDistributorCustomers", makeHTTPHandler(d, "ListDistributorCustomers"))
 		r.Post("/v1/billing.GrantCredits", makeHTTPHandler(d, "GrantCredits"))

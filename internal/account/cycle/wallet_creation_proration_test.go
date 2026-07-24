@@ -283,6 +283,44 @@ func TestChargeCreationProration_WalletFlagOffUsesLegacyStripePath(t *testing.T)
 	require.EqualValues(t, 50_000_000, store.walletSources[grant].remaining)
 }
 
+// The initial rail classification is intentionally unlocked. If an owner flips
+// credits→standard before the wallet transaction obtains the account lock, the
+// locked durable mode wins: even a fully covering grant is untouched and the
+// entire mid-period charge proceeds through Stripe.
+func TestChargeCreationProration_ModeFlipsToStandardBeforeWalletLockDefersToStripe(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	store.walletMode = cycle.CreditBillingModeCredits
+	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
+	sc := newFakeStripe()
+	observer := &fakeWalletMutationObserver{}
+	svc := appsSvc(store, sc).
+		WithCreditWallet(true).
+		WithWalletMutationObserver(observer)
+
+	appID := uuid.New()
+	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	registerMirror(t, svc, user, appID, created, 0)
+	store.beforeCreationWalletDraw = func(f *fakeStore, _ uuid.UUID) {
+		f.walletMode = cycle.CreditBillingModeStandard
+	}
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Equal(t, sc.invoiceID, resp.ProrationInvoiceID)
+	require.Equal(t, 1, store.creationWalletDrawCalls,
+		"the mode change is discovered inside the wallet transaction")
+	require.Zero(t, store.creationDrawn[appID], "standard mode never receives a mid-period wallet draw")
+	require.EqualValues(t, 50_000_000, store.walletSources[grant].remaining,
+		"a covering grant must remain untouched after the mode change")
+	require.Empty(t, store.walletDrawOrder)
+	require.Empty(t, observer.calls, "a no-draw defer emits no wallet mutation")
+	require.Len(t, sc.invoiceCalls, 1, "the full charge stays on the Stripe rail")
+	require.Len(t, sc.itemCalls, 1)
+	require.Len(t, sc.finalizeCalls, 1)
+}
+
 // Defect #1: the unlocked mirror can race with a concurrent Stripe attempt.
 // The wallet store's under-lock marker check wins, performs no debit, and hands
 // the caller to ms_charge_ref recovery so the already-moved invoice is adopted.

@@ -9,16 +9,13 @@ import (
 
 const metricsNamespace = "MirrorStack/Billing/CreditWalletRollout"
 
-// Observation is one selected shadow/enforce evaluation. The caller supplies
-// invariant flags explicitly; this package never infers or changes behavior.
+// Observation is one selected shadow/enforce evaluation. It contains only
+// signals the production rollout adapters can observe truthfully.
 type Observation struct {
-	Decision              Decision
-	Duration              time.Duration
-	Diverged              bool
-	EvaluatorError        bool
-	MoneyInvariantFailure bool
-	ShadowMutation        bool
-	DuplicateMutation     bool
+	Decision       Decision
+	Duration       time.Duration
+	Diverged       bool
+	EvaluatorError bool
 }
 
 // Reporter emits CloudWatch Embedded Metric Format JSON. Component, mode, and
@@ -59,9 +56,6 @@ func (r *Reporter) Emit(observation Observation) error {
 					{Name: "DivergenceCount", Unit: "Count"},
 					{Name: "EvaluatorErrorCount", Unit: "Count"},
 					{Name: "LatencyMs", Unit: "Milliseconds"},
-					{Name: "MoneyInvariantFailureCount", Unit: "Count"},
-					{Name: "ShadowMutationCount", Unit: "Count"},
-					{Name: "DuplicateMutationCount", Unit: "Count"},
 				},
 			}},
 		},
@@ -76,13 +70,10 @@ func (r *Reporter) Emit(observation Observation) error {
 		CoreManifestSHA: observation.Decision.CoreManifestSHA,
 		BillingSHA:      observation.Decision.BillingSHA,
 
-		EvaluationCount:            1,
-		DivergenceCount:            count(observation.Diverged),
-		EvaluatorErrorCount:        count(observation.EvaluatorError),
-		LatencyMs:                  float64(observation.Duration) / float64(time.Millisecond),
-		MoneyInvariantFailureCount: count(observation.MoneyInvariantFailure),
-		ShadowMutationCount:        count(observation.ShadowMutation),
-		DuplicateMutationCount:     count(observation.DuplicateMutation),
+		EvaluationCount:     1,
+		DivergenceCount:     count(observation.Diverged),
+		EvaluatorErrorCount: count(observation.EvaluatorError),
+		LatencyMs:           float64(observation.Duration) / float64(time.Millisecond),
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -103,13 +94,10 @@ type emfEvent struct {
 	CoreManifestSHA string `json:"CoreManifestSHA"`
 	BillingSHA      string `json:"BillingEngineSHA"`
 
-	EvaluationCount            int     `json:"EvaluationCount"`
-	DivergenceCount            int     `json:"DivergenceCount"`
-	EvaluatorErrorCount        int     `json:"EvaluatorErrorCount"`
-	LatencyMs                  float64 `json:"LatencyMs"`
-	MoneyInvariantFailureCount int     `json:"MoneyInvariantFailureCount"`
-	ShadowMutationCount        int     `json:"ShadowMutationCount"`
-	DuplicateMutationCount     int     `json:"DuplicateMutationCount"`
+	EvaluationCount     int     `json:"EvaluationCount"`
+	DivergenceCount     int     `json:"DivergenceCount"`
+	EvaluatorErrorCount int     `json:"EvaluatorErrorCount"`
+	LatencyMs           float64 `json:"LatencyMs"`
 }
 
 type emfMetadata struct {

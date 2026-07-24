@@ -101,6 +101,16 @@ func (f *fakeStripe) CreateDraftInvoice(_ context.Context, custID, ref, idemKey 
 	return billingstripe.Invoice{ID: f.invoiceID, Status: "draft", Currency: "usd"}, nil
 }
 
+func (f *fakeStripe) CreateCreditPurchaseInvoice(
+	ctx context.Context,
+	customerID string,
+	_ string,
+	ledgerID string,
+	idemKey string,
+) (billingstripe.Invoice, error) {
+	return f.CreateDraftInvoice(ctx, customerID, "credit-purchase:"+ledgerID, idemKey)
+}
+
 func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period billingstripe.LinePeriod, idemKey string) (billingstripe.InvoiceItem, error) {
 	f.itemCalls = append(f.itemCalls, itemCall{
 		custID: custID, invoiceID: invoiceID, amountCfg: amountCents,
@@ -527,6 +537,36 @@ func TestRunBillingCycle_LostFreezeRaceAdoptsWinnersAmount(t *testing.T) {
 	require.Len(t, sc.itemCalls, 1)
 	require.EqualValues(t, 4700, sc.itemCalls[0].amountCfg)
 	requireLinePeriod(t, sc.itemCalls[0].period, periodStart, periodEnd.AddDate(0, 1, 0))
+}
+
+// The inverse D7 race is equally important: a concurrent daemon can finish a
+// zero-charge path after this process read "unfrozen" but before it installs a
+// non-zero marker. Once that terminal mark wins, the stale process must fail
+// before Stripe rather than resurrecting an already-complete run as a charge.
+func TestRunBillingCycle_LostFreezeRaceToTerminalZeroRefusesStripe(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_terminal_zero_race"
+
+	sc := newFakeStripe()
+	store.onFreezeCharge = func(runID uuid.UUID) {
+		store.runStatus[runID] = cycle.RunStatusInvoiced
+	}
+
+	resp, err := chargeSvc(store, sc).RunBillingCycle(
+		context.Background(),
+		chargeAccount,
+		periodStart,
+		periodEnd,
+		0,
+	)
+
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "no frozen charge immediately after freezing")
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.invoiceCalls)
+	require.Empty(t, sc.finalizeCalls)
 }
 
 // Regression (review 2026-07-06, H5): a frozen reclaim past Stripe's ~24h

@@ -8,6 +8,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/eligibility"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -20,8 +22,16 @@ type Service struct {
 	stripe        billingstripe.Client
 	returnURL     string
 	walletEnabled bool
-	creditGate    credit.Gate
-	observer      credit.SettlementObserver
+	// creditAccess is the account-scoped rollout mutation gate. Production
+	// roots install it from the API controller before any public credit RPC can
+	// name a wallet object. A nil selector preserves the component-test
+	// behavior of WithCreditWallet(true).
+	creditAccess      func(uuid.UUID) bool
+	creditGate        credit.Gate
+	observer          credit.SettlementObserver
+	creditPurchases   creditrecovery.ManualPurchaseExecutor
+	creditRecovery    *creditrecovery.RuntimeCapability
+	autoTopUpRecovery AutoTopUpRecovery
 }
 
 // NewService wires a Service. store and stripe are required; passing
@@ -40,12 +50,46 @@ func (s *Service) WithCreditWallet(enabled bool) *Service {
 	return s
 }
 
+// WithCreditAccess installs the account-scoped rollout selector used by every
+// explicit wallet RPC. The selector must be side-effect free; returning false
+// prevents all migration-048/049 store calls for that account.
+func (s *Service) WithCreditAccess(access func(uuid.UUID) bool) *Service {
+	s.creditAccess = access
+	return s
+}
+
+func (s *Service) creditEnabledFor(accountID uuid.UUID) bool {
+	if !s.walletEnabled || accountID == uuid.Nil {
+		return false
+	}
+	return s.creditAccess == nil || s.creditAccess(accountID)
+}
+
 // WithCreditCoordinator attaches the runtime wallet gate and the best-effort
 // post-settlement observer. It is inert unless WithCreditWallet(true) is also
 // set after the fail-closed schema capability probe.
 func (s *Service) WithCreditCoordinator(gate credit.Gate, observer credit.SettlementObserver) *Service {
 	s.creditGate = gate
 	s.observer = observer
+	return s
+}
+
+// WithCreditPurchaseExecutor installs the resource-authoritative manual
+// purchase state machine. Production wires it regardless of rollout mode so a
+// previously authorized Finish can reconcile paid money after rollout is
+// disabled or the account leaves the selected cohort.
+func (s *Service) WithCreditPurchaseExecutor(executor creditrecovery.ManualPurchaseExecutor) *Service {
+	s.creditPurchases = executor
+	return s
+}
+
+// WithCreditRecoveryCapability installs the lazy catalog-only base-048 plus
+// exact-049 guard for already-authorized manual purchase recovery.
+// Construction itself never probes.
+func (s *Service) WithCreditRecoveryCapability(
+	capability *creditrecovery.RuntimeCapability,
+) *Service {
+	s.creditRecovery = capability
 	return s
 }
 
@@ -415,7 +459,17 @@ func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequ
 		UnpaidInvoiceCount:      unpaid,
 	})
 	if s.walletEnabled && s.creditGate != nil {
-		out, gateErr := s.creditGate.OutOfCredits(ctx, accountID)
+		out := false
+		var gateErr error
+		if additive, ok := s.creditGate.(interface {
+			EvaluateStanding(context.Context, uuid.UUID, bool) rollout.BooleanResult
+		}); ok {
+			result := additive.EvaluateStanding(ctx, accountID, verdict.Blocked)
+			out = result.Err == nil && result.Decision.Enforced() && result.Wallet
+			gateErr = result.Err
+		} else {
+			out, gateErr = s.creditGate.OutOfCredits(ctx, accountID)
+		}
 		if gateErr != nil {
 			slog.ErrorContext(ctx, "credit gate unavailable; preserving legacy verdict",
 				"account_id", accountID, "error", gateErr)

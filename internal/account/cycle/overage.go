@@ -112,12 +112,13 @@ const (
 	ModuleOverageWalletLockedCharged ModuleOverageWalletOutcome = iota
 	// ModuleOverageWalletShort: the wallet could not fully cover the overage.
 	// NOTHING was drawn and the guard is UNARMED; the caller stays unsettled
-	// instead of falling through to Stripe. The standard-mode case is a defensive
-	// credits→standard mode-flip race.
+	// instead of falling through to Stripe. Reserved for an all-or-nothing credits
+	// allocator that cannot cover; the current policy normally covers through its
+	// unsecured remainder.
 	ModuleOverageWalletShort
 	// ModuleOverageWalletDeferToStripe: the locked timer row shows a concurrent
-	// attempt already reached the Stripe leg (charge_attempted_at set). The wallet
-	// must not draw beside money that may have moved; defer to the Stripe leg.
+	// Stripe attempt, or the locked account mode is no longer credits. The wallet
+	// performs no draw and defers the full charge to the Stripe leg.
 	ModuleOverageWalletDeferToStripe
 	// ModuleOverageWalletLockedStale: the timer was removed, or resolved by a
 	// concurrent sweep, under the lock — nothing to settle (the M2 stale posture).
@@ -357,13 +358,13 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// may already have moved. The block is dark unless the credit-wallet flag is set
 	// (fail-closed): with the flag off nothing here runs and the OFF path is the
 	// byte-for-byte existing Stripe overage behavior below.
-	if s.walletEnabled && cand.ChargeAttemptedAt.IsZero() {
+	if cand.ChargeAttemptedAt.IsZero() {
 		walletStart, walletEnd := billingperiod.AnchoredPeriodWindow(cand.InstalledAt.UTC(), billingperiod.AnchorDay(cand.ActivatedAt))
-		walletState, err := s.store.WalletCreditState(ctx, cand.AccountID, walletStart, walletEnd)
+		walletState, walletAllowed, err := s.creditWalletChargeState(ctx, cand.AccountID, walletStart, walletEnd)
 		if err != nil {
-			return nil, billing.Internal("wallet state lookup failed", err)
+			return nil, billing.Internal("wallet route classification failed", err)
 		}
-		if walletState.Mode == CreditBillingModeCredits {
+		if walletAllowed && walletState.Mode == CreditBillingModeCredits {
 			wres, deferToStripe, err := s.chargeModuleOverageFromWallet(ctx, cand, proratedMicros, at)
 			if err != nil {
 				return nil, err
@@ -371,9 +372,11 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 			if !deferToStripe {
 				return wres, nil
 			}
-			// deferToStripe: the locked timer row showed a concurrent attempt already
-			// reached Stripe — fall through to the Stripe leg below, whose deterministic
-			// per-timer idem keys + first-write-wins grace guard dedupe against it.
+			// The locked state is authoritative: either a concurrent attempt already
+			// reached Stripe or the durable mode changed to standard. Fall through to
+			// the Stripe leg below; its deterministic per-timer keys + first-write-wins
+			// grace guard dedupe recovery, and a mode-change defer has made no wallet
+			// mutation to conflict with it.
 		}
 	}
 
@@ -484,8 +487,9 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 // the Stripe leg arms (grace_charged_at + a synthetic wallet grace_invoice_id ref,
 // NULL invoice-item id), all in one transaction. installed_at + the activation
 // anchor are immutable, so amountMicros is deterministic across retries. Returns
-// deferToStripe=true when the locked timer row showed a concurrent Stripe attempt,
-// so the caller falls through to the Stripe leg (mirroring #99's caller).
+// deferToStripe=true when the locked timer row showed a concurrent Stripe attempt
+// or the locked account mode is no longer credits, so the caller falls through to
+// the Stripe leg (mirroring #99's caller) without any wallet mutation.
 func (s *Service) chargeModuleOverageFromWallet(ctx context.Context, cand ModuleOverageCandidate, amountMicros int64, at time.Time) (*ModuleOverageResult, bool, error) {
 	res := &ModuleOverageResult{TimerID: cand.ID}
 	if amountMicros <= 0 {

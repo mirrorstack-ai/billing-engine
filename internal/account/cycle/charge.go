@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -82,7 +83,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("RunBillingCycle requires a Stripe client", nil)
 	}
 
-	runID, shouldCharge, err := s.store.InsertBillingRun(ctx, accountID, periodStart, periodEnd)
+	runID, shouldCharge, reclaimed, err := s.store.InsertBillingRun(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("insert billing run failed", err)
 	}
@@ -110,6 +111,28 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("frozen boundary charge lookup failed", err)
 	}
+	hadFrozenAtStart := hasFrozen
+
+	// Compatibility recovery for a draw created by an earlier active candidate
+	// before the atomic run marker existed: while the wallet schema gate remains
+	// active, a reclaimed run may look up an existing period draw with
+	// allowNew=false. New candidates atomically freeze the exact Stripe
+	// remainder on billing_runs with the draw below, so true master-off recovery
+	// uses that legacy run marker and executes no migration-048 SQL.
+	recoveredWalletDraw := WalletDrawdown{Mode: CreditBillingModeStandard}
+	if reclaimed && s.walletEnabled && !hasFrozen {
+		recoveredWalletDraw, err = s.store.DrawWalletCredits(
+			ctx,
+			accountID,
+			periodStart,
+			periodEnd,
+			0,
+			false,
+		)
+		if err != nil {
+			return nil, billing.Internal("recover prior wallet draw failed", err)
+		}
+	}
 
 	// The freeze is stamped BEFORE the first Stripe call, so "frozen" alone does
 	// not mean money moved — a crash (or Stripe 4xx) between the freeze and
@@ -124,7 +147,10 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// a false "nothing" can never double-charge.) Skips taken on the re-gated
 	// path are non-terminal; the frozen amount survives for a later reclaim.
 	var recovered *billingstripe.Invoice
-	if hasFrozen {
+	if hasFrozen && frozen.Cents < 0 {
+		return nil, billing.Internal("frozen boundary charge is negative", nil)
+	}
+	if hasFrozen && frozen.Cents > 0 {
 		custID, err := s.recoveryCustomer(ctx, accountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
@@ -154,14 +180,19 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("account collection lookup failed", err)
 	}
 	walletState := WalletCreditState{Mode: CreditBillingModeStandard}
-	if s.walletEnabled {
-		walletState, err = s.store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+	walletAllowed := false
+	if recoveredWalletDraw.DrawnMicros > 0 {
+		walletState.Mode = recoveredWalletDraw.Mode
+		walletState.PeriodDrawnMicros = recoveredWalletDraw.DrawnMicros
+		walletAllowed = true
+	} else if !hasFrozen {
+		walletState, walletAllowed, err = s.creditWalletChargeState(ctx, accountID, periodStart, periodEnd)
 		if err != nil {
-			return nil, billing.Internal("wallet state lookup failed", err)
+			return nil, billing.Internal("wallet route classification failed", err)
 		}
 	}
-	walletActive := walletState.Mode == CreditBillingModeCredits ||
-		walletState.SpendableBalanceMicros > 0 || walletState.PeriodDrawnMicros > 0
+	walletActive := walletAllowed && (walletState.Mode == CreditBillingModeCredits ||
+		walletState.SpendableBalanceMicros > 0 || walletState.PeriodDrawnMicros > 0)
 
 	// Preserve the historical prepaid fast path byte-for-byte for a standard
 	// account with no spendable wallet balance and no draw already recorded for
@@ -169,7 +200,10 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// instead price the true boundary and debit it before this collection gate.
 	// Never apply the fast path over a frozen charge (H8): a mode tightened after
 	// a crashed attempt charged must not strand moved money unmirrored.
-	if !moneyMayHaveMoved && acct.Mode == BillingModePrepaid && !walletActive {
+	if !moneyMayHaveMoved &&
+		!(hasFrozen && frozen.Cents == 0) &&
+		acct.Mode == BillingModePrepaid &&
+		!walletActive {
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedPrepaid, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (skipped_prepaid) failed", err)
 		}
@@ -256,6 +290,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// period's advance base + module overage + custom domains. The allowance nets
 	// USAGE only; all recurring account fees ride on top.
 	boundaryTotal := arrears + advanceBase + advanceOverage + advanceDomains
+	withBase := advanceBase+advanceOverage+advanceDomains > 0
 
 	summary := &ChargeSummary{
 		FirstRun:             true,
@@ -272,17 +307,36 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// new one beside that frozen charge.
 	stripeTotal := boundaryTotal
 	remainingArrears := arrears
-	walletMode := walletState.Mode
+	walletMode := CreditBillingModeStandard
+	if walletAllowed {
+		walletMode = walletState.Mode
+	}
 	if walletActive {
-		draw, err := s.store.DrawWalletCredits(ctx, accountID, periodStart, periodEnd, boundaryTotal, !hasFrozen)
-		if err != nil {
-			return nil, billing.Internal("wallet drawdown failed", err)
+		draw := recoveredWalletDraw
+		if draw.DrawnMicros == 0 || !hasFrozen {
+			draw, err = s.store.DrawBillingRunWalletCredits(
+				ctx,
+				runID,
+				accountID,
+				periodStart,
+				periodEnd,
+				boundaryTotal,
+				withBase,
+				!hadFrozenAtStart && draw.DrawnMicros == 0,
+			)
+			if err != nil {
+				return nil, billing.Internal("wallet drawdown failed", err)
+			}
 		}
 		if draw.DrawnMicros < 0 {
 			return nil, billing.Internal("wallet drawdown returned a negative magnitude", nil)
 		}
 		walletMode = draw.Mode
 		summary.WalletDrawnMicros = draw.DrawnMicros
+		if draw.BoundaryChargeFrozen {
+			frozen = draw.BoundaryCharge
+			hasFrozen = true
+		}
 		stripeTotal -= draw.DrawnMicros
 		if stripeTotal < 0 {
 			// A reclaimed period can have a larger already-durable draw than a
@@ -306,12 +360,31 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		}
 	}
 
+	// A run-level marker is authoritative even when this deployment is truly
+	// wallet-off (or the account is now excluded), so no migration-048 read is
+	// needed on reclaim. It stores the exact Stripe cents that survived the
+	// wallet debit. Rebuild the effective remainder from that legacy row for
+	// collection gates and the eventual idempotent Stripe request.
+	if hasFrozen && summary.WalletDrawnMicros == 0 {
+		if frozen.Cents > math.MaxInt64/microsPerCent {
+			return nil, billing.Internal("frozen boundary charge overflows micros", nil)
+		}
+		stripeTotal = frozen.Cents * microsPerCent
+		inferredDraw := boundaryTotal - stripeTotal
+		if inferredDraw > 0 {
+			remainingArrears -= inferredDraw
+			if remainingArrears < 0 {
+				remainingArrears = 0
+			}
+		}
+	}
+
 	// Credits mode is wallet-only: the store debits the full boundary amount,
 	// including an unallocated residual when positive lots are exhausted. It
 	// never sends a remainder to Stripe. A pre-existing frozen Stripe request is
 	// the sole exception: recovery must finish money that may already have moved,
 	// and allowNew=false above prevents adding a new wallet debit beside it.
-	if !hasFrozen && walletMode == CreditBillingModeCredits && stripeTotal != 0 {
+	if !hadFrozenAtStart && walletMode == CreditBillingModeCredits && stripeTotal != 0 {
 		return nil, billing.Internal("credits-mode wallet did not debit the full boundary total", nil)
 	}
 
@@ -328,11 +401,11 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// concurrent reclaim may have frozen + charged since — an unguarded terminal
 	// 'invoiced' would bury that charge forever. Guard lost → error out; the run
 	// stays reclaimable and the next reclaim reconciles the frozen charge.
-	if !hasFrozen && stripeTotal == 0 {
+	if stripeTotal == 0 && (!hasFrozen || frozen.Cents == 0) {
 		// A wallet-settled advance base is still a real billed base. Persist the
 		// same display snapshot the Stripe path would have written; a failure
 		// leaves the run reclaimable and the period draw is safely reused.
-		if summary.WalletDrawnMicros > 0 && advanceBase > 0 {
+		if (summary.WalletDrawnMicros > 0 || hasFrozen) && advanceBase > 0 {
 			anchorDay := billingperiod.AnchorDay(periodEnd)
 			if activatedAt, activated, err := s.store.AccountActivation(ctx, accountID); err != nil {
 				return nil, billing.Internal("account activation lookup failed", err)
@@ -352,12 +425,21 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 				}
 			}
 		}
-		ok, err := s.store.MarkBillingRunInvoicedIfUnfrozen(ctx, runID)
-		if err != nil {
-			return nil, billing.Internal("mark billing run (zero arrears) failed", err)
-		}
-		if !ok {
-			return nil, billing.Internal("zero-skip lost to a concurrent freeze — run left pending for the next reclaim to reconcile", nil)
+		if hasFrozen {
+			// frozen==0 is the durable full-wallet/sub-half-cent settlement
+			// marker. Unlike a genuinely fresh zero, it must be adopted rather
+			// than rejected by the unfrozen-only race guard.
+			if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
+				return nil, billing.Internal("mark billing run (wallet settled) failed", err)
+			}
+		} else {
+			ok, err := s.store.MarkBillingRunInvoicedIfUnfrozen(ctx, runID)
+			if err != nil {
+				return nil, billing.Internal("mark billing run (zero arrears) failed", err)
+			}
+			if !ok {
+				return nil, billing.Internal("zero-skip lost to a concurrent freeze — run left pending for the next reclaim to reconcile", nil)
+			}
 		}
 		summary.Status = RunStatusInvoiced
 		return summary, nil
@@ -498,8 +580,6 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("micros to cents conversion failed", err)
 	}
 	liveCents := cents // what the LIVE state says; may be replaced by a frozen amount below
-	withBase := advanceBase+advanceOverage+advanceDomains > 0
-
 	// FREEZE-OR-REUSE the boundary Stripe request (crash-safe idempotency,
 	// migration 035). The idem keys inv-/ii-/fin-<run> are STABLE across a
 	// reclaim of this run, so the request sent under them must be stable too.

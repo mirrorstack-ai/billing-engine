@@ -40,6 +40,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"time"
@@ -48,9 +49,13 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/legacyrestamp"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
@@ -66,6 +71,36 @@ const allowanceMicros int64 = 0
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+	restampConfig, err := legacyrestamp.ParseEnvironment(
+		legacyrestamp.Environment{
+			RestampMode: os.Getenv(legacyrestamp.EnvRestampMode),
+			Master:      os.Getenv(legacyrestamp.EnvMaster),
+			WorkerMode:  os.Getenv(legacyrestamp.EnvWorkerMode),
+			WorkerBPS:   os.Getenv(legacyrestamp.EnvWorkerBPS),
+			CoreSHA:     os.Getenv(legacyrestamp.EnvCoreSHA),
+			BillingSHA:  os.Getenv(legacyrestamp.EnvBillingSHA),
+		},
+	)
+	if err != nil {
+		slog.Error("legacy standing restamp configuration rejected", "error", err)
+		os.Exit(1)
+	}
+	if restampConfig.Enabled {
+		runner := buildLegacyRestampRunner()
+		if config.IsLambda() {
+			lambda.Start(legacyRestampHandler(runner, restampConfig))
+			return
+		}
+		if err := runAllLegacyRestampPages(
+			context.Background(),
+			runner,
+			restampConfig,
+		); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	svc := buildService()
 
 	if config.IsLambda() {
@@ -100,6 +135,157 @@ func main() {
 	}
 }
 
+type legacyRestampRunner interface {
+	RunPage(context.Context, uuid.UUID) (legacyrestamp.Result, error)
+}
+
+func buildLegacyRestampRunner() legacyRestampRunner {
+	pool := config.MustPgxPool()
+	// Intentionally fresh and wallet-disabled: GetServiceStatus evaluates only
+	// legacy card/invoice standing even if an account's stale billing_mode still
+	// says credits. NotifyOwner performs the existing idempotent status+POST.
+	legacyStatus := billing.NewService(billing.NewStore(pool), nil, "")
+	notifier := standing.NewNotifierFromEnvWithStatus(
+		pool,
+		legacyStatus,
+		slog.Default(),
+	)
+	return legacyrestamp.NewRunner(
+		legacyrestamp.NewSource(pool),
+		notifier,
+		legacyrestamp.DefaultPageSize,
+		legacyrestamp.DefaultConcurrency,
+	)
+}
+
+type legacyRestampRequest struct {
+	AfterAccountID string `json:"after_account_id"`
+}
+
+type legacyRestampResponse struct {
+	Complete           bool   `json:"complete"`
+	NextAfterAccountID string `json:"next_after_account_id"`
+	Attempted          int    `json:"attempted"`
+	Succeeded          int    `json:"succeeded"`
+	Failed             int    `json:"failed"`
+	Blocked            int    `json:"blocked"`
+	TotalOwners        int64  `json:"total_owners"`
+	CoreManifestSHA    string `json:"core_manifest_sha"`
+	BillingEngineSHA   string `json:"billing_engine_sha"`
+}
+
+func legacyRestampHandler(
+	runner legacyRestampRunner,
+	cfg legacyrestamp.Config,
+) func(context.Context, legacyRestampRequest) (legacyRestampResponse, error) {
+	return func(
+		ctx context.Context,
+		request legacyRestampRequest,
+	) (legacyRestampResponse, error) {
+		after, err := parseLegacyRestampCursor(request.AfterAccountID)
+		if err != nil {
+			return legacyRestampResponse{}, err
+		}
+		result, err := runLegacyRestampPage(ctx, runner, cfg, after)
+		return legacyRestampResponse{
+			Complete:           result.Complete,
+			NextAfterAccountID: result.NextCursor,
+			Attempted:          result.Scanned,
+			Succeeded:          result.Delivered,
+			Failed:             result.Failed,
+			Blocked:            result.Blocked,
+			TotalOwners:        result.TotalOwners,
+			CoreManifestSHA:    cfg.CoreSHA,
+			BillingEngineSHA:   cfg.BillingSHA,
+		}, err
+	}
+}
+
+func parseLegacyRestampCursor(raw string) (uuid.UUID, error) {
+	if raw == "" {
+		return uuid.Nil, nil
+	}
+	cursor, err := uuid.Parse(raw)
+	if err != nil || cursor == uuid.Nil || cursor.String() != raw {
+		return uuid.Nil, billing.InvalidInput(
+			"after_account_id must be empty or a canonical non-zero UUID",
+		)
+	}
+	return cursor, nil
+}
+
+func runAllLegacyRestampPages(
+	ctx context.Context,
+	runner legacyRestampRunner,
+	cfg legacyrestamp.Config,
+) error {
+	after := uuid.Nil
+	var (
+		expectedTotal int64 = -1
+		succeeded     int64
+	)
+	for {
+		result, err := runLegacyRestampPage(ctx, runner, cfg, after)
+		if err != nil {
+			return err
+		}
+		if expectedTotal == -1 {
+			expectedTotal = result.TotalOwners
+		}
+		if result.TotalOwners != expectedTotal {
+			return fmt.Errorf(
+				"legacy restamp owner count changed from %d to %d; restart at empty cursor",
+				expectedTotal,
+				result.TotalOwners,
+			)
+		}
+		succeeded += int64(result.Delivered)
+		if result.Complete {
+			if succeeded != expectedTotal {
+				return fmt.Errorf(
+					"legacy restamp completed %d owners, expected %d; restart at empty cursor",
+					succeeded,
+					expectedTotal,
+				)
+			}
+			return nil
+		}
+		next, err := parseLegacyRestampCursor(result.NextCursor)
+		if err != nil {
+			return err
+		}
+		after = next
+	}
+}
+
+func runLegacyRestampPage(
+	ctx context.Context,
+	runner legacyRestampRunner,
+	cfg legacyrestamp.Config,
+	after uuid.UUID,
+) (legacyrestamp.Result, error) {
+	result, err := runner.RunPage(ctx, after)
+	log := slog.InfoContext
+	if err != nil {
+		log = slog.ErrorContext
+	}
+	log(
+		ctx,
+		"legacy standing restamp page result",
+		"core_manifest_sha", cfg.CoreSHA,
+		"billing_engine_sha", cfg.BillingSHA,
+		"complete", result.Complete,
+		"total_owners", result.TotalOwners,
+		"pages", result.Pages,
+		"scanned", result.Scanned,
+		"delivered", result.Delivered,
+		"blocked", result.Blocked,
+		"failed", result.Failed,
+		"error", err,
+	)
+	return result, err
+}
+
 // runProrationSweep charges the creation-period base for every app that has
 // survived the grace window as of `at` (the second leg of the cycle job,
 // alongside the per-account boundary loop). Reports whether any per-app charge
@@ -122,33 +308,66 @@ func runProrationSweep(ctx context.Context, svc *cycle.Service, at time.Time) bo
 // Stripe secret is required (the charge leg cannot run without it).
 func buildService() *cycle.Service {
 	pool := config.MustPgxPool()
-	walletEnabled := config.CreditWalletEnabled()
-	if walletEnabled {
-		ready, err := config.CreditWalletSchemaReady(context.Background(), pool)
+	candidate := rollout.FromEnv(rollout.ComponentWorker, true)
+	schemaReady := false
+	if candidate.Active() {
+		ready, err := config.CreditRuntimeSchemaReady(context.Background(), pool)
 		if err != nil {
-			slog.Error("credit-wallet schema probe failed", "error", err)
+			slog.Error("credit runtime schema probe failed", "error", err)
 			os.Exit(1)
 		}
-		walletEnabled = ready
+		schemaReady = ready
 	}
+	policy := rollout.FromEnv(rollout.ComponentWorker, schemaReady)
+	controller := rollout.NewController(policy, rollout.NewReporter(os.Stdout))
+	walletEnabled := policy.Active()
+	creditAccess := func(accountID uuid.UUID) bool {
+		return controller.Decide(accountID).Enforced()
+	}
+
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
-	svc := cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey)).WithCreditWallet(walletEnabled)
-	coordinator := credit.NewCoordinatorIfReady(walletEnabled, func() *credit.Coordinator {
-		counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
-		if err != nil {
-			slog.Error("credit estimate cache unavailable; boundary live projection fallback remains active", "error", err)
-		}
-		standingStore := billing.NewStore(pool)
-		standingSvc := billing.NewService(standingStore, nil, "").WithCreditWallet(true)
-		projection := usage.NewService(usage.NewStoreWithCreditWallet(pool, true))
-		coordinator := credit.NewCoordinator(counter, standingStore, projection, nil)
-		notifier := standing.NewNotifierFromEnvWithStatus(pool, standingSvc, slog.Default())
-		if notifier.Enabled() {
-			coordinator.WithNotifier(notifier)
-		}
-		standingSvc.WithCreditCoordinator(coordinator, coordinator)
-		return coordinator
-	})
+	svc := cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey)).
+		WithCreditWallet(walletEnabled).
+		WithCreditRollout(controller)
+	coordinator := credit.NewCoordinatorIfReady(
+		walletEnabled && controller.Mode() == rollout.ModeEnforce,
+		func() *credit.Coordinator {
+			counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+			if err != nil {
+				slog.Error("credit estimate cache unavailable; boundary live projection fallback remains active", "error", err)
+			}
+			standingStore := billing.NewStore(pool)
+			projection := usage.NewService(usage.NewStoreWithCreditAccess(
+				pool,
+				rollout.ReadOnlySelectedAccess(controller),
+			))
+			coordinator := credit.NewCoordinator(counter, standingStore, projection, nil)
+			autoTopUpExecutor := autotopup.NewExecutor(
+				autotopup.NewStore(pool),
+				creditledger.NewStore(pool),
+				billingstripe.NewAutoTopUpClient(stripeKey),
+			).WithSettlementObserver(coordinator)
+			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
+				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
+					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
+					return credit.AutoTopUpTriggerResult{
+						Attempted:  result.Triggered,
+						NewAttempt: result.NewAttempt,
+						Terminal:   result.Status == "settled" || result.Status == "failed",
+					}, err
+				},
+			))
+
+			standingSvc := billing.NewService(standingStore, nil, "").
+				WithCreditWallet(true).
+				WithCreditAccess(creditAccess).
+				WithCreditCoordinator(rollout.NewGate(controller, nil, coordinator), coordinator)
+			notifier := standing.NewNotifierFromEnvWithStatus(pool, standingSvc, slog.Default())
+			if notifier.Enabled() {
+				coordinator.WithNotifier(notifier)
+			}
+			return coordinator
+		})
 	if coordinator != nil {
 		svc.WithBoundaryEstimateReconciler(coordinator).
 			WithWalletMutationObserver(coordinator)

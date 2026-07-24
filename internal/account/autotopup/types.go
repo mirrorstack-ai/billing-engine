@@ -44,10 +44,19 @@ type Attempt struct {
 	ExpiresAt             time.Time
 	FailureCode           string
 	CreatedAt             time.Time
+	// ObservedAt is the database transaction clock captured with a pending
+	// lookup/insert. Production expiry decisions use it so application clock
+	// skew cannot extend or shorten the durable ten-minute grace. Test fakes
+	// may leave it zero and use the injected fallback clock.
+	ObservedAt time.Time
 }
 
-func (a Attempt) Expired(now time.Time) bool {
-	return a.ExpiresAt.IsZero() || !now.Before(a.ExpiresAt)
+func (a Attempt) Expired(fallbackNow time.Time) bool {
+	observedAt := a.ObservedAt
+	if observedAt.IsZero() {
+		observedAt = fallbackNow
+	}
+	return a.ExpiresAt.IsZero() || !observedAt.Before(a.ExpiresAt)
 }
 
 // Result describes what this trigger observed after all synchronous recovery.
@@ -63,6 +72,7 @@ type Result struct {
 
 type Store interface {
 	Acquire(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64, now time.Time) (Attempt, AcquireKind, error)
+	Pending(ctx context.Context, accountID uuid.UUID) (Attempt, bool, error)
 	Get(ctx context.Context, accountID, attemptID uuid.UUID) (Attempt, error)
 	FindByStripeInvoice(ctx context.Context, stripeInvoiceID string) (Attempt, bool, error)
 	AttachInvoice(ctx context.Context, attempt Attempt, invoice billingstripe.Invoice) (Attempt, error)

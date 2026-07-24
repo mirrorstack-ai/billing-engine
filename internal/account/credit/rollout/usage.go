@@ -72,12 +72,6 @@ func (e *UsageEvaluator) EvaluateCreditUsage(ctx context.Context, event credit.U
 	default:
 		return nil
 	}
-	if e.controller.reporter != nil {
-		_ = e.controller.reporter.Emit(Observation{
-			Decision:       decision,
-			Duration:       e.controller.nowFn().Sub(started),
-			EvaluatorError: err != nil,
-		})
-	}
+	e.controller.Observe(decision, e.controller.nowFn().Sub(started), err)
 	return err
 }

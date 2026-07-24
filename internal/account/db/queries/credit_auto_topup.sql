@@ -28,6 +28,7 @@ SELECT
     config.enabled,
     config.threshold_micros,
     config.amount_micros,
+    config.updated_at,
     COALESCE(config.payment_method_id::text, '')::text AS payment_method_id,
     COALESCE(payment_method.stripe_payment_method_id, '')::text AS stripe_payment_method_id,
     COALESCE(account.stripe_customer_id, '')::text AS stripe_customer_id,
@@ -125,7 +126,9 @@ SELECT
     COALESCE(attempt_stripe_customer_id, '')::text AS stripe_customer_id,
     attempt_expires_at,
     COALESCE(failure_code, '')::text AS failure_code,
-    created_at
+    created_at,
+    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint
+        AS observed_at_unix_micros
 FROM ms_billing.credit_ledger
 WHERE account_id = sqlc.arg(account_id)::uuid
   AND type = 'auto_topup'
@@ -134,10 +137,29 @@ ORDER BY created_at DESC, id DESC
 LIMIT 1
 FOR UPDATE;
 
+-- LatestFailedAutoTopUpCreatedAt is the durable retry latch. Acquire checks it
+-- only after pending recovery and mutable policy resolution: a failure at or
+-- after the current config revision suppresses replacement attempts, while any
+-- explicit config resubmission advances updated_at and re-arms one attempt.
+-- name: LatestFailedAutoTopUpCreatedAt :one
+SELECT created_at
+FROM ms_billing.credit_ledger
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND type = 'auto_topup'
+  AND status = 'failed'
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
 -- InsertPendingAutoTopUp appends the in-flight guard and every frozen payment
--- fact before Stripe is called. The partial pending unique index is the
--- relational backstop if a caller ever bypasses the account lock.
+-- fact before Stripe is called. Creation and the ten-minute grace window are
+-- anchored to one post-lock database wall-clock sample; Lambda clock skew and
+-- time spent waiting on the account lock therefore cannot lengthen or shorten
+-- the durable pending grant. The partial pending unique index is the relational
+-- backstop if a caller ever bypasses the account lock.
 -- name: InsertPendingAutoTopUp :one
+WITH observed AS MATERIALIZED (
+    SELECT clock_timestamp() AS at
+)
 INSERT INTO ms_billing.credit_ledger (
     id,
     account_id,
@@ -152,7 +174,7 @@ INSERT INTO ms_billing.credit_ledger (
     attempt_stripe_customer_id,
     attempt_expires_at,
     created_at
-) VALUES (
+) SELECT
     sqlc.arg(attempt_id)::uuid,
     sqlc.arg(account_id)::uuid,
     sqlc.arg(amount_micros)::bigint,
@@ -164,9 +186,9 @@ INSERT INTO ms_billing.credit_ledger (
     sqlc.arg(payment_method_id)::uuid,
     sqlc.arg(stripe_payment_method_id)::text,
     sqlc.arg(stripe_customer_id)::text,
-    sqlc.arg(attempt_expires_at)::timestamptz,
-    sqlc.arg(created_at)::timestamptz
-)
+    observed.at + INTERVAL '10 minutes',
+    observed.at
+FROM observed
 ON CONFLICT DO NOTHING
 RETURNING
     id,

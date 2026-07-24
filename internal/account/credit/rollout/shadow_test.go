@@ -169,7 +169,7 @@ func TestCreditShadowEvaluatorErrorsAreReadOnlyAndFactsReachController(t *testin
 	evaluator := NewCreditShadowEvaluator(spy, spy)
 	cfg := validConfig()
 	cfg.BasisPoints = "0"
-	cfg.Allowlist = accountID.String()
+	setTestAllowlist(&cfg, accountID.String())
 
 	result := NewController(Parse(cfg), nil).CompareBoolean(
 		context.Background(),

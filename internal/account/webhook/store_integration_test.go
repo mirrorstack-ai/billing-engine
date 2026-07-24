@@ -4,17 +4,96 @@ package webhook_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
+	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook/webhooktest"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
+
+type integrationManualPurchaseStripe struct {
+	invoice  billingstripe.Invoice
+	items    []billingstripe.InvoiceItem
+	payments []billingstripe.InvoicePaymentProof
+}
+
+func (s *integrationManualPurchaseStripe) CreateCreditPurchaseInvoice(
+	context.Context,
+	string,
+	string,
+	string,
+	string,
+) (billingstripe.Invoice, error) {
+	return billingstripe.Invoice{}, fmt.Errorf("unexpected create invoice")
+}
+
+func (s *integrationManualPurchaseStripe) CreateInvoiceItem(
+	context.Context,
+	string,
+	string,
+	int64,
+	string,
+	string,
+	billingstripe.LinePeriod,
+	string,
+) (billingstripe.InvoiceItem, error) {
+	return billingstripe.InvoiceItem{}, fmt.Errorf("unexpected create item")
+}
+
+func (s *integrationManualPurchaseStripe) ListInvoiceItems(
+	context.Context,
+	string,
+) ([]billingstripe.InvoiceItem, error) {
+	return append([]billingstripe.InvoiceItem(nil), s.items...), nil
+}
+
+func (s *integrationManualPurchaseStripe) ListInvoicePayments(
+	context.Context,
+	string,
+) ([]billingstripe.InvoicePaymentProof, error) {
+	return append([]billingstripe.InvoicePaymentProof(nil), s.payments...), nil
+}
+
+func (s *integrationManualPurchaseStripe) FinalizeInvoice(
+	context.Context,
+	string,
+	string,
+) (billingstripe.Invoice, error) {
+	return billingstripe.Invoice{}, fmt.Errorf("unexpected finalize invoice")
+}
+
+func (s *integrationManualPurchaseStripe) GetInvoice(
+	context.Context,
+	string,
+) (billingstripe.Invoice, error) {
+	return s.invoice, nil
+}
+
+func (s *integrationManualPurchaseStripe) FindInvoiceByRef(
+	context.Context,
+	string,
+	string,
+) (billingstripe.Invoice, bool, error) {
+	return billingstripe.Invoice{}, false, fmt.Errorf("unexpected invoice search")
+}
+
+func (s *integrationManualPurchaseStripe) VoidInvoice(
+	context.Context,
+	string,
+	string,
+) (billingstripe.Invoice, error) {
+	return billingstripe.Invoice{}, fmt.Errorf("unexpected void invoice")
+}
 
 func TestPgxStore_MarkEventProcessed_FirstTimeAndDuplicate(t *testing.T) {
 	pool := testutil.NewTestDB(t)
@@ -45,24 +124,72 @@ func TestRouter_InvoicePaidSettlesManualCreditWithoutInvoiceMirror(t *testing.T)
 	require.NoError(t, err)
 
 	verifier := &webhooktest.FakeVerifier{
-		Event: invoiceEvent(
+		Event: creditInvoiceEvent(
 			"evt_credit_webhook_1",
 			"invoice.paid",
 			"in_credit_webhook",
 			"paid",
 			500,
 			500,
+			"purchase",
+			accountID,
+			ledgerID,
 		),
 	}
 	stripe := &webhooktest.FakeChargeRetriever{}
 	observer := &creditObserver{}
+	manualStripe := &integrationManualPurchaseStripe{
+		invoice: billingstripe.Invoice{
+			ID:                  "in_credit_webhook",
+			CustomerID:          "cus_credit_webhook",
+			Status:              "paid",
+			CollectionMethod:    "charge_automatically",
+			ChargeRef:           "credit-purchase:" + ledgerID.String(),
+			CreditOperation:     "purchase",
+			CreditAccountID:     accountID.String(),
+			CreditLedgerID:      ledgerID.String(),
+			AmountDue:           500,
+			AmountPaid:          500,
+			AmountRemaining:     0,
+			AmountPaidOffStripe: 0,
+			Total:               500,
+			Currency:            "usd",
+			HostedInvoiceURL:    "https://stripe.test/in_credit_webhook",
+		},
+		items: []billingstripe.InvoiceItem{{
+			ID: "ii_credit_webhook", AmountCents: 500, Currency: "usd",
+		}},
+	}
+	manualStripe.payments = []billingstripe.InvoicePaymentProof{{
+		ID:                    "inpay_credit_webhook",
+		InvoiceID:             "in_credit_webhook",
+		Status:                "paid",
+		IsDefault:             true,
+		AmountPaid:            500,
+		AmountRequested:       500,
+		Currency:              "usd",
+		PaymentType:           string(stripego.InvoicePaymentPaymentTypePaymentIntent),
+		PaymentIntentID:       "pi_credit_webhook",
+		PaymentIntentStatus:   string(stripego.PaymentIntentStatusSucceeded),
+		PaymentIntentCustomer: "cus_credit_webhook",
+		PaymentMethodID:       "pm_credit_webhook",
+		PaymentIntentAmount:   500,
+		AmountReceived:        500,
+		PaymentIntentCurrency: "usd",
+	}}
+	manualExecutor := creditpurchase.NewExecutor(
+		creditpurchase.NewStore(pool),
+		creditledger.NewStore(pool),
+		manualStripe,
+	)
 	router := webhook.NewRouter(
 		verifier,
 		webhook.NewStore(pool),
 		stripe,
 		stripe,
 		webhooktest.SilentLogger(),
-	).WithCreditSettlementObserver(observer)
+	).WithCreditSettlementObserver(observer).
+		WithManualCreditPaidReconciler(manualExecutor)
 
 	result := router.Process(ctx, []byte(`{}`), "sig")
 
@@ -81,13 +208,16 @@ func TestRouter_InvoicePaidSettlesManualCreditWithoutInvoiceMirror(t *testing.T)
 	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
 	require.Equal(t, []bool{true}, observer.settlementObservations)
 
-	verifier.Event = invoiceEvent(
+	verifier.Event = creditInvoiceEvent(
 		"evt_credit_webhook_2",
 		"invoice.paid",
 		"in_credit_webhook",
 		"paid",
 		500,
 		500,
+		"purchase",
+		accountID,
+		ledgerID,
 	)
 	result = router.Process(ctx, []byte(`{}`), "sig")
 	require.Equal(t, webhook.StatusDriftWarning, result.Status)

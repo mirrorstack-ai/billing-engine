@@ -57,9 +57,16 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/cloudflare"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // egressDataset is the Cloudflare Analytics Engine dataset name the cdn-worker
@@ -135,7 +142,95 @@ func main() {
 // required — a missing one exits at startup (config.MustEnv), never mid-run.
 func buildDeps() (*usage.Service, cloudflare.AnalyticsQuerier) {
 	pool := config.MustPgxPool()
-	svc := usage.NewService(usage.NewStore(pool))
+	candidate := rollout.FromEnv(rollout.ComponentWorker, true)
+	schemaReady := false
+	if candidate.Active() {
+		ready, err := config.CreditRuntimeSchemaReady(context.Background(), pool)
+		if err != nil {
+			slog.Error("credit runtime schema probe failed", "error", err)
+			os.Exit(1)
+		}
+		schemaReady = ready
+	}
+	policy := rollout.FromEnv(rollout.ComponentWorker, schemaReady)
+	controller := rollout.NewController(policy, rollout.NewReporter(os.Stdout))
+	walletEnabled := policy.Active()
+	creditAccess := func(accountID uuid.UUID) bool {
+		return controller.Decide(accountID).Enforced()
+	}
+
+	usageStore := usage.NewStore(pool)
+	if walletEnabled {
+		usageStore = usage.NewStoreWithCreditAccess(pool, creditAccess)
+	}
+	svc := usage.NewService(usageStore)
+	if walletEnabled {
+		standingStore := billing.NewStore(pool)
+		shadowProjection := usage.NewService(usage.NewStoreWithCreditAccess(
+			pool,
+			rollout.ReadOnlySelectedAccess(controller),
+		))
+		shadow := rollout.NewCreditShadowEvaluator(
+			rollout.SnapshotProviderFunc(func(ctx context.Context, accountID uuid.UUID) (rollout.CreditSnapshot, error) {
+				snapshot, err := standingStore.CreditGateSnapshot(ctx, accountID)
+				if err != nil {
+					return rollout.CreditSnapshot{}, err
+				}
+				return rollout.CreditSnapshot{
+					OwnerUserID:            snapshot.OwnerUserID,
+					OwnerOrgID:             snapshot.OwnerOrgID,
+					BillingMode:            snapshot.BillingMode,
+					SettledBalanceMicros:   snapshot.SettledBalanceMicros,
+					SpendableBalanceMicros: snapshot.SpendableBalanceMicros,
+					CreditLimitMicros:      snapshot.CreditLimitMicros,
+					PendingAutoTopUp:       snapshot.PendingAutoTopUp,
+				}, nil
+			}),
+			shadowProjection,
+		)
+
+		var coordinator *credit.Coordinator
+		if controller.Mode() == rollout.ModeEnforce {
+			counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+			if err != nil {
+				slog.Error("credit estimate cache unavailable; live projection fallback remains active", "error", err)
+			}
+			coordinator = credit.NewCoordinator(counter, standingStore, svc, nil)
+			stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
+			autoTopUpExecutor := autotopup.NewExecutor(
+				autotopup.NewStore(pool),
+				creditledger.NewStore(pool),
+				billingstripe.NewAutoTopUpClient(stripeKey),
+			).WithSettlementObserver(coordinator)
+			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
+				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
+					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
+					return credit.AutoTopUpTriggerResult{
+						Attempted:  result.Triggered,
+						NewAttempt: result.NewAttempt,
+						Terminal:   result.Status == "settled" || result.Status == "failed",
+					}, err
+				},
+			))
+
+			status := billing.NewService(standingStore, nil, "").
+				WithCreditWallet(true).
+				WithCreditAccess(creditAccess).
+				WithCreditCoordinator(rollout.NewGate(controller, shadow, coordinator), coordinator)
+			notifier := standing.NewNotifierFromEnvWithStatus(pool, status, slog.Default())
+			if notifier.Enabled() {
+				coordinator.WithNotifier(notifier)
+			}
+		}
+		svc.WithCreditEvaluator(rollout.NewUsageEvaluator(
+			controller,
+			rollout.ReadOnlyUsageEvaluatorFunc(func(ctx context.Context, event credit.UsageEvent) error {
+				_, err := shadow.EvaluateCreditReadOnly(ctx, event.AccountID)
+				return err
+			}),
+			coordinator,
+		))
+	}
 	cf := cloudflare.NewClient(
 		config.MustEnv("CF_ANALYTICS_API_TOKEN"),
 		config.MustEnv("CF_ACCOUNT_ID"),

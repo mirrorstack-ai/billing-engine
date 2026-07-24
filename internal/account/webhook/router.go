@@ -133,20 +133,6 @@ type Store interface {
 	// reordering without regressing a terminal status.
 	ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceStatusParams) (found bool, err error)
 
-	// SettleCreditInvoice applies paid Stripe truth to a pending/failed manual
-	// purchase before the ordinary invoice-mirror path. Auto-top-ups are routed
-	// through CreditPaidReconciler first because their frozen Stripe resource
-	// invariants must be independently re-read. Credit invoices need not have an
-	// ms_billing.invoices row, so this must run before ApplyInvoiceStatus's
-	// found=false early return.
-	SettleCreditInvoice(
-		ctx context.Context,
-		stripeInvoiceID string,
-		amountPaidCents int64,
-		currency string,
-		receiptURL string,
-	) (creditledger.Settlement, error)
-
 	// RelaxCollectionOnPaidInvoice is the risk-graded RELAX driver (PR #9): on a
 	// paid invoice, conservatively re-trust an account that was tightened to
 	// 'prepaid' back to 'arrears' — but ONLY when no open/uncollectible invoice
@@ -241,6 +227,7 @@ type DefaultPMSetter interface {
 type ServingBlockNotifier interface {
 	NotifyStripeCustomer(ctx context.Context, stripeCustomerID string)
 	NotifyStripeInvoice(ctx context.Context, stripeInvoiceID string)
+	NotifyCreditInvoice(ctx context.Context, stripeInvoiceID string)
 	NotifyStripePaymentMethod(ctx context.Context, stripePaymentMethodID string)
 }
 
@@ -251,9 +238,9 @@ type CreditSettlementObserver interface {
 	ObserveAccount(ctx context.Context, accountID uuid.UUID) error
 }
 
-// CreditPaidReconciler is satisfied by the durable auto-top-up executor. A
-// paid webhook payload is only a notification: the reconciler re-reads Stripe
-// and proves the frozen invoice resource before wallet credit can advance.
+// CreditPaidReconciler is satisfied by both durable credit executors. A paid
+// webhook payload is only a notification: the selected reconciler re-reads
+// Stripe and proves the exact invoice resource before wallet credit advances.
 type CreditPaidReconciler interface {
 	ReconcileWebhookPaid(
 		ctx context.Context,
@@ -281,7 +268,9 @@ type Router struct {
 	notify         ServingBlockNotifier     // nil = serving-block pushes disabled
 	creditObserver CreditSettlementObserver // nil = runtime reconciliation disabled
 	creditPaid     CreditPaidReconciler     // nil = auto-top-up paid reconciliation disabled
+	manualPaid     CreditPaidReconciler     // nil = manual-purchase paid reconciliation disabled
 	creditFailures CreditFailureReconciler  // nil = auto-top-up failure reconciliation disabled
+	manualFailures CreditFailureReconciler  // nil = manual-purchase failure reconciliation disabled
 	log            *slog.Logger
 }
 
@@ -331,10 +320,27 @@ func (r *Router) WithCreditPaidReconciler(reconciler CreditPaidReconciler) *Rout
 	return r
 }
 
+// WithManualCreditPaidReconciler attaches resource-authoritative invoice.paid
+// handling for manual wallet purchases. Both webhook binaries wire it even
+// while rollout enforcement is disabled so authorized payments are recoverable.
+func (r *Router) WithManualCreditPaidReconciler(reconciler CreditPaidReconciler) *Router {
+	r.manualPaid = reconciler
+	return r
+}
+
 // WithCreditFailureReconciler attaches resource-authoritative failure handling
 // for durable auto-top-ups. Both webhook binaries wire this in production.
 func (r *Router) WithCreditFailureReconciler(reconciler CreditFailureReconciler) *Router {
 	r.creditFailures = reconciler
+	return r
+}
+
+// WithManualCreditFailureReconciler attaches resource-authoritative
+// payment-failure/void handling for manual purchases.
+func (r *Router) WithManualCreditFailureReconciler(
+	reconciler CreditFailureReconciler,
+) *Router {
+	r.manualFailures = reconciler
 	return r
 }
 
@@ -387,6 +393,12 @@ func (r *Router) notifyCustomer(ctx context.Context, stripeCustomerID string) {
 func (r *Router) notifyInvoice(ctx context.Context, stripeInvoiceID string) {
 	if r.notify != nil {
 		r.notify.NotifyStripeInvoice(ctx, stripeInvoiceID)
+	}
+}
+
+func (r *Router) notifyCreditInvoice(ctx context.Context, stripeInvoiceID string) {
+	if r.notify != nil {
+		r.notify.NotifyCreditInvoice(ctx, stripeInvoiceID)
 	}
 }
 

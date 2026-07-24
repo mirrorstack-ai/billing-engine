@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -20,10 +21,11 @@ const (
 	// percentage cohort and therefore requires a separately reviewed rollout.
 	Version = "credit-wallet-v1"
 
-	envMaster     = "CREDIT_WALLET_ENABLED"
-	envAllowlist  = "CREDIT_WALLET_ALLOWLIST"
-	envManifest   = "CORE_MANIFEST_SHA"
-	envBillingSHA = "BILLING_ENGINE_SHA"
+	envMaster          = "CREDIT_WALLET_ENABLED"
+	envAllowlist       = "CREDIT_WALLET_ALLOWLIST"
+	envAllowlistSHA256 = "CREDIT_WALLET_ALLOWLIST_SHA256"
+	envManifest        = "CORE_MANIFEST_SHA"
+	envBillingSHA      = "BILLING_ENGINE_SHA"
 )
 
 // Component separates API/webhook and scheduled-worker cohorts. A percentage
@@ -55,6 +57,7 @@ type Config struct {
 	Mode            string
 	BasisPoints     string
 	Allowlist       string
+	AllowlistSHA256 string
 	CoreManifestSHA string
 	BillingSHA      string
 }
@@ -65,6 +68,7 @@ type Policy struct {
 	mode            Mode
 	basisPoints     uint16
 	allowlist       map[uuid.UUID]struct{}
+	allowlistSHA256 string
 	coreManifestSHA string
 	billingSHA      string
 	rolloutID       string
@@ -114,6 +118,7 @@ func FromEnv(component Component, schemaReady bool) Policy {
 		Mode:            os.Getenv(prefix + "MODE"),
 		BasisPoints:     os.Getenv(prefix + "BPS"),
 		Allowlist:       os.Getenv(envAllowlist),
+		AllowlistSHA256: os.Getenv(envAllowlistSHA256),
 		CoreManifestSHA: os.Getenv(envManifest),
 		BillingSHA:      os.Getenv(envBillingSHA),
 	})
@@ -144,10 +149,15 @@ func Parse(cfg Config) Policy {
 	if !ok || !fullSHA(cfg.CoreManifestSHA) || !fullSHA(cfg.BillingSHA) {
 		return offPolicy(cfg.Component)
 	}
+	allowlistSHA256 := allowlistDigest(allowlist)
+	if !fullSHA256(cfg.AllowlistSHA256) || cfg.AllowlistSHA256 != allowlistSHA256 {
+		return offPolicy(cfg.Component)
+	}
 	policy := Policy{
 		component: cfg.Component, mode: mode, basisPoints: bps,
-		allowlist: allowlist, coreManifestSHA: cfg.CoreManifestSHA,
-		billingSHA: cfg.BillingSHA,
+		allowlist: allowlist, allowlistSHA256: allowlistSHA256,
+		coreManifestSHA: cfg.CoreManifestSHA,
+		billingSHA:      cfg.BillingSHA,
 	}
 	policy.rolloutID = rolloutID(
 		policy.coreManifestSHA,
@@ -155,8 +165,20 @@ func Parse(cfg Config) Policy {
 		policy.component,
 		policy.mode,
 		policy.basisPoints,
+		policy.allowlistSHA256,
 	)
 	return policy
+}
+
+// Mode returns the startup-validated behavior for this immutable policy.
+func (p Policy) Mode() Mode {
+	return p.mode
+}
+
+// Active reports whether the policy has all required active configuration.
+// Account selection still requires an account-scoped Decide call.
+func (p Policy) Active() bool {
+	return p.mode == ModeShadow || p.mode == ModeEnforce
 }
 
 // Decide returns the immutable cohort decision for accountID.
@@ -234,7 +256,15 @@ func parseAllowlist(raw string) (map[uuid.UUID]struct{}, bool) {
 }
 
 func fullSHA(value string) bool {
-	if len(value) != 40 {
+	return fullLowerHex(value, 40)
+}
+
+func fullSHA256(value string) bool {
+	return fullLowerHex(value, 64)
+}
+
+func fullLowerHex(value string, length int) bool {
+	if len(value) != length {
 		return false
 	}
 	for _, r := range value {
@@ -256,6 +286,7 @@ func rolloutID(
 	component Component,
 	mode Mode,
 	basisPoints uint16,
+	allowlistSHA256 string,
 ) string {
 	payload := strings.Join([]string{
 		coreManifestSHA,
@@ -263,7 +294,21 @@ func rolloutID(
 		string(component),
 		string(mode),
 		strconv.FormatUint(uint64(basisPoints), 10),
+		allowlistSHA256,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:12])
+}
+
+// allowlistDigest binds a rollout stage to the exact reviewed allowlist
+// without putting account identifiers into telemetry. Canonical UUIDs are
+// sorted before hashing, so deployment-list order cannot change the identity.
+func allowlistDigest(allowlist map[uuid.UUID]struct{}) string {
+	canonical := make([]string, 0, len(allowlist))
+	for accountID := range allowlist {
+		canonical = append(canonical, accountID.String())
+	}
+	sort.Strings(canonical)
+	sum := sha256.Sum256([]byte(strings.Join(canonical, ",")))
+	return hex.EncodeToString(sum[:])
 }

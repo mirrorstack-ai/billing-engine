@@ -3,15 +3,22 @@ package config
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
 type fakeCreditWalletSchemaExecutor struct {
-	errs    []error
-	queries []string
+	errs            []error
+	queries         []string
+	baseContract    [3]bool
+	baseErr         error
+	runtimeContract creditAutoTopUpSchemaContract
+	runtimeErr      error
 }
 
 func (f *fakeCreditWalletSchemaExecutor) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
@@ -22,6 +29,103 @@ func (f *fakeCreditWalletSchemaExecutor) Exec(_ context.Context, query string, _
 	err := f.errs[0]
 	f.errs = f.errs[1:]
 	return pgconn.CommandTag{}, err
+}
+
+func (f *fakeCreditWalletSchemaExecutor) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	f.queries = append(f.queries, query)
+	if strings.Contains(query, "WITH schema_relations AS") {
+		return fakeCreditRecoveryBaseRow{
+			contract: f.baseContract,
+			err:      f.baseErr,
+		}
+	}
+	return fakeCreditRuntimeSchemaRow{
+		contract: f.runtimeContract,
+		err:      f.runtimeErr,
+	}
+}
+
+type fakeCreditRecoveryBaseRow struct {
+	contract [3]bool
+	err      error
+}
+
+func (r fakeCreditRecoveryBaseRow) Scan(destinations ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if len(destinations) != len(r.contract) {
+		return fmt.Errorf(
+			"scan destinations = %d, want %d",
+			len(destinations),
+			len(r.contract),
+		)
+	}
+	for i, destination := range destinations {
+		value, ok := destination.(*bool)
+		if !ok {
+			return fmt.Errorf(
+				"scan destination %d has type %T, want *bool",
+				i,
+				destination,
+			)
+		}
+		*value = r.contract[i]
+	}
+	return nil
+}
+
+type fakeCreditRuntimeSchemaRow struct {
+	contract creditAutoTopUpSchemaContract
+	err      error
+}
+
+func (r fakeCreditRuntimeSchemaRow) Scan(destinations ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	values := []bool{
+		r.contract.configPaymentMethodColumn,
+		r.contract.attemptPaymentMethodColumn,
+		r.contract.attemptStripePMColumn,
+		r.contract.attemptStripeCustomerColumn,
+		r.contract.attemptExpiresColumn,
+		r.contract.failureCodeColumn,
+		r.contract.configPaymentMethodForeignKey,
+		r.contract.attemptPaymentMethodForeignKey,
+		r.contract.attemptFieldsCheck,
+		r.contract.failureStateCheck,
+		r.contract.attemptWindowCheck,
+		r.contract.pendingAttemptUniqueIndex,
+	}
+	if len(destinations) != len(values) {
+		return fmt.Errorf("scan destinations = %d, want %d", len(destinations), len(values))
+	}
+	for i, destination := range destinations {
+		value, ok := destination.(*bool)
+		if !ok {
+			return fmt.Errorf("scan destination %d has type %T, want *bool", i, destination)
+		}
+		*value = values[i]
+	}
+	return nil
+}
+
+func completeCreditAutoTopUpSchemaContract() creditAutoTopUpSchemaContract {
+	return creditAutoTopUpSchemaContract{
+		configPaymentMethodColumn:      true,
+		attemptPaymentMethodColumn:     true,
+		attemptStripePMColumn:          true,
+		attemptStripeCustomerColumn:    true,
+		attemptExpiresColumn:           true,
+		failureCodeColumn:              true,
+		configPaymentMethodForeignKey:  true,
+		attemptPaymentMethodForeignKey: true,
+		attemptFieldsCheck:             true,
+		failureStateCheck:              true,
+		attemptWindowCheck:             true,
+		pendingAttemptUniqueIndex:      true,
+	}
 }
 
 func TestCreditWalletSchemaReadyClassifiesProbeErrors(t *testing.T) {
@@ -59,4 +163,202 @@ func TestCreditWalletSchemaReadyClassifiesProbeErrors(t *testing.T) {
 			require.Len(t, fake.queries, tc.wantCalls)
 		})
 	}
+}
+
+func TestCreditAutoTopUpSchemaReadyRequiresEveryExactCapability(t *testing.T) {
+	tests := []struct {
+		name   string
+		remove func(*creditAutoTopUpSchemaContract)
+	}{
+		{
+			name: "config payment method nullable UUID column",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.configPaymentMethodColumn = false
+			},
+		},
+		{
+			name: "attempt payment method nullable UUID column",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.attemptPaymentMethodColumn = false
+			},
+		},
+		{
+			name: "attempt Stripe payment method nullable text column",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.attemptStripePMColumn = false
+			},
+		},
+		{
+			name: "attempt Stripe customer nullable text column",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.attemptStripeCustomerColumn = false
+			},
+		},
+		{
+			name: "attempt expiry nullable timestamptz column",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.attemptExpiresColumn = false
+			},
+		},
+		{
+			name: "failure code nullable text column",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.failureCodeColumn = false
+			},
+		},
+		{
+			name: "config payment method named validated foreign key",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.configPaymentMethodForeignKey = false
+			},
+		},
+		{
+			name: "attempt payment method named validated foreign key",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.attemptPaymentMethodForeignKey = false
+			},
+		},
+		{
+			name: "attempt fields named validated check",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.attemptFieldsCheck = false
+			},
+		},
+		{
+			name: "failure state named validated check",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.failureStateCheck = false
+			},
+		},
+		{
+			name: "attempt window named validated check",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.attemptWindowCheck = false
+			},
+		},
+		{
+			name: "valid exact unique pending attempt index",
+			remove: func(contract *creditAutoTopUpSchemaContract) {
+				contract.pendingAttemptUniqueIndex = false
+			},
+		},
+	}
+
+	full := completeCreditAutoTopUpSchemaContract()
+	fake := &fakeCreditWalletSchemaExecutor{runtimeContract: full}
+	ready, err := creditAutoTopUpSchemaReady(context.Background(), fake)
+	require.NoError(t, err)
+	require.True(t, ready)
+	require.Len(t, fake.queries, 1)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			contract := completeCreditAutoTopUpSchemaContract()
+			tc.remove(&contract)
+			fake := &fakeCreditWalletSchemaExecutor{runtimeContract: contract}
+			ready, err := creditAutoTopUpSchemaReady(context.Background(), fake)
+			require.NoError(t, err)
+			require.False(t, ready)
+			require.Len(t, fake.queries, 1)
+		})
+	}
+}
+
+func TestCreditAutoTopUpSchemaReadyPropagatesCatalogError(t *testing.T) {
+	boom := errors.New("database unavailable")
+	fake := &fakeCreditWalletSchemaExecutor{runtimeErr: boom}
+
+	ready, err := creditAutoTopUpSchemaReady(context.Background(), fake)
+
+	require.False(t, ready)
+	require.ErrorIs(t, err, boom)
+	require.Len(t, fake.queries, 1)
+}
+
+func TestCreditAutoTopUpSchemaContractProbePinsMigration049Shape(t *testing.T) {
+	for _, fragment := range []string{
+		"column_name = 'payment_method_id'",
+		"column_name = 'attempt_payment_method_id'",
+		"column_name = 'attempt_stripe_payment_method_id'",
+		"column_name = 'attempt_stripe_customer_id'",
+		"column_name = 'attempt_expires_at'",
+		"column_name = 'failure_code'",
+		"type_id = 'uuid'::regtype",
+		"type_id = 'text'::regtype",
+		"type_id = 'timestamptz'::regtype",
+		"AND NOT not_null",
+		"credit_auto_topup_configs_payment_method_fkey",
+		"credit_ledger_attempt_payment_method_fkey",
+		"credit_ledger_auto_topup_attempt_fields_check",
+		"credit_ledger_auto_topup_failure_state_check",
+		"credit_ledger_auto_topup_attempt_window_check",
+		"credit_ledger_auto_topup_pending_uidx",
+		"AND is_unique",
+		"AND is_valid",
+		"AND is_ready",
+		"AND is_live",
+		"AND key_column = 'account_id'",
+		"AND predicate = '((type = ''auto_topup''::text) AND (status = ''pending''::text))'",
+	} {
+		require.Truef(
+			t,
+			strings.Contains(creditAutoTopUpSchemaContractProbe, fragment),
+			"probe missing exact migration-049 contract fragment %q",
+			fragment,
+		)
+	}
+}
+
+func TestCreditRecoverySchemaReadyUsesCatalogOnlyAndRequiresBothMigrations(t *testing.T) {
+	full := completeCreditAutoTopUpSchemaContract()
+	fake := &fakeCreditWalletSchemaExecutor{
+		baseContract:    [3]bool{true, true, true},
+		runtimeContract: full,
+	}
+
+	ready, err := creditRecoverySchemaReady(context.Background(), fake)
+
+	require.NoError(t, err)
+	require.True(t, ready)
+	require.Len(t, fake.queries, 2)
+	for _, query := range fake.queries {
+		normalized := strings.ToLower(query)
+		require.Contains(t, normalized, "pg_catalog")
+		require.NotContains(t, normalized, "from ms_billing.")
+		require.NotContains(t, normalized, "join ms_billing.")
+	}
+
+	for index := range 3 {
+		t.Run(fmt.Sprintf("missing base capability %d", index), func(t *testing.T) {
+			base := [3]bool{true, true, true}
+			base[index] = false
+			fake := &fakeCreditWalletSchemaExecutor{
+				baseContract:    base,
+				runtimeContract: full,
+			}
+			ready, err := creditRecoverySchemaReady(
+				context.Background(),
+				fake,
+			)
+			require.NoError(t, err)
+			require.False(t, ready)
+			require.Len(t, fake.queries, 1)
+			require.NotContains(
+				t,
+				strings.ToLower(fake.queries[0]),
+				"from ms_billing.",
+			)
+		})
+	}
+}
+
+func TestCreditRecoverySchemaReadyPropagatesCatalogErrors(t *testing.T) {
+	boom := errors.New("catalog unavailable")
+	fake := &fakeCreditWalletSchemaExecutor{baseErr: boom}
+
+	ready, err := creditRecoverySchemaReady(context.Background(), fake)
+
+	require.False(t, ready)
+	require.ErrorIs(t, err, boom)
+	require.Len(t, fake.queries, 1)
 }

@@ -17,16 +17,29 @@ import (
 )
 
 const (
-	testManifestSHA = "1111111111111111111111111111111111111111"
-	testBillingSHA  = "2222222222222222222222222222222222222222"
+	testManifestSHA          = "1111111111111111111111111111111111111111"
+	testBillingSHA           = "2222222222222222222222222222222222222222"
+	testEmptyAllowlistSHA256 = "e3b0c44298fc1c149afbf4c8996fb924" +
+		"27ae41e4649b934ca495991b7852b855"
 )
 
 func validConfig() Config {
 	return Config{
 		MasterEnabled: true, SchemaReady: true, Component: ComponentAPI,
 		Mode: string(ModeShadow), BasisPoints: "1000",
+		AllowlistSHA256: testEmptyAllowlistSHA256,
 		CoreManifestSHA: testManifestSHA, BillingSHA: testBillingSHA,
 	}
+}
+
+func setTestAllowlist(cfg *Config, raw string) {
+	cfg.Allowlist = raw
+	allowlist, ok := parseAllowlist(raw)
+	if !ok {
+		cfg.AllowlistSHA256 = ""
+		return
+	}
+	cfg.AllowlistSHA256 = allowlistDigest(allowlist)
 }
 
 func TestParseFailsClosedAtomically(t *testing.T) {
@@ -50,6 +63,13 @@ func TestParseFailsClosedAtomically(t *testing.T) {
 		}},
 		{name: "duplicate allowlist", mutate: func(c *Config) {
 			c.Allowlist = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa,aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		}},
+		{name: "missing allowlist digest", mutate: func(c *Config) { c.AllowlistSHA256 = "" }},
+		{name: "wrong allowlist digest", mutate: func(c *Config) {
+			c.AllowlistSHA256 = "3333333333333333333333333333333333333333333333333333333333333333"
+		}},
+		{name: "uppercase allowlist digest", mutate: func(c *Config) {
+			c.AllowlistSHA256 = strings.ToUpper(testEmptyAllowlistSHA256)
 		}},
 		{name: "missing manifest", mutate: func(c *Config) { c.CoreManifestSHA = "" }},
 		{name: "short billing sha", mutate: func(c *Config) { c.BillingSHA = "1234" }},
@@ -80,6 +100,11 @@ func TestExplicitOffDoesNotRequireActiveConfiguration(t *testing.T) {
 		BasisPoints: "invalid", Allowlist: "invalid",
 	})
 	require.Equal(t, ModeOff, policy.Decide(uuid.New()).Mode)
+	require.Equal(t, ModeOff, policy.Mode())
+	require.False(t, policy.Active())
+	require.False(t, NewController(policy, nil).Active())
+	require.Equal(t, ModeOff, (*Controller)(nil).Mode())
+	require.False(t, (*Controller)(nil).Active())
 }
 
 func TestAllowlistSelectsAtZeroPercent(t *testing.T) {
@@ -87,13 +112,17 @@ func TestAllowlistSelectsAtZeroPercent(t *testing.T) {
 	cfg := validConfig()
 	cfg.Mode = string(ModeEnforce)
 	cfg.BasisPoints = "0"
-	cfg.Allowlist = accountID.String()
+	setTestAllowlist(&cfg, accountID.String())
 
 	decision := Parse(cfg).Decide(accountID)
 	require.Equal(t, ModeEnforce, decision.Mode)
 	require.True(t, decision.Selected)
 	require.True(t, decision.Allowlisted)
 	require.Zero(t, decision.BasisPoints)
+	require.Equal(t, ModeEnforce, Parse(cfg).Mode())
+	require.True(t, Parse(cfg).Active())
+	require.Equal(t, ModeEnforce, NewController(Parse(cfg), nil).Mode())
+	require.True(t, NewController(Parse(cfg), nil).Active())
 }
 
 func TestPercentageMembershipIsMonotonic(t *testing.T) {
@@ -131,6 +160,7 @@ func TestBucketFixedVectorsAndComponentSeparation(t *testing.T) {
 func TestFromEnvUsesIndependentComponentControls(t *testing.T) {
 	t.Setenv(envMaster, "true")
 	t.Setenv(envAllowlist, "")
+	t.Setenv(envAllowlistSHA256, testEmptyAllowlistSHA256)
 	t.Setenv(envManifest, testManifestSHA)
 	t.Setenv(envBillingSHA, testBillingSHA)
 	t.Setenv("CREDIT_WALLET_API_MODE", "shadow")
@@ -157,6 +187,7 @@ func TestFromEnvMissingActiveBPSIsOffEvenWithAllowlist(t *testing.T) {
 	accountID := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	t.Setenv(envMaster, "true")
 	t.Setenv(envAllowlist, accountID.String())
+	t.Setenv(envAllowlistSHA256, allowlistDigest(map[uuid.UUID]struct{}{accountID: {}}))
 	t.Setenv(envManifest, testManifestSHA)
 	t.Setenv(envBillingSHA, testBillingSHA)
 	t.Setenv("CREDIT_WALLET_API_MODE", "enforce")
@@ -169,6 +200,33 @@ func TestFromEnvMissingActiveBPSIsOffEvenWithAllowlist(t *testing.T) {
 		"a missing percentage cannot leave an allowlisted account active")
 }
 
+func TestFromEnvRequiresDigestOfResolvedAllowlist(t *testing.T) {
+	first := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	second := uuid.MustParse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	t.Setenv(envMaster, "true")
+	t.Setenv(envManifest, testManifestSHA)
+	t.Setenv(envBillingSHA, testBillingSHA)
+	t.Setenv("CREDIT_WALLET_API_MODE", "enforce")
+	t.Setenv("CREDIT_WALLET_API_BPS", "0")
+	t.Setenv(envAllowlist, second.String())
+	t.Setenv(envAllowlistSHA256, allowlistDigest(map[uuid.UUID]struct{}{first: {}}))
+
+	mismatch := FromEnv(ComponentAPI, true).Decide(second)
+	require.Equal(t, ModeOff, mismatch.Mode)
+	require.False(t, mismatch.Selected,
+		"a resolved allowlist that differs from its reviewed digest must atomically disable")
+
+	t.Setenv(envAllowlistSHA256, allowlistDigest(map[uuid.UUID]struct{}{second: {}}))
+	matching := FromEnv(ComponentAPI, true).Decide(second)
+	require.True(t, matching.Enforced())
+	require.True(t, matching.Allowlisted)
+
+	t.Setenv(envAllowlistSHA256, "")
+	missing := FromEnv(ComponentAPI, true).Decide(second)
+	require.Equal(t, ModeOff, missing.Mode)
+	require.False(t, missing.Selected)
+}
+
 func TestRolloutIDBindsExactReleaseAndStageButNotAccount(t *testing.T) {
 	cfg := validConfig()
 	firstAccount := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -176,7 +234,7 @@ func TestRolloutIDBindsExactReleaseAndStageButNotAccount(t *testing.T) {
 	baseline := Parse(cfg)
 	baselineID := baseline.Decide(firstAccount).RolloutID
 	require.NotEmpty(t, baselineID)
-	require.Equal(t, "61b8948f50fb34423a15621d", baselineID,
+	require.Equal(t, "fad194f11398782b5a75d4ab", baselineID,
 		"release-stage identity is a reviewed stable vector")
 	require.Equal(t, baselineID, baseline.Decide(secondAccount).RolloutID,
 		"account and cohort bucket must not create metric cardinality")
@@ -200,6 +258,22 @@ func TestRolloutIDBindsExactReleaseAndStageButNotAccount(t *testing.T) {
 	modeChanged := cfg
 	modeChanged.Mode = string(ModeEnforce)
 	require.NotEqual(t, baselineID, Parse(modeChanged).Decide(firstAccount).RolloutID)
+
+	allowlistChanged := cfg
+	setTestAllowlist(&allowlistChanged, firstAccount.String())
+	require.NotEqual(t, baselineID, Parse(allowlistChanged).Decide(firstAccount).RolloutID,
+		"an allowlist change must create a distinct rollout identity")
+
+	secondAllowlist := uuid.MustParse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	ordered := cfg
+	setTestAllowlist(&ordered, firstAccount.String()+","+secondAllowlist.String())
+	reversed := cfg
+	setTestAllowlist(&reversed, secondAllowlist.String()+","+firstAccount.String())
+	orderedID := Parse(ordered).Decide(firstAccount).RolloutID
+	require.Equal(t, "2e45062e05f74b915107396d", orderedID,
+		"allowlist-bound identity is a shared billing/infra stable vector")
+	require.Equal(t, orderedID, Parse(reversed).Decide(firstAccount).RolloutID,
+		"deployment allowlist order must not change rollout identity")
 }
 
 func TestReporterHasLowCardinalityDimensionsAndNoAccountIdentifier(t *testing.T) {
@@ -215,8 +289,6 @@ func TestReporterHasLowCardinalityDimensionsAndNoAccountIdentifier(t *testing.T)
 		Emit(Observation{
 			Decision: decision, Duration: 1250 * time.Microsecond,
 			Diverged: true, EvaluatorError: true,
-			MoneyInvariantFailure: true, ShadowMutation: true,
-			DuplicateMutation: true,
 		})
 	require.NoError(t, err)
 	require.NotContains(t, strings.ToLower(out.String()), "account")
@@ -234,12 +306,20 @@ func TestReporterHasLowCardinalityDimensionsAndNoAccountIdentifier(t *testing.T)
 	require.EqualValues(t, 1, event["DivergenceCount"])
 	require.EqualValues(t, 1, event["EvaluatorErrorCount"])
 	require.EqualValues(t, 1.25, event["LatencyMs"])
+	require.NotContains(t, event, "MoneyInvariantFailureCount")
+	require.NotContains(t, event, "ShadowMutationCount")
+	require.NotContains(t, event, "DuplicateMutationCount")
 
 	metadata := event["_aws"].(map[string]any)
 	directive := metadata["CloudWatchMetrics"].([]any)[0].(map[string]any)
 	require.Equal(t, metricsNamespace, directive["Namespace"])
 	require.Equal(t, []any{[]any{"Component", "Mode", "RolloutID"}}, directive["Dimensions"])
 	require.NotContains(t, directive["Dimensions"], "CohortBucket")
+	renderedMetrics, err := json.Marshal(directive["Metrics"])
+	require.NoError(t, err)
+	require.NotContains(t, string(renderedMetrics), "MoneyInvariantFailureCount")
+	require.NotContains(t, string(renderedMetrics), "ShadowMutationCount")
+	require.NotContains(t, string(renderedMetrics), "DuplicateMutationCount")
 }
 
 func TestControllerOffAndExcludedNeverInvokeWalletEvaluator(t *testing.T) {
@@ -269,7 +349,7 @@ func TestControllerShadowEvaluatesReadOnlyAndPreservesLegacy(t *testing.T) {
 	accountID := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	cfg := validConfig()
 	cfg.BasisPoints = "0"
-	cfg.Allowlist = accountID.String()
+	setTestAllowlist(&cfg, accountID.String())
 
 	var out bytes.Buffer
 	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
@@ -301,7 +381,7 @@ func TestControllerSelectedNilEvaluatorIsVisibleAndPreservesLegacy(t *testing.T)
 	accountID := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	cfg := validConfig()
 	cfg.BasisPoints = "0"
-	cfg.Allowlist = accountID.String()
+	setTestAllowlist(&cfg, accountID.String())
 
 	var out bytes.Buffer
 	controller := NewController(Parse(cfg), NewReporter(&out))
@@ -339,7 +419,7 @@ func TestControllerEnforceOnlyAppliesSuccessfulSelectedEvaluation(t *testing.T) 
 	cfg := validConfig()
 	cfg.Mode = string(ModeEnforce)
 	cfg.BasisPoints = "0"
-	cfg.Allowlist = accountID.String()
+	setTestAllowlist(&cfg, accountID.String())
 	controller := NewController(Parse(cfg), nil)
 
 	result := controller.CompareBoolean(
@@ -393,7 +473,7 @@ func TestUsageEvaluatorRoutesOffShadowAndEnforceWithoutCrossingSeams(t *testing.
 	require.Zero(t, shadowCalls)
 	require.Zero(t, enforce.calls, "excluded account must make zero wallet calls")
 
-	cfg.Allowlist = accountID.String()
+	setTestAllowlist(&cfg, accountID.String())
 	adapter = NewUsageEvaluator(NewController(Parse(cfg), nil), shadow, enforce)
 	require.NoError(t, adapter.EvaluateCreditUsage(context.Background(), event))
 	require.Equal(t, 1, shadowCalls)

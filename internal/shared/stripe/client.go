@@ -23,6 +23,12 @@ func NewClient(secretKey string) Client {
 	return newRealClient(secretKey)
 }
 
+// NewCreditPurchaseClient returns the exact invoice/item/payment-read surface
+// used by manual wallet purchase reconciliation.
+func NewCreditPurchaseClient(secretKey string) CreditPurchaseClient {
+	return newRealClient(secretKey)
+}
+
 // NewAutoTopUpClient returns the selected-card invoice surface used by the
 // durable auto-top-up executor. It uses the same isolated Stripe API client as
 // NewClient but exposes only the operations whose params the financial flow
@@ -169,15 +175,42 @@ func (c *realClient) GetCustomer(ctx context.Context, stripeCustomerID string) (
 // ms_charge_ref metadata anchor for crash reconciliation. The deterministic
 // Idempotency-Key (inv-<id>) makes a re-run reuse the original draft.
 func (c *realClient) CreateDraftInvoice(ctx context.Context, custID, ref, idemKey string) (Invoice, error) {
-	params := &stripego.InvoiceParams{
-		Customer:                    stripego.String(custID),
+	params := inertDraftInvoiceParams(custID)
+	if ref != "" {
+		params.AddMetadata("ms_charge_ref", ref)
+	}
+	return c.createInvoice(ctx, params, idemKey)
+}
+
+func (c *realClient) CreateCreditPurchaseInvoice(
+	ctx context.Context,
+	customerID string,
+	accountID string,
+	ledgerID string,
+	idemKey string,
+) (Invoice, error) {
+	params := inertDraftInvoiceParams(customerID)
+	params.AddMetadata("ms_charge_ref", "credit-purchase:"+ledgerID)
+	params.AddMetadata("ms_credit_operation", "purchase")
+	params.AddMetadata("ms_credit_account_id", accountID)
+	params.AddMetadata("ms_credit_ledger_id", ledgerID)
+	return c.createInvoice(ctx, params, idemKey)
+}
+
+func inertDraftInvoiceParams(customerID string) *stripego.InvoiceParams {
+	return &stripego.InvoiceParams{
+		Customer:                    stripego.String(customerID),
 		CollectionMethod:            stripego.String(string(stripego.InvoiceCollectionMethodChargeAutomatically)),
 		AutoAdvance:                 stripego.Bool(false),
 		PendingInvoiceItemsBehavior: stripego.String("exclude"),
 	}
-	if ref != "" {
-		params.AddMetadata("ms_charge_ref", ref)
-	}
+}
+
+func (c *realClient) createInvoice(
+	ctx context.Context,
+	params *stripego.InvoiceParams,
+	idemKey string,
+) (Invoice, error) {
 	params.Context = ctx
 	params.SetIdempotencyKey(idemKey)
 	inv, err := c.sc.Invoices.New(params)
@@ -192,7 +225,14 @@ func (c *realClient) CreateDraftInvoice(ctx context.Context, custID, ref, idemKe
 // calls PayInvoiceWithMethod explicitly with this same frozen payment method.
 // Setting DefaultPaymentMethod on the invoice is defense in depth and also
 // makes Stripe's hosted audit trail identify the intended card.
-func (c *realClient) CreateAutoTopUpInvoice(ctx context.Context, customerID, paymentMethodID, ref, idemKey string) (Invoice, error) {
+func (c *realClient) CreateAutoTopUpInvoice(
+	ctx context.Context,
+	customerID string,
+	paymentMethodID string,
+	accountID string,
+	ledgerID string,
+	idemKey string,
+) (Invoice, error) {
 	params := &stripego.InvoiceParams{
 		Customer:                    stripego.String(customerID),
 		DefaultPaymentMethod:        stripego.String(paymentMethodID),
@@ -200,17 +240,11 @@ func (c *realClient) CreateAutoTopUpInvoice(ctx context.Context, customerID, pay
 		AutoAdvance:                 stripego.Bool(false),
 		PendingInvoiceItemsBehavior: stripego.String("exclude"),
 	}
-	if ref != "" {
-		params.AddMetadata("ms_charge_ref", ref)
-		params.AddMetadata("ms_credit_operation", "auto_topup")
-	}
-	params.Context = ctx
-	params.SetIdempotencyKey(idemKey)
-	inv, err := c.sc.Invoices.New(params)
-	if err != nil {
-		return Invoice{}, err
-	}
-	return projectInvoice(inv), nil
+	params.AddMetadata("ms_charge_ref", "credit-auto-topup:"+ledgerID)
+	params.AddMetadata("ms_credit_operation", "auto_topup")
+	params.AddMetadata("ms_credit_account_id", accountID)
+	params.AddMetadata("ms_credit_ledger_id", ledgerID)
+	return c.createInvoice(ctx, params, idemKey)
 }
 
 // CreateInvoiceItem creates an invoice item PINNED to the given draft invoice
@@ -498,6 +532,7 @@ func projectInvoice(inv *stripego.Invoice) Invoice {
 		Deleted:             inv.Deleted,
 		AmountDue:           inv.AmountDue,
 		AmountPaid:          inv.AmountPaid,
+		AmountRemaining:     inv.AmountRemaining,
 		AmountPaidOffStripe: inv.AmountPaidOffStripe,
 		Total:               inv.Total,
 		Currency:            string(inv.Currency),
@@ -510,6 +545,12 @@ func projectInvoice(inv *stripego.Invoice) Invoice {
 	}
 	if inv.DefaultPaymentMethod != nil {
 		out.DefaultPaymentMethodID = inv.DefaultPaymentMethod.ID
+	}
+	if inv.Metadata != nil {
+		out.ChargeRef = inv.Metadata["ms_charge_ref"]
+		out.CreditOperation = inv.Metadata["ms_credit_operation"]
+		out.CreditAccountID = inv.Metadata["ms_credit_account_id"]
+		out.CreditLedgerID = inv.Metadata["ms_credit_ledger_id"]
 	}
 	if inv.ConfirmationSecret != nil {
 		out.ClientSecret = inv.ConfirmationSecret.ClientSecret

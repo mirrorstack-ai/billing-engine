@@ -44,7 +44,7 @@ func (s *pgxStore) Acquire(
 	if projectedChargeMicros < 0 {
 		return Attempt{}, AcquireNone, fmt.Errorf("projected charge must be non-negative")
 	}
-	now = now.UTC()
+	_ = now // production attempt/grace time is anchored to the database clock.
 
 	var (
 		attempt Attempt
@@ -99,6 +99,18 @@ func (s *pgxStore) Acquire(
 		if remaining > policy.ThresholdMicros {
 			return nil
 		}
+		failedAt, err := qtx.LatestFailedAutoTopUpCreatedAt(ctx, accountID.String())
+		if err == nil {
+			if !failedAt.Before(policy.UpdatedAt) {
+				// The newest deterministic/terminal failure belongs to this
+				// exact mutable policy revision. Repeated usage/status probes
+				// remain inert until an explicit config resubmission advances
+				// updated_at. Pending recovery already won above.
+				return nil
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 		if !policy.PaymentMethodValid {
 			return ErrPaymentMethodUnavailable
 		}
@@ -110,7 +122,6 @@ func (s *pgxStore) Acquire(
 		if err != nil {
 			return err
 		}
-
 		attemptID := uuid.New()
 		row, err := qtx.InsertPendingAutoTopUp(ctx, db.InsertPendingAutoTopUpParams{
 			AttemptID:             attemptID.String(),
@@ -121,8 +132,6 @@ func (s *pgxStore) Acquire(
 			PaymentMethodID:       paymentMethodID.String(),
 			StripePaymentMethodID: policy.StripePaymentMethodID,
 			StripeCustomerID:      policy.StripeCustomerID,
-			AttemptExpiresAt:      now.Add(PendingGrace),
-			CreatedAt:             now,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The partial unique index is a second line of defense. The account
@@ -164,6 +173,26 @@ func (s *pgxStore) Get(ctx context.Context, accountID, attemptID uuid.UUID) (Att
 		return Attempt{}, err
 	}
 	return attemptFromGet(row)
+}
+
+// Pending returns the one durable in-flight attempt for explicit recovery.
+// It never evaluates mutable policy and never creates a replacement attempt.
+func (s *pgxStore) Pending(ctx context.Context, accountID uuid.UUID) (Attempt, bool, error) {
+	if accountID == uuid.Nil {
+		return Attempt{}, false, fmt.Errorf("account id required")
+	}
+	row, err := s.q.LatestPendingAutoTopUp(ctx, accountID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Attempt{}, false, nil
+	}
+	if err != nil {
+		return Attempt{}, false, err
+	}
+	attempt, err := attemptFromPending(row)
+	if err != nil {
+		return Attempt{}, false, err
+	}
+	return attempt, true, nil
 }
 
 func (s *pgxStore) FindByStripeInvoice(
@@ -271,21 +300,25 @@ func (s *pgxStore) Fail(
 }
 
 func attemptFromPending(row db.LatestPendingAutoTopUpRow) (Attempt, error) {
-	return decodeAttempt(
+	attempt, err := decodeAttempt(
 		row.ID, row.AccountID, row.AmountMicros, row.Status,
 		row.BalanceAfterMicros, row.IdempotencyKey, row.StripeInvoiceID,
 		row.ReceiptUrl, row.PaymentMethodID, row.StripePaymentMethodID,
 		row.StripeCustomerID, row.AttemptExpiresAt, row.FailureCode, row.CreatedAt,
 	)
+	attempt.ObservedAt = time.UnixMicro(row.ObservedAtUnixMicros).UTC()
+	return attempt, err
 }
 
 func attemptFromInsert(row db.InsertPendingAutoTopUpRow) (Attempt, error) {
-	return decodeAttempt(
+	attempt, err := decodeAttempt(
 		row.ID, row.AccountID, row.AmountMicros, row.Status,
 		row.BalanceAfterMicros, row.IdempotencyKey, row.StripeInvoiceID,
 		row.ReceiptUrl, row.PaymentMethodID, row.StripePaymentMethodID,
 		row.StripeCustomerID, row.AttemptExpiresAt, row.FailureCode, row.CreatedAt,
 	)
+	attempt.ObservedAt = row.CreatedAt
+	return attempt, err
 }
 
 func attemptFromGet(row db.GetAutoTopUpAttemptByIDRow) (Attempt, error) {

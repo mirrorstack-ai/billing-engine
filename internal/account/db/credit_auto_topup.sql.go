@@ -247,6 +247,9 @@ func (q *Queries) GetAutoTopUpAttemptByStripeInvoice(ctx context.Context, stripe
 }
 
 const insertPendingAutoTopUp = `-- name: InsertPendingAutoTopUp :one
+WITH observed AS MATERIALIZED (
+    SELECT clock_timestamp() AS at
+)
 INSERT INTO ms_billing.credit_ledger (
     id,
     account_id,
@@ -261,7 +264,7 @@ INSERT INTO ms_billing.credit_ledger (
     attempt_stripe_customer_id,
     attempt_expires_at,
     created_at
-) VALUES (
+) SELECT
     $1::uuid,
     $2::uuid,
     $3::bigint,
@@ -273,9 +276,9 @@ INSERT INTO ms_billing.credit_ledger (
     $6::uuid,
     $7::text,
     $8::text,
-    $9::timestamptz,
-    $10::timestamptz
-)
+    observed.at + INTERVAL '10 minutes',
+    observed.at
+FROM observed
 ON CONFLICT DO NOTHING
 RETURNING
     id,
@@ -295,16 +298,14 @@ RETURNING
 `
 
 type InsertPendingAutoTopUpParams struct {
-	AttemptID             string    `json:"attempt_id"`
-	AccountID             string    `json:"account_id"`
-	AmountMicros          int64     `json:"amount_micros"`
-	BalanceAfterMicros    int64     `json:"balance_after_micros"`
-	IdempotencyKey        string    `json:"idempotency_key"`
-	PaymentMethodID       string    `json:"payment_method_id"`
-	StripePaymentMethodID string    `json:"stripe_payment_method_id"`
-	StripeCustomerID      string    `json:"stripe_customer_id"`
-	AttemptExpiresAt      time.Time `json:"attempt_expires_at"`
-	CreatedAt             time.Time `json:"created_at"`
+	AttemptID             string `json:"attempt_id"`
+	AccountID             string `json:"account_id"`
+	AmountMicros          int64  `json:"amount_micros"`
+	BalanceAfterMicros    int64  `json:"balance_after_micros"`
+	IdempotencyKey        string `json:"idempotency_key"`
+	PaymentMethodID       string `json:"payment_method_id"`
+	StripePaymentMethodID string `json:"stripe_payment_method_id"`
+	StripeCustomerID      string `json:"stripe_customer_id"`
 }
 
 type InsertPendingAutoTopUpRow struct {
@@ -325,8 +326,11 @@ type InsertPendingAutoTopUpRow struct {
 }
 
 // InsertPendingAutoTopUp appends the in-flight guard and every frozen payment
-// fact before Stripe is called. The partial pending unique index is the
-// relational backstop if a caller ever bypasses the account lock.
+// fact before Stripe is called. Creation and the ten-minute grace window are
+// anchored to one post-lock database wall-clock sample; Lambda clock skew and
+// time spent waiting on the account lock therefore cannot lengthen or shorten
+// the durable pending grant. The partial pending unique index is the relational
+// backstop if a caller ever bypasses the account lock.
 func (q *Queries) InsertPendingAutoTopUp(ctx context.Context, arg InsertPendingAutoTopUpParams) (InsertPendingAutoTopUpRow, error) {
 	row := q.db.QueryRow(ctx, insertPendingAutoTopUp,
 		arg.AttemptID,
@@ -337,8 +341,6 @@ func (q *Queries) InsertPendingAutoTopUp(ctx context.Context, arg InsertPendingA
 		arg.PaymentMethodID,
 		arg.StripePaymentMethodID,
 		arg.StripeCustomerID,
-		arg.AttemptExpiresAt,
-		arg.CreatedAt,
 	)
 	var i InsertPendingAutoTopUpRow
 	err := row.Scan(
@@ -360,6 +362,27 @@ func (q *Queries) InsertPendingAutoTopUp(ctx context.Context, arg InsertPendingA
 	return i, err
 }
 
+const latestFailedAutoTopUpCreatedAt = `-- name: LatestFailedAutoTopUpCreatedAt :one
+SELECT created_at
+FROM ms_billing.credit_ledger
+WHERE account_id = $1::uuid
+  AND type = 'auto_topup'
+  AND status = 'failed'
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+// LatestFailedAutoTopUpCreatedAt is the durable retry latch. Acquire checks it
+// only after pending recovery and mutable policy resolution: a failure at or
+// after the current config revision suppresses replacement attempts, while any
+// explicit config resubmission advances updated_at and re-arms one attempt.
+func (q *Queries) LatestFailedAutoTopUpCreatedAt(ctx context.Context, accountID string) (time.Time, error) {
+	row := q.db.QueryRow(ctx, latestFailedAutoTopUpCreatedAt, accountID)
+	var created_at time.Time
+	err := row.Scan(&created_at)
+	return created_at, err
+}
+
 const latestPendingAutoTopUp = `-- name: LatestPendingAutoTopUp :one
 SELECT
     id,
@@ -375,7 +398,9 @@ SELECT
     COALESCE(attempt_stripe_customer_id, '')::text AS stripe_customer_id,
     attempt_expires_at,
     COALESCE(failure_code, '')::text AS failure_code,
-    created_at
+    created_at,
+    (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint
+        AS observed_at_unix_micros
 FROM ms_billing.credit_ledger
 WHERE account_id = $1::uuid
   AND type = 'auto_topup'
@@ -400,6 +425,7 @@ type LatestPendingAutoTopUpRow struct {
 	AttemptExpiresAt      pgtype.Timestamptz `json:"attempt_expires_at"`
 	FailureCode           string             `json:"failure_code"`
 	CreatedAt             time.Time          `json:"created_at"`
+	ObservedAtUnixMicros  int64              `json:"observed_at_unix_micros"`
 }
 
 func (q *Queries) LatestPendingAutoTopUp(ctx context.Context, accountID string) (LatestPendingAutoTopUpRow, error) {
@@ -420,6 +446,7 @@ func (q *Queries) LatestPendingAutoTopUp(ctx context.Context, accountID string) 
 		&i.AttemptExpiresAt,
 		&i.FailureCode,
 		&i.CreatedAt,
+		&i.ObservedAtUnixMicros,
 	)
 	return i, err
 }
@@ -692,6 +719,7 @@ SELECT
     config.enabled,
     config.threshold_micros,
     config.amount_micros,
+    config.updated_at,
     COALESCE(config.payment_method_id::text, '')::text AS payment_method_id,
     COALESCE(payment_method.stripe_payment_method_id, '')::text AS stripe_payment_method_id,
     COALESCE(account.stripe_customer_id, '')::text AS stripe_customer_id,
@@ -714,13 +742,14 @@ WHERE config.account_id = $1::uuid
 `
 
 type ReadAutoTopUpPolicyRow struct {
-	Enabled               bool   `json:"enabled"`
-	ThresholdMicros       int64  `json:"threshold_micros"`
-	AmountMicros          int64  `json:"amount_micros"`
-	PaymentMethodID       string `json:"payment_method_id"`
-	StripePaymentMethodID string `json:"stripe_payment_method_id"`
-	StripeCustomerID      string `json:"stripe_customer_id"`
-	PaymentMethodValid    bool   `json:"payment_method_valid"`
+	Enabled               bool      `json:"enabled"`
+	ThresholdMicros       int64     `json:"threshold_micros"`
+	AmountMicros          int64     `json:"amount_micros"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	PaymentMethodID       string    `json:"payment_method_id"`
+	StripePaymentMethodID string    `json:"stripe_payment_method_id"`
+	StripeCustomerID      string    `json:"stripe_customer_id"`
+	PaymentMethodValid    bool      `json:"payment_method_valid"`
 }
 
 // ReadAutoTopUpPolicy resolves the mutable policy and selected card only while
@@ -735,6 +764,7 @@ func (q *Queries) ReadAutoTopUpPolicy(ctx context.Context, accountID string) (Re
 		&i.Enabled,
 		&i.ThresholdMicros,
 		&i.AmountMicros,
+		&i.UpdatedAt,
 		&i.PaymentMethodID,
 		&i.StripePaymentMethodID,
 		&i.StripeCustomerID,

@@ -165,8 +165,20 @@ SELECT
         WHERE pending.account_id = sqlc.arg(account_id)::uuid
           AND pending.type = 'auto_topup'
           AND pending.status = 'pending'
-    )::boolean AS pending_auto_topup
-FROM balances;
+    )::boolean AS auto_topup_attempt_pending,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = sqlc.arg(account_id)::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+          AND pending.attempt_expires_at > CURRENT_TIMESTAMP
+    )::boolean AS pending_auto_topup,
+    COALESCE(config.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(config.threshold_micros, 0)::bigint AS auto_topup_threshold_micros
+FROM balances
+LEFT JOIN ms_billing.credit_auto_topup_configs config
+       ON config.account_id = sqlc.arg(account_id)::uuid;
 
 -- LockWalletAccount is the serialization point for a draw. The account FK on
 -- credit_ledger also makes concurrent ledger inserts wait behind this lock.
@@ -614,6 +626,30 @@ RETURNING
     threshold_micros,
     amount_micros,
     COALESCE(payment_method_id::text, '')::text AS payment_method_id;
+
+-- HasUninvoicedBillingRunWalletDraw protects a boundary that has durably
+-- consumed wallet credit but has not yet reached the only non-reclaimable run
+-- state. SetCreditBillingMode calls this only for an actual mode change while
+-- holding LockWalletAccount's account FOR UPDATE lock. DrawWalletCredits takes
+-- that same lock before reading billing_mode and inserting period draw rows, so
+-- either the mode change wins before any draw or this exact durable draw wins
+-- and keeps its original mode through terminal invoice completion.
+-- name: HasUninvoicedBillingRunWalletDraw :one
+SELECT EXISTS (
+    SELECT 1
+    FROM ms_billing.billing_runs run
+    JOIN ms_billing.billing_periods period
+      ON period.account_id = run.account_id
+     AND period.period_start = run.period_start
+     AND period.period_end = run.period_end
+    JOIN ms_billing.credit_ledger draw
+      ON draw.account_id = run.account_id
+     AND draw.period_id = period.id
+     AND draw.type IN ('usage_draw', 'subscription_draw')
+     AND draw.status = 'settled'
+    WHERE run.account_id = sqlc.arg(account_id)::uuid
+      AND run.status <> 'invoiced'
+)::boolean;
 
 -- SetCreditAccountBillingMode applies a service-resolved concrete credit limit.
 -- In particular, the service resolves an omitted credits-mode value to the

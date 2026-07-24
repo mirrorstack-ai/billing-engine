@@ -89,6 +89,28 @@ func (e *Executor) Trigger(
 	return e.resume(ctx, attempt, kind == AcquireNew)
 }
 
+// Recover resumes only the already-authorized pending attempt for accountID.
+// Unlike Trigger it never evaluates current mutable policy, never creates a
+// replacement, and accepts no amount, invoice, customer, or card identity from
+// the caller. This is the explicit liveness path after a rollout rollback or a
+// crash with no webhook-producing Stripe resource.
+func (e *Executor) Recover(ctx context.Context, accountID uuid.UUID) (Result, error) {
+	if accountID == uuid.Nil {
+		return Result{}, fmt.Errorf("account id required")
+	}
+	attempt, found, err := e.store.Pending(ctx, accountID)
+	if err != nil {
+		return Result{}, err
+	}
+	if !found {
+		return Result{}, nil
+	}
+	if attempt.Expired(e.nowFn()) {
+		return e.reconcileExpired(ctx, attempt)
+	}
+	return e.resume(ctx, attempt, false)
+}
+
 // ReconcileWebhookPaid handles invoice.paid without trusting the event payload
 // as money truth. Auto-top-up invoices are re-read from Stripe and checked
 // against the durable frozen customer, card, amount, currency, and single-line
@@ -159,8 +181,10 @@ func (e *Executor) ReconcileWebhookPaid(
 // without trusting the event payload as money truth. It first resolves the
 // linked durable attempt, then re-reads Stripe and proves the frozen
 // invoice/customer/amount/currency/single-line invariants. An exact unpaid open
-// invoice is deterministically voided and re-read before the ledger may fail.
-// A paid re-read wins over every earlier failure and settles exactly once.
+// or uncollectible invoice is deterministically voided and re-read before the
+// ledger may fail. Uncollectible is reversible in Stripe, so it is never itself
+// terminal proof. A paid re-read wins over every earlier failure and settles
+// exactly once.
 //
 // Invariant mismatches, foreign resources, partial payments, and non-terminal
 // states deliberately remain pending. Stripe read/write ambiguity returns an
@@ -210,27 +234,29 @@ func (e *Executor) ReconcileWebhookFailure(
 			return result, fmt.Errorf("list webhook auto-top-up invoice items: %w", err)
 		}
 		return e.settleWebhookPaid(ctx, attempt, invoice, items, result)
-	case "void", "uncollectible":
-		if validateTerminalUnpaidInvoiceResource(attempt, invoice) != nil {
+	case "void":
+		if validateVoidedInvoiceResource(attempt, invoice) != nil {
 			return result, nil
 		}
 		return e.failWebhookAttempt(ctx, attempt, invoice, failureCode, result)
-	case "open":
-		items, err := e.stripe.ListInvoiceItems(ctx, stripeInvoiceID)
-		if err != nil {
-			return result, fmt.Errorf("list webhook auto-top-up invoice items: %w", err)
+	case "open", "uncollectible":
+		var invariantErr error
+		if invoice.Status == "open" {
+			invariantErr = validateOpenUnpaidInvoiceResource(attempt, invoice)
+		} else {
+			invariantErr = validateUncollectibleInvoiceResource(attempt, invoice)
 		}
-		if validateInvoiceResource(attempt, invoice, items, "open") != nil {
+		if invariantErr != nil {
 			return result, nil
 		}
 	default:
 		return result, nil
 	}
 
-	// The exact open invoice is unpaid and owned by this attempt. Close the
-	// Stripe resource first, using the same deterministic idempotency key as
-	// foreground recovery, then independently re-read before touching ledger
-	// state.
+	// The exact open or uncollectible invoice is unpaid and owned by this
+	// attempt. Close the Stripe resource first, using the same deterministic
+	// idempotency key as foreground recovery, then independently re-read before
+	// touching ledger state.
 	_, voidErr := e.stripe.VoidInvoice(
 		ctx,
 		invoice.ID,
@@ -254,7 +280,7 @@ func (e *Executor) ReconcileWebhookFailure(
 		}
 		return e.settleWebhookPaid(ctx, attempt, latest, latestItems, result)
 	}
-	if latest.Status != "void" && latest.Status != "uncollectible" {
+	if latest.Status != "void" {
 		if voidErr != nil {
 			return result, fmt.Errorf(
 				"void webhook auto-top-up invoice failed and current status is %q: %w",
@@ -267,7 +293,7 @@ func (e *Executor) ReconcileWebhookFailure(
 			latest.Status,
 		)
 	}
-	if validateTerminalUnpaidInvoiceResource(attempt, latest) != nil {
+	if validateVoidedInvoiceResource(attempt, latest) != nil {
 		return result, nil
 	}
 	return e.failWebhookAttempt(ctx, attempt, latest, failureCode, result)
@@ -453,27 +479,24 @@ func (e *Executor) recoverOrCreateInvoice(
 				ctx,
 				attempt.StripeCustomerID,
 				attempt.StripePaymentMethodID,
-				ref,
+				attempt.AccountID.String(),
+				attempt.ID.String(),
 				"credit-auto-topup-invoice:"+attempt.ID.String(),
 			)
 			if err != nil {
 				return billingstripe.Invoice{}, attempt, fmt.Errorf("create auto-top-up invoice: %w", err)
 			}
 		}
+		if err := validateInvoiceOwnership(attempt, invoice); err != nil {
+			return billingstripe.Invoice{}, attempt, err
+		}
 		attempt, err = e.store.AttachInvoice(ctx, attempt, invoice)
 		if err != nil {
 			return billingstripe.Invoice{}, attempt, fmt.Errorf("attach auto-top-up invoice: %w", err)
 		}
 	}
-	if invoice.ID == "" {
-		return billingstripe.Invoice{}, attempt, fmt.Errorf("Stripe returned an invoice without id")
-	}
-	if invoice.CustomerID != attempt.StripeCustomerID {
-		return billingstripe.Invoice{}, attempt, fmt.Errorf(
-			"auto-top-up invoice customer %q does not match frozen customer %q",
-			invoice.CustomerID,
-			attempt.StripeCustomerID,
-		)
+	if err := validateInvoiceOwnership(attempt, invoice); err != nil {
+		return billingstripe.Invoice{}, attempt, err
 	}
 	return invoice, attempt, nil
 }
@@ -649,15 +672,18 @@ func validatePaidInvoiceResource(
 	}
 	if invoice.Status != "paid" ||
 		invoice.AmountPaid != expectedCents ||
-		invoice.AmountDue != 0 ||
+		invoice.AmountDue != expectedCents ||
+		invoice.AmountRemaining != 0 ||
 		invoice.AmountPaidOffStripe != 0 {
 		return fmt.Errorf(
-			"paid auto-top-up invoice %s has status=%q amount_paid=%d amount_due=%d amount_paid_off_stripe=%d; expected paid/%d/0/0",
+			"paid auto-top-up invoice %s has status=%q amount_paid=%d amount_due=%d amount_remaining=%d amount_paid_off_stripe=%d; expected paid/%d/%d/0/0",
 			invoice.ID,
 			invoice.Status,
 			invoice.AmountPaid,
 			invoice.AmountDue,
+			invoice.AmountRemaining,
 			invoice.AmountPaidOffStripe,
+			expectedCents,
 			expectedCents,
 		)
 	}
@@ -692,34 +718,52 @@ func validatePaidInvoiceResource(
 	return nil
 }
 
-func validateTerminalUnpaidInvoiceResource(
+func validateVoidedInvoiceResource(
 	attempt Attempt,
 	invoice billingstripe.Invoice,
 ) error {
-	if invoice.ID != attempt.StripeInvoiceID {
-		return fmt.Errorf(
-			"terminal auto-top-up invoice id is %q; expected attached invoice %q",
-			invoice.ID,
-			attempt.StripeInvoiceID,
-		)
+	return validateClosedUnpaidInvoiceResource(attempt, invoice, "void")
+}
+
+func validateUncollectibleInvoiceResource(
+	attempt Attempt,
+	invoice billingstripe.Invoice,
+) error {
+	return validateClosedUnpaidInvoiceResource(attempt, invoice, "uncollectible")
+}
+
+func validateOpenUnpaidInvoiceResource(
+	attempt Attempt,
+	invoice billingstripe.Invoice,
+) error {
+	return validateClosedUnpaidInvoiceResource(attempt, invoice, "open")
+}
+
+// validateClosedUnpaidInvoiceResource is intentionally narrower than payable
+// validation. Once an exactly owned invoice is irreversibly void, line/total,
+// collection-mode, or frozen-card mismatches cannot make it collectible again
+// and must not strand the durable pending row. The same ownership + unpaid
+// proof authorizes attempting to void an open or reversible-uncollectible
+// resource; an independent exact void reread is still required before failure.
+func validateClosedUnpaidInvoiceResource(
+	attempt Attempt,
+	invoice billingstripe.Invoice,
+	expectedStatus string,
+) error {
+	if err := validateInvoiceOwnership(attempt, invoice); err != nil {
+		return err
 	}
-	if invoice.CustomerID != attempt.StripeCustomerID {
-		return fmt.Errorf(
-			"terminal auto-top-up invoice %s customer is %q; expected %q",
-			invoice.ID,
-			invoice.CustomerID,
-			attempt.StripeCustomerID,
-		)
-	}
-	if (invoice.Status != "void" && invoice.Status != "uncollectible") ||
+	if invoice.Status != expectedStatus ||
 		invoice.AmountPaid != 0 ||
 		invoice.AmountPaidOffStripe != 0 {
 		return fmt.Errorf(
-			"terminal auto-top-up invoice %s has status=%q amount_paid=%d amount_paid_off_stripe=%d; expected void|uncollectible/0/0",
+			"%s auto-top-up invoice %s has status=%q amount_paid=%d amount_paid_off_stripe=%d; expected %s/0/0",
+			expectedStatus,
 			invoice.ID,
 			invoice.Status,
 			invoice.AmountPaid,
 			invoice.AmountPaidOffStripe,
+			expectedStatus,
 		)
 	}
 	return nil
@@ -731,20 +775,8 @@ func validateInvoiceIdentityAndLine(
 	items []billingstripe.InvoiceItem,
 ) error {
 	expectedCents := microsToCentsRoundHalfUp(attempt.AmountMicros)
-	if invoice.ID != attempt.StripeInvoiceID {
-		return fmt.Errorf(
-			"auto-top-up invoice id is %q; expected attached invoice %q",
-			invoice.ID,
-			attempt.StripeInvoiceID,
-		)
-	}
-	if invoice.CustomerID != attempt.StripeCustomerID {
-		return fmt.Errorf(
-			"auto-top-up invoice %s customer is %q; expected %q",
-			invoice.ID,
-			invoice.CustomerID,
-			attempt.StripeCustomerID,
-		)
+	if err := validateInvoiceOwnership(attempt, invoice); err != nil {
+		return err
 	}
 	if invoice.Total != expectedCents {
 		return fmt.Errorf(
@@ -779,6 +811,43 @@ func validateInvoiceIdentityAndLine(
 			item.AmountCents,
 			item.Currency,
 			expectedCents,
+		)
+	}
+	return nil
+}
+
+// validateInvoiceOwnership proves the immutable Stripe resource anchors without
+// relying on amount, line, or status truth. It runs before a recovered resource
+// is attached and again at every destructive close boundary. This permits a
+// malformed owned invoice to be closed safely while a same-customer foreign or
+// partially tagged resource remains unattached and untouched.
+func validateInvoiceOwnership(attempt Attempt, invoice billingstripe.Invoice) error {
+	if invoice.ID == "" {
+		return fmt.Errorf("Stripe returned an invoice without id")
+	}
+	if attempt.StripeInvoiceID != "" && invoice.ID != attempt.StripeInvoiceID {
+		return fmt.Errorf(
+			"auto-top-up invoice id is %q; expected attached invoice %q",
+			invoice.ID,
+			attempt.StripeInvoiceID,
+		)
+	}
+	if invoice.CustomerID != attempt.StripeCustomerID {
+		return fmt.Errorf(
+			"auto-top-up invoice customer %q does not match frozen customer %q",
+			invoice.CustomerID,
+			attempt.StripeCustomerID,
+		)
+	}
+	if invoice.ChargeRef != "credit-auto-topup:"+attempt.ID.String() ||
+		invoice.CreditOperation != "auto_topup" ||
+		invoice.CreditAccountID != attempt.AccountID.String() ||
+		invoice.CreditLedgerID != attempt.ID.String() {
+		return fmt.Errorf(
+			"auto-top-up invoice %s credit metadata does not match account %s attempt %s",
+			invoice.ID,
+			attempt.AccountID,
+			attempt.ID,
 		)
 	}
 	return nil
@@ -854,10 +923,20 @@ func (e *Executor) voidAndFail(
 	if invoice.Status == "draft" {
 		return e.deleteDraftAndFail(ctx, attempt, invoice, failureCode, isNew)
 	}
-	if handled, result, err := e.handleTerminalInvoice(ctx, attempt, invoice, isNew); handled {
-		return result, err
+	if err := validateInvoiceOwnership(attempt, invoice); err != nil {
+		return resultFor(attempt, isNew), err
 	}
-	if invoice.Status != "open" {
+	switch invoice.Status {
+	case "paid", "void":
+		if handled, result, err := e.handleTerminalInvoice(ctx, attempt, invoice, isNew); handled {
+			return result, err
+		}
+	case "uncollectible":
+		if err := validateUncollectibleInvoiceResource(attempt, invoice); err != nil {
+			return resultFor(attempt, isNew), err
+		}
+	}
+	if invoice.Status != "open" && invoice.Status != "uncollectible" {
 		return resultFor(attempt, isNew), fmt.Errorf(
 			"cannot close unpaid auto-top-up invoice %s in status %q",
 			invoice.ID,
@@ -904,7 +983,7 @@ func (e *Executor) voidAndFail(
 			return result, err
 		}
 	}
-	if err := validateTerminalUnpaidInvoiceResource(attempt, latest); err != nil {
+	if err := validateVoidedInvoiceResource(attempt, latest); err != nil {
 		if voidErr != nil {
 			return resultFor(attempt, isNew), fmt.Errorf(
 				"void auto-top-up invoice failed and current resource is unsafe: %v: %w",
@@ -931,16 +1010,14 @@ func (e *Executor) deleteDraftAndFail(
 	failureCode string,
 	isNew bool,
 ) (Result, error) {
-	if invoice.ID != attempt.StripeInvoiceID ||
-		invoice.CustomerID != attempt.StripeCustomerID ||
-		invoice.Status != "draft" ||
+	if err := validateInvoiceOwnership(attempt, invoice); err != nil {
+		return resultFor(attempt, isNew), err
+	}
+	if invoice.Status != "draft" ||
 		invoice.AmountPaid != 0 {
 		return resultFor(attempt, isNew), fmt.Errorf(
-			"cannot safely delete auto-top-up draft %q: attached=%q customer=%q expected_customer=%q status=%q amount_paid=%d",
+			"cannot safely delete auto-top-up draft %q: status=%q amount_paid=%d",
 			invoice.ID,
-			attempt.StripeInvoiceID,
-			invoice.CustomerID,
-			attempt.StripeCustomerID,
 			invoice.Status,
 			invoice.AmountPaid,
 		)
@@ -1069,13 +1146,20 @@ func (e *Executor) handleTerminalInvoice(
 		if settlement.Transitioned {
 			e.observe(ctx, settlement.AccountID)
 		}
+		// Settlement is already committed and paid is the highest money truth.
+		// Preserve that terminal fact in the returned Result even if the
+		// convenience refresh below fails; the outer coordinator uses Status to
+		// own the one unblock notification after a deferred nested observer.
+		attempt.Status = "settled"
+		attempt.FailureCode = ""
+		attempt.ReceiptURL = invoice.HostedInvoiceURL
 		current, err := e.store.Get(ctx, attempt.AccountID, attempt.ID)
 		if err != nil {
 			return true, resultFor(attempt, isNew), err
 		}
 		return true, resultFor(current, isNew), nil
-	case "void", "uncollectible":
-		if err := validateTerminalUnpaidInvoiceResource(attempt, invoice); err != nil {
+	case "void":
+		if err := validateVoidedInvoiceResource(attempt, invoice); err != nil {
 			return true, resultFor(attempt, isNew), err
 		}
 		failureCode := "invoice_" + invoice.Status
@@ -1092,6 +1176,15 @@ func (e *Executor) handleTerminalInvoice(
 			e.observe(ctx, failed.AccountID)
 		}
 		return true, resultFor(failed, isNew), nil
+	case "uncollectible":
+		result, err := e.voidAndFail(
+			ctx,
+			attempt,
+			invoice,
+			"invoice_uncollectible",
+			isNew,
+		)
+		return true, result, err
 	default:
 		return false, Result{}, nil
 	}

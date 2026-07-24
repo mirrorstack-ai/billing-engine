@@ -254,3 +254,190 @@ func TestDrawCreationProrationFromWallet_Integration_AttemptedDefersBeforeDraw(t
 	require.True(t, app.ProrationAttempted)
 	require.Empty(t, app.ProrationInvoiceID, "Stripe recovery, not the wallet, must arm the guard")
 }
+
+// Regression: both mid-period wallet legs classify the account before entering
+// their transaction. A concurrent credits→standard update can commit while the
+// draw is waiting for the account lock. PostgreSQL's locked read must then expose
+// standard as the authoritative mode, defer the whole charge to Stripe, and make
+// no ledger/guard write even when a grant could fully cover the amount.
+func TestMidPeriodWalletDraws_Integration_ModeFlipSerializesAndDefersBeforeLedger(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	waitForLockedWalletModeRead := func(t *testing.T) {
+		t.Helper()
+		var probeErr error
+		require.Eventually(t, func() bool {
+			var waiting bool
+			probeErr = pool.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM pg_stat_activity
+					WHERE datname = current_database()
+					  AND wait_event_type = 'Lock'
+					  AND query ILIKE '%SELECT billing_mode%'
+					  AND query ILIKE '%FOR UPDATE%'
+				)`).Scan(&waiting)
+			return probeErr == nil && waiting
+		}, 5*time.Second, 10*time.Millisecond,
+			"the wallet draw must wait behind the concurrent account-mode update")
+		require.NoError(t, probeErr)
+	}
+
+	t.Run("creation proration", func(t *testing.T) {
+		accountID := seedAccount(t, pool)
+		_, err := pool.Exec(ctx,
+			`UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`,
+			accountID.String())
+		require.NoError(t, err)
+		appID := uuid.New()
+		createdAt := mustTime(t, "2026-06-19T12:00:00Z")
+		require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, createdAt, "mode-race app"))
+		insertWalletEntry(t, pool, accountID, uuid.New(), 50_000_000, "grant", "settled", nil, createdAt)
+
+		periodStart := mustTime(t, "2026-06-04T00:00:00Z")
+		periodEnd := mustTime(t, "2026-07-04T00:00:00Z")
+		classified, err := store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+		require.NoError(t, err)
+		require.Equal(t, cycle.CreditBillingModeCredits, classified.Mode,
+			"the unlocked caller snapshot selects the wallet rail before the flip")
+
+		flipTx, err := pool.Begin(ctx)
+		require.NoError(t, err)
+		defer func() { _ = flipTx.Rollback(ctx) }()
+		_, err = flipTx.Exec(ctx,
+			`UPDATE ms_billing.accounts SET billing_mode = 'standard' WHERE id = $1`,
+			accountID.String())
+		require.NoError(t, err)
+
+		type drawResult struct {
+			outcome cycle.ProrationOutcome
+			ref     string
+			err     error
+		}
+		done := make(chan drawResult, 1)
+		go func() {
+			outcome, ref, drawErr := store.DrawCreationProrationFromWallet(ctx, appID, cycle.ProrationWalletCharge{
+				Ref:          "wallet:app-proration:" + appID.String(),
+				AmountMicros: 3_250_123,
+				Snapshot: cycle.AppBaseSnapshot{
+					AppID: appID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+					BaseMicros: 3_250_123,
+				},
+			})
+			done <- drawResult{outcome: outcome, ref: ref, err: drawErr}
+		}()
+
+		waitForLockedWalletModeRead(t)
+		require.NoError(t, flipTx.Commit(ctx))
+
+		var got drawResult
+		select {
+		case got = <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("creation wallet draw did not resume after the mode flip committed")
+		}
+		require.NoError(t, got.err)
+		require.Equal(t, cycle.ProrationWalletDeferToStripe, got.outcome)
+		require.Empty(t, got.ref)
+
+		var draws, snapshots int
+		var guard *string
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM ms_billing.credit_ledger
+			WHERE account_id = $1 AND type = 'usage_draw'`,
+			accountID.String()).Scan(&draws))
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT count(*) FROM ms_billing.app_base_snapshots WHERE app_id = $1`,
+			appID.String()).Scan(&snapshots))
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`,
+			appID.String()).Scan(&guard))
+		require.Zero(t, draws, "the locked standard mode must win before any ledger write")
+		require.Zero(t, snapshots, "a mode-change defer freezes no wallet snapshot")
+		require.Nil(t, guard, "Stripe, not the wallet transaction, owns the one-shot guard")
+	})
+
+	t.Run("module overage", func(t *testing.T) {
+		accountID := seedAccount(t, pool)
+		_, err := pool.Exec(ctx,
+			`UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`,
+			accountID.String())
+		require.NoError(t, err)
+		appID := uuid.New()
+		installedAt := mustTime(t, "2026-06-10T12:00:00Z")
+		require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 1, installedAt, "mode-race module"))
+		require.NoError(t, store.InsertModuleOverageTimers(
+			ctx, accountID, appID, installedAt, installedAt.AddDate(0, 0, 3), 1,
+		))
+		insertWalletEntry(t, pool, accountID, uuid.New(), 50_000_000, "grant", "settled", nil, installedAt)
+
+		var timerID uuid.UUID
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT id
+			FROM ms_billing.app_module_overage_timers
+			WHERE app_id = $1`,
+			appID.String()).Scan(&timerID))
+		periodStart := mustTime(t, "2026-06-04T00:00:00Z")
+		periodEnd := mustTime(t, "2026-07-04T00:00:00Z")
+		classified, err := store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+		require.NoError(t, err)
+		require.Equal(t, cycle.CreditBillingModeCredits, classified.Mode,
+			"the unlocked caller snapshot selects the wallet rail before the flip")
+
+		flipTx, err := pool.Begin(ctx)
+		require.NoError(t, err)
+		defer func() { _ = flipTx.Rollback(ctx) }()
+		_, err = flipTx.Exec(ctx,
+			`UPDATE ms_billing.accounts SET billing_mode = 'standard' WHERE id = $1`,
+			accountID.String())
+		require.NoError(t, err)
+
+		type drawResult struct {
+			outcome cycle.ModuleOverageWalletOutcome
+			ref     string
+			err     error
+		}
+		done := make(chan drawResult, 1)
+		go func() {
+			outcome, ref, drawErr := store.DrawModuleOverageFromWallet(ctx, timerID, cycle.ModuleOverageWalletCharge{
+				Ref:          "wallet:module-overage:" + timerID.String(),
+				AmountMicros: 2_400_000,
+				ChargedAt:    installedAt.AddDate(0, 0, 4),
+			})
+			done <- drawResult{outcome: outcome, ref: ref, err: drawErr}
+		}()
+
+		waitForLockedWalletModeRead(t)
+		require.NoError(t, flipTx.Commit(ctx))
+
+		var got drawResult
+		select {
+		case got = <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("module-overage wallet draw did not resume after the mode flip committed")
+		}
+		require.NoError(t, got.err)
+		require.Equal(t, cycle.ModuleOverageWalletDeferToStripe, got.outcome)
+		require.Empty(t, got.ref)
+
+		var draws int
+		var resolved bool
+		var guard *string
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM ms_billing.credit_ledger
+			WHERE account_id = $1 AND type = 'usage_draw'`,
+			accountID.String()).Scan(&draws))
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT grace_resolved, grace_invoice_id
+			FROM ms_billing.app_module_overage_timers
+			WHERE id = $1`,
+			timerID.String()).Scan(&resolved, &guard))
+		require.Zero(t, draws, "the locked standard mode must win before any ledger write")
+		require.False(t, resolved, "Stripe, not the wallet transaction, owns the terminal guard")
+		require.Nil(t, guard)
+	})
+}

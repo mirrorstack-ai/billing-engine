@@ -44,6 +44,9 @@ func (f *fakeOwners) OwnerByStripeCustomer(context.Context, string) (standing.Ow
 func (f *fakeOwners) OwnerByStripeInvoice(context.Context, string) (standing.Owner, bool, error) {
 	return f.owner, f.found, nil
 }
+func (f *fakeOwners) OwnerByCreditInvoice(context.Context, string) (standing.Owner, bool, error) {
+	return f.owner, f.found, nil
+}
 func (f *fakeOwners) OwnerByStripePaymentMethod(context.Context, string) (standing.Owner, bool, error) {
 	return f.owner, f.found, nil
 }

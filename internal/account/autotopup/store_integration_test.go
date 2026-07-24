@@ -47,7 +47,17 @@ func TestStoreAcquire_ThresholdModePolicyAndSelectedCardGates(t *testing.T) {
 			accountID, pmID := seedEligibleAutoTopUp(t, pool, tt.threshold, true)
 			seedSettledGrant(t, pool, accountID, 10_000_000)
 
+			var dbBefore time.Time
+			require.NoError(t, pool.QueryRow(
+				ctx,
+				`SELECT clock_timestamp()`,
+			).Scan(&dbBefore))
 			attempt, kind, err := store.Acquire(ctx, accountID, 2_000_000, now)
+			var dbAfter time.Time
+			require.NoError(t, pool.QueryRow(
+				ctx,
+				`SELECT clock_timestamp()`,
+			).Scan(&dbAfter))
 
 			require.NoError(t, err)
 			require.Equal(t, autotopup.AcquireNew, kind)
@@ -55,8 +65,9 @@ func TestStoreAcquire_ThresholdModePolicyAndSelectedCardGates(t *testing.T) {
 			require.Equal(t, pmID, attempt.PaymentMethodID)
 			require.Equal(t, "pm_"+pmID.String(), attempt.StripePaymentMethodID)
 			require.Equal(t, "cus_"+accountID.String(), attempt.StripeCustomerID)
-			require.True(t, now.Equal(attempt.CreatedAt))
-			require.True(t, now.Add(autotopup.PendingGrace).Equal(attempt.ExpiresAt))
+			require.False(t, attempt.CreatedAt.Before(dbBefore))
+			require.False(t, attempt.CreatedAt.After(dbAfter))
+			require.Equal(t, autotopup.PendingGrace, attempt.ExpiresAt.Sub(attempt.CreatedAt))
 			require.Equal(t, int64(5_000_000), attempt.AmountMicros)
 			require.Equal(t, int64(15_000_000), attempt.BalanceAfterMicros)
 		})
@@ -240,6 +251,73 @@ func TestStoreAcquire_FreezesAttemptAndConcurrentTriggersConverge(t *testing.T) 
 	require.Equal(t, originalPM, recovered.PaymentMethodID)
 	require.Equal(t, "pm_"+originalPM.String(), recovered.StripePaymentMethodID)
 	require.Equal(t, "cus_"+accountID.String(), recovered.StripeCustomerID)
+}
+
+func TestStoreAcquire_FailedPolicyRevisionLatchesUntilConfigResubmission(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := autotopup.NewStore(pool)
+	ctx := context.Background()
+	accountID, _ := seedEligibleAutoTopUp(t, pool, 0, true)
+
+	var configRevision time.Time
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT updated_at
+		FROM ms_billing.credit_auto_topup_configs
+		WHERE account_id = $1`,
+		accountID,
+	).Scan(&configRevision))
+
+	attempt, kind, err := store.Acquire(ctx, accountID, 1, configRevision)
+	require.NoError(t, err)
+	require.Equal(t, autotopup.AcquireNew, kind)
+	failed, transitioned, err := store.Fail(
+		ctx,
+		attempt,
+		"card_declined",
+		"https://stripe.test/declined",
+	)
+	require.NoError(t, err)
+	require.True(t, transitioned)
+	require.Equal(t, "failed", failed.Status)
+
+	for i := 1; i <= 5; i++ {
+		got, gotKind, acquireErr := store.Acquire(
+			ctx,
+			accountID,
+			1,
+			configRevision.Add(time.Duration(i)*time.Second),
+		)
+		require.NoError(t, acquireErr)
+		require.Equal(t, autotopup.AcquireNone, gotKind,
+			"the same failed config revision must remain latched")
+		require.Equal(t, autotopup.Attempt{}, got)
+	}
+	require.Equal(t, 1, countAutoTopUps(t, pool, accountID),
+		"repeated below-threshold probes must not append replacement attempts")
+
+	var rearmedRevision time.Time
+	require.NoError(t, pool.QueryRow(ctx, `
+		UPDATE ms_billing.credit_auto_topup_configs
+		SET enabled = enabled
+		WHERE account_id = $1
+		RETURNING updated_at`,
+		accountID,
+	).Scan(&rearmedRevision))
+	require.True(t, rearmedRevision.After(attempt.CreatedAt),
+		"even an exact config resubmission must advance the durable retry revision")
+
+	retry, kind, err := store.Acquire(ctx, accountID, 1, rearmedRevision)
+	require.NoError(t, err)
+	require.Equal(t, autotopup.AcquireNew, kind)
+	require.NotEqual(t, attempt.ID, retry.ID)
+	require.Equal(t, 2, countAutoTopUps(t, pool, accountID))
+
+	recovered, kind, err := store.Acquire(ctx, accountID, 1, rearmedRevision.Add(time.Second))
+	require.NoError(t, err)
+	require.Equal(t, autotopup.AcquireExisting, kind,
+		"the rearmed revision may authorize only one pending replacement")
+	require.Equal(t, retry.ID, recovered.ID)
+	require.Equal(t, 2, countAutoTopUps(t, pool, accountID))
 }
 
 func TestStoreFail_ConcurrentWebhookTransitionsOnceAndAddsZeroCredit(t *testing.T) {

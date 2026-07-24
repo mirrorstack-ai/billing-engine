@@ -74,6 +74,17 @@ type Client interface {
 	// idemKey (inv-<id>) makes a re-run reuse the SAME draft.
 	CreateDraftInvoice(ctx context.Context, custID, ref, idemKey string) (Invoice, error)
 
+	// CreateCreditPurchaseInvoice creates the same inert draft but stamps the
+	// exact credit operation/account/ledger anchors used to route a trusted
+	// invoice webhook without querying wallet tables for ordinary invoices.
+	CreateCreditPurchaseInvoice(
+		ctx context.Context,
+		customerID string,
+		accountID string,
+		ledgerID string,
+		idemKey string,
+	) (Invoice, error)
+
 	// CreateInvoiceItem creates an invoice item PINNED to the given draft
 	// invoice — never a floating customer-level pending item. amountCents is
 	// the whole-cent customer charge (micro-dollars are converted to cents
@@ -140,6 +151,28 @@ type Client interface {
 	FindInvoiceByRef(ctx context.Context, custID, ref string) (Invoice, bool, error)
 }
 
+// CreditPurchaseClient is the resource-authoritative Stripe surface for manual
+// wallet purchases. It is deliberately narrower than Client so ordinary cycle
+// fakes do not need the invoice-item/payment-list proof operations. Manual
+// settlement never trusts an invoice.paid webhook payload: callers must re-read
+// the attached invoice, its complete item list, and its paid allocations.
+type CreditPurchaseClient interface {
+	CreateCreditPurchaseInvoice(
+		ctx context.Context,
+		customerID string,
+		accountID string,
+		ledgerID string,
+		idemKey string,
+	) (Invoice, error)
+	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error)
+	ListInvoiceItems(ctx context.Context, invoiceID string) ([]InvoiceItem, error)
+	ListInvoicePayments(ctx context.Context, invoiceID string) ([]InvoicePaymentProof, error)
+	FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+	GetInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error)
+	FindInvoiceByRef(ctx context.Context, customerID, ref string) (Invoice, bool, error)
+	VoidInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+}
+
 // AutoTopUpClient is the narrower, selected-card Stripe surface used only by
 // the durable automatic credit executor. It is deliberately separate from
 // Client: the ordinary cycle and manual-invoice paths keep their established
@@ -149,7 +182,14 @@ type AutoTopUpClient interface {
 	// CreateAutoTopUpInvoice creates an empty charge_automatically invoice with
 	// auto_advance=false, pending items excluded, and the attempt-frozen card set
 	// as default_payment_method. It cannot collect until PayInvoiceWithMethod.
-	CreateAutoTopUpInvoice(ctx context.Context, customerID, paymentMethodID, ref, idemKey string) (Invoice, error)
+	CreateAutoTopUpInvoice(
+		ctx context.Context,
+		customerID string,
+		paymentMethodID string,
+		accountID string,
+		ledgerID string,
+		idemKey string,
+	) (Invoice, error)
 
 	// CreateInvoiceItem pins the single credit line to the inert draft.
 	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error)
@@ -219,9 +259,14 @@ type Invoice struct {
 	CollectionMethod       string
 	AutoAdvance            bool
 	DefaultPaymentMethodID string
+	ChargeRef              string
+	CreditOperation        string
+	CreditAccountID        string
+	CreditLedgerID         string
 	Deleted                bool
 	AmountDue              int64
 	AmountPaid             int64
+	AmountRemaining        int64
 	AmountPaidOffStripe    int64
 	Total                  int64
 	Currency               string

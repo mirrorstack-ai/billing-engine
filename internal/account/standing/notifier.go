@@ -47,9 +47,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
-	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
-	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
-	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 )
 
 // servingBlockPath is api-platform's internal endpoint (C6), joined onto
@@ -82,6 +79,7 @@ type Owner struct {
 type OwnerResolver interface {
 	OwnerByStripeCustomer(ctx context.Context, stripeCustomerID string) (Owner, bool, error)
 	OwnerByStripeInvoice(ctx context.Context, stripeInvoiceID string) (Owner, bool, error)
+	OwnerByCreditInvoice(ctx context.Context, stripeInvoiceID string) (Owner, bool, error)
 	OwnerByStripePaymentMethod(ctx context.Context, stripePaymentMethodID string) (Owner, bool, error)
 }
 
@@ -132,34 +130,7 @@ func (n *Notifier) Enabled() bool {
 func NewNotifierFromEnv(pool *pgxpool.Pool, log *slog.Logger) *Notifier {
 	store := billing.NewStore(pool)
 	svc := billing.NewService(store, nil, "")
-	walletEnabled := config.CreditWalletEnabled()
-	if walletEnabled {
-		ready, err := config.CreditWalletSchemaReady(context.Background(), pool)
-		if err != nil {
-			log.Error("credit-wallet schema probe failed; webhook notifier using legacy standing", "error", err)
-			walletEnabled = false
-		} else {
-			walletEnabled = ready
-		}
-	}
-	svc.WithCreditWallet(walletEnabled)
-	notifier := NewNotifierFromEnvWithStatus(pool, svc, log)
-	coordinator := credit.NewCoordinatorIfReady(walletEnabled, func() *credit.Coordinator {
-		counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
-		if err != nil {
-			log.Error("credit estimate cache unavailable; webhook status uses live projection", "error", err)
-		}
-		projection := usage.NewService(usage.NewStoreWithCreditWallet(pool, true))
-		coordinator := credit.NewCoordinator(counter, store, projection, nil)
-		if notifier.Enabled() {
-			coordinator.WithNotifier(notifier)
-		}
-		return coordinator
-	})
-	if coordinator != nil {
-		svc.WithCreditCoordinator(coordinator, coordinator)
-	}
-	return notifier
+	return NewNotifierFromEnvWithStatus(pool, svc, log)
 }
 
 // NewNotifierFromEnvWithStatus permits production roots to supply the same
@@ -185,6 +156,12 @@ func (n *Notifier) NotifyStripeInvoice(ctx context.Context, stripeInvoiceID stri
 	_, _ = n.notify(ctx, "stripe_invoice_id", stripeInvoiceID, n.owners.OwnerByStripeInvoice)
 }
 
+// NotifyCreditInvoice resolves through the credit ledger only after the
+// webhook router has authenticated the invoice's exact credit metadata.
+func (n *Notifier) NotifyCreditInvoice(ctx context.Context, stripeInvoiceID string) {
+	_, _ = n.notify(ctx, "credit_stripe_invoice_id", stripeInvoiceID, n.owners.OwnerByCreditInvoice)
+}
+
 // NotifyStripePaymentMethod re-evaluates and pushes the verdict for the
 // account owning the mirrored card (card detach events, which carry only the
 // pm id).
@@ -198,16 +175,12 @@ func (n *Notifier) NotifyStripePaymentMethod(ctx context.Context, stripePaymentM
 // disposable SETNX claim and make a later retry eligible.
 func (n *Notifier) NotifyOwner(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (bool, error) {
 	owner := Owner{UserID: ownerUserID, OrgID: ownerOrgID}
-	return n.notify(ctx, "account_id", ownerID(owner), func(context.Context, string) (Owner, bool, error) {
+	// The already-resolved path is also used by the bulk rollback restamp.
+	// Keep raw owner UUIDs out of logs/error evidence; the POST body still
+	// carries the exact principal required by the trusted internal endpoint.
+	return n.notify(ctx, "resolved_owner", "present", func(context.Context, string) (Owner, bool, error) {
 		return owner, owner.UserID != uuid.Nil || owner.OrgID != uuid.Nil, nil
 	})
-}
-
-func ownerID(owner Owner) string {
-	if owner.OrgID != uuid.Nil {
-		return owner.OrgID.String()
-	}
-	return owner.UserID.String()
 }
 
 // servingBlockBody is the C6 wire body: exactly one owner field + the current

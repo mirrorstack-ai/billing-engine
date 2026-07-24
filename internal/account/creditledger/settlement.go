@@ -96,9 +96,11 @@ func (s *Store) SettleStripeInvoice(
 	)
 }
 
-// SettleManualStripeInvoice is the webhook-safe manual-purchase entry point.
-// An auto-top-up match fails closed because that operation must first pass the
-// executor's resource-authoritative Stripe re-read and frozen-card validation.
+// SettleManualStripeInvoice is the manual-purchase-only transaction invoked
+// after creditpurchase.Executor has completed its resource-authoritative
+// invoice/item/PaymentIntent proof. It deliberately does no Stripe read itself.
+// An auto-top-up match fails closed because that operation uses its own
+// frozen-card executor.
 func (s *Store) SettleManualStripeInvoice(
 	ctx context.Context,
 	stripeInvoiceID string,

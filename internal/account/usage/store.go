@@ -548,7 +548,7 @@ type InvoiceMirrorRaw struct {
 // NewStore returns a Store backed by the given pgxpool. The pool is
 // retained so the batch catalog sync can run inside a single transaction.
 func NewStore(pool *pgxpool.Pool) Store {
-	return newStore(pool, false)
+	return newStore(pool, false, nil)
 }
 
 // NewStoreWithCreditWallet returns a Store whose settled-creation display read
@@ -556,17 +556,30 @@ func NewStore(pool *pgxpool.Pool) Store {
 // boot flag (environment flag AND successful schema capability probe). When
 // disabled, the store uses the pre-wallet Stripe-only query.
 func NewStoreWithCreditWallet(pool *pgxpool.Pool, enabled bool) Store {
-	return newStore(pool, enabled)
+	return newStore(pool, enabled, nil)
 }
 
-func newStore(pool *pgxpool.Pool, walletEnabled bool) Store {
-	return &pgxStore{pool: pool, q: db.New(pool), walletEnabled: walletEnabled}
+// NewStoreWithCreditAccess enables wallet-aware display reads only after the
+// supplied account-scoped rollout selector authorizes enforcement. Excluded
+// and shadow accounts execute the legacy query without preparing or invoking
+// SQL that names migration-048 objects.
+func NewStoreWithCreditAccess(pool *pgxpool.Pool, access func(uuid.UUID) bool) Store {
+	return newStore(pool, true, access)
+}
+
+func newStore(pool *pgxpool.Pool, walletEnabled bool, walletAccess func(uuid.UUID) bool) Store {
+	return &pgxStore{
+		pool: pool, q: db.New(pool),
+		walletEnabled: walletEnabled,
+		walletAccess:  walletAccess,
+	}
 }
 
 type pgxStore struct {
 	pool          *pgxpool.Pool
 	q             *db.Queries
 	walletEnabled bool
+	walletAccess  func(uuid.UUID) bool
 }
 
 func (s *pgxStore) LookupMetricDefinition(ctx context.Context, moduleID uuid.UUID, metric string) (MetricDefinition, bool, error) {
@@ -820,7 +833,17 @@ func (s *pgxStore) SettledNewCreationCharges(ctx context.Context, accountID uuid
 		PeriodEnd:   periodEnd,
 	}
 	var normalized []settledNewCreationDBRow
-	if s.walletEnabled {
+	walletSelected := s.walletEnabled &&
+		(s.walletAccess == nil || s.walletAccess(accountID))
+	walletCreditsMode := false
+	if walletSelected {
+		account, err := s.q.GetCreditAccountSnapshot(ctx, accountID.String())
+		if err != nil {
+			return nil, err
+		}
+		walletCreditsMode = account.BillingMode == "credits"
+	}
+	if walletCreditsMode {
 		rows, err := s.q.SettledNewCreationCharges(ctx, params)
 		if err != nil {
 			return nil, err

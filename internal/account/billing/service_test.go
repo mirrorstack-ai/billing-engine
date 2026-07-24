@@ -12,6 +12,9 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -60,10 +63,20 @@ type fakeStore struct {
 	creditAutoTopUps         map[uuid.UUID]billing.AutoTopUpConfig
 	distributorCustomers     map[distributorCustomerKey]uuid.UUID
 	distributorStates        map[uuid.UUID][]billing.DistributorCustomerState
+	creditStandingReads      int
+	creditLedgerListReads    int
 	creditPurchaseCreates    int
 	creditIdempotencyReads   int
+	creditPurchaseReads      int
+	creditPurchaseAttaches   int
+	creditPurchaseFinalizes  int
+	creditAutoTopUpWrites    int
+	creditGateSnapshotReads  int
+	creditBillingModeWrites  int
 	distributorRelationReads int
+	distributorStateReads    int
 	creditGrantInserts       int
+	chargeFundingReads       int
 
 	// Injected failures (set per-test as needed).
 	errEnsureAccount        error
@@ -108,6 +121,147 @@ type pmTarget struct {
 	stripePMID       string
 	stripeCustomerID string
 	isDefault        bool
+}
+
+type fakeCreditPurchaseStore struct {
+	store *fakeStore
+}
+
+func (s *fakeCreditPurchaseStore) Get(
+	ctx context.Context,
+	accountID, attemptID uuid.UUID,
+) (creditpurchase.Attempt, error) {
+	purchase, found, err := s.store.CreditPurchase(ctx, attemptID, accountID)
+	if err != nil {
+		return creditpurchase.Attempt{}, err
+	}
+	if !found {
+		return creditpurchase.Attempt{}, errors.New("credit purchase not found")
+	}
+	return fakeCreditPurchaseAttempt(purchase), nil
+}
+
+func (s *fakeCreditPurchaseStore) FindByStripeInvoice(
+	_ context.Context,
+	stripeInvoiceID string,
+) (creditpurchase.Attempt, bool, error) {
+	for _, purchase := range s.store.creditPurchases {
+		if purchase.StripeInvoiceID == stripeInvoiceID {
+			return fakeCreditPurchaseAttempt(purchase), true, nil
+		}
+	}
+	return creditpurchase.Attempt{}, false, nil
+}
+
+func (s *fakeCreditPurchaseStore) AttachInvoice(
+	ctx context.Context,
+	attempt creditpurchase.Attempt,
+	invoice billingstripe.Invoice,
+) (creditpurchase.Attempt, error) {
+	if err := s.store.AttachCreditPurchaseInvoice(
+		ctx,
+		attempt.ID,
+		attempt.AccountID,
+		invoice.ID,
+		invoice.HostedInvoiceURL,
+	); err != nil {
+		return creditpurchase.Attempt{}, err
+	}
+	current, err := s.Get(ctx, attempt.AccountID, attempt.ID)
+	if err != nil {
+		return creditpurchase.Attempt{}, err
+	}
+	current.StripeCustomerID = invoice.CustomerID
+	return current, nil
+}
+
+func (s *fakeCreditPurchaseStore) Fail(
+	ctx context.Context,
+	attempt creditpurchase.Attempt,
+	receiptURL string,
+) (creditpurchase.Attempt, bool, error) {
+	failed, err := s.store.FinalizeCreditPurchase(
+		ctx,
+		attempt.ID,
+		attempt.AccountID,
+		"failed",
+		receiptURL,
+	)
+	if err != nil {
+		return creditpurchase.Attempt{}, false, err
+	}
+	return fakeCreditPurchaseAttempt(failed), failed.Transitioned, nil
+}
+
+type fakeCreditPurchaseSettler struct {
+	store *fakeStore
+}
+
+func (s *fakeCreditPurchaseSettler) SettleManualStripeInvoice(
+	_ context.Context,
+	stripeInvoiceID string,
+	_ int64,
+	_ string,
+	receiptURL string,
+) (creditledger.Settlement, error) {
+	for _, candidate := range s.store.creditPurchases {
+		if candidate.StripeInvoiceID != stripeInvoiceID {
+			continue
+		}
+		purchase := candidate
+		transitioned := false
+		if purchase.Status == "pending" || purchase.Status == "failed" {
+			purchase.Status = "settled"
+			purchase.Transitioned = true
+			transitioned = true
+			s.store.creditPurchaseFinalizes++
+			if receiptURL != "" {
+				purchase.ReceiptURL = receiptURL
+			}
+			s.store.creditPurchases[purchase.ID] = purchase
+			s.store.putCreditPurchaseRecord(purchase)
+			standing := s.store.creditStanding[purchase.AccountID]
+			standing.BalanceMicros += purchase.AmountMicros
+			s.store.creditStanding[purchase.AccountID] = standing
+		}
+		return creditledger.Settlement{
+			Found:        true,
+			Transitioned: transitioned,
+			AccountID:    purchase.AccountID,
+			LedgerID:     purchase.ID,
+			Type:         "purchase",
+		}, nil
+	}
+	return creditledger.Settlement{}, nil
+}
+
+func fakeCreditPurchaseAttempt(
+	purchase billing.CreditPurchaseRow,
+) creditpurchase.Attempt {
+	return creditpurchase.Attempt{
+		ID:              purchase.ID,
+		AccountID:       purchase.AccountID,
+		AmountMicros:    purchase.AmountMicros,
+		Status:          purchase.Status,
+		StripeInvoiceID: purchase.StripeInvoiceID,
+		ReceiptURL:      purchase.ReceiptURL,
+	}
+}
+
+func newCreditPurchaseTestService(
+	store *fakeStore,
+	stripe *fakeStripe,
+) *billing.Service {
+	executor := creditpurchase.NewExecutor(
+		&fakeCreditPurchaseStore{store: store},
+		&fakeCreditPurchaseSettler{store: store},
+		stripe,
+	)
+	return billing.NewService(store, stripe, "").
+		WithCreditPurchaseExecutor(executor).
+		WithCreditRecoveryCapability(creditrecovery.NewRuntimeCapability(
+			func(context.Context) (bool, error) { return true, nil },
+		))
 }
 
 func newFakeStore() *fakeStore {
@@ -283,6 +437,7 @@ func (s *fakeStore) ResolveOrgFundedAccount(_ context.Context, orgID uuid.UUID) 
 }
 
 func (s *fakeStore) ChargeFundingAccount(_ context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	s.chargeFundingReads++
 	// Identity unless a sponsor funding mapping is configured (org D1 hop).
 	if funding, ok := s.fundingOf[accountID]; ok {
 		return funding, nil
@@ -352,10 +507,12 @@ func (s *fakeStore) SyncInvoiceMirror(_ context.Context, inv billingstripe.Invoi
 }
 
 func (s *fakeStore) CreditStanding(_ context.Context, accountID uuid.UUID) (billing.CreditStandingRow, error) {
+	s.creditStandingReads++
 	return s.creditStanding[accountID], nil
 }
 
 func (s *fakeStore) ListCreditLedger(_ context.Context, accountID uuid.UUID, limit int32, _ *billing.CreditLedgerCursor) ([]billing.CreditLedgerEntry, error) {
+	s.creditLedgerListReads++
 	entries := s.creditLedgerEntries[accountID]
 	if int32(len(entries)) > limit {
 		entries = entries[:limit]
@@ -389,6 +546,7 @@ func (s *fakeStore) CreatePendingCreditPurchase(_ context.Context, accountID uui
 }
 
 func (s *fakeStore) CreditPurchase(_ context.Context, purchaseID, accountID uuid.UUID) (billing.CreditPurchaseRow, bool, error) {
+	s.creditPurchaseReads++
 	purchase, ok := s.creditPurchases[purchaseID]
 	if !ok || purchase.AccountID != accountID {
 		return billing.CreditPurchaseRow{}, false, nil
@@ -397,6 +555,7 @@ func (s *fakeStore) CreditPurchase(_ context.Context, purchaseID, accountID uuid
 }
 
 func (s *fakeStore) AttachCreditPurchaseInvoice(_ context.Context, purchaseID, accountID uuid.UUID, stripeInvoiceID, receiptURL string) error {
+	s.creditPurchaseAttaches++
 	purchase, ok := s.creditPurchases[purchaseID]
 	if !ok || purchase.AccountID != accountID {
 		return errors.New("credit purchase not found")
@@ -414,6 +573,7 @@ func (s *fakeStore) AttachCreditPurchaseInvoice(_ context.Context, purchaseID, a
 }
 
 func (s *fakeStore) FinalizeCreditPurchase(_ context.Context, purchaseID, accountID uuid.UUID, status, receiptURL string) (billing.CreditPurchaseRow, error) {
+	s.creditPurchaseFinalizes++
 	purchase, ok := s.creditPurchases[purchaseID]
 	if !ok || purchase.AccountID != accountID {
 		return billing.CreditPurchaseRow{}, errors.New("credit purchase not found")
@@ -433,6 +593,7 @@ func (s *fakeStore) FinalizeCreditPurchase(_ context.Context, purchaseID, accoun
 }
 
 func (s *fakeStore) UpsertCreditAutoTopUp(_ context.Context, accountID uuid.UUID, cfg billing.AutoTopUpConfig) (billing.AutoTopUpConfig, error) {
+	s.creditAutoTopUpWrites++
 	s.creditAutoTopUps[accountID] = cfg
 	standing := s.creditStanding[accountID]
 	standing.AutoTopUp = &cfg
@@ -441,6 +602,7 @@ func (s *fakeStore) UpsertCreditAutoTopUp(_ context.Context, accountID uuid.UUID
 }
 
 func (s *fakeStore) CreditGateSnapshot(_ context.Context, accountID uuid.UUID) (credit.Snapshot, error) {
+	s.creditGateSnapshotReads++
 	standing := s.creditStanding[accountID]
 	return credit.Snapshot{
 		AccountID:              accountID,
@@ -452,6 +614,7 @@ func (s *fakeStore) CreditGateSnapshot(_ context.Context, accountID uuid.UUID) (
 }
 
 func (s *fakeStore) SetCreditBillingMode(_ context.Context, accountID uuid.UUID, mode billing.BillingMode, creditLimitMicros int64) (bool, error) {
+	s.creditBillingModeWrites++
 	standing := s.creditStanding[accountID]
 	changed := standing.BillingMode != mode || standing.CreditLimitMicros != creditLimitMicros
 	standing.BillingMode = mode
@@ -470,6 +633,7 @@ func (s *fakeStore) DistributorCustomerAccount(_ context.Context, distributorOrg
 }
 
 func (s *fakeStore) ListDistributorCustomerStates(_ context.Context, distributorOrgID uuid.UUID) ([]billing.DistributorCustomerState, error) {
+	s.distributorStateReads++
 	return s.distributorStates[distributorOrgID], nil
 }
 
@@ -527,6 +691,8 @@ type fakeStripe struct {
 	getInvoiceStatus         string                // Status GetInvoice reports; "" → "open"
 	creditInvoices           map[string]billingstripe.Invoice
 	creditInvoiceRefs        map[string]string
+	creditInvoiceItems       map[string][]billingstripe.InvoiceItem
+	creditInvoicePayments    map[string][]billingstripe.InvoicePaymentProof
 	creditDraftCalls         []creditDraftInvoiceCall
 	creditItemCalls          []creditInvoiceItemCall
 	creditFinalizeCalls      []string
@@ -649,14 +815,36 @@ func (f *fakeStripe) CreateDraftInvoice(_ context.Context, customerID, ref, idem
 		idempotencyKey: idempotencyKey,
 	})
 	invoice := billingstripe.Invoice{
-		ID:         "in_credit_" + uuid.New().String(),
-		CustomerID: customerID,
-		Status:     "draft",
-		Currency:   "usd",
+		ID:               "in_credit_" + uuid.New().String(),
+		CustomerID:       customerID,
+		Status:           "draft",
+		CollectionMethod: "charge_automatically",
+		ChargeRef:        ref,
+		Currency:         "usd",
 	}
 	f.creditInvoices[invoice.ID] = invoice
 	f.creditInvoiceRefs[ref] = invoice.ID
 	return invoice, nil
+}
+
+func (f *fakeStripe) CreateCreditPurchaseInvoice(
+	ctx context.Context,
+	customerID string,
+	accountID string,
+	ledgerID string,
+	idempotencyKey string,
+) (billingstripe.Invoice, error) {
+	invoice, err := f.CreateDraftInvoice(
+		ctx,
+		customerID,
+		"credit-purchase:"+ledgerID,
+		idempotencyKey,
+	)
+	invoice.CreditOperation = "purchase"
+	invoice.CreditAccountID = accountID
+	invoice.CreditLedgerID = ledgerID
+	f.creditInvoices[invoice.ID] = invoice
+	return invoice, err
 }
 
 func (f *fakeStripe) CreateInvoiceItem(_ context.Context, customerID, invoiceID string, amountCents int64, currency, _ string, _ billingstripe.LinePeriod, idempotencyKey string) (billingstripe.InvoiceItem, error) {
@@ -670,7 +858,45 @@ func (f *fakeStripe) CreateInvoiceItem(_ context.Context, customerID, invoiceID 
 		currency:       currency,
 		idempotencyKey: idempotencyKey,
 	})
-	return billingstripe.InvoiceItem{ID: "ii_credit_" + uuid.New().String()}, nil
+	f.ensureCreditInvoiceMaps()
+	item := billingstripe.InvoiceItem{
+		ID:          "ii_credit_" + uuid.New().String(),
+		AmountCents: amountCents,
+		Currency:    currency,
+	}
+	f.creditInvoiceItems[invoiceID] = append(
+		f.creditInvoiceItems[invoiceID],
+		item,
+	)
+	invoice := f.creditInvoices[invoiceID]
+	invoice.Total = amountCents
+	invoice.AmountDue = amountCents
+	invoice.AmountRemaining = amountCents
+	invoice.Currency = currency
+	f.creditInvoices[invoiceID] = invoice
+	return item, nil
+}
+
+func (f *fakeStripe) ListInvoiceItems(
+	_ context.Context,
+	invoiceID string,
+) ([]billingstripe.InvoiceItem, error) {
+	f.ensureCreditInvoiceMaps()
+	return append(
+		[]billingstripe.InvoiceItem(nil),
+		f.creditInvoiceItems[invoiceID]...,
+	), nil
+}
+
+func (f *fakeStripe) ListInvoicePayments(
+	_ context.Context,
+	invoiceID string,
+) ([]billingstripe.InvoicePaymentProof, error) {
+	f.ensureCreditInvoiceMaps()
+	return append(
+		[]billingstripe.InvoicePaymentProof(nil),
+		f.creditInvoicePayments[invoiceID]...,
+	), nil
 }
 
 func (f *fakeStripe) FinalizeInvoice(_ context.Context, invoiceID, idempotencyKey string) (billingstripe.Invoice, error) {
@@ -688,14 +914,29 @@ func (f *fakeStripe) FinalizeInvoice(_ context.Context, invoiceID, idempotencyKe
 		status = "open"
 	}
 	invoice.Status = status
+	invoice.AutoAdvance = true
 	invoice.ClientSecret = "pi_credit_secret"
 	invoice.HostedInvoiceURL = "https://invoice.test/" + invoiceID
 	if status == "paid" {
-		for _, call := range f.creditItemCalls {
-			if call.invoiceID == invoiceID {
-				invoice.AmountPaid = call.amountCents
-			}
-		}
+		invoice.AmountPaid = invoice.Total
+		invoice.AmountRemaining = 0
+		f.creditInvoicePayments[invoiceID] = []billingstripe.InvoicePaymentProof{{
+			ID:                    "inpay_credit_" + invoiceID,
+			InvoiceID:             invoiceID,
+			Status:                "paid",
+			IsDefault:             true,
+			AmountPaid:            invoice.Total,
+			AmountRequested:       invoice.Total,
+			Currency:              "usd",
+			PaymentType:           string(stripego.InvoicePaymentPaymentTypePaymentIntent),
+			PaymentIntentID:       "pi_credit_" + invoiceID,
+			PaymentIntentStatus:   string(stripego.PaymentIntentStatusSucceeded),
+			PaymentIntentCustomer: invoice.CustomerID,
+			PaymentMethodID:       "pm_credit",
+			PaymentIntentAmount:   invoice.Total,
+			AmountReceived:        invoice.Total,
+			PaymentIntentCurrency: "usd",
+		}}
 	}
 	f.creditInvoices[invoiceID] = invoice
 	return invoice, nil
@@ -740,6 +981,73 @@ func (f *fakeStripe) ensureCreditInvoiceMaps() {
 	if f.creditInvoiceRefs == nil {
 		f.creditInvoiceRefs = map[string]string{}
 	}
+	if f.creditInvoiceItems == nil {
+		f.creditInvoiceItems = map[string][]billingstripe.InvoiceItem{}
+	}
+	if f.creditInvoicePayments == nil {
+		f.creditInvoicePayments = map[string][]billingstripe.InvoicePaymentProof{}
+	}
+}
+
+func (f *fakeStripe) seedExactCreditPurchaseInvoice(
+	purchase billing.CreditPurchaseRow,
+	customerID, status string,
+) {
+	f.ensureCreditInvoiceMaps()
+	expectedCents := (purchase.AmountMicros + 5_000) / 10_000
+	invoice := billingstripe.Invoice{
+		ID:                  purchase.StripeInvoiceID,
+		CustomerID:          customerID,
+		Status:              status,
+		CollectionMethod:    "charge_automatically",
+		ChargeRef:           "credit-purchase:" + purchase.ID.String(),
+		CreditOperation:     "purchase",
+		CreditAccountID:     purchase.AccountID.String(),
+		CreditLedgerID:      purchase.ID.String(),
+		Total:               expectedCents,
+		AmountDue:           expectedCents,
+		AmountRemaining:     expectedCents,
+		AmountPaidOffStripe: 0,
+		Currency:            "usd",
+		HostedInvoiceURL:    "https://invoice.test/" + purchase.StripeInvoiceID,
+	}
+	f.creditInvoiceItems[purchase.StripeInvoiceID] = []billingstripe.InvoiceItem{{
+		ID: "ii_credit_" + purchase.ID.String(), AmountCents: expectedCents, Currency: "usd",
+	}}
+	if status == "paid" {
+		invoice.AmountPaid = expectedCents
+		invoice.AmountRemaining = 0
+		f.creditInvoicePayments[purchase.StripeInvoiceID] = []billingstripe.InvoicePaymentProof{{
+			ID:                    "inpay_credit_" + purchase.ID.String(),
+			InvoiceID:             purchase.StripeInvoiceID,
+			Status:                "paid",
+			IsDefault:             true,
+			AmountPaid:            expectedCents,
+			AmountRequested:       expectedCents,
+			Currency:              "usd",
+			PaymentType:           string(stripego.InvoicePaymentPaymentTypePaymentIntent),
+			PaymentIntentID:       "pi_credit_" + purchase.ID.String(),
+			PaymentIntentStatus:   string(stripego.PaymentIntentStatusSucceeded),
+			PaymentIntentCustomer: customerID,
+			PaymentMethodID:       "pm_credit",
+			PaymentIntentAmount:   expectedCents,
+			AmountReceived:        expectedCents,
+			PaymentIntentCurrency: "usd",
+		}}
+	}
+	f.creditInvoices[purchase.StripeInvoiceID] = invoice
+}
+
+func (f *fakeStripe) VoidInvoice(
+	_ context.Context,
+	invoiceID, _ string,
+) (billingstripe.Invoice, error) {
+	f.ensureCreditInvoiceMaps()
+	invoice := f.creditInvoices[invoiceID]
+	invoice.Status = "void"
+	invoice.AmountRemaining = 0
+	f.creditInvoices[invoiceID] = invoice
+	return invoice, nil
 }
 
 func (f *fakeStripe) PayInvoice(_ context.Context, stripeInvoiceID string) (billingstripe.Invoice, error) {

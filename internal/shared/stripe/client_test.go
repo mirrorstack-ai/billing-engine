@@ -32,6 +32,12 @@ func TestNewAutoTopUpClient(t *testing.T) {
 	var _ AutoTopUpClient = c
 }
 
+func TestNewCreditPurchaseClient(t *testing.T) {
+	c := NewCreditPurchaseClient("sk_test_dummy")
+	require.NotNil(t, c)
+	var _ CreditPurchaseClient = c
+}
+
 func TestNewVerifier(t *testing.T) {
 	v := NewVerifier("whsec_dummy")
 	require.NotNil(t, v)
@@ -89,9 +95,16 @@ func TestProjectInvoice_ConfirmationSecret(t *testing.T) {
 	got := projectInvoice(&stripego.Invoice{
 		ID:                   "in_credit_purchase",
 		Total:                501,
+		AmountRemaining:      17,
 		CollectionMethod:     stripego.InvoiceCollectionMethodChargeAutomatically,
 		AutoAdvance:          false,
 		DefaultPaymentMethod: &stripego.PaymentMethod{ID: "pm_frozen"},
+		Metadata: map[string]string{
+			"ms_charge_ref":        "credit-auto-topup:ledger-id",
+			"ms_credit_operation":  "auto_topup",
+			"ms_credit_account_id": "account-id",
+			"ms_credit_ledger_id":  "ledger-id",
+		},
 		ConfirmationSecret: &stripego.InvoiceConfirmationSecret{
 			ClientSecret: "pi_secret_for_client",
 		},
@@ -99,9 +112,14 @@ func TestProjectInvoice_ConfirmationSecret(t *testing.T) {
 
 	require.Equal(t, "pi_secret_for_client", got.ClientSecret)
 	require.Equal(t, int64(501), got.Total)
+	require.Equal(t, int64(17), got.AmountRemaining)
 	require.Equal(t, "charge_automatically", got.CollectionMethod)
 	require.False(t, got.AutoAdvance)
 	require.Equal(t, "pm_frozen", got.DefaultPaymentMethodID)
+	require.Equal(t, "credit-auto-topup:ledger-id", got.ChargeRef)
+	require.Equal(t, "auto_topup", got.CreditOperation)
+	require.Equal(t, "account-id", got.CreditAccountID)
+	require.Equal(t, "ledger-id", got.CreditLedgerID)
 }
 
 func TestFinalizeInvoice_ExpandsAndProjectsConfirmationSecret(t *testing.T) {
@@ -173,8 +191,10 @@ func TestCreateAutoTopUpInvoice_PinsSelectedMethodAndRemainsInert(t *testing.T) 
 			require.False(t, *got.AutoAdvance)
 			require.Equal(t, "exclude", *got.PendingInvoiceItemsBehavior)
 			require.Equal(t, map[string]string{
-				"ms_charge_ref":       "credit-auto-topup:attempt-1",
-				"ms_credit_operation": "auto_topup",
+				"ms_charge_ref":        "credit-auto-topup:attempt-1",
+				"ms_credit_operation":  "auto_topup",
+				"ms_credit_account_id": "account-1",
+				"ms_credit_ledger_id":  "attempt-1",
 			}, got.Metadata)
 			require.Equal(t, "credit-auto-topup-invoice:attempt-1", *got.IdempotencyKey)
 		},
@@ -185,12 +205,46 @@ func TestCreateAutoTopUpInvoice_PinsSelectedMethodAndRemainsInert(t *testing.T) 
 		context.Background(),
 		"cus_frozen",
 		"pm_frozen",
-		"credit-auto-topup:attempt-1",
+		"account-1",
+		"attempt-1",
 		"credit-auto-topup-invoice:attempt-1",
 	)
 
 	require.NoError(t, err)
 	require.Equal(t, "in_topup", got.ID)
+}
+
+func TestCreateCreditPurchaseInvoice_StampsExactRoutingAnchors(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodPost,
+		wantPath:   "/v1/invoices",
+		response:   stripego.Invoice{ID: "in_purchase"},
+		checkParams: func(params stripego.ParamsContainer) {
+			got, ok := params.(*stripego.InvoiceParams)
+			require.True(t, ok)
+			require.Equal(t, "cus_purchase", *got.Customer)
+			require.Equal(t, map[string]string{
+				"ms_charge_ref":        "credit-purchase:ledger-1",
+				"ms_credit_operation":  "purchase",
+				"ms_credit_account_id": "account-1",
+				"ms_credit_ledger_id":  "ledger-1",
+			}, got.Metadata)
+			require.Equal(t, "credit-inv:ledger-1", *got.IdempotencyKey)
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.CreateCreditPurchaseInvoice(
+		context.Background(),
+		"cus_purchase",
+		"account-1",
+		"ledger-1",
+		"credit-inv:ledger-1",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "in_purchase", got.ID)
 }
 
 func TestListInvoiceItems_FiltersOneInvoiceAndProjectsResourceTruth(t *testing.T) {

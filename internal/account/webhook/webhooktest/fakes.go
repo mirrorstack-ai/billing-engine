@@ -14,7 +14,6 @@ import (
 
 	stripego "github.com/stripe/stripe-go/v85"
 
-	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -49,12 +48,11 @@ type FakeStore struct {
 	ResolvedPMs        []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
 	ActivatedCustomers []string                            // stripe_customer_id values from StampAccountActivated
 
-	AppliedInvoices   []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
-	CreditSettlements []CreditSettlementCall             // invoice.paid wallet settlement calls
-	RelaxedInvoices   []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
-	FailedInvoices    []string                           // stripe_invoice_id values from MarkInvoiceFailed
-	FraudFlags        []FraudFlag                        // captured calls to FlagPaymentMethodFraud
-	insertedDefaults  map[string]bool                    // advisory is_default by stripe_payment_method_id
+	AppliedInvoices  []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
+	RelaxedInvoices  []string                           // stripe_invoice_id values from RelaxCollectionOnPaidInvoice
+	FailedInvoices   []string                           // stripe_invoice_id values from MarkInvoiceFailed
+	FraudFlags       []FraudFlag                        // captured calls to FlagPaymentMethodFraud
+	insertedDefaults map[string]bool                    // advisory is_default by stripe_payment_method_id
 
 	// Found-flag knobs
 	TouchedFound        bool // returned by TouchAccountByStripeCustomer
@@ -65,7 +63,6 @@ type FakeStore struct {
 	Relaxed             bool // returned by RelaxCollectionOnPaidInvoice
 	FraudFound          bool // returned by FlagPaymentMethodFraud
 	ActivatedNew        bool // returned by StampAccountActivated (firstBind)
-	CreditSettlement    creditledger.Settlement
 
 	// Error injection
 	ErrMark         error // from MarkEventProcessed
@@ -77,20 +74,10 @@ type FakeStore struct {
 	ErrStamp        error // from SetAddCardRequestStripePM
 	ErrResolve      error // from ResolvePendingAddCardRequest
 	ErrApplyInvoice error // from ApplyInvoiceStatus
-	ErrSettleCredit error // from SettleCreditInvoice
 	ErrRelax        error // from RelaxCollectionOnPaidInvoice
 	ErrMarkFailed   error // from MarkInvoiceFailed
 	ErrFlagFraud    error // from FlagPaymentMethodFraud
 	ErrActivate     error // from StampAccountActivated
-}
-
-// CreditSettlementCall records the paid Stripe facts passed to the shared
-// wallet settler before the ordinary invoice-mirror path.
-type CreditSettlementCall struct {
-	StripeInvoiceID string
-	AmountPaidCents int64
-	Currency        string
-	ReceiptURL      string
 }
 
 // FraudFlag records one FlagPaymentMethodFraud call.
@@ -206,25 +193,6 @@ func (s *FakeStore) ApplyInvoiceStatus(_ context.Context, params webhook.ApplyIn
 	}
 	s.AppliedInvoices = append(s.AppliedInvoices, params)
 	return s.InvoiceFound, nil
-}
-
-func (s *FakeStore) SettleCreditInvoice(
-	_ context.Context,
-	stripeInvoiceID string,
-	amountPaidCents int64,
-	currency string,
-	receiptURL string,
-) (creditledger.Settlement, error) {
-	if s.ErrSettleCredit != nil {
-		return creditledger.Settlement{}, s.ErrSettleCredit
-	}
-	s.CreditSettlements = append(s.CreditSettlements, CreditSettlementCall{
-		StripeInvoiceID: stripeInvoiceID,
-		AmountPaidCents: amountPaidCents,
-		Currency:        currency,
-		ReceiptURL:      receiptURL,
-	})
-	return s.CreditSettlement, nil
 }
 
 func (s *FakeStore) RelaxCollectionOnPaidInvoice(_ context.Context, stripeInvoiceID string) (bool, error) {

@@ -83,6 +83,44 @@ func TestSettleStripeInvoice_PaidIsHighestForFailedAutoTopUp(t *testing.T) {
 	require.Equal(t, int64(5_000_000), settledBalance(t, pool, accountID))
 }
 
+func TestSettleManualStripeInvoice_PaidIsHighestForFailedPurchase(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := creditledger.NewStore(pool)
+	accountID := seedCreditAccount(t, pool)
+	ledgerID := seedManualPurchase(
+		t,
+		pool,
+		accountID,
+		"in_manual_late_paid",
+		"failed",
+		5_000_000,
+	)
+
+	result, err := store.SettleManualStripeInvoice(
+		context.Background(),
+		"in_manual_late_paid",
+		500,
+		"usd",
+		"https://stripe.test/in_manual_late_paid",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, creditledger.Settlement{
+		Found: true, Transitioned: true,
+		AccountID: accountID, LedgerID: ledgerID, Type: "purchase",
+	}, result)
+	status, balanceAfter, failureCode, receiptURL := readCreditAttempt(
+		t,
+		pool,
+		ledgerID,
+	)
+	require.Equal(t, "settled", status)
+	require.Equal(t, int64(5_000_000), balanceAfter)
+	require.Empty(t, failureCode)
+	require.Equal(t, "https://stripe.test/in_manual_late_paid", receiptURL)
+	require.Equal(t, int64(5_000_000), settledBalance(t, pool, accountID))
+}
+
 func TestSettleStripeInvoice_AmountCurrencyAndUnknownFailuresDoNotMutate(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := creditledger.NewStore(pool)

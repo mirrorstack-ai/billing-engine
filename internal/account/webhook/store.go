@@ -9,7 +9,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 )
 
@@ -20,16 +19,14 @@ func NewStore(pool *pgxpool.Pool) Store {
 		panic("webhook.NewStore: pool must not be nil")
 	}
 	return &pgxStore{
-		pool:    pool,
-		q:       db.New(pool),
-		credits: creditledger.NewStore(pool),
+		pool: pool,
+		q:    db.New(pool),
 	}
 }
 
 type pgxStore struct {
-	pool    *pgxpool.Pool
-	q       *db.Queries
-	credits *creditledger.Store
+	pool *pgxpool.Pool
+	q    *db.Queries
 }
 
 // MarkEventProcessed inserts the event_id into webhook_events_processed
@@ -314,25 +311,6 @@ func (s *pgxStore) ApplyInvoiceStatus(ctx context.Context, params ApplyInvoiceSt
 		return false, err
 	}
 	return rows > 0, nil
-}
-
-// SettleCreditInvoice delegates to the manual-purchase-only wallet settlement
-// transaction. Auto-top-ups fail closed here and must instead pass the
-// executor's resource-authoritative Stripe re-read.
-func (s *pgxStore) SettleCreditInvoice(
-	ctx context.Context,
-	stripeInvoiceID string,
-	amountPaidCents int64,
-	currency string,
-	receiptURL string,
-) (creditledger.Settlement, error) {
-	return s.credits.SettleManualStripeInvoice(
-		ctx,
-		stripeInvoiceID,
-		amountPaidCents,
-		currency,
-		receiptURL,
-	)
 }
 
 // RelaxCollectionOnPaidInvoice re-trusts a prepaid account back to arrears when

@@ -3,6 +3,7 @@ package cycle_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"testing"
@@ -61,7 +62,17 @@ type fakeStore struct {
 	walletDraws       map[string][]fakeWalletDraw
 	walletDrawOrder   []uuid.UUID
 	walletUnallocated int64
+	walletModeCalls   int
 	walletStateCalls  int
+	walletDrawCalls   int
+	// beforeBillingRunWalletDraw fires after RunBillingCycle's top marker read
+	// but before the atomic draw begins, modeling a competing daemon freezing
+	// the same run in that exact race window.
+	beforeBillingRunWalletDraw func(*fakeStore, uuid.UUID)
+	// errAfterBoundaryWalletCommit models process death after the atomic
+	// ledger+run-marker transaction committed but before RunBillingCycle could
+	// make any terminal run write. It fires once.
+	errAfterBoundaryWalletCommit error
 	// beforeWalletCreditState fires once (one-shot) at the top of WalletCreditState
 	// — the seam a test uses to model a concurrent worker mutating a timer between
 	// the charging worker's pending re-check and its WalletCreditState read (the
@@ -422,9 +433,9 @@ func (f *fakeStore) UpsertDeveloperSettlement(_ context.Context, periodID, _ uui
 	return nil
 }
 
-func (f *fakeStore) InsertBillingRun(_ context.Context, accountID uuid.UUID, start, end time.Time) (uuid.UUID, bool, error) {
+func (f *fakeStore) InsertBillingRun(_ context.Context, accountID uuid.UUID, start, end time.Time) (uuid.UUID, bool, bool, error) {
 	if f.errInsertRun != nil {
-		return uuid.Nil, false, f.errInsertRun
+		return uuid.Nil, false, false, f.errInsertRun
 	}
 	k := runKey(accountID, start, end)
 	if id, exists := f.insertedRuns[k]; exists {
@@ -433,15 +444,15 @@ func (f *fakeStore) InsertBillingRun(_ context.Context, accountID uuid.UUID, sta
 		// false); any non-terminal row (skipped_no_pm / failed / pending) is
 		// RECLAIMED — same id, reset to pending, shouldCharge=true.
 		if f.runStatus[id] == cycle.RunStatusInvoiced {
-			return id, false, nil
+			return id, false, false, nil
 		}
 		f.runStatus[id] = "pending"
-		return id, true, nil
+		return id, true, true, nil
 	}
 	id := uuid.New()
 	f.insertedRuns[k] = id
 	f.runStatus[id] = "pending"
-	return id, true, nil
+	return id, true, false, nil
 }
 
 func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time.Time) (int64, error) {
@@ -449,6 +460,11 @@ func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time
 		return 0, f.errTotal
 	}
 	return f.chargedTotal, nil
+}
+
+func (f *fakeStore) CreditBillingMode(_ context.Context, _ uuid.UUID) (cycle.CreditBillingMode, error) {
+	f.walletModeCalls++
+	return f.walletMode, nil
 }
 
 func (f *fakeStore) WalletCreditState(_ context.Context, accountID uuid.UUID, start, end time.Time) (cycle.WalletCreditState, error) {
@@ -477,6 +493,7 @@ func (f *fakeStore) WalletCreditState(_ context.Context, accountID uuid.UUID, st
 }
 
 func (f *fakeStore) DrawWalletCredits(_ context.Context, accountID uuid.UUID, start, end time.Time, amountMicros int64, allowNew bool) (cycle.WalletDrawdown, error) {
+	f.walletDrawCalls++
 	key := runKey(accountID, start, end)
 	if prior := f.walletDraws[key]; len(prior) > 0 {
 		var total int64
@@ -555,6 +572,70 @@ func (f *fakeStore) DrawWalletCredits(_ context.Context, accountID uuid.UUID, st
 		left = 0
 	}
 	return cycle.WalletDrawdown{Mode: f.walletMode, DrawnMicros: target}, nil
+}
+
+func (f *fakeStore) DrawBillingRunWalletCredits(
+	ctx context.Context,
+	runID, accountID uuid.UUID,
+	start, end time.Time,
+	boundaryTotalMicros int64,
+	withBase, allowNew bool,
+) (cycle.WalletDrawdown, error) {
+	if f.beforeBillingRunWalletDraw != nil {
+		hook := f.beforeBillingRunWalletDraw
+		f.beforeBillingRunWalletDraw = nil
+		hook(f, runID)
+	}
+	if frozen, exists := f.frozenCharges[runID]; exists {
+		// A marker that won before the transaction's run-row lock forbids any
+		// fresh debit, but an already-recorded period debit is recoverable.
+		draw, err := f.DrawWalletCredits(
+			ctx,
+			accountID,
+			start,
+			end,
+			boundaryTotalMicros,
+			false,
+		)
+		draw.BoundaryCharge = frozen
+		draw.BoundaryChargeFrozen = true
+		return draw, err
+	}
+	draw, err := f.DrawWalletCredits(
+		ctx,
+		accountID,
+		start,
+		end,
+		boundaryTotalMicros,
+		allowNew,
+	)
+	if err != nil {
+		return cycle.WalletDrawdown{}, err
+	}
+	if draw.DrawnMicros > 0 && boundaryTotalMicros > 0 {
+		remainderMicros := boundaryTotalMicros - draw.DrawnMicros
+		if remainderMicros < 0 {
+			remainderMicros = 0
+		}
+		remainderCents := remainderMicros / 10_000
+		if remainderMicros%10_000 >= 5_000 {
+			remainderCents++
+		}
+		if _, exists := f.frozenCharges[runID]; !exists {
+			f.frozenCharges[runID] = cycle.FrozenBoundaryCharge{
+				Cents:    remainderCents,
+				WithBase: withBase,
+			}
+		}
+		draw.BoundaryCharge = f.frozenCharges[runID]
+		draw.BoundaryChargeFrozen = true
+		if f.errAfterBoundaryWalletCommit != nil {
+			err := f.errAfterBoundaryWalletCommit
+			f.errAfterBoundaryWalletCommit = nil
+			return draw, err
+		}
+	}
+	return draw, nil
 }
 
 func (f *fakeStore) HasUsableDefaultPM(_ context.Context, accountID uuid.UUID) (bool, error) {
@@ -662,8 +743,14 @@ func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, c
 	if f.onFreezeCharge != nil {
 		f.onFreezeCharge(runID)
 	}
+	if f.runStatus[runID] == cycle.RunStatusInvoiced {
+		return cycle.FrozenBoundaryCharge{}, fmt.Errorf(
+			"billing run %s has no frozen charge immediately after freezing",
+			runID,
+		)
+	}
 	// First-write-wins, returning the SURVIVING value (mirrors the SQL's
-	// WHERE frozen_charge_cents IS NULL + read-back).
+	// WHERE frozen_charge_cents IS NULL AND status <> 'invoiced' + read-back).
 	if _, exists := f.frozenCharges[runID]; !exists {
 		f.frozenCharges[runID] = charge
 	}
@@ -1146,11 +1233,12 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 
 // DrawCreationProrationFromWallet models the pgxStore's atomic wallet-settled
 // creation proration (billing-engine #99): it re-checks the terminal state, then
+// re-reads the durable mode under the account "lock" (a concurrent non-credits
+// mode returns ProrationWalletDeferToStripe before touching any source), then
 // draws the amount from the wallet sources in the SAME consumption order as
 // DrawWalletCredits (a credits account spends through zero into its unsecured
-// remainder; a standard account that cannot fully cover draws NOTHING and returns
-// ProrationWalletShort), and only on a full cover freezes the snapshot(s) and
-// arms the guard — exactly what the real single tx does.
+// remainder), and only on a full cover freezes the snapshot(s) and arms the guard
+// — exactly what the real single tx does.
 func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uuid.UUID, pc cycle.ProrationWalletCharge) (cycle.ProrationOutcome, string, error) {
 	f.creationWalletDrawCalls++
 	if f.errDrawCreationWallet != nil {
@@ -1175,6 +1263,9 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 		return cycle.ProrationLockedAlreadyCharged, app.ProrationInvoiceID, nil
 	}
 	if app.ProrationAttempted {
+		return cycle.ProrationWalletDeferToStripe, "", nil
+	}
+	if f.walletMode != cycle.CreditBillingModeCredits {
 		return cycle.ProrationWalletDeferToStripe, "", nil
 	}
 	if len(f.creationWalletOutcomes) > 0 {
@@ -1221,19 +1312,6 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 		return a.id.String() < b.id.String()
 	})
 
-	// Standard mode cannot fully cover from its spendable lots → unsettled (no
-	// draw, never Stripe). Credits mode always fully covers via the unsecured
-	// remainder below.
-	if f.walletMode == cycle.CreditBillingModeStandard {
-		var available int64
-		for _, source := range sources {
-			available += source.remaining
-		}
-		if available < pc.AmountMicros {
-			return cycle.ProrationWalletShort, "", nil
-		}
-	}
-
 	left := pc.AmountMicros
 	for _, source := range sources {
 		if left == 0 {
@@ -1249,9 +1327,6 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 		f.walletDrawOrder = append(f.walletDrawOrder, source.id)
 	}
 	if left > 0 {
-		if f.walletMode != cycle.CreditBillingModeCredits {
-			return cycle.ProrationWalletShort, "", nil
-		}
 		f.creationDrawn[appID] += left
 		f.walletUnallocated += left
 		left = 0
@@ -1539,11 +1614,12 @@ func (f *fakeStore) MarkModuleTimerCharged(_ context.Context, timerID uuid.UUID,
 
 // DrawModuleOverageFromWallet models the pgxStore's atomic wallet-settled module
 // overage (billing-engine Job 3, mirrors the DrawCreationProrationFromWallet fake):
-// it re-checks the terminal timer state UNDER the "lock", then draws from the wallet
-// sources in the SAME consumption order (a credits account spends through zero into
-// its unsecured remainder; a standard account that cannot fully cover draws NOTHING
-// and returns ModuleOverageWalletShort), and only on a full cover arms the SAME
-// per-timer guard the Stripe leg arms — exactly what the real single tx does.
+// it re-checks the terminal timer state UNDER the "lock", re-reads the durable
+// mode under the account "lock" (a concurrent non-credits mode returns
+// ModuleOverageWalletDeferToStripe before touching any source), then draws from
+// the wallet sources in the SAME consumption order (a credits account spends
+// through zero into its unsecured remainder), and only on a full cover arms the
+// SAME per-timer guard the Stripe leg arms — exactly what the real single tx does.
 func (f *fakeStore) DrawModuleOverageFromWallet(_ context.Context, timerID uuid.UUID, mc cycle.ModuleOverageWalletCharge) (cycle.ModuleOverageWalletOutcome, string, error) {
 	f.moduleOverageDrawCalls++
 	if f.errDrawModuleOverageWallet != nil {
@@ -1562,6 +1638,9 @@ func (f *fakeStore) DrawModuleOverageFromWallet(_ context.Context, timerID uuid.
 		return cycle.ModuleOverageWalletLockedStale, "", nil
 	}
 	if !t.chargeAttemptedAt.IsZero() {
+		return cycle.ModuleOverageWalletDeferToStripe, "", nil
+	}
+	if f.walletMode != cycle.CreditBillingModeCredits {
 		return cycle.ModuleOverageWalletDeferToStripe, "", nil
 	}
 	if len(f.moduleOverageWalletOutcomes) > 0 {
@@ -1608,19 +1687,6 @@ func (f *fakeStore) DrawModuleOverageFromWallet(_ context.Context, timerID uuid.
 		return a.id.String() < b.id.String()
 	})
 
-	// Standard mode cannot fully cover from its spendable lots → unsettled (no
-	// draw, never Stripe). Credits mode always fully covers via the unsecured
-	// remainder below.
-	if f.walletMode == cycle.CreditBillingModeStandard {
-		var available int64
-		for _, source := range sources {
-			available += source.remaining
-		}
-		if available < mc.AmountMicros {
-			return cycle.ModuleOverageWalletShort, "", nil
-		}
-	}
-
 	left := mc.AmountMicros
 	for _, source := range sources {
 		if left == 0 {
@@ -1636,9 +1702,6 @@ func (f *fakeStore) DrawModuleOverageFromWallet(_ context.Context, timerID uuid.
 		f.walletDrawOrder = append(f.walletDrawOrder, source.id)
 	}
 	if left > 0 {
-		if f.walletMode != cycle.CreditBillingModeCredits {
-			return cycle.ModuleOverageWalletShort, "", nil
-		}
 		f.moduleOverageDrawn[timerID] += left
 		f.walletUnallocated += left
 		left = 0

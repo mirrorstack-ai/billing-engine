@@ -373,6 +373,23 @@ type SetAutoTopUpResponse struct {
 	AutoTopUp AutoTopUpConfig `json:"auto_topup"`
 }
 
+// RecoverAutoTopUpRequest explicitly resumes only the owner's already-durable
+// pending automatic top-up. It carries no amount, customer, invoice, or card
+// identity: those facts stay frozen on the authorized attempt.
+type RecoverAutoTopUpRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+}
+
+// RecoverAutoTopUpResponse reports the durable attempt state observed after
+// recovery. Recovered is false when the owner has no pending attempt.
+type RecoverAutoTopUpResponse struct {
+	Recovered   bool   `json:"recovered"`
+	AttemptID   string `json:"attempt_id,omitempty"`
+	Status      string `json:"status,omitempty"`
+	FailureCode string `json:"failure_code,omitempty"`
+}
+
 // SetCustomerBillingModeRequest supports the pinned owner/distributor fields.
 // CreditLimitMicros is additive and optional: omitting it while enabling
 // credits applies the platform's $5 default; a pointer preserves explicit 0.

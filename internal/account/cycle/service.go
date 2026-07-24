@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -25,6 +27,11 @@ type Service struct {
 	stripe        billingstripe.Client
 	nowFn         func() time.Time
 	walletEnabled bool
+	// creditRollout is the immutable, account-scoped production rollout
+	// controller. nil deliberately preserves the component-test behavior of
+	// WithCreditWallet(true); production roots install a controller so an
+	// off/excluded account returns before any migration-048 wallet read.
+	creditRollout *rollout.Controller
 	// bill is the ONE audited account-bill pricing spine (usage.Service),
 	// injected via WithAccountBill. ListSponsoredOrgs reuses it to price each
 	// sponsored org's current-window total instead of growing a second rollup.
@@ -177,6 +184,135 @@ func (s *Service) WithNow(now func() time.Time) *Service {
 func (s *Service) WithCreditWallet(enabled bool) *Service {
 	s.walletEnabled = enabled
 	return s
+}
+
+// WithCreditRollout installs the immutable account-scoped rollout controller
+// used by the cycle money paths. The controller never enables the wallet by
+// itself: WithCreditWallet(true) remains the startup schema-capability gate.
+//
+// Off/excluded accounts execute the exact legacy Stripe path without reading
+// accounts.billing_mode or credit_ledger. Shadow-selected accounts may perform
+// only the read-only classification probe and always preserve Stripe. Enforce
+// first classifies through accounts.billing_mode alone; standard stays on the
+// legacy path without a credit_ledger read, while credits may enter the wallet
+// graph.
+func (s *Service) WithCreditRollout(controller *rollout.Controller) *Service {
+	s.creditRollout = controller
+	return s
+}
+
+// creditBillingModeReader is intentionally narrower than Store. Production's
+// pgxStore implements it with a single accounts.billing_mode SELECT, while
+// legacy component fakes need not implement it unless they exercise rollout.
+type creditBillingModeReader interface {
+	CreditBillingMode(context.Context, uuid.UUID) (CreditBillingMode, error)
+}
+
+// creditWalletChargeState selects a wallet charge rail before invoking any
+// wallet graph. walletAllowed is the sole authorization consumed by the three
+// cycle mutation legs; a returned state from shadow is diagnostic only.
+func (s *Service) creditWalletChargeState(
+	ctx context.Context,
+	accountID uuid.UUID,
+	periodStart, periodEnd time.Time,
+) (state WalletCreditState, walletAllowed bool, err error) {
+	state.Mode = CreditBillingModeStandard
+	if !s.walletEnabled {
+		return state, false, nil
+	}
+
+	// Preserve existing isolated component semantics. Production roots install
+	// a controller; this fallback keeps the already-audited wallet component
+	// tests useful without manufacturing rollout configuration in every case.
+	if s.creditRollout == nil {
+		state, err = s.store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+		return state, err == nil, err
+	}
+
+	decision := s.creditRollout.Decide(accountID)
+	if !decision.Selected {
+		return state, false, nil
+	}
+
+	reader, ok := s.store.(creditBillingModeReader)
+	if !ok {
+		err = errors.New("cycle store does not implement the credit billing-mode probe")
+		s.creditRollout.Observe(decision, 0, err)
+		if decision.Shadowed() {
+			slog.ErrorContext(ctx, "credit wallet shadow classification failed; preserving Stripe path",
+				"error", err)
+			return state, false, nil
+		}
+		return state, false, err
+	}
+
+	if decision.Shadowed() {
+		var observed WalletCreditState
+		result := s.creditRollout.CompareBoolean(
+			ctx,
+			accountID,
+			false, // the legacy route does not enter the wallet money graph
+			rollout.ReadOnlyBooleanEvaluatorFunc(func(ctx context.Context, accountID uuid.UUID) (bool, error) {
+				mode, err := reader.CreditBillingMode(ctx, accountID)
+				if err != nil {
+					return false, err
+				}
+				if mode == CreditBillingModeStandard {
+					// Classification is sufficient: a standard account has no
+					// wallet money path to compare, so shadow must not read the
+					// credit ledger.
+					observed.Mode = CreditBillingModeStandard
+					return false, nil
+				}
+				observed, err = s.store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+				if err != nil {
+					return false, err
+				}
+				if observed.Mode != mode {
+					return false, fmt.Errorf(
+						"credit billing mode changed during shadow classification: account=%s mode=%s state_mode=%s",
+						accountID, mode, observed.Mode,
+					)
+				}
+				return mode == CreditBillingModeCredits, nil
+			}),
+		)
+		if result.Err != nil {
+			// Shadow telemetry must never become a money-path outage or move the
+			// account away from the exact legacy Stripe behavior.
+			slog.ErrorContext(ctx, "credit wallet shadow classification failed; preserving Stripe path",
+				"account_id", accountID, "error", result.Err)
+			return state, false, nil
+		}
+		return observed, false, nil
+	}
+
+	started := time.Now()
+	mode, err := reader.CreditBillingMode(ctx, accountID)
+	if err != nil {
+		s.creditRollout.Observe(decision, time.Since(started), err)
+		return state, false, err
+	}
+	state.Mode = mode
+	if mode == CreditBillingModeStandard {
+		// This is the critical selected-standard no-touch boundary: no
+		// WalletCreditState call, hence no credit_ledger access.
+		s.creditRollout.Observe(decision, time.Since(started), nil)
+		return state, false, nil
+	}
+
+	state, err = s.store.WalletCreditState(ctx, accountID, periodStart, periodEnd)
+	if err == nil && state.Mode != mode {
+		err = fmt.Errorf(
+			"credit billing mode changed during enforce classification: account=%s mode=%s state_mode=%s",
+			accountID, mode, state.Mode,
+		)
+	}
+	s.creditRollout.Observe(decision, time.Since(started), err)
+	if err != nil {
+		return WalletCreditState{Mode: CreditBillingModeStandard}, false, err
+	}
+	return state, true, nil
 }
 
 // WithAccountBill injects the account-bill pricing spine ListSponsoredOrgs
