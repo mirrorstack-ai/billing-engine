@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
@@ -23,6 +24,12 @@ func TestNewClient(t *testing.T) {
 	// assignment. This var declaration would fail to build if
 	// NewClient's return type didn't satisfy Client.
 	var _ Client = c
+}
+
+func TestNewAutoTopUpClient(t *testing.T) {
+	c := NewAutoTopUpClient("sk_test_dummy")
+	require.NotNil(t, c)
+	var _ AutoTopUpClient = c
 }
 
 func TestNewVerifier(t *testing.T) {
@@ -80,13 +87,21 @@ func TestItemPeriodParams(t *testing.T) {
 
 func TestProjectInvoice_ConfirmationSecret(t *testing.T) {
 	got := projectInvoice(&stripego.Invoice{
-		ID: "in_credit_purchase",
+		ID:                   "in_credit_purchase",
+		Total:                501,
+		CollectionMethod:     stripego.InvoiceCollectionMethodChargeAutomatically,
+		AutoAdvance:          false,
+		DefaultPaymentMethod: &stripego.PaymentMethod{ID: "pm_frozen"},
 		ConfirmationSecret: &stripego.InvoiceConfirmationSecret{
 			ClientSecret: "pi_secret_for_client",
 		},
 	})
 
 	require.Equal(t, "pi_secret_for_client", got.ClientSecret)
+	require.Equal(t, int64(501), got.Total)
+	require.Equal(t, "charge_automatically", got.CollectionMethod)
+	require.False(t, got.AutoAdvance)
+	require.Equal(t, "pm_frozen", got.DefaultPaymentMethodID)
 }
 
 func TestFinalizeInvoice_ExpandsAndProjectsConfirmationSecret(t *testing.T) {
@@ -140,12 +155,248 @@ func TestGetInvoice_ExpandsAndProjectsConfirmationSecret(t *testing.T) {
 	require.Equal(t, "pi_secret_from_get", got.ClientSecret)
 }
 
+func TestCreateAutoTopUpInvoice_PinsSelectedMethodAndRemainsInert(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodPost,
+		wantPath:   "/v1/invoices",
+		response: stripego.Invoice{
+			ID: "in_topup",
+		},
+		checkParams: func(params stripego.ParamsContainer) {
+			got, ok := params.(*stripego.InvoiceParams)
+			require.True(t, ok)
+			require.Equal(t, "cus_frozen", *got.Customer)
+			require.Equal(t, "pm_frozen", *got.DefaultPaymentMethod)
+			require.Equal(t, string(stripego.InvoiceCollectionMethodChargeAutomatically), *got.CollectionMethod)
+			require.NotNil(t, got.AutoAdvance)
+			require.False(t, *got.AutoAdvance)
+			require.Equal(t, "exclude", *got.PendingInvoiceItemsBehavior)
+			require.Equal(t, map[string]string{
+				"ms_charge_ref":       "credit-auto-topup:attempt-1",
+				"ms_credit_operation": "auto_topup",
+			}, got.Metadata)
+			require.Equal(t, "credit-auto-topup-invoice:attempt-1", *got.IdempotencyKey)
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.CreateAutoTopUpInvoice(
+		context.Background(),
+		"cus_frozen",
+		"pm_frozen",
+		"credit-auto-topup:attempt-1",
+		"credit-auto-topup-invoice:attempt-1",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "in_topup", got.ID)
+}
+
+func TestListInvoiceItems_FiltersOneInvoiceAndProjectsResourceTruth(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodGet,
+		wantPath:   "/v1/invoiceitems",
+		rawListResult: &stripego.InvoiceItemList{
+			ListMeta: stripego.ListMeta{HasMore: false},
+			Data: []*stripego.InvoiceItem{
+				{ID: "ii_one", Amount: 500, Currency: stripego.CurrencyUSD},
+				{ID: "ii_two", Amount: 250, Currency: stripego.CurrencyEUR},
+			},
+		},
+		checkRawParams: func(values url.Values) {
+			require.Equal(t, "in_topup", values.Get("invoice"))
+			require.Equal(t, "100", values.Get("limit"))
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.ListInvoiceItems(context.Background(), "in_topup")
+
+	require.NoError(t, err)
+	require.Equal(t, []InvoiceItem{
+		{ID: "ii_one", AmountCents: 500, Currency: "usd"},
+		{ID: "ii_two", AmountCents: 250, Currency: "eur"},
+	}, got)
+}
+
+func TestListInvoicePayments_FiltersPaidAndProjectsFrozenCardProof(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodGet,
+		wantPath:   "/v1/invoice_payments",
+		rawPaymentList: &stripego.InvoicePaymentList{
+			ListMeta: stripego.ListMeta{HasMore: false},
+			Data: []*stripego.InvoicePayment{{
+				ID:              "inpay_exact",
+				Invoice:         &stripego.Invoice{ID: "in_topup"},
+				Status:          "paid",
+				IsDefault:       true,
+				AmountPaid:      500,
+				AmountRequested: 500,
+				Currency:        stripego.CurrencyUSD,
+				Payment: &stripego.InvoicePaymentPayment{
+					Type: stripego.InvoicePaymentPaymentTypePaymentIntent,
+					PaymentIntent: &stripego.PaymentIntent{
+						ID:             "pi_exact",
+						Status:         stripego.PaymentIntentStatusSucceeded,
+						Customer:       &stripego.Customer{ID: "cus_frozen"},
+						PaymentMethod:  &stripego.PaymentMethod{ID: "pm_frozen"},
+						Amount:         500,
+						AmountReceived: 500,
+						Currency:       stripego.CurrencyUSD,
+					},
+				},
+			}},
+		},
+		checkRawParams: func(values url.Values) {
+			require.Equal(t, "in_topup", values.Get("invoice"))
+			require.Equal(t, "paid", values.Get("status"))
+			require.Equal(t, "100", values.Get("limit"))
+			require.Equal(t,
+				"data.payment.payment_intent.customer",
+				values.Get("expand[0]"),
+			)
+			require.Equal(t,
+				"data.payment.payment_intent.payment_method",
+				values.Get("expand[1]"),
+			)
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.ListInvoicePayments(context.Background(), "in_topup")
+
+	require.NoError(t, err)
+	require.Equal(t, []InvoicePaymentProof{{
+		ID:                    "inpay_exact",
+		InvoiceID:             "in_topup",
+		Status:                "paid",
+		IsDefault:             true,
+		AmountPaid:            500,
+		AmountRequested:       500,
+		Currency:              "usd",
+		PaymentType:           "payment_intent",
+		PaymentIntentID:       "pi_exact",
+		PaymentIntentStatus:   "succeeded",
+		PaymentIntentCustomer: "cus_frozen",
+		PaymentMethodID:       "pm_frozen",
+		PaymentIntentAmount:   500,
+		AmountReceived:        500,
+		PaymentIntentCurrency: "usd",
+	}}, got)
+}
+
+func TestFinalizeInvoiceWithoutAutoAdvance_ExplicitlyStaysInert(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodPost,
+		wantPath:   "/v1/invoices/in_topup/finalize",
+		response:   stripego.Invoice{ID: "in_topup", Status: stripego.InvoiceStatusOpen},
+		checkParams: func(params stripego.ParamsContainer) {
+			got, ok := params.(*stripego.InvoiceFinalizeInvoiceParams)
+			require.True(t, ok)
+			require.NotNil(t, got.AutoAdvance)
+			require.False(t, *got.AutoAdvance)
+			require.Equal(t, "credit-auto-topup-finalize:attempt-1", *got.IdempotencyKey)
+			require.Len(t, got.Expand, 1)
+			require.Equal(t, "confirmation_secret", *got.Expand[0])
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.FinalizeInvoiceWithoutAutoAdvance(
+		context.Background(),
+		"in_topup",
+		"credit-auto-topup-finalize:attempt-1",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "open", got.Status)
+}
+
+func TestPayInvoiceWithMethod_PinsFrozenMethodOffSessionAndIdempotency(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodPost,
+		wantPath:   "/v1/invoices/in_topup/pay",
+		response:   stripego.Invoice{ID: "in_topup", Status: stripego.InvoiceStatusPaid},
+		checkParams: func(params stripego.ParamsContainer) {
+			got, ok := params.(*stripego.InvoicePayParams)
+			require.True(t, ok)
+			require.Equal(t, "pm_frozen", *got.PaymentMethod)
+			require.NotNil(t, got.OffSession)
+			require.True(t, *got.OffSession)
+			require.Equal(t, "credit-auto-topup-pay:attempt-1", *got.IdempotencyKey)
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.PayInvoiceWithMethod(
+		context.Background(),
+		"in_topup",
+		"pm_frozen",
+		"credit-auto-topup-pay:attempt-1",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "paid", got.Status)
+}
+
+func TestVoidInvoice_UsesDeterministicIdempotency(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodPost,
+		wantPath:   "/v1/invoices/in_topup/void",
+		response:   stripego.Invoice{ID: "in_topup", Status: stripego.InvoiceStatusVoid},
+		checkParams: func(params stripego.ParamsContainer) {
+			got, ok := params.(*stripego.InvoiceVoidInvoiceParams)
+			require.True(t, ok)
+			require.Equal(t, "credit-auto-topup-void:attempt-1", *got.IdempotencyKey)
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.VoidInvoice(
+		context.Background(),
+		"in_topup",
+		"credit-auto-topup-void:attempt-1",
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "void", got.Status)
+}
+
+func TestDeleteDraftInvoice_UsesExactResourceAndProjectsDeletion(t *testing.T) {
+	backend := &invoiceTestBackend{
+		t:          t,
+		wantMethod: http.MethodDelete,
+		wantPath:   "/v1/invoices/in_topup",
+		response:   stripego.Invoice{ID: "in_topup", Deleted: true},
+		checkParams: func(params stripego.ParamsContainer) {
+			_, ok := params.(*stripego.InvoiceParams)
+			require.True(t, ok)
+		},
+	}
+	client := testRealClient(backend)
+
+	got, err := client.DeleteDraftInvoice(context.Background(), "in_topup")
+
+	require.NoError(t, err)
+	require.Equal(t, "in_topup", got.ID)
+	require.True(t, got.Deleted)
+}
+
 type invoiceTestBackend struct {
-	t           *testing.T
-	wantMethod  string
-	wantPath    string
-	checkParams func(stripego.ParamsContainer)
-	response    stripego.Invoice
+	t              *testing.T
+	wantMethod     string
+	wantPath       string
+	checkParams    func(stripego.ParamsContainer)
+	checkRawParams func(url.Values)
+	response       stripego.Invoice
+	rawListResult  *stripego.InvoiceItemList
+	rawPaymentList *stripego.InvoicePaymentList
 }
 
 func (b *invoiceTestBackend) Call(method, path, _ string, params stripego.ParamsContainer, v stripego.LastResponseSetter) error {
@@ -163,8 +414,26 @@ func (*invoiceTestBackend) CallStreaming(string, string, string, stripego.Params
 	panic("unexpected streaming Stripe call")
 }
 
-func (*invoiceTestBackend) CallRaw(string, string, string, []byte, *stripego.Params, stripego.LastResponseSetter) error {
-	panic("unexpected raw Stripe call")
+func (b *invoiceTestBackend) CallRaw(method, path, _ string, body []byte, _ *stripego.Params, v stripego.LastResponseSetter) error {
+	b.t.Helper()
+	require.Equal(b.t, b.wantMethod, method)
+	require.Equal(b.t, b.wantPath, path)
+	values, err := url.ParseQuery(string(body))
+	require.NoError(b.t, err)
+	if b.checkRawParams != nil {
+		b.checkRawParams(values)
+	}
+	switch got := v.(type) {
+	case *stripego.InvoiceItemList:
+		require.NotNil(b.t, b.rawListResult, "unexpected invoice-item list call")
+		*got = *b.rawListResult
+	case *stripego.InvoicePaymentList:
+		require.NotNil(b.t, b.rawPaymentList, "unexpected invoice-payment list call")
+		*got = *b.rawPaymentList
+	default:
+		b.t.Fatalf("unexpected raw Stripe response type %T", v)
+	}
+	return nil
 }
 
 func (*invoiceTestBackend) CallMultipart(string, string, string, string, *bytes.Buffer, *stripego.Params, stripego.LastResponseSetter) error {

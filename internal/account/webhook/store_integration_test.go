@@ -12,6 +12,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook/webhooktest"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
@@ -26,6 +27,71 @@ func TestPgxStore_MarkEventProcessed_FirstTimeAndDuplicate(t *testing.T) {
 	firstTime2, err := store.MarkEventProcessed(context.Background(), "evt_test_1", "customer.created")
 	require.NoError(t, err)
 	require.False(t, firstTime2, "second insert of same event_id should return firstTime=false")
+}
+
+func TestRouter_InvoicePaidSettlesManualCreditWithoutInvoiceMirror(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	accountID := seedAccount(t, pool, "cus_credit_webhook")
+	ledgerID := uuid.New()
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.credit_ledger
+		   (id, account_id, amount_micros, type, status, balance_after_micros,
+		    actor, idempotency_key, stripe_invoice_id)
+		 VALUES ($1, $2, 5000000, 'purchase', 'pending', 5000000,
+		         'self', $3, 'in_credit_webhook')`,
+		ledgerID, accountID, "purchase:"+ledgerID.String(),
+	)
+	require.NoError(t, err)
+
+	verifier := &webhooktest.FakeVerifier{
+		Event: invoiceEvent(
+			"evt_credit_webhook_1",
+			"invoice.paid",
+			"in_credit_webhook",
+			"paid",
+			500,
+			500,
+		),
+	}
+	stripe := &webhooktest.FakeChargeRetriever{}
+	observer := &creditObserver{}
+	router := webhook.NewRouter(
+		verifier,
+		webhook.NewStore(pool),
+		stripe,
+		stripe,
+		webhooktest.SilentLogger(),
+	).WithCreditSettlementObserver(observer)
+
+	result := router.Process(ctx, []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusDriftWarning, result.Status)
+	var (
+		status       string
+		balanceAfter int64
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, balance_after_micros
+		   FROM ms_billing.credit_ledger WHERE id=$1`,
+		ledgerID,
+	).Scan(&status, &balanceAfter))
+	require.Equal(t, "settled", status)
+	require.Equal(t, int64(5_000_000), balanceAfter)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	require.Equal(t, []bool{true}, observer.settlementObservations)
+
+	verifier.Event = invoiceEvent(
+		"evt_credit_webhook_2",
+		"invoice.paid",
+		"in_credit_webhook",
+		"paid",
+		500,
+		500,
+	)
+	result = router.Process(ctx, []byte(`{}`), "sig")
+	require.Equal(t, webhook.StatusDriftWarning, result.Status)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts, "ledger replay must not observe twice")
 }
 
 func TestPgxStore_TouchAccountByStripeCustomer_FoundAndNotFound(t *testing.T) {

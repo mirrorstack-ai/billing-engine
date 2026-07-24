@@ -423,22 +423,36 @@ SELECT
     COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
     COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
     COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
-    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+    COALESCE(auto_topup.payment_method_id::text, '')::text AS auto_topup_payment_method_id,
+    COALESCE(last_attempt.status, '')::text AS auto_topup_last_attempt_status,
+    COALESCE(last_attempt.failure_code, '')::text AS auto_topup_last_failure_code,
+    last_attempt.attempt_expires_at AS auto_topup_pending_until
 FROM ms_billing.accounts account
 LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
        ON auto_topup.account_id = account.id
+LEFT JOIN LATERAL (
+    SELECT status, failure_code, attempt_expires_at
+    FROM ms_billing.credit_ledger
+    WHERE account_id = account.id
+      AND type = 'auto_topup'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+) last_attempt ON true
 WHERE account.id = $1::uuid
 `
 
 type GetCreditStandingSnapshotRow struct {
-	BillingMode              string `json:"billing_mode"`
-	CreditLimitMicros        int64  `json:"credit_limit_micros"`
-	BalanceMicros            int64  `json:"balance_micros"`
-	AutoTopupConfigured      bool   `json:"auto_topup_configured"`
-	AutoTopupEnabled         bool   `json:"auto_topup_enabled"`
-	AutoTopupThresholdMicros int64  `json:"auto_topup_threshold_micros"`
-	AutoTopupAmountMicros    int64  `json:"auto_topup_amount_micros"`
-	AutoTopupPaymentMethodID string `json:"auto_topup_payment_method_id"`
+	BillingMode                string             `json:"billing_mode"`
+	CreditLimitMicros          int64              `json:"credit_limit_micros"`
+	BalanceMicros              int64              `json:"balance_micros"`
+	AutoTopupConfigured        bool               `json:"auto_topup_configured"`
+	AutoTopupEnabled           bool               `json:"auto_topup_enabled"`
+	AutoTopupThresholdMicros   int64              `json:"auto_topup_threshold_micros"`
+	AutoTopupAmountMicros      int64              `json:"auto_topup_amount_micros"`
+	AutoTopupPaymentMethodID   string             `json:"auto_topup_payment_method_id"`
+	AutoTopupLastAttemptStatus string             `json:"auto_topup_last_attempt_status"`
+	AutoTopupLastFailureCode   string             `json:"auto_topup_last_failure_code"`
+	AutoTopupPendingUntil      pgtype.Timestamptz `json:"auto_topup_pending_until"`
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +482,9 @@ func (q *Queries) GetCreditStandingSnapshot(ctx context.Context, accountID strin
 		&i.AutoTopupThresholdMicros,
 		&i.AutoTopupAmountMicros,
 		&i.AutoTopupPaymentMethodID,
+		&i.AutoTopupLastAttemptStatus,
+		&i.AutoTopupLastFailureCode,
+		&i.AutoTopupPendingUntil,
 	)
 	return i, err
 }
@@ -840,7 +857,7 @@ SELECT
     COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
     COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
     COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
-    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+    COALESCE(auto_topup.payment_method_id::text, '')::text AS auto_topup_payment_method_id
 FROM ms_billing.org_billing_designations designation
 JOIN ms_billing.accounts distributor
   ON distributor.id = designation.sponsor_account_id
@@ -1033,7 +1050,7 @@ INSERT INTO ms_billing.credit_auto_topup_configs (
     $2::boolean,
     $3::bigint,
     $4::bigint,
-    NULLIF($5::text, '')
+    NULLIF($5::text, '')::uuid
 )
 ON CONFLICT (account_id) DO UPDATE SET
     enabled = EXCLUDED.enabled,
@@ -1044,7 +1061,7 @@ RETURNING
     enabled,
     threshold_micros,
     amount_micros,
-    COALESCE(payment_method_id, '')::text AS payment_method_id
+    COALESCE(payment_method_id::text, '')::text AS payment_method_id
 `
 
 type UpsertCreditAutoTopUpParams struct {

@@ -30,6 +30,8 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
@@ -89,11 +91,19 @@ func buildRouter() *webhook.Router {
 	verifier := billingstripe.NewVerifier(webhookSecret)
 	store := webhook.NewStore(pool)
 	charges := billingstripe.NewClient(stripeKey)
+	autoTopUpExecutor := autotopup.NewExecutor(
+		autotopup.NewStore(pool),
+		creditledger.NewStore(pool),
+		billingstripe.NewAutoTopUpClient(stripeKey),
+	)
 	// Serving-block notifier (funding-gates C6): pushes standing verdicts to
 	// api-platform after standing-relevant events. Disabled (log-and-skip)
 	// when APPLICATIONS_INTERNAL_URL / INTERNAL_SECRET are unset.
 	notifier := standing.NewNotifierFromEnv(pool, slog.Default())
-	return webhook.NewRouter(verifier, store, charges, charges, slog.Default()).WithServingBlockNotifier(notifier)
+	return webhook.NewRouter(verifier, store, charges, charges, slog.Default()).
+		WithServingBlockNotifier(notifier).
+		WithCreditPaidReconciler(autoTopUpExecutor).
+		WithCreditFailureReconciler(autoTopUpExecutor)
 }
 
 // proxyHandler is the Lambda entrypoint. Uses APIGatewayProxyRequest

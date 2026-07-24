@@ -6,6 +6,8 @@ import (
 	"errors"
 
 	stripego "github.com/stripe/stripe-go/v85"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 )
 
 // handleCustomerCreated is informational — we initiated the customer
@@ -245,6 +247,35 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
 	}
 
+	creditSettlement := creditledger.Settlement{}
+	creditFailure := creditledger.FailureReconciliation{}
+	if event.Type == stripego.EventTypeInvoicePaid {
+		if r.creditPaid != nil {
+			creditSettlement, err = r.creditPaid.ReconcileWebhookPaid(ctx, inv.ID)
+		}
+		if err == nil && !creditSettlement.Found {
+			creditSettlement, err = r.store.SettleCreditInvoice(
+				ctx,
+				inv.ID,
+				inv.AmountPaid,
+				string(inv.Currency),
+				inv.HostedInvoiceURL,
+			)
+		}
+		if err != nil {
+			r.log.ErrorContext(ctx, "invoice.paid credit settlement failed",
+				"event_id", event.ID,
+				"stripe_invoice_id", inv.ID,
+				"error", err,
+			)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		// The settlement transaction has committed. Reconcile the runtime
+		// estimate and release its SETNX block-notification claim exactly once,
+		// before any invoice-mirror early return can bypass the observer.
+		r.observeCreditSettlement(ctx, creditSettlement)
+	}
+
 	// SERVICE-BLOCK failure latch — set BEFORE the found-guard and the status
 	// reconcile, on BOTH failure signals (payment_failed leaves the invoice
 	// 'open'; marked_uncollectible is a terminal that may arrive first under
@@ -253,10 +284,38 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 	// — the read-time streak derivation (ServiceBlockSignals) does the rest, so
 	// there is no counter to advance here and no reset on invoice.paid. A failure
 	// here is surfaced (500) so Stripe retries; the latch makes the retry a no-op.
-	if event.Type == stripego.EventTypeInvoicePaymentFailed || event.Type == stripego.EventTypeInvoiceMarkedUncollectible {
+	if event.Type == stripego.EventTypeInvoicePaymentFailed ||
+		event.Type == stripego.EventTypeInvoicePaymentActionRequired ||
+		event.Type == stripego.EventTypeInvoiceMarkedUncollectible {
 		if err := r.store.MarkInvoiceFailed(ctx, inv.ID); err != nil {
 			r.log.ErrorContext(ctx, "invoice failure latch (ever_failed) failed", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "error", err)
 			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+	}
+
+	if failureCode, reconcile := autoTopUpFailureCode(event.Type); reconcile && r.creditFailures != nil {
+		creditFailure, err = r.creditFailures.ReconcileWebhookFailure(
+			ctx,
+			inv.ID,
+			failureCode,
+		)
+		if err != nil {
+			r.log.ErrorContext(ctx, "invoice failure auto-top-up reconciliation failed",
+				"event_id", event.ID,
+				"type", event.Type,
+				"stripe_invoice_id", inv.ID,
+				"error", err,
+			)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		r.observeCreditFailure(ctx, creditFailure)
+		if creditFailure.Found && !creditFailure.Transitioned {
+			r.log.InfoContext(ctx, "invoice failure auto-top-up reconciliation retained current state",
+				"event_id", event.ID,
+				"type", event.Type,
+				"stripe_invoice_id", inv.ID,
+				"ledger_status", creditFailure.Status,
+			)
 		}
 	}
 
@@ -283,6 +342,12 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 		return Result{HTTPStatus: 500, Status: StatusInternal}
 	}
 	if !found {
+		if creditSettlement.Found || creditFailure.Found {
+			// Manual credit purchases and auto-top-ups intentionally live in
+			// credit_ledger even when no ordinary invoice mirror exists. The
+			// notifier's owner lookup falls back to that ledger relationship.
+			r.notifyInvoice(ctx, inv.ID)
+		}
 		r.log.WarnContext(ctx, "invoice event drift/stale: no mirror row updated", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "status", inv.Status)
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
 	}
@@ -309,6 +374,21 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 	// the receiving side is idempotent (see package standing).
 	r.notifyInvoice(ctx, inv.ID)
 	return Result{HTTPStatus: 200, Status: StatusOK}
+}
+
+func autoTopUpFailureCode(eventType stripego.EventType) (string, bool) {
+	switch eventType {
+	case stripego.EventTypeInvoicePaymentFailed:
+		return "payment_failed", true
+	case stripego.EventTypeInvoicePaymentActionRequired:
+		return "authentication_required", true
+	case stripego.EventTypeInvoiceVoided:
+		return "invoice_void", true
+	case stripego.EventTypeInvoiceMarkedUncollectible:
+		return "invoice_uncollectible", true
+	default:
+		return "", false
+	}
 }
 
 // fraud_reason tokens recorded on the mirror row, stable + compact (they feed

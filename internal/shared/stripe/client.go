@@ -20,6 +20,18 @@ import (
 // fail at the next API request with an authentication error. Callers
 // should fail-fast at startup if the secret is empty.
 func NewClient(secretKey string) Client {
+	return newRealClient(secretKey)
+}
+
+// NewAutoTopUpClient returns the selected-card invoice surface used by the
+// durable auto-top-up executor. It uses the same isolated Stripe API client as
+// NewClient but exposes only the operations whose params the financial flow
+// constrains.
+func NewAutoTopUpClient(secretKey string) AutoTopUpClient {
+	return newRealClient(secretKey)
+}
+
+func newRealClient(secretKey string) *realClient {
 	sc := &stripeclient.API{}
 	sc.Init(secretKey, nil)
 	return &realClient{sc: sc}
@@ -175,6 +187,32 @@ func (c *realClient) CreateDraftInvoice(ctx context.Context, custID, ref, idemKe
 	return projectInvoice(inv), nil
 }
 
+// CreateAutoTopUpInvoice creates the one-shot selected-card invoice. It stays
+// inert through finalization because auto_advance=false; the executor later
+// calls PayInvoiceWithMethod explicitly with this same frozen payment method.
+// Setting DefaultPaymentMethod on the invoice is defense in depth and also
+// makes Stripe's hosted audit trail identify the intended card.
+func (c *realClient) CreateAutoTopUpInvoice(ctx context.Context, customerID, paymentMethodID, ref, idemKey string) (Invoice, error) {
+	params := &stripego.InvoiceParams{
+		Customer:                    stripego.String(customerID),
+		DefaultPaymentMethod:        stripego.String(paymentMethodID),
+		CollectionMethod:            stripego.String(string(stripego.InvoiceCollectionMethodChargeAutomatically)),
+		AutoAdvance:                 stripego.Bool(false),
+		PendingInvoiceItemsBehavior: stripego.String("exclude"),
+	}
+	if ref != "" {
+		params.AddMetadata("ms_charge_ref", ref)
+		params.AddMetadata("ms_credit_operation", "auto_topup")
+	}
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	inv, err := c.sc.Invoices.New(params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
 // CreateInvoiceItem creates an invoice item PINNED to the given draft invoice
 // (never a floating customer-level pending item — see CreateDraftInvoice).
 // amountCents is whole cents (the caller converts micro-dollars → cents
@@ -201,7 +239,99 @@ func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID st
 	if err != nil {
 		return InvoiceItem{}, err
 	}
-	return InvoiceItem{ID: item.ID}, nil
+	return projectInvoiceItem(item), nil
+}
+
+// ListInvoiceItems returns every invoice item attached to one invoice. The
+// executor uses the complete paginated list as its durable resource-truth
+// check, rather than trusting an idempotency key Stripe may have pruned.
+func (c *realClient) ListInvoiceItems(ctx context.Context, invoiceID string) ([]InvoiceItem, error) {
+	params := &stripego.InvoiceItemListParams{
+		Invoice: stripego.String(invoiceID),
+	}
+	params.Context = ctx
+	params.Limit = stripego.Int64(100)
+	iter := c.sc.InvoiceItems.List(params)
+	items := make([]InvoiceItem, 0)
+	for iter.Next() {
+		items = append(items, projectInvoiceItem(iter.InvoiceItem()))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func projectInvoiceItem(item *stripego.InvoiceItem) InvoiceItem {
+	if item == nil {
+		return InvoiceItem{}
+	}
+	return InvoiceItem{
+		ID:          item.ID,
+		AmountCents: item.Amount,
+		Currency:    string(item.Currency),
+	}
+}
+
+// ListInvoicePayments returns every paid allocation attached to one invoice,
+// expanding the underlying PaymentIntent payer facts. Auto-top-up settlement
+// rejects anything except one exact default allocation funded by the frozen
+// customer/card.
+func (c *realClient) ListInvoicePayments(ctx context.Context, invoiceID string) ([]InvoicePaymentProof, error) {
+	params := &stripego.InvoicePaymentListParams{
+		Invoice: stripego.String(invoiceID),
+		Status:  stripego.String("paid"),
+	}
+	params.Context = ctx
+	params.Limit = stripego.Int64(100)
+	params.AddExpand("data.payment.payment_intent.customer")
+	params.AddExpand("data.payment.payment_intent.payment_method")
+	iter := c.sc.InvoicePayments.List(params)
+	payments := make([]InvoicePaymentProof, 0)
+	for iter.Next() {
+		payments = append(payments, projectInvoicePayment(iter.InvoicePayment()))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	return payments, nil
+}
+
+func projectInvoicePayment(payment *stripego.InvoicePayment) InvoicePaymentProof {
+	if payment == nil {
+		return InvoicePaymentProof{}
+	}
+	out := InvoicePaymentProof{
+		ID:              payment.ID,
+		Status:          payment.Status,
+		IsDefault:       payment.IsDefault,
+		AmountPaid:      payment.AmountPaid,
+		AmountRequested: payment.AmountRequested,
+		Currency:        string(payment.Currency),
+	}
+	if payment.Invoice != nil {
+		out.InvoiceID = payment.Invoice.ID
+	}
+	if payment.Payment == nil {
+		return out
+	}
+	out.PaymentType = string(payment.Payment.Type)
+	intent := payment.Payment.PaymentIntent
+	if intent == nil {
+		return out
+	}
+	out.PaymentIntentID = intent.ID
+	out.PaymentIntentStatus = string(intent.Status)
+	out.PaymentIntentAmount = intent.Amount
+	out.AmountReceived = intent.AmountReceived
+	out.PaymentIntentCurrency = string(intent.Currency)
+	if intent.Customer != nil {
+		out.PaymentIntentCustomer = intent.Customer.ID
+	}
+	if intent.PaymentMethod != nil {
+		out.PaymentMethodID = intent.PaymentMethod.ID
+	}
+	return out
 }
 
 // itemPeriodParams maps a LinePeriod to Stripe params; nil when either bound is unset.
@@ -224,6 +354,23 @@ func itemPeriodParams(p LinePeriod) *stripego.InvoiceItemPeriodParams {
 func (c *realClient) FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error) {
 	params := &stripego.InvoiceFinalizeInvoiceParams{
 		AutoAdvance: stripego.Bool(true),
+	}
+	params.AddExpand("confirmation_secret")
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	inv, err := c.sc.Invoices.FinalizeInvoice(invoiceID, params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
+// FinalizeInvoiceWithoutAutoAdvance opens an auto-top-up invoice but leaves
+// automatic collection, retries, reminders, and state advancement disabled.
+// The only authorized charge is the following explicit, idempotent pay call.
+func (c *realClient) FinalizeInvoiceWithoutAutoAdvance(ctx context.Context, invoiceID, idemKey string) (Invoice, error) {
+	params := &stripego.InvoiceFinalizeInvoiceParams{
+		AutoAdvance: stripego.Bool(false),
 	}
 	params.AddExpand("confirmation_secret")
 	params.Context = ctx
@@ -270,6 +417,52 @@ func (c *realClient) PayInvoice(ctx context.Context, stripeInvoiceID string) (In
 	return projectInvoice(inv), nil
 }
 
+// PayInvoiceWithMethod performs the auto-top-up's sole money-moving request.
+// The selected card is repeated explicitly (rather than relying on a mutable
+// Customer default), off_session is pinned true, and the deterministic key
+// makes concurrent triggers/retries converge on one Stripe payment attempt.
+func (c *realClient) PayInvoiceWithMethod(ctx context.Context, invoiceID, paymentMethodID, idemKey string) (Invoice, error) {
+	params := &stripego.InvoicePayParams{
+		PaymentMethod: stripego.String(paymentMethodID),
+		OffSession:    stripego.Bool(true),
+	}
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	inv, err := c.sc.Invoices.Pay(invoiceID, params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
+// VoidInvoice closes a verified-unpaid auto-top-up invoice under a
+// deterministic key. The executor does not mark the ledger failed unless this
+// call succeeds (or the invoice already reads void), so network ambiguity never
+// trades a recoverable pending attempt for an uncoordinated later charge.
+func (c *realClient) VoidInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error) {
+	params := &stripego.InvoiceVoidInvoiceParams{}
+	params.Context = ctx
+	params.SetIdempotencyKey(idemKey)
+	inv, err := c.sc.Invoices.VoidInvoice(invoiceID, params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
+// DeleteDraftInvoice permanently removes a one-off draft. Stripe does not
+// accept meaningful parameters for this DELETE; resource-level verification is
+// performed by the executor with an independent GetInvoice afterward.
+func (c *realClient) DeleteDraftInvoice(ctx context.Context, invoiceID string) (Invoice, error) {
+	params := &stripego.InvoiceParams{}
+	params.Context = ctx
+	inv, err := c.sc.Invoices.Del(invoiceID, params)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return projectInvoice(inv), nil
+}
+
 // FindInvoiceByRef searches the Customer's invoices for the ms_charge_ref
 // metadata anchor — the crash-recovery read for retries past Stripe's ~24h
 // idempotency-key window (see the interface comment). Uses the Stripe Search
@@ -298,17 +491,25 @@ func (c *realClient) FindInvoiceByRef(ctx context.Context, custID, ref string) (
 // .ID set), which is all CustomerID carries.
 func projectInvoice(inv *stripego.Invoice) Invoice {
 	out := Invoice{
-		ID:               inv.ID,
-		Status:           string(inv.Status),
-		AmountDue:        inv.AmountDue,
-		AmountPaid:       inv.AmountPaid,
-		Currency:         string(inv.Currency),
-		Number:           inv.Number,
-		HostedInvoiceURL: inv.HostedInvoiceURL,
-		InvoicePDF:       inv.InvoicePDF,
+		ID:                  inv.ID,
+		Status:              string(inv.Status),
+		CollectionMethod:    string(inv.CollectionMethod),
+		AutoAdvance:         inv.AutoAdvance,
+		Deleted:             inv.Deleted,
+		AmountDue:           inv.AmountDue,
+		AmountPaid:          inv.AmountPaid,
+		AmountPaidOffStripe: inv.AmountPaidOffStripe,
+		Total:               inv.Total,
+		Currency:            string(inv.Currency),
+		Number:              inv.Number,
+		HostedInvoiceURL:    inv.HostedInvoiceURL,
+		InvoicePDF:          inv.InvoicePDF,
 	}
 	if inv.Customer != nil {
 		out.CustomerID = inv.Customer.ID
+	}
+	if inv.DefaultPaymentMethod != nil {
+		out.DefaultPaymentMethodID = inv.DefaultPaymentMethod.ID
 	}
 	if inv.ConfirmationSecret != nil {
 		out.ClientSecret = inv.ConfirmationSecret.ClientSecret

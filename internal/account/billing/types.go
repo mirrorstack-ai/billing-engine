@@ -264,10 +264,13 @@ const (
 // AutoTopUpConfig is the public projection of one account's optional credit
 // auto-top-up configuration.
 type AutoTopUpConfig struct {
-	Enabled         bool   `json:"enabled"`
-	ThresholdMicros int64  `json:"threshold_micros"`
-	AmountMicros    int64  `json:"amount_micros"`
-	PaymentMethodID string `json:"payment_method_id,omitempty"`
+	Enabled           bool       `json:"enabled"`
+	ThresholdMicros   int64      `json:"threshold_micros"`
+	AmountMicros      int64      `json:"amount_micros"`
+	PaymentMethodID   string     `json:"payment_method_id,omitempty"`
+	LastAttemptStatus string     `json:"last_attempt_status,omitempty"`
+	LastFailureCode   string     `json:"last_failure_code,omitempty"`
+	PendingUntil      *time.Time `json:"pending_until,omitempty"`
 }
 
 // GetCreditStandingRequest addresses one wallet by its owning user or org.

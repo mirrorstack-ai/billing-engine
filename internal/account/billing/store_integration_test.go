@@ -373,3 +373,75 @@ func TestPgxStore_SyncInvoiceMirror_Integration(t *testing.T) {
 	require.False(t, applied, "an open snapshot must not regress a paid mirror")
 	require.Equal(t, paidState, readState(), "rejected regression must not alter the settled mirror")
 }
+
+func TestPgxStore_CreditStandingProjectsLatestAutoTopUpOutcome(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := billing.NewStore(pool)
+	ctx := context.Background()
+	accountID := seedAccount(t, pool, "cus_topup_standing")
+	paymentMethodID := uuid.New()
+	createdAt := time.Date(2026, time.July, 25, 13, 0, 0, 0, time.UTC)
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.payment_methods_mirror
+		   (id, account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year)
+		 VALUES ($1, $2, 'pm_topup_standing', 'visa', '4242', 12, 2099)`,
+		paymentMethodID,
+		accountID,
+	)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.credit_auto_topup_configs
+		   (account_id, enabled, threshold_micros, amount_micros, payment_method_id)
+		 VALUES ($2, true, 1000000, 5000000, $1)`,
+		paymentMethodID,
+		accountID,
+	)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.credit_ledger
+		   (account_id, amount_micros, type, status, balance_after_micros,
+		    actor, idempotency_key, attempt_payment_method_id,
+		    attempt_stripe_payment_method_id, attempt_stripe_customer_id,
+		    attempt_expires_at, failure_code, created_at)
+		 VALUES ($2, 5000000, 'auto_topup', 'failed', 0, 'system', $3, $1,
+		         'pm_topup_standing', 'cus_topup_standing', $4,
+		         'insufficient_funds', $5)`,
+		paymentMethodID,
+		accountID,
+		"topup:failed:"+uuid.NewString(),
+		createdAt.Add(10*time.Minute),
+		createdAt,
+	)
+	require.NoError(t, err)
+
+	standing, err := store.CreditStanding(ctx, accountID)
+	require.NoError(t, err)
+	require.NotNil(t, standing.AutoTopUp)
+	require.Equal(t, "failed", standing.AutoTopUp.LastAttemptStatus)
+	require.Equal(t, "insufficient_funds", standing.AutoTopUp.LastFailureCode)
+	require.Nil(t, standing.AutoTopUp.PendingUntil, "terminal attempts do not expose stale pending grace")
+
+	pendingAt := createdAt.Add(time.Hour)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.credit_ledger
+		   (account_id, amount_micros, type, status, balance_after_micros,
+		    actor, idempotency_key, attempt_payment_method_id,
+		    attempt_stripe_payment_method_id, attempt_stripe_customer_id,
+		    attempt_expires_at, created_at)
+		 VALUES ($1, 5000000, 'auto_topup', 'pending', 5000000, 'system', $2, $3,
+		         'pm_topup_standing', 'cus_topup_standing', $4, $5)`,
+		accountID,
+		"topup:pending:"+uuid.NewString(),
+		paymentMethodID,
+		pendingAt.Add(10*time.Minute),
+		pendingAt,
+	)
+	require.NoError(t, err)
+
+	standing, err = store.CreditStanding(ctx, accountID)
+	require.NoError(t, err)
+	require.Equal(t, "pending", standing.AutoTopUp.LastAttemptStatus)
+	require.Empty(t, standing.AutoTopUp.LastFailureCode)
+	require.NotNil(t, standing.AutoTopUp.PendingUntil)
+	require.True(t, pendingAt.Add(10*time.Minute).Equal(*standing.AutoTopUp.PendingUntil))
+}

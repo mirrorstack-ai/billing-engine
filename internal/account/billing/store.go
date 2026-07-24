@@ -620,11 +620,18 @@ func (s *pgxStore) CreditStanding(ctx context.Context, accountID uuid.UUID) (Cre
 		CreditLimitMicros: row.CreditLimitMicros,
 	}
 	if row.AutoTopupConfigured {
+		var pendingUntil *time.Time
+		if row.AutoTopupLastAttemptStatus == "pending" {
+			pendingUntil = nullableTimeValue(row.AutoTopupPendingUntil)
+		}
 		out.AutoTopUp = &AutoTopUpConfig{
-			Enabled:         row.AutoTopupEnabled,
-			ThresholdMicros: row.AutoTopupThresholdMicros,
-			AmountMicros:    row.AutoTopupAmountMicros,
-			PaymentMethodID: row.AutoTopupPaymentMethodID,
+			Enabled:           row.AutoTopupEnabled,
+			ThresholdMicros:   row.AutoTopupThresholdMicros,
+			AmountMicros:      row.AutoTopupAmountMicros,
+			PaymentMethodID:   row.AutoTopupPaymentMethodID,
+			LastAttemptStatus: row.AutoTopupLastAttemptStatus,
+			LastFailureCode:   row.AutoTopupLastFailureCode,
+			PendingUntil:      pendingUntil,
 		}
 	}
 	return out, nil

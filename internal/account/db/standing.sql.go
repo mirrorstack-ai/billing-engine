@@ -39,10 +39,21 @@ func (q *Queries) AccountOwnerByStripeCustomer(ctx context.Context, stripeCustom
 }
 
 const accountOwnerByStripeInvoice = `-- name: AccountOwnerByStripeInvoice :one
-SELECT a.owner_user_id, a.owner_org_id
-FROM ms_billing.invoices i
-JOIN ms_billing.accounts a ON a.id = i.account_id
-WHERE i.stripe_invoice_id = $1
+SELECT account.owner_user_id, account.owner_org_id
+FROM ms_billing.accounts account
+WHERE account.id = COALESCE(
+    (
+        SELECT invoice.account_id
+        FROM ms_billing.invoices invoice
+        WHERE invoice.stripe_invoice_id = $1
+    ),
+    (
+        SELECT credit.account_id
+        FROM ms_billing.credit_ledger credit
+        WHERE credit.stripe_invoice_id = $1
+          AND credit.type IN ('purchase', 'auto_topup')
+    )
+)
 `
 
 type AccountOwnerByStripeInvoiceRow struct {
