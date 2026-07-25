@@ -31,6 +31,10 @@ const microsPerCent = 10_000
 // "included"; the rest are "over", so max(0, live − included) is exactly the live
 // over-count. A liveModuleCount ≤ IncludedModules yields 0 (the max(0, …) clamp
 // makes the function total; a negative count cannot occur — a live-row count).
+// GetAccountBill uses this current-live steady-state amount as the next-period
+// recurring overage forecast inside ProjectedTotalMicros; unresolved one-time
+// timer proration is layered on separately and any exact next-period straddle
+// overlap is counted once.
 func AccountOverageMicros(liveModuleCount int) int64 {
 	if extra := liveModuleCount - IncludedModules; extra > 0 {
 		return ModuleOverageFeeMicros * int64(extra)

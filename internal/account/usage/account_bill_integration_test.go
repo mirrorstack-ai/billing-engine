@@ -321,6 +321,401 @@ func TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO(t *testi
 		"preview rounds one timer to cents exactly where the sweep does")
 }
 
+func TestUnresolvedOneTimeCharges_Integration_CreationTerminalsAndD11(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	activatedAt := appMustTime(t, "2026-06-11T09:00:00Z")
+	accountID := uuid.New()
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.accounts
+		   (id, owner_kind, owner_user_id, activated_at)
+		 VALUES ($1, 'user', $2, $3)`,
+		accountID, uuid.New(), activatedAt)
+	require.NoError(t, err)
+
+	foreignAccount := uuid.New()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.accounts
+		   (id, owner_kind, owner_user_id, activated_at)
+		 VALUES ($1, 'user', $2, $3)`,
+		foreignAccount, uuid.New(), activatedAt)
+	require.NoError(t, err)
+	unactivatedAccount := appSeedAccount(t, pool)
+
+	type appFixture struct {
+		id        uuid.UUID
+		accountID uuid.UUID
+		createdAt time.Time
+		deletedAt *time.Time
+		guard     string
+		skippedAt *time.Time
+	}
+	insertApp := func(f appFixture) {
+		t.Helper()
+		var deletedAt, skippedAt any
+		if f.deletedAt != nil {
+			deletedAt = *f.deletedAt
+		}
+		if f.skippedAt != nil {
+			skippedAt = *f.skippedAt
+		}
+		var guard any
+		if f.guard != "" {
+			guard = f.guard
+		}
+		_, insertErr := pool.Exec(ctx,
+			`INSERT INTO ms_billing.apps
+			   (app_id, account_id, module_count, created_module_count, created_at,
+			    deleted_at, proration_invoice_id, proration_skipped_at)
+			 VALUES ($1, $2, 0, 0, $3, $4, $5, $6)`,
+			f.id, f.accountID, f.createdAt, deletedAt, guard, skippedAt)
+		require.NoError(t, insertErr)
+	}
+
+	inGrace, postETA := uuid.New(), uuid.New()
+	guardArmed, skipArmed := uuid.New(), uuid.New()
+	deletedBefore, deletedExactly, deletedAfter := uuid.New(), uuid.New(), uuid.New()
+	foreignApp, unactivatedApp := uuid.New(), uuid.New()
+	createdAt := appMustTime(t, "2026-07-15T11:00:00Z")
+	graceExpiry := usage.GraceExpiry(createdAt)
+	oneSecondBefore := graceExpiry.Add(-time.Second)
+	oneSecondAfter := graceExpiry.Add(time.Second)
+	skippedAt := graceExpiry.Add(time.Hour)
+
+	for _, fixture := range []appFixture{
+		{id: inGrace, accountID: accountID, createdAt: appMustTime(t, "2026-07-25T11:00:00Z")},
+		{id: postETA, accountID: accountID, createdAt: appMustTime(t, "2026-07-01T11:00:00Z")},
+		{id: guardArmed, accountID: accountID, createdAt: createdAt, guard: "in_armed"},
+		{id: skipArmed, accountID: accountID, createdAt: createdAt, skippedAt: &skippedAt},
+		{id: deletedBefore, accountID: accountID, createdAt: createdAt, deletedAt: &oneSecondBefore},
+		{id: deletedExactly, accountID: accountID, createdAt: createdAt, deletedAt: &graceExpiry},
+		{id: deletedAfter, accountID: accountID, createdAt: createdAt, deletedAt: &oneSecondAfter},
+		{id: foreignApp, accountID: foreignAccount, createdAt: createdAt},
+		{id: unactivatedApp, accountID: unactivatedAccount, createdAt: createdAt},
+	} {
+		insertApp(fixture)
+	}
+
+	rows, err := store.UnresolvedOneTimeCharges(
+		ctx, accountID, usage.IncludedModules, usage.GraceDays*24,
+	)
+	require.NoError(t, err)
+	require.Len(t, rows, 4)
+
+	got := make(map[uuid.UUID]usage.UnresolvedOneTimeChargeRaw, len(rows))
+	for _, row := range rows {
+		require.Equal(t, usage.UnresolvedOneTimeChargeCreationBase, row.Kind)
+		got[row.ChargeID] = row
+	}
+	require.ElementsMatch(t,
+		[]uuid.UUID{inGrace, postETA, deletedExactly, deletedAfter},
+		[]uuid.UUID{
+			got[inGrace].ChargeID,
+			got[postETA].ChargeID,
+			got[deletedExactly].ChargeID,
+			got[deletedAfter].ChargeID,
+		},
+	)
+	require.True(t, got[inGrace].CountsTowardRecurring)
+	require.True(t, got[postETA].CountsTowardRecurring,
+		"post-ETA/pre-sweep creation remains unresolved without a now cutoff")
+	require.False(t, got[deletedExactly].CountsTowardRecurring)
+	require.False(t, got[deletedAfter].CountsTowardRecurring)
+	require.Equal(t, usage.GraceExpiry(got[inGrace].ChargeAt), got[inGrace].GraceExpiresAt)
+	require.Equal(t, activatedAt, got[inGrace].ActivatedAt.UTC())
+	require.NotContains(t, got, guardArmed)
+	require.NotContains(t, got, skipArmed)
+	require.NotContains(t, got, deletedBefore,
+		"D11 deletion before grace is free; deletion exactly at grace still owes")
+	require.NotContains(t, got, foreignApp)
+	require.NotContains(t, got, unactivatedApp)
+}
+
+func TestUnresolvedOneTimeCharges_Integration_TimerFIFORecoveryAndTerminals(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+	activatedAt := appMustTime(t, "2026-06-11T09:00:00Z")
+
+	seedAccount := func() uuid.UUID {
+		t.Helper()
+		accountID := uuid.New()
+		_, err := pool.Exec(ctx,
+			`INSERT INTO ms_billing.accounts
+			   (id, owner_kind, owner_user_id, activated_at)
+			 VALUES ($1, 'user', $2, $3)`,
+			accountID, uuid.New(), activatedAt)
+		require.NoError(t, err)
+		return accountID
+	}
+	seedApp := func(accountID uuid.UUID, createdAt time.Time, guard string, attemptedAt *time.Time) uuid.UUID {
+		t.Helper()
+		appID := uuid.New()
+		var guardArg, attemptedArg any
+		if guard != "" {
+			guardArg = guard
+		}
+		if attemptedAt != nil {
+			attemptedArg = *attemptedAt
+		}
+		_, err := pool.Exec(ctx,
+			`INSERT INTO ms_billing.apps
+			   (app_id, account_id, module_count, created_module_count, created_at,
+			    proration_invoice_id, proration_attempted_at)
+			 VALUES ($1, $2, 0, 0, $3, $4, $5)`,
+			appID, accountID, createdAt, guardArg, attemptedArg)
+		require.NoError(t, err)
+		return appID
+	}
+	seedTimer := func(accountID, appID uuid.UUID, installedAt, graceExpiresAt time.Time) uuid.UUID {
+		t.Helper()
+		timerID := uuid.New()
+		_, err := pool.Exec(ctx,
+			`INSERT INTO ms_billing.app_module_overage_timers
+			   (id, account_id, app_id, installed_at, grace_expires_at)
+			 VALUES ($1, $2, $3, $4, $5)`,
+			timerID, accountID, appID, installedAt, graceExpiresAt)
+		require.NoError(t, err)
+		return timerID
+	}
+	rowsFor := func(accountID uuid.UUID) []usage.UnresolvedOneTimeChargeRaw {
+		t.Helper()
+		rows, err := store.UnresolvedOneTimeCharges(
+			ctx, accountID, usage.IncludedModules, usage.GraceDays*24,
+		)
+		require.NoError(t, err)
+		return rows
+	}
+	moduleRows := func(rows []usage.UnresolvedOneTimeChargeRaw) []usage.UnresolvedOneTimeChargeRaw {
+		t.Helper()
+		var modules []usage.UnresolvedOneTimeChargeRaw
+		for _, row := range rows {
+			if row.Kind == usage.UnresolvedOneTimeChargeModuleTimer {
+				modules = append(modules, row)
+			}
+		}
+		return modules
+	}
+
+	t.Run("combined app attempt never promotes included co-created timers", func(t *testing.T) {
+		accountID := seedAccount()
+		createdAt := appMustTime(t, "2026-07-15T11:00:00Z")
+		attemptedAt := usage.GraceExpiry(createdAt)
+		appID := seedApp(accountID, createdAt, "", &attemptedAt)
+
+		for i := 0; i < usage.IncludedModules; i++ {
+			seedTimer(accountID, appID, createdAt, usage.GraceExpiry(createdAt))
+		}
+		rows := rowsFor(accountID)
+		require.Len(t, rows, 1, "only the unresolved app base is exposed")
+		require.Equal(t, usage.UnresolvedOneTimeChargeCreationBase, rows[0].Kind)
+		require.Empty(t, moduleRows(rows),
+			"the app attempt marker does not falsely turn the five included timers into $15")
+
+		seedTimer(accountID, appID, createdAt, usage.GraceExpiry(createdAt))
+		seedTimer(accountID, appID, createdAt, usage.GraceExpiry(createdAt))
+		rows = rowsFor(accountID)
+		require.Len(t, moduleRows(rows), 2,
+			"seven co-created timers expose only the two current-FIFO over units")
+
+		_, err := pool.Exec(ctx,
+			`UPDATE ms_billing.apps SET proration_invoice_id = 'wallet:armed'
+			 WHERE app_id = $1`, appID)
+		require.NoError(t, err)
+		rows = rowsFor(accountID)
+		require.Len(t, rows, 2,
+			"wallet base settlement removes only the base; unresolved timer units remain exactly once")
+		require.Len(t, moduleRows(rows), 2)
+	})
+
+	t.Run("timer attempt survives over to included rank improvement", func(t *testing.T) {
+		accountID := seedAccount()
+		appID := seedApp(
+			accountID,
+			appMustTime(t, "2026-06-01T00:00:00Z"),
+			"creation:settled",
+			nil,
+		)
+		var timers []uuid.UUID
+		for i := 0; i < usage.IncludedModules+1; i++ {
+			installedAt := appMustTime(t, "2026-07-01T00:00:00Z").Add(time.Duration(i) * time.Hour)
+			timers = append(timers, seedTimer(
+				accountID, appID, installedAt, usage.GraceExpiry(installedAt),
+			))
+		}
+		attemptedTimer := timers[len(timers)-1]
+		_, err := pool.Exec(ctx,
+			`UPDATE ms_billing.app_module_overage_timers
+			 SET charge_attempted_at = $2
+			 WHERE id = $1`,
+			attemptedTimer, appMustTime(t, "2026-07-05T00:00:00Z"))
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx,
+			`UPDATE ms_billing.app_module_overage_timers
+			 SET removed_at = $2
+			 WHERE id = $1`,
+			timers[0], appMustTime(t, "2026-07-06T00:00:00Z"))
+		require.NoError(t, err)
+
+		modules := moduleRows(rowsFor(accountID))
+		require.Len(t, modules, 1)
+		require.Equal(t, attemptedTimer, modules[0].ChargeID)
+		require.False(t, modules[0].CountsTowardRecurring,
+			"after the earlier removal it is currently included, but recovery still owns it")
+
+		_, err = pool.Exec(ctx,
+			`UPDATE ms_billing.app_module_overage_timers
+			 SET grace_resolved = true
+			 WHERE id = $1`, attemptedTimer)
+		require.NoError(t, err)
+		require.Empty(t, moduleRows(rowsFor(accountID)),
+			"the durable timer terminal removes attempted recovery exposure")
+	})
+
+	t.Run("ETA does not filter and resolved or removed timers do", func(t *testing.T) {
+		accountID := seedAccount()
+		appID := seedApp(
+			accountID,
+			appMustTime(t, "2026-06-01T00:00:00Z"),
+			"creation:settled",
+			nil,
+		)
+		baseInstall := appMustTime(t, "2026-07-01T00:00:00Z")
+		for i := 0; i < usage.IncludedModules; i++ {
+			installedAt := baseInstall.Add(time.Duration(i) * time.Hour)
+			seedTimer(accountID, appID, installedAt, usage.GraceExpiry(installedAt))
+		}
+		pastETAInstall := baseInstall.Add(24 * time.Hour)
+		futureETAInstall := baseInstall.Add(48 * time.Hour)
+		pastETA := seedTimer(
+			accountID, appID, pastETAInstall,
+			appMustTime(t, "2026-07-02T00:00:00Z"),
+		)
+		futureETA := seedTimer(
+			accountID, appID, futureETAInstall,
+			appMustTime(t, "2027-07-02T00:00:00Z"),
+		)
+
+		modules := moduleRows(rowsFor(accountID))
+		require.Len(t, modules, 2)
+		require.ElementsMatch(t, []uuid.UUID{pastETA, futureETA},
+			[]uuid.UUID{modules[0].ChargeID, modules[1].ChargeID})
+
+		_, err := pool.Exec(ctx,
+			`UPDATE ms_billing.app_module_overage_timers
+			 SET grace_resolved = true
+			 WHERE id = $1`, pastETA)
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx,
+			`UPDATE ms_billing.app_module_overage_timers
+			 SET removed_at = now()
+			 WHERE id = $1`, futureETA)
+		require.NoError(t, err)
+		require.Empty(t, moduleRows(rowsFor(accountID)))
+	})
+}
+
+func TestUnresolvedOneTimeCharges_Integration_MVCCWalletGuardHandoff(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	accountID, ownerID, appID := uuid.New(), uuid.New(), uuid.New()
+	activatedAt := appMustTime(t, "2026-06-11T09:00:00Z")
+	createdAt := appMustTime(t, "2026-07-25T11:00:00Z")
+	_, err := pool.Exec(ctx,
+		`INSERT INTO ms_billing.accounts
+		   (id, owner_kind, owner_user_id, activated_at)
+		 VALUES ($1, 'user', $2, $3)`,
+		accountID, ownerID, activatedAt)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.apps
+		   (app_id, account_id, module_count, created_module_count, created_at)
+		 VALUES ($1, $2, 7, 7, $3)`,
+		appID, accountID, createdAt)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.app_module_overage_timers
+		   (account_id, app_id, installed_at, grace_expires_at)
+		 SELECT $1, $2, $3, $4
+		 FROM generate_series(1, 7)`,
+		accountID, appID, createdAt, usage.GraceExpiry(createdAt))
+	require.NoError(t, err)
+
+	type projectionSet struct {
+		creationIDs map[uuid.UUID]bool
+		timerIDs    map[uuid.UUID]bool
+	}
+	readProjection := func() projectionSet {
+		t.Helper()
+		readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		rows, readErr := store.UnresolvedOneTimeCharges(
+			readCtx, accountID, usage.IncludedModules, usage.GraceDays*24,
+		)
+		require.NoError(t, readErr)
+		set := projectionSet{
+			creationIDs: make(map[uuid.UUID]bool),
+			timerIDs:    make(map[uuid.UUID]bool),
+		}
+		seen := make(map[uuid.UUID]bool, len(rows))
+		for _, row := range rows {
+			require.False(t, seen[row.ChargeID],
+				"one unified snapshot must never emit an unresolved unit twice")
+			seen[row.ChargeID] = true
+			switch row.Kind {
+			case usage.UnresolvedOneTimeChargeCreationBase:
+				set.creationIDs[row.ChargeID] = true
+			case usage.UnresolvedOneTimeChargeModuleTimer:
+				set.timerIDs[row.ChargeID] = true
+			default:
+				t.Fatalf("unexpected charge kind %q", row.Kind)
+			}
+		}
+		return set
+	}
+	assertPreHandoff := func(set projectionSet) {
+		t.Helper()
+		require.Equal(t, map[uuid.UUID]bool{appID: true}, set.creationIDs)
+		require.Len(t, set.timerIDs, 2,
+			"seven co-created timers expose exactly the two FIFO-over units")
+	}
+
+	before := readProjection()
+	assertPreHandoff(before)
+
+	// Hold the wallet base settlement's guard update uncommitted. The unified
+	// SELECT runs from another pool connection and must observe one coherent
+	// pre-commit MVCC snapshot: base + the same two timer units, without a lock
+	// wait, transient omission, or ownership double count.
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx,
+		`UPDATE ms_billing.apps
+		 SET proration_invoice_id = $2
+		 WHERE app_id = $1`,
+		appID, "wallet:app-proration:"+appID.String())
+	require.NoError(t, err)
+
+	during := readProjection()
+	assertPreHandoff(during)
+	require.Equal(t, before.timerIDs, during.timerIDs)
+
+	require.NoError(t, tx.Commit(ctx))
+
+	// After commit, the base guard is terminal and only the wallet rail's
+	// deliberately unresolved module units remain. Their identity is unchanged
+	// and each still appears exactly once.
+	after := readProjection()
+	require.Empty(t, after.creationIDs)
+	require.Equal(t, before.timerIDs, after.timerIDs)
+	require.Len(t, after.timerIDs, 2)
+}
+
 // TestGetAccountBill_Integration_RolledAgentModelsUseFrozenCharges proves the
 // account-agent model decomposition reads the authoritative charged_micros from
 // a frozen usage_aggregates period. A model-less custom row remains in the

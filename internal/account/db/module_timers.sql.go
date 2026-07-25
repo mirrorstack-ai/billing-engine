@@ -549,3 +549,144 @@ func (q *Queries) SoftRemoveNewestModuleTimers(ctx context.Context, arg SoftRemo
 	_, err := q.db.Exec(ctx, softRemoveNewestModuleTimers, arg.RemovedAt, arg.AppID, arg.LimitCount)
 	return err
 }
+
+const unresolvedOneTimeCharges = `-- name: UnresolvedOneTimeCharges :many
+WITH ranked_timers AS (
+    SELECT id, app_id, account_id, installed_at, grace_expires_at,
+           grace_resolved, charge_attempted_at,
+           row_number() OVER (ORDER BY installed_at, id) AS rn
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = $1::uuid
+      AND removed_at IS NULL
+),
+unresolved_creations AS (
+    SELECT 'creation_base'::text AS charge_kind,
+           app.app_id AS charge_id,
+           app.app_id,
+           app.created_at AS charge_at,
+           app.created_at + make_interval(hours => $2::int) AS grace_expires_at,
+           account.activated_at,
+           (app.deleted_at IS NULL) AS counts_toward_recurring
+    FROM ms_billing.apps app
+    JOIN ms_billing.accounts account ON account.id = app.account_id
+    WHERE app.account_id = $1::uuid
+      AND account.activated_at IS NOT NULL
+      AND app.proration_invoice_id IS NULL
+      AND app.proration_skipped_at IS NULL
+      AND (
+          app.deleted_at IS NULL
+          OR app.deleted_at >= app.created_at + make_interval(hours => $2::int)
+      )
+),
+unresolved_timers AS (
+    SELECT 'module_timer'::text AS charge_kind,
+           ranked.id AS charge_id,
+           ranked.app_id,
+           ranked.installed_at AS charge_at,
+           ranked.grace_expires_at,
+           account.activated_at,
+           (ranked.rn > $3::int) AS counts_toward_recurring
+    FROM ranked_timers ranked
+    JOIN ms_billing.accounts account ON account.id = ranked.account_id
+    WHERE account.activated_at IS NOT NULL
+      AND ranked.grace_resolved = false
+      AND (
+          ranked.rn > $3::int
+          OR ranked.charge_attempted_at IS NOT NULL
+      )
+),
+all_charges AS (
+    SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
+           activated_at, counts_toward_recurring
+    FROM unresolved_creations
+    UNION ALL
+    SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
+           activated_at, counts_toward_recurring
+    FROM unresolved_timers
+)
+SELECT charge_kind::text,
+       charge_id::uuid,
+       app_id::uuid,
+       charge_at::timestamptz,
+       grace_expires_at::timestamptz,
+       activated_at::timestamptz,
+       counts_toward_recurring::boolean
+FROM all_charges
+ORDER BY charge_at, charge_kind, charge_id
+`
+
+type UnresolvedOneTimeChargesParams struct {
+	AccountID       string `json:"account_id"`
+	GraceHours      int32  `json:"grace_hours"`
+	IncludedModules int32  `json:"included_modules"`
+}
+
+type UnresolvedOneTimeChargesRow struct {
+	ChargeKind            string    `json:"charge_kind"`
+	ChargeID              string    `json:"charge_id"`
+	AppID                 string    `json:"app_id"`
+	ChargeAt              time.Time `json:"charge_at"`
+	GraceExpiresAt        time.Time `json:"grace_expires_at"`
+	ActivatedAt           time.Time `json:"activated_at"`
+	CountsTowardRecurring bool      `json:"counts_toward_recurring"`
+}
+
+// UnresolvedOneTimeCharges is GetAccountBill's authoritative one-time
+// projection input. One SQL statement returns every unresolved creation-base
+// unit and module-timer unit from one MVCC snapshot, so a concurrent wallet
+// creation settlement cannot move a co-created timer between ownership queries
+// and make the read double-count it.
+//
+// Creation-base eligibility mirrors the charge leg:
+//   - activated accounts only (the exact amount is unknowable before activation);
+//   - no durable charged/skipped terminal guard;
+//   - D11 deletion boundary: before grace is free, at/after grace still owes.
+//
+// Timer eligibility mirrors ChargeModuleOverage:
+//   - live and not durably grace_resolved;
+//   - current account-FIFO rank is over, OR charge_attempted_at is set.
+//
+// Attempted timers remain exposed after an over→included rank improvement
+// because recovery reconciles possibly-moved Stripe money BEFORE recomputing
+// the live rank. Unattempted included timers are deterministically free.
+// This recovery exception is deliberately limited to the timer's OWN
+// charge_attempted_at marker. A combined app attempt does not durably freeze
+// which co-created timer ids were over; treating every co-created timer as
+// attempted would overstate the first five included units. Therefore combined
+// attempts retain current-FIFO estimate semantics (a rare post-attempt rank
+// improvement can conservatively understate until app recovery arms the guard).
+//
+// No ETA filter is intentional: upcoming and post-ETA/pre-sweep money stays in
+// the estimate until its terminal guard is armed. Co-created timers need no
+// special ownership branch here: whether the combined creation rail or Leg 1
+// will settle one, it is one unresolved timer unit and this statement emits it
+// exactly once. counts_toward_recurring tells the caller whether the live
+// next-period base/overage forecast already contains that unit, so an exactly
+// overlapping straddled period can be de-duplicated.
+func (q *Queries) UnresolvedOneTimeCharges(ctx context.Context, arg UnresolvedOneTimeChargesParams) ([]UnresolvedOneTimeChargesRow, error) {
+	rows, err := q.db.Query(ctx, unresolvedOneTimeCharges, arg.AccountID, arg.GraceHours, arg.IncludedModules)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UnresolvedOneTimeChargesRow{}
+	for rows.Next() {
+		var i UnresolvedOneTimeChargesRow
+		if err := rows.Scan(
+			&i.ChargeKind,
+			&i.ChargeID,
+			&i.AppID,
+			&i.ChargeAt,
+			&i.GraceExpiresAt,
+			&i.ActivatedAt,
+			&i.CountsTowardRecurring,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
