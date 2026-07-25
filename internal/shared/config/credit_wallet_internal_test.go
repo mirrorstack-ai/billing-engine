@@ -1,9 +1,12 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -165,7 +168,13 @@ func TestCreditWalletSchemaReadyClassifiesProbeErrors(t *testing.T) {
 	}
 }
 
-func TestCreditAutoTopUpSchemaReadyRequiresEveryExactCapability(t *testing.T) {
+func TestCreditAutoTopUpSchemaReadyRequiresEveryCapability(t *testing.T) {
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
 	tests := []struct {
 		name   string
 		remove func(*creditAutoTopUpSchemaContract)
@@ -237,7 +246,7 @@ func TestCreditAutoTopUpSchemaReadyRequiresEveryExactCapability(t *testing.T) {
 			},
 		},
 		{
-			name: "valid exact unique pending attempt index",
+			name: "valid unique pending attempt index",
 			remove: func(contract *creditAutoTopUpSchemaContract) {
 				contract.pendingAttemptUniqueIndex = false
 			},
@@ -275,7 +284,42 @@ func TestCreditAutoTopUpSchemaReadyPropagatesCatalogError(t *testing.T) {
 	require.Len(t, fake.queries, 1)
 }
 
-func TestCreditAutoTopUpSchemaContractProbePinsMigration049Shape(t *testing.T) {
+func TestCreditAutoTopUpSchemaReadyLogsEveryMissingCapability(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	contract := completeCreditAutoTopUpSchemaContract()
+	contract.configPaymentMethodColumn = false
+	contract.attemptWindowCheck = false
+	fake := &fakeCreditWalletSchemaExecutor{runtimeContract: contract}
+
+	ready, err := creditAutoTopUpSchemaReady(context.Background(), fake)
+
+	require.NoError(t, err)
+	require.False(t, ready)
+	require.Contains(t, logs.String(), "missing_or_incompatible_capabilities")
+	require.Contains(
+		t,
+		logs.String(),
+		"ms_billing.credit_auto_topup_configs.payment_method_id (nullable uuid column)",
+	)
+	require.Contains(
+		t,
+		logs.String(),
+		"credit_ledger_auto_topup_attempt_window_check (validated check constraint)",
+	)
+	require.NotContains(
+		t,
+		logs.String(),
+		"credit_ledger_auto_topup_pending_uidx (valid unique index)",
+	)
+}
+
+func TestCreditAutoTopUpSchemaContractProbeUsesStableCatalogCapabilities(t *testing.T) {
 	for _, fragment := range []string{
 		"column_name = 'payment_method_id'",
 		"column_name = 'attempt_payment_method_id'",
@@ -293,19 +337,31 @@ func TestCreditAutoTopUpSchemaContractProbePinsMigration049Shape(t *testing.T) {
 		"credit_ledger_auto_topup_failure_state_check",
 		"credit_ledger_auto_topup_attempt_window_check",
 		"credit_ledger_auto_topup_pending_uidx",
+		"constraint_type = 'f'",
+		"constraint_type = 'c'",
+		"AND validated",
 		"AND is_unique",
 		"AND is_valid",
 		"AND is_ready",
 		"AND is_live",
-		"AND key_column = 'account_id'",
-		"AND predicate = '((type = ''auto_topup''::text) AND (status = ''pending''::text))'",
 	} {
 		require.Truef(
 			t,
 			strings.Contains(creditAutoTopUpSchemaContractProbe, fragment),
-			"probe missing exact migration-049 contract fragment %q",
+			"probe missing migration-049 catalog capability %q",
 			fragment,
 		)
+	}
+
+	for _, unstableFragment := range []string{
+		"pg_get_constraintdef",
+		"pg_get_indexdef",
+		"pg_get_expr",
+		"key_column",
+		"predicate =",
+		"definition =",
+	} {
+		require.NotContains(t, creditAutoTopUpSchemaContractProbe, unstableFragment)
 	}
 }
 
