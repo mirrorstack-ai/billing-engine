@@ -457,7 +457,7 @@ type MsBillingCreditAutoTopupConfig struct {
 	Enabled         bool        `json:"enabled"`
 	ThresholdMicros int64       `json:"threshold_micros"`
 	AmountMicros    int64       `json:"amount_micros"`
-	PaymentMethodID pgtype.Text `json:"payment_method_id"`
+	PaymentMethodID pgtype.UUID `json:"payment_method_id"`
 	CreatedAt       time.Time   `json:"created_at"`
 	UpdatedAt       time.Time   `json:"updated_at"`
 }
@@ -477,6 +477,16 @@ type MsBillingCreditLedger struct {
 	PeriodID           pgtype.UUID        `json:"period_id"`
 	SourceCreditID     pgtype.UUID        `json:"source_credit_id"`
 	CreatedAt          time.Time          `json:"created_at"`
+	// Auto-top-up audit snapshot of the selected local payment-method UUID.
+	AttemptPaymentMethodID pgtype.UUID `json:"attempt_payment_method_id"`
+	// Auto-top-up frozen Stripe payment method; never re-resolved from config.
+	AttemptStripePaymentMethodID pgtype.Text `json:"attempt_stripe_payment_method_id"`
+	// Auto-top-up frozen Stripe customer; must own the frozen payment method.
+	AttemptStripeCustomerID pgtype.Text `json:"attempt_stripe_customer_id"`
+	// End of the bounded in-flight grace. Expired attempts reconcile before retry.
+	AttemptExpiresAt pgtype.Timestamptz `json:"attempt_expires_at"`
+	// Stable terminal payment failure token; NULL while pending or after settlement.
+	FailureCode pgtype.Text `json:"failure_code"`
 }
 
 type MsBillingDeveloperSettlement struct {

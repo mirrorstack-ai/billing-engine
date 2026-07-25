@@ -84,6 +84,102 @@ FROM ms_billing.accounts account
 CROSS JOIN balances
 WHERE account.id = sqlc.arg(account_id)::uuid;
 
+-- GetCreditAccountSnapshot classifies the account before any ledger read.
+-- A standard account returns from the Go provider after this query, keeping
+-- credit_ledger completely untouched on that path.
+-- name: GetCreditAccountSnapshot :one
+SELECT
+    account.id,
+    account.owner_user_id,
+    account.owner_org_id,
+    account.billing_mode,
+    account.credit_limit_micros,
+    account.activated_at
+FROM ms_billing.accounts account
+WHERE account.id = sqlc.arg(account_id)::uuid;
+
+-- GetCreditGateState mirrors WalletCreditState's spendable-balance predicate:
+-- active positive lot remainder, capped by posted balance after expired lot
+-- remainder is removed. Pending manual purchases are neither settled balance
+-- nor grace; only a durable pending auto_topup suppresses the real-time block.
+-- name: GetCreditGateState :one
+WITH source_lots AS (
+    SELECT
+        source.id,
+        source.expires_at,
+        (
+            source.amount_micros::numeric
+            + COALESCE((
+                SELECT SUM(draw.amount_micros)
+                FROM ms_billing.credit_ledger draw
+                WHERE draw.source_credit_id = source.id
+                  AND draw.account_id = source.account_id
+                  AND draw.status = 'settled'
+                  AND draw.type IN ('usage_draw', 'subscription_draw')
+            ), 0)
+        ) AS remaining_micros
+    FROM ms_billing.credit_ledger source
+    WHERE source.account_id = sqlc.arg(account_id)::uuid
+      AND source.status = 'settled'
+      AND source.amount_micros > 0
+      AND source.type IN (
+          'grant', 'preallocation', 'refund', 'adjustment',
+          'purchase', 'auto_topup'
+      )
+), balances AS (
+    SELECT
+        COALESCE((
+            SELECT SUM(entry.amount_micros)
+            FROM ms_billing.credit_ledger entry
+            WHERE entry.account_id = sqlc.arg(account_id)::uuid
+              AND entry.status = 'settled'
+        ), 0) AS settled_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND (lot.expires_at IS NULL OR lot.expires_at > CURRENT_TIMESTAMP)
+        ), 0) AS lot_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND lot.expires_at <= CURRENT_TIMESTAMP
+        ), 0) AS expired_lot_micros
+)
+SELECT
+    balances.settled_micros::bigint AS settled_balance_micros,
+    GREATEST(
+        LEAST(
+            balances.lot_micros,
+            GREATEST(
+                balances.settled_micros - balances.expired_lot_micros,
+                0
+            )
+        ),
+        0
+    )::bigint AS spendable_balance_micros,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = sqlc.arg(account_id)::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+    )::boolean AS auto_topup_attempt_pending,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = sqlc.arg(account_id)::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+          AND pending.attempt_expires_at > CURRENT_TIMESTAMP
+    )::boolean AS pending_auto_topup,
+    COALESCE(config.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(config.threshold_micros, 0)::bigint AS auto_topup_threshold_micros
+FROM balances
+LEFT JOIN ms_billing.credit_auto_topup_configs config
+       ON config.account_id = sqlc.arg(account_id)::uuid;
+
 -- LockWalletAccount is the serialization point for a draw. The account FK on
 -- credit_ledger also makes concurrent ledger inserts wait behind this lock.
 -- name: LockWalletAccount :one
@@ -294,10 +390,21 @@ SELECT
     COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
     COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
     COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
-    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+    COALESCE(auto_topup.payment_method_id::text, '')::text AS auto_topup_payment_method_id,
+    COALESCE(last_attempt.status, '')::text AS auto_topup_last_attempt_status,
+    COALESCE(last_attempt.failure_code, '')::text AS auto_topup_last_failure_code,
+    last_attempt.attempt_expires_at AS auto_topup_pending_until
 FROM ms_billing.accounts account
 LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
        ON auto_topup.account_id = account.id
+LEFT JOIN LATERAL (
+    SELECT status, failure_code, attempt_expires_at
+    FROM ms_billing.credit_ledger
+    WHERE account_id = account.id
+      AND type = 'auto_topup'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+) last_attempt ON true
 WHERE account.id = sqlc.arg(account_id)::uuid;
 
 -- ListCreditLedgerPage is stable newest-first keyset pagination over the
@@ -507,7 +614,7 @@ INSERT INTO ms_billing.credit_auto_topup_configs (
     sqlc.arg(enabled)::boolean,
     sqlc.arg(threshold_micros)::bigint,
     sqlc.arg(amount_micros)::bigint,
-    NULLIF(sqlc.arg(payment_method_id)::text, '')
+    NULLIF(sqlc.arg(payment_method_id)::text, '')::uuid
 )
 ON CONFLICT (account_id) DO UPDATE SET
     enabled = EXCLUDED.enabled,
@@ -518,7 +625,31 @@ RETURNING
     enabled,
     threshold_micros,
     amount_micros,
-    COALESCE(payment_method_id, '')::text AS payment_method_id;
+    COALESCE(payment_method_id::text, '')::text AS payment_method_id;
+
+-- HasUninvoicedBillingRunWalletDraw protects a boundary that has durably
+-- consumed wallet credit but has not yet reached the only non-reclaimable run
+-- state. SetCreditBillingMode calls this only for an actual mode change while
+-- holding LockWalletAccount's account FOR UPDATE lock. DrawWalletCredits takes
+-- that same lock before reading billing_mode and inserting period draw rows, so
+-- either the mode change wins before any draw or this exact durable draw wins
+-- and keeps its original mode through terminal invoice completion.
+-- name: HasUninvoicedBillingRunWalletDraw :one
+SELECT EXISTS (
+    SELECT 1
+    FROM ms_billing.billing_runs run
+    JOIN ms_billing.billing_periods period
+      ON period.account_id = run.account_id
+     AND period.period_start = run.period_start
+     AND period.period_end = run.period_end
+    JOIN ms_billing.credit_ledger draw
+      ON draw.account_id = run.account_id
+     AND draw.period_id = period.id
+     AND draw.type IN ('usage_draw', 'subscription_draw')
+     AND draw.status = 'settled'
+    WHERE run.account_id = sqlc.arg(account_id)::uuid
+      AND run.status <> 'invoiced'
+)::boolean;
 
 -- SetCreditAccountBillingMode applies a service-resolved concrete credit limit.
 -- In particular, the service resolves an omitted credits-mode value to the
@@ -528,6 +659,10 @@ UPDATE ms_billing.accounts
 SET billing_mode = sqlc.arg(billing_mode)::text,
     credit_limit_micros = sqlc.arg(credit_limit_micros)::bigint
 WHERE id = sqlc.arg(account_id)::uuid
+  AND (
+      billing_mode IS DISTINCT FROM sqlc.arg(billing_mode)::text
+      OR credit_limit_micros IS DISTINCT FROM sqlc.arg(credit_limit_micros)::bigint
+  )
 RETURNING billing_mode, credit_limit_micros;
 
 -- GetDistributorCustomerAccount validates the distributor -> customer
@@ -561,7 +696,7 @@ SELECT
     COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
     COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
     COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
-    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+    COALESCE(auto_topup.payment_method_id::text, '')::text AS auto_topup_payment_method_id
 FROM ms_billing.org_billing_designations designation
 JOIN ms_billing.accounts distributor
   ON distributor.id = designation.sponsor_account_id

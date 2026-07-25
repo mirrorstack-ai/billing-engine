@@ -32,6 +32,11 @@ func (s *pgxStore) OwnerByStripeInvoice(ctx context.Context, stripeInvoiceID str
 	return ownerRowFound(row.OwnerUserID, row.OwnerOrgID, err)
 }
 
+func (s *pgxStore) OwnerByCreditInvoice(ctx context.Context, stripeInvoiceID string) (Owner, bool, error) {
+	row, err := s.q.AccountOwnerByCreditInvoice(ctx, pgtype.Text{String: stripeInvoiceID, Valid: true})
+	return ownerRowFound(row.OwnerUserID, row.OwnerOrgID, err)
+}
+
 func (s *pgxStore) OwnerByStripePaymentMethod(ctx context.Context, stripePaymentMethodID string) (Owner, bool, error) {
 	row, err := s.q.AccountOwnerByStripePaymentMethod(ctx, stripePaymentMethodID)
 	return ownerRowFound(row.OwnerUserID, row.OwnerOrgID, err)

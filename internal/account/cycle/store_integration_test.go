@@ -233,9 +233,10 @@ func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
 
 	// First InsertBillingRun creates the row (shouldCharge=true). Mark it
 	// skipped_no_pm (a non-terminal outcome).
-	run1, should1, err := store.InsertBillingRun(ctx, acct, start, end)
+	run1, should1, reclaimed1, err := store.InsertBillingRun(ctx, acct, start, end)
 	require.NoError(t, err)
 	require.True(t, should1)
+	require.False(t, reclaimed1)
 	require.NoError(t, store.MarkBillingRun(ctx, run1, cycle.RunStatusSkippedNoPM, "", 0))
 
 	// A skipped run still surfaces in the work list (RETAINED, re-attempt).
@@ -244,9 +245,10 @@ func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
 	require.Contains(t, unbilled, acct, "skipped_no_pm must re-appear for retry")
 
 	// InsertBillingRun reclaims the SAME run row for a fresh attempt.
-	run2, should2, err := store.InsertBillingRun(ctx, acct, start, end)
+	run2, should2, reclaimed2, err := store.InsertBillingRun(ctx, acct, start, end)
 	require.NoError(t, err)
 	require.True(t, should2, "a skipped run is reclaimed")
+	require.True(t, reclaimed2)
 	require.Equal(t, run1, run2, "reclaim reuses the same run id (stable idem-keys)")
 
 	// Mark invoiced → terminal. Now it disappears + reclaim refuses.
@@ -255,16 +257,18 @@ func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, unbilled, acct, "invoiced run excludes the account")
 
-	_, should3, err := store.InsertBillingRun(ctx, acct, start, end)
+	_, should3, reclaimed3, err := store.InsertBillingRun(ctx, acct, start, end)
 	require.NoError(t, err)
 	require.False(t, should3, "an invoiced run blocks re-charge")
+	require.False(t, reclaimed3)
 
 	// Exact-window match: a different window must not collide with this run.
 	otherStart := mustTime(t, "2026-07-01T00:00:00Z")
 	otherEnd := mustTime(t, "2026-08-01T00:00:00Z")
-	_, shouldOther, err := store.InsertBillingRun(ctx, acct, otherStart, otherEnd)
+	_, shouldOther, reclaimedOther, err := store.InsertBillingRun(ctx, acct, otherStart, otherEnd)
 	require.NoError(t, err)
 	require.True(t, shouldOther, "a different window is a distinct run")
+	require.False(t, reclaimedOther)
 }
 
 func TestUpsertInvoice_Integration_EverFailedIsSticky(t *testing.T) {
@@ -356,9 +360,10 @@ func TestTightenAndMarkRun_Integration(t *testing.T) {
 	acct := seedAccount(t, pool)
 	start, end := mustTime(t, pStart), mustTime(t, pEnd)
 
-	runID, should, err := store.InsertBillingRun(ctx, acct, start, end)
+	runID, should, reclaimed, err := store.InsertBillingRun(ctx, acct, start, end)
 	require.NoError(t, err)
 	require.True(t, should)
+	require.False(t, reclaimed)
 
 	require.NoError(t, store.TightenAndMarkRun(ctx, acct,
 		cycle.AccountCollection{Mode: cycle.BillingModePrepaid, CreditLimitMicros: 25_000_000},

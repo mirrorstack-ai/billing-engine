@@ -11,6 +11,30 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const accountOwnerByCreditInvoice = `-- name: AccountOwnerByCreditInvoice :one
+SELECT account.owner_user_id, account.owner_org_id
+FROM ms_billing.accounts account
+JOIN ms_billing.credit_ledger credit ON credit.account_id = account.id
+WHERE credit.stripe_invoice_id = $1
+  AND credit.type IN ('purchase', 'auto_topup')
+`
+
+type AccountOwnerByCreditInvoiceRow struct {
+	OwnerUserID pgtype.UUID `json:"owner_user_id"`
+	OwnerOrgID  pgtype.UUID `json:"owner_org_id"`
+}
+
+// Credit invoices are routed only after their exact trusted metadata has been
+// validated by the webhook handler. Keeping this lookup separate guarantees
+// an ordinary invoice notification never prepares or executes SQL that names
+// the credit ledger.
+func (q *Queries) AccountOwnerByCreditInvoice(ctx context.Context, stripeInvoiceID pgtype.Text) (AccountOwnerByCreditInvoiceRow, error) {
+	row := q.db.QueryRow(ctx, accountOwnerByCreditInvoice, stripeInvoiceID)
+	var i AccountOwnerByCreditInvoiceRow
+	err := row.Scan(&i.OwnerUserID, &i.OwnerOrgID)
+	return i, err
+}
+
 const accountOwnerByStripeCustomer = `-- name: AccountOwnerByStripeCustomer :one
 
 SELECT owner_user_id, owner_org_id
@@ -39,10 +63,10 @@ func (q *Queries) AccountOwnerByStripeCustomer(ctx context.Context, stripeCustom
 }
 
 const accountOwnerByStripeInvoice = `-- name: AccountOwnerByStripeInvoice :one
-SELECT a.owner_user_id, a.owner_org_id
-FROM ms_billing.invoices i
-JOIN ms_billing.accounts a ON a.id = i.account_id
-WHERE i.stripe_invoice_id = $1
+SELECT account.owner_user_id, account.owner_org_id
+FROM ms_billing.accounts account
+JOIN ms_billing.invoices invoice ON invoice.account_id = account.id
+WHERE invoice.stripe_invoice_id = $1
 `
 
 type AccountOwnerByStripeInvoiceRow struct {
@@ -74,4 +98,85 @@ func (q *Queries) AccountOwnerByStripePaymentMethod(ctx context.Context, stripeP
 	var i AccountOwnerByStripePaymentMethodRow
 	err := row.Scan(&i.OwnerUserID, &i.OwnerOrgID)
 	return i, err
+}
+
+const countAccountOwnersForLegacyRestamp = `-- name: CountAccountOwnersForLegacyRestamp :one
+SELECT COUNT(*) FROM ms_billing.accounts
+`
+
+// Snapshot cardinality is returned with every page. The protected workflow
+// accepts completion only when the first/terminal totals equal the aggregate
+// successful attempts; concurrent account creation therefore restarts from
+// the empty cursor instead of letting a lower random UUID be skipped.
+func (q *Queries) CountAccountOwnersForLegacyRestamp(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countAccountOwnersForLegacyRestamp)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const listAccountOwnersForLegacyRestamp = `-- name: ListAccountOwnersForLegacyRestamp :many
+SELECT id, owner_user_id, owner_org_id
+FROM ms_billing.accounts
+WHERE id > $1
+ORDER BY id
+LIMIT $2
+`
+
+type ListAccountOwnersForLegacyRestampParams struct {
+	ID    string `json:"id"`
+	Limit int32  `json:"limit"`
+}
+
+type ListAccountOwnersForLegacyRestampRow struct {
+	ID          string      `json:"id"`
+	OwnerUserID pgtype.UUID `json:"owner_user_id"`
+	OwnerOrgID  pgtype.UUID `json:"owner_org_id"`
+}
+
+// The rollback restamp is deliberately migration-048-independent. It scans
+// every legacy account by immutable primary-key cursor and never filters on
+// billing_mode, rollout cohort, card state, or activation.
+func (q *Queries) ListAccountOwnersForLegacyRestamp(ctx context.Context, arg ListAccountOwnersForLegacyRestampParams) ([]ListAccountOwnersForLegacyRestampRow, error) {
+	rows, err := q.db.Query(ctx, listAccountOwnersForLegacyRestamp, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAccountOwnersForLegacyRestampRow{}
+	for rows.Next() {
+		var i ListAccountOwnersForLegacyRestampRow
+		if err := rows.Scan(&i.ID, &i.OwnerUserID, &i.OwnerOrgID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const releaseLegacyRestampMutex = `-- name: ReleaseLegacyRestampMutex :one
+SELECT pg_advisory_unlock(1297306707, 1)
+`
+
+func (q *Queries) ReleaseLegacyRestampMutex(ctx context.Context) (bool, error) {
+	row := q.db.QueryRow(ctx, releaseLegacyRestampMutex)
+	var pg_advisory_unlock bool
+	err := row.Scan(&pg_advisory_unlock)
+	return pg_advisory_unlock, err
+}
+
+const tryAcquireLegacyRestampMutex = `-- name: TryAcquireLegacyRestampMutex :one
+SELECT pg_try_advisory_lock(1297306707, 1)
+`
+
+// Session-level singleton for the explicit rollback restamp. The caller must
+// execute lock and unlock on the same acquired pgxpool connection.
+func (q *Queries) TryAcquireLegacyRestampMutex(ctx context.Context) (bool, error) {
+	row := q.db.QueryRow(ctx, tryAcquireLegacyRestampMutex)
+	var pg_try_advisory_lock bool
+	err := row.Scan(&pg_try_advisory_lock)
+	return pg_try_advisory_lock, err
 }

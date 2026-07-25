@@ -74,6 +74,17 @@ type Client interface {
 	// idemKey (inv-<id>) makes a re-run reuse the SAME draft.
 	CreateDraftInvoice(ctx context.Context, custID, ref, idemKey string) (Invoice, error)
 
+	// CreateCreditPurchaseInvoice creates the same inert draft but stamps the
+	// exact credit operation/account/ledger anchors used to route a trusted
+	// invoice webhook without querying wallet tables for ordinary invoices.
+	CreateCreditPurchaseInvoice(
+		ctx context.Context,
+		customerID string,
+		accountID string,
+		ledgerID string,
+		idemKey string,
+	) (Invoice, error)
+
 	// CreateInvoiceItem creates an invoice item PINNED to the given draft
 	// invoice — never a floating customer-level pending item. amountCents is
 	// the whole-cent customer charge (micro-dollars are converted to cents
@@ -140,6 +151,81 @@ type Client interface {
 	FindInvoiceByRef(ctx context.Context, custID, ref string) (Invoice, bool, error)
 }
 
+// CreditPurchaseClient is the resource-authoritative Stripe surface for manual
+// wallet purchases. It is deliberately narrower than Client so ordinary cycle
+// fakes do not need the invoice-item/payment-list proof operations. Manual
+// settlement never trusts an invoice.paid webhook payload: callers must re-read
+// the attached invoice, its complete item list, and its paid allocations.
+type CreditPurchaseClient interface {
+	CreateCreditPurchaseInvoice(
+		ctx context.Context,
+		customerID string,
+		accountID string,
+		ledgerID string,
+		idemKey string,
+	) (Invoice, error)
+	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error)
+	ListInvoiceItems(ctx context.Context, invoiceID string) ([]InvoiceItem, error)
+	ListInvoicePayments(ctx context.Context, invoiceID string) ([]InvoicePaymentProof, error)
+	FinalizeInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+	GetInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error)
+	FindInvoiceByRef(ctx context.Context, customerID, ref string) (Invoice, bool, error)
+	VoidInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+}
+
+// AutoTopUpClient is the narrower, selected-card Stripe surface used only by
+// the durable automatic credit executor. It is deliberately separate from
+// Client: the ordinary cycle and manual-invoice paths keep their established
+// default-payment-method behavior, while auto-top-up must freeze one exact
+// card and explicitly finalize then pay an inert invoice.
+type AutoTopUpClient interface {
+	// CreateAutoTopUpInvoice creates an empty charge_automatically invoice with
+	// auto_advance=false, pending items excluded, and the attempt-frozen card set
+	// as default_payment_method. It cannot collect until PayInvoiceWithMethod.
+	CreateAutoTopUpInvoice(
+		ctx context.Context,
+		customerID string,
+		paymentMethodID string,
+		accountID string,
+		ledgerID string,
+		idemKey string,
+	) (Invoice, error)
+
+	// CreateInvoiceItem pins the single credit line to the inert draft.
+	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error)
+
+	// ListInvoiceItems establishes resource truth independently of Stripe's
+	// finite idempotency-key retention. An auto-top-up draft is valid only with
+	// exactly one attached item of the frozen amount/currency.
+	ListInvoiceItems(ctx context.Context, invoiceID string) ([]InvoiceItem, error)
+
+	// ListInvoicePayments proves which successful payment object funded a paid
+	// invoice. It returns the complete paid allocation list with the underlying
+	// PaymentIntent customer and payment method projected.
+	ListInvoicePayments(ctx context.Context, invoiceID string) ([]InvoicePaymentProof, error)
+
+	// FinalizeInvoiceWithoutAutoAdvance opens the invoice without allowing
+	// Stripe's automatic advancement, retry, or dunning machinery to collect it.
+	FinalizeInvoiceWithoutAutoAdvance(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+
+	// PayInvoiceWithMethod explicitly attempts the frozen card off-session.
+	// Every argument and the idempotency key comes from the durable attempt.
+	PayInvoiceWithMethod(ctx context.Context, invoiceID, paymentMethodID, idemKey string) (Invoice, error)
+
+	// GetInvoice and FindInvoiceByRef recover after process/network ambiguity.
+	GetInvoice(ctx context.Context, stripeInvoiceID string) (Invoice, error)
+	FindInvoiceByRef(ctx context.Context, customerID, ref string) (Invoice, bool, error)
+
+	// VoidInvoice closes a verified-unpaid finalized invoice before the ledger
+	// attempt is marked failed, preventing an uncoordinated later charge.
+	VoidInvoice(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+
+	// DeleteDraftInvoice permanently removes a verified one-off draft. The
+	// executor always follows this call with an independent GetInvoice and only
+	// releases the pending guard after that read proves resource_missing.
+	DeleteDraftInvoice(ctx context.Context, invoiceID string) (Invoice, error)
+}
+
 // LinePeriod is the coverage window an invoice line bills, half-open [Start, End).
 // Mapped to Stripe's native invoice-item period (rendered on the hosted invoice).
 // The zero value omits the period.
@@ -152,7 +238,9 @@ type LinePeriod struct {
 // the charge path needs: just the id (callers correlate, they don't read the
 // rest). Kept stripe-go-free so the cycle consumer doesn't import the SDK.
 type InvoiceItem struct {
-	ID string
+	ID          string
+	AmountCents int64
+	Currency    string
 }
 
 // Invoice is the trust-boundary-edge projection of a Stripe invoice the charge
@@ -164,16 +252,50 @@ type InvoiceItem struct {
 // separately. CustomerID rides the default (unexpanded) customer field — an
 // id-only *Customer — which is all the pre-pay coherence check reads.
 type Invoice struct {
-	ID               string
-	CustomerID       string
-	ClientSecret     string
-	Status           string
-	AmountDue        int64
-	AmountPaid       int64
-	Currency         string
-	Number           string
-	HostedInvoiceURL string
-	InvoicePDF       string
+	ID                     string
+	CustomerID             string
+	ClientSecret           string
+	Status                 string
+	CollectionMethod       string
+	AutoAdvance            bool
+	DefaultPaymentMethodID string
+	ChargeRef              string
+	CreditOperation        string
+	CreditAccountID        string
+	CreditLedgerID         string
+	Deleted                bool
+	AmountDue              int64
+	AmountPaid             int64
+	AmountRemaining        int64
+	AmountPaidOffStripe    int64
+	Total                  int64
+	Currency               string
+	Number                 string
+	HostedInvoiceURL       string
+	InvoicePDF             string
+}
+
+// InvoicePaymentProof projects the Stripe-side allocation and successful
+// PaymentIntent used to pay an invoice. Auto-top-up settlement requires one
+// exact proof tying the collected amount to the attempt-frozen customer/card;
+// invoice status alone is insufficient because Stripe also supports marking an
+// invoice paid outside Stripe.
+type InvoicePaymentProof struct {
+	ID                    string
+	InvoiceID             string
+	Status                string
+	IsDefault             bool
+	AmountPaid            int64
+	AmountRequested       int64
+	Currency              string
+	PaymentType           string
+	PaymentIntentID       string
+	PaymentIntentStatus   string
+	PaymentIntentCustomer string
+	PaymentMethodID       string
+	PaymentIntentAmount   int64
+	AmountReceived        int64
+	PaymentIntentCurrency string
 }
 
 // ChargeCardRef is the trust-boundary-edge projection of a Stripe charge the

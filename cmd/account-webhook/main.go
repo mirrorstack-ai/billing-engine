@@ -29,8 +29,17 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/httputil"
@@ -89,11 +98,118 @@ func buildRouter() *webhook.Router {
 	verifier := billingstripe.NewVerifier(webhookSecret)
 	store := webhook.NewStore(pool)
 	charges := billingstripe.NewClient(stripeKey)
+	autoTopUpExecutor := autotopup.NewExecutor(
+		autotopup.NewStore(pool),
+		creditledger.NewStore(pool),
+		billingstripe.NewAutoTopUpClient(stripeKey),
+	)
+	manualPurchaseExecutor := creditpurchase.NewExecutor(
+		creditpurchase.NewStore(pool),
+		creditledger.NewStore(pool),
+		billingstripe.NewCreditPurchaseClient(stripeKey),
+	)
+	recoveryCapability := creditrecovery.NewRuntimeCapability(
+		func(ctx context.Context) (bool, error) {
+			return config.CreditRecoverySchemaReady(ctx, pool)
+		},
+	)
+	guardedAutoTopUpRecovery := creditrecovery.GuardWebhookReconciler(
+		recoveryCapability,
+		autoTopUpExecutor,
+	)
+	guardedManualPurchaseRecovery := creditrecovery.GuardWebhookReconciler(
+		recoveryCapability,
+		manualPurchaseExecutor,
+	)
+	candidate := rollout.FromEnv(rollout.ComponentAPI, true)
+	schemaReady := false
+	if candidate.Active() {
+		ready, err := config.CreditRuntimeSchemaReady(context.Background(), pool)
+		if err != nil {
+			slog.Error("credit runtime schema probe failed", "error", err)
+			os.Exit(1)
+		}
+		schemaReady = ready
+	}
+	policy := rollout.FromEnv(rollout.ComponentAPI, schemaReady)
+	controller := rollout.NewController(policy, rollout.NewReporter(os.Stdout))
+	walletEnabled := policy.Active()
+	creditAccess := func(accountID uuid.UUID) bool {
+		return controller.Decide(accountID).Enforced()
+	}
+
+	standingStore := billing.NewStore(pool)
+	status := billing.NewService(standingStore, nil, "").
+		WithCreditWallet(walletEnabled).
+		WithCreditAccess(creditAccess)
+
+	var (
+		shadow      *rollout.CreditShadowEvaluator
+		coordinator *credit.Coordinator
+	)
+	if walletEnabled {
+		projection := usage.NewService(usage.NewStoreWithCreditAccess(
+			pool,
+			creditAccess,
+		))
+		shadowProjection := usage.NewService(usage.NewStoreWithCreditAccess(
+			pool,
+			rollout.ReadOnlySelectedAccess(controller),
+		))
+		shadow = rollout.NewCreditShadowEvaluator(
+			rollout.SnapshotProviderFunc(func(ctx context.Context, accountID uuid.UUID) (rollout.CreditSnapshot, error) {
+				snapshot, err := standingStore.CreditGateSnapshot(ctx, accountID)
+				if err != nil {
+					return rollout.CreditSnapshot{}, err
+				}
+				return rollout.CreditSnapshot{
+					OwnerUserID:            snapshot.OwnerUserID,
+					OwnerOrgID:             snapshot.OwnerOrgID,
+					BillingMode:            snapshot.BillingMode,
+					SettledBalanceMicros:   snapshot.SettledBalanceMicros,
+					SpendableBalanceMicros: snapshot.SpendableBalanceMicros,
+					CreditLimitMicros:      snapshot.CreditLimitMicros,
+					PendingAutoTopUp:       snapshot.PendingAutoTopUp,
+				}, nil
+			}),
+			shadowProjection,
+		)
+		if controller.Mode() == rollout.ModeEnforce {
+			counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+			if err != nil {
+				slog.Error("credit estimate cache unavailable; live projection fallback remains active", "error", err)
+			}
+			coordinator = credit.NewCoordinator(counter, standingStore, projection, nil)
+			autoTopUpExecutor.WithSettlementObserver(coordinator)
+			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
+				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
+					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
+					return credit.AutoTopUpTriggerResult{
+						Attempted:  result.Triggered,
+						NewAttempt: result.NewAttempt,
+						Terminal:   result.Status == "settled" || result.Status == "failed",
+					}, err
+				},
+			))
+		}
+		status.WithCreditCoordinator(rollout.NewGate(controller, shadow, coordinator), coordinator)
+	}
 	// Serving-block notifier (funding-gates C6): pushes standing verdicts to
 	// api-platform after standing-relevant events. Disabled (log-and-skip)
 	// when APPLICATIONS_INTERNAL_URL / INTERNAL_SECRET are unset.
-	notifier := standing.NewNotifierFromEnv(pool, slog.Default())
-	return webhook.NewRouter(verifier, store, charges, charges, slog.Default()).WithServingBlockNotifier(notifier)
+	notifier := standing.NewNotifierFromEnvWithStatus(pool, status, slog.Default())
+	router := webhook.NewRouter(verifier, store, charges, charges, slog.Default()).
+		WithServingBlockNotifier(notifier).
+		WithCreditPaidReconciler(guardedAutoTopUpRecovery).
+		WithManualCreditPaidReconciler(guardedManualPurchaseRecovery).
+		WithCreditFailureReconciler(guardedAutoTopUpRecovery).
+		WithManualCreditFailureReconciler(guardedManualPurchaseRecovery)
+	if coordinator != nil {
+		router.WithCreditSettlementObserver(
+			rollout.NewSettlementObserver(controller, coordinator),
+		)
+	}
+	return router
 }
 
 // proxyHandler is the Lambda entrypoint. Uses APIGatewayProxyRequest

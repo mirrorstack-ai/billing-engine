@@ -34,8 +34,10 @@
 //
 // AWS auth: region + credentials resolve through the SDK's default chain
 // (the Lambda execution role in production) — unlike the Cloudflare puller,
-// there is no separate API token/secret to hold. Requires only DATABASE_URL
-// (+ optional DB_AUTH) like every other billing-engine binary.
+// there is no separate AWS API token/secret to hold. The legacy path requires
+// DATABASE_URL (+ optional DB_AUTH); selected credit-wallet enforcement also
+// requires REDIS_URL and STRIPE_SECRET_KEY for authoritative projection and
+// automatic top-up execution.
 //
 // Spec: docs-temp/app-hosting/ssr-metering-design.md.
 package main
@@ -50,10 +52,18 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/awslambdainv"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 func main() {
@@ -79,7 +89,95 @@ func main() {
 // pgxpool lookup, from config/the ambient AWS SDK credential chain.
 func buildDeps() (*usage.Service, lambdaLister, metricsQuerier, idleChecker) {
 	pool := config.MustPgxPool()
-	svc := usage.NewService(usage.NewStore(pool))
+	candidate := rollout.FromEnv(rollout.ComponentWorker, true)
+	schemaReady := false
+	if candidate.Active() {
+		ready, err := config.CreditRuntimeSchemaReady(context.Background(), pool)
+		if err != nil {
+			slog.Error("credit runtime schema probe failed", "error", err)
+			os.Exit(1)
+		}
+		schemaReady = ready
+	}
+	policy := rollout.FromEnv(rollout.ComponentWorker, schemaReady)
+	controller := rollout.NewController(policy, rollout.NewReporter(os.Stdout))
+	walletEnabled := policy.Active()
+	creditAccess := func(accountID uuid.UUID) bool {
+		return controller.Decide(accountID).Enforced()
+	}
+
+	usageStore := usage.NewStore(pool)
+	if walletEnabled {
+		usageStore = usage.NewStoreWithCreditAccess(pool, creditAccess)
+	}
+	svc := usage.NewService(usageStore)
+	if walletEnabled {
+		standingStore := billing.NewStore(pool)
+		shadowProjection := usage.NewService(usage.NewStoreWithCreditAccess(
+			pool,
+			rollout.ReadOnlySelectedAccess(controller),
+		))
+		shadow := rollout.NewCreditShadowEvaluator(
+			rollout.SnapshotProviderFunc(func(ctx context.Context, accountID uuid.UUID) (rollout.CreditSnapshot, error) {
+				snapshot, err := standingStore.CreditGateSnapshot(ctx, accountID)
+				if err != nil {
+					return rollout.CreditSnapshot{}, err
+				}
+				return rollout.CreditSnapshot{
+					OwnerUserID:            snapshot.OwnerUserID,
+					OwnerOrgID:             snapshot.OwnerOrgID,
+					BillingMode:            snapshot.BillingMode,
+					SettledBalanceMicros:   snapshot.SettledBalanceMicros,
+					SpendableBalanceMicros: snapshot.SpendableBalanceMicros,
+					CreditLimitMicros:      snapshot.CreditLimitMicros,
+					PendingAutoTopUp:       snapshot.PendingAutoTopUp,
+				}, nil
+			}),
+			shadowProjection,
+		)
+
+		var coordinator *credit.Coordinator
+		if controller.Mode() == rollout.ModeEnforce {
+			counter, err := credit.NewCounter(os.Getenv("REDIS_URL"))
+			if err != nil {
+				slog.Error("credit estimate cache unavailable; live projection fallback remains active", "error", err)
+			}
+			coordinator = credit.NewCoordinator(counter, standingStore, svc, nil)
+			stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
+			autoTopUpExecutor := autotopup.NewExecutor(
+				autotopup.NewStore(pool),
+				creditledger.NewStore(pool),
+				billingstripe.NewAutoTopUpClient(stripeKey),
+			).WithSettlementObserver(coordinator)
+			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
+				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
+					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
+					return credit.AutoTopUpTriggerResult{
+						Attempted:  result.Triggered,
+						NewAttempt: result.NewAttempt,
+						Terminal:   result.Status == "settled" || result.Status == "failed",
+					}, err
+				},
+			))
+
+			status := billing.NewService(standingStore, nil, "").
+				WithCreditWallet(true).
+				WithCreditAccess(creditAccess).
+				WithCreditCoordinator(rollout.NewGate(controller, shadow, coordinator), coordinator)
+			notifier := standing.NewNotifierFromEnvWithStatus(pool, status, slog.Default())
+			if notifier.Enabled() {
+				coordinator.WithNotifier(notifier)
+			}
+		}
+		svc.WithCreditEvaluator(rollout.NewUsageEvaluator(
+			controller,
+			rollout.ReadOnlyUsageEvaluatorFunc(func(ctx context.Context, event credit.UsageEvent) error {
+				_, err := shadow.EvaluateCreditReadOnly(ctx, event.AccountID)
+				return err
+			}),
+			coordinator,
+		))
+	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background())
 	if err != nil {

@@ -6,9 +6,11 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	stripego "github.com/stripe/stripe-go/v85"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook/webhooktest"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -59,6 +61,7 @@ func invoiceEvent(id, eventType, invoiceID, status string, amountPaid, amountDue
 		"status":      status,
 		"amount_paid": amountPaid,
 		"amount_due":  amountDue,
+		"currency":    "usd",
 	}
 	raw, _ := json.Marshal(payload)
 	return stripego.Event{
@@ -66,6 +69,29 @@ func invoiceEvent(id, eventType, invoiceID, status string, amountPaid, amountDue
 		Type: stripego.EventType(eventType),
 		Data: &stripego.EventData{Raw: raw},
 	}
+}
+
+func creditInvoiceEvent(
+	id, eventType, invoiceID, status string,
+	amountPaid, amountDue int64,
+	operation string,
+	accountID, ledgerID uuid.UUID,
+) stripego.Event {
+	event := invoiceEvent(id, eventType, invoiceID, status, amountPaid, amountDue)
+	var payload map[string]any
+	_ = json.Unmarshal(event.Data.Raw, &payload)
+	refPrefix := "credit-purchase:"
+	if operation == "auto_topup" {
+		refPrefix = "credit-auto-topup:"
+	}
+	payload["metadata"] = map[string]any{
+		"ms_charge_ref":        refPrefix + ledgerID.String(),
+		"ms_credit_operation":  operation,
+		"ms_credit_account_id": accountID.String(),
+		"ms_credit_ledger_id":  ledgerID.String(),
+	}
+	event.Data.Raw, _ = json.Marshal(payload)
+	return event
 }
 
 // fraudEvent builds a charge.dispute.created / radar.early_fraud_warning.created
@@ -453,6 +479,595 @@ func TestProcess_InvoicePaid_RecordsAmountPaid(t *testing.T) {
 	require.Equal(t, int64(1200), s.AppliedInvoices[0].AmountPaidCents)
 	// invoice.paid ALSO runs the relax driver (PR #9).
 	require.Equal(t, []string{"in_1"}, s.RelaxedInvoices, "invoice.paid must attempt the prepaid → arrears relax")
+}
+
+func TestProcess_InvoicePaid_SettlesLedgerBeforeMissingMirrorReturnAndObservesOnce(t *testing.T) {
+	accountID := uuid.New()
+	ledgerID := uuid.New()
+	event := creditInvoiceEvent(
+		"evt_credit_paid_1", "invoice.paid", "in_credit", "paid", 501, 501,
+		"purchase", accountID, ledgerID,
+	)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(event.Data.Raw, &payload))
+	payload["hosted_invoice_url"] = "https://stripe.test/in_credit"
+	event.Data.Raw, _ = json.Marshal(payload)
+
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false // credit invoices need not exist in the ordinary mirror
+	manualSettlement := creditledger.Settlement{
+		Found: true, Transitioned: true,
+		AccountID: accountID, LedgerID: ledgerID, Type: "purchase",
+	}
+	observer := &creditObserver{}
+	notifier := &recordingNotifier{}
+	manual := &recordingCreditPaidReconciler{
+		results: []creditledger.Settlement{
+			manualSettlement,
+			{
+				Found: true, Transitioned: false,
+				AccountID: accountID, LedgerID: ledgerID, Type: "purchase",
+			},
+		},
+	}
+	r := newRouter(v, s).
+		WithCreditSettlementObserver(observer).
+		WithServingBlockNotifier(notifier).
+		WithManualCreditPaidReconciler(manual)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Equal(t, []string{"in_credit"}, manual.calls)
+	require.Len(t, s.AppliedInvoices, 1, "settlement runs before the mirror lookup")
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	require.Equal(t, []bool{true}, observer.settlementObservations)
+	require.Equal(t, []string{"in_credit"}, notifier.creditInvoices, "ledger-only invoices still push standing")
+	require.Equal(t, []bool{true}, notifier.creditSettlementObservations)
+	require.Zero(t, notifier.creditUnmarkedCalls,
+		"credit notification re-entry must inherit settlement observation")
+	require.Empty(t, notifier.invoices)
+	require.Empty(t, s.RelaxedInvoices, "missing ordinary mirror still cannot run collection relax")
+
+	// A different Stripe event for the same paid invoice reaches settlement
+	// again, but the shared transaction reports Transitioned=false. Runtime
+	// reconciliation and block-claim release must not run twice.
+	v.Event = creditInvoiceEvent(
+		"evt_credit_paid_2", "invoice.paid", "in_credit", "paid", 501, 501,
+		"purchase", accountID, ledgerID,
+	)
+	res = r.Process(context.Background(), []byte(`{}`), "sig")
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Equal(t, []string{"in_credit", "in_credit"}, manual.calls)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+}
+
+func TestProcess_InvoicePaid_CreditSettlementFailureRetriesBeforeMirrorWrite(t *testing.T) {
+	accountID, ledgerID := uuid.New(), uuid.New()
+	v := &webhooktest.FakeVerifier{
+		Event: creditInvoiceEvent(
+			"evt_credit_err", "invoice.paid", "in_credit", "paid", 500, 500,
+			"purchase", accountID, ledgerID,
+		),
+	}
+	s := webhooktest.NewFakeStore()
+	manual := &recordingCreditPaidReconciler{
+		err: errors.New("wallet transaction unavailable"),
+	}
+	r := newRouter(v, s).WithManualCreditPaidReconciler(manual)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+	require.Equal(t, []string{"in_credit"}, manual.calls)
+	require.Empty(t, s.AppliedInvoices, "ordinary mirror must not hide a failed money settlement")
+	require.False(t, s.Processed["evt_credit_err"], "5xx unmarks the event so Stripe can retry")
+}
+
+func TestProcess_InvoicePaid_AutoTopUpUsesResourceReconcilerNotEventSettlement(t *testing.T) {
+	accountID := uuid.New()
+	ledgerID := uuid.New()
+	v := &webhooktest.FakeVerifier{
+		Event: creditInvoiceEvent(
+			"evt_auto_paid", "invoice.paid", "in_auto", "paid", 500, 500,
+			"auto_topup", accountID, ledgerID,
+		),
+	}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false
+	reconciler := &recordingCreditPaidReconciler{
+		results: []creditledger.Settlement{{
+			Found: true, Transitioned: true,
+			AccountID: accountID, LedgerID: ledgerID, Type: "auto_topup",
+		}},
+	}
+	observer := &creditObserver{}
+	r := newRouter(v, s).
+		WithCreditPaidReconciler(reconciler).
+		WithCreditSettlementObserver(observer)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusDriftWarning, res.Status)
+	require.Equal(t, []string{"in_auto"}, reconciler.calls)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+}
+
+func TestProcess_InvoicePaid_AutoTopUpResourceErrorRetriesBeforeAnySettlement(t *testing.T) {
+	event := creditInvoiceEvent(
+		"evt_auto_paid_bad", "invoice.paid", "in_auto", "paid", 500, 500,
+		"auto_topup", uuid.New(), uuid.New(),
+	)
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	reconciler := &recordingCreditPaidReconciler{
+		err: errors.New("auto-top-up invoice invariant mismatch"),
+	}
+	r := newRouter(v, s).WithCreditPaidReconciler(reconciler)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+	require.Equal(t, []string{"in_auto"}, reconciler.calls)
+	require.Empty(t, s.AppliedInvoices)
+	require.False(t, s.Processed[event.ID], "5xx must allow transport redelivery")
+}
+
+func TestProcess_NonPaidInvoice_DoesNotAttemptCreditSettlement(t *testing.T) {
+	v := &webhooktest.FakeVerifier{
+		Event: invoiceEvent("evt_credit_open", "invoice.finalized", "in_credit", "open", 0, 500),
+	}
+	s := webhooktest.NewFakeStore()
+	r := newRouter(v, s)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusOK, res.Status)
+}
+
+func TestProcess_OrdinaryInvoiceEventsNeverEnterCreditReconcilers(t *testing.T) {
+	for _, tc := range []struct {
+		name, eventType, status string
+		paid, due               int64
+	}{
+		{name: "paid", eventType: "invoice.paid", status: "paid", paid: 500, due: 500},
+		{name: "failed", eventType: "invoice.payment_failed", status: "open", due: 500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: invoiceEvent(
+				"evt_ordinary_"+tc.name, tc.eventType, "in_ordinary",
+				tc.status, tc.paid, tc.due,
+			)}
+			s := webhooktest.NewFakeStore()
+			paid := &recordingCreditPaidReconciler{}
+			manual := &recordingCreditPaidReconciler{}
+			failed := &recordingCreditFailureReconciler{}
+			r := newRouter(v, s).
+				WithCreditPaidReconciler(paid).
+				WithManualCreditPaidReconciler(manual).
+				WithCreditFailureReconciler(failed)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, 200, res.HTTPStatus)
+			require.Empty(t, paid.calls)
+			require.Empty(t, manual.calls)
+			require.Empty(t, failed.calls)
+		})
+	}
+}
+
+func TestProcess_UnknownCreditOperationDoesNotAuthorizeWalletLookup(t *testing.T) {
+	event := creditInvoiceEvent(
+		"evt_unknown_credit_op", "invoice.paid", "in_unknown", "paid", 500, 500,
+		"future_operation", uuid.New(), uuid.New(),
+	)
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	paid := &recordingCreditPaidReconciler{}
+	manual := &recordingCreditPaidReconciler{}
+	failed := &recordingCreditFailureReconciler{}
+	r := newRouter(v, s).
+		WithCreditPaidReconciler(paid).
+		WithManualCreditPaidReconciler(manual).
+		WithCreditFailureReconciler(failed)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Empty(t, paid.calls)
+	require.Empty(t, manual.calls)
+	require.Empty(t, failed.calls)
+}
+
+func TestProcess_LegacyManualPurchaseReferenceFailsClosedWithoutExactMetadata(t *testing.T) {
+	ledgerID := uuid.New()
+	event := invoiceEvent(
+		"evt_legacy_purchase", "invoice.paid", "in_legacy_purchase", "paid", 500, 500,
+	)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(event.Data.Raw, &payload))
+	payload["metadata"] = map[string]any{
+		"ms_charge_ref": "credit-purchase:" + ledgerID.String(),
+	}
+	event.Data.Raw, _ = json.Marshal(payload)
+
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	manual := &recordingCreditPaidReconciler{}
+	r := newRouter(v, s).WithManualCreditPaidReconciler(manual)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+	require.Empty(t, manual.calls)
+	require.False(t, s.Processed[event.ID])
+}
+
+func TestProcess_AuthenticatedCreditMetadataMustResolveDurableAttempt(t *testing.T) {
+	accountID, ledgerID := uuid.New(), uuid.New()
+	tests := []struct {
+		name              string
+		event             stripego.Event
+		withPaid          bool
+		withManual        bool
+		withError         bool
+		withManualFailure bool
+	}{
+		{
+			name: "paid auto top-up missing attempt",
+			event: creditInvoiceEvent(
+				"evt_missing_paid", "invoice.paid", "in_missing", "paid", 500, 500,
+				"auto_topup", accountID, ledgerID,
+			),
+			withPaid: true,
+		},
+		{
+			name: "failed auto top-up missing attempt",
+			event: creditInvoiceEvent(
+				"evt_missing_failed", "invoice.payment_failed", "in_missing", "open", 0, 500,
+				"auto_topup", accountID, ledgerID,
+			),
+			withError: true,
+		},
+		{
+			name: "manual purchase missing attempt",
+			event: creditInvoiceEvent(
+				"evt_missing_purchase", "invoice.paid", "in_missing", "paid", 500, 500,
+				"purchase", accountID, ledgerID,
+			),
+			withManual: true,
+		},
+		{
+			name: "failed manual purchase missing attempt",
+			event: creditInvoiceEvent(
+				"evt_missing_purchase_failure", "invoice.voided", "in_missing", "void", 0, 500,
+				"purchase", accountID, ledgerID,
+			),
+			withManualFailure: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: tc.event}
+			s := webhooktest.NewFakeStore()
+			r := newRouter(v, s)
+			if tc.withPaid {
+				r.WithCreditPaidReconciler(&recordingCreditPaidReconciler{})
+			}
+			if tc.withManual {
+				r.WithManualCreditPaidReconciler(&recordingCreditPaidReconciler{})
+			}
+			if tc.withError {
+				r.WithCreditFailureReconciler(&recordingCreditFailureReconciler{})
+			}
+			if tc.withManualFailure {
+				r.WithManualCreditFailureReconciler(
+					&recordingCreditFailureReconciler{},
+				)
+			}
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, 500, res.HTTPStatus)
+			require.Equal(t, webhook.StatusInternal, res.Status)
+			require.False(t, s.Processed[tc.event.ID])
+			require.Empty(t, s.AppliedInvoices)
+		})
+	}
+}
+
+func TestProcess_MalformedRecognizedCreditMetadataRetriesWithoutWalletLookup(t *testing.T) {
+	event := creditInvoiceEvent(
+		"evt_bad_credit_metadata", "invoice.paid", "in_bad", "paid", 500, 500,
+		"auto_topup", uuid.New(), uuid.New(),
+	)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(event.Data.Raw, &payload))
+	metadata := payload["metadata"].(map[string]any)
+	metadata["ms_credit_account_id"] = "not-a-uuid"
+	event.Data.Raw, _ = json.Marshal(payload)
+
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	paid := &recordingCreditPaidReconciler{}
+	r := newRouter(v, s).WithCreditPaidReconciler(paid)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Empty(t, paid.calls)
+	require.Empty(t, s.AppliedInvoices)
+	require.False(t, s.Processed[event.ID])
+}
+
+func TestProcess_AutoTopUpFailureEventsUseResourceReconciler(t *testing.T) {
+	tests := []struct {
+		name        string
+		eventType   string
+		status      string
+		failureCode string
+		latches     bool
+	}{
+		{
+			name: "payment failed", eventType: "invoice.payment_failed",
+			status: "open", failureCode: "payment_failed", latches: true,
+		},
+		{
+			name: "action required", eventType: "invoice.payment_action_required",
+			status: "open", failureCode: "authentication_required", latches: true,
+		},
+		{
+			name: "voided", eventType: "invoice.voided",
+			status: "void", failureCode: "invoice_void",
+		},
+		{
+			name: "uncollectible", eventType: "invoice.marked_uncollectible",
+			status: "uncollectible", failureCode: "invoice_uncollectible", latches: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: creditInvoiceEvent(
+				"evt_auto_failure_"+tt.name,
+				tt.eventType,
+				"in_auto_failure",
+				tt.status,
+				0,
+				500,
+				"auto_topup",
+				uuid.New(),
+				uuid.New(),
+			)}
+			s := webhooktest.NewFakeStore()
+			reconciler := &recordingCreditFailureReconciler{
+				results: []creditledger.FailureReconciliation{{Found: true}},
+			}
+			r := newRouter(v, s).WithCreditFailureReconciler(reconciler)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, 200, res.HTTPStatus)
+			require.Equal(t, webhook.StatusOK, res.Status)
+			require.Equal(t, []creditFailureCall{{
+				invoiceID:   "in_auto_failure",
+				failureCode: tt.failureCode,
+			}}, reconciler.calls)
+			if tt.latches {
+				require.Equal(t, []string{"in_auto_failure"}, s.FailedInvoices)
+			} else {
+				require.Empty(t, s.FailedInvoices)
+			}
+		})
+	}
+}
+
+func TestProcess_AutoTopUpFailureTransitionObservesOnceAndNotifiesLedgerOwner(t *testing.T) {
+	accountID := uuid.New()
+	ledgerID := uuid.New()
+	v := &webhooktest.FakeVerifier{Event: creditInvoiceEvent(
+		"evt_auto_failure_first",
+		"invoice.payment_failed",
+		"in_auto_failure",
+		"open",
+		0,
+		500,
+		"auto_topup",
+		accountID,
+		ledgerID,
+	)}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false
+	reconciler := &recordingCreditFailureReconciler{
+		results: []creditledger.FailureReconciliation{
+			{
+				Found: true, Transitioned: true,
+				AccountID: accountID, LedgerID: ledgerID,
+				Status: "failed", FailureCode: "payment_failed",
+			},
+			{
+				Found: true, Transitioned: false,
+				AccountID: accountID, LedgerID: ledgerID,
+				Status: "failed", FailureCode: "payment_failed",
+			},
+		},
+	}
+	observer := &creditObserver{}
+	notifier := &recordingNotifier{}
+	r := newRouter(v, s).
+		WithCreditFailureReconciler(reconciler).
+		WithCreditSettlementObserver(observer).
+		WithServingBlockNotifier(notifier)
+
+	first := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, first.HTTPStatus)
+	require.Equal(t, webhook.StatusDriftWarning, first.Status)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	require.Equal(t, []bool{true}, observer.settlementObservations)
+	require.Equal(t, []string{"in_auto_failure"}, notifier.creditInvoices)
+	require.Empty(t, notifier.invoices)
+
+	v.Event = creditInvoiceEvent(
+		"evt_auto_failure_replay",
+		"invoice.payment_action_required",
+		"in_auto_failure",
+		"open",
+		0,
+		500,
+		"auto_topup",
+		accountID,
+		ledgerID,
+	)
+	second := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusDriftWarning, second.Status)
+	require.Len(t, reconciler.calls, 2)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts,
+		"only the first committed transition may reconcile runtime state")
+	require.Equal(t, []string{"in_auto_failure"}, notifier.creditInvoices,
+		"ledger replay must not emit a second owner notification")
+	require.Equal(t, []bool{true}, notifier.creditSettlementObservations)
+	require.Zero(t, notifier.creditUnmarkedCalls,
+		"notifier re-entry must not be able to trigger another top-up")
+}
+
+func TestProcess_ManualPurchaseVoidWithoutBrowserFailsOnceAndNotifiesOwner(t *testing.T) {
+	accountID, ledgerID := uuid.New(), uuid.New()
+	v := &webhooktest.FakeVerifier{Event: creditInvoiceEvent(
+		"evt_manual_void_first",
+		"invoice.voided",
+		"in_manual_void",
+		"void",
+		0,
+		500,
+		"purchase",
+		accountID,
+		ledgerID,
+	)}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false
+	reconciler := &recordingCreditFailureReconciler{
+		results: []creditledger.FailureReconciliation{
+			{
+				Found: true, Transitioned: true,
+				AccountID: accountID, LedgerID: ledgerID,
+				Status: "failed", FailureCode: "invoice_void",
+			},
+			{
+				Found: true, Transitioned: false,
+				AccountID: accountID, LedgerID: ledgerID,
+				Status: "failed", FailureCode: "invoice_void",
+			},
+		},
+	}
+	observer := &creditObserver{}
+	notifier := &recordingNotifier{}
+	r := newRouter(v, s).
+		WithManualCreditFailureReconciler(reconciler).
+		WithCreditSettlementObserver(observer).
+		WithServingBlockNotifier(notifier)
+
+	first := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, first.HTTPStatus)
+	require.Equal(t, webhook.StatusDriftWarning, first.Status)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	require.Equal(t, []string{"in_manual_void"}, notifier.creditInvoices)
+	require.Equal(t, []bool{true}, notifier.creditSettlementObservations)
+	require.Zero(t, notifier.creditUnmarkedCalls)
+
+	v.Event = creditInvoiceEvent(
+		"evt_manual_void_replay",
+		"invoice.voided",
+		"in_manual_void",
+		"void",
+		0,
+		500,
+		"purchase",
+		accountID,
+		ledgerID,
+	)
+	second := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusDriftWarning, second.Status)
+	require.Len(t, reconciler.calls, 2)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	require.Equal(t, []string{"in_manual_void"}, notifier.creditInvoices)
+}
+
+func TestProcess_ManualUncollectiblePaidRaceRoutesPaidHighestResult(t *testing.T) {
+	accountID, ledgerID := uuid.New(), uuid.New()
+	event := creditInvoiceEvent(
+		"evt_manual_uncollectible_paid",
+		"invoice.marked_uncollectible",
+		"in_manual_paid_race",
+		"uncollectible",
+		0,
+		500,
+		"purchase",
+		accountID,
+		ledgerID,
+	)
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	s.InvoiceFound = false
+	reconciler := &recordingCreditFailureReconciler{
+		results: []creditledger.FailureReconciliation{{
+			Found: true, Transitioned: true,
+			AccountID: accountID, LedgerID: ledgerID,
+			Status: "settled",
+		}},
+	}
+	observer := &creditObserver{}
+	notifier := &recordingNotifier{}
+	r := newRouter(v, s).
+		WithManualCreditFailureReconciler(reconciler).
+		WithCreditSettlementObserver(observer).
+		WithServingBlockNotifier(notifier)
+
+	result := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, result.HTTPStatus)
+	require.Equal(t, webhook.StatusDriftWarning, result.Status)
+	require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	require.Equal(t, []string{"in_manual_paid_race"}, notifier.creditInvoices)
+}
+
+func TestProcess_AutoTopUpFailureReconciliationErrorRetriesBeforeMirrorWrite(t *testing.T) {
+	event := creditInvoiceEvent(
+		"evt_auto_failure_error",
+		"invoice.payment_failed",
+		"in_auto_failure",
+		"open",
+		0,
+		500,
+		"auto_topup",
+		uuid.New(),
+		uuid.New(),
+	)
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	reconciler := &recordingCreditFailureReconciler{
+		err: errors.New("Stripe reconciliation unavailable"),
+	}
+	r := newRouter(v, s).WithCreditFailureReconciler(reconciler)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 500, res.HTTPStatus)
+	require.Equal(t, webhook.StatusInternal, res.Status)
+	require.False(t, s.Processed[event.ID], "5xx must allow transport redelivery")
+	require.Empty(t, s.AppliedInvoices,
+		"ordinary mirror status cannot hide an unresolved money transition")
 }
 
 // --- risk-graded RELAX driver (PR #9) -------------------------------------
@@ -848,6 +1463,73 @@ func TestProcess_InvoiceEvent_StoreError_Internal(t *testing.T) {
 
 	require.Equal(t, 500, res.HTTPStatus)
 	require.Equal(t, webhook.StatusInternal, res.Status)
+}
+
+type creditObserver struct {
+	accounts               []uuid.UUID
+	settlementObservations []bool
+	err                    error
+}
+
+func (o *creditObserver) ObserveAccount(ctx context.Context, accountID uuid.UUID) error {
+	o.accounts = append(o.accounts, accountID)
+	o.settlementObservations = append(
+		o.settlementObservations,
+		creditledger.IsSettlementObservation(ctx),
+	)
+	return o.err
+}
+
+type creditFailureCall struct {
+	invoiceID   string
+	failureCode string
+}
+
+type recordingCreditPaidReconciler struct {
+	calls   []string
+	results []creditledger.Settlement
+	err     error
+}
+
+func (r *recordingCreditPaidReconciler) ReconcileWebhookPaid(
+	_ context.Context,
+	stripeInvoiceID string,
+) (creditledger.Settlement, error) {
+	r.calls = append(r.calls, stripeInvoiceID)
+	if r.err != nil {
+		return creditledger.Settlement{}, r.err
+	}
+	if len(r.results) == 0 {
+		return creditledger.Settlement{}, nil
+	}
+	result := r.results[0]
+	r.results = r.results[1:]
+	return result, nil
+}
+
+type recordingCreditFailureReconciler struct {
+	calls   []creditFailureCall
+	results []creditledger.FailureReconciliation
+	err     error
+}
+
+func (r *recordingCreditFailureReconciler) ReconcileWebhookFailure(
+	_ context.Context,
+	stripeInvoiceID string,
+	failureCode string,
+) (creditledger.FailureReconciliation, error) {
+	r.calls = append(r.calls, creditFailureCall{
+		invoiceID: stripeInvoiceID, failureCode: failureCode,
+	})
+	if r.err != nil {
+		return creditledger.FailureReconciliation{}, r.err
+	}
+	if len(r.results) == 0 {
+		return creditledger.FailureReconciliation{}, nil
+	}
+	result := r.results[0]
+	r.results = r.results[1:]
+	return result, nil
 }
 
 // --- ProcessTrusted (EventBridge entry point) -----------------------------

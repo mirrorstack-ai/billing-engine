@@ -4,6 +4,8 @@ package usage_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
@@ -114,22 +117,28 @@ func TestMirroredAppIDs_Integration(t *testing.T) {
 	require.ElementsMatch(t, []uuid.UUID{longLived, createdInside, deletedInside}, ids)
 }
 
-// TestSettledNewCreationCharges_Integration_WalletDraw proves a creation settled
-// without a Stripe invoice remains visible in 本期新建立. The synthetic wallet
-// guard supplies the display identity, while only settled creation usage-draw
-// ledger rows contribute to the base amount.
-func TestSettledNewCreationCharges_Integration_WalletDraw(t *testing.T) {
+// TestSettledNewCreationCharges_Integration_ShadowSelectedWalletDraw proves a
+// creation settled without a Stripe invoice remains visible to the dedicated
+// selected-account shadow projection after an enforce→shadow rollback. The
+// public/excluded store remains on the legacy query, while the shadow-only
+// access reads durable wallet truth without authorizing a mutation or changing
+// a public response.
+func TestSettledNewCreationCharges_Integration_ShadowSelectedWalletDraw(t *testing.T) {
 	pool := testutil.NewTestDB(t)
-	store := usage.NewStoreWithCreditWallet(pool, true)
 	ctx := context.Background()
 
 	acct := appSeedAccount(t, pool)
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`,
+		acct,
+	)
+	require.NoError(t, err)
 	appID := uuid.New()
 	const amountMicros = int64(3_250_123)
 	walletRef := "wallet:app-proration:" + appID.String()
 	recordedAt := appMustTime(t, "2026-06-18T12:30:00Z")
 
-	_, err := pool.Exec(ctx,
+	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.apps
 		   (app_id, account_id, module_count, created_module_count, name, created_at,
 		    proration_invoice_id, updated_at)
@@ -156,6 +165,35 @@ func TestSettledNewCreationCharges_Integration_WalletDraw(t *testing.T) {
 		recordedAt, keyPrefix+"usage_draw:failed", keyPrefix+"subscription_draw:distractor")
 	require.NoError(t, err)
 
+	legacyRows, err := usage.NewStoreWithCreditAccess(
+		pool,
+		func(uuid.UUID) bool { return false },
+	).SettledNewCreationCharges(
+		ctx,
+		acct,
+		appMustTime(t, appPeriodStart),
+		appMustTime(t, appPeriodEnd),
+	)
+	require.NoError(t, err)
+	require.Empty(t, legacyRows,
+		"an excluded/public legacy read must not enter the wallet query")
+
+	allowlistDigest := sha256.Sum256([]byte(acct.String()))
+	controller := rollout.NewController(rollout.Parse(rollout.Config{
+		MasterEnabled:   true,
+		SchemaReady:     true,
+		Component:       rollout.ComponentAPI,
+		Mode:            string(rollout.ModeShadow),
+		BasisPoints:     "0",
+		Allowlist:       acct.String(),
+		AllowlistSHA256: hex.EncodeToString(allowlistDigest[:]),
+		CoreManifestSHA: "1111111111111111111111111111111111111111",
+		BillingSHA:      "2222222222222222222222222222222222222222",
+	}), nil)
+	store := usage.NewStoreWithCreditAccess(
+		pool,
+		rollout.ReadOnlySelectedAccess(controller),
+	)
 	rows, err := store.SettledNewCreationCharges(ctx, acct,
 		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
 	require.NoError(t, err)

@@ -22,3 +22,10 @@ func TestHTTPStatusForError_PaymentRequired(t *testing.T) {
 	require.Equal(t, "PAYMENT_REQUIRED", resp.Error.Code)
 	require.Equal(t, "add a card before creating an app", resp.Error.Message)
 }
+
+func TestHTTPStatusForError_CreditWalletUnavailable(t *testing.T) {
+	err := billing.Unavailable("credit wallet is not enabled for this account")
+
+	require.Equal(t, http.StatusServiceUnavailable, httpStatusForError(err))
+	require.Equal(t, string(billing.CodeUnavailable), buildResponse(nil, err).Error.Code)
+}

@@ -8,34 +8,54 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 )
 
-func TestGetCreditStanding_FoldsEligibilityAndCreditLimit(t *testing.T) {
+type countingCreditObserver struct {
+	accounts               []uuid.UUID
+	settlementObservations []bool
+}
+
+func (o *countingCreditObserver) ObserveAccount(ctx context.Context, accountID uuid.UUID) error {
+	o.accounts = append(o.accounts, accountID)
+	o.settlementObservations = append(
+		o.settlementObservations,
+		creditledger.IsSettlementObservation(ctx),
+	)
+	return nil
+}
+
+func TestGetCreditStanding_FoldsSingleServiceStatusGate(t *testing.T) {
 	tests := []struct {
 		name            string
 		signals         billing.ServiceSignals
 		balanceMicros   int64
+		creditLimit     int64
+		gateBlocked     bool
 		wantBlocked     bool
 		wantBlockReason string
 	}{
 		{
-			name:            "otherwise eligible exhausted wallet is out of credits",
+			name:            "otherwise eligible authoritative shortfall is out of credits",
 			signals:         billing.ServiceSignals{UsableCardCount: 1, FirstChargeStatus: "paid"},
-			balanceMicros:   -5_000_000,
+			balanceMicros:   0,
+			gateBlocked:     true,
 			wantBlocked:     true,
 			wantBlockReason: "out_of_credits",
 		},
 		{
 			name:            "base eligibility reason keeps priority",
 			signals:         billing.ServiceSignals{FirstChargeStatus: "paid"},
-			balanceMicros:   -5_000_000,
+			balanceMicros:   0,
+			gateBlocked:     true,
 			wantBlocked:     true,
 			wantBlockReason: "card_gate",
 		},
 		{
-			name:          "wallet above negative limit stays eligible",
+			name:          "zero-limit equality stays eligible when authoritative gate allows",
 			signals:       billing.ServiceSignals{UsableCardCount: 1, FirstChargeStatus: "paid"},
-			balanceMicros: -4_999_999,
+			balanceMicros: 0,
 			wantBlocked:   false,
 		},
 	}
@@ -49,9 +69,12 @@ func TestGetCreditStanding_FoldsEligibilityAndCreditLimit(t *testing.T) {
 			store.creditStanding[accountID] = billing.CreditStandingRow{
 				BillingMode:       billing.BillingModeCredits,
 				BalanceMicros:     tc.balanceMicros,
-				CreditLimitMicros: 5_000_000,
+				CreditLimitMicros: tc.creditLimit,
 			}
-			svc := billing.NewService(store, &fakeStripe{}, "").WithCreditWallet(true)
+			gate := &fixedCreditGate{blocked: tc.gateBlocked}
+			svc := billing.NewService(store, &fakeStripe{}, "").
+				WithCreditWallet(true).
+				WithCreditCoordinator(gate, nil)
 
 			resp, err := svc.GetCreditStanding(context.Background(), billing.GetCreditStandingRequest{
 				OwnerUserID: userID,
@@ -60,7 +83,7 @@ func TestGetCreditStanding_FoldsEligibilityAndCreditLimit(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, billing.BillingModeCredits, resp.BillingMode)
 			require.Equal(t, tc.balanceMicros, resp.BalanceMicros)
-			require.Equal(t, int64(5_000_000), resp.CreditLimitMicros)
+			require.Equal(t, tc.creditLimit, resp.CreditLimitMicros)
 			require.Equal(t, tc.wantBlocked, resp.Blocked)
 			require.Equal(t, tc.wantBlockReason, resp.BlockReason)
 		})
@@ -86,7 +109,8 @@ func TestStartCreditPurchase_EnforcesInclusiveBounds(t *testing.T) {
 			store.accountsByUser[userID] = fakeAccount{id: accountID}
 			store.stripeCustomerOf[accountID] = "cus_credit"
 			stripeFake := &fakeStripe{}
-			svc := billing.NewService(store, stripeFake, "").WithCreditWallet(true)
+			svc := newCreditPurchaseTestService(store, stripeFake).
+				WithCreditWallet(true)
 
 			resp, err := svc.StartCreditPurchase(context.Background(), billing.StartCreditPurchaseRequest{
 				OwnerUserID:    userID,
@@ -120,7 +144,8 @@ func TestStartCreditPurchase_SameKeyRunsOneStripeInvoiceFlow(t *testing.T) {
 	store.accountsByUser[userID] = fakeAccount{id: accountID}
 	store.stripeCustomerOf[accountID] = "cus_credit"
 	stripeFake := &fakeStripe{}
-	svc := billing.NewService(store, stripeFake, "").WithCreditWallet(true)
+	svc := newCreditPurchaseTestService(store, stripeFake).
+		WithCreditWallet(true)
 	req := billing.StartCreditPurchaseRequest{
 		OwnerUserID:    userID,
 		AmountMicros:   12_340_000,
@@ -140,7 +165,108 @@ func TestStartCreditPurchase_SameKeyRunsOneStripeInvoiceFlow(t *testing.T) {
 	require.Len(t, stripeFake.creditDraftCalls, 1)
 	require.Len(t, stripeFake.creditItemCalls, 1)
 	require.Len(t, stripeFake.creditFinalizeCalls, 1)
-	require.Len(t, stripeFake.creditGetCalls, 1)
+	require.GreaterOrEqual(t, len(stripeFake.creditGetCalls), 3,
+		"draft item, finalize, and idempotent replay each establish independent resource truth")
+}
+
+func TestCreditMutationObserversRunOnlyForFirstDurableTransition(t *testing.T) {
+	t.Run("start purchase settled replay", func(t *testing.T) {
+		store := newFakeStore()
+		userID, accountID := uuid.New(), uuid.New()
+		store.accountsByUser[userID] = fakeAccount{id: accountID}
+		store.stripeCustomerOf[accountID] = "cus_credit"
+		stripeFake := &fakeStripe{creditFinalizeStatus: "paid"}
+		observer := &countingCreditObserver{}
+		svc := newCreditPurchaseTestService(store, stripeFake).
+			WithCreditWallet(true).
+			WithCreditCoordinator(nil, observer)
+		req := billing.StartCreditPurchaseRequest{
+			OwnerUserID: userID, AmountMicros: 12_340_000,
+			IdempotencyKey: "settled-start-observer",
+		}
+
+		_, err := svc.StartCreditPurchase(context.Background(), req)
+		require.NoError(t, err)
+		_, err = svc.StartCreditPurchase(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+		require.Equal(t, []bool{true}, observer.settlementObservations)
+	})
+
+	t.Run("finish purchase settled replay", func(t *testing.T) {
+		store := newFakeStore()
+		userID, accountID, purchaseID := uuid.New(), uuid.New(), uuid.New()
+		store.accountsByUser[userID] = fakeAccount{id: accountID}
+		store.creditPurchases[purchaseID] = billing.CreditPurchaseRow{
+			ID: purchaseID, AccountID: accountID,
+			AmountMicros: billing.MinCreditPurchaseMicros,
+			Type:         "purchase", Status: "pending", Actor: "self",
+			IdempotencyKey:  "settled-finish-observer",
+			StripeInvoiceID: "in_paid_credit",
+		}
+		stripeFake := &fakeStripe{}
+		stripeFake.seedExactCreditPurchaseInvoice(
+			store.creditPurchases[purchaseID],
+			"cus_original_sponsor",
+			"paid",
+		)
+		observer := &countingCreditObserver{}
+		svc := newCreditPurchaseTestService(store, stripeFake).
+			WithCreditWallet(true).
+			WithCreditCoordinator(nil, observer)
+		req := billing.FinishCreditPurchaseRequest{
+			OwnerUserID: userID, PurchaseID: purchaseID.String(),
+		}
+
+		_, err := svc.FinishCreditPurchase(context.Background(), req)
+		require.NoError(t, err)
+		_, err = svc.FinishCreditPurchase(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+		require.Equal(t, []bool{true}, observer.settlementObservations)
+	})
+
+	t.Run("grant replay", func(t *testing.T) {
+		store := newFakeStore()
+		customerOrgID, accountID := uuid.New(), uuid.New()
+		store.accountsByOrg[customerOrgID] = fakeAccount{id: accountID}
+		observer := &countingCreditObserver{}
+		svc := billing.NewService(store, &fakeStripe{}, "").
+			WithCreditWallet(true).
+			WithCreditCoordinator(nil, observer)
+		req := billing.GrantCreditsRequest{
+			CustomerOrgID: customerOrgID, AmountMicros: 1_000_000,
+			Actor: "system", IdempotencyKey: "grant-observer",
+		}
+
+		_, err := svc.GrantCredits(context.Background(), req)
+		require.NoError(t, err)
+		_, err = svc.GrantCredits(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	})
+
+	t.Run("billing mode no-op", func(t *testing.T) {
+		store := newFakeStore()
+		userID, accountID := uuid.New(), uuid.New()
+		store.accountsByUser[userID] = fakeAccount{id: accountID}
+		store.creditStanding[accountID] = billing.CreditStandingRow{
+			BillingMode: billing.BillingModeStandard,
+		}
+		observer := &countingCreditObserver{}
+		svc := billing.NewService(store, &fakeStripe{}, "").
+			WithCreditWallet(true).
+			WithCreditCoordinator(nil, observer)
+		req := billing.SetCustomerBillingModeRequest{
+			OwnerUserID: userID, BillingMode: billing.BillingModeCredits,
+		}
+
+		_, err := svc.SetCustomerBillingMode(context.Background(), req)
+		require.NoError(t, err)
+		_, err = svc.SetCustomerBillingMode(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+	})
 }
 
 func TestGrantCredits_InvalidDistributorRelationshipRejectedBeforeInsert(t *testing.T) {
@@ -214,16 +340,6 @@ func TestCreditRPCs_FlagOffReturnUnavailableBeforeStoreAccess(t *testing.T) {
 			},
 		},
 		{
-			name: "FinishCreditPurchase",
-			call: func(t *testing.T) error {
-				resp, err := svc.FinishCreditPurchase(context.Background(), billing.FinishCreditPurchaseRequest{
-					OwnerUserID: ownerUserID, PurchaseID: uuid.New().String(),
-				})
-				require.Nil(t, resp)
-				return err
-			},
-		},
-		{
 			name: "SetAutoTopUp",
 			call: func(t *testing.T) error {
 				resp, err := svc.SetAutoTopUp(context.Background(), billing.SetAutoTopUpRequest{OwnerUserID: ownerUserID})
@@ -272,6 +388,123 @@ func TestCreditRPCs_FlagOffReturnUnavailableBeforeStoreAccess(t *testing.T) {
 			require.Equal(t, "credit wallet is not enabled", billingErr.Message)
 		})
 	}
+}
+
+func TestFinishCreditPurchase_RolloutOffStillRecoversAuthorizedPurchase(t *testing.T) {
+	store := newFakeStore()
+	userID, accountID, purchaseID := uuid.New(), uuid.New(), uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID}
+	store.creditPurchases[purchaseID] = billing.CreditPurchaseRow{
+		ID: purchaseID, AccountID: accountID,
+		AmountMicros:   billing.MinCreditPurchaseMicros,
+		Type:           "purchase",
+		Status:         "settled",
+		IdempotencyKey: "rollout-off-finish",
+	}
+	svc := newCreditPurchaseTestService(store, &fakeStripe{}).
+		WithCreditWallet(false)
+
+	response, err := svc.FinishCreditPurchase(
+		context.Background(),
+		billing.FinishCreditPurchaseRequest{
+			OwnerUserID: userID,
+			PurchaseID:  purchaseID.String(),
+		},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "settled", response.Status)
+}
+
+func TestFinishCreditPurchase_AttachedSponsorInvoiceSurvivesFundingDrift(t *testing.T) {
+	store := newFakeStore()
+	orgID, accountID := uuid.New(), uuid.New()
+	newSponsorAccountID, purchaseID := uuid.New(), uuid.New()
+	store.accountsByOrg[orgID] = fakeAccount{id: accountID}
+	store.fundingOf[accountID] = newSponsorAccountID
+	store.stripeCustomerOf[newSponsorAccountID] = "cus_new_sponsor"
+	store.creditPurchases[purchaseID] = billing.CreditPurchaseRow{
+		ID: purchaseID, AccountID: accountID,
+		AmountMicros:       billing.MinCreditPurchaseMicros,
+		Type:               "purchase",
+		Status:             "failed",
+		IdempotencyKey:     "sponsor-drift-recovery",
+		StripeInvoiceID:    "in_old_sponsor_paid",
+		BalanceAfterMicros: billing.MinCreditPurchaseMicros,
+	}
+	stripeFake := &fakeStripe{}
+	stripeFake.seedExactCreditPurchaseInvoice(
+		store.creditPurchases[purchaseID],
+		"cus_original_sponsor",
+		"paid",
+	)
+	svc := newCreditPurchaseTestService(store, stripeFake).
+		WithCreditWallet(false)
+
+	response, err := svc.FinishCreditPurchase(
+		context.Background(),
+		billing.FinishCreditPurchaseRequest{
+			OwnerOrgID: orgID,
+			PurchaseID: purchaseID.String(),
+		},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "settled", response.Status)
+	require.Zero(t, store.chargeFundingReads,
+		"an attached invoice freezes payer identity; recovery must not consult the current sponsor")
+}
+
+func TestFinishCreditPurchase_ExcludedSettlementDoesNotEnterRolloutGraph(t *testing.T) {
+	store := newFakeStore()
+	userID, accountID, purchaseID := uuid.New(), uuid.New(), uuid.New()
+	store.accountsByUser[userID] = fakeAccount{id: accountID}
+	store.creditPurchases[purchaseID] = billing.CreditPurchaseRow{
+		ID: purchaseID, AccountID: accountID,
+		AmountMicros:    billing.MinCreditPurchaseMicros,
+		Type:            "purchase",
+		Status:          "failed",
+		IdempotencyKey:  "excluded-paid-recovery",
+		StripeInvoiceID: "in_excluded_paid",
+	}
+	stripeFake := &fakeStripe{}
+	stripeFake.seedExactCreditPurchaseInvoice(
+		store.creditPurchases[purchaseID],
+		"cus_excluded_original",
+		"paid",
+	)
+	enforceObserver := &countingCreditObserver{}
+	excludedPolicy := rollout.Parse(rollout.Config{
+		MasterEnabled:   true,
+		SchemaReady:     true,
+		Component:       rollout.ComponentAPI,
+		Mode:            string(rollout.ModeEnforce),
+		BasisPoints:     "0",
+		AllowlistSHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		CoreManifestSHA: "1111111111111111111111111111111111111111",
+		BillingSHA:      "2222222222222222222222222222222222222222",
+	})
+	controller := rollout.NewController(excludedPolicy, nil)
+	svc := newCreditPurchaseTestService(store, stripeFake).
+		WithCreditWallet(false).
+		WithCreditAccess(func(uuid.UUID) bool { return false }).
+		WithCreditCoordinator(
+			nil,
+			rollout.NewSettlementObserver(controller, enforceObserver),
+		)
+
+	response, err := svc.FinishCreditPurchase(
+		context.Background(),
+		billing.FinishCreditPurchaseRequest{
+			OwnerUserID: userID,
+			PurchaseID:  purchaseID.String(),
+		},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "settled", response.Status)
+	require.Empty(t, enforceObserver.accounts,
+		"excluded recovery commits durable money without entering the enforce graph")
 }
 
 func requireBillingErrorCode(t *testing.T, err error, code billing.Code) {

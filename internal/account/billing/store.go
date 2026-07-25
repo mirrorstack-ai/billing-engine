@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -159,6 +160,10 @@ type Store interface {
 	// billing policy, credit limit, and optional auto-top-up configuration.
 	CreditStanding(ctx context.Context, accountID uuid.UUID) (CreditStandingRow, error)
 
+	// CreditGateSnapshot classifies the account before conditionally reading
+	// spendable wallet state. Standard accounts never read credit_ledger.
+	CreditGateSnapshot(ctx context.Context, accountID uuid.UUID) (credit.Snapshot, error)
+
 	// ListCreditLedger returns a newest-first keyset page. limit is already
 	// service-clamped and normally includes one look-ahead row.
 	ListCreditLedger(ctx context.Context, accountID uuid.UUID, limit int32, cursor *CreditLedgerCursor) ([]CreditLedgerEntry, error)
@@ -187,8 +192,10 @@ type Store interface {
 	UpsertCreditAutoTopUp(ctx context.Context, accountID uuid.UUID, cfg AutoTopUpConfig) (AutoTopUpConfig, error)
 
 	// SetCreditBillingMode updates the wallet mode and its resolved non-negative
-	// limit in one statement.
-	SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) error
+	// limit in one statement. A real mode change is rejected while a period
+	// wallet draw belongs to a reclaimable billing run; credit-limit-only updates
+	// and exact no-ops remain available. changed=false is an idempotent no-op.
+	SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) (changed bool, err error)
 
 	// DistributorCustomerAccount validates the distributor→customer relation
 	// represented by org_billing_designations and returns the customer account.
@@ -220,6 +227,13 @@ type pgxStore struct {
 	pool *pgxpool.Pool
 	q    *db.Queries
 }
+
+var (
+	errPendingAutoTopUpModeChange     = errors.New("pending auto-top-up prevents billing-mode change")
+	errUninvoicedWalletDrawModeChange = errors.New(
+		"uninvoiced billing-run wallet draw prevents billing-mode change",
+	)
+)
 
 // AdvisoryLockNamespaceBillingAccountUser is the first argument to
 // pg_advisory_xact_lock(int, int) for the per-user get-or-create account
@@ -615,14 +629,52 @@ func (s *pgxStore) CreditStanding(ctx context.Context, accountID uuid.UUID) (Cre
 		CreditLimitMicros: row.CreditLimitMicros,
 	}
 	if row.AutoTopupConfigured {
+		var pendingUntil *time.Time
+		if row.AutoTopupLastAttemptStatus == "pending" {
+			pendingUntil = nullableTimeValue(row.AutoTopupPendingUntil)
+		}
 		out.AutoTopUp = &AutoTopUpConfig{
-			Enabled:         row.AutoTopupEnabled,
-			ThresholdMicros: row.AutoTopupThresholdMicros,
-			AmountMicros:    row.AutoTopupAmountMicros,
-			PaymentMethodID: row.AutoTopupPaymentMethodID,
+			Enabled:           row.AutoTopupEnabled,
+			ThresholdMicros:   row.AutoTopupThresholdMicros,
+			AmountMicros:      row.AutoTopupAmountMicros,
+			PaymentMethodID:   row.AutoTopupPaymentMethodID,
+			LastAttemptStatus: row.AutoTopupLastAttemptStatus,
+			LastFailureCode:   row.AutoTopupLastFailureCode,
+			PendingUntil:      pendingUntil,
 		}
 	}
 	return out, nil
+}
+
+func (s *pgxStore) CreditGateSnapshot(ctx context.Context, accountID uuid.UUID) (credit.Snapshot, error) {
+	account, err := s.q.GetCreditAccountSnapshot(ctx, accountID.String())
+	if err != nil {
+		return credit.Snapshot{}, err
+	}
+	snapshot := credit.Snapshot{
+		AccountID:         accountID,
+		OwnerUserID:       uuidFromPgtype(account.OwnerUserID),
+		OwnerOrgID:        uuidFromPgtype(account.OwnerOrgID),
+		BillingMode:       account.BillingMode,
+		CreditLimitMicros: account.CreditLimitMicros,
+	}
+	if account.ActivatedAt.Valid {
+		snapshot.ActivatedAt = account.ActivatedAt.Time
+	}
+	if snapshot.BillingMode != string(BillingModeCredits) {
+		return snapshot, nil
+	}
+	state, err := s.q.GetCreditGateState(ctx, accountID.String())
+	if err != nil {
+		return credit.Snapshot{}, err
+	}
+	snapshot.SettledBalanceMicros = state.SettledBalanceMicros
+	snapshot.SpendableBalanceMicros = state.SpendableBalanceMicros
+	snapshot.AutoTopUpAttemptPending = state.AutoTopupAttemptPending
+	snapshot.PendingAutoTopUp = state.PendingAutoTopup
+	snapshot.AutoTopUpEnabled = state.AutoTopupEnabled
+	snapshot.AutoTopUpThreshold = state.AutoTopupThresholdMicros
+	return snapshot, nil
 }
 
 func (s *pgxStore) ListCreditLedger(ctx context.Context, accountID uuid.UUID, limit int32, cursor *CreditLedgerCursor) ([]CreditLedgerEntry, error) {
@@ -829,6 +881,7 @@ func (s *pgxStore) FinalizeCreditPurchase(ctx context.Context, purchaseID, accou
 			finalized.ReceiptUrl,
 			finalized.CreatedAt,
 		)
+		out.Transitioned = true
 		return err
 	})
 	return out, err
@@ -853,13 +906,46 @@ func (s *pgxStore) UpsertCreditAutoTopUp(ctx context.Context, accountID uuid.UUI
 	}, nil
 }
 
-func (s *pgxStore) SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) error {
-	_, err := s.q.SetCreditAccountBillingMode(ctx, db.SetCreditAccountBillingModeParams{
-		BillingMode:       string(mode),
-		CreditLimitMicros: creditLimitMicros,
-		AccountID:         accountID.String(),
+func (s *pgxStore) SetCreditBillingMode(ctx context.Context, accountID uuid.UUID, mode BillingMode, creditLimitMicros int64) (bool, error) {
+	changed := false
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		currentMode, err := qtx.LockWalletAccount(ctx, accountID.String())
+		if err != nil {
+			return err
+		}
+		modeChanging := currentMode != string(mode)
+		if modeChanging {
+			blocked, err := qtx.HasUninvoicedBillingRunWalletDraw(ctx, accountID.String())
+			if err != nil {
+				return err
+			}
+			if blocked {
+				return errUninvoicedWalletDrawModeChange
+			}
+		}
+		if modeChanging && mode == BillingModeStandard {
+			if _, err := qtx.LatestPendingAutoTopUp(ctx, accountID.String()); err == nil {
+				return errPendingAutoTopUpModeChange
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+		_, err = qtx.SetCreditAccountBillingMode(ctx, db.SetCreditAccountBillingModeParams{
+			BillingMode:       string(mode),
+			CreditLimitMicros: creditLimitMicros,
+			AccountID:         accountID.String(),
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		changed = true
+		return nil
 	})
-	return err
+	return changed, err
 }
 
 func (s *pgxStore) DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {
@@ -1079,4 +1165,11 @@ func uuidRowFound(id string, err error) (uuid.UUID, bool, error) {
 // (the service layer rejects Nil user ids before reaching the store).
 func nullableUUID(id uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+func uuidFromPgtype(id pgtype.UUID) uuid.UUID {
+	if !id.Valid {
+		return uuid.Nil
+	}
+	return uuid.UUID(id.Bytes)
 }
