@@ -267,9 +267,17 @@ const (
 
 // WalletDrawdown reports the durable debit selected for one account-period.
 // DrawnMicros is always non-negative even though the ledger rows are negative.
+//
+// BoundaryChargeFrozen is set only by DrawBillingRunWalletCredits. In that
+// path the same transaction that commits the ledger debit also freezes the
+// exact Stripe remainder on the owning billing_run. A reclaim can therefore
+// finish from billing_runs alone even when the wallet master switch is now
+// truly off and migration-048 SQL is forbidden.
 type WalletDrawdown struct {
-	Mode        CreditBillingMode
-	DrawnMicros int64
+	Mode                 CreditBillingMode
+	DrawnMicros          int64
+	BoundaryCharge       FrozenBoundaryCharge
+	BoundaryChargeFrozen bool
 }
 
 // WalletCreditState is the read-only eligibility probe for the boundary draw.

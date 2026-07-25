@@ -168,6 +168,150 @@ func (q *Queries) FinalizeCreditPurchase(ctx context.Context, arg FinalizeCredit
 	return i, err
 }
 
+const getCreditAccountSnapshot = `-- name: GetCreditAccountSnapshot :one
+SELECT
+    account.id,
+    account.owner_user_id,
+    account.owner_org_id,
+    account.billing_mode,
+    account.credit_limit_micros,
+    account.activated_at
+FROM ms_billing.accounts account
+WHERE account.id = $1::uuid
+`
+
+type GetCreditAccountSnapshotRow struct {
+	ID                string             `json:"id"`
+	OwnerUserID       pgtype.UUID        `json:"owner_user_id"`
+	OwnerOrgID        pgtype.UUID        `json:"owner_org_id"`
+	BillingMode       string             `json:"billing_mode"`
+	CreditLimitMicros int64              `json:"credit_limit_micros"`
+	ActivatedAt       pgtype.Timestamptz `json:"activated_at"`
+}
+
+// GetCreditAccountSnapshot classifies the account before any ledger read.
+// A standard account returns from the Go provider after this query, keeping
+// credit_ledger completely untouched on that path.
+func (q *Queries) GetCreditAccountSnapshot(ctx context.Context, accountID string) (GetCreditAccountSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, getCreditAccountSnapshot, accountID)
+	var i GetCreditAccountSnapshotRow
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerUserID,
+		&i.OwnerOrgID,
+		&i.BillingMode,
+		&i.CreditLimitMicros,
+		&i.ActivatedAt,
+	)
+	return i, err
+}
+
+const getCreditGateState = `-- name: GetCreditGateState :one
+WITH source_lots AS (
+    SELECT
+        source.id,
+        source.expires_at,
+        (
+            source.amount_micros::numeric
+            + COALESCE((
+                SELECT SUM(draw.amount_micros)
+                FROM ms_billing.credit_ledger draw
+                WHERE draw.source_credit_id = source.id
+                  AND draw.account_id = source.account_id
+                  AND draw.status = 'settled'
+                  AND draw.type IN ('usage_draw', 'subscription_draw')
+            ), 0)
+        ) AS remaining_micros
+    FROM ms_billing.credit_ledger source
+    WHERE source.account_id = $1::uuid
+      AND source.status = 'settled'
+      AND source.amount_micros > 0
+      AND source.type IN (
+          'grant', 'preallocation', 'refund', 'adjustment',
+          'purchase', 'auto_topup'
+      )
+), balances AS (
+    SELECT
+        COALESCE((
+            SELECT SUM(entry.amount_micros)
+            FROM ms_billing.credit_ledger entry
+            WHERE entry.account_id = $1::uuid
+              AND entry.status = 'settled'
+        ), 0) AS settled_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND (lot.expires_at IS NULL OR lot.expires_at > CURRENT_TIMESTAMP)
+        ), 0) AS lot_micros,
+        COALESCE((
+            SELECT SUM(lot.remaining_micros)
+            FROM source_lots lot
+            WHERE lot.remaining_micros > 0
+              AND lot.expires_at <= CURRENT_TIMESTAMP
+        ), 0) AS expired_lot_micros
+)
+SELECT
+    balances.settled_micros::bigint AS settled_balance_micros,
+    GREATEST(
+        LEAST(
+            balances.lot_micros,
+            GREATEST(
+                balances.settled_micros - balances.expired_lot_micros,
+                0
+            )
+        ),
+        0
+    )::bigint AS spendable_balance_micros,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = $1::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+    )::boolean AS auto_topup_attempt_pending,
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.credit_ledger pending
+        WHERE pending.account_id = $1::uuid
+          AND pending.type = 'auto_topup'
+          AND pending.status = 'pending'
+          AND pending.attempt_expires_at > CURRENT_TIMESTAMP
+    )::boolean AS pending_auto_topup,
+    COALESCE(config.enabled, false)::boolean AS auto_topup_enabled,
+    COALESCE(config.threshold_micros, 0)::bigint AS auto_topup_threshold_micros
+FROM balances
+LEFT JOIN ms_billing.credit_auto_topup_configs config
+       ON config.account_id = $1::uuid
+`
+
+type GetCreditGateStateRow struct {
+	SettledBalanceMicros     int64 `json:"settled_balance_micros"`
+	SpendableBalanceMicros   int64 `json:"spendable_balance_micros"`
+	AutoTopupAttemptPending  bool  `json:"auto_topup_attempt_pending"`
+	PendingAutoTopup         bool  `json:"pending_auto_topup"`
+	AutoTopupEnabled         bool  `json:"auto_topup_enabled"`
+	AutoTopupThresholdMicros int64 `json:"auto_topup_threshold_micros"`
+}
+
+// GetCreditGateState mirrors WalletCreditState's spendable-balance predicate:
+// active positive lot remainder, capped by posted balance after expired lot
+// remainder is removed. Pending manual purchases are neither settled balance
+// nor grace; only a durable pending auto_topup suppresses the real-time block.
+func (q *Queries) GetCreditGateState(ctx context.Context, accountID string) (GetCreditGateStateRow, error) {
+	row := q.db.QueryRow(ctx, getCreditGateState, accountID)
+	var i GetCreditGateStateRow
+	err := row.Scan(
+		&i.SettledBalanceMicros,
+		&i.SpendableBalanceMicros,
+		&i.AutoTopupAttemptPending,
+		&i.PendingAutoTopup,
+		&i.AutoTopupEnabled,
+		&i.AutoTopupThresholdMicros,
+	)
+	return i, err
+}
+
 const getCreditLedgerEntryByIdempotencyKey = `-- name: GetCreditLedgerEntryByIdempotencyKey :one
 SELECT
     id,
@@ -301,22 +445,36 @@ SELECT
     COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
     COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
     COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
-    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+    COALESCE(auto_topup.payment_method_id::text, '')::text AS auto_topup_payment_method_id,
+    COALESCE(last_attempt.status, '')::text AS auto_topup_last_attempt_status,
+    COALESCE(last_attempt.failure_code, '')::text AS auto_topup_last_failure_code,
+    last_attempt.attempt_expires_at AS auto_topup_pending_until
 FROM ms_billing.accounts account
 LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
        ON auto_topup.account_id = account.id
+LEFT JOIN LATERAL (
+    SELECT status, failure_code, attempt_expires_at
+    FROM ms_billing.credit_ledger
+    WHERE account_id = account.id
+      AND type = 'auto_topup'
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+) last_attempt ON true
 WHERE account.id = $1::uuid
 `
 
 type GetCreditStandingSnapshotRow struct {
-	BillingMode              string `json:"billing_mode"`
-	CreditLimitMicros        int64  `json:"credit_limit_micros"`
-	BalanceMicros            int64  `json:"balance_micros"`
-	AutoTopupConfigured      bool   `json:"auto_topup_configured"`
-	AutoTopupEnabled         bool   `json:"auto_topup_enabled"`
-	AutoTopupThresholdMicros int64  `json:"auto_topup_threshold_micros"`
-	AutoTopupAmountMicros    int64  `json:"auto_topup_amount_micros"`
-	AutoTopupPaymentMethodID string `json:"auto_topup_payment_method_id"`
+	BillingMode                string             `json:"billing_mode"`
+	CreditLimitMicros          int64              `json:"credit_limit_micros"`
+	BalanceMicros              int64              `json:"balance_micros"`
+	AutoTopupConfigured        bool               `json:"auto_topup_configured"`
+	AutoTopupEnabled           bool               `json:"auto_topup_enabled"`
+	AutoTopupThresholdMicros   int64              `json:"auto_topup_threshold_micros"`
+	AutoTopupAmountMicros      int64              `json:"auto_topup_amount_micros"`
+	AutoTopupPaymentMethodID   string             `json:"auto_topup_payment_method_id"`
+	AutoTopupLastAttemptStatus string             `json:"auto_topup_last_attempt_status"`
+	AutoTopupLastFailureCode   string             `json:"auto_topup_last_failure_code"`
+	AutoTopupPendingUntil      pgtype.Timestamptz `json:"auto_topup_pending_until"`
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +504,9 @@ func (q *Queries) GetCreditStandingSnapshot(ctx context.Context, accountID strin
 		&i.AutoTopupThresholdMicros,
 		&i.AutoTopupAmountMicros,
 		&i.AutoTopupPaymentMethodID,
+		&i.AutoTopupLastAttemptStatus,
+		&i.AutoTopupLastFailureCode,
+		&i.AutoTopupPendingUntil,
 	)
 	return i, err
 }
@@ -378,6 +539,38 @@ func (q *Queries) GetDistributorCustomerAccount(ctx context.Context, arg GetDist
 	var account_id string
 	err := row.Scan(&account_id)
 	return account_id, err
+}
+
+const hasUninvoicedBillingRunWalletDraw = `-- name: HasUninvoicedBillingRunWalletDraw :one
+SELECT EXISTS (
+    SELECT 1
+    FROM ms_billing.billing_runs run
+    JOIN ms_billing.billing_periods period
+      ON period.account_id = run.account_id
+     AND period.period_start = run.period_start
+     AND period.period_end = run.period_end
+    JOIN ms_billing.credit_ledger draw
+      ON draw.account_id = run.account_id
+     AND draw.period_id = period.id
+     AND draw.type IN ('usage_draw', 'subscription_draw')
+     AND draw.status = 'settled'
+    WHERE run.account_id = $1::uuid
+      AND run.status <> 'invoiced'
+)::boolean
+`
+
+// HasUninvoicedBillingRunWalletDraw protects a boundary that has durably
+// consumed wallet credit but has not yet reached the only non-reclaimable run
+// state. SetCreditBillingMode calls this only for an actual mode change while
+// holding LockWalletAccount's account FOR UPDATE lock. DrawWalletCredits takes
+// that same lock before reading billing_mode and inserting period draw rows, so
+// either the mode change wins before any draw or this exact durable draw wins
+// and keeps its original mode through terminal invoice completion.
+func (q *Queries) HasUninvoicedBillingRunWalletDraw(ctx context.Context, accountID string) (bool, error) {
+	row := q.db.QueryRow(ctx, hasUninvoicedBillingRunWalletDraw, accountID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const insertCreationWalletDraw = `-- name: InsertCreationWalletDraw :exec
@@ -718,7 +911,7 @@ SELECT
     COALESCE(auto_topup.enabled, false)::boolean AS auto_topup_enabled,
     COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
     COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
-    COALESCE(auto_topup.payment_method_id, '')::text AS auto_topup_payment_method_id
+    COALESCE(auto_topup.payment_method_id::text, '')::text AS auto_topup_payment_method_id
 FROM ms_billing.org_billing_designations designation
 JOIN ms_billing.accounts distributor
   ON distributor.id = designation.sponsor_account_id
@@ -871,6 +1064,10 @@ UPDATE ms_billing.accounts
 SET billing_mode = $1::text,
     credit_limit_micros = $2::bigint
 WHERE id = $3::uuid
+  AND (
+      billing_mode IS DISTINCT FROM $1::text
+      OR credit_limit_micros IS DISTINCT FROM $2::bigint
+  )
 RETURNING billing_mode, credit_limit_micros
 `
 
@@ -907,7 +1104,7 @@ INSERT INTO ms_billing.credit_auto_topup_configs (
     $2::boolean,
     $3::bigint,
     $4::bigint,
-    NULLIF($5::text, '')
+    NULLIF($5::text, '')::uuid
 )
 ON CONFLICT (account_id) DO UPDATE SET
     enabled = EXCLUDED.enabled,
@@ -918,7 +1115,7 @@ RETURNING
     enabled,
     threshold_micros,
     amount_micros,
-    COALESCE(payment_method_id, '')::text AS payment_method_id
+    COALESCE(payment_method_id::text, '')::text AS payment_method_id
 `
 
 type UpsertCreditAutoTopUpParams struct {

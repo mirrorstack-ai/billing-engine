@@ -11,15 +11,19 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook/webhooktest"
 )
 
 // recordingNotifier captures which hook fired with which Stripe object id.
 type recordingNotifier struct {
-	customers      []string
-	invoices       []string
-	paymentMethods []string
+	customers                    []string
+	invoices                     []string
+	creditInvoices               []string
+	creditSettlementObservations []bool
+	creditUnmarkedCalls          int
+	paymentMethods               []string
 }
 
 func (n *recordingNotifier) NotifyStripeCustomer(_ context.Context, id string) {
@@ -27,6 +31,17 @@ func (n *recordingNotifier) NotifyStripeCustomer(_ context.Context, id string) {
 }
 func (n *recordingNotifier) NotifyStripeInvoice(_ context.Context, id string) {
 	n.invoices = append(n.invoices, id)
+}
+func (n *recordingNotifier) NotifyCreditInvoice(ctx context.Context, id string) {
+	n.creditInvoices = append(n.creditInvoices, id)
+	marked := creditledger.IsSettlementObservation(ctx)
+	n.creditSettlementObservations = append(
+		n.creditSettlementObservations,
+		marked,
+	)
+	if !marked {
+		n.creditUnmarkedCalls++
+	}
 }
 func (n *recordingNotifier) NotifyStripePaymentMethod(_ context.Context, id string) {
 	n.paymentMethods = append(n.paymentMethods, id)

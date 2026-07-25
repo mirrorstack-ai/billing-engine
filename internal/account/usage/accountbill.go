@@ -271,10 +271,12 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	return response, nil
 }
 
-// ProjectedCreditCharge exposes the existing account-bill calculation through
-// the narrow wallet reconciliation interface. It deliberately delegates to
-// GetAccountBill so the real-time credit gate and UI standing never grow a
-// second pricing implementation.
+// ProjectedCreditCharge exposes the current period's unpaid usage-plane
+// exposure through the narrow wallet reconciliation interface. Recurring base,
+// module-overage, and custom-domain fees are charged in advance by the boundary
+// and mid-period charge legs, so including them against the already-reduced
+// post-draw wallet balance would double-reserve credit. The component amounts
+// still come from GetAccountBill's one pricing path.
 func (s *Service) ProjectedCreditCharge(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (credit.Projection, error) {
 	bill, err := s.GetAccountBill(ctx, GetAccountBillRequest{
 		OwnerUserID: ownerUserID,
@@ -283,8 +285,12 @@ func (s *Service) ProjectedCreditCharge(ctx context.Context, ownerUserID, ownerO
 	if err != nil {
 		return credit.Projection{}, err
 	}
+	unpaidExposure := bill.ModuleUsageTotalMicros +
+		bill.InfraTotalMicros +
+		bill.Agent.TotalMicros -
+		bill.PaasCreditMicros
 	return credit.Projection{
-		AmountMicros: bill.TotalMicros,
+		AmountMicros: unpaidExposure,
 		PeriodStart:  bill.PeriodStart,
 		PeriodEnd:    bill.PeriodEnd,
 	}, nil

@@ -142,15 +142,40 @@ WHERE ua.account_id   = $1
 -- Stripe invoice reuses that exact invoice (no double charge), and UpsertInvoice
 -- is idempotent on stripe_invoice_id. UNIQUE(account, period) still holds —
 -- there is never more than one run row per window.
+-- Return whether this invocation reclaimed an existing non-terminal run. That
+-- bit is a money-recovery boundary: a reclaimed run may need to recover a
+-- previously committed wallet draw even when the current rollout is off or the
+-- account is no longer selected. A fresh run must not make that recovery read.
 -- name: InsertBillingRun :one
-INSERT INTO ms_billing.billing_runs (account_id, period_start, period_end, status)
-VALUES ($1, $2, $3, 'pending')
-ON CONFLICT (account_id, period_start, period_end) DO UPDATE
+WITH inserted AS (
+    INSERT INTO ms_billing.billing_runs (
+        account_id,
+        period_start,
+        period_end,
+        status
+    )
+    VALUES ($1, $2, $3, 'pending')
+    ON CONFLICT (account_id, period_start, period_end) DO NOTHING
+    RETURNING id
+),
+reclaimed AS (
+    UPDATE ms_billing.billing_runs
     SET status            = 'pending',
         stripe_invoice_id = NULL,
         total_amount      = 0
-    WHERE ms_billing.billing_runs.status <> 'invoiced'
-RETURNING id;
+    WHERE account_id = $1
+      AND period_start = $2
+      AND period_end = $3
+      AND status <> 'invoiced'
+      AND NOT EXISTS (SELECT 1 FROM inserted)
+    RETURNING id
+)
+SELECT id, false::boolean AS reclaimed
+FROM inserted
+UNION ALL
+SELECT id, true::boolean AS reclaimed
+FROM reclaimed
+LIMIT 1;
 
 -- MarkBillingRun sets a run's terminal status, the Stripe invoice id (NULL for
 -- zero-arrears / skipped runs), and the charged total. Scoped to the run id so
@@ -177,7 +202,8 @@ SET status            = 'invoiced',
     stripe_invoice_id = NULL,
     total_amount      = 0
 WHERE id = $1
-  AND frozen_charge_cents IS NULL;
+  AND frozen_charge_cents IS NULL
+  AND status <> 'invoiced';
 
 -- FreezeBillingRunCharge records, BEFORE the boundary Stripe charge, the exact
 -- whole-cent amount AND the base/overage description determinant this run will
@@ -186,13 +212,17 @@ WHERE id = $1
 -- already froze keeps its ORIGINAL values, so a retry that recomputed a different
 -- LIVE total can never send Stripe a mismatched request under the same idem key.
 -- InsertBillingRun's ON CONFLICT DO UPDATE deliberately leaves these columns
--- untouched, so the freeze survives the reclaim.
+-- untouched, so the freeze survives the reclaim. The terminal-status guard is
+-- the other half of the zero-vs-freeze race: once a concurrent daemon has
+-- successfully marked the run invoiced, no later stale non-zero computation may
+-- install a charge marker and enter Stripe.
 -- name: FreezeBillingRunCharge :exec
 UPDATE ms_billing.billing_runs
 SET frozen_charge_cents     = $2,
     frozen_charge_with_base = $3
 WHERE id = $1
-  AND frozen_charge_cents IS NULL;
+  AND frozen_charge_cents IS NULL
+  AND status <> 'invoiced';
 
 -- BillingRunFrozenCharge reads a run's frozen boundary-charge amount + description
 -- determinant (set by a prior attempt's FreezeBillingRunCharge). Both are NULL
@@ -203,6 +233,17 @@ WHERE id = $1
 SELECT frozen_charge_cents, frozen_charge_with_base
 FROM ms_billing.billing_runs
 WHERE id = $1;
+
+-- LockBillingRunCharge is the serialization point between a first wallet debit,
+-- a competing Stripe freeze, and a terminal run write. The boundary wallet
+-- transaction takes this row lock BEFORE allocating ledger lots. If another
+-- daemon already froze a Stripe request, the wallet transaction may recover an
+-- existing period draw but must never create a new one beside that request.
+-- name: LockBillingRunCharge :one
+SELECT status, frozen_charge_cents, frozen_charge_with_base
+FROM ms_billing.billing_runs
+WHERE id = $1
+FOR UPDATE;
 
 -- UpsertInvoice mirrors a Stripe invoice into ms_billing.invoices, keyed on the
 -- UNIQUE stripe_invoice_id so a re-run (deterministic Stripe Idempotency-Key

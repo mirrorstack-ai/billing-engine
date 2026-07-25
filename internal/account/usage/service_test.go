@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
 
@@ -870,6 +871,56 @@ func TestRecordUsage_BudgetEvalSkippedOnDedupedRetry(t *testing.T) {
 	_, err = svc.RecordUsage(context.Background(), req) // same event_id → deduped
 	require.NoError(t, err)
 	require.False(t, eval.called, "hook is skipped on a deduped retry")
+}
+
+type fakeCreditEvaluator struct {
+	err    error
+	calls  int
+	events []credit.UsageEvent
+}
+
+func (f *fakeCreditEvaluator) EvaluateCreditUsage(_ context.Context, event credit.UsageEvent) error {
+	f.calls++
+	f.events = append(f.events, event)
+	return f.err
+}
+
+func TestRecordUsage_CreditEvaluatorRunsOnceForFreshEventOnly(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+	accountID := uuid.New()
+	store.accounts[req.OwnerUserID] = accountID
+	eval := &fakeCreditEvaluator{}
+	svc := usage.NewService(store).WithCreditEvaluator(eval)
+
+	first, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, first.Recorded)
+	second, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, second.Recorded)
+
+	require.Equal(t, 1, eval.calls, "the deduped event must not increment credit exposure twice")
+	require.Len(t, eval.events, 1)
+	require.Equal(t, accountID, eval.events[0].AccountID)
+	require.Equal(t, req.EventID, eval.events[0].EventID)
+}
+
+func TestRecordUsage_CreditEvaluatorErrorDoesNotFailIngest(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+	store.accounts[req.OwnerUserID] = uuid.New()
+	eval := &fakeCreditEvaluator{err: errors.New("credit evaluator down")}
+
+	resp, err := usage.NewService(store).
+		WithCreditEvaluator(eval).
+		RecordUsage(context.Background(), req)
+
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, 1, eval.calls)
 }
 
 // --- GetUsageSummary ------------------------------------------------------

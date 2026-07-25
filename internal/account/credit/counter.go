@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,14 +23,32 @@ var ErrUnavailable = errors.New("credit estimate counter unavailable")
 // is part of the key so a stale prior-period value can never block a new
 // period. Implementations must treat a missing key as (found=false, nil).
 type Counter interface {
-	Add(ctx context.Context, accountID uuid.UUID, periodStart time.Time, deltaMicros int64) (estimateMicros int64, err error)
+	AddIfPresent(ctx context.Context, accountID uuid.UUID, periodStart time.Time, deltaMicros int64) (previousMicros, estimateMicros int64, found bool, err error)
 	Get(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (estimateMicros int64, found bool, err error)
+	SetMax(ctx context.Context, accountID uuid.UUID, periodStart time.Time, estimateMicros int64) (MaxResult, error)
+	SetIfEqual(ctx context.Context, accountID uuid.UUID, periodStart time.Time, expectedMicros, estimateMicros int64) (applied bool, err error)
 	Set(ctx context.Context, accountID uuid.UUID, periodStart time.Time, estimateMicros int64) error
+	ClaimBlockNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (claimed bool, err error)
+	ClearBlockNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) error
+	ClaimBoundaryNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (claimed bool, err error)
+	ClearBoundaryNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) error
+}
+
+// MaxResult describes one atomic monotonic initialization attempt. Previous is
+// meaningful only when FoundBefore is true. Advanced is true only for the
+// transaction that actually raised (or first created) the key.
+type MaxResult struct {
+	PreviousMicros int64
+	StoredMicros   int64
+	FoundBefore    bool
+	Advanced       bool
 }
 
 // UsageEvent is the narrow payload usage.Service sends to its best-effort
-// credit hook after a fresh usage insert. ApproximateChargeMicros has already
-// been priced at ingest from the event's snapshotted catalog definition.
+// credit hook after a fresh usage insert. Normal module usage carries an
+// ingest-priced ApproximateChargeMicros; platform infra sets
+// ForceLiveProjection because its authoritative model/catalog price is only
+// available through the account bill.
 type UsageEvent struct {
 	AccountID               uuid.UUID
 	AppID                   uuid.UUID
@@ -37,6 +56,11 @@ type UsageEvent struct {
 	ApproximateChargeMicros int64
 	PeriodStart             time.Time
 	PeriodEnd               time.Time
+	// ForceLiveProjection is set for freshly inserted usage whose exact price
+	// is not available at ingest (for example platform infra/model pricing).
+	// The coordinator must bypass a warm-low fast allow and reconcile from the
+	// authoritative account bill instead of inventing an approximate delta.
+	ForceLiveProjection bool
 }
 
 // UsageEvaluator is implemented by the wallet coordinator and injected into
@@ -83,15 +107,45 @@ func NewRedisCounter(rawURL string) (*RedisCounter, error) {
 	return &RedisCounter{client: redis.NewClient(opts), ttl: defaultEstimateTTL}, nil
 }
 
-func (c *RedisCounter) Add(ctx context.Context, accountID uuid.UUID, periodStart time.Time, deltaMicros int64) (int64, error) {
-	key := estimateKey(accountID, periodStart)
-	pipe := c.client.TxPipeline()
-	incr := pipe.IncrBy(ctx, key, deltaMicros)
-	pipe.Expire(ctx, key, c.ttl)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, err
+// NewCounter is the production construction seam. Its interface return is a
+// true nil on configuration failure, avoiding the typed-nil *RedisCounter that
+// would otherwise make `counter != nil` true inside Coordinator.
+func NewCounter(rawURL string) (Counter, error) {
+	counter, err := NewRedisCounter(rawURL)
+	if err != nil {
+		return nil, err
 	}
-	return incr.Val(), nil
+	return counter, nil
+}
+
+var addIfPresentScript = redis.NewScript(`
+local previous = redis.call("GET", KEYS[1])
+if not previous then return {} end
+redis.call("INCRBY", KEYS[1], ARGV[1])
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+return {previous, redis.call("GET", KEYS[1])}
+`)
+
+func (c *RedisCounter) AddIfPresent(ctx context.Context, accountID uuid.UUID, periodStart time.Time, deltaMicros int64) (int64, int64, bool, error) {
+	raw, err := addIfPresentScript.Run(ctx, c.client, []string{estimateKey(accountID, periodStart)}, deltaMicros, c.ttl.Milliseconds()).Slice()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(raw) == 0 {
+		return 0, 0, false, nil
+	}
+	if len(raw) != 2 {
+		return 0, 0, false, fmt.Errorf("credit counter add returned %d values", len(raw))
+	}
+	previous, err := redisInt64(raw[0])
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("parse previous credit estimate: %w", err)
+	}
+	estimate, err := redisInt64(raw[1])
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("parse updated credit estimate: %w", err)
+	}
+	return previous, estimate, true, nil
 }
 
 func (c *RedisCounter) Get(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (int64, bool, error) {
@@ -109,6 +163,102 @@ func (c *RedisCounter) Set(ctx context.Context, accountID uuid.UUID, periodStart
 	return c.client.Set(ctx, estimateKey(accountID, periodStart), estimateMicros, c.ttl).Err()
 }
 
+var setIfEqualScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if (not current) or current ~= ARGV[1] then return 0 end
+redis.call("SET", KEYS[1], ARGV[2], "PX", ARGV[3])
+return 1
+`)
+
+func (c *RedisCounter) SetIfEqual(ctx context.Context, accountID uuid.UUID, periodStart time.Time, expectedMicros, estimateMicros int64) (bool, error) {
+	applied, err := setIfEqualScript.Run(
+		ctx,
+		c.client,
+		[]string{estimateKey(accountID, periodStart)},
+		expectedMicros,
+		estimateMicros,
+		c.ttl.Milliseconds(),
+	).Int64()
+	return applied == 1, err
+}
+
+func (c *RedisCounter) SetMax(ctx context.Context, accountID uuid.UUID, periodStart time.Time, estimateMicros int64) (MaxResult, error) {
+	key := estimateKey(accountID, periodStart)
+	for {
+		var result MaxResult
+		err := c.client.Watch(ctx, func(tx *redis.Tx) error {
+			result = MaxResult{}
+			current, err := tx.Get(ctx, key).Int64()
+			switch {
+			case errors.Is(err, redis.Nil):
+				// Missing key: this transaction is the cold initializer if its
+				// SET wins the WATCH below.
+			case err != nil:
+				return err
+			default:
+				result.FoundBefore = true
+				result.PreviousMicros = current
+			}
+
+			if result.FoundBefore && current >= estimateMicros {
+				result.StoredMicros = current
+				_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+					pipe.PExpire(ctx, key, c.ttl)
+					return nil
+				})
+				return err
+			}
+
+			result.StoredMicros = estimateMicros
+			result.Advanced = true
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, estimateMicros, c.ttl)
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		return result, err
+	}
+}
+
+func redisInt64(value any) (int64, error) {
+	switch value := value.(type) {
+	case string:
+		return strconv.ParseInt(value, 10, 64)
+	case []byte:
+		return strconv.ParseInt(string(value), 10, 64)
+	default:
+		return 0, fmt.Errorf("unexpected Redis value type %T", value)
+	}
+}
+
 func estimateKey(accountID uuid.UUID, periodStart time.Time) string {
 	return fmt.Sprintf("billing:credit-estimate:%s:%d", accountID, periodStart.UTC().Unix())
+}
+
+func (c *RedisCounter) ClaimBlockNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (bool, error) {
+	return c.client.SetNX(ctx, blockNotificationKey(accountID, periodStart), "1", c.ttl).Result()
+}
+
+func (c *RedisCounter) ClearBlockNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) error {
+	return c.client.Del(ctx, blockNotificationKey(accountID, periodStart)).Err()
+}
+
+func (c *RedisCounter) ClaimBoundaryNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) (bool, error) {
+	return c.client.SetNX(ctx, boundaryNotificationKey(accountID, periodStart), "1", c.ttl).Result()
+}
+
+func (c *RedisCounter) ClearBoundaryNotification(ctx context.Context, accountID uuid.UUID, periodStart time.Time) error {
+	return c.client.Del(ctx, boundaryNotificationKey(accountID, periodStart)).Err()
+}
+
+func blockNotificationKey(accountID uuid.UUID, periodStart time.Time) string {
+	return fmt.Sprintf("billing:credit-block-notified:%s:%d", accountID, periodStart.UTC().Unix())
+}
+
+func boundaryNotificationKey(accountID uuid.UUID, periodStart time.Time) string {
+	return fmt.Sprintf("billing:credit-boundary-notified:%s:%d", accountID, periodStart.UTC().Unix())
 }

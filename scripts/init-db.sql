@@ -66,3 +66,16 @@
 
 -- 042: AI roster refresh — seed Claude Sonnet 5 COGS, retire Sonnet 4.6.
 \i migrations/billing/042_ai_model_prices_sonnet5.up.sql
+
+-- 043–047: sponsored-org lookup coverage, versioned prices, SSR metering, and
+-- custom-domain charge support.
+\i migrations/billing/043_sponsored_orgs_index.up.sql
+\i migrations/billing/044_metric_version_prices.up.sql
+\i migrations/billing/045_ssr_compute_metrics.up.sql
+\i migrations/billing/046_ssr_egress_metrics.up.sql
+\i migrations/billing/047_app_custom_domains.up.sql
+
+-- 048–049: universal credit wallet followed by durable selected-card
+-- automatic top-up attempts.
+\i migrations/billing/048_credit_wallet.up.sql
+\i migrations/billing/049_credit_auto_topup_attempts.up.sql

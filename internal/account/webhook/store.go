@@ -18,7 +18,10 @@ func NewStore(pool *pgxpool.Pool) Store {
 	if pool == nil {
 		panic("webhook.NewStore: pool must not be nil")
 	}
-	return &pgxStore{pool: pool, q: db.New(pool)}
+	return &pgxStore{
+		pool: pool,
+		q:    db.New(pool),
+	}
 }
 
 type pgxStore struct {

@@ -11,8 +11,10 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/google/uuid"
 	stripego "github.com/stripe/stripe-go/v85"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -225,16 +227,51 @@ type DefaultPMSetter interface {
 type ServingBlockNotifier interface {
 	NotifyStripeCustomer(ctx context.Context, stripeCustomerID string)
 	NotifyStripeInvoice(ctx context.Context, stripeInvoiceID string)
+	NotifyCreditInvoice(ctx context.Context, stripeInvoiceID string)
 	NotifyStripePaymentMethod(ctx context.Context, stripePaymentMethodID string)
 }
 
+// CreditSettlementObserver is the post-commit runtime reconciliation seam.
+// The #103 coordinator satisfies this interface. It is invoked only for the
+// first committed ledger transition, never for webhook/RPC replays.
+type CreditSettlementObserver interface {
+	ObserveAccount(ctx context.Context, accountID uuid.UUID) error
+}
+
+// CreditPaidReconciler is satisfied by both durable credit executors. A paid
+// webhook payload is only a notification: the selected reconciler re-reads
+// Stripe and proves the exact invoice resource before wallet credit advances.
+type CreditPaidReconciler interface {
+	ReconcileWebhookPaid(
+		ctx context.Context,
+		stripeInvoiceID string,
+	) (creditledger.Settlement, error)
+}
+
+// CreditFailureReconciler is satisfied by the durable auto-top-up executor.
+// Failure/terminal event payload text is never enough to move the ledger: the
+// reconciler loads the linked attempt, re-reads Stripe resource truth, and
+// closes an exact unpaid invoice before committing pending→failed.
+type CreditFailureReconciler interface {
+	ReconcileWebhookFailure(
+		ctx context.Context,
+		stripeInvoiceID string,
+		failureCode string,
+	) (creditledger.FailureReconciliation, error)
+}
+
 type Router struct {
-	verifier billingstripe.Verifier
-	store    Store
-	charges  ChargeRetriever
-	pmSetter DefaultPMSetter
-	notify   ServingBlockNotifier // nil = serving-block pushes disabled
-	log      *slog.Logger
+	verifier       billingstripe.Verifier
+	store          Store
+	charges        ChargeRetriever
+	pmSetter       DefaultPMSetter
+	notify         ServingBlockNotifier     // nil = serving-block pushes disabled
+	creditObserver CreditSettlementObserver // nil = runtime reconciliation disabled
+	creditPaid     CreditPaidReconciler     // nil = auto-top-up paid reconciliation disabled
+	manualPaid     CreditPaidReconciler     // nil = manual-purchase paid reconciliation disabled
+	creditFailures CreditFailureReconciler  // nil = auto-top-up failure reconciliation disabled
+	manualFailures CreditFailureReconciler  // nil = manual-purchase failure reconciliation disabled
+	log            *slog.Logger
 }
 
 // NewRouter wires a Router. All dependencies are required; nil
@@ -268,6 +305,82 @@ func (r *Router) WithServingBlockNotifier(n ServingBlockNotifier) *Router {
 	return r
 }
 
+// WithCreditSettlementObserver attaches the wallet-estimate/block-claim
+// reconciler. Observer failures are best-effort after durable money truth has
+// committed and therefore never fail webhook delivery.
+func (r *Router) WithCreditSettlementObserver(observer CreditSettlementObserver) *Router {
+	r.creditObserver = observer
+	return r
+}
+
+// WithCreditPaidReconciler attaches resource-authoritative invoice.paid
+// handling for durable auto-top-ups.
+func (r *Router) WithCreditPaidReconciler(reconciler CreditPaidReconciler) *Router {
+	r.creditPaid = reconciler
+	return r
+}
+
+// WithManualCreditPaidReconciler attaches resource-authoritative invoice.paid
+// handling for manual wallet purchases. Both webhook binaries wire it even
+// while rollout enforcement is disabled so authorized payments are recoverable.
+func (r *Router) WithManualCreditPaidReconciler(reconciler CreditPaidReconciler) *Router {
+	r.manualPaid = reconciler
+	return r
+}
+
+// WithCreditFailureReconciler attaches resource-authoritative failure handling
+// for durable auto-top-ups. Both webhook binaries wire this in production.
+func (r *Router) WithCreditFailureReconciler(reconciler CreditFailureReconciler) *Router {
+	r.creditFailures = reconciler
+	return r
+}
+
+// WithManualCreditFailureReconciler attaches resource-authoritative
+// payment-failure/void handling for manual purchases.
+func (r *Router) WithManualCreditFailureReconciler(
+	reconciler CreditFailureReconciler,
+) *Router {
+	r.manualFailures = reconciler
+	return r
+}
+
+func (r *Router) observeCreditSettlement(ctx context.Context, settlement creditledger.Settlement) {
+	if !settlement.Transitioned || r.creditObserver == nil {
+		return
+	}
+	if err := r.creditObserver.ObserveAccount(
+		creditledger.WithSettlementObservation(ctx),
+		settlement.AccountID,
+	); err != nil {
+		r.log.WarnContext(ctx, "credit settlement observer failed; durable truth committed",
+			"account_id", settlement.AccountID,
+			"ledger_id", settlement.LedgerID,
+			"credit_type", settlement.Type,
+			"error", err,
+		)
+	}
+}
+
+func (r *Router) observeCreditFailure(
+	ctx context.Context,
+	reconciliation creditledger.FailureReconciliation,
+) {
+	if !reconciliation.Transitioned || r.creditObserver == nil {
+		return
+	}
+	if err := r.creditObserver.ObserveAccount(
+		creditledger.WithSettlementObservation(ctx),
+		reconciliation.AccountID,
+	); err != nil {
+		r.log.WarnContext(ctx, "credit failure observer failed; durable truth committed",
+			"account_id", reconciliation.AccountID,
+			"ledger_id", reconciliation.LedgerID,
+			"status", reconciliation.Status,
+			"error", err,
+		)
+	}
+}
+
 // notifyCustomer / notifyInvoice / notifyPaymentMethod are the nil-guarded
 // hook call sites the handlers use — one line at each standing-relevant
 // event, after its store writes succeeded.
@@ -280,6 +393,12 @@ func (r *Router) notifyCustomer(ctx context.Context, stripeCustomerID string) {
 func (r *Router) notifyInvoice(ctx context.Context, stripeInvoiceID string) {
 	if r.notify != nil {
 		r.notify.NotifyStripeInvoice(ctx, stripeInvoiceID)
+	}
+}
+
+func (r *Router) notifyCreditInvoice(ctx context.Context, stripeInvoiceID string) {
+	if r.notify != nil {
+		r.notify.NotifyCreditInvoice(ctx, stripeInvoiceID)
 	}
 }
 
@@ -372,6 +491,7 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		stripego.EventTypeInvoiceFinalized,
 		stripego.EventTypeInvoicePaid,
 		stripego.EventTypeInvoicePaymentFailed,
+		stripego.EventTypeInvoicePaymentActionRequired,
 		stripego.EventTypeInvoiceVoided,
 		stripego.EventTypeInvoiceMarkedUncollectible:
 		// All six ride the same reconciler: each carries the full Invoice

@@ -132,11 +132,13 @@ const (
 	// ProrationWalletShort (credit mode, billing-engine #99): the wallet could
 	// not fully cover the creation proration. NOTHING was drawn and the guard is
 	// UNARMED; this call stays unsettled instead of falling through to Stripe.
-	// The standard-mode case is a defensive credits→standard mode-flip race.
+	// Reserved for an all-or-nothing credits allocator that cannot cover; the
+	// current credits policy normally covers through its unsecured remainder.
 	ProrationWalletShort
 	// ProrationWalletDeferToStripe (credit mode, billing-engine #99): the locked
-	// app row shows a prior attempt already reached the Stripe leg. The wallet
-	// must not draw beside money that may have moved; defer to Stripe recovery.
+	// app row shows a prior Stripe attempt, or the locked account mode is no
+	// longer credits. The wallet performs no draw and defers the full charge to
+	// the Stripe rail.
 	ProrationWalletDeferToStripe
 )
 
@@ -321,13 +323,13 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// re-checked UNDER the app-row lock in the store) defers to the Stripe recovery leg below,
 	// so a mid-flight mode flip can never draw the wallet beside money that may already have moved.
 	// The whole block is dark unless the credit-wallet flag + schema capability are BOTH ready.
-	if s.walletEnabled && !app.ProrationAttempted {
+	if !app.ProrationAttempted {
 		walletStart, walletEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
-		walletState, err := s.store.WalletCreditState(ctx, app.AccountID, walletStart, walletEnd)
+		walletState, walletAllowed, err := s.creditWalletChargeState(ctx, app.AccountID, walletStart, walletEnd)
 		if err != nil {
-			return nil, billing.Internal("wallet state lookup failed", err)
+			return nil, billing.Internal("wallet route classification failed", err)
 		}
-		if walletState.Mode == CreditBillingModeCredits {
+		if walletAllowed && walletState.Mode == CreditBillingModeCredits {
 			res, deferToStripe, err := s.chargeCreationProrationFromWallet(ctx, app, activatedAt)
 			if err != nil {
 				return nil, err
@@ -335,11 +337,12 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			if !deferToStripe {
 				return res, nil
 			}
-			// The under-lock outcome supersedes this stale unlocked snapshot and
-			// makes the existing Stripe recovery lookup authoritative below.
+			// The under-lock outcome supersedes this stale unlocked snapshot: a
+			// prior Stripe attempt makes recovery authoritative, while a concurrent
+			// credits→standard change hands the untouched full charge to Stripe.
 			app.ProrationAttempted = true
-			// deferToStripe: a prior attempt already reached Stripe — fall through to the
-			// Stripe recovery leg below (idempotent reconcile by ms_charge_ref).
+			// Fall through to the Stripe leg below. Its ms_charge_ref recovery is
+			// idempotent when an attempt already exists and a no-op lookup otherwise.
 		}
 	}
 
@@ -789,6 +792,10 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 
 	switch outcome {
 	case ProrationLockedCharged:
+		// The store transaction has committed the debit and armed the one-shot
+		// guard. Observe only this winning transition; replay/already/short
+		// outcomes must never emit another standing push.
+		s.observeWalletMutation(ctx, app.AccountID)
 		cents, err := centsFromMicros(amountMicros)
 		if err != nil {
 			return nil, false, billing.Internal("micros to cents conversion failed", err)

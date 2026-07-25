@@ -281,6 +281,7 @@ SET frozen_charge_cents     = $2,
     frozen_charge_with_base = $3
 WHERE id = $1
   AND frozen_charge_cents IS NULL
+  AND status <> 'invoiced'
 `
 
 type FreezeBillingRunChargeParams struct {
@@ -296,7 +297,10 @@ type FreezeBillingRunChargeParams struct {
 // already froze keeps its ORIGINAL values, so a retry that recomputed a different
 // LIVE total can never send Stripe a mismatched request under the same idem key.
 // InsertBillingRun's ON CONFLICT DO UPDATE deliberately leaves these columns
-// untouched, so the freeze survives the reclaim.
+// untouched, so the freeze survives the reclaim. The terminal-status guard is
+// the other half of the zero-vs-freeze race: once a concurrent daemon has
+// successfully marked the run invoiced, no later stale non-zero computation may
+// install a charge marker and enter Stripe.
 func (q *Queries) FreezeBillingRunCharge(ctx context.Context, arg FreezeBillingRunChargeParams) error {
 	_, err := q.db.Exec(ctx, freezeBillingRunCharge, arg.ID, arg.FrozenChargeCents, arg.FrozenChargeWithBase)
 	return err
@@ -329,20 +333,46 @@ func (q *Queries) HasUsableDefaultPM(ctx context.Context, accountID string) (boo
 }
 
 const insertBillingRun = `-- name: InsertBillingRun :one
-INSERT INTO ms_billing.billing_runs (account_id, period_start, period_end, status)
-VALUES ($1, $2, $3, 'pending')
-ON CONFLICT (account_id, period_start, period_end) DO UPDATE
+WITH inserted AS (
+    INSERT INTO ms_billing.billing_runs (
+        account_id,
+        period_start,
+        period_end,
+        status
+    )
+    VALUES ($1, $2, $3, 'pending')
+    ON CONFLICT (account_id, period_start, period_end) DO NOTHING
+    RETURNING id
+),
+reclaimed AS (
+    UPDATE ms_billing.billing_runs
     SET status            = 'pending',
         stripe_invoice_id = NULL,
         total_amount      = 0
-    WHERE ms_billing.billing_runs.status <> 'invoiced'
-RETURNING id
+    WHERE account_id = $1
+      AND period_start = $2
+      AND period_end = $3
+      AND status <> 'invoiced'
+      AND NOT EXISTS (SELECT 1 FROM inserted)
+    RETURNING id
+)
+SELECT id, false::boolean AS reclaimed
+FROM inserted
+UNION ALL
+SELECT id, true::boolean AS reclaimed
+FROM reclaimed
+LIMIT 1
 `
 
 type InsertBillingRunParams struct {
 	AccountID   string    `json:"account_id"`
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
+}
+
+type InsertBillingRunRow struct {
+	ID        string `json:"id"`
+	Reclaimed bool   `json:"reclaimed"`
 }
 
 // InsertBillingRun is the FIRST idempotency layer: one run row per
@@ -363,11 +393,15 @@ type InsertBillingRunParams struct {
 // Stripe invoice reuses that exact invoice (no double charge), and UpsertInvoice
 // is idempotent on stripe_invoice_id. UNIQUE(account, period) still holds —
 // there is never more than one run row per window.
-func (q *Queries) InsertBillingRun(ctx context.Context, arg InsertBillingRunParams) (string, error) {
+// Return whether this invocation reclaimed an existing non-terminal run. That
+// bit is a money-recovery boundary: a reclaimed run may need to recover a
+// previously committed wallet draw even when the current rollout is off or the
+// account is no longer selected. A fresh run must not make that recovery read.
+func (q *Queries) InsertBillingRun(ctx context.Context, arg InsertBillingRunParams) (InsertBillingRunRow, error) {
 	row := q.db.QueryRow(ctx, insertBillingRun, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
-	var id string
-	err := row.Scan(&id)
-	return id, err
+	var i InsertBillingRunRow
+	err := row.Scan(&i.ID, &i.Reclaimed)
+	return i, err
 }
 
 const latestClosedPeriodEnd = `-- name: LatestClosedPeriodEnd :one
@@ -391,6 +425,31 @@ func (q *Queries) LatestClosedPeriodEnd(ctx context.Context, accountID string) (
 	var period_end time.Time
 	err := row.Scan(&period_end)
 	return period_end, err
+}
+
+const lockBillingRunCharge = `-- name: LockBillingRunCharge :one
+SELECT status, frozen_charge_cents, frozen_charge_with_base
+FROM ms_billing.billing_runs
+WHERE id = $1
+FOR UPDATE
+`
+
+type LockBillingRunChargeRow struct {
+	Status               string      `json:"status"`
+	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+}
+
+// LockBillingRunCharge is the serialization point between a first wallet debit,
+// a competing Stripe freeze, and a terminal run write. The boundary wallet
+// transaction takes this row lock BEFORE allocating ledger lots. If another
+// daemon already froze a Stripe request, the wallet transaction may recover an
+// existing period draw but must never create a new one beside that request.
+func (q *Queries) LockBillingRunCharge(ctx context.Context, id string) (LockBillingRunChargeRow, error) {
+	row := q.db.QueryRow(ctx, lockBillingRunCharge, id)
+	var i LockBillingRunChargeRow
+	err := row.Scan(&i.Status, &i.FrozenChargeCents, &i.FrozenChargeWithBase)
+	return i, err
 }
 
 const markBillingRun = `-- name: MarkBillingRun :exec
@@ -428,6 +487,7 @@ SET status            = 'invoiced',
     total_amount      = 0
 WHERE id = $1
   AND frozen_charge_cents IS NULL
+  AND status <> 'invoiced'
 `
 
 // MarkBillingRunInvoicedIfUnfrozen is the ZERO-SKIP terminal mark (review

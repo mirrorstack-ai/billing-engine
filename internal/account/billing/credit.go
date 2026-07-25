@@ -3,13 +3,17 @@ package billing
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/mirrorstack-ai/billing-engine/internal/account/eligibility"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -60,6 +64,9 @@ func (s *Service) GetCreditStanding(ctx context.Context, req GetCreditStandingRe
 			BlockReason: status.BlockReason,
 		}, nil
 	}
+	if !s.creditEnabledFor(accountID) {
+		return nil, Unavailable("credit wallet is not enabled for this account")
+	}
 
 	standing, err := s.store.CreditStanding(ctx, accountID)
 	if err != nil {
@@ -67,10 +74,6 @@ func (s *Service) GetCreditStanding(ctx context.Context, req GetCreditStandingRe
 	}
 	blocked := status.Blocked
 	blockReason := status.BlockReason
-	if creditLimitExhausted(standing) && !blocked {
-		blocked = true
-		blockReason = blockReasonForEligibility(eligibility.ReasonOutOfCredits)
-	}
 
 	return &GetCreditStandingResponse{
 		BillingMode:       standing.BillingMode,
@@ -117,6 +120,9 @@ func (s *Service) ListCreditLedger(ctx context.Context, req ListCreditLedgerRequ
 	}
 	if !found {
 		return &ListCreditLedgerResponse{Entries: []CreditLedgerEntry{}}, nil
+	}
+	if !s.creditEnabledFor(accountID) {
+		return nil, Unavailable("credit wallet is not enabled for this account")
 	}
 
 	entries, err := s.store.ListCreditLedger(ctx, accountID, int32(limit+1), cursor)
@@ -168,6 +174,9 @@ func (s *Service) StartCreditPurchase(ctx context.Context, req StartCreditPurcha
 	if !found {
 		return nil, PaymentRequired("billing account required before purchasing credits")
 	}
+	if !s.creditEnabledFor(accountID) {
+		return nil, Unavailable("credit wallet is not enabled for this account")
+	}
 
 	if existing, found, err := s.store.CreditLedgerByIdempotencyKey(ctx, req.IdempotencyKey); err != nil {
 		return nil, Internal("credit purchase idempotency lookup failed", err)
@@ -197,19 +206,18 @@ func (s *Service) StartCreditPurchase(ctx context.Context, req StartCreditPurcha
 // resumeCreditPurchase is the crash/retry spine shared by fresh starts and
 // idempotent replays. Stripe resource-level state decides which steps remain.
 func (s *Service) resumeCreditPurchase(ctx context.Context, purchase CreditPurchaseRow) (*StartCreditPurchaseResponse, error) {
-	if purchase.Status == "failed" && purchase.StripeInvoiceID == "" {
-		return creditPurchaseStartResponse(purchase, billingstripe.Invoice{}), nil
+	if s.creditPurchases == nil {
+		return nil, Internal("manual credit purchase reconciler is not configured", nil)
 	}
-
-	ref := "credit-purchase:" + purchase.ID.String()
-	invoice := billingstripe.Invoice{}
-	var err error
-	if purchase.StripeInvoiceID != "" {
-		invoice, err = s.stripe.GetInvoice(ctx, purchase.StripeInvoiceID)
-		if err != nil {
-			return nil, StripeError("retrieve credit purchase invoice failed", err)
-		}
-	} else {
+	attempt := creditpurchase.Attempt{
+		ID:              purchase.ID,
+		AccountID:       purchase.AccountID,
+		AmountMicros:    purchase.AmountMicros,
+		Status:          purchase.Status,
+		StripeInvoiceID: purchase.StripeInvoiceID,
+		ReceiptURL:      purchase.ReceiptURL,
+	}
+	if purchase.StripeInvoiceID == "" && purchase.Status == "pending" {
 		fundingAccountID, err := s.store.ChargeFundingAccount(ctx, purchase.AccountID)
 		if err != nil {
 			return nil, Internal("funding account lookup failed", err)
@@ -221,63 +229,49 @@ func (s *Service) resumeCreditPurchase(ctx context.Context, purchase CreditPurch
 		if stripeCustomerID == "" {
 			return nil, PaymentRequired("Stripe customer required before purchasing credits")
 		}
-
-		var found bool
-		invoice, found, err = s.stripe.FindInvoiceByRef(ctx, stripeCustomerID, ref)
-		if err != nil {
-			return nil, StripeError("recover credit purchase invoice failed", err)
-		}
-		if !found {
-			invoice, err = s.stripe.CreateDraftInvoice(ctx, stripeCustomerID, ref, "credit-inv:"+purchase.ID.String())
-			if err != nil {
-				return nil, StripeError("create credit purchase invoice failed", err)
-			}
-		}
-		if err := s.store.AttachCreditPurchaseInvoice(ctx, purchase.ID, purchase.AccountID, invoice.ID, invoice.HostedInvoiceURL); err != nil {
-			return nil, Internal("attach credit purchase invoice failed", err)
-		}
-		purchase.StripeInvoiceID = invoice.ID
+		attempt.StripeCustomerID = stripeCustomerID
 	}
 
-	if invoice.Status == "draft" || invoice.Status == "" {
-		amountCents := microsToCentsRoundHalfUp(purchase.AmountMicros)
-		if _, err := s.stripe.CreateInvoiceItem(
-			ctx,
-			invoice.CustomerID,
-			invoice.ID,
-			amountCents,
-			"usd",
-			"MirrorStack credit purchase",
-			billingstripe.LinePeriod{},
-			"credit-item:"+purchase.ID.String(),
-		); err != nil {
-			return nil, StripeError("create credit purchase invoice item failed", err)
+	result, err := s.creditPurchases.Resume(ctx, attempt)
+	if err != nil {
+		if errors.Is(err, creditrecovery.ErrUnavailable) {
+			return nil, Unavailable("credit purchase recovery runtime is unavailable")
 		}
-		invoice, err = s.stripe.FinalizeInvoice(ctx, invoice.ID, "credit-fin:"+purchase.ID.String())
-		if err != nil {
-			return nil, StripeError("finalize credit purchase invoice failed", err)
+		return nil, Internal("reconcile manual credit purchase failed", err)
+	}
+	if result.Settlement.Found {
+		if result.Settlement.Transitioned {
+			s.observeCreditMutation(
+				creditledger.WithSettlementObservation(ctx),
+				purchase.AccountID,
+			)
 		}
 	}
-
-	if invoice.ID != "" && purchase.Status == "pending" {
-		if err := s.store.AttachCreditPurchaseInvoice(ctx, purchase.ID, purchase.AccountID, invoice.ID, invoice.HostedInvoiceURL); err != nil {
-			return nil, Internal("enrich credit purchase invoice failed", err)
-		}
+	if result.FailureTransitioned {
+		s.observeCreditMutation(
+			creditledger.WithSettlementObservation(ctx),
+			purchase.AccountID,
+		)
 	}
-	if target := creditPurchaseStatusFromInvoice(invoice.Status); purchase.Status == "pending" && target != "pending" {
-		if target == "settled" && invoice.AmountPaid != microsToCentsRoundHalfUp(purchase.AmountMicros) {
-			return nil, Internal("credit purchase invoice paid amount does not match the ledger amount", nil)
-		}
-		purchase, err = s.store.FinalizeCreditPurchase(ctx, purchase.ID, purchase.AccountID, target, invoice.HostedInvoiceURL)
-		if err != nil {
-			return nil, Internal("finalize credit purchase ledger failed", err)
-		}
+	var found bool
+	purchase, found, err = s.store.CreditPurchase(
+		ctx,
+		purchase.ID,
+		purchase.AccountID,
+	)
+	if err != nil {
+		return nil, Internal("refresh manual credit purchase failed", err)
 	}
-	return creditPurchaseStartResponse(purchase, invoice), nil
+	if !found {
+		return nil, Internal("manual credit purchase disappeared during reconciliation", nil)
+	}
+	return creditPurchaseStartResponse(purchase, result.Invoice), nil
 }
 
-// FinishCreditPurchase polls Stripe's invoice and applies the one-way ledger
-// transition. Ownership is enforced by the (purchase id, account id) lookup.
+// FinishCreditPurchase reconciles an already-authorized durable purchase.
+// Unlike Start, it intentionally ignores current rollout mode/cohort selection:
+// collected money must remain recoverable after a rollout is disabled.
+// Ownership is enforced by the (purchase id, account id) lookup.
 func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurchaseRequest) (*FinishCreditPurchaseResponse, error) {
 	if err := validateCreditOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
 		return nil, err
@@ -286,15 +280,18 @@ func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurc
 	if err != nil {
 		return nil, InvalidInput("purchase_id must be a UUID")
 	}
-	if !s.walletEnabled {
-		return nil, Unavailable("credit wallet is not enabled")
-	}
 	accountID, found, err := s.ownerAccount(ctx, req.OwnerUserID, req.OwnerOrgID)
 	if err != nil {
 		return nil, Internal("account lookup failed", err)
 	}
 	if !found {
 		return nil, NotFound("credit purchase not found")
+	}
+	if s.creditRecovery == nil {
+		return nil, Unavailable("credit purchase recovery runtime is not configured")
+	}
+	if err := s.creditRecovery.Require(ctx); err != nil {
+		return nil, Unavailable("credit purchase recovery runtime is unavailable")
 	}
 	purchase, found, err := s.store.CreditPurchase(ctx, purchaseID, accountID)
 	if err != nil {
@@ -304,26 +301,21 @@ func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurc
 		return nil, NotFound("credit purchase not found")
 	}
 
-	receiptURL := purchase.ReceiptURL
-	if purchase.Status == "pending" && purchase.StripeInvoiceID != "" {
-		invoice, err := s.stripe.GetInvoice(ctx, purchase.StripeInvoiceID)
+	if purchase.Status != "settled" &&
+		(purchase.Status != "failed" || purchase.StripeInvoiceID != "") {
+		start, reconcileErr := s.resumeCreditPurchase(ctx, purchase)
+		if reconcileErr != nil {
+			return nil, reconcileErr
+		}
+		purchase, found, err = s.store.CreditPurchase(ctx, purchaseID, accountID)
 		if err != nil {
-			return nil, StripeError("retrieve credit purchase invoice failed", err)
+			return nil, Internal("credit purchase refresh failed", err)
 		}
-		if invoice.HostedInvoiceURL != "" {
-			receiptURL = invoice.HostedInvoiceURL
+		if !found {
+			return nil, Internal("credit purchase disappeared during reconciliation", nil)
 		}
-		target := creditPurchaseStatusFromInvoice(invoice.Status)
-		if target == "settled" && invoice.AmountPaid != microsToCentsRoundHalfUp(purchase.AmountMicros) {
-			return nil, Internal("credit purchase invoice paid amount does not match the ledger amount", nil)
-		}
-		if target != "pending" {
-			purchase, err = s.store.FinalizeCreditPurchase(ctx, purchase.ID, purchase.AccountID, target, receiptURL)
-			if err != nil {
-				return nil, Internal("finalize credit purchase ledger failed", err)
-			}
-		} else if err := s.store.AttachCreditPurchaseInvoice(ctx, purchase.ID, purchase.AccountID, invoice.ID, receiptURL); err != nil {
-			return nil, Internal("enrich credit purchase invoice failed", err)
+		if start.Stripe != nil && start.Stripe.HostedInvoiceURL != "" {
+			purchase.ReceiptURL = start.Stripe.HostedInvoiceURL
 		}
 	}
 
@@ -334,7 +326,7 @@ func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurc
 	return &FinishCreditPurchaseResponse{
 		Status:        purchase.Status,
 		BalanceMicros: standing.BalanceMicros,
-		ReceiptURL:    receiptURL,
+		ReceiptURL:    purchase.ReceiptURL,
 	}, nil
 }
 
@@ -375,6 +367,9 @@ func (s *Service) SetAutoTopUp(ctx context.Context, req SetAutoTopUpRequest) (*S
 	}
 	if !found {
 		return nil, NotFound("billing account not found")
+	}
+	if !s.creditEnabledFor(accountID) {
+		return nil, Unavailable("credit wallet is not enabled for this account")
 	}
 	if req.PaymentMethodID != "" {
 		_, _, _, owned, err := s.paymentMethodTarget(ctx, req.OwnerUserID, req.OwnerOrgID, paymentMethodID)
@@ -440,6 +435,9 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 			return nil, Internal("ensure billing account failed", err)
 		}
 	}
+	if !s.creditEnabledFor(accountID) {
+		return nil, Unavailable("credit wallet is not enabled for this account")
+	}
 
 	standing, err := s.store.CreditStanding(ctx, accountID)
 	if err != nil {
@@ -451,8 +449,20 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 	} else if req.BillingMode == BillingModeCredits {
 		creditLimit = DefaultCreditsLimitMicros
 	}
-	if err := s.store.SetCreditBillingMode(ctx, accountID, req.BillingMode, creditLimit); err != nil {
+	changed, err := s.store.SetCreditBillingMode(ctx, accountID, req.BillingMode, creditLimit)
+	if err != nil {
+		if errors.Is(err, errPendingAutoTopUpModeChange) {
+			return nil, InvalidInput("cannot switch billing mode while an auto top-up is pending")
+		}
+		if errors.Is(err, errUninvoicedWalletDrawModeChange) {
+			return nil, InvalidInput(
+				"cannot switch billing mode while a boundary wallet draw is pending recovery",
+			)
+		}
 		return nil, Internal("set customer billing mode failed", err)
+	}
+	if changed {
+		s.observeCreditMutation(ctx, accountID)
 	}
 	return &SetCustomerBillingModeResponse{BillingMode: req.BillingMode}, nil
 }
@@ -464,6 +474,16 @@ func (s *Service) ListDistributorCustomers(ctx context.Context, req ListDistribu
 	}
 	if !s.walletEnabled {
 		return nil, Unavailable("credit wallet is not enabled")
+	}
+	distributorAccountID, found, err := s.store.AccountByOrg(ctx, req.DistributorOrgID)
+	if err != nil {
+		return nil, Internal("distributor account lookup failed", err)
+	}
+	if !found {
+		return &ListDistributorCustomersResponse{Customers: []DistributorCustomerRow{}}, nil
+	}
+	if !s.creditEnabledFor(distributorAccountID) {
+		return nil, Unavailable("credit wallet is not enabled for this account")
 	}
 	states, err := s.store.ListDistributorCustomerStates(ctx, req.DistributorOrgID)
 	if err != nil {
@@ -531,6 +551,9 @@ func (s *Service) GrantCredits(ctx context.Context, req GrantCreditsRequest) (*G
 			return nil, NotFound("customer billing account not found")
 		}
 	}
+	if !s.creditEnabledFor(accountID) {
+		return nil, Unavailable("credit wallet is not enabled for this account")
+	}
 
 	if existing, found, err := s.store.CreditLedgerByIdempotencyKey(ctx, req.IdempotencyKey); err != nil {
 		return nil, Internal("credit grant idempotency lookup failed", err)
@@ -553,7 +576,18 @@ func (s *Service) GrantCredits(ctx context.Context, req GrantCreditsRequest) (*G
 		}
 		return nil, Internal("insert credit grant failed", err)
 	}
+	s.observeCreditMutation(ctx, accountID)
 	return &GrantCreditsResponse{LedgerID: grant.ID.String(), BalanceMicros: grant.BalanceAfterMicros}, nil
+}
+
+func (s *Service) observeCreditMutation(ctx context.Context, accountID uuid.UUID) {
+	if s.observer == nil {
+		return
+	}
+	if err := s.observer.ObserveAccount(ctx, accountID); err != nil {
+		slog.ErrorContext(ctx, "credit mutation committed; standing observation failed",
+			"account_id", accountID, "error", err)
+	}
 }
 
 func validateCreditOwner(userID, orgID uuid.UUID) error {
@@ -564,25 +598,6 @@ func validateCreditOwner(userID, orgID uuid.UUID) error {
 		return InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
 	}
 	return nil
-}
-
-func creditLimitExhausted(standing CreditStandingRow) bool {
-	return standing.BillingMode == BillingModeCredits && standing.BalanceMicros <= -standing.CreditLimitMicros
-}
-
-func blockReasonForEligibility(reason eligibility.Reason) string {
-	return blockReason(reason)
-}
-
-func creditPurchaseStatusFromInvoice(status string) string {
-	switch status {
-	case "paid":
-		return "settled"
-	case "void", "uncollectible":
-		return "failed"
-	default:
-		return "pending"
-	}
 }
 
 func creditPurchaseStartResponse(purchase CreditPurchaseRow, invoice billingstripe.Invoice) *StartCreditPurchaseResponse {

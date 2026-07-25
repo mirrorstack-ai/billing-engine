@@ -44,6 +44,9 @@ func (f *fakeOwners) OwnerByStripeCustomer(context.Context, string) (standing.Ow
 func (f *fakeOwners) OwnerByStripeInvoice(context.Context, string) (standing.Owner, bool, error) {
 	return f.owner, f.found, nil
 }
+func (f *fakeOwners) OwnerByCreditInvoice(context.Context, string) (standing.Owner, bool, error) {
+	return f.owner, f.found, nil
+}
 func (f *fakeOwners) OwnerByStripePaymentMethod(context.Context, string) (standing.Owner, bool, error) {
 	return f.owner, f.found, nil
 }
@@ -81,11 +84,20 @@ func TestNotifier_DisabledWhenEnvUnset_SkipsWithoutCalling(t *testing.T) {
 		{"", "shhh"},               // url missing
 	} {
 		n := standing.NewNotifier(tc.url, tc.secret, status, owners, slog.Default())
+		require.False(t, n.Enabled())
 		n.NotifyStripeCustomer(context.Background(), "cus_x")
 		n.NotifyStripeInvoice(context.Background(), "in_x")
 		n.NotifyStripePaymentMethod(context.Background(), "pm_x")
 	}
 	require.Empty(t, status.lastReq, "a disabled notifier must not even read the verdict")
+}
+
+func TestNotifier_EnabledRequiresBothDestinationValues(t *testing.T) {
+	n := standing.NewNotifier(
+		"https://applications.internal", "secret",
+		&fakeStatus{}, &fakeOwners{}, slog.Default(),
+	)
+	require.True(t, n.Enabled())
 }
 
 func TestNotifier_PostsUserVerdictWithSecret(t *testing.T) {
@@ -156,4 +168,20 @@ func TestNotifier_EndpointErrorIsSwallowed(t *testing.T) {
 
 	n.NotifyStripeInvoice(context.Background(), "in_err") // must not panic
 	require.Len(t, c.bodies, 1, "the attempt was made; the failure is swallowed")
+}
+
+func TestNotifier_NotifyOwnerReturnsDeliveryErrorForCoordinatorRetry(t *testing.T) {
+	c := &capture{}
+	srv := servingBlockServer(t, c, http.StatusServiceUnavailable)
+	defer srv.Close()
+
+	userID := uuid.New()
+	status := &fakeStatus{blocked: true}
+	owners := &fakeOwners{owner: standing.Owner{UserID: userID}, found: true}
+	n := standing.NewNotifier(srv.URL, "shhh", status, owners, slog.Default())
+
+	_, err := n.NotifyOwner(context.Background(), userID, uuid.Nil)
+	require.Error(t, err)
+	require.Len(t, c.bodies, 1, "the owner path attempted delivery before returning the error")
+	require.Equal(t, userID, status.lastReq.UserID)
 }

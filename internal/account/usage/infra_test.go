@@ -2,6 +2,7 @@ package usage_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -163,6 +164,84 @@ func TestRecordInfraUsage_IdempotentReplay(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, second.Recorded)
 	require.Len(t, store.events, 1)
+}
+
+func TestRecordInfraUsage_CreditEvaluatorForcesLiveProjectionOnceForFreshOwnerEvent(t *testing.T) {
+	store := newFakeStore()
+	req := validInfra()
+	accountID := uuid.New()
+	store.accounts[req.OwnerUserID] = accountID
+	store.anchorDays[accountID] = 17
+	eval := &fakeCreditEvaluator{}
+	svc := usage.NewService(store).WithCreditEvaluator(eval)
+
+	first, err := svc.RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, first.Recorded)
+	second, err := svc.RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, second.Recorded)
+
+	require.Equal(t, 1, eval.calls,
+		"the deduped infra retry must not force a second live projection")
+	require.Len(t, eval.events, 1)
+	event := eval.events[0]
+	require.Equal(t, accountID, event.AccountID)
+	require.Equal(t, req.AppID, event.AppID)
+	require.Equal(t, req.EventID, event.EventID)
+	require.True(t, event.ForceLiveProjection)
+	require.Zero(t, event.ApproximateChargeMicros,
+		"infra ingest must not invent a price delta")
+	require.Equal(t, time.Date(2026, time.May, 17, 0, 0, 0, 0, time.UTC), event.PeriodStart)
+	require.Equal(t, time.Date(2026, time.June, 17, 0, 0, 0, 0, time.UTC), event.PeriodEnd)
+}
+
+func TestRecordInfraUsage_CreditEvaluatorSkipsLazyEvents(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*usage.RecordInfraUsageRequest)
+	}{
+		{
+			name: "ownerless producer event",
+			mutate: func(req *usage.RecordInfraUsageRequest) {
+				req.OwnerUserID = uuid.Nil
+			},
+		},
+		{
+			name:   "owner has no billing account",
+			mutate: func(*usage.RecordInfraUsageRequest) {},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			req := validInfra()
+			tc.mutate(&req)
+			eval := &fakeCreditEvaluator{}
+
+			resp, err := usage.NewService(store).
+				WithCreditEvaluator(eval).
+				RecordInfraUsage(context.Background(), req)
+
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			require.Zero(t, eval.calls)
+		})
+	}
+}
+
+func TestRecordInfraUsage_CreditEvaluatorErrorIsBestEffort(t *testing.T) {
+	store := newFakeStore()
+	req := validInfra()
+	store.accounts[req.OwnerUserID] = uuid.New()
+	eval := &fakeCreditEvaluator{err: errors.New("live projection unavailable")}
+
+	resp, err := usage.NewService(store).
+		WithCreditEvaluator(eval).
+		RecordInfraUsage(context.Background(), req)
+
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, 1, eval.calls)
 }
 
 func TestRecordInfraUsage_LazyAccountWhenNoBillingAccount(t *testing.T) {

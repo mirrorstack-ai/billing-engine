@@ -634,6 +634,47 @@ func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
 		"projected and accrued totals must differ by exactly the base delta")
 }
 
+func TestProjectedCreditChargeContainsOnlyUnpaidUsageExposure(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	app := seqUUID(1)
+	store.appMirrors[app] = usage.AppMirrorInfo{
+		ModuleCount: 7,
+		CreatedAt:   time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+	store.appBillRowsByApp[app] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "orders.placed", "", 1_500),
+	}
+	store.appInfraBillRowsByApp[app] = []usage.AppInfraUsage{
+		appInfraLine("infra.egress.api.bytes", "network", 100, 2, 200),
+	}
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "agent.tokens", "", 300),
+	}
+	store.liveDomainCount = 2
+
+	svc := newService(store)
+	bill, err := svc.GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	projection, err := svc.ProjectedCreditCharge(context.Background(), owner, uuid.Nil)
+	require.NoError(t, err)
+
+	wantExposure := bill.ModuleUsageTotalMicros +
+		bill.InfraTotalMicros +
+		bill.Agent.TotalMicros -
+		bill.PaasCreditMicros
+	require.Equal(t, wantExposure, projection.AmountMicros)
+	require.Equal(t,
+		bill.ProjectedBaseFeeTotalMicros+bill.AccountOverageMicros+bill.CustomDomainsMicros,
+		bill.ProjectedTotalMicros-projection.AmountMicros,
+		"recurring fees already settled by advance/proration legs are excluded from post-draw exposure")
+	require.True(t, projection.PeriodStart.Equal(bill.PeriodStart))
+	require.True(t, projection.PeriodEnd.Equal(bill.PeriodEnd))
+}
+
 // Migration 037: the account bill carries each app's FROZEN name + a deleted
 // flag, and — the hoist guard — they show even on a CHARGED (snapshotted)
 // period, where pre-037 the mirror was never read. A deleted app keeps its

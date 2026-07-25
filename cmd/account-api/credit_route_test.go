@@ -23,6 +23,7 @@ func TestCreditRPCRoutes_AreInternalSecretGatedAndDispatched(t *testing.T) {
 		"StartCreditPurchase",
 		"FinishCreditPurchase",
 		"SetAutoTopUp",
+		"RecoverAutoTopUp",
 		"SetCustomerBillingMode",
 		"ListDistributorCustomers",
 		"GrantCredits",
