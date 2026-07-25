@@ -3,13 +3,16 @@ package usage
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // ============================================================================
@@ -78,7 +81,11 @@ const (
 //  8. adds the live custom-domain account line ($2 per domain) once,
 //  9. TotalMicros = BaseFeeTotal + ModuleUsageTotal + InfraTotal +
 //     AccountOverage + CustomDomains + Agent.TotalMicros − PaasCredit (≥ 0 by
-//     the cap), plus the v1 plan stub with RenewsAt = the period end.
+//     the cap), plus the v1 plan stub with RenewsAt = the period end,
+//  10. ProjectedTotalMicros substitutes the full next-period base and, for the
+//     current live window, adds every unresolved one-time creation/module charge
+//     through its durable charge-leg predicates (including the ETA→sweep gap).
+//     Exact overlap with the recurring next-period forecast is counted once.
 func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest) (*GetAccountBillResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -266,9 +273,139 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	}
 	projectedBaseFeeTotal := liveAppCount * resolveBaseFeeMicros(plan)
 	response.ProjectedBaseFeeTotalMicros = projectedBaseFeeTotal
-	response.ProjectedTotalMicros = projectedBaseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + agent.TotalMicros + customDomains - paasCredit
+
+	// Creation-proration and per-install grace charges are one-time money due IN
+	// ADDITION TO the recurring period-end forecast above. Only the current live
+	// bill carries this forward-looking exposure. Unlike the itemized display's
+	// in-grace-only list, the projection keeps each amount through the ETA→daily
+	// sweep gap and removes it only on the charge leg's durable terminal guard.
+	var unresolvedOneTimeTotal int64
+	if periodID == "" {
+		unresolvedOneTimeTotal, err = s.unresolvedOneTimeChargeMicros(
+			ctx, accountID, periodEnd,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	response.unresolvedOneTimeMicros = unresolvedOneTimeTotal
+	response.ProjectedTotalMicros = projectedBaseFeeTotal +
+		moduleUsageTotal +
+		infraTotal +
+		accountOverage +
+		agent.TotalMicros +
+		customDomains -
+		paasCredit +
+		unresolvedOneTimeTotal
 
 	return response, nil
+}
+
+// unresolvedOneTimeChargeMicros is the authoritative current-bill projection
+// of one-time creation + module-grace money that has not reached a durable
+// terminal verdict.
+//
+// The store returns both kinds in one snapshot, avoiding an ownership-handoff
+// race while a wallet creation settlement arms the app guard but deliberately
+// leaves co-created timers unresolved. This read is rail-neutral: it projects
+// raw micro-USD charge shapes (the prospective credits amount); Stripe's final
+// whole-cent rounding belongs to collection, not this estimate.
+func (s *Service) unresolvedOneTimeChargeMicros(
+	ctx context.Context,
+	accountID uuid.UUID,
+	projectedPeriodStart time.Time,
+) (int64, error) {
+	charges, err := s.store.UnresolvedOneTimeCharges(
+		ctx, accountID, IncludedModules, GraceDays*24,
+	)
+	if err != nil {
+		return 0, billing.Internal("unresolved one-time charges query failed", err)
+	}
+
+	var total int64
+	for _, charge := range charges {
+		increment, err := unresolvedOneTimeChargeIncrementMicros(
+			charge, projectedPeriodStart,
+		)
+		if err != nil {
+			return 0, err
+		}
+		total += increment
+	}
+	return total, nil
+}
+
+// unresolvedOneTimeChargeIncrementMicros mirrors the immutable D1d charge shape
+// shared by creation base and module-timer grace legs:
+//   - charge day → its anchored period end, prorated at the unit fee;
+//   - plus one full unit when grace straddles into the following period;
+//   - if activation closed the first period, forgive it and retain only a
+//     post-activation straddled period; otherwise the whole shape is free.
+//
+// When that straddled period is exactly the next period already represented by
+// ProjectedBaseFeeTotalMicros/AccountOverageMicros, subtract its full unit once.
+// Delayed older charges keep their full straddle because their coverage does
+// not overlap the currently projected recurring period.
+func unresolvedOneTimeChargeIncrementMicros(
+	charge UnresolvedOneTimeChargeRaw,
+	projectedPeriodStart time.Time,
+) (int64, error) {
+	var unitMicros int64
+	switch charge.Kind {
+	case UnresolvedOneTimeChargeCreationBase:
+		unitMicros = BaseFeeMicros
+	case UnresolvedOneTimeChargeModuleTimer:
+		unitMicros = ModuleOverageFeeMicros
+	default:
+		return 0, billing.Internal(
+			fmt.Sprintf("unknown unresolved one-time charge kind %q", charge.Kind),
+			nil,
+		)
+	}
+
+	anchorDay := billingperiod.AnchorDay(charge.ActivatedAt)
+	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(
+		charge.ChargeAt.UTC(), anchorDay,
+	)
+	coverageEnd := periodEnd
+	straddles := !charge.GraceExpiresAt.UTC().Before(periodEnd)
+	if straddles {
+		_, coverageEnd = billingperiod.AnchoredPeriodWindow(
+			charge.GraceExpiresAt.UTC(), anchorDay,
+		)
+	}
+
+	amount := ProratedBaseMicros(
+		unitMicros, charge.ChargeAt, periodStart, periodEnd,
+	)
+	if straddles {
+		amount += unitMicros
+	}
+
+	periodClosedByActivation := !charge.ActivatedAt.Before(periodEnd)
+	if periodClosedByActivation {
+		if !straddles || !charge.ActivatedAt.Before(coverageEnd) {
+			return 0, nil
+		}
+		// D1d narrowing: the pre-activation first period is forgiven; only the
+		// full straddled period remains chargeable.
+		amount = unitMicros
+	}
+
+	if charge.CountsTowardRecurring && straddles {
+		recurringStart, recurringEnd := billingperiod.AnchoredPeriodWindow(
+			projectedPeriodStart.UTC(), anchorDay,
+		)
+		if recurringStart.Equal(periodEnd) &&
+			recurringStart.Equal(projectedPeriodStart.UTC()) &&
+			recurringEnd.Equal(coverageEnd) {
+			amount -= unitMicros
+		}
+	}
+	if amount < 0 {
+		return 0, billing.Internal("unresolved one-time charge projection underflow", nil)
+	}
+	return amount, nil
 }
 
 // ProjectedCreditCharge exposes the current period's unpaid usage-plane

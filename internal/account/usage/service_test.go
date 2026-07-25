@@ -55,6 +55,10 @@ type fakeStore struct {
 	errPendingNewApp         error
 	gotPendingGraceCutoff    time.Time // captured graceCutoff the service resolved (now − GraceDays)
 
+	// GetAccountBill's single-snapshot unresolved one-time projection fixtures.
+	unresolvedOneTimeCharges []usage.UnresolvedOneTimeChargeRaw
+	errUnresolvedOneTime     error
+
 	// Pending ADD-ON rows (post-creation in-grace over-module timers): the timer
 	// table has no other representation in this fake, so tests set the exact
 	// per-app rows the query would return (soonest-first, the SQL's ORDER BY).
@@ -305,6 +309,15 @@ func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, _ 
 		return nil, f.errPendingAddon
 	}
 	return f.pendingAddonCharges, nil
+}
+
+// UnresolvedOneTimeCharges returns the configured single-snapshot projection
+// rows. SQL eligibility and ownership predicates are covered in Postgres.
+func (f *fakeStore) UnresolvedOneTimeCharges(_ context.Context, _ uuid.UUID, _, _ int) ([]usage.UnresolvedOneTimeChargeRaw, error) {
+	if f.errUnresolvedOneTime != nil {
+		return nil, f.errUnresolvedOneTime
+	}
+	return f.unresolvedOneTimeCharges, nil
 }
 
 // baseSnapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
