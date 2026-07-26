@@ -208,7 +208,7 @@ func eventBridgeHandler(router *webhook.Router) func(context.Context, events.Eve
 			return nil
 		}
 
-		res := router.ProcessTrusted(ctx, event)
+		res := router.ProcessTrusted(credit.SuppressAutoTopUp(ctx), event)
 		if res.HTTPStatus >= 500 {
 			slog.ErrorContext(ctx, "webhook processing failed", "event_id", event.ID, "type", event.Type, "http_status", res.HTTPStatus, "status", res.Status)
 			return fmt.Errorf("webhook: dispatch failed for event %s (%s)", event.ID, res.Status)

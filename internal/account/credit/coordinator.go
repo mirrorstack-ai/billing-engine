@@ -620,6 +620,13 @@ func suppressAutoTopUp(ctx context.Context) context.Context {
 	return context.WithValue(ctx, autoTopUpSuppressionContextKey{}, true)
 }
 
+// SuppressAutoTopUp marks a call tree as unable to originate an automatic
+// card charge. Webhook transports use it before entering the shared router so
+// their standing-notification status reads remain read-only.
+func SuppressAutoTopUp(ctx context.Context) context.Context {
+	return suppressAutoTopUp(ctx)
+}
+
 func autoTopUpSuppressed(ctx context.Context) bool {
 	suppressed, _ := ctx.Value(autoTopUpSuppressionContextKey{}).(bool)
 	return suppressed

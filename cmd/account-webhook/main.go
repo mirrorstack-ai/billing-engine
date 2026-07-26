@@ -243,7 +243,7 @@ func proxyHandler(router *webhook.Router) func(context.Context, events.APIGatewa
 			return proxyResponse(http.StatusBadRequest, webhook.StatusInvalidBody), nil
 		}
 
-		res := router.Process(ctx, body, sig)
+		res := router.Process(credit.SuppressAutoTopUp(ctx), body, sig)
 		return proxyResponse(res.HTTPStatus, res.Status), nil
 	}
 }
@@ -263,7 +263,7 @@ func httpHandler(router *webhook.Router) http.HandlerFunc {
 		}
 
 		sig := r.Header.Get(stripeSigHeader)
-		res := router.Process(r.Context(), body, sig)
+		res := router.Process(credit.SuppressAutoTopUp(r.Context()), body, sig)
 		writeJSONResponse(w, res.HTTPStatus, res.Status)
 	}
 }
