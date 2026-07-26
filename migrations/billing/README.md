@@ -21,6 +21,25 @@ numbering is **tolerated**: a file simply slots into its sorted position. New
 migrations must still be born-clean (no create-then-rename churn) and land main
 applying cleanly on a fresh DB.
 
+### Migration 050 billing-cycle cutover
+
+`050_combined_proration_attempts.up.sql` is expand-only for the old binary, but
+its new exact Stripe-item ownership contract requires an atomic charge-worker
+cutover:
+
+1. Keep scheduled and manual `billing-cycle` invocations idle.
+2. Apply migration 050; its first statement rejects every legacy app with
+   `proration_attempted_at` set and no durable invoice guard, including rows
+   later marked skipped.
+3. Atomically move the non-canary `billing-cycle` Lambda alias to the matching
+   binary.
+4. After the first new worker invocation can create a combined-attempt header,
+   do not invoke or roll back to an older charge worker; use forward recovery.
+
+The canaried account API does not run creation charging and is outside this
+constraint. Header-scoped DB triggers reject old terminal writes without
+changing old no-header behavior before cutover.
+
 > If a future sequential-only runner (golang-migrate / goose) is adopted, the
 > reserved slots below must be materialized first (see "Reserved slots").
 

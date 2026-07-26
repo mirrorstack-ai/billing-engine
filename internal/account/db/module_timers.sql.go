@@ -242,6 +242,14 @@ UPDATE ms_billing.app_module_overage_timers
 SET charge_attempted_at = COALESCE(charge_attempted_at, $2)
 WHERE id = $1
   AND grace_resolved = false
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ms_billing.app_combined_proration_attempt_timers owned
+      JOIN ms_billing.app_combined_proration_attempts attempt
+        ON attempt.app_id = owned.app_id
+      WHERE owned.timer_id = ms_billing.app_module_overage_timers.id
+        AND attempt.resolved_at IS NULL
+  )
 `
 
 type MarkModuleTimerChargeAttemptedParams struct {
@@ -307,6 +315,14 @@ UPDATE ms_billing.app_module_overage_timers
 SET grace_resolved = true
 WHERE id = $1
   AND grace_resolved = false
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ms_billing.app_combined_proration_attempt_timers owned
+      JOIN ms_billing.app_combined_proration_attempts attempt
+        ON attempt.app_id = owned.app_id
+      WHERE owned.timer_id = ms_billing.app_module_overage_timers.id
+        AND attempt.resolved_at IS NULL
+  )
 `
 
 // MarkModuleTimerIncluded stamps a TERMINAL "included" verdict (grace_resolved =
@@ -378,9 +394,20 @@ func (q *Queries) ModuleOverageTimersPastGrace(ctx context.Context, graceExpires
 }
 
 const moduleTimerStillPending = `-- name: ModuleTimerStillPending :one
-SELECT (removed_at IS NULL AND grace_resolved = false)::bool AS pending
-FROM ms_billing.app_module_overage_timers
-WHERE id = $1
+SELECT (
+    timer.removed_at IS NULL
+    AND timer.grace_resolved = false
+    AND NOT EXISTS (
+        SELECT 1
+        FROM ms_billing.app_combined_proration_attempt_timers owned
+        JOIN ms_billing.app_combined_proration_attempts attempt
+          ON attempt.app_id = owned.app_id
+        WHERE owned.timer_id = timer.id
+          AND attempt.resolved_at IS NULL
+    )
+)::bool AS pending
+FROM ms_billing.app_module_overage_timers timer
+WHERE timer.id = $1
 `
 
 // ModuleTimerStillPending is the charge-time re-verification read (review
@@ -548,4 +575,348 @@ type SoftRemoveNewestModuleTimersParams struct {
 func (q *Queries) SoftRemoveNewestModuleTimers(ctx context.Context, arg SoftRemoveNewestModuleTimersParams) error {
 	_, err := q.db.Exec(ctx, softRemoveNewestModuleTimers, arg.RemovedAt, arg.AppID, arg.LimitCount)
 	return err
+}
+
+const unresolvedOneTimeCharges = `-- name: UnresolvedOneTimeCharges :many
+WITH live_timer_ranks AS (
+    SELECT id,
+           row_number() OVER (ORDER BY installed_at, id) AS rn
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = $1::uuid
+      AND removed_at IS NULL
+),
+frozen_headers AS (
+    SELECT attempt.app_id, attempt.account_id, attempt.attempted_at, attempt.currency, attempt.base_charge_micros, attempt.base_charge_cents, attempt.module_charge_micros, attempt.module_charge_cents, attempt.timer_count, attempt.coverage_start, attempt.coverage_end, attempt.base_description, attempt.module_description, attempt.snapshot_period_start, attempt.snapshot_period_end, attempt.snapshot_base_micros, attempt.snapshot_module_count, attempt.straddle_period_start, attempt.straddle_period_end, attempt.straddle_base_micros, attempt.resolved_at, attempt.resolved_invoice_id,
+           (
+               SELECT count(*)::bigint
+               FROM ms_billing.app_combined_proration_attempt_timers child
+               WHERE child.app_id = attempt.app_id
+           ) AS actual_timer_count
+    FROM ms_billing.app_combined_proration_attempts attempt
+    WHERE attempt.account_id = $1::uuid
+      AND attempt.resolved_at IS NULL
+),
+dynamic_creations AS (
+    SELECT 'creation_base'::text AS charge_kind,
+           app.app_id AS charge_id,
+           app.app_id,
+           app.created_at AS charge_at,
+           app.created_at + make_interval(hours => $2::int) AS grace_expires_at,
+           account.activated_at,
+           (app.deleted_at IS NULL) AS counts_toward_recurring,
+           false AS frozen,
+           0::bigint AS frozen_amount_micros,
+           NULL::timestamptz AS frozen_snapshot_period_start,
+           NULL::timestamptz AS frozen_snapshot_period_end,
+           NULL::bigint AS frozen_snapshot_base_micros,
+           NULL::timestamptz AS frozen_straddle_period_start,
+           NULL::timestamptz AS frozen_straddle_period_end,
+           NULL::bigint AS frozen_straddle_base_micros,
+           false AS frozen_has_straddle,
+           0::int AS frozen_declared_timer_count,
+           0::bigint AS frozen_actual_timer_count,
+           -- Any attempted row that reaches the dynamic branch is inconsistent:
+           -- a healthy migration-050 attempt has an unresolved header and was
+           -- excluded above. This also rejects resolved-header/no-app-terminal
+           -- split state instead of reconstructing mutable money.
+           (
+               app.proration_attempted_at IS NOT NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM ms_billing.app_combined_proration_attempts any_attempt
+                   WHERE any_attempt.app_id = app.app_id
+               )
+           ) AS ownership_unknown
+    FROM ms_billing.apps app
+    JOIN ms_billing.accounts account ON account.id = app.account_id
+    WHERE app.account_id = $1::uuid
+      AND account.activated_at IS NOT NULL
+      AND app.proration_invoice_id IS NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM frozen_headers frozen
+          WHERE frozen.app_id = app.app_id
+      )
+      AND (
+          app.proration_attempted_at IS NOT NULL
+          OR (
+              app.proration_skipped_at IS NULL
+              AND (
+                  app.deleted_at IS NULL
+                  OR app.deleted_at >= app.created_at + make_interval(hours => $2::int)
+              )
+          )
+      )
+),
+dynamic_timers AS (
+    SELECT 'module_timer'::text AS charge_kind,
+           timer.id AS charge_id,
+           timer.app_id,
+           timer.installed_at AS charge_at,
+           timer.grace_expires_at,
+           account.activated_at,
+           (
+               timer.removed_at IS NULL
+               AND rank.rn > $3::int
+           ) AS counts_toward_recurring,
+           false AS frozen,
+           0::bigint AS frozen_amount_micros,
+           NULL::timestamptz AS frozen_snapshot_period_start,
+           NULL::timestamptz AS frozen_snapshot_period_end,
+           NULL::bigint AS frozen_snapshot_base_micros,
+           NULL::timestamptz AS frozen_straddle_period_start,
+           NULL::timestamptz AS frozen_straddle_period_end,
+           NULL::bigint AS frozen_straddle_base_micros,
+           false AS frozen_has_straddle,
+           0::int AS frozen_declared_timer_count,
+           0::bigint AS frozen_actual_timer_count,
+           EXISTS (
+               SELECT 1
+               FROM ms_billing.app_combined_proration_attempt_timers any_owned
+               WHERE any_owned.timer_id = timer.id
+           ) AS ownership_unknown
+    FROM ms_billing.app_module_overage_timers timer
+    JOIN ms_billing.accounts account ON account.id = timer.account_id
+    LEFT JOIN live_timer_ranks rank ON rank.id = timer.id
+    WHERE account.activated_at IS NOT NULL
+      AND timer.account_id = $1::uuid
+      AND timer.grace_resolved = false
+      AND NOT EXISTS (
+          SELECT 1
+          FROM ms_billing.app_combined_proration_attempt_timers child
+          JOIN frozen_headers frozen ON frozen.app_id = child.app_id
+          WHERE child.timer_id = timer.id
+      )
+      AND (
+          timer.charge_attempted_at IS NOT NULL
+          OR EXISTS (
+              SELECT 1
+              FROM ms_billing.app_combined_proration_attempt_timers any_owned
+              WHERE any_owned.timer_id = timer.id
+          )
+          OR (
+              timer.removed_at IS NULL
+              AND rank.rn > $3::int
+          )
+      )
+),
+frozen_bases AS (
+    SELECT 'creation_base'::text AS charge_kind,
+           frozen.app_id AS charge_id,
+           frozen.app_id,
+           app.created_at AS charge_at,
+           app.created_at + make_interval(hours => $2::int) AS grace_expires_at,
+           account.activated_at,
+           (app.deleted_at IS NULL) AS counts_toward_recurring,
+           true AS frozen,
+           frozen.base_charge_micros AS frozen_amount_micros,
+           frozen.snapshot_period_start AS frozen_snapshot_period_start,
+           frozen.snapshot_period_end AS frozen_snapshot_period_end,
+           frozen.snapshot_base_micros AS frozen_snapshot_base_micros,
+           frozen.straddle_period_start AS frozen_straddle_period_start,
+           frozen.straddle_period_end AS frozen_straddle_period_end,
+           frozen.straddle_base_micros AS frozen_straddle_base_micros,
+           (frozen.straddle_period_start IS NOT NULL) AS frozen_has_straddle,
+           frozen.timer_count AS frozen_declared_timer_count,
+           frozen.actual_timer_count AS frozen_actual_timer_count,
+           false AS ownership_unknown
+    FROM frozen_headers frozen
+    JOIN ms_billing.apps app ON app.app_id = frozen.app_id
+    JOIN ms_billing.accounts account ON account.id = frozen.account_id
+),
+frozen_timers AS (
+    SELECT 'module_timer'::text AS charge_kind,
+           child.timer_id AS charge_id,
+           frozen.app_id,
+           timer.installed_at AS charge_at,
+           timer.grace_expires_at,
+           account.activated_at,
+           (
+               timer.removed_at IS NULL
+               AND rank.rn > $3::int
+           ) AS counts_toward_recurring,
+           true AS frozen,
+           frozen.module_charge_micros AS frozen_amount_micros,
+           frozen.snapshot_period_start AS frozen_snapshot_period_start,
+           frozen.snapshot_period_end AS frozen_snapshot_period_end,
+           frozen.snapshot_base_micros AS frozen_snapshot_base_micros,
+           frozen.straddle_period_start AS frozen_straddle_period_start,
+           frozen.straddle_period_end AS frozen_straddle_period_end,
+           frozen.straddle_base_micros AS frozen_straddle_base_micros,
+           (frozen.straddle_period_start IS NOT NULL) AS frozen_has_straddle,
+           frozen.timer_count AS frozen_declared_timer_count,
+           frozen.actual_timer_count AS frozen_actual_timer_count,
+           false AS ownership_unknown
+    FROM frozen_headers frozen
+    JOIN ms_billing.app_combined_proration_attempt_timers child
+      ON child.app_id = frozen.app_id
+    JOIN ms_billing.app_module_overage_timers timer
+      ON timer.id = child.timer_id
+    JOIN ms_billing.accounts account ON account.id = frozen.account_id
+    LEFT JOIN live_timer_ranks rank ON rank.id = timer.id
+),
+all_charges AS (
+    SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
+           activated_at, counts_toward_recurring, frozen,
+           frozen_amount_micros,
+           frozen_snapshot_period_start, frozen_snapshot_period_end,
+           frozen_snapshot_base_micros,
+           frozen_straddle_period_start, frozen_straddle_period_end,
+           frozen_straddle_base_micros,
+           frozen_has_straddle,
+           frozen_declared_timer_count, frozen_actual_timer_count,
+           ownership_unknown
+    FROM dynamic_creations
+    UNION ALL
+    SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
+           activated_at, counts_toward_recurring, frozen,
+           frozen_amount_micros,
+           frozen_snapshot_period_start, frozen_snapshot_period_end,
+           frozen_snapshot_base_micros,
+           frozen_straddle_period_start, frozen_straddle_period_end,
+           frozen_straddle_base_micros,
+           frozen_has_straddle,
+           frozen_declared_timer_count, frozen_actual_timer_count,
+           ownership_unknown
+    FROM dynamic_timers
+    UNION ALL
+    SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
+           activated_at, counts_toward_recurring, frozen,
+           frozen_amount_micros,
+           frozen_snapshot_period_start, frozen_snapshot_period_end,
+           frozen_snapshot_base_micros,
+           frozen_straddle_period_start, frozen_straddle_period_end,
+           frozen_straddle_base_micros,
+           frozen_has_straddle,
+           frozen_declared_timer_count, frozen_actual_timer_count,
+           ownership_unknown
+    FROM frozen_bases
+    UNION ALL
+    SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
+           activated_at, counts_toward_recurring, frozen,
+           frozen_amount_micros,
+           frozen_snapshot_period_start, frozen_snapshot_period_end,
+           frozen_snapshot_base_micros,
+           frozen_straddle_period_start, frozen_straddle_period_end,
+           frozen_straddle_base_micros,
+           frozen_has_straddle,
+           frozen_declared_timer_count, frozen_actual_timer_count,
+           ownership_unknown
+    FROM frozen_timers
+)
+SELECT charge_kind::text,
+       charge_id::uuid,
+       app_id::uuid,
+       charge_at::timestamptz,
+       grace_expires_at::timestamptz,
+       activated_at::timestamptz,
+       counts_toward_recurring::boolean,
+       frozen::boolean,
+       frozen_amount_micros::bigint,
+       COALESCE(frozen_snapshot_period_start, 'epoch'::timestamptz)::timestamptz
+           AS frozen_snapshot_period_start,
+       COALESCE(frozen_snapshot_period_end, 'epoch'::timestamptz)::timestamptz
+           AS frozen_snapshot_period_end,
+       COALESCE(frozen_snapshot_base_micros, 0)::bigint
+           AS frozen_snapshot_base_micros,
+       COALESCE(frozen_straddle_period_start, 'epoch'::timestamptz)::timestamptz
+           AS frozen_straddle_period_start,
+       COALESCE(frozen_straddle_period_end, 'epoch'::timestamptz)::timestamptz
+           AS frozen_straddle_period_end,
+       COALESCE(frozen_straddle_base_micros, 0)::bigint
+           AS frozen_straddle_base_micros,
+       frozen_has_straddle::boolean,
+       frozen_declared_timer_count::int,
+       frozen_actual_timer_count::bigint,
+       ownership_unknown::boolean
+FROM all_charges
+ORDER BY charge_at, charge_kind, charge_id
+`
+
+type UnresolvedOneTimeChargesParams struct {
+	AccountID       string `json:"account_id"`
+	GraceHours      int32  `json:"grace_hours"`
+	IncludedModules int32  `json:"included_modules"`
+}
+
+type UnresolvedOneTimeChargesRow struct {
+	ChargeKind                string    `json:"charge_kind"`
+	ChargeID                  string    `json:"charge_id"`
+	AppID                     string    `json:"app_id"`
+	ChargeAt                  time.Time `json:"charge_at"`
+	GraceExpiresAt            time.Time `json:"grace_expires_at"`
+	ActivatedAt               time.Time `json:"activated_at"`
+	CountsTowardRecurring     bool      `json:"counts_toward_recurring"`
+	Frozen                    bool      `json:"frozen"`
+	FrozenAmountMicros        int64     `json:"frozen_amount_micros"`
+	FrozenSnapshotPeriodStart time.Time `json:"frozen_snapshot_period_start"`
+	FrozenSnapshotPeriodEnd   time.Time `json:"frozen_snapshot_period_end"`
+	FrozenSnapshotBaseMicros  int64     `json:"frozen_snapshot_base_micros"`
+	FrozenStraddlePeriodStart time.Time `json:"frozen_straddle_period_start"`
+	FrozenStraddlePeriodEnd   time.Time `json:"frozen_straddle_period_end"`
+	FrozenStraddleBaseMicros  int64     `json:"frozen_straddle_base_micros"`
+	FrozenHasStraddle         bool      `json:"frozen_has_straddle"`
+	FrozenDeclaredTimerCount  int32     `json:"frozen_declared_timer_count"`
+	FrozenActualTimerCount    int64     `json:"frozen_actual_timer_count"`
+	OwnershipUnknown          bool      `json:"ownership_unknown"`
+}
+
+// UnresolvedOneTimeCharges is GetAccountBill's authoritative one-time
+// projection input. One SQL statement returns both mutable fresh candidates
+// and immutable migration-050 combined-attempt components from one MVCC
+// snapshot. A frozen app/timer identity is excluded from the dynamic branches
+// and emitted exactly once from its header/child rows; removal, FIFO drift, or
+// a delayed retry can never rewrite money already claimed by Stripe recovery.
+//
+// Dynamic recovery eligibility mirrors the charge legs:
+//   - an attempted app survives a later within-grace deletion;
+//   - an attempted timer survives removal or an over→included rank change;
+//   - unattempted candidates still use D11 + live account-FIFO rank.
+//
+// A legacy attempted app without a migration-050 header is explicitly flagged
+// so the service fails closed instead of reconstructing unknown ownership.
+//
+// Frozen rows carry raw micros and both exact snapshot windows. The service
+// subtracts a recurring unit only when the frozen full-period snapshot exactly
+// equals the projected next period AND that exact app/child is still represented
+// by the live recurring forecast. Declared/actual child counts are repeated on
+// every frozen row (including the base), making incomplete ownership loud.
+func (q *Queries) UnresolvedOneTimeCharges(ctx context.Context, arg UnresolvedOneTimeChargesParams) ([]UnresolvedOneTimeChargesRow, error) {
+	rows, err := q.db.Query(ctx, unresolvedOneTimeCharges, arg.AccountID, arg.GraceHours, arg.IncludedModules)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UnresolvedOneTimeChargesRow{}
+	for rows.Next() {
+		var i UnresolvedOneTimeChargesRow
+		if err := rows.Scan(
+			&i.ChargeKind,
+			&i.ChargeID,
+			&i.AppID,
+			&i.ChargeAt,
+			&i.GraceExpiresAt,
+			&i.ActivatedAt,
+			&i.CountsTowardRecurring,
+			&i.Frozen,
+			&i.FrozenAmountMicros,
+			&i.FrozenSnapshotPeriodStart,
+			&i.FrozenSnapshotPeriodEnd,
+			&i.FrozenSnapshotBaseMicros,
+			&i.FrozenStraddlePeriodStart,
+			&i.FrozenStraddlePeriodEnd,
+			&i.FrozenStraddleBaseMicros,
+			&i.FrozenHasStraddle,
+			&i.FrozenDeclaredTimerCount,
+			&i.FrozenActualTimerCount,
+			&i.OwnershipUnknown,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

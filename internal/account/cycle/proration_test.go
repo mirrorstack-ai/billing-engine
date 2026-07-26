@@ -6,6 +6,7 @@ package cycle_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -26,6 +27,69 @@ func registerMirror(t *testing.T, svc *cycle.Service, user, appID uuid.UUID, cre
 		OwnerUserID: user, AppID: appID, ModuleCount: moduleCount, CreatedAt: created,
 	})
 	require.NoError(t, err)
+}
+
+func freezeCombinedBeforeDraft(
+	t *testing.T,
+	svc *cycle.Service,
+	store *fakeStore,
+	sc *fakeStripe,
+	appID uuid.UUID,
+) cycle.CombinedProrationAttempt {
+	t.Helper()
+	sc.errDraft = errors.New("simulated crash before draft creation")
+	_, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.Error(t, err)
+	sc.errDraft = nil
+	attempt, ok := store.combinedProrationAttempts[appID]
+	require.True(t, ok, "the exact ownership header must commit before the failed first Stripe call")
+	require.True(t, store.apps[appID].ProrationAttempted)
+	sc.invoiceCalls = nil
+	return cloneCombinedProrationAttempt(attempt)
+}
+
+func seedCombinedAttemptItems(
+	t *testing.T,
+	sc *fakeStripe,
+	invoiceID string,
+	attempt cycle.CombinedProrationAttempt,
+	timerIDs []uuid.UUID,
+) {
+	t.Helper()
+	period := billingstripe.LinePeriod{
+		Start: attempt.Shape.CoverageStart,
+		End:   attempt.Shape.CoverageEnd,
+	}
+	_, err := sc.CreateCombinedProrationInvoiceItem(
+		context.Background(),
+		"cus_test",
+		invoiceID,
+		attempt.Shape.BaseChargeCents,
+		attempt.Shape.Currency,
+		attempt.Shape.BaseDescription,
+		period,
+		"seed-base:"+attempt.AppID.String(),
+		billingstripe.CombinedProrationItemIdentity{AppID: attempt.AppID.String()},
+	)
+	require.NoError(t, err)
+	for _, timerID := range timerIDs {
+		_, err := sc.CreateCombinedProrationInvoiceItem(
+			context.Background(),
+			"cus_test",
+			invoiceID,
+			attempt.Shape.ModuleChargeCents,
+			attempt.Shape.Currency,
+			attempt.Shape.ModuleDescription,
+			period,
+			"seed-timer:"+timerID.String(),
+			billingstripe.CombinedProrationItemIdentity{
+				AppID:   attempt.AppID.String(),
+				TimerID: timerID.String(),
+			},
+		)
+		require.NoError(t, err)
+	}
+	sc.itemCalls = nil
 }
 
 // --- (a) grace holds: an app charged before GraceDays elapse is impossible ---
@@ -73,12 +137,77 @@ func TestSweep_NeverChargesAppDeletedWithinGrace(t *testing.T) {
 	require.Empty(t, store.apps[appID].ProrationInvoiceID)
 }
 
-// Regression (wave 2, D2): a recovered combined draft whose co-created timer
-// set SHRANK between crash and retry (uninstall / rank flip) used to hit the
-// refuse-loudly branch on every sweep forever — the app's proration never
-// resolved and its modules were never billed by any leg. The validation now
-// accepts base + k overage lines for live-set ≤ k ≤ created count.
-func TestChargeCreationProration_RecoveredDraftAcceptsShrunkTimerSet(t *testing.T) {
+func TestChargeCreationProration_LegacyAttemptMarkerWithoutHeaderFailsBeforeStripe(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
+	app := store.apps[appID]
+	app.ProrationAttempted = true
+	store.apps[appID] = app
+
+	_, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.Error(t, err)
+	require.ErrorIs(t, err, cycle.ErrCombinedProrationAttemptUnknown)
+	require.Empty(t, sc.findByRefCalls, "unknown ownership fails before even reading Stripe recovery truth")
+	require.Empty(t, sc.invoiceCalls)
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.finalizeCalls)
+}
+
+func TestChargeCreationProration_LegacyAttemptMarkerWithSkipStillFailsClosed(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 0)
+	app := store.apps[appID]
+	app.ProrationAttempted = true
+	app.ProrationSkipped = true
+	store.apps[appID] = app
+
+	_, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.ErrorIs(t, err, cycle.ErrCombinedProrationAttemptUnknown)
+	require.Empty(t, sc.findByRefCalls)
+	require.Empty(t, sc.invoiceCalls)
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.finalizeCalls)
+}
+
+func TestChargeCreationProration_FrozenRecoveryBypassesLaterPeriodClosedDecision(t *testing.T) {
+	store := newFakeStore()
+	user, accountID := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	registerMirror(t, svc, user, appID, createdAt, 0)
+
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Empty(t, attempt.TimerIDs)
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
+		ID: "in_period_closed_recovery", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
+	})
+	seedCombinedAttemptItems(t, sc, "in_period_closed_recovery", attempt, nil)
+
+	// Simulate a later gate read deciding that this creation period is closed.
+	// Once an exact header exists this cannot convert recovery into a permanent
+	// skip: Stripe may already own the frozen request.
+	store.activation[accountID] = time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
+	result, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, result.Status)
+	require.Equal(t, "in_period_closed_recovery", result.ProrationInvoiceID)
+	require.False(t, store.apps[appID].ProrationSkipped)
+	require.Len(t, sc.finalizeCalls, 1)
+}
+
+// A timer uninstall/rank improvement after the attempt freezes cannot rewrite
+// ownership: recovery consumes the exact child IDs and Stripe metadata truth.
+func TestChargeCreationProration_RecoveredDraftUsesFrozenSetAfterRemoval(t *testing.T) {
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	sc := newFakeStripe()
@@ -89,13 +218,12 @@ func TestChargeCreationProration_RecoveredDraftAcceptsShrunkTimerSet(t *testing.
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, created, 7)
 	_ = acct
-
-	// The crashed attempt pinned base + BOTH overage lines (1000 + 2×150 = 1300¢)
-	// and died before finalize. Marker durable.
-	app := store.apps[appID]
-	app.ProrationAttempted = true
-	store.apps[appID] = app
-	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{ID: "in_shrunk_draft", Status: "draft", AmountDue: 1300, Currency: "usd"})
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Len(t, attempt.TimerIDs, 2)
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
+		ID: "in_shrunk_draft", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
+	})
+	seedCombinedAttemptItems(t, sc, "in_shrunk_draft", attempt, attempt.TimerIDs)
 
 	// Between crash and retry one co-created over-module is uninstalled — the
 	// live set shrinks to 1.
@@ -103,19 +231,24 @@ func TestChargeCreationProration_RecoveredDraftAcceptsShrunkTimerSet(t *testing.
 	require.NoError(t, err)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
-	require.NoError(t, err, "a shrunk timer set must not livelock the recovery")
+	require.NoError(t, err, "a shrunk live set must not rewrite frozen ownership")
 	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
 	require.Equal(t, "in_shrunk_draft", resp.ProrationInvoiceID)
-	require.Empty(t, sc.itemCalls, "the crashed attempt's complete line set is finalized as-is")
+	require.Empty(t, sc.itemCalls, "resource truth proves every frozen line already landed")
 	require.Len(t, sc.finalizeCalls, 1)
 	require.Equal(t, "in_shrunk_draft", sc.finalizeCalls[0].invoiceID)
 	require.Equal(t, "in_shrunk_draft", store.apps[appID].ProrationInvoiceID, "the guard arms — no livelock")
+	resolved := store.combinedProrationAttempts[appID]
+	require.Equal(t, "in_shrunk_draft", resolved.ResolvedInvoiceID)
+	for _, timerID := range attempt.TimerIDs {
+		require.True(t, store.timers[timerID].graceResolved)
+		require.Equal(t, "in_shrunk_draft", store.timers[timerID].graceInvoiceID)
+	}
 }
 
-// The complement: a draft carrying FEWER lines than the still-live set is
-// genuinely incomplete (crashed mid-attach) — completing it past the idem-key
-// window risks duplicate lines, so it is refused loudly for ops.
-func TestChargeCreationProration_RecoveredDraftBelowLiveSetRefused(t *testing.T) {
+// A crash during item attachment is repaired from exact Stripe metadata even
+// after idempotency retention: only the missing frozen identity is created.
+func TestChargeCreationProration_RecoveredPartialDraftCreatesOnlyMissingFrozenItem(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
@@ -123,16 +256,90 @@ func TestChargeCreationProration_RecoveredDraftBelowLiveSetRefused(t *testing.T)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
 
-	app := store.apps[appID]
-	app.ProrationAttempted = true
-	store.apps[appID] = app
-	// Base + only 1 of the 2 live over-lines (1000 + 150 = 1150¢): incomplete.
-	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{ID: "in_partial_draft", Status: "draft", AmountDue: 1150, Currency: "usd"})
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Len(t, attempt.TimerIDs, 2)
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
+		ID: "in_partial_draft", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
+	})
+	seedCombinedAttemptItems(t, sc, "in_partial_draft", attempt, attempt.TimerIDs[:1])
 
-	_, err := svc.ChargeCreationProration(context.Background(), appID)
-	require.Error(t, err, "an incomplete draft is refused for ops, never silently completed or finalized")
-	require.Empty(t, sc.finalizeCalls)
-	require.Empty(t, store.apps[appID].ProrationInvoiceID)
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Len(t, sc.itemCalls, 1, "only the one missing frozen timer line is repaired")
+	require.Equal(t, attempt.TimerIDs[1].String(), sc.itemsByInvoice["in_partial_draft"][2].CombinedProrationTimerID)
+	require.Len(t, sc.finalizeCalls, 1)
+	require.Equal(t, "in_partial_draft", store.apps[appID].ProrationInvoiceID)
+}
+
+func TestChargeCreationProration_InvalidRecoveredItemMetadataFailsClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*fakeStripe, string, cycle.CombinedProrationAttempt)
+	}{
+		{
+			name: "missing ownership metadata",
+			mutate: func(sc *fakeStripe, invoiceID string, attempt cycle.CombinedProrationAttempt) {
+				sc.itemsByInvoice[invoiceID] = append(sc.itemsByInvoice[invoiceID], billingstripe.InvoiceItem{
+					ID:          "ii_unattributed",
+					AmountCents: 1,
+					Currency:    attempt.Shape.Currency,
+					Description: "foreign pending item",
+					Period: billingstripe.LinePeriod{
+						Start: attempt.Shape.CoverageStart,
+						End:   attempt.Shape.CoverageEnd,
+					},
+				})
+			},
+		},
+		{
+			name: "duplicate frozen identity",
+			mutate: func(sc *fakeStripe, invoiceID string, attempt cycle.CombinedProrationAttempt) {
+				base := sc.itemsByInvoice[invoiceID][0]
+				base.ID = "ii_duplicate_base"
+				sc.itemsByInvoice[invoiceID] = append(sc.itemsByInvoice[invoiceID], base)
+			},
+		},
+		{
+			name: "unfrozen timer identity",
+			mutate: func(sc *fakeStripe, invoiceID string, attempt cycle.CombinedProrationAttempt) {
+				sc.itemsByInvoice[invoiceID] = append(sc.itemsByInvoice[invoiceID], billingstripe.InvoiceItem{
+					ID:                         "ii_foreign_timer",
+					AmountCents:                attempt.Shape.ModuleChargeCents,
+					Currency:                   attempt.Shape.Currency,
+					Description:                attempt.Shape.ModuleDescription,
+					Period:                     billingstripe.LinePeriod{Start: attempt.Shape.CoverageStart, End: attempt.Shape.CoverageEnd},
+					CombinedProrationComponent: billingstripe.CombinedProrationComponentModuleOverage,
+					CombinedProrationAppID:     attempt.AppID.String(),
+					CombinedProrationTimerID:   uuid.NewString(),
+				})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeStore()
+			user, _ := registeredAccount(store)
+			sc := newFakeStripe()
+			svc := appsSvc(store, sc)
+			appID := uuid.New()
+			registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
+
+			attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+			sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
+				ID: "in_invalid_metadata", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
+			})
+			seedCombinedAttemptItems(t, sc, "in_invalid_metadata", attempt, attempt.TimerIDs)
+			tt.mutate(sc, "in_invalid_metadata", attempt)
+
+			_, err := svc.ChargeCreationProration(context.Background(), appID)
+			require.Error(t, err)
+			require.Empty(t, sc.finalizeCalls, "invalid resource truth must never reach the money-moving finalize")
+			require.Empty(t, store.apps[appID].ProrationInvoiceID)
+			require.Empty(t, store.combinedProrationAttempts[appID].ResolvedInvoiceID)
+		})
+	}
 }
 
 // Regression (wave 2, D4): an app created pre-activation whose creation grace
@@ -194,14 +401,24 @@ func TestChargeCreationProration_LateRetryAdoptsFoundInvoice(t *testing.T) {
 	sc := newFakeStripe()
 	svc := appsSvc(store, sc)
 	appID := uuid.New()
-	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 0)
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
 
-	// A prior attempt reached its Stripe section (marker set), finalized the
-	// invoice, and crashed before persisting.
-	app := store.apps[appID]
-	app.ProrationAttempted = true
-	store.apps[appID] = app
-	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{ID: "in_prior_combined", Status: "paid", AmountDue: 1000, AmountPaid: 1000, Currency: "usd"})
+	// A prior attempt froze its exact app + two FIFO-over timer identities,
+	// finalized the complete invoice, and crashed before the terminal DB
+	// transaction.
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Len(t, attempt.TimerIDs, 2)
+	totalCents := attempt.Shape.BaseChargeCents +
+		attempt.Shape.ModuleChargeCents*int64(len(attempt.TimerIDs))
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
+		ID:         "in_prior_combined",
+		CustomerID: store.stripeCustomer,
+		Status:     "paid",
+		AmountDue:  totalCents,
+		AmountPaid: totalCents,
+		Currency:   "usd",
+	})
+	seedCombinedAttemptItems(t, sc, "in_prior_combined", attempt, attempt.TimerIDs)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
@@ -211,6 +428,15 @@ func TestChargeCreationProration_LateRetryAdoptsFoundInvoice(t *testing.T) {
 	require.Empty(t, sc.invoiceCalls, "no second draft")
 	require.Empty(t, sc.itemCalls, "no re-attached lines")
 	require.Empty(t, sc.finalizeCalls, "no second finalize — the money moved once")
+	for _, timerID := range attempt.TimerIDs {
+		timer := store.timers[timerID]
+		require.True(t, timer.graceResolved)
+		require.True(t, timer.graceCharged)
+		require.Equal(t, "in_prior_combined", timer.graceInvoiceID)
+		require.NotEmpty(t, timer.graceInvoiceItemID)
+	}
+	require.Equal(t, "in_prior_combined",
+		store.combinedProrationAttempts[appID].ResolvedInvoiceID)
 }
 
 // Regression (review 2026-07-06, H10): a PREPAID account is never auto-charged
@@ -810,12 +1036,11 @@ func TestChargeCreationProration_RecoveryResolvesSponsorCustomer(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, orgAcct, store.apps[appID].AccountID, "funded org app registers on the org account")
 
-	// A prior attempt crashed after arming the durable marker but before any
-	// Stripe object survived (FindInvoiceByRef finds nothing) — recovery must
-	// SEARCH the sponsor's customer, then charge fresh through the same hop.
-	app := store.apps[appID]
-	app.ProrationAttempted = true
-	store.apps[appID] = app
+	// A prior attempt committed exact ownership and crashed before any Stripe
+	// object survived. Recovery must SEARCH the sponsor's customer, then charge
+	// fresh through the same funding hop.
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Empty(t, attempt.TimerIDs)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)

@@ -1,6 +1,15 @@
 package billing
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrCombinedProrationAttemptUnknown marks a legacy or corrupt creation
+// attempt whose exact app/timer ownership was not durably frozen. Charge
+// recovery and every strict pending-money projection must fail closed on this
+// state instead of rebuilding an amount from mutable live rows.
+var ErrCombinedProrationAttemptUnknown = errors.New("combined proration attempt ownership is unknown")
 
 // Code is the wire-level error code returned in the RPC envelope's
 // {"ok": false, "error": {"code": …}} field. Matches the vocabulary

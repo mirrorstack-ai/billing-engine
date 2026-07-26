@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	stripego "github.com/stripe/stripe-go/v85"
 	stripeclient "github.com/stripe/stripe-go/v85/client"
@@ -257,6 +258,47 @@ func (c *realClient) CreateAutoTopUpInvoice(
 // replayed draft) instead of creating a second one. We project to a plain
 // InvoiceItem (id only) so consumers stay off stripe-go.
 func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error) {
+	return c.createInvoiceItem(ctx, custID, invoiceID, amountCents, currency, desc, period, idemKey, CombinedProrationItemIdentity{})
+}
+
+const (
+	combinedProrationComponentMetadata = "ms_combined_proration_component"
+	combinedProrationAppMetadata       = "ms_combined_proration_app_id"
+	combinedProrationTimerMetadata     = "ms_combined_proration_timer_id"
+)
+
+// CreateCombinedProrationInvoiceItem is the metadata-authenticated variant
+// used by combined app-creation recovery. The metadata survives Stripe's
+// finite idempotency-key retention and lets a later retry correlate every
+// listed resource to the exact database-frozen base/timer identity.
+func (c *realClient) CreateCombinedProrationInvoiceItem(
+	ctx context.Context,
+	custID string,
+	invoiceID string,
+	amountCents int64,
+	currency string,
+	desc string,
+	period LinePeriod,
+	idemKey string,
+	identity CombinedProrationItemIdentity,
+) (InvoiceItem, error) {
+	if identity.AppID == "" {
+		return InvoiceItem{}, errors.New("combined proration app id required")
+	}
+	return c.createInvoiceItem(ctx, custID, invoiceID, amountCents, currency, desc, period, idemKey, identity)
+}
+
+func (c *realClient) createInvoiceItem(
+	ctx context.Context,
+	custID string,
+	invoiceID string,
+	amountCents int64,
+	currency string,
+	desc string,
+	period LinePeriod,
+	idemKey string,
+	identity CombinedProrationItemIdentity,
+) (InvoiceItem, error) {
 	params := &stripego.InvoiceItemParams{
 		Customer: stripego.String(custID),
 		Invoice:  stripego.String(invoiceID),
@@ -265,6 +307,15 @@ func (c *realClient) CreateInvoiceItem(ctx context.Context, custID, invoiceID st
 	}
 	if desc != "" {
 		params.Description = stripego.String(desc)
+	}
+	if identity.AppID != "" {
+		component := CombinedProrationComponentAppBase
+		if identity.TimerID != "" {
+			component = CombinedProrationComponentModuleOverage
+			params.AddMetadata(combinedProrationTimerMetadata, identity.TimerID)
+		}
+		params.AddMetadata(combinedProrationComponentMetadata, component)
+		params.AddMetadata(combinedProrationAppMetadata, identity.AppID)
 	}
 	params.Period = itemPeriodParams(period)
 	params.Context = ctx
@@ -301,9 +352,24 @@ func projectInvoiceItem(item *stripego.InvoiceItem) InvoiceItem {
 		return InvoiceItem{}
 	}
 	return InvoiceItem{
-		ID:          item.ID,
-		AmountCents: item.Amount,
-		Currency:    string(item.Currency),
+		ID:                         item.ID,
+		AmountCents:                item.Amount,
+		Currency:                   string(item.Currency),
+		Description:                item.Description,
+		Period:                     projectLinePeriod(item.Period),
+		CombinedProrationComponent: item.Metadata[combinedProrationComponentMetadata],
+		CombinedProrationAppID:     item.Metadata[combinedProrationAppMetadata],
+		CombinedProrationTimerID:   item.Metadata[combinedProrationTimerMetadata],
+	}
+}
+
+func projectLinePeriod(period *stripego.Period) LinePeriod {
+	if period == nil {
+		return LinePeriod{}
+	}
+	return LinePeriod{
+		Start: time.Unix(period.Start, 0).UTC(),
+		End:   time.Unix(period.End, 0).UTC(),
 	}
 }
 

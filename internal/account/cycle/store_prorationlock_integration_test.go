@@ -22,8 +22,9 @@ import (
 
 func mkProrationCharge(acct, appID uuid.UUID, invID string, periodEnd time.Time) *cycle.ProrationCharge {
 	return &cycle.ProrationCharge{
-		InvoiceID: invID,
-		Cents:     200,
+		InvoiceID:  invID,
+		Cents:      200,
+		ResolvedAt: periodEnd.Add(time.Second),
 		Invoice: cycle.InvoiceMirror{
 			AccountID: acct, StripeInvoiceID: invID, Status: "open",
 			AmountDueCents: 200, Currency: "usd", EverFailed: true,
@@ -36,6 +37,36 @@ func mkProrationCharge(acct, appID uuid.UUID, invID string, periodEnd time.Time)
 	}
 }
 
+// freezeProrationForCharge models the service's mandatory pre-Stripe durable
+// ownership step. ChargeProrationLocked is intentionally a narrow persistence
+// primitive; a successful callback may commit only against this exact header.
+func freezeProrationForCharge(
+	t *testing.T,
+	ctx context.Context,
+	store cycle.Store,
+	acct, appID uuid.UUID,
+	pc *cycle.ProrationCharge,
+) cycle.CombinedProrationAttempt {
+	t.Helper()
+	attempt, outcome, err := store.FreezeCombinedProrationAttempt(ctx, appID, pc.Invoice.PeriodEnd, cycle.CombinedProrationChargeShape{
+		AccountID:          acct,
+		Currency:           pc.Invoice.Currency,
+		BaseChargeMicros:   pc.Snapshot.BaseMicros,
+		BaseChargeCents:    pc.Cents,
+		ModuleChargeMicros: 0,
+		ModuleChargeCents:  0,
+		CoverageStart:      pc.Invoice.PeriodStart,
+		CoverageEnd:        pc.Invoice.PeriodEnd,
+		BaseDescription:    "Creation base proration",
+		ModuleDescription:  "Co-created module overage",
+		Snapshot:           pc.Snapshot,
+		StraddleSnapshot:   pc.StraddleSnapshot,
+	}, false)
+	require.NoError(t, err)
+	require.Equal(t, cycle.StripeRailClaimed, outcome)
+	return attempt
+}
+
 func TestChargeProrationLocked_Integration_LockNotHeldAcrossStripeCall(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := cycle.NewStore(pool)
@@ -44,6 +75,8 @@ func TestChargeProrationLocked_Integration_LockNotHeldAcrossStripeCall(t *testin
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
 	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
+	pc := mkProrationCharge(acct, appID, "in_slow", mustTime(t, "2026-07-04T00:00:00Z"))
+	freezeProrationForCharge(t, ctx, store, acct, appID, pc)
 
 	insideCallback := make(chan struct{})
 	release := make(chan struct{})
@@ -53,7 +86,7 @@ func TestChargeProrationLocked_Integration_LockNotHeldAcrossStripeCall(t *testin
 		_, _, err := store.ChargeProrationLocked(ctx, appID, func(locked cycle.AppMirror) (*cycle.ProrationCharge, error) {
 			close(insideCallback) // signal: the phase-1 lock has already been read + released
 			<-release             // simulate a slow Stripe HTTP call
-			return mkProrationCharge(acct, appID, "in_slow", mustTime(t, "2026-07-04T00:00:00Z")), nil
+			return pc, nil
 		})
 		chargeDone <- err
 	}()
@@ -97,6 +130,8 @@ func TestChargeProrationLocked_Integration_ConcurrentDeleteDoesNotBlockOnLock(t 
 	acct := seedAccount(t, pool)
 	appID := uuid.New()
 	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
+	pc := mkProrationCharge(acct, appID, "in_slow_del", mustTime(t, "2026-07-04T00:00:00Z"))
+	freezeProrationForCharge(t, ctx, store, acct, appID, pc)
 
 	insideCallback := make(chan struct{})
 	release := make(chan struct{})
@@ -106,7 +141,7 @@ func TestChargeProrationLocked_Integration_ConcurrentDeleteDoesNotBlockOnLock(t 
 		_, _, err := store.ChargeProrationLocked(ctx, appID, func(locked cycle.AppMirror) (*cycle.ProrationCharge, error) {
 			close(insideCallback)
 			<-release
-			return mkProrationCharge(acct, appID, "in_slow_del", mustTime(t, "2026-07-04T00:00:00Z")), nil
+			return pc, nil
 		})
 		chargeDone <- err
 	}()
@@ -155,6 +190,7 @@ func TestChargeProrationLocked_Integration_PersistsInvoiceFlags(t *testing.T) {
 
 	pc := mkProrationCharge(acct, appID, "in_large_flag", mustTime(t, "2026-07-04T00:00:00Z"))
 	pc.Invoice.IsLargeAutoCollect = true
+	freezeProrationForCharge(t, ctx, store, acct, appID, pc)
 
 	outcome, invID, err := store.ChargeProrationLocked(ctx, appID, func(cycle.AppMirror) (*cycle.ProrationCharge, error) {
 		return pc, nil

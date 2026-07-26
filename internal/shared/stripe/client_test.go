@@ -247,7 +247,113 @@ func TestCreateCreditPurchaseInvoice_StampsExactRoutingAnchors(t *testing.T) {
 	require.Equal(t, "in_purchase", got.ID)
 }
 
+func TestCreateCombinedProrationInvoiceItem_StampsExactIdentity(t *testing.T) {
+	period := LinePeriod{
+		Start: time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC),
+	}
+	tests := []struct {
+		name         string
+		identity     CombinedProrationItemIdentity
+		wantMetadata map[string]string
+	}{
+		{
+			name:     "app base",
+			identity: CombinedProrationItemIdentity{AppID: "app-1"},
+			wantMetadata: map[string]string{
+				combinedProrationComponentMetadata: CombinedProrationComponentAppBase,
+				combinedProrationAppMetadata:       "app-1",
+			},
+		},
+		{
+			name:     "module timer",
+			identity: CombinedProrationItemIdentity{AppID: "app-1", TimerID: "timer-1"},
+			wantMetadata: map[string]string{
+				combinedProrationComponentMetadata: CombinedProrationComponentModuleOverage,
+				combinedProrationAppMetadata:       "app-1",
+				combinedProrationTimerMetadata:     "timer-1",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := &stripego.InvoiceItem{
+				ID:          "ii_combined",
+				Amount:      150,
+				Currency:    stripego.CurrencyUSD,
+				Description: "frozen description",
+				Period:      &stripego.Period{Start: period.Start.Unix(), End: period.End.Unix()},
+				Metadata:    tt.wantMetadata,
+			}
+			backend := &invoiceTestBackend{
+				t:            t,
+				wantMethod:   http.MethodPost,
+				wantPath:     "/v1/invoiceitems",
+				itemResponse: response,
+				checkParams: func(params stripego.ParamsContainer) {
+					got, ok := params.(*stripego.InvoiceItemParams)
+					require.True(t, ok)
+					require.Equal(t, "cus_combined", *got.Customer)
+					require.Equal(t, "in_combined", *got.Invoice)
+					require.EqualValues(t, 150, *got.Amount)
+					require.Equal(t, "usd", *got.Currency)
+					require.Equal(t, "frozen description", *got.Description)
+					require.Equal(t, period.Start.Unix(), *got.Period.Start)
+					require.Equal(t, period.End.Unix(), *got.Period.End)
+					require.Equal(t, tt.wantMetadata, got.Metadata)
+					require.Equal(t, "combined-item-key", *got.IdempotencyKey)
+				},
+			}
+			client := testRealClient(backend)
+
+			got, err := client.CreateCombinedProrationInvoiceItem(
+				context.Background(),
+				"cus_combined",
+				"in_combined",
+				150,
+				"usd",
+				"frozen description",
+				period,
+				"combined-item-key",
+				tt.identity,
+			)
+
+			require.NoError(t, err)
+			require.Equal(t, InvoiceItem{
+				ID:                         "ii_combined",
+				AmountCents:                150,
+				Currency:                   "usd",
+				Description:                "frozen description",
+				Period:                     period,
+				CombinedProrationComponent: tt.wantMetadata[combinedProrationComponentMetadata],
+				CombinedProrationAppID:     "app-1",
+				CombinedProrationTimerID:   tt.wantMetadata[combinedProrationTimerMetadata],
+			}, got)
+		})
+	}
+}
+
+func TestCreateCombinedProrationInvoiceItem_RequiresAppIdentity(t *testing.T) {
+	client, ok := NewClient("sk_test_dummy").(CombinedProrationClient)
+	require.True(t, ok)
+	_, err := client.CreateCombinedProrationInvoiceItem(
+		context.Background(),
+		"cus_combined",
+		"in_combined",
+		150,
+		"usd",
+		"frozen description",
+		LinePeriod{},
+		"combined-item-key",
+		CombinedProrationItemIdentity{},
+	)
+	require.ErrorContains(t, err, "app id required")
+}
+
 func TestListInvoiceItems_FiltersOneInvoiceAndProjectsResourceTruth(t *testing.T) {
+	start := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
 	backend := &invoiceTestBackend{
 		t:          t,
 		wantMethod: http.MethodGet,
@@ -255,7 +361,17 @@ func TestListInvoiceItems_FiltersOneInvoiceAndProjectsResourceTruth(t *testing.T
 		rawListResult: &stripego.InvoiceItemList{
 			ListMeta: stripego.ListMeta{HasMore: false},
 			Data: []*stripego.InvoiceItem{
-				{ID: "ii_one", Amount: 500, Currency: stripego.CurrencyUSD},
+				{
+					ID:          "ii_one",
+					Amount:      500,
+					Currency:    stripego.CurrencyUSD,
+					Description: "frozen base",
+					Period:      &stripego.Period{Start: start.Unix(), End: end.Unix()},
+					Metadata: map[string]string{
+						combinedProrationComponentMetadata: CombinedProrationComponentAppBase,
+						combinedProrationAppMetadata:       "app-1",
+					},
+				},
 				{ID: "ii_two", Amount: 250, Currency: stripego.CurrencyEUR},
 			},
 		},
@@ -270,7 +386,15 @@ func TestListInvoiceItems_FiltersOneInvoiceAndProjectsResourceTruth(t *testing.T
 
 	require.NoError(t, err)
 	require.Equal(t, []InvoiceItem{
-		{ID: "ii_one", AmountCents: 500, Currency: "usd"},
+		{
+			ID:                         "ii_one",
+			AmountCents:                500,
+			Currency:                   "usd",
+			Description:                "frozen base",
+			Period:                     LinePeriod{Start: start, End: end},
+			CombinedProrationComponent: CombinedProrationComponentAppBase,
+			CombinedProrationAppID:     "app-1",
+		},
 		{ID: "ii_two", AmountCents: 250, Currency: "eur"},
 	}, got)
 }
@@ -449,6 +573,7 @@ type invoiceTestBackend struct {
 	checkParams    func(stripego.ParamsContainer)
 	checkRawParams func(url.Values)
 	response       stripego.Invoice
+	itemResponse   *stripego.InvoiceItem
 	rawListResult  *stripego.InvoiceItemList
 	rawPaymentList *stripego.InvoicePaymentList
 }
@@ -458,9 +583,15 @@ func (b *invoiceTestBackend) Call(method, path, _ string, params stripego.Params
 	require.Equal(b.t, b.wantMethod, method)
 	require.Equal(b.t, b.wantPath, path)
 	b.checkParams(params)
-	got, ok := v.(*stripego.Invoice)
-	require.True(b.t, ok)
-	*got = b.response
+	switch got := v.(type) {
+	case *stripego.Invoice:
+		*got = b.response
+	case *stripego.InvoiceItem:
+		require.NotNil(b.t, b.itemResponse, "unexpected invoice-item create call")
+		*got = *b.itemResponse
+	default:
+		b.t.Fatalf("unexpected Stripe response type %T", v)
+	}
 	return nil
 }
 

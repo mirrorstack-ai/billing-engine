@@ -36,10 +36,17 @@ type fakeStripe struct {
 	invoiceAmountPaid int64
 
 	// injected errors
-	errItem      error
-	errDraft     error
-	errInvoice   error // injected on FinalizeInvoice — the money-moving step
-	errFindByRef error
+	errItem       error
+	errDraft      error
+	errInvoice    error // injected on FinalizeInvoice — the money-moving step
+	errFindByRef  error
+	errListItems  error
+	errGetInvoice error
+
+	// Stripe resource truth for combined-proration recovery.
+	invoicesByID   map[string]billingstripe.Invoice
+	itemsByInvoice map[string][]billingstripe.InvoiceItem
+	itemsByIdem    map[string]billingstripe.InvoiceItem
 
 	// crash-recovery lookup (FindInvoiceByRef): invoices "found" on Stripe
 	// KEYED BY REF (wave 2 critic finding — an unkeyed fake could not detect a
@@ -86,6 +93,9 @@ func newFakeStripe() *fakeStripe {
 		// Finalize settles asynchronously, so a healthy finalize returns "open".
 		invoiceStatus:    "open",
 		invoiceAmountDue: 0, // overridden per test where the charged amount matters
+		invoicesByID:     map[string]billingstripe.Invoice{},
+		itemsByInvoice:   map[string][]billingstripe.InvoiceItem{},
+		itemsByIdem:      map[string]billingstripe.InvoiceItem{},
 	}
 }
 
@@ -98,7 +108,17 @@ func (f *fakeStripe) CreateDraftInvoice(_ context.Context, custID, ref, idemKey 
 	if f.errDraft != nil {
 		return billingstripe.Invoice{}, f.errDraft
 	}
-	return billingstripe.Invoice{ID: f.invoiceID, Status: "draft", Currency: "usd"}, nil
+	if existing, ok := f.invoicesByID[f.invoiceID]; ok {
+		return existing, nil
+	}
+	inv := billingstripe.Invoice{
+		ID:         f.invoiceID,
+		CustomerID: custID,
+		Status:     "draft",
+		Currency:   "usd",
+	}
+	f.invoicesByID[f.invoiceID] = inv
+	return inv, nil
 }
 
 func (f *fakeStripe) CreateCreditPurchaseInvoice(
@@ -122,6 +142,47 @@ func (f *fakeStripe) CreateInvoiceItem(_ context.Context, custID, invoiceID stri
 	return billingstripe.InvoiceItem{ID: "ii_test_" + uuid.NewString()}, nil
 }
 
+func (f *fakeStripe) CreateCombinedProrationInvoiceItem(
+	ctx context.Context,
+	custID string,
+	invoiceID string,
+	amountCents int64,
+	currency string,
+	desc string,
+	period billingstripe.LinePeriod,
+	idemKey string,
+	identity billingstripe.CombinedProrationItemIdentity,
+) (billingstripe.InvoiceItem, error) {
+	if existing, ok := f.itemsByIdem[idemKey]; ok {
+		return existing, nil
+	}
+	item, err := f.CreateInvoiceItem(ctx, custID, invoiceID, amountCents, currency, desc, period, idemKey)
+	if err != nil {
+		return billingstripe.InvoiceItem{}, err
+	}
+	item.AmountCents = amountCents
+	item.Currency = currency
+	item.Description = desc
+	item.Period = period
+	item.CombinedProrationAppID = identity.AppID
+	if identity.TimerID == "" {
+		item.CombinedProrationComponent = billingstripe.CombinedProrationComponentAppBase
+	} else {
+		item.CombinedProrationComponent = billingstripe.CombinedProrationComponentModuleOverage
+		item.CombinedProrationTimerID = identity.TimerID
+	}
+	f.itemsByIdem[idemKey] = item
+	f.itemsByInvoice[invoiceID] = append(f.itemsByInvoice[invoiceID], item)
+	return item, nil
+}
+
+func (f *fakeStripe) ListInvoiceItems(_ context.Context, invoiceID string) ([]billingstripe.InvoiceItem, error) {
+	if f.errListItems != nil {
+		return nil, f.errListItems
+	}
+	return append([]billingstripe.InvoiceItem(nil), f.itemsByInvoice[invoiceID]...), nil
+}
+
 // setFindByRef seeds the invoice the recovery lookup finds under EXACTLY the
 // given ref — a lookup with any other ref misses, so a leg reconciling against
 // another leg's charge identity fails its test.
@@ -130,6 +191,10 @@ func (f *fakeStripe) setFindByRef(ref string, inv billingstripe.Invoice) {
 		f.findByRefByRef = map[string]billingstripe.Invoice{}
 	}
 	f.findByRefByRef[ref] = inv
+	if f.invoicesByID == nil {
+		f.invoicesByID = map[string]billingstripe.Invoice{}
+	}
+	f.invoicesByID[inv.ID] = inv
 }
 
 func (f *fakeStripe) FindInvoiceByRef(_ context.Context, custID, ref string) (billingstripe.Invoice, bool, error) {
@@ -152,13 +217,24 @@ func (f *fakeStripe) FinalizeInvoice(_ context.Context, invoiceID, idemKey strin
 	if f.onCreateInvoice != nil {
 		f.onCreateInvoice()
 	}
-	return billingstripe.Invoice{
+	amountDue := f.invoiceAmountDue
+	if amountDue == 0 {
+		for _, item := range f.itemsByInvoice[invoiceID] {
+			amountDue += item.AmountCents
+		}
+	}
+	inv := billingstripe.Invoice{
 		ID:         invoiceID,
 		Status:     f.invoiceStatus,
-		AmountDue:  f.invoiceAmountDue,
+		AmountDue:  amountDue,
 		AmountPaid: f.invoiceAmountPaid,
 		Currency:   "usd",
-	}, nil
+	}
+	if previous, ok := f.invoicesByID[invoiceID]; ok {
+		inv.CustomerID = previous.CustomerID
+	}
+	f.invoicesByID[invoiceID] = inv
+	return inv, nil
 }
 
 // Card-management methods: never called by the charge cycle. Present only to
@@ -182,8 +258,22 @@ func (f *fakeStripe) SetDefaultPaymentMethod(context.Context, string, string) er
 func (f *fakeStripe) GetCustomer(context.Context, string) (*stripego.Customer, error) {
 	return &stripego.Customer{}, nil
 }
-func (f *fakeStripe) GetInvoice(context.Context, string) (billingstripe.Invoice, error) {
-	panic("GetInvoice must not be called by the charge cycle")
+func (f *fakeStripe) GetInvoice(_ context.Context, invoiceID string) (billingstripe.Invoice, error) {
+	if f.errGetInvoice != nil {
+		return billingstripe.Invoice{}, f.errGetInvoice
+	}
+	inv, ok := f.invoicesByID[invoiceID]
+	if !ok {
+		return billingstripe.Invoice{}, errors.New("invoice not found")
+	}
+	if inv.Status == "draft" {
+		inv.AmountDue = 0
+		for _, item := range f.itemsByInvoice[invoiceID] {
+			inv.AmountDue += item.AmountCents
+		}
+		f.invoicesByID[invoiceID] = inv
+	}
+	return inv, nil
 }
 func (f *fakeStripe) PayInvoice(context.Context, string) (billingstripe.Invoice, error) {
 	panic("PayInvoice must not be called by the charge cycle")
@@ -191,6 +281,7 @@ func (f *fakeStripe) PayInvoice(context.Context, string) (billingstripe.Invoice,
 
 // Compile-time check: fakeStripe satisfies the full Client interface.
 var _ billingstripe.Client = (*fakeStripe)(nil)
+var _ billingstripe.CombinedProrationClient = (*fakeStripe)(nil)
 
 // --- helpers --------------------------------------------------------------
 
