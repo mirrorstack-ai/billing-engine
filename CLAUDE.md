@@ -52,7 +52,7 @@ git config --local user.email "nothingchang@mirrorstack.ai"
 
 1. **Branch off `main`** — `git checkout -b <type>/<slug>` where type is `feat`, `fix`, `chore`, `docs`, `refactor`.
 2. **Make the change.** If you touch the schema, coordinate with a matching `mirrorstack-docs/db/ms_billing/` update in the same PR cycle.
-3. **Commit prefix**: `feat:` / `fix:` / `chore:` / `docs:` / `refactor:`. Co-author tail: `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
+3. **Commit prefix**: `feat:` / `fix:` / `chore:` / `docs:` / `refactor:`. Co-author tail: `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
 4. **Open a PR against `main`**. Never push directly to `main`.
 5. **`Closes #N`** in the PR body for auto-close when a tracking issue exists.
 
