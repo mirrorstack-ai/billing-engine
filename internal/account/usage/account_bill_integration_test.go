@@ -563,13 +563,31 @@ func TestUnresolvedOneTimeCharges_Integration_TimerFIFORecoveryAndTerminals(t *t
 		require.False(t, modules[0].CountsTowardRecurring,
 			"removal cannot erase a timer whose standalone Stripe recovery marker is unresolved")
 
-		_, err = pool.Exec(ctx,
-			`UPDATE ms_billing.app_module_overage_timers
-			 SET grace_resolved = true
-			 WHERE id = $1`, attemptedTimer)
+		// The exposure the projection holds must have a reachable exit: the sweep
+		// work list carves removal out for an attempted timer (mirroring
+		// AppsPendingProration), so the crashed attempt converges on its terminal
+		// guard instead of being projected forever.
+		cycleStore := cycle.NewStore(pool)
+		cands, err := cycleStore.ModuleOverageTimersPastGrace(
+			ctx, appMustTime(t, "2026-07-08T00:00:00Z"),
+		)
 		require.NoError(t, err)
+		swept := make(map[uuid.UUID]bool, len(cands))
+		for _, cand := range cands {
+			swept[cand.ID] = true
+		}
+		require.True(t, swept[attemptedTimer],
+			"the sweep must recover a removed timer after its Stripe attempt marker was stamped")
+		require.False(t, swept[timers[0]],
+			"a removal with no attempt marker still drops out of the sweep")
+
+		pending, err := cycleStore.ModuleTimerStillPending(ctx, attemptedTimer)
+		require.NoError(t, err)
+		require.True(t, pending,
+			"charge-time re-verification must preserve attempted recovery ownership")
+		require.NoError(t, cycleStore.MarkModuleTimerIncluded(ctx, attemptedTimer))
 		require.Empty(t, moduleRows(rowsFor(accountID)),
-			"the durable timer terminal removes attempted recovery exposure")
+			"the durable timer terminal removes attempted recovery exposure exactly once")
 	})
 
 	t.Run("ETA does not filter and resolved or removed timers do", func(t *testing.T) {

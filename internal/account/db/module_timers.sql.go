@@ -340,7 +340,7 @@ SELECT t.id, t.account_id, t.app_id, t.installed_at, t.grace_expires_at,
        t.charge_attempted_at, a.activated_at
 FROM ms_billing.app_module_overage_timers t
 JOIN ms_billing.accounts a ON a.id = t.account_id
-WHERE t.removed_at IS NULL
+WHERE (t.removed_at IS NULL OR t.charge_attempted_at IS NOT NULL)
   AND t.grace_resolved = false
   AND t.grace_expires_at <= $1
   AND a.activated_at IS NOT NULL
@@ -357,12 +357,16 @@ type ModuleOverageTimersPastGraceRow struct {
 	ActivatedAt       pgtype.Timestamptz `json:"activated_at"`
 }
 
-// ModuleOverageTimersPastGrace is Leg 1's work list: live, unresolved install
-// timers whose grace window has elapsed as of $1, on accounts that are chargeable
+// ModuleOverageTimersPastGrace is Leg 1's work list: unresolved install timers
+// whose grace window has elapsed as of $1, on accounts that are chargeable
 // (activated_at IS NOT NULL — the same activation gate as the spine + proration
-// leg). Each row carries the account's activation anchor so the sweep can resolve
-// the install's period window without a second read, and the charge_attempted_at
-// recovery marker (036) so a retried candidate reconciles against Stripe first.
+// leg). Like AppsPendingProration, an attempted row survives later removal so a
+// possibly in-flight Stripe attempt can converge to its terminal guard.
+// charge_attempted_at is stamped only after grace has already elapsed, so this
+// carve-out never admits a timer removed inside its grace window. Each row carries
+// the account's activation anchor so the sweep can resolve the install's period
+// window without a second read, and the charge_attempted_at recovery marker (036)
+// so a retried candidate reconciles against Stripe first.
 // Ordered (installed_at, id) so the oldest install charges first (matches the
 // FIFO ordering). Backed by app_module_overage_timers_sweep_idx.
 func (q *Queries) ModuleOverageTimersPastGrace(ctx context.Context, graceExpiresAt time.Time) ([]ModuleOverageTimersPastGraceRow, error) {
@@ -395,7 +399,7 @@ func (q *Queries) ModuleOverageTimersPastGrace(ctx context.Context, graceExpires
 
 const moduleTimerStillPending = `-- name: ModuleTimerStillPending :one
 SELECT (
-    timer.removed_at IS NULL
+    (timer.removed_at IS NULL OR timer.charge_attempted_at IS NOT NULL)
     AND timer.grace_resolved = false
     AND NOT EXISTS (
         SELECT 1
@@ -412,9 +416,10 @@ WHERE timer.id = $1
 
 // ModuleTimerStillPending is the charge-time re-verification read (review
 // 2026-07-06, M2): the sweep's work list is read ONCE and can be minutes stale
-// by the time a late candidate is processed — re-check live + unresolved
-// immediately before acting so a module removed (or resolved by a concurrent
-// sweep) mid-batch is not charged.
+// by the time a late candidate is processed. Mid-batch removal of an UNATTEMPTED
+// timer still skips the charge; only a timer that already reached Stripe survives
+// removal so its crashed attempt can be reconciled. A timer resolved by a
+// concurrent sweep is always skipped.
 func (q *Queries) ModuleTimerStillPending(ctx context.Context, id string) (bool, error) {
 	row := q.db.QueryRow(ctx, moduleTimerStillPending, id)
 	var pending bool
