@@ -377,6 +377,36 @@ type MsBillingAppBaseSnapshot struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type MsBillingAppCombinedProrationAttempt struct {
+	AppID               string             `json:"app_id"`
+	AccountID           string             `json:"account_id"`
+	AttemptedAt         time.Time          `json:"attempted_at"`
+	Currency            string             `json:"currency"`
+	BaseChargeMicros    int64              `json:"base_charge_micros"`
+	BaseChargeCents     int64              `json:"base_charge_cents"`
+	ModuleChargeMicros  int64              `json:"module_charge_micros"`
+	ModuleChargeCents   int64              `json:"module_charge_cents"`
+	TimerCount          int32              `json:"timer_count"`
+	CoverageStart       time.Time          `json:"coverage_start"`
+	CoverageEnd         time.Time          `json:"coverage_end"`
+	BaseDescription     string             `json:"base_description"`
+	ModuleDescription   string             `json:"module_description"`
+	SnapshotPeriodStart time.Time          `json:"snapshot_period_start"`
+	SnapshotPeriodEnd   time.Time          `json:"snapshot_period_end"`
+	SnapshotBaseMicros  int64              `json:"snapshot_base_micros"`
+	SnapshotModuleCount int32              `json:"snapshot_module_count"`
+	StraddlePeriodStart pgtype.Timestamptz `json:"straddle_period_start"`
+	StraddlePeriodEnd   pgtype.Timestamptz `json:"straddle_period_end"`
+	StraddleBaseMicros  pgtype.Int8        `json:"straddle_base_micros"`
+	ResolvedAt          pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedInvoiceID   pgtype.Text        `json:"resolved_invoice_id"`
+}
+
+type MsBillingAppCombinedProrationAttemptTimer struct {
+	AppID   string `json:"app_id"`
+	TimerID string `json:"timer_id"`
+}
+
 type MsBillingAppCustomDomain struct {
 	ID                  string             `json:"id"`
 	AccountID           string             `json:"account_id"`

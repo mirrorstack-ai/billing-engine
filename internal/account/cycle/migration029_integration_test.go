@@ -64,8 +64,9 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 	// mkCharge builds the payload the service's charge callback would return.
 	mkCharge := func(appID uuid.UUID, invID string) *cycle.ProrationCharge {
 		return &cycle.ProrationCharge{
-			InvoiceID: invID,
-			Cents:     200,
+			InvoiceID:  invID,
+			Cents:      200,
+			ResolvedAt: periodEnd.Add(time.Second),
 			Invoice: cycle.InvoiceMirror{
 				AccountID: acct, StripeInvoiceID: invID, Status: "open",
 				AmountDueCents: 200, Currency: "usd", EverFailed: true,
@@ -82,11 +83,13 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 	// commit atomically.
 	live := uuid.New()
 	require.NoError(t, store.InsertAppMirror(ctx, live, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
+	liveCharge := mkCharge(live, "in_live")
+	freezeProrationForCharge(t, ctx, store, acct, live, liveCharge)
 	called := false
 	outcome, invID, err := store.ChargeProrationLocked(ctx, live, func(l cycle.AppMirror) (*cycle.ProrationCharge, error) {
 		called = true
 		require.Equal(t, live, l.AppID)
-		return mkCharge(live, "in_live"), nil
+		return liveCharge, nil
 	})
 	require.NoError(t, err)
 	require.True(t, called)

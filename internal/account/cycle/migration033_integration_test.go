@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
@@ -93,6 +94,92 @@ func TestModuleOverageTimers_Integration_SynthesisFIFOAndSweep(t *testing.T) {
 	n, err = store.LiveModuleTimerCountForApp(ctx, app)
 	require.NoError(t, err)
 	require.Zero(t, n)
+}
+
+// Leg 1's work list carves removal out for a timer whose Stripe attempt marker
+// is already stamped (the same attempted-survives posture AppsPendingProration
+// takes for an app deleted after its grace). Without it a timer that was stamped
+// and then soft-removed — by an uninstall, or by app deletion running
+// SoftRemoveAllModuleTimersForApp — could never re-enter the sweep, so no leg
+// could ever reach its terminal guard and GetAccountBill projected its unresolved
+// amount forever.
+func TestModuleOverageTimers_Integration_RemovedAttemptedRecoveryCarveOut(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	acct := seedAccount(t, pool)
+	_, err := pool.Exec(ctx, `UPDATE ms_billing.accounts SET activated_at = $2 WHERE id = $1`,
+		acct.String(), mustTime(t, "2026-05-04T00:00:00Z"))
+	require.NoError(t, err)
+
+	app := uuid.New()
+	installedAt := mustTime(t, "2026-06-01T00:00:00Z")
+	graceExpiresAt := installedAt.AddDate(0, 0, usage.GraceDays)
+	require.NoError(t, store.InsertAppMirror(ctx, app, acct, uuid.Nil, 0, installedAt, ""))
+	require.NoError(t, store.InsertModuleOverageTimers(ctx, acct, app, installedAt, graceExpiresAt, 3))
+
+	rows, err := pool.Query(ctx, `
+		SELECT id
+		FROM ms_billing.app_module_overage_timers
+		WHERE app_id = $1::uuid
+		ORDER BY id`,
+		app.String(),
+	)
+	require.NoError(t, err)
+	timerIDs, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	require.NoError(t, err)
+	require.Len(t, timerIDs, 3)
+
+	// All three are soft-removed AFTER their grace elapsed. Only the one whose
+	// Stripe attempt marker was stamped stays in the work list — the
+	// attempted-survives carve-out that mirrors AppsPendingProration and gives a
+	// crashed attempt a reachable terminal guard.
+	attempted, unattempted, resolved := timerIDs[0], timerIDs[1], timerIDs[2]
+	removedAt := mustTime(t, "2026-06-05T00:00:00Z")
+	_, err = pool.Exec(ctx, `
+		UPDATE ms_billing.app_module_overage_timers
+		SET removed_at = $1::timestamptz
+		WHERE app_id = $2::uuid`,
+		removedAt, app.String(),
+	)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		UPDATE ms_billing.app_module_overage_timers
+		SET charge_attempted_at = $1::timestamptz
+		WHERE id = ANY($2::uuid[])`,
+		removedAt, []string{attempted.String(), resolved.String()},
+	)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		UPDATE ms_billing.app_module_overage_timers
+		SET grace_resolved = true
+		WHERE id = $1::uuid`,
+		resolved.String(),
+	)
+	require.NoError(t, err)
+
+	cands, err := store.ModuleOverageTimersPastGrace(ctx, removedAt)
+	require.NoError(t, err)
+	require.Len(t, cands, 1)
+	require.Equal(t, attempted, cands[0].ID,
+		"removed+attempted survives; removed+unattempted and resolved do not")
+
+	tests := []struct {
+		name    string
+		timerID uuid.UUID
+		want    bool
+	}{
+		{name: "removed attempted", timerID: attempted, want: true},
+		{name: "removed unattempted", timerID: unattempted, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pending, err := store.ModuleTimerStillPending(ctx, tt.timerID)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, pending)
+		})
+	}
 }
 
 // Regression (review 2026-07-06, H7): timer synthesis is a count-then-insert

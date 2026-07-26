@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
@@ -266,6 +267,14 @@ type Store interface {
 	// per-app earliest grace expiry (the charge ETA), app_id tie-break.
 	PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error)
 
+	// UnresolvedOneTimeCharges returns every activated-account creation-base and
+	// module-timer unit without a durable terminal verdict in one MVCC snapshot.
+	// It deliberately spans every charge window and both sides of each grace ETA.
+	// The query applies D11 deletion, live FIFO, attempted-charge recovery, and
+	// terminal-guard eligibility; the service applies the immutable D1d amount
+	// shape and de-duplicates any exact overlap with the recurring projection.
+	UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, includedModules, graceHours int) ([]UnresolvedOneTimeChargeRaw, error)
+
 	// CoCreatedOverModuleTimerCount returns how many of an app's co-created
 	// (installed_at == createdAt) module install timers are "over" per the
 	// account-level live FIFO rank — the EXACT set the creation-proration sweep
@@ -322,6 +331,41 @@ type PendingAddonChargeRaw struct {
 	Name       string
 	AddonCount int
 	ChargeETA  time.Time
+}
+
+type UnresolvedOneTimeChargeKind string
+
+const (
+	UnresolvedOneTimeChargeCreationBase UnresolvedOneTimeChargeKind = "creation_base"
+	UnresolvedOneTimeChargeModuleTimer  UnresolvedOneTimeChargeKind = "module_timer"
+)
+
+// UnresolvedOneTimeChargeRaw is one exact, independently priced creation-base
+// or module-timer unit. ChargeAt, GraceExpiresAt, and ActivatedAt are immutable
+// inputs to the D1d amount shape. CountsTowardRecurring says the live recurring
+// forecast already includes this unit, allowing only an exactly overlapping
+// straddled period to be removed from the one-time increment.
+type UnresolvedOneTimeChargeRaw struct {
+	Kind                  UnresolvedOneTimeChargeKind
+	ChargeID              uuid.UUID
+	AppID                 uuid.UUID
+	ChargeAt              time.Time
+	GraceExpiresAt        time.Time
+	ActivatedAt           time.Time
+	CountsTowardRecurring bool
+
+	// Frozen identifies a migration-050 combined Stripe attempt. Its raw amount
+	// and coverage snapshots are immutable first-write-wins data; callers must
+	// never recompute this money from mutable app/timer state.
+	Frozen                    bool
+	FrozenAmountMicros        int64
+	FrozenSnapshotPeriodStart time.Time
+	FrozenSnapshotPeriodEnd   time.Time
+	FrozenSnapshotBaseMicros  int64
+	FrozenHasStraddle         bool
+	FrozenStraddlePeriodStart time.Time
+	FrozenStraddlePeriodEnd   time.Time
+	FrozenStraddleBaseMicros  int64
 }
 
 // AppBaseSnapshotInfo is the display-read projection of a
@@ -955,6 +999,60 @@ func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid
 			Name:       r.Name.String, // "" when NULL (pre-037 / unnamed)
 			AddonCount: int(r.AddonCount),
 			ChargeETA:  r.ChargeEta,
+		})
+	}
+	return out, nil
+}
+
+// UnresolvedOneTimeCharges reads every non-terminal creation-base and eligible
+// module-timer unit in one statement — see the Store interface doc.
+func (s *pgxStore) UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, includedModules, graceHours int) ([]UnresolvedOneTimeChargeRaw, error) {
+	rows, err := s.q.UnresolvedOneTimeCharges(ctx, db.UnresolvedOneTimeChargesParams{
+		AccountID:       accountID.String(),
+		IncludedModules: int32(includedModules),
+		GraceHours:      int32(graceHours),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UnresolvedOneTimeChargeRaw, 0, len(rows))
+	for _, r := range rows {
+		if r.OwnershipUnknown {
+			return nil, billing.ErrCombinedProrationAttemptUnknown
+		}
+		if r.Frozen && int64(r.FrozenDeclaredTimerCount) != r.FrozenActualTimerCount {
+			return nil, fmt.Errorf(
+				"combined proration attempt %s child count mismatch: declared=%d actual=%d",
+				r.AppID,
+				r.FrozenDeclaredTimerCount,
+				r.FrozenActualTimerCount,
+			)
+		}
+		chargeID, err := uuid.Parse(r.ChargeID)
+		if err != nil {
+			return nil, fmt.Errorf("decode unresolved one-time charge id %q: %w", r.ChargeID, err)
+		}
+		appID, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return nil, fmt.Errorf("decode unresolved one-time app_id %q: %w", r.AppID, err)
+		}
+		out = append(out, UnresolvedOneTimeChargeRaw{
+			Kind:                      UnresolvedOneTimeChargeKind(r.ChargeKind),
+			ChargeID:                  chargeID,
+			AppID:                     appID,
+			ChargeAt:                  r.ChargeAt,
+			GraceExpiresAt:            r.GraceExpiresAt,
+			ActivatedAt:               r.ActivatedAt,
+			CountsTowardRecurring:     r.CountsTowardRecurring,
+			Frozen:                    r.Frozen,
+			FrozenAmountMicros:        r.FrozenAmountMicros,
+			FrozenSnapshotPeriodStart: r.FrozenSnapshotPeriodStart,
+			FrozenSnapshotPeriodEnd:   r.FrozenSnapshotPeriodEnd,
+			FrozenSnapshotBaseMicros:  r.FrozenSnapshotBaseMicros,
+			FrozenHasStraddle:         r.FrozenHasStraddle,
+			FrozenStraddlePeriodStart: r.FrozenStraddlePeriodStart,
+			FrozenStraddlePeriodEnd:   r.FrozenStraddlePeriodEnd,
+			FrozenStraddleBaseMicros:  r.FrozenStraddleBaseMicros,
 		})
 	}
 	return out, nil

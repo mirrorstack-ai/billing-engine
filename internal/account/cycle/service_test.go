@@ -113,10 +113,11 @@ type fakeStore struct {
 	// migration-028 per-app-period base ledger, keyed (app, period_start) like
 	// the PRIMARY KEY, with the source recorded so tests can assert which
 	// charge leg wrote (and kept) each row.
-	apps           map[uuid.UUID]cycle.AppMirror
-	accountsByUser map[uuid.UUID]uuid.UUID
-	activation     map[uuid.UUID]time.Time
-	baseSnapshots  map[snapKey]fakeBaseSnapshot
+	apps                      map[uuid.UUID]cycle.AppMirror
+	combinedProrationAttempts map[uuid.UUID]cycle.CombinedProrationAttempt
+	accountsByUser            map[uuid.UUID]uuid.UUID
+	activation                map[uuid.UUID]time.Time
+	baseSnapshots             map[snapKey]fakeBaseSnapshot
 	// custom-domain mirror state (migration 047). The map is keyed by the
 	// surrogate domain id; InsertDomain enforces the live-hostname partial
 	// unique constraint by scanning the currently-live rows.
@@ -205,6 +206,9 @@ type fakeStore struct {
 	errPendingProration   error // AppsPendingProration
 	errChargeLocked       error // ChargeProrationLocked
 	errDrawCreationWallet error // DrawCreationProrationFromWallet
+	errFreezeCombined     error // FreezeCombinedProrationAttempt
+	errCombinedAttempt    error // CombinedProrationAttempt
+	errUnresolvedCombined error // UnresolvedCombinedProrationAttempts
 	// errPersistAfterStripe fails ChargeProrationLocked's persist phase (Phase 3)
 	// AFTER the charge callback's Stripe calls already succeeded — modeling a
 	// combined-invoice charge whose guard/timer marks fail to commit (deadlock /
@@ -298,30 +302,31 @@ type repointCall struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		prices:              map[string]int64{},
-		modelPrices:         map[string]int64{},
-		versionPrices:       map[string]int64{},
-		inactiveModelPrices: map[string]bool{},
-		visibility:          map[uuid.UUID]cycle.Visibility{},
-		periodID:            uuid.New(),
-		aggregates:          map[aggKey]cycle.MetricAggregate{},
-		settlements:         map[string]cycle.ModuleSettlement{},
-		insertedRuns:        map[string]uuid.UUID{},
-		runStatus:           map[uuid.UUID]cycle.BillingRunStatus{},
-		markedRuns:          map[uuid.UUID]markedRun{},
-		invoices:            map[string]cycle.InvoiceMirror{},
-		frozenCharges:       map[uuid.UUID]cycle.FrozenBoundaryCharge{},
-		walletMode:          cycle.CreditBillingModeStandard,
-		walletSources:       map[uuid.UUID]*fakeWalletSource{},
-		walletDraws:         map[string][]fakeWalletDraw{},
-		creationDrawn:       map[uuid.UUID]int64{},
-		moduleOverageDrawn:  map[uuid.UUID]int64{},
-		apps:                map[uuid.UUID]cycle.AppMirror{},
-		accountsByUser:      map[uuid.UUID]uuid.UUID{},
-		activation:          map[uuid.UUID]time.Time{},
-		baseSnapshots:       map[snapKey]fakeBaseSnapshot{},
-		domains:             map[uuid.UUID]*fakeDomain{},
-		timers:              map[uuid.UUID]*fakeTimer{},
+		prices:                    map[string]int64{},
+		modelPrices:               map[string]int64{},
+		versionPrices:             map[string]int64{},
+		inactiveModelPrices:       map[string]bool{},
+		visibility:                map[uuid.UUID]cycle.Visibility{},
+		periodID:                  uuid.New(),
+		aggregates:                map[aggKey]cycle.MetricAggregate{},
+		settlements:               map[string]cycle.ModuleSettlement{},
+		insertedRuns:              map[string]uuid.UUID{},
+		runStatus:                 map[uuid.UUID]cycle.BillingRunStatus{},
+		markedRuns:                map[uuid.UUID]markedRun{},
+		invoices:                  map[string]cycle.InvoiceMirror{},
+		frozenCharges:             map[uuid.UUID]cycle.FrozenBoundaryCharge{},
+		walletMode:                cycle.CreditBillingModeStandard,
+		walletSources:             map[uuid.UUID]*fakeWalletSource{},
+		walletDraws:               map[string][]fakeWalletDraw{},
+		creationDrawn:             map[uuid.UUID]int64{},
+		moduleOverageDrawn:        map[uuid.UUID]int64{},
+		apps:                      map[uuid.UUID]cycle.AppMirror{},
+		combinedProrationAttempts: map[uuid.UUID]cycle.CombinedProrationAttempt{},
+		accountsByUser:            map[uuid.UUID]uuid.UUID{},
+		activation:                map[uuid.UUID]time.Time{},
+		baseSnapshots:             map[snapKey]fakeBaseSnapshot{},
+		domains:                   map[uuid.UUID]*fakeDomain{},
+		timers:                    map[uuid.UUID]*fakeTimer{},
 
 		hasPMByAccount:          map[uuid.UUID]bool{},
 		cardCount:               map[uuid.UUID]int{},
@@ -1209,6 +1214,29 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 	if f.errPersistAfterStripe != nil {
 		return 0, "", f.errPersistAfterStripe
 	}
+	attempt, hasAttempt := f.combinedProrationAttempts[appID]
+	if !hasAttempt {
+		return 0, "", errors.New("missing durable combined proration attempt")
+	}
+	if pc.ResolvedAt.IsZero() {
+		return 0, "", errors.New("missing combined proration resolved_at")
+	}
+	if len(attempt.TimerIDs) != len(pc.TimerCharges) {
+		return 0, "", errors.New("combined proration timer set mismatch")
+	}
+	owned := make(map[uuid.UUID]struct{}, len(attempt.TimerIDs))
+	for _, timerID := range attempt.TimerIDs {
+		owned[timerID] = struct{}{}
+	}
+	for _, timerCharge := range pc.TimerCharges {
+		if _, ok := owned[timerCharge.TimerID]; !ok {
+			return 0, "", errors.New("combined proration received unowned timer")
+		}
+		delete(owned, timerCharge.TimerID)
+	}
+	if len(owned) != 0 {
+		return 0, "", errors.New("combined proration omitted owned timer")
+	}
 	f.invoices[pc.Invoice.StripeInvoiceID] = pc.Invoice
 	f.baseSnapshots[snapKey{pc.Snapshot.AppID, pc.Snapshot.PeriodStart}] = fakeBaseSnapshot{snap: pc.Snapshot, source: "proration"}
 	if pc.StraddleSnapshot != nil {
@@ -1228,6 +1256,9 @@ func (f *fakeStore) ChargeProrationLocked(_ context.Context, appID uuid.UUID, ch
 			t.graceInvoiceItemID = tc.InvoiceItemID
 		}
 	}
+	attempt.ResolvedAt = pc.ResolvedAt
+	attempt.ResolvedInvoiceID = pc.InvoiceID
+	f.combinedProrationAttempts[appID] = attempt
 	return cycle.ProrationLockedCharged, pc.InvoiceID, nil
 }
 
@@ -1566,6 +1597,9 @@ func (f *fakeStore) MarkModuleTimerChargeAttempted(_ context.Context, timerID uu
 	if !ok || t.graceResolved {
 		return 0, nil
 	}
+	if owned, _ := f.TimerHasUnresolvedCombinedProrationOwner(context.Background(), timerID); owned {
+		return 0, nil
+	}
 	if t.chargeAttemptedAt.IsZero() {
 		t.chargeAttemptedAt = at // first-write-wins, mirroring COALESCE
 	}
@@ -1577,7 +1611,8 @@ func (f *fakeStore) ModuleTimerStillPending(_ context.Context, timerID uuid.UUID
 	if !ok {
 		return false, nil
 	}
-	return !t.removed && !t.graceResolved, nil
+	owned, _ := f.TimerHasUnresolvedCombinedProrationOwner(context.Background(), timerID)
+	return !t.removed && !t.graceResolved && !owned, nil
 }
 
 func (f *fakeStore) MarkAppProrationAttempted(_ context.Context, appID uuid.UUID, _ time.Time) error {
@@ -1588,11 +1623,119 @@ func (f *fakeStore) MarkAppProrationAttempted(_ context.Context, appID uuid.UUID
 	return nil
 }
 
+func cloneCombinedProrationAttempt(attempt cycle.CombinedProrationAttempt) cycle.CombinedProrationAttempt {
+	attempt.TimerIDs = append([]uuid.UUID(nil), attempt.TimerIDs...)
+	if attempt.Shape.StraddleSnapshot != nil {
+		snapshot := *attempt.Shape.StraddleSnapshot
+		attempt.Shape.StraddleSnapshot = &snapshot
+	}
+	return attempt
+}
+
+func (f *fakeStore) FreezeCombinedProrationAttempt(
+	_ context.Context,
+	appID uuid.UUID,
+	at time.Time,
+	shape cycle.CombinedProrationChargeShape,
+	creditRailEnabled bool,
+) (cycle.CombinedProrationAttempt, cycle.StripeRailClaimOutcome, error) {
+	if f.errFreezeCombined != nil {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, f.errFreezeCombined
+	}
+	if attempt, ok := f.combinedProrationAttempts[appID]; ok {
+		return cloneCombinedProrationAttempt(attempt), cycle.StripeRailClaimed, nil
+	}
+	app, ok := f.apps[appID]
+	if !ok {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, nil
+	}
+	if app.ProrationAttempted {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, cycle.ErrCombinedProrationAttemptUnknown
+	}
+	if app.ProrationInvoiceID != "" || app.ProrationSkipped ||
+		(app.Deleted && app.DeletedAt.Before(app.CreatedAt.AddDate(0, 0, usage.GraceDays))) {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, nil
+	}
+	if creditRailEnabled && f.walletMode == cycle.CreditBillingModeCredits {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailWalletRequired, nil
+	}
+	timerIDs, err := f.CoCreatedOverModuleTimers(context.Background(), app.AccountID, appID, app.CreatedAt, usage.IncludedModules)
+	if err != nil {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, err
+	}
+	filtered := make([]uuid.UUID, 0, len(timerIDs))
+	if shape.ModuleChargeMicros > 0 && shape.ModuleChargeCents > 0 {
+		for _, timerID := range timerIDs {
+			timer := f.timers[timerID]
+			if timer == nil || timer.removed || timer.graceResolved || !timer.chargeAttemptedAt.IsZero() {
+				return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, cycle.ErrCombinedProrationSelectionChanged
+			}
+			filtered = append(filtered, timerID)
+		}
+	}
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].String() < filtered[j].String() })
+	attempt := cycle.CombinedProrationAttempt{
+		AppID:       appID,
+		AttemptedAt: at.UTC(),
+		Shape:       shape,
+		TimerIDs:    filtered,
+	}
+	f.combinedProrationAttempts[appID] = cloneCombinedProrationAttempt(attempt)
+	app.ProrationAttempted = true
+	f.apps[appID] = app
+	return cloneCombinedProrationAttempt(attempt), cycle.StripeRailClaimed, nil
+}
+
+func (f *fakeStore) CombinedProrationAttempt(_ context.Context, appID uuid.UUID) (cycle.CombinedProrationAttempt, bool, error) {
+	if f.errCombinedAttempt != nil {
+		return cycle.CombinedProrationAttempt{}, false, f.errCombinedAttempt
+	}
+	attempt, ok := f.combinedProrationAttempts[appID]
+	return cloneCombinedProrationAttempt(attempt), ok, nil
+}
+
+func (f *fakeStore) UnresolvedCombinedProrationAttempts(_ context.Context, accountID uuid.UUID) ([]cycle.UnresolvedCombinedProrationAmount, error) {
+	if f.errUnresolvedCombined != nil {
+		return nil, f.errUnresolvedCombined
+	}
+	var out []cycle.UnresolvedCombinedProrationAmount
+	for appID, attempt := range f.combinedProrationAttempts {
+		if attempt.Shape.AccountID != accountID || !attempt.ResolvedAt.IsZero() {
+			continue
+		}
+		timerCount := len(attempt.TimerIDs)
+		out = append(out, cycle.UnresolvedCombinedProrationAmount{
+			AppID:              appID,
+			BaseChargeMicros:   attempt.Shape.BaseChargeMicros,
+			ModuleChargeMicros: attempt.Shape.ModuleChargeMicros,
+			TimerCount:         timerCount,
+			TotalMicros:        attempt.Shape.BaseChargeMicros + attempt.Shape.ModuleChargeMicros*int64(timerCount),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AppID.String() < out[j].AppID.String() })
+	return out, nil
+}
+
+func (f *fakeStore) TimerHasUnresolvedCombinedProrationOwner(_ context.Context, timerID uuid.UUID) (bool, error) {
+	for _, attempt := range f.combinedProrationAttempts {
+		if !attempt.ResolvedAt.IsZero() {
+			continue
+		}
+		for _, owned := range attempt.TimerIDs {
+			if owned == timerID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 func (f *fakeStore) MarkModuleTimerIncluded(_ context.Context, timerID uuid.UUID) error {
 	if f.errMarkIncluded != nil {
 		return f.errMarkIncluded
 	}
-	if t, ok := f.timers[timerID]; ok && !t.graceResolved {
+	owned, _ := f.TimerHasUnresolvedCombinedProrationOwner(context.Background(), timerID)
+	if t, ok := f.timers[timerID]; ok && !t.graceResolved && !owned {
 		t.graceResolved = true
 	}
 	return nil
@@ -1635,6 +1778,9 @@ func (f *fakeStore) DrawModuleOverageFromWallet(_ context.Context, timerID uuid.
 	}
 	t, ok := f.timers[timerID]
 	if !ok || t.removed || t.graceResolved {
+		return cycle.ModuleOverageWalletLockedStale, "", nil
+	}
+	if owned, _ := f.TimerHasUnresolvedCombinedProrationOwner(context.Background(), timerID); owned {
 		return cycle.ModuleOverageWalletLockedStale, "", nil
 	}
 	if !t.chargeAttemptedAt.IsZero() {

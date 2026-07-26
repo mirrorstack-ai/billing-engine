@@ -443,6 +443,69 @@ func TestModuleOverage_StaleCandidateNotCharged(t *testing.T) {
 	require.False(t, store.timers[x].graceCharged)
 }
 
+func TestModuleOverage_FrozenCombinedChildDefersBeforeRemovedOrImprovedRank(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	registerMirror(t, svc, user, appID, createdAt, 7)
+
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Len(t, attempt.TimerIDs, 2)
+	timerID := attempt.TimerIDs[0]
+	timer := store.timers[timerID]
+	timer.removed = true
+	timer.removedAt = createdAt.AddDate(0, 0, 4)
+	// Removing earlier live timers would also improve this child's rank. The
+	// exact rank no longer matters once durable ownership exists; removal alone
+	// proves the ownership check runs before the ordinary stale predicate.
+
+	res, err := svc.ChargeModuleOverage(context.Background(), cycle.ModuleOverageCandidate{
+		ID:             timerID,
+		AccountID:      acct,
+		AppID:          appID,
+		InstalledAt:    timer.installedAt,
+		GraceExpiresAt: timer.graceExpiresAt,
+		ActivatedAt:    store.activation[acct],
+	}, createdAt.AddDate(0, 0, 5))
+	require.NoError(t, err)
+	require.Equal(t, cycle.ModuleOverageDeferredToCombined, res.Status)
+	require.Empty(t, sc.findByRefCalls)
+	require.Empty(t, sc.invoiceCalls)
+	require.False(t, timer.graceResolved)
+}
+
+func TestModuleOverage_KnownCombinedSetDoesNotCaptureLaterNonChild(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	registerMirror(t, svc, user, appID, createdAt, 7)
+
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Len(t, attempt.TimerIDs, 2)
+	laterAt := createdAt.AddDate(0, 0, 10)
+	laterID := seedTimer(store, acct, appID, laterAt)
+
+	res, err := svc.ChargeModuleOverage(context.Background(), cycle.ModuleOverageCandidate{
+		ID:             laterID,
+		AccountID:      acct,
+		AppID:          appID,
+		InstalledAt:    laterAt,
+		GraceExpiresAt: laterAt.AddDate(0, 0, 3),
+		ActivatedAt:    store.activation[acct],
+	}, laterAt.AddDate(0, 0, 4))
+	require.NoError(t, err)
+	require.Equal(t, cycle.ModuleOverageCharged, res.Status,
+		"a known frozen set owns only its children; a later over timer keeps the standalone Leg-1 path")
+	require.Len(t, sc.invoiceCalls, 1)
+	require.True(t, store.timers[laterID].graceResolved)
+}
+
 // Regression (review 2026-07-06, H10): a PREPAID account is never auto-charged
 // off-session — the boundary spine always gated on this, but the per-module
 // grace leg bypassed it entirely. The skip is transient: nothing is resolved,
