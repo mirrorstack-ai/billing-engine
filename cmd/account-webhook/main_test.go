@@ -95,6 +95,81 @@ func TestHTTPHandler_Duplicate(t *testing.T) {
 	}
 }
 
+func TestHTTPWebhookTransports_SuppressAutoTopUpCardCharge(t *testing.T) {
+	event := stripego.Event{
+		ID:   "evt_no_topup",
+		Type: stripego.EventTypeInvoicePaid,
+		Data: &stripego.EventData{Raw: json.RawMessage(`{
+			"id":"in_no_topup",
+			"status":"paid",
+			"amount_paid":500,
+			"amount_due":500
+		}`)},
+	}
+
+	tests := []struct {
+		name    string
+		deliver func(*webhook.Router) webhook.Status
+	}{
+		{
+			name: "API Gateway proxy",
+			deliver: func(router *webhook.Router) webhook.Status {
+				res, err := proxyHandler(router)(context.Background(), events.APIGatewayProxyRequest{
+					HTTPMethod: http.MethodPost,
+					Headers:    map[string]string{stripeSigHeader: "t=0,v1=stub"},
+					Body:       `{}`,
+				})
+				if err != nil {
+					t.Fatalf("proxy handler returned err: %v", err)
+				}
+				return decodeStatus(t, strings.NewReader(res.Body))
+			},
+		},
+		{
+			name: "local HTTP",
+			deliver: func(router *webhook.Router) webhook.Status {
+				req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(`{}`))
+				req.Header.Set(stripeSigHeader, "t=0,v1=stub")
+				rr := httptest.NewRecorder()
+				httpHandler(router).ServeHTTP(rr, req)
+				return decodeStatus(t, rr.Body)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			probe := webhooktest.NewAutoTopUpChargeProbe()
+			// Prove the fixture reaches the card-charge seam when its context is
+			// not suppressed, then exercise the real transport boundary.
+			probe.NotifyStripeInvoice(context.Background(), "in_control")
+			if got := probe.PayInvoiceCalls(); got != 1 {
+				t.Fatalf("control PayInvoiceWithMethod calls: got %d, want 1", got)
+			}
+			probe.Reset()
+
+			router := makeRouter(
+				t,
+				&webhooktest.FakeVerifier{Event: event},
+				webhooktest.NewFakeStore(),
+			).WithServingBlockNotifier(probe)
+
+			if got := tt.deliver(router); got != webhook.StatusOK {
+				t.Fatalf("status: got %q, want %q", got, webhook.StatusOK)
+			}
+			if got := probe.EvaluationCalls(); got != 1 {
+				t.Fatalf("standing evaluations: got %d, want 1", got)
+			}
+			if errs := probe.Errors(); len(errs) != 0 {
+				t.Fatalf("standing evaluation errors: %v", errs)
+			}
+			if got := probe.PayInvoiceCalls(); got != 0 {
+				t.Fatalf("webhook reached PayInvoiceWithMethod %d times, want 0", got)
+			}
+		})
+	}
+}
+
 // --- proxyHandler (Lambda transport — same router contract) ---------------
 
 // A GET must return 200 without ever calling router.Process - the

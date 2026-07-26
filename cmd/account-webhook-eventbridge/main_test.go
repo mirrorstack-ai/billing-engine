@@ -88,3 +88,37 @@ func TestEventBridgeHandler_5xxResult_SurfacesError(t *testing.T) {
 
 	require.Error(t, err, "a genuine 5xx must surface as a non-nil error so EventBridge retries/DLQs")
 }
+
+func TestEventBridgeWebhookDelivery_SuppressesAutoTopUpCardCharge(t *testing.T) {
+	probe := webhooktest.NewAutoTopUpChargeProbe()
+	// Prove the fixture reaches the card-charge seam when its context is not
+	// suppressed, then exercise the real EventBridge transport boundary.
+	probe.NotifyStripeInvoice(context.Background(), "in_control")
+	require.Equal(t, 1, probe.PayInvoiceCalls())
+	probe.Reset()
+
+	event := stripego.Event{
+		ID:   "evt_no_topup",
+		Type: stripego.EventTypeInvoicePaid,
+		Data: &stripego.EventData{Raw: json.RawMessage(`{
+			"id":"in_no_topup",
+			"status":"paid",
+			"amount_paid":500,
+			"amount_due":500
+		}`)},
+	}
+	detail, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	router := makeRouter(t, webhooktest.NewFakeStore(), nil).
+		WithServingBlockNotifier(probe)
+	err = eventBridgeHandler(router)(context.Background(), events.EventBridgeEvent{
+		ID:     "eb-no-topup",
+		Detail: detail,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, probe.EvaluationCalls(), "webhook should still evaluate standing")
+	require.Empty(t, probe.Errors())
+	require.Zero(t, probe.PayInvoiceCalls(), "webhook must never reach PayInvoiceWithMethod")
+}
