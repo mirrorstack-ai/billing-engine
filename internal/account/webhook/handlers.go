@@ -215,9 +215,10 @@ func (r *Router) handlePaymentMethodDetached(ctx context.Context, event stripego
 }
 
 // handleInvoiceLifecycle reconciles an invoice.created / .finalized / .paid /
-// .payment_failed / .voided / .marked_uncollectible event onto the
-// ms_billing.invoices mirror. The six events share one handler because each
-// delivers the full Invoice object carrying its current status;
+// .payment_failed / .payment_action_required / .voided /
+// .marked_uncollectible event onto the ms_billing.invoices mirror. These
+// events share one handler because each delivers the full Invoice object
+// carrying its current status;
 // ApplyInvoiceStatus's monotonic guard (draft<open<terminal) is what makes the
 // path safe under Stripe's at-least-once + out-of-order delivery — a replayed
 // or late event can never regress a row past a terminal state. payment_failed
@@ -300,15 +301,15 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 	}
 
 	// SERVICE-BLOCK failure latch — set BEFORE the found-guard and the status
-	// reconcile, on BOTH failure signals (payment_failed leaves the invoice
-	// 'open'; marked_uncollectible is a terminal that may arrive first under
-	// out-of-order delivery). ever_failed is invoice-keyed and set-only, so this
-	// is order-independent and a harmless no-op when the mirror row hasn't landed
-	// — the read-time streak derivation (ServiceBlockSignals) does the rest, so
-	// there is no counter to advance here and no reset on invoice.paid. A failure
-	// here is surfaced (500) so Stripe retries; the latch makes the retry a no-op.
+	// reconcile, on both ACTUAL failure signals (payment_failed leaves the
+	// invoice 'open'; marked_uncollectible is a terminal that may arrive first
+	// under out-of-order delivery). payment_action_required is deliberately
+	// excluded: 3DS/SCA is a transient authentication step, not a failed charge.
+	// It still reaches the mirror and credit-attempt reconciliation below.
+	// ever_failed is invoice-keyed and set-only, so actual failures remain
+	// order-independent and harmless no-ops when the mirror row hasn't landed.
+	// A latch error is surfaced (500) so Stripe retries.
 	if event.Type == stripego.EventTypeInvoicePaymentFailed ||
-		event.Type == stripego.EventTypeInvoicePaymentActionRequired ||
 		event.Type == stripego.EventTypeInvoiceMarkedUncollectible {
 		if err := r.store.MarkInvoiceFailed(ctx, inv.ID); err != nil {
 			r.log.ErrorContext(ctx, "invoice failure latch (ever_failed) failed", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "error", err)

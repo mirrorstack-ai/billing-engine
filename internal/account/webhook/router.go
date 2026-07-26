@@ -1,6 +1,7 @@
 // Package webhook implements the v1 Stripe webhook router. It handles
 // customer + payment_method CRUD plus the invoice lifecycle
-// (created/finalized/paid/payment_failed/voided/marked_uncollectible);
+// (created/finalized/paid/payment_failed/payment_action_required/voided/
+// marked_uncollectible);
 // idempotency is enforced via ms_billing.webhook_events_processed. All
 // other events ACK with status "unhandled" so Stripe doesn't retry.
 //
@@ -494,11 +495,12 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		stripego.EventTypeInvoicePaymentActionRequired,
 		stripego.EventTypeInvoiceVoided,
 		stripego.EventTypeInvoiceMarkedUncollectible:
-		// All six ride the same reconciler: each carries the full Invoice
-		// object with its current status, and ApplyInvoiceStatus's monotonic
-		// guard decides whether the event advances the mirror. payment_failed
-		// leaves the invoice 'open' (Stripe keeps retrying), which is exactly
-		// the unpaid state Ensure derives delinquency from — no separate flag.
+		// All lifecycle signals ride the same reconciler: each carries the full
+		// Invoice object with its current status, and ApplyInvoiceStatus's
+		// monotonic guard decides whether the event advances the mirror.
+		// payment_failed leaves the invoice 'open' (Stripe keeps retrying), which
+		// is exactly the unpaid state Ensure derives delinquency from — no
+		// separate flag.
 		// voided (status 'void') and marked_uncollectible (status
 		// 'uncollectible') are the terminal collection outcomes the
 		// delinquency predicate (AccountHasUnpaidInvoice's IN clause) keys on:
