@@ -25,7 +25,26 @@ import (
 // rather than silently bill at the cheaper catalog (Haiku-floor) fallback — that
 // would under-bill a deliberately-retired model and defeat the rollup's loud
 // revenue-leak guard. The Service maps this to a loud Internal error.
-var ErrInactiveModelPrice = errors.New("per-model price is retired (active=false)")
+var (
+	ErrInactiveModelPrice = errors.New("per-model price is retired (active=false)")
+
+	// ErrCreditRailRequired means a fresh Stripe claim lost the account-lock
+	// race to a standard→credits transition. No Stripe marker or network call
+	// exists; the service must retry the charge through the wallet rail.
+	ErrCreditRailRequired = errors.New("durable credits rail now owns the fresh charge")
+)
+
+// StripeRailClaimOutcome is shared by every pre-network durable Stripe claim.
+// Migration 050 introduces it with combined creation-proration ownership; the
+// other money legs adopt the same account-lock result in the following durable
+// rail hardening.
+type StripeRailClaimOutcome uint8
+
+const (
+	StripeRailClaimed StripeRailClaimOutcome = iota
+	StripeRailWalletRequired
+	StripeRailStale
+)
 
 // Store is the persistence interface the rollup + settlement Service depends
 // on. Narrow on purpose — every method maps to a specific rollup step — so
@@ -471,6 +490,40 @@ type Store interface {
 	// creation-proration leg — first-write-wins, never cleared.
 	MarkAppProrationAttempted(ctx context.Context, appID uuid.UUID, at time.Time) error
 
+	// FreezeCombinedProrationAttempt atomically freezes the exact combined
+	// app-base + co-created-timer Stripe request before its first network call.
+	// The store locks the app, returns an existing first-write winner verbatim,
+	// or selects + row-locks + rechecks the live FIFO-over timers before inserting
+	// one header (including an intentionally empty set), its child timer IDs, and
+	// apps.proration_attempted_at in one transaction. A legacy attempted app with
+	// no header returns ErrCombinedProrationAttemptUnknown. When
+	// creditRailEnabled is true, the transaction locks the owning account before
+	// the app/timers: a fresh credits-mode charge returns
+	// StripeRailWalletRequired with no header/marker, while an existing header
+	// remains recovery-authoritative regardless of the current mode.
+	FreezeCombinedProrationAttempt(
+		ctx context.Context,
+		appID uuid.UUID,
+		at time.Time,
+		shape CombinedProrationChargeShape,
+		creditRailEnabled bool,
+	) (CombinedProrationAttempt, StripeRailClaimOutcome, error)
+
+	// CombinedProrationAttempt reads one immutable attempt and its complete
+	// frozen timer set. found=false means no header; callers must interpret that
+	// as fresh only when apps.proration_attempted_at is also absent.
+	CombinedProrationAttempt(ctx context.Context, appID uuid.UUID) (attempt CombinedProrationAttempt, found bool, err error)
+
+	// UnresolvedCombinedProrationAttempts returns exact raw frozen money for the
+	// strict bill/runtime projection. It fails closed if a header's declared
+	// timer_count differs from its durable child rows.
+	UnresolvedCombinedProrationAttempts(ctx context.Context, accountID uuid.UUID) ([]UnresolvedCombinedProrationAmount, error)
+
+	// TimerHasUnresolvedCombinedProrationOwner is the durable standalone-rail
+	// exclusion: a frozen timer belongs to the combined attempt until the same
+	// terminal transaction resolves the header, app, and timer guards.
+	TimerHasUnresolvedCombinedProrationOwner(ctx context.Context, timerID uuid.UUID) (bool, error)
+
 	// ReconcileModuleTimersToTarget brings an app's live install-timer set into
 	// line with its CURRENT roster row, ATOMICALLY under a per-app advisory
 	// transaction lock (review 2026-07-06, H7; hardened in wave 2, D8/D9): the
@@ -717,6 +770,62 @@ type FrozenBoundaryCharge struct {
 	Cents    int64
 	WithBase bool
 }
+
+// CombinedProrationChargeShape is the complete immutable app-base + per-timer
+// request and snapshot shape frozen before the first Stripe call (migration
+// 050). Descriptions and line coverage are included because they are part of
+// Stripe's idempotent request body; raw micros independently feed strict
+// prospective-credit projections.
+type CombinedProrationChargeShape struct {
+	AccountID          uuid.UUID
+	Currency           string
+	BaseChargeMicros   int64
+	BaseChargeCents    int64
+	ModuleChargeMicros int64
+	ModuleChargeCents  int64
+	CoverageStart      time.Time
+	CoverageEnd        time.Time
+	BaseDescription    string
+	ModuleDescription  string
+	Snapshot           AppBaseSnapshot
+	StraddleSnapshot   *AppBaseSnapshot
+}
+
+// CombinedProrationAttempt is one durable first-write winner. Header presence
+// proves the timer set is known; TimerIDs may legitimately be empty. ResolvedAt
+// and ResolvedInvoiceID are both empty until the same transaction that arms the
+// app and timer terminal guards commits.
+type CombinedProrationAttempt struct {
+	AppID             uuid.UUID
+	AttemptedAt       time.Time
+	Shape             CombinedProrationChargeShape
+	TimerIDs          []uuid.UUID
+	ResolvedAt        time.Time
+	ResolvedInvoiceID string
+}
+
+// UnresolvedCombinedProrationAmount is the exact raw amount owned by one
+// unresolved frozen attempt. The live pending projection must use this in place
+// of recomputing that app/timer set.
+type UnresolvedCombinedProrationAmount struct {
+	AppID              uuid.UUID
+	BaseChargeMicros   int64
+	ModuleChargeMicros int64
+	TimerCount         int
+	TotalMicros        int64
+}
+
+var (
+	// ErrCombinedProrationAttemptUnknown marks a legacy/incomplete split state:
+	// apps.proration_attempted_at exists but migration-050 ownership does not.
+	// Exact recovery/projection is impossible, so callers must fail closed.
+	ErrCombinedProrationAttemptUnknown = billing.ErrCombinedProrationAttemptUnknown
+	// ErrCombinedProrationSelectionChanged means a timer selected at the FIFO
+	// statement boundary was removed, resolved, or claimed by standalone Leg 1
+	// before its row lock/recheck. No header/marker is committed; retry selects a
+	// new coherent winner.
+	ErrCombinedProrationSelectionChanged = errors.New("combined proration timer selection changed before freeze")
+)
 
 // ErrAccountNotFound is returned by UpdateAccountCollection when no accounts row
 // matches the id (the UPDATE affected zero rows).
@@ -1836,6 +1945,83 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 	defer deferredRollback(ctx, tx)
 	qtx := s.q.WithTx(tx)
 
+	// Match freeze's app→header lock order. Besides serializing concurrent
+	// terminal writers, this makes any app guard/header disagreement a loud
+	// rollback instead of silently resolving only part of the ownership graph.
+	appRow, err := qtx.SelectAppMirrorForUpdate(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProrationLockedNotFound, "", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	attempt, found, err := readCombinedProrationAttempt(ctx, qtx, appID)
+	if err != nil {
+		return 0, "", err
+	}
+	if !found {
+		return 0, "", fmt.Errorf(
+			"cannot persist app %s proration without durable combined-attempt ownership",
+			appID,
+		)
+	}
+	if uuidFromPg(appRow.AccountID) != attempt.Shape.AccountID ||
+		!appRow.ProrationAttemptedAt.Valid ||
+		appRow.ProrationSkippedAt.Valid {
+		return 0, "", fmt.Errorf(
+			"combined proration attempt %s disagrees with the locked app marker/account",
+			appID,
+		)
+	}
+	if attempt.ResolvedInvoiceID != "" {
+		if !appRow.ProrationInvoiceID.Valid ||
+			appRow.ProrationInvoiceID.String != attempt.ResolvedInvoiceID {
+			return 0, "", fmt.Errorf(
+				"resolved combined proration attempt %s disagrees with the app invoice guard",
+				appID,
+			)
+		}
+		return ProrationLockedCharged, attempt.ResolvedInvoiceID, nil
+	}
+	if appRow.ProrationInvoiceID.Valid {
+		return 0, "", fmt.Errorf(
+			"unresolved combined proration attempt %s has an already-armed app invoice guard",
+			appID,
+		)
+	}
+	if pc.ResolvedAt.IsZero() {
+		return 0, "", errors.New("combined proration resolved_at required")
+	}
+	if err := validateProrationChargeMatchesAttempt(attempt, pc); err != nil {
+		return 0, "", err
+	}
+	expectedTimers := make(map[uuid.UUID]struct{}, len(attempt.TimerIDs))
+	for _, timerID := range attempt.TimerIDs {
+		expectedTimers[timerID] = struct{}{}
+	}
+	if len(pc.TimerCharges) != len(expectedTimers) {
+		return 0, "", fmt.Errorf(
+			"combined proration attempt %s owns %d timers but persistence received %d",
+			appID, len(expectedTimers), len(pc.TimerCharges),
+		)
+	}
+	seenTimers := make(map[uuid.UUID]struct{}, len(pc.TimerCharges))
+	for _, timerCharge := range pc.TimerCharges {
+		if _, ok := expectedTimers[timerCharge.TimerID]; !ok {
+			return 0, "", fmt.Errorf(
+				"combined proration attempt %s does not own timer %s",
+				appID, timerCharge.TimerID,
+			)
+		}
+		if _, duplicate := seenTimers[timerCharge.TimerID]; duplicate {
+			return 0, "", fmt.Errorf(
+				"combined proration attempt %s received duplicate timer %s",
+				appID, timerCharge.TimerID,
+			)
+		}
+		seenTimers[timerCharge.TimerID] = struct{}{}
+	}
+
 	due, err := centsNumeric(pc.Invoice.AmountDueCents)
 	if err != nil {
 		return 0, "", err
@@ -1884,29 +2070,66 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 			return 0, "", err
 		}
 	}
-	// Arm the one-shot guard. First-write-wins (WHERE proration_invoice_id IS
-	// NULL): a concurrent second attempt for the same app affects 0 rows here
-	// and keeps the winner's (identical, by construction) invoice id.
-	if _, err := qtx.SetAppProrationInvoice(ctx, db.SetAppProrationInvoiceParams{
-		AppID:              appID.String(),
-		ProrationInvoiceID: pgtype.Text{String: pc.InvoiceID, Valid: true},
-	}); err != nil {
+	// Resolve the header before its children inside THIS transaction. Other
+	// transactions continue to see it unresolved until commit, so ownership is
+	// never externally released early. The internal order allows migration
+	// 050's mixed-version guard to distinguish this exact owner writer from an
+	// old standalone worker. Any later child mismatch rolls this update back.
+	resolved, err := qtx.ResolveCombinedProrationAttempt(ctx, db.ResolveCombinedProrationAttemptParams{
+		ResolvedAt:        pc.ResolvedAt,
+		ResolvedInvoiceID: pgtype.Text{String: pc.InvoiceID, Valid: pc.InvoiceID != ""},
+		AppID:             appID.String(),
+	})
+	if err != nil {
 		return 0, "", err
 	}
+	if resolved != 1 {
+		return 0, "", fmt.Errorf(
+			"combined proration attempt %s could not resolve to invoice %s",
+			appID, pc.InvoiceID,
+		)
+	}
 
-	// Scenario 3 — stamp the co-created over-module timers billed on this SAME
-	// combined invoice as terminally charged, in the SAME transaction as the guard
-	// arm (all-or-nothing: an over-module and the app base are marked together).
-	// WHERE grace_resolved = false is first-write-wins — a Leg 1 sweep that already
-	// resolved a timer (its own invoice) affects 0 rows here, keeping the winner's ids.
+	// Arm the app guard only after the header is internally resolved, allowing
+	// migration 050's mixed-version trigger to reject legacy app workers while
+	// admitting this exact terminal transaction. First-write-wins must affect
+	// exactly one locked row; otherwise all writes, including header resolve,
+	// roll back.
+	armed, err := qtx.SetAppProrationInvoice(ctx, db.SetAppProrationInvoiceParams{
+		AppID:              appID.String(),
+		ProrationInvoiceID: pgtype.Text{String: pc.InvoiceID, Valid: true},
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	if armed != 1 {
+		return 0, "", fmt.Errorf(
+			"combined proration attempt %s could not arm app invoice %s",
+			appID, pc.InvoiceID,
+		)
+	}
+
+	// Scenario 3 — stamp every exact child billed on this SAME invoice. Unlike
+	// the generic legacy mark, this query proves child membership and returns a
+	// row count. A removed/resolved/stolen child is a loud atomic rollback; the
+	// header can never be buried while a timer guard disagrees.
 	for _, tc := range pc.TimerCharges {
-		if err := qtx.MarkModuleTimerCharged(ctx, db.MarkModuleTimerChargedParams{
-			TimerID:            tc.TimerID.String(),
+		marked, err := qtx.MarkCombinedProrationTimerCharged(ctx, db.MarkCombinedProrationTimerChargedParams{
 			GraceChargedAt:     tc.ChargedAt,
 			GraceInvoiceID:     pgtype.Text{String: tc.InvoiceID, Valid: tc.InvoiceID != ""},
 			GraceInvoiceItemID: pgtype.Text{String: tc.InvoiceItemID, Valid: tc.InvoiceItemID != ""},
-		}); err != nil {
+			TimerID:            tc.TimerID.String(),
+			AppID:              appID.String(),
+			ResolvedInvoiceID:  pgtype.Text{String: pc.InvoiceID, Valid: true},
+		})
+		if err != nil {
 			return 0, "", err
+		}
+		if marked != 1 {
+			return 0, "", fmt.Errorf(
+				"combined proration attempt %s could not terminally mark timer %s",
+				appID, tc.TimerID,
+			)
 		}
 	}
 
@@ -1914,6 +2137,52 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 		return 0, "", err
 	}
 	return ProrationLockedCharged, pc.InvoiceID, nil
+}
+
+func validateProrationChargeMatchesAttempt(attempt CombinedProrationAttempt, pc *ProrationCharge) error {
+	if pc == nil {
+		return errors.New("combined proration terminal payload required")
+	}
+	expectedCents := attempt.Shape.BaseChargeCents
+	timerCount := int64(len(attempt.TimerIDs))
+	if timerCount > 0 {
+		if attempt.Shape.ModuleChargeCents > (math.MaxInt64-expectedCents)/timerCount {
+			return errors.New("combined proration frozen cents overflow")
+		}
+		expectedCents += attempt.Shape.ModuleChargeCents * timerCount
+	}
+	sameSnapshot := func(got AppBaseSnapshot, want AppBaseSnapshot) bool {
+		return got.AppID == want.AppID &&
+			got.PeriodStart.Equal(want.PeriodStart) &&
+			got.PeriodEnd.Equal(want.PeriodEnd) &&
+			got.ModuleCount == want.ModuleCount &&
+			got.BaseMicros == want.BaseMicros
+	}
+	switch {
+	case pc.InvoiceID == "":
+		return errors.New("combined proration invoice id required")
+	case pc.Cents != attempt.Shape.BaseChargeCents:
+		return fmt.Errorf("combined proration base cents %d do not match frozen %d", pc.Cents, attempt.Shape.BaseChargeCents)
+	case pc.Invoice.StripeInvoiceID != pc.InvoiceID:
+		return errors.New("combined proration invoice mirror id disagrees with terminal id")
+	case pc.Invoice.AccountID != attempt.Shape.AccountID:
+		return errors.New("combined proration invoice account disagrees with frozen account")
+	case pc.Invoice.AmountDueCents != expectedCents:
+		return fmt.Errorf("combined proration invoice amount %d does not match frozen %d", pc.Invoice.AmountDueCents, expectedCents)
+	case pc.Invoice.Currency != attempt.Shape.Currency:
+		return errors.New("combined proration invoice currency disagrees with frozen currency")
+	case !pc.Invoice.PeriodStart.Equal(attempt.Shape.CoverageStart) ||
+		!pc.Invoice.PeriodEnd.Equal(attempt.Shape.CoverageEnd):
+		return errors.New("combined proration invoice period disagrees with frozen coverage")
+	case !sameSnapshot(pc.Snapshot, attempt.Shape.Snapshot):
+		return errors.New("combined proration primary snapshot disagrees with frozen snapshot")
+	case (pc.StraddleSnapshot == nil) != (attempt.Shape.StraddleSnapshot == nil):
+		return errors.New("combined proration straddle snapshot presence disagrees with frozen snapshot")
+	case pc.StraddleSnapshot != nil &&
+		!sameSnapshot(*pc.StraddleSnapshot, *attempt.Shape.StraddleSnapshot):
+		return errors.New("combined proration straddle snapshot disagrees with frozen snapshot")
+	}
+	return nil
 }
 
 func (s *pgxStore) ChargeProrationLocked(ctx context.Context, appID uuid.UUID, charge func(AppMirror) (*ProrationCharge, error)) (ProrationOutcome, string, error) {
@@ -2237,6 +2506,383 @@ func (s *pgxStore) MarkAppProrationAttempted(ctx context.Context, appID uuid.UUI
 	})
 }
 
+func readCombinedProrationAttempt(ctx context.Context, q *db.Queries, appID uuid.UUID) (CombinedProrationAttempt, bool, error) {
+	row, err := q.SelectCombinedProrationAttempt(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CombinedProrationAttempt{}, false, nil
+	}
+	if err != nil {
+		return CombinedProrationAttempt{}, false, err
+	}
+	timerRows, err := q.CombinedProrationAttemptTimerIDs(ctx, appID.String())
+	if err != nil {
+		return CombinedProrationAttempt{}, false, err
+	}
+	if int(row.TimerCount) != len(timerRows) {
+		return CombinedProrationAttempt{}, false, fmt.Errorf(
+			"combined proration attempt %s declares %d timers but has %d child rows",
+			appID, row.TimerCount, len(timerRows),
+		)
+	}
+	accountID, err := uuid.Parse(row.AccountID)
+	if err != nil {
+		return CombinedProrationAttempt{}, false, err
+	}
+	timerIDs := make([]uuid.UUID, 0, len(timerRows))
+	for _, raw := range timerRows {
+		timerID, err := uuid.Parse(raw)
+		if err != nil {
+			return CombinedProrationAttempt{}, false, err
+		}
+		timerIDs = append(timerIDs, timerID)
+	}
+	attempt := CombinedProrationAttempt{
+		AppID:       appID,
+		AttemptedAt: row.AttemptedAt,
+		Shape: CombinedProrationChargeShape{
+			AccountID:          accountID,
+			Currency:           row.Currency,
+			BaseChargeMicros:   row.BaseChargeMicros,
+			BaseChargeCents:    row.BaseChargeCents,
+			ModuleChargeMicros: row.ModuleChargeMicros,
+			ModuleChargeCents:  row.ModuleChargeCents,
+			CoverageStart:      row.CoverageStart,
+			CoverageEnd:        row.CoverageEnd,
+			BaseDescription:    row.BaseDescription,
+			ModuleDescription:  row.ModuleDescription,
+			Snapshot: AppBaseSnapshot{
+				AppID:       appID,
+				PeriodStart: row.SnapshotPeriodStart,
+				PeriodEnd:   row.SnapshotPeriodEnd,
+				ModuleCount: int(row.SnapshotModuleCount),
+				BaseMicros:  row.SnapshotBaseMicros,
+			},
+		},
+		TimerIDs: timerIDs,
+	}
+	if row.StraddlePeriodStart.Valid || row.StraddlePeriodEnd.Valid || row.StraddleBaseMicros.Valid {
+		if !row.StraddlePeriodStart.Valid || !row.StraddlePeriodEnd.Valid || !row.StraddleBaseMicros.Valid {
+			return CombinedProrationAttempt{}, false, fmt.Errorf(
+				"combined proration attempt %s has an incomplete straddle snapshot",
+				appID,
+			)
+		}
+		attempt.Shape.StraddleSnapshot = &AppBaseSnapshot{
+			AppID:       appID,
+			PeriodStart: row.StraddlePeriodStart.Time,
+			PeriodEnd:   row.StraddlePeriodEnd.Time,
+			ModuleCount: int(row.SnapshotModuleCount),
+			BaseMicros:  row.StraddleBaseMicros.Int64,
+		}
+	}
+	if row.ResolvedAt.Valid || row.ResolvedInvoiceID.Valid {
+		if !row.ResolvedAt.Valid || !row.ResolvedInvoiceID.Valid || row.ResolvedInvoiceID.String == "" {
+			return CombinedProrationAttempt{}, false, fmt.Errorf(
+				"combined proration attempt %s has an incomplete terminal state",
+				appID,
+			)
+		}
+		attempt.ResolvedAt = row.ResolvedAt.Time
+		attempt.ResolvedInvoiceID = row.ResolvedInvoiceID.String
+	}
+	return attempt, true, nil
+}
+
+func (s *pgxStore) CombinedProrationAttempt(ctx context.Context, appID uuid.UUID) (CombinedProrationAttempt, bool, error) {
+	return readCombinedProrationAttempt(ctx, s.q, appID)
+}
+
+func validateCombinedProrationShape(appID, accountID uuid.UUID, shape CombinedProrationChargeShape) error {
+	switch {
+	case shape.AccountID != accountID:
+		return fmt.Errorf("combined proration shape account %s does not match app account %s", shape.AccountID, accountID)
+	case shape.Currency == "":
+		return errors.New("combined proration currency required")
+	case shape.BaseChargeMicros <= 0:
+		return errors.New("combined proration base micros must be positive")
+	case shape.BaseChargeCents <= 0:
+		return errors.New("combined proration base cents must be positive")
+	case shape.ModuleChargeMicros < 0 || shape.ModuleChargeCents < 0:
+		return errors.New("combined proration module amount cannot be negative")
+	case (shape.ModuleChargeMicros == 0) != (shape.ModuleChargeCents == 0):
+		return errors.New("combined proration module micros and cents must both be zero or both be positive")
+	case shape.CoverageStart.IsZero() || !shape.CoverageEnd.After(shape.CoverageStart):
+		return errors.New("combined proration coverage window is invalid")
+	case shape.BaseDescription == "" || shape.ModuleDescription == "":
+		return errors.New("combined proration descriptions required")
+	case shape.Snapshot.AppID != appID:
+		return fmt.Errorf("combined proration snapshot app %s does not match %s", shape.Snapshot.AppID, appID)
+	case shape.Snapshot.PeriodStart.IsZero() || !shape.Snapshot.PeriodEnd.After(shape.Snapshot.PeriodStart):
+		return errors.New("combined proration primary snapshot window is invalid")
+	case shape.Snapshot.ModuleCount < 0 || shape.Snapshot.ModuleCount > maxModuleCount:
+		return errors.New("combined proration snapshot module count is invalid")
+	case shape.Snapshot.BaseMicros < 0:
+		return errors.New("combined proration snapshot micros cannot be negative")
+	}
+	if shape.StraddleSnapshot != nil {
+		switch {
+		case shape.StraddleSnapshot.AppID != appID:
+			return fmt.Errorf("combined proration straddle snapshot app %s does not match %s", shape.StraddleSnapshot.AppID, appID)
+		case shape.StraddleSnapshot.PeriodStart.IsZero() ||
+			!shape.StraddleSnapshot.PeriodEnd.After(shape.StraddleSnapshot.PeriodStart):
+			return errors.New("combined proration straddle snapshot window is invalid")
+		case shape.StraddleSnapshot.ModuleCount != shape.Snapshot.ModuleCount:
+			return errors.New("combined proration snapshots disagree on module count")
+		case shape.StraddleSnapshot.BaseMicros <= 0:
+			return errors.New("combined proration straddle snapshot micros must be positive")
+		}
+	}
+	return nil
+}
+
+func (s *pgxStore) FreezeCombinedProrationAttempt(
+	ctx context.Context,
+	appID uuid.UUID,
+	at time.Time,
+	shape CombinedProrationChargeShape,
+	creditRailEnabled bool,
+) (CombinedProrationAttempt, StripeRailClaimOutcome, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	// Enforced wallet mode makes this freeze the atomic Stripe-rail claim too.
+	// Resolve the account without a lock, then take the durable account mode
+	// lock BEFORE advisory→app→timers. A standard→credits transition takes the
+	// same account lock, so exactly one rail wins before any marker/network call.
+	// When the feature/schema capability is off, preserve the exact legacy path:
+	// no accounts.billing_mode read or account row lock at all.
+	var probedAccountID uuid.UUID
+	mode := CreditBillingModeStandard
+	if creditRailEnabled {
+		probe, err := qtx.SelectAppMirror(ctx, appID.String())
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !probe.AccountID.Valid) {
+			return CombinedProrationAttempt{}, StripeRailStale, nil
+		}
+		if err != nil {
+			return CombinedProrationAttempt{}, StripeRailStale, err
+		}
+		probedAccountID = uuidFromPg(probe.AccountID)
+		rawMode, err := qtx.LockWalletAccount(ctx, probedAccountID.String())
+		if err != nil {
+			return CombinedProrationAttempt{}, StripeRailStale, err
+		}
+		mode, err = parseCreditBillingMode(rawMode)
+		if err != nil {
+			return CombinedProrationAttempt{}, StripeRailStale, err
+		}
+	}
+
+	// Match every existing timer-set writer after the optional account lock:
+	// advisory timer-set lock, then app row. The advisory lock prevents a
+	// same-app reconcile insert/remove from escaping selected-row rechecks.
+	if err := lockModuleTimers(ctx, tx, appID); err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	// The app row is the first-write serialization point between freezers. A
+	// concurrent freezer waits here, then observes and returns the winner.
+	appRow, err := qtx.SelectAppMirrorForUpdate(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CombinedProrationAttempt{}, StripeRailStale, nil
+	}
+	if err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	accountID := uuidFromPg(appRow.AccountID)
+	if accountID == uuid.Nil {
+		return CombinedProrationAttempt{}, StripeRailStale, nil
+	}
+	if creditRailEnabled && accountID != probedAccountID {
+		return CombinedProrationAttempt{}, StripeRailStale, fmt.Errorf(
+			"app account changed during combined Stripe claim: before=%s locked=%s",
+			probedAccountID, accountID,
+		)
+	}
+	if existing, found, err := readCombinedProrationAttempt(ctx, qtx, appID); err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	} else if found {
+		if !appRow.ProrationAttemptedAt.Valid ||
+			existing.Shape.AccountID != accountID ||
+			(existing.ResolvedInvoiceID == "" && (appRow.ProrationInvoiceID.Valid || appRow.ProrationSkippedAt.Valid)) ||
+			(existing.ResolvedInvoiceID != "" &&
+				(!appRow.ProrationInvoiceID.Valid || appRow.ProrationInvoiceID.String != existing.ResolvedInvoiceID)) {
+			return CombinedProrationAttempt{}, StripeRailStale, fmt.Errorf(
+				"combined proration attempt %s disagrees with the app marker/terminal guard",
+				appID,
+			)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return CombinedProrationAttempt{}, StripeRailStale, err
+		}
+		// Recovery is authoritative even if the account transitioned to credits
+		// after the first standard-rail claim. Money may already have moved.
+		return existing, StripeRailClaimed, nil
+	}
+
+	// A marker without a migration-050 header cannot prove which timer lines
+	// landed. Never reconstruct pseudo-history from current FIFO state.
+	if appRow.ProrationAttemptedAt.Valid {
+		return CombinedProrationAttempt{}, StripeRailStale, ErrCombinedProrationAttemptUnknown
+	}
+	if appRow.ProrationInvoiceID.Valid ||
+		appRow.ProrationSkippedAt.Valid ||
+		(appRow.DeletedAt.Valid && appRow.DeletedAt.Time.Before(moduleGraceExpiry(appRow.CreatedAt.UTC()))) {
+		return CombinedProrationAttempt{}, StripeRailStale, nil
+	}
+	if err := validateCombinedProrationShape(appID, accountID, shape); err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	if creditRailEnabled && mode == CreditBillingModeCredits {
+		// No header, children, or legacy app marker have been written. The caller
+		// can safely retry the full charge through the wallet transaction.
+		return CombinedProrationAttempt{}, StripeRailWalletRequired, nil
+	}
+
+	var selected []string
+	if shape.ModuleChargeMicros > 0 && shape.ModuleChargeCents > 0 {
+		selected, err = qtx.CoCreatedOverModuleTimersForAttempt(ctx, db.CoCreatedOverModuleTimersForAttemptParams{
+			AccountID:       accountID.String(),
+			AppID:           appID.String(),
+			CreatedAt:       appRow.CreatedAt,
+			IncludedModules: int32(usage.IncludedModules),
+		})
+		if err != nil {
+			return CombinedProrationAttempt{}, StripeRailStale, err
+		}
+	}
+
+	// Lock + recheck every selected timer before the header exists. If a
+	// standalone marker, resolution, or removal won after the selection
+	// statement, rollback the entire freeze; a later retry selects coherently.
+	lockedTimers, err := qtx.LockCombinedProrationCandidateTimers(ctx, selected)
+	if err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	if len(lockedTimers) != len(selected) {
+		return CombinedProrationAttempt{}, StripeRailStale, ErrCombinedProrationSelectionChanged
+	}
+	selectedSet := make(map[string]struct{}, len(selected))
+	for _, timerID := range selected {
+		selectedSet[timerID] = struct{}{}
+	}
+	for _, timer := range lockedTimers {
+		if _, ok := selectedSet[timer.ID]; !ok ||
+			timer.AccountID != accountID.String() ||
+			timer.AppID != appID.String() ||
+			!timer.InstalledAt.Equal(appRow.CreatedAt) ||
+			timer.RemovedAt.Valid ||
+			timer.GraceResolved ||
+			timer.ChargeAttemptedAt.Valid {
+			return CombinedProrationAttempt{}, StripeRailStale, ErrCombinedProrationSelectionChanged
+		}
+	}
+
+	var straddleStart, straddleEnd pgtype.Timestamptz
+	var straddleMicros pgtype.Int8
+	if shape.StraddleSnapshot != nil {
+		straddleStart = pgtype.Timestamptz{Time: shape.StraddleSnapshot.PeriodStart, Valid: true}
+		straddleEnd = pgtype.Timestamptz{Time: shape.StraddleSnapshot.PeriodEnd, Valid: true}
+		straddleMicros = pgtype.Int8{Int64: shape.StraddleSnapshot.BaseMicros, Valid: true}
+	}
+	if len(selected) > math.MaxInt32 {
+		return CombinedProrationAttempt{}, StripeRailStale, errors.New("combined proration timer count overflows int32")
+	}
+	if at.IsZero() {
+		return CombinedProrationAttempt{}, StripeRailStale, errors.New("combined proration attempted_at required")
+	}
+	at = at.UTC()
+	if err := qtx.InsertCombinedProrationAttempt(ctx, db.InsertCombinedProrationAttemptParams{
+		AppID:               appID.String(),
+		AccountID:           accountID.String(),
+		AttemptedAt:         at,
+		Currency:            shape.Currency,
+		BaseChargeMicros:    shape.BaseChargeMicros,
+		BaseChargeCents:     shape.BaseChargeCents,
+		ModuleChargeMicros:  shape.ModuleChargeMicros,
+		ModuleChargeCents:   shape.ModuleChargeCents,
+		TimerCount:          int32(len(selected)), //nolint:gosec // checked against MaxInt32 above
+		CoverageStart:       shape.CoverageStart,
+		CoverageEnd:         shape.CoverageEnd,
+		BaseDescription:     shape.BaseDescription,
+		ModuleDescription:   shape.ModuleDescription,
+		SnapshotPeriodStart: shape.Snapshot.PeriodStart,
+		SnapshotPeriodEnd:   shape.Snapshot.PeriodEnd,
+		SnapshotBaseMicros:  shape.Snapshot.BaseMicros,
+		SnapshotModuleCount: int32(shape.Snapshot.ModuleCount), //nolint:gosec // validated ≤ maxModuleCount
+		StraddlePeriodStart: straddleStart,
+		StraddlePeriodEnd:   straddleEnd,
+		StraddleBaseMicros:  straddleMicros,
+	}); err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	if err := qtx.InsertCombinedProrationAttemptTimers(ctx, db.InsertCombinedProrationAttemptTimersParams{
+		AppID:    appID.String(),
+		TimerIds: selected,
+	}); err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	stamped, err := qtx.MarkAppProrationAttemptedWithFreeze(ctx, db.MarkAppProrationAttemptedWithFreezeParams{
+		AttemptedAt: at,
+		AppID:       appID.String(),
+	})
+	if err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	if stamped != 1 {
+		return CombinedProrationAttempt{}, StripeRailStale, errors.New("combined proration freeze could not stamp app attempt marker")
+	}
+	attempt, found, err := readCombinedProrationAttempt(ctx, qtx, appID)
+	if err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	if !found {
+		return CombinedProrationAttempt{}, StripeRailStale, errors.New("combined proration attempt missing immediately after insert")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	return attempt, StripeRailClaimed, nil
+}
+
+func (s *pgxStore) UnresolvedCombinedProrationAttempts(ctx context.Context, accountID uuid.UUID) ([]UnresolvedCombinedProrationAmount, error) {
+	rows, err := s.q.UnresolvedCombinedProrationAttempts(ctx, accountID.String())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UnresolvedCombinedProrationAmount, 0, len(rows))
+	for _, row := range rows {
+		if int64(row.TimerCount) != row.FrozenTimerCount {
+			return nil, fmt.Errorf(
+				"combined proration attempt %s declares %d timers but projection found %d",
+				row.AppID, row.TimerCount, row.FrozenTimerCount,
+			)
+		}
+		appID, err := uuid.Parse(row.AppID)
+		if err != nil {
+			return nil, err
+		}
+		timerCount := int64(row.TimerCount)
+		if timerCount > 0 && row.ModuleChargeMicros > (math.MaxInt64-row.BaseChargeMicros)/timerCount {
+			return nil, fmt.Errorf("combined proration attempt %s raw amount overflows int64", row.AppID)
+		}
+		out = append(out, UnresolvedCombinedProrationAmount{
+			AppID:              appID,
+			BaseChargeMicros:   row.BaseChargeMicros,
+			ModuleChargeMicros: row.ModuleChargeMicros,
+			TimerCount:         int(row.TimerCount),
+			TotalMicros:        row.BaseChargeMicros + row.ModuleChargeMicros*timerCount,
+		})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) TimerHasUnresolvedCombinedProrationOwner(ctx context.Context, timerID uuid.UUID) (bool, error) {
+	return s.q.TimerHasUnresolvedCombinedProrationOwner(ctx, timerID.String())
+}
+
 // lockModuleTimers takes the per-app advisory xact lock every timer-set writer
 // serializes on. Released automatically on commit/rollback.
 func lockModuleTimers(ctx context.Context, tx pgx.Tx, appID uuid.UUID) error {
@@ -2447,6 +3093,15 @@ func (s *pgxStore) DrawModuleOverageFromWallet(ctx context.Context, timerID uuid
 	if row.RemovedAt.Valid || row.GraceResolved {
 		// Removed, or resolved by a concurrent sweep between the work-list read and
 		// this lock — nothing to settle (the M2 stale posture).
+		return ModuleOverageWalletLockedStale, "", nil
+	}
+	owned, err := qtx.TimerHasUnresolvedCombinedProrationOwner(ctx, timerID.String())
+	if err != nil {
+		return 0, "", err
+	}
+	if owned {
+		// The combined app attempt committed ownership while this wallet worker
+		// waited on the timer row lock. It alone may settle the timer.
 		return ModuleOverageWalletLockedStale, "", nil
 	}
 	if row.ChargeAttemptedAt.Valid {

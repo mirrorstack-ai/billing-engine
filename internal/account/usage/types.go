@@ -604,7 +604,11 @@ type GetAccountBillResponse struct {
 	// an ACCOUNT line (NOT per app, NOT folded into any Apps[].base_fee_micros).
 	// Under the per-module-instance model overage is billed per install on its
 	// own grace timer (Leg 1); this display value is the steady-state estimate
-	// from the CURRENT live pool. Included in TotalMicros below.
+	// from the CURRENT live pool. Included in TotalMicros below; inside
+	// ProjectedTotalMicros the same steady-state amount is interpreted as the
+	// NEXT-period recurring overage forecast. Therefore normal one-time timer
+	// proration is additional, while an exact straddled-next-period $3 is
+	// de-duplicated from the unresolved increment.
 	AccountOverageMicros int64 `json:"account_overage_micros"`
 
 	// CustomDomainsMicros is the account's steady-state custom-domain fee:
@@ -629,8 +633,18 @@ type GetAccountBillResponse struct {
 	// live app in Apps, without using the current period's accrued base.
 	ProjectedBaseFeeTotalMicros int64 `json:"projected_base_fee_total_micros"`
 	// ProjectedTotalMicros has the same composition as TotalMicros, with
-	// ProjectedBaseFeeTotalMicros substituted for BaseFeeTotalMicros.
+	// ProjectedBaseFeeTotalMicros substituted for BaseFeeTotalMicros. On the
+	// current live window it additionally includes raw micro-USD exposure from
+	// every unresolved creation-base/module-timer charge, including the
+	// post-ETA/pre-sweep gap. Durable charged/skipped guards remove exposure;
+	// deterministically free D1d shapes contribute zero. A straddled period
+	// already present in the recurring next-period forecast is counted once.
 	ProjectedTotalMicros int64 `json:"projected_total_micros"`
+
+	// unresolvedOneTimeMicros is the non-wire seam for other usage-package
+	// projections that must consume the same authoritative one-time exposure
+	// without copying its SQL or reverse-engineering ProjectedTotalMicros.
+	unresolvedOneTimeMicros int64
 }
 
 // GetBillingPeriodsRequest is the payload of GetBillingPeriods: the owner

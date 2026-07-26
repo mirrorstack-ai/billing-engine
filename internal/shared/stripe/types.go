@@ -151,6 +151,48 @@ type Client interface {
 	FindInvoiceByRef(ctx context.Context, custID, ref string) (Invoice, bool, error)
 }
 
+// CombinedProrationClient is the resource-authoritative invoice-item surface
+// used only by the app-creation + co-created-module combined charge. The
+// durable database attempt freezes the expected item identities and shape;
+// recovery lists Stripe's actual items (rather than inferring landed lines
+// from an aggregate invoice amount) and creates only the missing identities.
+//
+// Kept narrower than Client so unrelated cycle fakes and call sites do not
+// acquire list/metadata methods they never use. NewClient's real implementation
+// satisfies both interfaces.
+type CombinedProrationClient interface {
+	// CreateCombinedProrationInvoiceItem pins one metadata-authenticated base or
+	// module item to the given draft. identity.TimerID is empty for the single
+	// app-base item and non-empty for one frozen timer item.
+	CreateCombinedProrationInvoiceItem(
+		ctx context.Context,
+		custID string,
+		invoiceID string,
+		amountCents int64,
+		currency string,
+		desc string,
+		period LinePeriod,
+		idemKey string,
+		identity CombinedProrationItemIdentity,
+	) (InvoiceItem, error)
+
+	// ListInvoiceItems returns the complete paginated Stripe resource truth.
+	ListInvoiceItems(ctx context.Context, invoiceID string) ([]InvoiceItem, error)
+}
+
+// CombinedProrationItemIdentity is the durable business identity stamped onto
+// a combined invoice item. An empty TimerID denotes the exactly-one base item;
+// a non-empty TimerID denotes that exact frozen co-created module timer.
+type CombinedProrationItemIdentity struct {
+	AppID   string
+	TimerID string
+}
+
+const (
+	CombinedProrationComponentAppBase       = "app_base"
+	CombinedProrationComponentModuleOverage = "module_overage"
+)
+
 // CreditPurchaseClient is the resource-authoritative Stripe surface for manual
 // wallet purchases. It is deliberately narrower than Client so ordinary cycle
 // fakes do not need the invoice-item/payment-list proof operations. Manual
@@ -241,6 +283,13 @@ type InvoiceItem struct {
 	ID          string
 	AmountCents int64
 	Currency    string
+	Description string
+	Period      LinePeriod
+	// Combined-proration resource identity projected from Stripe metadata.
+	// All three are empty on invoice items created by other charge flows.
+	CombinedProrationComponent string
+	CombinedProrationAppID     string
+	CombinedProrationTimerID   string
 }
 
 // Invoice is the trust-boundary-edge projection of a Stripe invoice the charge

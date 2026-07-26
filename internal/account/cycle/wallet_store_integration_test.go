@@ -217,12 +217,18 @@ func TestDrawCreationProrationFromWallet_Integration_AttemptedDefersBeforeDraw(t
 	ctx := context.Background()
 
 	accountID := seedAccount(t, pool)
-	_, err := pool.Exec(ctx, `UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`, accountID.String())
-	require.NoError(t, err)
 	appID := uuid.New()
 	createdAt := mustTime(t, "2026-06-19T12:00:00Z")
 	require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, createdAt, "race app"))
-	require.NoError(t, store.MarkAppProrationAttempted(ctx, appID, createdAt.Add(4*time.Hour)))
+	shape := combinedAttemptShape(appID, accountID)
+	shape.Snapshot.ModuleCount = 0
+	_, claim, err := store.FreezeCombinedProrationAttempt(
+		ctx, appID, createdAt.Add(4*time.Hour), shape, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, cycle.StripeRailClaimed, claim)
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`, accountID.String())
+	require.NoError(t, err)
 	insertWalletEntry(t, pool, accountID, uuid.New(), 5_000_000, "grant", "settled", nil, createdAt)
 
 	periodStart := mustTime(t, "2026-06-04T00:00:00Z")

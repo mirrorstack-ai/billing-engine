@@ -213,6 +213,20 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	}
 	res := &ModuleOverageResult{TimerID: cand.ID}
 
+	// Durable combined-attempt ownership outranks every mutable timer fact.
+	// Check it before removal/pending state and before live FIFO rank: a selected
+	// timer remains the app invoice's responsibility after uninstall or
+	// over→included promotion, until the atomic terminal transaction resolves
+	// the attempt and timer together.
+	ownedByCombined, err := s.store.TimerHasUnresolvedCombinedProrationOwner(ctx, cand.ID)
+	if err != nil {
+		return nil, billing.Internal("combined proration timer ownership lookup failed", err)
+	}
+	if ownedByCombined {
+		res.Status = ModuleOverageDeferredToCombined
+		return res, nil
+	}
+
 	// CHARGE-TIME RE-VERIFICATION (review 2026-07-06, M2): the sweep's work list
 	// was read once and this candidate may be minutes stale — re-check live +
 	// unresolved immediately before acting, so a module removed (or resolved by
@@ -317,9 +331,32 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		return nil, billing.Internal("app mirror lookup failed", err)
 	}
 	if found && cand.InstalledAt.Equal(app.CreatedAt) &&
-		app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.Deleted {
-		res.Status = ModuleOverageDeferredToCombined
-		return res, nil
+		app.ProrationInvoiceID == "" && !app.ProrationSkipped {
+		if !app.ProrationAttempted {
+			// No set is frozen yet, so the creation leg still owns the decision
+			// and must linearize before standalone Leg 1 can claim any co-created
+			// timer.
+			res.Status = ModuleOverageDeferredToCombined
+			return res, nil
+		}
+		// Once a known set exists, only its exact child IDs defer. This timer was
+		// not owned at the top-of-method check, so a later FIFO change may make it
+		// a legitimate standalone overage. A legacy marker without a header is
+		// unprovable and must fail closed instead of guessing.
+		if attempt, known, err := s.store.CombinedProrationAttempt(ctx, cand.AppID); err != nil {
+			return nil, billing.Internal("combined proration attempt lookup failed (module overage)", err)
+		} else if !known {
+			return nil, billing.Internal(fmt.Sprintf(
+				"module overage: app %s has a legacy combined marker without exact ownership",
+				cand.AppID,
+			), ErrCombinedProrationAttemptUnknown)
+		} else if attempt.Shape.AccountID != cand.AccountID ||
+			attempt.ResolvedInvoiceID != "" {
+			return nil, billing.Internal(fmt.Sprintf(
+				"module overage: app %s combined attempt disagrees with its unarmed app guard",
+				cand.AppID,
+			), nil)
+		}
 	}
 
 	// Coverage (review 2026-07-06 contract, moduleOverageCoverage): install day →

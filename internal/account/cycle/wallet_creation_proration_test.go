@@ -336,11 +336,22 @@ func TestChargeCreationProration_LockedAttemptDefersWalletToStripeRecovery(t *te
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, created, 0)
 	store.beforeCreationWalletDraw = func(f *fakeStore, id uuid.UUID) {
-		app := f.apps[id]
-		app.ProrationAttempted = true
-		f.apps[id] = app
+		// A concurrent standard-rail worker freezes exact ownership and crashes
+		// before draft creation while this worker is between its unlocked mode
+		// read and wallet app-row lock.
+		f.walletMode = cycle.CreditBillingModeStandard
+		attempt := freezeCombinedBeforeDraft(t, svc, store, sc, id)
+		f.walletMode = cycle.CreditBillingModeCredits
+		sc.setFindByRef("app-proration:"+id.String(), billingstripe.Invoice{
+			ID:         "in_race_winner",
+			CustomerID: store.stripeCustomer,
+			Status:     "paid",
+			AmountDue:  attempt.Shape.BaseChargeCents,
+			AmountPaid: attempt.Shape.BaseChargeCents,
+			Currency:   "usd",
+		})
+		seedCombinedAttemptItems(t, sc, "in_race_winner", attempt, nil)
 	}
-	sc.setFindByRef("app-proration:"+appID.String(), cycleInvoice("in_race_winner", 1000))
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)

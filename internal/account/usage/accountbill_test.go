@@ -634,6 +634,375 @@ func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
 		"projected and accrued totals must differ by exactly the base delta")
 }
 
+func TestGetAccountBill_ProjectedTotalIncludesUnresolvedCreationUntilDurableTerminal(t *testing.T) {
+	store := newFakeStore()
+	owner, accountID := uuid.New(), uuid.New()
+	store.accounts[owner] = accountID
+	store.anchorDays[accountID] = 11
+
+	now := time.Date(2026, 7, 25, 11, 0, 0, 0, time.UTC)
+	activatedAt := time.Date(2026, 6, 11, 9, 0, 0, 0, time.UTC)
+	apps := []uuid.UUID{seqUUID(1), seqUUID(2), seqUUID(3), seqUUID(4), seqUUID(5)}
+	for _, appID := range apps {
+		store.appMirrors[appID] = usage.AppMirrorInfo{
+			CreatedAt: time.Date(2026, 7, 15, 11, 0, 0, 0, time.UTC),
+		}
+	}
+
+	// Match the reported bill: five live apps project $100 next-period base,
+	// one app carries $0.06 usage, and the account agent carries $0.01.
+	store.appBillRowsByApp[apps[0]] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "views.count", "", 60_000),
+	}
+	store.appBillRowsByApp[uuid.Nil] = []usage.AppMetricUsageRaw{
+		customLine(uuid.New(), "agent.tokens", "", 10_000),
+	}
+
+	pendingApp := apps[4]
+	createdAt := time.Date(2026, 7, 25, 11, 0, 0, 0, time.UTC)
+	store.appMirrors[pendingApp] = usage.AppMirrorInfo{CreatedAt: createdAt}
+	store.unresolvedOneTimeCharges = []usage.UnresolvedOneTimeChargeRaw{{
+		Kind:                  usage.UnresolvedOneTimeChargeCreationBase,
+		ChargeID:              pendingApp,
+		AppID:                 pendingApp,
+		ChargeAt:              createdAt,
+		GraceExpiresAt:        usage.GraceExpiry(createdAt),
+		ActivatedAt:           activatedAt,
+		CountsTowardRecurring: true,
+	}}
+
+	svc := newService(store).WithNow(func() time.Time { return now })
+	bill, err := svc.GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+
+	const (
+		recurringProjection = int64(100_070_000) // $100.07
+		pendingCreation     = int64(10_967_742)  // $10.967742 → UI $10.97
+		wantProjection      = int64(111_037_742) // UI rounds to $111.04
+	)
+	require.Equal(t, int64(5)*usage.BaseFeeMicros, bill.ProjectedBaseFeeTotalMicros)
+	require.Equal(t, recurringProjection, bill.ProjectedTotalMicros-pendingCreation)
+	require.Equal(t, wantProjection, bill.ProjectedTotalMicros)
+
+	// ETA is only a scheduling threshold. A delayed daily sweep must not make
+	// the amount disappear while the durable guard is still unresolved.
+	svc = newService(store).WithNow(func() time.Time {
+		return usage.GraceExpiry(createdAt).Add(24 * time.Hour)
+	})
+	afterETA, err := svc.GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantProjection, afterETA.ProjectedTotalMicros)
+
+	// Once the Stripe rail starts, migration 050 replaces dynamic recomputation
+	// with the immutable first-write amount. The pending exposure must not blink
+	// out during that ownership handoff or drift while Stripe recovery retries.
+	store.unresolvedOneTimeCharges[0].Frozen = true
+	store.unresolvedOneTimeCharges[0].FrozenAmountMicros = pendingCreation
+	store.unresolvedOneTimeCharges[0].FrozenSnapshotPeriodStart =
+		time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
+	store.unresolvedOneTimeCharges[0].FrozenSnapshotPeriodEnd =
+		time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	store.unresolvedOneTimeCharges[0].FrozenSnapshotBaseMicros = pendingCreation
+	frozenRetry, err := svc.GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantProjection, frozenRetry.ProjectedTotalMicros)
+
+	// The store query drops the row atomically when either the settled guard or
+	// permanent-skip guard arms. Settled charges are never added back.
+	store.unresolvedOneTimeCharges = nil
+	terminal, err := svc.GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.Equal(t, recurringProjection, terminal.ProjectedTotalMicros)
+}
+
+func TestGetAccountBill_UnresolvedOneTimeChargeShapesAndRecurringDedup(t *testing.T) {
+	tests := []struct {
+		name                  string
+		now                   time.Time
+		activatedAt           time.Time
+		kind                  usage.UnresolvedOneTimeChargeKind
+		chargeAt              time.Time
+		graceExpiresAt        time.Time
+		countsTowardRecurring bool
+		moduleCount           int
+		wantIncrementMicros   int64
+	}{
+		{
+			name:                  "D1d fully pre-activation creation is deterministically free",
+			now:                   time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeCreationBase,
+			chargeAt:              time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: true,
+			wantIncrementMicros:   0,
+		},
+		{
+			name:                  "D1d narrows a creation straddle to the post-activation period",
+			now:                   time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeCreationBase,
+			chargeAt:              time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: true,
+			wantIncrementMicros:   usage.BaseFeeMicros,
+		},
+		{
+			name:                  "creation straddle overlapping forecast adds only raw first-period proration",
+			now:                   time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeCreationBase,
+			chargeAt:              time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: true,
+			wantIncrementMicros:   1_290_323, // $20 × 2 remaining days / 31
+		},
+		{
+			name:                  "grace exactly at boundary is an inclusive straddle and deduplicates",
+			now:                   time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeCreationBase,
+			chargeAt:              time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: true,
+			wantIncrementMicros:   1_935_484, // full next period is already in projected base
+		},
+		{
+			name:                  "delayed older creation retains non-overlapping straddled period",
+			now:                   time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeCreationBase,
+			chargeAt:              time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: true,
+			wantIncrementMicros:   21_290_323,
+		},
+		{
+			name:                  "normal module proration is additional to next-period recurring overage",
+			now:                   time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 6, 11, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeModuleTimer,
+			chargeAt:              time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: true,
+			moduleCount:           usage.IncludedModules + 1,
+			wantIncrementMicros:   2_129_032, // raw $3 × 22 remaining days / 31
+		},
+		{
+			name:                  "module straddle uses raw wallet micros and removes overlapping recurring fee",
+			now:                   time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeModuleTimer,
+			chargeAt:              time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: true,
+			moduleCount:           usage.IncludedModules + 1,
+			wantIncrementMicros:   193_548, // $3 × 2 remaining days / 31, not Stripe-cent rounded
+		},
+		{
+			name:                  "attempted timer now included keeps full unresolved recovery shape",
+			now:                   time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC),
+			activatedAt:           time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC),
+			kind:                  usage.UnresolvedOneTimeChargeModuleTimer,
+			chargeAt:              time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC),
+			graceExpiresAt:        time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
+			countsTowardRecurring: false,
+			moduleCount:           usage.IncludedModules,
+			wantIncrementMicros:   3_193_548,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			owner, accountID, appID := uuid.New(), uuid.New(), uuid.New()
+			store.accounts[owner] = accountID
+			store.anchorDays[accountID] = tc.activatedAt.UTC().Day()
+			store.appMirrors[appID] = usage.AppMirrorInfo{
+				CreatedAt:   tc.chargeAt,
+				ModuleCount: tc.moduleCount,
+			}
+			store.unresolvedOneTimeCharges = []usage.UnresolvedOneTimeChargeRaw{{
+				Kind:                  tc.kind,
+				ChargeID:              uuid.New(),
+				AppID:                 appID,
+				ChargeAt:              tc.chargeAt,
+				GraceExpiresAt:        tc.graceExpiresAt,
+				ActivatedAt:           tc.activatedAt,
+				CountsTowardRecurring: tc.countsTowardRecurring,
+			}}
+
+			bill, err := newService(store).WithNow(func() time.Time {
+				return tc.now
+			}).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+				OwnerUserID: owner,
+			})
+			require.NoError(t, err)
+			recurring := bill.ProjectedBaseFeeTotalMicros + bill.AccountOverageMicros
+			require.Equal(t, tc.wantIncrementMicros, bill.ProjectedTotalMicros-recurring)
+		})
+	}
+}
+
+func TestGetAccountBill_FrozenCombinedAttemptUsesExactMoneyAndExactRecurringMembership(t *testing.T) {
+	activatedAt := time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)
+	projectedStart := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	projectedEnd := time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)
+	creationPeriodStart := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
+	const (
+		frozenBase   = int64(21_290_323)
+		frozenModule = int64(3_193_548)
+	)
+
+	tests := []struct {
+		name                 string
+		appLive              bool
+		liveModuleCount      int
+		baseRecurring        bool
+		firstTimerRecurring  bool
+		secondTimerRecurring bool
+		snapshotStart        time.Time
+		snapshotEnd          time.Time
+		wantPending          int64
+	}{
+		{
+			name:                 "live app and both exact children deduct their overlapping recurring units",
+			appLive:              true,
+			liveModuleCount:      usage.IncludedModules + 2,
+			baseRecurring:        true,
+			firstTimerRecurring:  true,
+			secondTimerRecurring: true,
+			snapshotStart:        projectedStart,
+			snapshotEnd:          projectedEnd,
+			wantPending:          1_677_419,
+		},
+		{
+			name:                 "deleted app keeps full frozen base and timer recovery money",
+			appLive:              false,
+			baseRecurring:        false,
+			firstTimerRecurring:  false,
+			secondTimerRecurring: false,
+			snapshotStart:        projectedStart,
+			snapshotEnd:          projectedEnd,
+			wantPending:          frozenBase + 2*frozenModule,
+		},
+		{
+			name:                 "removed or now-included owned child is not deducted",
+			appLive:              true,
+			liveModuleCount:      usage.IncludedModules + 1,
+			baseRecurring:        true,
+			firstTimerRecurring:  true,
+			secondTimerRecurring: false,
+			snapshotStart:        projectedStart,
+			snapshotEnd:          projectedEnd,
+			wantPending:          frozenBase + 2*frozenModule - usage.BaseFeeMicros - usage.ModuleOverageFeeMicros,
+		},
+		{
+			name:                 "delayed old full-period snapshot does not overlap the current forecast",
+			appLive:              true,
+			liveModuleCount:      usage.IncludedModules + 2,
+			baseRecurring:        true,
+			firstTimerRecurring:  true,
+			secondTimerRecurring: true,
+			snapshotStart:        projectedStart.AddDate(0, -1, 0),
+			snapshotEnd:          projectedStart,
+			wantPending:          frozenBase + 2*frozenModule,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			owner, accountID, appID := uuid.New(), uuid.New(), uuid.New()
+			store.accounts[owner] = accountID
+			store.anchorDays[accountID] = activatedAt.Day()
+			mirror := usage.AppMirrorInfo{
+				CreatedAt:   time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
+				ModuleCount: tc.liveModuleCount,
+			}
+			if !tc.appLive {
+				mirror.Deleted = true
+				mirror.DeletedAt = time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC)
+			}
+			store.appMirrors[appID] = mirror
+
+			frozen := func(
+				kind usage.UnresolvedOneTimeChargeKind,
+				id uuid.UUID,
+				amount int64,
+				recurring bool,
+			) usage.UnresolvedOneTimeChargeRaw {
+				return usage.UnresolvedOneTimeChargeRaw{
+					Kind:                      kind,
+					ChargeID:                  id,
+					AppID:                     appID,
+					ChargeAt:                  time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC),
+					GraceExpiresAt:            time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
+					ActivatedAt:               activatedAt,
+					CountsTowardRecurring:     recurring,
+					Frozen:                    true,
+					FrozenAmountMicros:        amount,
+					FrozenSnapshotPeriodStart: creationPeriodStart,
+					FrozenSnapshotPeriodEnd:   projectedStart,
+					FrozenSnapshotBaseMicros:  1_290_323,
+					FrozenHasStraddle:         true,
+					FrozenStraddlePeriodStart: tc.snapshotStart,
+					FrozenStraddlePeriodEnd:   tc.snapshotEnd,
+					FrozenStraddleBaseMicros:  usage.BaseFeeMicros,
+				}
+			}
+			store.unresolvedOneTimeCharges = []usage.UnresolvedOneTimeChargeRaw{
+				frozen(usage.UnresolvedOneTimeChargeCreationBase, appID, frozenBase, tc.baseRecurring),
+				frozen(usage.UnresolvedOneTimeChargeModuleTimer, uuid.New(), frozenModule, tc.firstTimerRecurring),
+				frozen(usage.UnresolvedOneTimeChargeModuleTimer, uuid.New(), frozenModule, tc.secondTimerRecurring),
+			}
+
+			bill, err := newService(store).WithNow(func() time.Time {
+				return time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC)
+			}).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+				OwnerUserID: owner,
+			})
+			require.NoError(t, err)
+			recurring := bill.ProjectedBaseFeeTotalMicros + bill.AccountOverageMicros
+			require.Equal(t, tc.wantPending, bill.ProjectedTotalMicros-recurring)
+		})
+	}
+}
+
+func TestGetAccountBill_HistoricalPeriodNeverCarriesCurrentUnresolvedExposure(t *testing.T) {
+	store := newFakeStore()
+	owner, accountID, appID := uuid.New(), uuid.New(), uuid.New()
+	store.accounts[owner] = accountID
+	periodID := mirrorPeriod(store)
+	store.appMirrors[appID] = usage.AppMirrorInfo{
+		CreatedAt: time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC),
+	}
+	store.unresolvedOneTimeCharges = []usage.UnresolvedOneTimeChargeRaw{{
+		Kind:                  usage.UnresolvedOneTimeChargeCreationBase,
+		ChargeID:              appID,
+		AppID:                 appID,
+		ChargeAt:              time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC),
+		GraceExpiresAt:        time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
+		ActivatedAt:           time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		CountsTowardRecurring: true,
+	}}
+
+	bill, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+		PeriodID:    periodID.String(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, bill.ProjectedBaseFeeTotalMicros, bill.ProjectedTotalMicros)
+}
+
 func TestProjectedCreditChargeContainsOnlyUnpaidUsageExposure(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
@@ -803,6 +1172,8 @@ func TestGetAccountBill_AgentModelsJSONContract(t *testing.T) {
 
 	var wire map[string]any
 	require.NoError(t, json.Unmarshal(encoded, &wire))
+	require.NotContains(t, wire, "unresolved_one_time_micros",
+		"the package-internal projection seam must not change the public JSON contract")
 	agent, ok := wire["agent"].(map[string]any)
 	require.True(t, ok)
 	models, ok := agent["models"].([]any)
@@ -895,9 +1266,15 @@ func TestGetAccountBill_RejectsBothOwners(t *testing.T) {
 
 func TestGetAccountBill_InternalOnEnumerationErrors(t *testing.T) {
 	for name, arm := range map[string]func(*fakeStore){
-		"usage half":        func(f *fakeStore) { f.errAppIDsWithUsage = errors.New("boom") },
-		"mirror half":       func(f *fakeStore) { f.errMirroredApps = errors.New("boom") },
-		"live domain count": func(f *fakeStore) { f.errLiveDomainCount = errors.New("boom") },
+		"usage half":          func(f *fakeStore) { f.errAppIDsWithUsage = errors.New("boom") },
+		"mirror half":         func(f *fakeStore) { f.errMirroredApps = errors.New("boom") },
+		"live domain count":   func(f *fakeStore) { f.errLiveDomainCount = errors.New("boom") },
+		"unresolved one-time": func(f *fakeStore) { f.errUnresolvedOneTime = errors.New("boom") },
+		"unknown unresolved kind": func(f *fakeStore) {
+			f.unresolvedOneTimeCharges = []usage.UnresolvedOneTimeChargeRaw{{
+				Kind: "not-a-charge-kind",
+			}}
+		},
 		"per-app bill": func(f *fakeStore) {
 			f.usageAppIDs = []uuid.UUID{uuid.New()}
 			f.errAppBill = errors.New("boom")

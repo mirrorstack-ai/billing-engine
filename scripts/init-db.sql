@@ -79,3 +79,6 @@
 -- automatic top-up attempts.
 \i migrations/billing/048_credit_wallet.up.sql
 \i migrations/billing/049_credit_auto_topup_attempts.up.sql
+
+-- 050: durable exact ownership for combined creation-proration attempts.
+\i migrations/billing/050_combined_proration_attempts.up.sql

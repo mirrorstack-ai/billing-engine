@@ -201,6 +201,21 @@ func (s *Service) WithCreditRollout(controller *rollout.Controller) *Service {
 	return s
 }
 
+// creditWalletRailEnabled reports whether this worker must serialize fresh
+// Stripe claims against durable mode transitions. Enforce applies to the whole
+// component, not only the rollout cohort: cohort selection may limit standard
+// account rollout, but it can never send an independently opted-in credits
+// account back to Stripe. Shadow/off preserve the exact legacy path.
+func (s *Service) creditWalletRailEnabled(accountID uuid.UUID) bool {
+	if !s.walletEnabled {
+		return false
+	}
+	if s.creditRollout == nil {
+		return true
+	}
+	return s.creditRollout.Decide(accountID).Mode == rollout.ModeEnforce
+}
+
 // creditBillingModeReader is intentionally narrower than Store. Production's
 // pgxStore implements it with a single accounts.billing_mode SELECT, while
 // legacy component fakes need not implement it unless they exercise rollout.
