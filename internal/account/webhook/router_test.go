@@ -822,7 +822,7 @@ func TestProcess_AutoTopUpFailureEventsUseResourceReconciler(t *testing.T) {
 		},
 		{
 			name: "action required", eventType: "invoice.payment_action_required",
-			status: "open", failureCode: "authentication_required", latches: true,
+			status: "open", failureCode: "authentication_required",
 		},
 		{
 			name: "voided", eventType: "invoice.voided",
@@ -1153,6 +1153,38 @@ func TestProcess_InvoicePaymentFailed_StaysOpen(t *testing.T) {
 	require.Equal(t, int64(0), s.AppliedInvoices[0].AmountPaidCents)
 }
 
+func TestProcess_InvoicePaymentActionRequired_AcksMirrorsWithoutFailureLatch(t *testing.T) {
+	// 3DS/SCA is a transient authentication step on an otherwise live payment.
+	// It must keep the invoice mirror current and ACK Stripe, but it must never
+	// feed the sticky service-block failure latch.
+	v := &webhooktest.FakeVerifier{Event: invoiceEvent(
+		"evt_inv_3ds",
+		"invoice.payment_action_required",
+		"in_3ds",
+		"open",
+		0,
+		1200,
+	)}
+	s := webhooktest.NewFakeStore()
+	s.ErrMarkFailed = errors.New("failure latch must not run for 3DS")
+	notifier := &recordingNotifier{}
+	r := newRouter(v, s).WithServingBlockNotifier(notifier)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.True(t, s.Processed["evt_inv_3ds"], "successful delivery stays acknowledged")
+	require.Empty(t, s.FailedInvoices, "3DS must not latch ever_failed")
+	require.Equal(t, []webhook.ApplyInvoiceStatusParams{{
+		StripeInvoiceID: "in_3ds",
+		Status:          "open",
+		AmountDueCents:  1200,
+	}}, s.AppliedInvoices, "the transient signal still refreshes the invoice mirror")
+	require.Equal(t, []string{"in_3ds"}, notifier.invoices,
+		"standing notification still observes the current mirrored state")
+}
+
 // --- service-block failure latch (migration 039; streak derived at read time) ---
 
 func TestProcess_FailureEvents_LatchEverFailed(t *testing.T) {
@@ -1195,11 +1227,13 @@ func TestProcess_FailureLatch_RunsEvenOnDriftMirror(t *testing.T) {
 }
 
 func TestProcess_NonFailureInvoiceEvent_DoesNotLatch(t *testing.T) {
-	// Only the two failure signals latch ever_failed. created/finalized/paid/void
-	// land the mirror but never mark the invoice failed.
+	// Only the two actual failure signals latch ever_failed. Transient
+	// authentication plus created/finalized/paid/void land the mirror but never
+	// mark the invoice failed.
 	for _, ev := range []struct{ name, typ, status string }{
 		{"created", "invoice.created", "draft"},
 		{"finalized", "invoice.finalized", "open"},
+		{"payment_action_required", "invoice.payment_action_required", "open"},
 		{"paid", "invoice.paid", "paid"},
 		{"voided", "invoice.voided", "void"},
 	} {

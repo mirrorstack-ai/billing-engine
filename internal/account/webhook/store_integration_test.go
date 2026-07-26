@@ -224,6 +224,102 @@ func TestRouter_InvoicePaidSettlesManualCreditWithoutInvoiceMirror(t *testing.T)
 	require.Equal(t, []uuid.UUID{accountID}, observer.accounts, "ledger replay must not observe twice")
 }
 
+func TestRouter_InvoicePaymentActionRequiredIsNonLatchingButFailuresLatch(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	accountID := seedAccount(t, pool, "cus_invoice_signals")
+	for _, invoiceID := range []string{
+		"in_action_required",
+		"in_payment_failed",
+		"in_uncollectible",
+	} {
+		seedInvoice(t, pool, accountID, invoiceID, "open", 0, 1200)
+	}
+
+	verifier := &webhooktest.FakeVerifier{}
+	stripe := &webhooktest.FakeChargeRetriever{}
+	router := webhook.NewRouter(
+		verifier,
+		webhook.NewStore(pool),
+		stripe,
+		stripe,
+		webhooktest.SilentLogger(),
+	)
+
+	tests := []struct {
+		name           string
+		eventID        string
+		eventType      string
+		invoiceID      string
+		eventStatus    string
+		wantEverFailed bool
+	}{
+		{
+			name:        "3DS action required stays transient",
+			eventID:     "evt_action_required",
+			eventType:   "invoice.payment_action_required",
+			invoiceID:   "in_action_required",
+			eventStatus: "open",
+		},
+		{
+			name:           "payment failed latches",
+			eventID:        "evt_payment_failed",
+			eventType:      "invoice.payment_failed",
+			invoiceID:      "in_payment_failed",
+			eventStatus:    "open",
+			wantEverFailed: true,
+		},
+		{
+			name:           "marked uncollectible latches",
+			eventID:        "evt_uncollectible",
+			eventType:      "invoice.marked_uncollectible",
+			invoiceID:      "in_uncollectible",
+			eventStatus:    "uncollectible",
+			wantEverFailed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verifier.Event = invoiceEvent(
+				tt.eventID,
+				tt.eventType,
+				tt.invoiceID,
+				tt.eventStatus,
+				0,
+				1200,
+			)
+
+			result := router.Process(ctx, []byte(`{}`), "sig")
+
+			require.Equal(t, 200, result.HTTPStatus)
+			require.Equal(t, webhook.StatusOK, result.Status)
+
+			var (
+				status     string
+				everFailed bool
+				processed  bool
+			)
+			require.NoError(t, pool.QueryRow(ctx,
+				`SELECT status, ever_failed
+				   FROM ms_billing.invoices
+				  WHERE stripe_invoice_id = $1`,
+				tt.invoiceID,
+			).Scan(&status, &everFailed))
+			require.Equal(t, tt.eventStatus, status)
+			require.Equal(t, tt.wantEverFailed, everFailed)
+			require.NoError(t, pool.QueryRow(ctx,
+				`SELECT EXISTS (
+				   SELECT 1 FROM ms_billing.webhook_events_processed
+				    WHERE event_id = $1
+				 )`,
+				tt.eventID,
+			).Scan(&processed))
+			require.True(t, processed, "successful signal remains acknowledged")
+		})
+	}
+}
+
 func TestPgxStore_TouchAccountByStripeCustomer_FoundAndNotFound(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := webhook.NewStore(pool)
