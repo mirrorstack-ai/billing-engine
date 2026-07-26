@@ -88,9 +88,18 @@ type creditRuntimeSchemaExecutor interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+func warnCreditSchemaCapabilitiesNotReady(ctx context.Context, missing []string) {
+	slog.WarnContext(
+		ctx,
+		"credit runtime schema capability probe is not ready",
+		"missing_or_incompatible_capabilities",
+		missing,
+	)
+}
+
 // creditWalletCatalogCapabilityProbe checks the base objects needed before the
-// exact migration-049 contract can be meaningful. Every relation/column name
-// is data filtered from pg_catalog; none appears in a direct FROM/SELECT target.
+// migration-049 capabilities can be meaningful. Every relation/column name is
+// data filtered from pg_catalog; none appears in a direct FROM/SELECT target.
 const creditWalletCatalogCapabilityProbe = `
 WITH schema_relations AS (
     SELECT relation.oid, relation.relname, relation.relkind
@@ -146,6 +155,23 @@ func creditRecoverySchemaReady(
 		return false, err
 	}
 	if !billingMode || !ledger || !autoTopUpConfig {
+		var missing []string
+		if !billingMode {
+			missing = append(
+				missing,
+				"ms_billing.accounts.billing_mode (non-null text column)",
+			)
+		}
+		if !ledger {
+			missing = append(missing, "ms_billing.credit_ledger (ordinary table)")
+		}
+		if !autoTopUpConfig {
+			missing = append(
+				missing,
+				"ms_billing.credit_auto_topup_configs (ordinary table)",
+			)
+		}
+		warnCreditSchemaCapabilitiesNotReady(ctx, missing)
 		return false, nil
 	}
 	return creditAutoTopUpSchemaReady(ctx, db)
@@ -155,6 +181,10 @@ func creditWalletSchemaReady(ctx context.Context, db creditWalletSchemaExecutor)
 	if _, err := db.Exec(ctx, "SELECT billing_mode FROM ms_billing.accounts LIMIT 0"); err != nil {
 		var pg *pgconn.PgError
 		if errors.As(err, &pg) && (pg.Code == "42P01" || pg.Code == "42703") {
+			warnCreditSchemaCapabilitiesNotReady(
+				ctx,
+				[]string{"ms_billing.accounts.billing_mode (readable column)"},
+			)
 			return false, nil
 		}
 		return false, err
@@ -162,6 +192,10 @@ func creditWalletSchemaReady(ctx context.Context, db creditWalletSchemaExecutor)
 	if _, err := db.Exec(ctx, "SELECT 1 FROM ms_billing.credit_ledger LIMIT 0"); err != nil {
 		var pg *pgconn.PgError
 		if errors.As(err, &pg) && pg.Code == "42P01" {
+			warnCreditSchemaCapabilitiesNotReady(
+				ctx,
+				[]string{"ms_billing.credit_ledger (readable table)"},
+			)
 			return false, nil
 		}
 		return false, err
@@ -170,7 +204,8 @@ func creditWalletSchemaReady(ctx context.Context, db creditWalletSchemaExecutor)
 }
 
 // creditAutoTopUpSchemaContract is deliberately one boolean per runtime
-// dependency. Keeping the fields separate makes a drifted migration fail closed
+// dependency. Keeping the fields separate makes a partial migration fail
+// closed, identifies every missing or incompatible capability in diagnostics,
 // and lets tests remove each capability independently.
 type creditAutoTopUpSchemaContract struct {
 	configPaymentMethodColumn      bool
@@ -188,34 +223,91 @@ type creditAutoTopUpSchemaContract struct {
 }
 
 func (c creditAutoTopUpSchemaContract) ready() bool {
-	return c.configPaymentMethodColumn &&
-		c.attemptPaymentMethodColumn &&
-		c.attemptStripePMColumn &&
-		c.attemptStripeCustomerColumn &&
-		c.attemptExpiresColumn &&
-		c.failureCodeColumn &&
-		c.configPaymentMethodForeignKey &&
-		c.attemptPaymentMethodForeignKey &&
-		c.attemptFieldsCheck &&
-		c.failureStateCheck &&
-		c.attemptWindowCheck &&
-		c.pendingAttemptUniqueIndex
+	return len(c.missingCapabilities()) == 0
 }
 
-// creditAutoTopUpSchemaContractProbe verifies migration 049 as a runtime
-// contract, not merely as a list of readable column names. The executor relies
-// on the exact nullable frozen-attempt types, validated constraints, and the
-// valid one-pending-attempt-per-account unique index for money safety.
-//
-// pg_get_constraintdef / pg_get_expr use the non-pretty form so the comparison
-// is stable for the repository's PostgreSQL 17 contract.
+func (c creditAutoTopUpSchemaContract) missingCapabilities() []string {
+	checks := []struct {
+		name  string
+		ready bool
+	}{
+		{
+			name:  "ms_billing.credit_auto_topup_configs.payment_method_id (nullable uuid column)",
+			ready: c.configPaymentMethodColumn,
+		},
+		{
+			name:  "ms_billing.credit_ledger.attempt_payment_method_id (nullable uuid column)",
+			ready: c.attemptPaymentMethodColumn,
+		},
+		{
+			name:  "ms_billing.credit_ledger.attempt_stripe_payment_method_id (nullable text column)",
+			ready: c.attemptStripePMColumn,
+		},
+		{
+			name:  "ms_billing.credit_ledger.attempt_stripe_customer_id (nullable text column)",
+			ready: c.attemptStripeCustomerColumn,
+		},
+		{
+			name:  "ms_billing.credit_ledger.attempt_expires_at (nullable timestamptz column)",
+			ready: c.attemptExpiresColumn,
+		},
+		{
+			name:  "ms_billing.credit_ledger.failure_code (nullable text column)",
+			ready: c.failureCodeColumn,
+		},
+		{
+			name: "ms_billing.credit_auto_topup_configs constraint " +
+				"credit_auto_topup_configs_payment_method_fkey (validated foreign key)",
+			ready: c.configPaymentMethodForeignKey,
+		},
+		{
+			name: "ms_billing.credit_ledger constraint " +
+				"credit_ledger_attempt_payment_method_fkey (validated foreign key)",
+			ready: c.attemptPaymentMethodForeignKey,
+		},
+		{
+			name: "ms_billing.credit_ledger constraint " +
+				"credit_ledger_auto_topup_attempt_fields_check (validated check constraint)",
+			ready: c.attemptFieldsCheck,
+		},
+		{
+			name: "ms_billing.credit_ledger constraint " +
+				"credit_ledger_auto_topup_failure_state_check (validated check constraint)",
+			ready: c.failureStateCheck,
+		},
+		{
+			name: "ms_billing.credit_ledger constraint " +
+				"credit_ledger_auto_topup_attempt_window_check (validated check constraint)",
+			ready: c.attemptWindowCheck,
+		},
+		{
+			name: "ms_billing.credit_ledger_auto_topup_pending_uidx " +
+				"(valid unique index on ms_billing.credit_ledger)",
+			ready: c.pendingAttemptUniqueIndex,
+		},
+	}
+
+	var missing []string
+	for _, check := range checks {
+		if !check.ready {
+			missing = append(missing, check.name)
+		}
+	}
+	return missing
+}
+
+// creditAutoTopUpSchemaContractProbe verifies that migration 049's runtime
+// capabilities exist with the required catalog-level kind, type, nullability,
+// and validity. It deliberately does not compare pg_get_* output: PostgreSQL's
+// rendered definitions are not a stable runtime interface. The exact
+// constraint and index shapes remain pinned by the PostgreSQL integration
+// suite (and the production migration verifier).
 const creditAutoTopUpSchemaContractProbe = `
 WITH schema_columns AS (
     SELECT
         relation.relname AS table_name,
         attribute.attname AS column_name,
         attribute.atttypid AS type_id,
-        attribute.atttypmod AS type_modifier,
         attribute.attnotnull AS not_null
     FROM pg_catalog.pg_namespace AS namespace
     JOIN pg_catalog.pg_class AS relation
@@ -232,8 +324,7 @@ schema_constraints AS (
         relation.relname AS table_name,
         catalog_constraint.conname AS constraint_name,
         catalog_constraint.contype AS constraint_type,
-        catalog_constraint.convalidated AS validated,
-        pg_catalog.pg_get_constraintdef(catalog_constraint.oid, false) AS definition
+        catalog_constraint.convalidated AS validated
     FROM pg_catalog.pg_namespace AS namespace
     JOIN pg_catalog.pg_class AS relation
       ON relation.relnamespace = namespace.oid
@@ -248,16 +339,7 @@ schema_indexes AS (
         catalog_index.indisunique AS is_unique,
         catalog_index.indisvalid AS is_valid,
         catalog_index.indisready AS is_ready,
-        catalog_index.indislive AS is_live,
-        catalog_index.indnkeyatts AS key_attribute_count,
-        catalog_index.indnatts AS attribute_count,
-        access_method.amname AS access_method,
-        pg_catalog.pg_get_indexdef(catalog_index.indexrelid, 1, true) AS key_column,
-        pg_catalog.pg_get_expr(
-            catalog_index.indpred,
-            catalog_index.indrelid,
-            false
-        ) AS predicate
+        catalog_index.indislive AS is_live
     FROM pg_catalog.pg_namespace AS namespace
     JOIN pg_catalog.pg_class AS relation
       ON relation.relnamespace = namespace.oid
@@ -265,8 +347,6 @@ schema_indexes AS (
       ON catalog_index.indrelid = relation.oid
     JOIN pg_catalog.pg_class AS index_relation
       ON index_relation.oid = catalog_index.indexrelid
-    JOIN pg_catalog.pg_am AS access_method
-      ON access_method.oid = index_relation.relam
     WHERE namespace.nspname = 'ms_billing'
 )
 SELECT
@@ -276,7 +356,6 @@ SELECT
         WHERE table_name = 'credit_auto_topup_configs'
           AND column_name = 'payment_method_id'
           AND type_id = 'uuid'::regtype
-          AND type_modifier = -1
           AND NOT not_null
     ),
     EXISTS (
@@ -285,7 +364,6 @@ SELECT
         WHERE table_name = 'credit_ledger'
           AND column_name = 'attempt_payment_method_id'
           AND type_id = 'uuid'::regtype
-          AND type_modifier = -1
           AND NOT not_null
     ),
     EXISTS (
@@ -294,7 +372,6 @@ SELECT
         WHERE table_name = 'credit_ledger'
           AND column_name = 'attempt_stripe_payment_method_id'
           AND type_id = 'text'::regtype
-          AND type_modifier = -1
           AND NOT not_null
     ),
     EXISTS (
@@ -303,7 +380,6 @@ SELECT
         WHERE table_name = 'credit_ledger'
           AND column_name = 'attempt_stripe_customer_id'
           AND type_id = 'text'::regtype
-          AND type_modifier = -1
           AND NOT not_null
     ),
     EXISTS (
@@ -312,7 +388,6 @@ SELECT
         WHERE table_name = 'credit_ledger'
           AND column_name = 'attempt_expires_at'
           AND type_id = 'timestamptz'::regtype
-          AND type_modifier = -1
           AND NOT not_null
     ),
     EXISTS (
@@ -321,7 +396,6 @@ SELECT
         WHERE table_name = 'credit_ledger'
           AND column_name = 'failure_code'
           AND type_id = 'text'::regtype
-          AND type_modifier = -1
           AND NOT not_null
     ),
     EXISTS (
@@ -331,7 +405,6 @@ SELECT
           AND constraint_name = 'credit_auto_topup_configs_payment_method_fkey'
           AND constraint_type = 'f'
           AND validated
-          AND definition = 'FOREIGN KEY (payment_method_id) REFERENCES ms_billing.payment_methods_mirror(id) DEFERRABLE'
     ),
     EXISTS (
         SELECT 1
@@ -340,7 +413,6 @@ SELECT
           AND constraint_name = 'credit_ledger_attempt_payment_method_fkey'
           AND constraint_type = 'f'
           AND validated
-          AND definition = 'FOREIGN KEY (attempt_payment_method_id) REFERENCES ms_billing.payment_methods_mirror(id) DEFERRABLE'
     ),
     EXISTS (
         SELECT 1
@@ -349,7 +421,6 @@ SELECT
           AND constraint_name = 'credit_ledger_auto_topup_attempt_fields_check'
           AND constraint_type = 'c'
           AND validated
-          AND definition = 'CHECK ((((type = ''auto_topup''::text) AND (attempt_payment_method_id IS NOT NULL) AND (NULLIF(btrim(attempt_stripe_payment_method_id), ''''::text) IS NOT NULL) AND (NULLIF(btrim(attempt_stripe_customer_id), ''''::text) IS NOT NULL) AND (attempt_expires_at IS NOT NULL)) OR ((type <> ''auto_topup''::text) AND (attempt_payment_method_id IS NULL) AND (attempt_stripe_payment_method_id IS NULL) AND (attempt_stripe_customer_id IS NULL) AND (attempt_expires_at IS NULL) AND (failure_code IS NULL))))'
     ),
     EXISTS (
         SELECT 1
@@ -358,7 +429,6 @@ SELECT
           AND constraint_name = 'credit_ledger_auto_topup_failure_state_check'
           AND constraint_type = 'c'
           AND validated
-          AND definition = 'CHECK ((((type = ''auto_topup''::text) AND (status = ''failed''::text) AND (NULLIF(btrim(failure_code), ''''::text) IS NOT NULL)) OR ((NOT ((type = ''auto_topup''::text) AND (status = ''failed''::text))) AND (failure_code IS NULL))))'
     ),
     EXISTS (
         SELECT 1
@@ -367,7 +437,6 @@ SELECT
           AND constraint_name = 'credit_ledger_auto_topup_attempt_window_check'
           AND constraint_type = 'c'
           AND validated
-          AND definition = 'CHECK (((type <> ''auto_topup''::text) OR ((attempt_expires_at > created_at) AND (attempt_expires_at <= (created_at + ''00:10:00''::interval)))))'
     ),
     EXISTS (
         SELECT 1
@@ -378,11 +447,6 @@ SELECT
           AND is_valid
           AND is_ready
           AND is_live
-          AND key_attribute_count = 1
-          AND attribute_count = 1
-          AND access_method = 'btree'
-          AND key_column = 'account_id'
-          AND predicate = '((type = ''auto_topup''::text) AND (status = ''pending''::text))'
     )
 `
 
@@ -405,7 +469,11 @@ func creditAutoTopUpSchemaReady(ctx context.Context, db creditRuntimeSchemaExecu
 	if err != nil {
 		return false, err
 	}
-	return contract.ready(), nil
+	if contract.ready() {
+		return true, nil
+	}
+	warnCreditSchemaCapabilitiesNotReady(ctx, contract.missingCapabilities())
+	return false, nil
 }
 
 // MustEnv returns the value of the given env var. If unset or empty,

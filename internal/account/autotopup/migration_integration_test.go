@@ -16,47 +16,132 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
-func TestMigration049_NamedConstraintsAndMoneyAuditDeleteSemantics(t *testing.T) {
+func TestMigration049_ExactConstraintAndIndexShapesAndMoneyAuditDeleteSemantics(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	ctx := context.Background()
 
 	expectedConstraints := map[string]struct {
 		validated  bool
 		deferrable bool
+		kind       string
+		definition string
 	}{
-		"credit_auto_topup_configs_payment_method_fkey": {validated: true, deferrable: true},
-		"credit_ledger_attempt_payment_method_fkey":     {validated: true, deferrable: true},
-		"credit_ledger_auto_topup_attempt_fields_check": {validated: true},
-		"credit_ledger_auto_topup_failure_state_check":  {validated: true},
-		"credit_ledger_auto_topup_attempt_window_check": {validated: true},
+		"credit_auto_topup_configs_payment_method_fkey": {
+			validated:  true,
+			deferrable: true,
+			kind:       "f",
+			definition: "FOREIGN KEY (payment_method_id) REFERENCES ms_billing.payment_methods_mirror(id) DEFERRABLE",
+		},
+		"credit_ledger_attempt_payment_method_fkey": {
+			validated:  true,
+			deferrable: true,
+			kind:       "f",
+			definition: "FOREIGN KEY (attempt_payment_method_id) REFERENCES ms_billing.payment_methods_mirror(id) DEFERRABLE",
+		},
+		"credit_ledger_auto_topup_attempt_fields_check": {
+			validated: true,
+			kind:      "c",
+			definition: "CHECK ((((type = 'auto_topup'::text) AND (attempt_payment_method_id IS NOT NULL) " +
+				"AND (NULLIF(btrim(attempt_stripe_payment_method_id), ''::text) IS NOT NULL) " +
+				"AND (NULLIF(btrim(attempt_stripe_customer_id), ''::text) IS NOT NULL) " +
+				"AND (attempt_expires_at IS NOT NULL)) OR ((type <> 'auto_topup'::text) " +
+				"AND (attempt_payment_method_id IS NULL) " +
+				"AND (attempt_stripe_payment_method_id IS NULL) " +
+				"AND (attempt_stripe_customer_id IS NULL) AND (attempt_expires_at IS NULL) " +
+				"AND (failure_code IS NULL))))",
+		},
+		"credit_ledger_auto_topup_failure_state_check": {
+			validated: true,
+			kind:      "c",
+			definition: "CHECK ((((type = 'auto_topup'::text) AND (status = 'failed'::text) " +
+				"AND (NULLIF(btrim(failure_code), ''::text) IS NOT NULL)) OR " +
+				"((NOT ((type = 'auto_topup'::text) AND (status = 'failed'::text))) " +
+				"AND (failure_code IS NULL))))",
+		},
+		"credit_ledger_auto_topup_attempt_window_check": {
+			validated: true,
+			kind:      "c",
+			definition: "CHECK (((type <> 'auto_topup'::text) OR " +
+				"((attempt_expires_at > created_at) " +
+				"AND (attempt_expires_at <= (created_at + '00:10:00'::interval)))))",
+		},
 	}
 	for name, want := range expectedConstraints {
 		var (
 			validated  bool
 			deferrable bool
+			kind       string
+			definition string
 		)
 		require.NoError(t, pool.QueryRow(ctx,
-			`SELECT convalidated, condeferrable
+			`SELECT convalidated, condeferrable, contype::text,
+			        pg_get_constraintdef(oid, false)
 			   FROM pg_constraint
 			  WHERE connamespace='ms_billing'::regnamespace AND conname=$1`,
 			name,
-		).Scan(&validated, &deferrable), name)
+		).Scan(&validated, &deferrable, &kind, &definition), name)
 		require.Equal(t, want.validated, validated, name)
 		require.Equal(t, want.deferrable, deferrable, name)
+		require.Equal(t, want.kind, kind, name)
+		require.Equal(t, want.definition, definition, name)
 	}
 
 	var (
-		indexUnique    bool
-		indexPredicate string
+		indexUnique            bool
+		indexValid             bool
+		indexReady             bool
+		indexLive              bool
+		indexKeyAttributeCount int16
+		indexAttributeCount    int16
+		indexAccessMethod      string
+		indexKeyColumn         string
+		indexPredicate         string
 	)
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT indisunique, pg_get_expr(indpred, indrelid)
-		   FROM pg_index
-		  WHERE indexrelid='ms_billing.credit_ledger_auto_topup_pending_uidx'::regclass`,
-	).Scan(&indexUnique, &indexPredicate))
+		`SELECT catalog_index.indisunique,
+		        catalog_index.indisvalid,
+		        catalog_index.indisready,
+		        catalog_index.indislive,
+		        catalog_index.indnkeyatts,
+		        catalog_index.indnatts,
+		        access_method.amname,
+		        pg_get_indexdef(catalog_index.indexrelid, 1, true),
+		        pg_get_expr(
+		            catalog_index.indpred,
+		            catalog_index.indrelid,
+		            false
+		        )
+		   FROM pg_index AS catalog_index
+		   JOIN pg_class AS index_relation
+		     ON index_relation.oid = catalog_index.indexrelid
+		   JOIN pg_am AS access_method
+		     ON access_method.oid = index_relation.relam
+		  WHERE catalog_index.indexrelid =
+		        'ms_billing.credit_ledger_auto_topup_pending_uidx'::regclass`,
+	).Scan(
+		&indexUnique,
+		&indexValid,
+		&indexReady,
+		&indexLive,
+		&indexKeyAttributeCount,
+		&indexAttributeCount,
+		&indexAccessMethod,
+		&indexKeyColumn,
+		&indexPredicate,
+	))
 	require.True(t, indexUnique)
-	require.Contains(t, indexPredicate, "status = 'pending'")
-	require.Contains(t, indexPredicate, "type = 'auto_topup'")
+	require.True(t, indexValid)
+	require.True(t, indexReady)
+	require.True(t, indexLive)
+	require.Equal(t, int16(1), indexKeyAttributeCount)
+	require.Equal(t, int16(1), indexAttributeCount)
+	require.Equal(t, "btree", indexAccessMethod)
+	require.Equal(t, "account_id", indexKeyColumn)
+	require.Equal(
+		t,
+		"((type = 'auto_topup'::text) AND (status = 'pending'::text))",
+		indexPredicate,
+	)
 
 	t.Run("config prevents direct payment method hard delete", func(t *testing.T) {
 		accountID := seedAutoAccount(t, pool)

@@ -27,9 +27,8 @@ import (
 // credit runtime schema is absent or its capability probe failed.
 var ErrUnavailable = errors.New("credit recovery runtime schema is unavailable")
 
-// Probe reports whether the established base-048 capability and exact
-// 12-point migration-049 runtime contract are ready. Production supplies
-// config.CreditRecoverySchemaReady.
+// Probe reports whether the established base-048 and migration-049 runtime
+// capabilities are ready. Production supplies config.CreditRecoverySchemaReady.
 type Probe func(context.Context) (bool, error)
 
 // RuntimeCapability serializes cold probes and caches TRUE only.
