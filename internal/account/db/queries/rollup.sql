@@ -320,12 +320,34 @@ DO UPDATE SET
 -- ModuleIncomeForPeriod sums charged_micros per module across the period's
 -- usage_aggregates — the settlement "income" input. Grouped by module so the
 -- developer-settlement rollup gets one income figure per module.
+--
+-- RESERVED METRICS ARE EXCLUDED, and that exclusion is load-bearing. A
+-- reserved infra./platform. charge is a PLATFORM↔APP transaction the developer
+-- is not party to: the app pays cost × 1.2 and the platform's compensation IS
+-- that 0.2 (migration 013's settlement model; markup at cycle/service.go:222-228).
+-- Reserved rows are nonetheless stored under a REAL module_id whenever the cost
+-- is attributable to an incurring module (cycle/store.go's "(module, metric) →
+-- (SENTINEL, metric)" resolution chain), so an unfiltered SUM counted the
+-- platform's own infra markup as that module's income and revenue-shared it
+-- back — 15%/30% take on 1.2C leaves the platform at −0.82C/−0.64C per infra
+-- dollar against a markup meant to earn +0.2C.
+--
+-- The sentinel module is dropped outright: every one of its metrics is reserved,
+-- so it can only ever produce an all-zero settlement row for a module that does
+-- not exist. Unfiltered it accrued 70% of ALL residual infra revenue to
+-- developer_id = NULL (no module_visibility row → the private default).
+--
+-- Developer COGS belongs in developer_settlements.infra_micros, NOT here as
+-- negative income. Keep the prefixes in sync with usage.reservedMetricPrefixes.
 -- name: ModuleIncomeForPeriod :many
 SELECT
     module_id                              AS module_id,
     COALESCE(SUM(charged_micros), 0)::bigint AS income_micros
 FROM ms_billing.usage_aggregates
 WHERE period_id = $1
+  AND module_id <> '00000000-0000-0000-0000-000000000000'::uuid
+  AND metric NOT LIKE 'infra.%'
+  AND metric NOT LIKE 'platform.%'
 GROUP BY module_id;
 
 -- ModuleVisibility returns a module's developer margin-share class. No row →
