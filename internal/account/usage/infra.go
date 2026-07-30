@@ -67,6 +67,9 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.storage.put.count      S3 tier-1 PUT/COPY ops (per-1k)           → count
 //	infra.storage.list.count     S3 tier-1 LIST ops (per-1k)               → count
 //	infra.storage.gib_hours      S3 stored volume (GiB-hours integral)     → time_weighted
+//	infra.task.vcpu.hours        Fargate task vCPU-hours                   → sum
+//	infra.task.memory.gib_hours  Fargate task GiB-hours                    → sum
+//	infra.task.gpu.hours         ECS GPU instance-hours                    → sum
 //	infra.compute.ssr.gb_seconds SSR Lambda duration x memory (per app-hr) → sum
 //	infra.compute.ssr.request.count SSR Lambda per-invocation fee (per-1k) → count
 //	infra.compute.ssr.egress.bytes  SSR response-body egress (per-GiB)     → sum
@@ -170,6 +173,20 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// a peak and NOT an op count. Priced per GiB-hour (~31.5 µ$ >= 1, no floor).
 		return KindTimeWeighted, true
 
+	// --- Heavy-task-tier substrate metrics (migration 051). Catalog-only here:
+	// the app-module-sdk execution classes land separately, after both the
+	// registry and catalog already accept their producer events.
+	case "infra.task.vcpu.hours":
+		// Fargate ARM vCPU allocation. sum; value = task_vcpu * billed_hours.
+		return KindSum, true
+	case "infra.task.memory.gib_hours":
+		// Fargate ARM memory allocation. sum; value = memory_mib/1024 * billed_hours.
+		return KindSum, true
+	case "infra.task.gpu.hours":
+		// ECS GPU host allocation. sum; value = billed instance-hours; Model is
+		// the required EC2 instance-type pricing dimension.
+		return KindSum, true
+
 	// --- SSR compute metering (migration 045, docs-temp/app-hosting/
 	// ssr-metering-design.md §1/§4). Producer: cmd/infra-ssr-compute-sync, a
 	// CloudWatch/Lambda puller mirroring cmd/infra-egress-sync's dual-transport,
@@ -248,14 +265,10 @@ type RecordInfraUsageRequest struct {
 	// INVALID_INPUT (the inverse of the SDK gate).
 	Metric string `json:"metric"`
 
-	// Model is the OPTIONAL AI pricing dimension (migration 018). The producer
-	// (infra-metrics PR #2) stamps the roster model id (e.g.
-	// "anthropic.claude-sonnet-4-6") on an infra.ai.* event so the rollup prices
-	// it from metric_model_prices PER MODEL; the catalog row is the fallback when
-	// it is empty. Empty for every non-AI infra metric → stored as a NULL
-	// usage_events.model. It is purely a pricing dimension: it does NOT gate
-	// acceptance (an AI metric with no model still records and prices via the
-	// catalog fallback), and it is never read for non-AI metrics.
+	// Model is migration 018's per-(metric, model) pricing dimension. For
+	// infra.ai.* it is an OPTIONAL roster model id and an empty value retains the
+	// catalog fallback. For infra.task.gpu.hours it is the REQUIRED EC2 instance
+	// type. It is empty and rejected when supplied for every other infra metric.
 	Model string `json:"model,omitempty"`
 
 	// ModuleVersion is the OPTIONAL version-attribution dimension (migration
@@ -344,14 +357,21 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		return nil, billing.InvalidInput("unknown platform-infra metric: " + req.Metric)
 	}
 
-	// Model is a pricing dimension EXCLUSIVE to the infra.ai.* family (migration
-	// 018). Reject it on any other infra metric: a stray model on, say,
+	// Model is migration 018's pricing dimension. Reject it outside the two
+	// dimensioned families: a stray model on, say,
 	// infra.compute.walltime.ms would persist as a non-NULL usage_events.model and then
 	// trigger a spurious per-model lookup at rollup that always misses and falls
-	// back to the catalog — a silent footgun. The comment that model is "never
-	// read for non-AI metrics" is now ENFORCED, not just documented.
-	if req.Model != "" && !strings.HasPrefix(req.Metric, "infra.ai.") {
-		return nil, billing.InvalidInput("model is only valid for infra.ai.* metrics")
+	// back to the catalog — a silent footgun.
+	if req.Model != "" && !metricHasPriceDimension(req.Metric) {
+		return nil, billing.InvalidInput("model is only valid for infra.ai.* and infra.task.gpu.hours metrics")
+	}
+	// GPU prices span $0.71 to $23.62/hour. Unlike AI's optional-model
+	// near-miss fallback, a model-less g5.48xlarge would silently bill at the
+	// g4dn.xlarge floor, about a 33x under-charge. No producer exists yet, so
+	// requiring the instance type now closes the footgun without rejecting an
+	// in-flight event; AI's optional-model behavior remains unchanged.
+	if req.Metric == "infra.task.gpu.hours" && req.Model == "" {
+		return nil, billing.InvalidInput("model is required for infra.task.gpu.hours (use the EC2 instance type)")
 	}
 
 	// Resolve the owner's billing account. Nil owner (or no account yet)
@@ -428,4 +448,12 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	}
 
 	return &RecordInfraUsageResponse{Recorded: recorded}, nil
+}
+
+// metricHasPriceDimension reports whether a reserved infra metric carries the
+// per-(metric, model) PRICING dimension (migration 018's metric_model_prices
+// side-table plus the nullable usage_events.model column). The column is named
+// for its first AI consumer; GPU stores an opaque EC2 instance type in it.
+func metricHasPriceDimension(metric string) bool {
+	return strings.HasPrefix(metric, "infra.ai.") || metric == "infra.task.gpu.hours"
 }
