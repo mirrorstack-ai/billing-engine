@@ -69,6 +69,10 @@ func (f *fakeStore) AccountByOwner(_ context.Context, _ usage.Owner) (uuid.UUID,
 	return uuid.Nil, false, nil // egress rows carry no owner → lazy event
 }
 
+func (f *fakeStore) AppOwnerOrg(context.Context, uuid.UUID) (uuid.UUID, bool, error) {
+	return uuid.Nil, false, nil
+}
+
 func (f *fakeStore) AccountAnchorDay(_ context.Context, _ uuid.UUID) (int, error) {
 	return 1, nil // egress sync never reads a period window; calendar-month default
 }

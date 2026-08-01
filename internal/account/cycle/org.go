@@ -18,6 +18,7 @@ package cycle
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/google/uuid"
 
@@ -25,6 +26,48 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
+
+// OrgUsageSweepSummary reports what one self-healing sweep pass did.
+type OrgUsageSweepSummary struct {
+	Orgs            int   // orgs the work list returned
+	Swept           int   // orgs whose attach sweep completed
+	AttachedApps    int64 // roster rows backfilled with account_id
+	RepointedEvents int64 // NULL-account events folded into the funded account
+	Failed          int   // per-org failures (counted, never abort the pass)
+}
+
+// SweepUnattachedOrgUsage is the SELF-HEALING half of the org attach path. The
+// RepointOrgUsage RPC is fire-and-forget from api-platform, so a dropped call
+// used to strand usage at account_id = NULL permanently; this pass makes the
+// reconciliation converge without depending on that call landing.
+func (s *Service) SweepUnattachedOrgUsage(ctx context.Context) (*OrgUsageSweepSummary, error) {
+	orgs, err := s.store.OrgsWithUnsweptUsage(ctx)
+	if err != nil {
+		return nil, billing.Internal("list orgs with unswept usage failed", err)
+	}
+	summary := &OrgUsageSweepSummary{Orgs: len(orgs)}
+	for _, orgID := range orgs {
+		accountID, funded, err := s.store.ResolveOrgFundedAccount(ctx, orgID)
+		if err != nil {
+			slog.ErrorContext(ctx, "resolve funded org account for usage sweep failed", "org_id", orgID, "error", err)
+			summary.Failed++
+			continue
+		}
+		if !funded {
+			continue
+		}
+		attached, repointed, err := s.attachOrgBilling(ctx, orgID, accountID)
+		if err != nil {
+			slog.ErrorContext(ctx, "org usage attach sweep failed", "org_id", orgID, "error", err)
+			summary.Failed++
+			continue
+		}
+		summary.Swept++
+		summary.AttachedApps += attached
+		summary.RepointedEvents += repointed
+	}
+	return summary, nil
+}
 
 // OrgFunding is the designation's funding instrument choice.
 type OrgFunding string

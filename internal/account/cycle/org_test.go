@@ -7,6 +7,7 @@ package cycle_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -397,4 +398,49 @@ func TestListSponsoredOrgs_RequiresSponsorUser(t *testing.T) {
 	_, err := orgSvc(newFakeStore()).WithAccountBill(bill).
 		ListSponsoredOrgs(context.Background(), cycle.ListSponsoredOrgsRequest{})
 	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestSweepUnattachedOrgUsage_AttachesAndRepoints(t *testing.T) {
+	store := newFakeStore()
+	orgID, accountID, appID := uuid.New(), uuid.New(), uuid.New()
+	store.orgUnswept = []uuid.UUID{orgID}
+	store.accountsByOrg[orgID] = accountID
+	store.orgDesignations[orgID] = cycle.OrgDesignation{OrgID: orgID, Funding: cycle.OrgFundingOrg}
+	store.activation[accountID] = orgNow
+	store.apps[appID] = cycle.AppMirror{AppID: appID}
+	store.appOwnerOrg[appID] = orgID
+	store.orgNullEvents[orgID] = 2
+
+	summary, err := orgSvc(store).SweepUnattachedOrgUsage(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, &cycle.OrgUsageSweepSummary{Orgs: 1, Swept: 1, AttachedApps: 1, RepointedEvents: 2}, summary)
+	require.Equal(t, accountID, store.apps[appID].AccountID)
+	require.Len(t, store.repointCalls, 1)
+}
+
+func TestSweepUnattachedOrgUsage_PerOrgFailureDoesNotAbortPass(t *testing.T) {
+	store := newFakeStore()
+	orgs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	store.orgUnswept = orgs
+	store.errOrgResolve = map[uuid.UUID]error{orgs[1]: errors.New("transient")}
+	for _, orgID := range []uuid.UUID{orgs[0], orgs[2]} {
+		accountID := uuid.New()
+		store.accountsByOrg[orgID] = accountID
+		store.orgDesignations[orgID] = cycle.OrgDesignation{OrgID: orgID, Funding: cycle.OrgFundingOrg}
+		store.activation[accountID] = orgNow
+	}
+
+	summary, err := orgSvc(store).SweepUnattachedOrgUsage(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 3, summary.Orgs)
+	require.Equal(t, 2, summary.Swept)
+	require.Equal(t, 1, summary.Failed)
+}
+
+func TestSweepUnattachedOrgUsage_EmptyListIsNoOp(t *testing.T) {
+	store := newFakeStore()
+	summary, err := orgSvc(store).SweepUnattachedOrgUsage(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, &cycle.OrgUsageSweepSummary{}, summary)
+	require.Empty(t, store.repointCalls)
 }

@@ -26,8 +26,10 @@ type fakeStore struct {
 	defs                   map[string]usage.MetricDefinition   // key: module/metric
 	versionPrices          map[string]usage.MetricVersionPrice // key: module/metric/version (migration 044)
 	accounts               map[uuid.UUID]uuid.UUID             // owner userID → accountID
-	events                 map[string]usage.UsageEvent         // event_id → event (idempotency)
-	anchorDays             map[uuid.UUID]int                   // accountID → billing-period anchor day (0/absent → 1)
+	appOwnerOrgs           map[uuid.UUID]uuid.UUID             // app roster owner_org_id
+	appOwnerLookups        int
+	events                 map[string]usage.UsageEvent // event_id → event (idempotency)
+	anchorDays             map[uuid.UUID]int           // accountID → billing-period anchor day (0/absent → 1)
 	periodRows             []usage.MetricUsageRaw
 	historyRows            []usage.PeriodMetricUsageRaw
 	versionRows            []usage.VersionUsageRaw
@@ -153,6 +155,7 @@ func newFakeStore() *fakeStore {
 		defs:                        map[string]usage.MetricDefinition{},
 		versionPrices:               map[string]usage.MetricVersionPrice{},
 		accounts:                    map[uuid.UUID]uuid.UUID{},
+		appOwnerOrgs:                map[uuid.UUID]uuid.UUID{},
 		events:                      map[string]usage.UsageEvent{},
 		anchorDays:                  map[uuid.UUID]int{},
 		visibility:                  map[uuid.UUID]usage.Visibility{},
@@ -484,6 +487,12 @@ func (f *fakeStore) AccountByOwner(_ context.Context, owner usage.Owner) (uuid.U
 	return id, ok, nil
 }
 
+func (f *fakeStore) AppOwnerOrg(_ context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {
+	f.appOwnerLookups++
+	orgID, found := f.appOwnerOrgs[appID]
+	return orgID, found, nil
+}
+
 func (f *fakeStore) CurrentPeriodUsage(_ context.Context, _ uuid.UUID, start, end time.Time) ([]usage.MetricUsageRaw, error) {
 	f.gotPeriodStart, f.gotPeriodEnd = start, end
 	if f.errPeriod != nil {
@@ -728,6 +737,43 @@ func TestRecordUsage_LazyAccountWhenNoBillingAccount(t *testing.T) {
 	_, err := newService(store).RecordUsage(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, uuid.Nil, store.events[req.EventID].AccountID, "lazy event records NULL account")
+}
+
+func TestRecordUsage_UnresolvedOrgWithRegisteredAppRetainsNullAccount(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	req.OwnerUserID = uuid.Nil
+	req.OwnerOrgID = uuid.New()
+	store.appOwnerOrgs[req.AppID] = req.OwnerOrgID
+	declare(store, req, usage.KindCount)
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, uuid.Nil, store.events[req.EventID].AccountID)
+	require.Equal(t, 1, store.appOwnerLookups)
+}
+
+func TestRecordUsage_UnresolvedOrgWithoutRegisteredAppRejectsBeforeInsert(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	req.OwnerUserID = uuid.Nil
+	req.OwnerOrgID = uuid.New()
+	declare(store, req, usage.KindCount)
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.events, "unattributable usage must never reach InsertUsageEvent")
+}
+
+func TestRecordUsage_UnresolvedUserKeepsLazyNullWithoutAppLookup(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, uuid.Nil, store.events[req.EventID].AccountID)
+	require.Zero(t, store.appOwnerLookups)
 }
 
 func TestRecordUsage_RejectsReservedPrefixes(t *testing.T) {

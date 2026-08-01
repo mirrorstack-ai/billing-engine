@@ -113,6 +113,7 @@ func main() {
 	// per-module overage grace queue (Leg 1), then exit. No HTTP listener — the
 	// dev cycle is a single batch.
 	at := time.Now().UTC()
+	runOrgAttachSweep(context.Background(), svc, at)
 	res := runCycle(context.Background(), svc, at)
 	// Proration runs BEFORE the overage sweep. A Stripe creation charge resolves
 	// its co-created overage on the combined invoice; a wallet creation charge
@@ -126,6 +127,8 @@ func main() {
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 		"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
+		"unactivated_candidates", res.UnactivatedCandidates, "unactivated_rolled_up", res.UnactivatedRolledUp,
+		"unactivated_failed", res.UnactivatedFailed,
 		"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
 		"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed,
 		"domain_candidates", res.DomainCandidates, "domain_charged", res.DomainCharged,
@@ -386,6 +389,7 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 		if at.IsZero() {
 			at = time.Now().UTC()
 		}
+		runOrgAttachSweep(ctx, svc, at.UTC())
 		res := runCycle(ctx, svc, at.UTC())
 		// Proration runs BEFORE the overage sweep (see main): Stripe creations
 		// resolve co-created overage on their combined invoice; wallet creations
@@ -398,6 +402,8 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
 			"skipped_no_pm", res.SkippedNoPM, "zero_arrears", res.ZeroArrears,
 			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
+			"unactivated_candidates", res.UnactivatedCandidates, "unactivated_rolled_up", res.UnactivatedRolledUp,
+			"unactivated_failed", res.UnactivatedFailed,
 			"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
 			"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed,
 			"domain_candidates", res.DomainCandidates, "domain_charged", res.DomainCharged,
@@ -412,16 +418,19 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 
 // cycleResult tallies a batch run for logging / exit code.
 type cycleResult struct {
-	AsOf        time.Time // the run's evaluation instant (UTC)
-	Activated   int       // card-bound accounts considered
-	RolledUp    int       // accounts whose just-closed window had usage (rolled up)
-	Processed   int       // accounts processed in the charge phase
-	Charged     int
-	SkippedNoPM int
-	ZeroArrears int
-	AlreadyRun  int
-	FailedRuns  int // per-account charge runs that ended status='failed'
-	Failed      int // errors (rollup error, charge error, or list error)
+	AsOf                  time.Time // the run's evaluation instant (UTC)
+	Activated             int       // card-bound accounts considered
+	RolledUp              int       // accounts whose just-closed window had usage (rolled up)
+	Processed             int       // accounts processed in the charge phase
+	Charged               int
+	SkippedNoPM           int
+	ZeroArrears           int
+	AlreadyRun            int
+	FailedRuns            int // per-account charge runs that ended status='failed'
+	Failed                int // errors (rollup error, charge error, or list error)
+	UnactivatedCandidates int // card-less accounts considered for rollup only
+	UnactivatedRolledUp   int // card-less accounts whose calendar-month rollup completed
+	UnactivatedFailed     int // card-less list or per-account rollup errors
 
 	// Mid-period per-module overage grace sweep (migration 033, Leg 1).
 	OverageCandidates int // install timers past their grace window this sweep evaluated
@@ -459,6 +468,7 @@ type cycleResult struct {
 // A single account's error is logged + counted but never aborts the batch.
 func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult {
 	res := cycleResult{AsOf: at}
+	processed := make(map[uuid.UUID]bool)
 
 	accounts, err := svc.ActivatedAccounts(ctx)
 	if err != nil {
@@ -469,6 +479,7 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 	res.Activated = len(accounts)
 
 	for _, a := range accounts {
+		processed[a.ID] = true
 		anchorDay := billingperiod.AnchorDay(a.ActivatedAt)
 		start, end := billingperiod.AnchoredJustClosed(at, anchorDay)
 
@@ -537,7 +548,60 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 		}
 		tally(&res, a.ID, chargeSummary)
 	}
+	runUnactivatedRollup(ctx, svc, at, processed, &res)
 	return res
+}
+
+// unactivatedRoller is deliberately NARROW: it exposes rollup and nothing else.
+// The rollup-only phase for card-less accounts is handed this interface rather
+// than *cycle.Service so that charging one of these accounts is a COMPILE ERROR,
+// not a code-review promise. Do not widen it.
+type unactivatedRoller interface {
+	UnactivatedAccountsWithUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+	RollupPeriod(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (*cycle.RollupSummary, error)
+}
+
+// runUnactivatedRollup uses the calendar month because AccountAnchorDay falls
+// back to DefaultAnchorDay while activated_at is NULL, so aggregate writes must
+// match the windows reads already request. After card binding, runCycle's
+// existing straddle-clamp bridges calendar→anchor as it does for cutover 025.
+func runUnactivatedRollup(ctx context.Context, svc unactivatedRoller, at time.Time, skip map[uuid.UUID]bool, res *cycleResult) {
+	start, end := billingperiod.AnchoredJustClosed(at, billingperiod.DefaultAnchorDay)
+	accounts, err := svc.UnactivatedAccountsWithUsage(ctx, start, end)
+	if err != nil {
+		slog.ErrorContext(ctx, "list unactivated accounts with usage failed", "error", err)
+		res.UnactivatedFailed++
+		res.Failed++
+		return
+	}
+	res.UnactivatedCandidates = len(accounts)
+	for _, accountID := range accounts {
+		if skip[accountID] {
+			continue
+		}
+		if _, err := svc.RollupPeriod(ctx, accountID, start, end); err != nil {
+			slog.ErrorContext(ctx, "unactivated account rollup failed", "account_id", accountID,
+				"period_start", start, "period_end", end, "error", err)
+			res.UnactivatedFailed++
+			res.Failed++
+			continue
+		}
+		res.UnactivatedRolledUp++
+	}
+}
+
+// runOrgAttachSweep runs before runCycle. The placement does not change which
+// period recovered events bill: the attach clamp puts them in the account's
+// currently open window, the first period that closes after designation.
+func runOrgAttachSweep(ctx context.Context, svc *cycle.Service, at time.Time) {
+	summary, err := svc.SweepUnattachedOrgUsage(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "org usage attach sweep failed", "as_of", at, "error", err)
+		return
+	}
+	slog.InfoContext(ctx, "org usage attach sweep complete", "as_of", at,
+		"orgs", summary.Orgs, "swept", summary.Swept, "attached_apps", summary.AttachedApps,
+		"repointed_events", summary.RepointedEvents, "failed", summary.Failed)
 }
 
 // runOverageSweep runs Leg 1's per-module overage grace sweep as of `at`. A

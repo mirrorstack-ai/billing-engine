@@ -73,6 +73,11 @@ type Store interface {
 	// missing-account is a normal lazy-state outcome, not an error.
 	AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, bool, error)
 
+	// AppOwnerOrg returns the roster row's owning org for the unresolved-org
+	// ingest guard. found=false means no billing roster row exists; a present
+	// row with NULL owner_org_id returns uuid.Nil with found=true.
+	AppOwnerOrg(ctx context.Context, appID uuid.UUID) (orgID uuid.UUID, found bool, err error)
+
 	// AccountAnchorDay returns the account's billing-period anchor day (1..31):
 	// the day-of-month it bound its first credit card (activated_at, migration
 	// 025), derived in UTC. An account with no activation yet (NULL activated_at,
@@ -789,6 +794,20 @@ func (s *pgxStore) AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, 
 		return uuid.Nil, false, err
 	}
 	return parsed, true, nil
+}
+
+func (s *pgxStore) AppOwnerOrg(ctx context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {
+	orgID, err := s.q.AppOwnerOrg(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if !orgID.Valid {
+		return uuid.Nil, true, nil
+	}
+	return uuid.UUID(orgID.Bytes), true, nil
 }
 
 func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInfo, bool, error) {

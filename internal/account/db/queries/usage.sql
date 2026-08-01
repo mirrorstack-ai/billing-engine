@@ -744,3 +744,11 @@ SELECT app_id FROM (
       AND e.recorded_at <  @period_end::timestamptz
 ) apps_with_usage
 ORDER BY app_id;
+
+-- AppOwnerOrg verifies that an unresolved org-owned event still has the roster
+-- attribution marker the later self-healing attach sweep requires. A NULL
+-- owner_org_id is returned as NULL and is not treated as a missing app row.
+-- name: AppOwnerOrg :one
+SELECT owner_org_id
+FROM ms_billing.apps
+WHERE app_id = $1;
