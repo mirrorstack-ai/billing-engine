@@ -515,3 +515,75 @@ func TestRecordInfraUsage_RejectsModelOnP1Metric(t *testing.T) {
 	requireCode(t, err, billing.CodeInvalidInput)
 	require.Empty(t, store.events)
 }
+
+// --- Heavy task tier (migration 051) ---------------------------------------
+
+func TestRecordInfraUsage_AcceptsHeavyTaskMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		metric string
+		model  string
+	}{
+		{"infra.task.vcpu.hours", ""},
+		{"infra.task.memory.gib_hours", ""},
+		{"infra.task.gpu.hours", "g4dn.xlarge"},
+	} {
+		t.Run(tc.metric, func(t *testing.T) {
+			store := newFakeStore()
+			req := validInfra()
+			req.EventID = "heavy-" + tc.metric
+			req.Metric = tc.metric
+			req.Model = tc.model
+
+			resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			ev := store.events[req.EventID]
+			require.Equal(t, usage.KindSum, ev.Kind)
+			require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+			require.Equal(t, tc.metric, ev.Metric)
+		})
+	}
+}
+
+func TestRecordInfraUsage_GPUHoursCarriesInstanceType(t *testing.T) {
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "gpu-g4dn-xlarge"
+	req.Metric = "infra.task.gpu.hours"
+	req.Model = "g4dn.xlarge"
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, "g4dn.xlarge", store.events[req.EventID].Model)
+}
+
+func TestRecordInfraUsage_GPUHoursRequiresInstanceType(t *testing.T) {
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "gpu-no-instance"
+	req.Metric = "infra.task.gpu.hours"
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.events)
+}
+
+func TestRecordInfraUsage_RejectsModelOnUndimensionedHeavyTaskMetrics(t *testing.T) {
+	for _, metric := range []string{
+		"infra.task.vcpu.hours",
+		"infra.task.memory.gib_hours",
+	} {
+		t.Run(metric, func(t *testing.T) {
+			store := newFakeStore()
+			req := validInfra()
+			req.EventID = "heavy-model-" + metric
+			req.Metric = metric
+			req.Model = "g4dn.xlarge"
+
+			_, err := newService(store).RecordInfraUsage(context.Background(), req)
+			requireCode(t, err, billing.CodeInvalidInput)
+			require.Empty(t, store.events)
+		})
+	}
+}
