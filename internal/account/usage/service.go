@@ -149,6 +149,16 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 		}
 		if ok {
 			accountID = id
+		} else if owner.OrgID != uuid.Nil {
+			rosterOrgID, found, err := s.store.AppOwnerOrg(ctx, req.AppID)
+			if err != nil {
+				return nil, billing.Internal("app billing registration lookup failed", err)
+			}
+			if !found || rosterOrgID != owner.OrgID {
+				return nil, billing.InvalidInput("app is not registered for billing under this org — usage cannot be attributed and was NOT recorded (register the app before metering)")
+			}
+			slog.WarnContext(ctx, "org usage retained but unbilled pending funding designation",
+				"org_id", owner.OrgID, "app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric)
 		}
 	}
 

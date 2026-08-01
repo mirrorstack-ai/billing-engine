@@ -98,6 +98,10 @@ func (f *fakeStore) InsertUsageEvent(_ context.Context, ev usage.UsageEvent) (bo
 func (f *fakeStore) AccountByOwner(_ context.Context, _ usage.Owner) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil
 }
+
+func (f *fakeStore) AppOwnerOrg(context.Context, uuid.UUID) (uuid.UUID, bool, error) {
+	return uuid.Nil, false, nil
+}
 func (f *fakeStore) AccountAnchorDay(_ context.Context, _ uuid.UUID) (int, error) { return 1, nil }
 func (f *fakeStore) LookupMetricDefinition(_ context.Context, _ uuid.UUID, _ string) (usage.MetricDefinition, bool, error) {
 	return usage.MetricDefinition{}, false, nil

@@ -533,6 +533,44 @@ func (q *Queries) PeriodChargedTotal(ctx context.Context, arg PeriodChargedTotal
 	return total_micros, err
 }
 
+const unactivatedAccountsWithUsage = `-- name: UnactivatedAccountsWithUsage :many
+SELECT DISTINCT e.account_id::uuid AS account_id
+FROM ms_billing.usage_events e
+JOIN ms_billing.accounts a ON a.id = e.account_id
+WHERE a.activated_at IS NULL
+  AND e.recorded_at >= $1
+  AND e.recorded_at <  $2
+`
+
+type UnactivatedAccountsWithUsageParams struct {
+	RecordedAt   time.Time `json:"recorded_at"`
+	RecordedAt_2 time.Time `json:"recorded_at_2"`
+}
+
+// UnactivatedAccountsWithUsage is the ROLLUP-ONLY work list for accounts with
+// no card. Rolling these events up populates usage_aggregates (and therefore
+// GetUsageHistory) before a card later arrives; these accounts are never
+// handed to the charge phase.
+func (q *Queries) UnactivatedAccountsWithUsage(ctx context.Context, arg UnactivatedAccountsWithUsageParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, unactivatedAccountsWithUsage, arg.RecordedAt, arg.RecordedAt_2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var account_id string
+		if err := rows.Scan(&account_id); err != nil {
+			return nil, err
+		}
+		items = append(items, account_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateAccountCollection = `-- name: UpdateAccountCollection :execrows
 UPDATE ms_billing.accounts
 SET usage_billing_mode   = $2,

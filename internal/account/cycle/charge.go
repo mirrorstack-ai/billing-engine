@@ -819,6 +819,20 @@ func (s *Service) AccountsWithUsageEvents(ctx context.Context, periodStart, peri
 	return accounts, nil
 }
 
+// UnactivatedAccountsWithUsage returns the card-less accounts whose raw events
+// need rollup in the calendar-month window. It is deliberately only a work-list
+// pass-through; the driver exposes no charge capability to this phase.
+func (s *Service) UnactivatedAccountsWithUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
+	if periodStart.IsZero() || periodEnd.IsZero() || !periodEnd.After(periodStart) {
+		return nil, billing.InvalidInput("period_end must be after period_start")
+	}
+	accounts, err := s.store.UnactivatedAccountsWithUsage(ctx, periodStart, periodEnd)
+	if err != nil {
+		return nil, billing.Internal("list unactivated accounts with usage failed", err)
+	}
+	return accounts, nil
+}
+
 // AccountsWithUnbilledUsage returns the accounts with usage_aggregates in the
 // [periodStart, periodEnd) window that have no SUCCESSFUL (invoiced) billing_run
 // yet — the charge-phase (phase 2) work list cmd/billing-cycle iterates. A thin
