@@ -53,6 +53,7 @@ type fakeStore struct {
 	stripeCustomer   string      // AccountStripeCustomer return
 	unbilledAccounts []uuid.UUID // AccountsWithUnbilledUsage return
 	usageEventAccts  []uuid.UUID // AccountsWithUsageEvents return
+	unactivatedAccts []uuid.UUID // UnactivatedAccountsWithUsage return
 
 	// universal credit-wallet inputs/captured draw state (billing-engine#95).
 	// Sources retain their remaining amount so reclaimed-cycle tests can prove
@@ -145,6 +146,8 @@ type fakeStore struct {
 	orgBacklog      map[uuid.UUID]int64
 	orgNullEvents   map[uuid.UUID]int64
 	repointCalls    []repointCall
+	orgUnswept      []uuid.UUID
+	errOrgResolve   map[uuid.UUID]error
 	// sponsoredOrgs seeds ListSponsoredOrgIDs (sponsor user → the funded,
 	// activated orgs they sponsor) — the /me sponsored-orgs read's roster.
 	sponsoredOrgs map[uuid.UUID][]uuid.UUID
@@ -777,6 +780,14 @@ func (f *fakeStore) AccountsWithUsageEvents(_ context.Context, _, _ time.Time) (
 	return f.usageEventAccts, nil
 }
 
+func (f *fakeStore) UnactivatedAccountsWithUsage(_ context.Context, _, _ time.Time) ([]uuid.UUID, error) {
+	return f.unactivatedAccts, nil
+}
+
+func (f *fakeStore) OrgsWithUnsweptUsage(_ context.Context) ([]uuid.UUID, error) {
+	return f.orgUnswept, nil
+}
+
 func (f *fakeStore) AccountsWithUnbilledUsage(_ context.Context, _, _ time.Time) ([]uuid.UUID, error) {
 	if f.errUnbilled != nil {
 		return nil, f.errUnbilled
@@ -890,6 +901,9 @@ func (f *fakeStore) DeleteOrgDesignation(_ context.Context, orgID uuid.UUID) (bo
 }
 
 func (f *fakeStore) ResolveOrgFundedAccount(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	if err := f.errOrgResolve[orgID]; err != nil {
+		return uuid.Nil, false, err
+	}
 	// Mirrors the SQL's single funded gate: a designation row exists AND the
 	// org's account row is activated.
 	if _, designated := f.orgDesignations[orgID]; !designated {

@@ -242,6 +242,47 @@ func (q *Queries) OrgUnbilledBacklogMicros(ctx context.Context, ownerOrgID pgtyp
 	return backlog_micros, err
 }
 
+const orgsWithUnsweptUsage = `-- name: OrgsWithUnsweptUsage :many
+SELECT d.org_id
+FROM ms_billing.org_billing_designations d
+JOIN ms_billing.accounts a
+  ON a.owner_kind = 'org' AND a.owner_org_id = d.org_id
+ AND a.activated_at IS NOT NULL
+WHERE EXISTS (
+        SELECT 1 FROM ms_billing.apps ap
+        WHERE ap.owner_org_id = d.org_id AND ap.account_id IS NULL)
+   OR EXISTS (
+        SELECT 1
+        FROM ms_billing.usage_events e
+        JOIN ms_billing.apps ap ON ap.app_id = e.app_id
+        WHERE ap.owner_org_id = d.org_id AND e.account_id IS NULL)
+ORDER BY d.org_id
+`
+
+// OrgsWithUnsweptUsage is the self-healing work list for funded, activated
+// orgs whose roster or retained usage still lacks the funded account id. Both
+// predicates become false after a successful attach sweep, which prevents the
+// daily driver from repeatedly resetting live-app overage grace timers.
+func (q *Queries) OrgsWithUnsweptUsage(ctx context.Context) ([]string, error) {
+	rows, err := q.db.Query(ctx, orgsWithUnsweptUsage)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var org_id string
+		if err := rows.Scan(&org_id); err != nil {
+			return nil, err
+		}
+		items = append(items, org_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const paymentMethodTargetForOrg = `-- name: PaymentMethodTargetForOrg :one
 SELECT
     pmm.stripe_payment_method_id,

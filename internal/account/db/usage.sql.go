@@ -537,6 +537,22 @@ func (q *Queries) AppModuleInfraBillLines(ctx context.Context, arg AppModuleInfr
 	return items, nil
 }
 
+const appOwnerOrg = `-- name: AppOwnerOrg :one
+SELECT owner_org_id
+FROM ms_billing.apps
+WHERE app_id = $1
+`
+
+// AppOwnerOrg verifies that an unresolved org-owned event still has the roster
+// attribution marker the later self-healing attach sweep requires. A NULL
+// owner_org_id is returned as NULL and is not treated as a missing app row.
+func (q *Queries) AppOwnerOrg(ctx context.Context, appID string) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, appOwnerOrg, appID)
+	var owner_org_id pgtype.UUID
+	err := row.Scan(&owner_org_id)
+	return owner_org_id, err
+}
+
 const appUsageSummary = `-- name: AppUsageSummary :many
 WITH rolled AS (
     SELECT

@@ -386,3 +386,52 @@ func TestTightenAndMarkRun_Integration(t *testing.T) {
 		`SELECT status FROM ms_billing.billing_runs WHERE id = $1`, runID.String()).Scan(&status))
 	require.Equal(t, "skipped_ceiling", status)
 }
+
+func TestUnactivatedAccountsWithUsage_Integration(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	inWindow := seedAccount(t, pool)
+	activated := seedAccount(t, pool)
+	outOfWindow := seedAccount(t, pool)
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.accounts SET activated_at = $2 WHERE id = $1`,
+		activated.String(), mustTime(t, "2026-05-15T00:00:00Z"))
+	require.NoError(t, err)
+	app, mod := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, mod, "orders.placed", usage.KindCount, 1_000)
+	seedEvent(t, pool, inWindow, app, mod, "orders.placed", usage.KindCount, 1, "2026-06-10T00:00:00Z")
+	seedEvent(t, pool, activated, app, mod, "orders.placed", usage.KindCount, 1, "2026-06-10T00:00:00Z")
+	seedEvent(t, pool, outOfWindow, app, mod, "orders.placed", usage.KindCount, 1, "2026-07-10T00:00:00Z")
+
+	got, err := store.UnactivatedAccountsWithUsage(ctx, mustTime(t, pStart), mustTime(t, pEnd))
+	require.NoError(t, err)
+	require.Contains(t, got, inWindow)
+	require.NotContains(t, got, activated)
+	require.NotContains(t, got, outOfWindow)
+}
+
+func TestRollupPeriod_UnactivatedAccountWritesAggregatesButNoBillingRun(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	svc := cycle.NewService(cycle.NewStore(pool), nil)
+	ctx := context.Background()
+
+	accountID := seedAccount(t, pool)
+	appID, moduleID := uuid.New(), uuid.New()
+	seedMetricDef(t, pool, moduleID, "orders.placed", usage.KindCount, 1_000)
+	seedEvent(t, pool, accountID, appID, moduleID, "orders.placed", usage.KindCount, 3, "2026-06-10T00:00:00Z")
+
+	_, err := svc.RollupPeriod(ctx, accountID, mustTime(t, pStart), mustTime(t, pEnd))
+	require.NoError(t, err)
+
+	var aggregates, billingRuns int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.usage_aggregates WHERE account_id = $1`,
+		accountID.String()).Scan(&aggregates))
+	require.Positive(t, aggregates)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.billing_runs WHERE account_id = $1`,
+		accountID.String()).Scan(&billingRuns))
+	require.Zero(t, billingRuns, "rollup-only processing must never create a billing run")
+}

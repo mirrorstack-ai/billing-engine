@@ -291,6 +291,18 @@ SELECT EXISTS (
       )
 ) AS has;
 
+-- UnactivatedAccountsWithUsage is the ROLLUP-ONLY work list for accounts with
+-- no card. Rolling these events up populates usage_aggregates (and therefore
+-- GetUsageHistory) before a card later arrives; these accounts are never
+-- handed to the charge phase.
+-- name: UnactivatedAccountsWithUsage :many
+SELECT DISTINCT e.account_id::uuid AS account_id
+FROM ms_billing.usage_events e
+JOIN ms_billing.accounts a ON a.id = e.account_id
+WHERE a.activated_at IS NULL
+  AND e.recorded_at >= $1
+  AND e.recorded_at <  $2;
+
 -- AccountStripeCustomer resolves the account's Stripe Customer id for the
 -- charge. COALESCE to '' so the Go layer distinguishes "no Customer yet" (empty)
 -- from a real id without a nullable round-trip. A charge never auto-creates a

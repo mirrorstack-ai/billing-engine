@@ -119,6 +119,11 @@ type Store interface {
 	// charge phase reads them).
 	AccountsWithUsageEvents(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
 
+	// UnactivatedAccountsWithUsage returns card-less accounts with raw events in
+	// the window for rollup only. The driver must never hand this list to the
+	// charge phase.
+	UnactivatedAccountsWithUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
+
 	// PeriodChargedTotal returns Σ usage_aggregates.charged_micros for the
 	// account's period window — the arrears input before allowance-netting.
 	PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
@@ -299,6 +304,10 @@ type Store interface {
 	// AND the account being activated — "the pointer never flips to an
 	// unfunded account" (D1). found=false → the org is unbilled.
 	ResolveOrgFundedAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
+
+	// OrgsWithUnsweptUsage returns funded, activated orgs whose roster or usage
+	// still lacks its account id, making the fire-and-forget attach RPC converge.
+	OrgsWithUnsweptUsage(ctx context.Context) ([]uuid.UUID, error)
 
 	// ActivateAccountIfUnset stamps the ADR-0006 activation anchor when the
 	// org account activates by SPONSOR designation (anchor = designation day;
@@ -1725,6 +1734,17 @@ func (s *pgxStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) 
 
 func (s *pgxStore) AccountsWithUsageEvents(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
 	rows, err := s.q.AccountsWithUsageEvents(ctx, db.AccountsWithUsageEventsParams{
+		RecordedAt:   periodStart,
+		RecordedAt_2: periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+func (s *pgxStore) UnactivatedAccountsWithUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
+	rows, err := s.q.UnactivatedAccountsWithUsage(ctx, db.UnactivatedAccountsWithUsageParams{
 		RecordedAt:   periodStart,
 		RecordedAt_2: periodEnd,
 	})
@@ -3480,6 +3500,14 @@ func (s *pgxStore) ResolveOrgFundedAccount(ctx context.Context, orgID uuid.UUID)
 	// ErrNoRows = no designation, or not yet activated — unbilled, normal.
 	id, err := s.q.ResolveOrgFundedAccount(ctx, orgID.String())
 	return uuidRowFound(id, err)
+}
+
+func (s *pgxStore) OrgsWithUnsweptUsage(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := s.q.OrgsWithUnsweptUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
 }
 
 func (s *pgxStore) ActivateAccountIfUnset(ctx context.Context, accountID uuid.UUID, at time.Time) error {

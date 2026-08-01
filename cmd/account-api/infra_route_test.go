@@ -40,6 +40,10 @@ func (s *stubUsageStore) InsertUsageEvent(_ context.Context, e usage.UsageEvent)
 func (stubUsageStore) AccountByOwner(context.Context, usage.Owner) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil
 }
+
+func (stubUsageStore) AppOwnerOrg(context.Context, uuid.UUID) (uuid.UUID, bool, error) {
+	return uuid.Nil, false, nil
+}
 func (stubUsageStore) AccountAnchorDay(context.Context, uuid.UUID) (int, error) {
 	return 1, nil
 }

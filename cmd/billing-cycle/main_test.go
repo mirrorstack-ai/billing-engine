@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/legacyrestamp"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // The per-account anchored window math (AnchoredJustClosed, clamping,
@@ -169,4 +171,60 @@ func mapKeys(values map[string]any) []string {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+type fakeUnactivatedRoller struct {
+	candidates []uuid.UUID
+	calls      map[uuid.UUID][][2]time.Time
+	fail       map[uuid.UUID]error
+}
+
+func (f *fakeUnactivatedRoller) UnactivatedAccountsWithUsage(context.Context, time.Time, time.Time) ([]uuid.UUID, error) {
+	return f.candidates, nil
+}
+
+func (f *fakeUnactivatedRoller) RollupPeriod(_ context.Context, id uuid.UUID, start, end time.Time) (*cycle.RollupSummary, error) {
+	if f.calls == nil {
+		f.calls = make(map[uuid.UUID][][2]time.Time)
+	}
+	f.calls[id] = append(f.calls[id], [2]time.Time{start, end})
+	if err := f.fail[id]; err != nil {
+		return nil, err
+	}
+	return &cycle.RollupSummary{}, nil
+}
+
+func TestRunUnactivatedRollup_RollsUpEveryCandidateAndNeverCharges(t *testing.T) {
+	// The fake implements the deliberately narrow interface, which has no charge
+	// method: "never charges" is therefore enforced structurally at compile time.
+	ids := []uuid.UUID{uuid.New(), uuid.New()}
+	fake := &fakeUnactivatedRoller{candidates: ids}
+	res := cycleResult{}
+	at := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	runUnactivatedRollup(context.Background(), fake, at, nil, &res)
+	start, end := billingperiod.AnchoredJustClosed(at, billingperiod.DefaultAnchorDay)
+	require.Equal(t, 2, res.UnactivatedCandidates)
+	require.Equal(t, 2, res.UnactivatedRolledUp)
+	for _, id := range ids {
+		require.Equal(t, [][2]time.Time{{start, end}}, fake.calls[id])
+	}
+}
+
+func TestRunUnactivatedRollup_SkipsAlreadyProcessedAccounts(t *testing.T) {
+	id := uuid.New()
+	fake := &fakeUnactivatedRoller{candidates: []uuid.UUID{id}}
+	res := cycleResult{}
+	runUnactivatedRollup(context.Background(), fake, time.Now().UTC(), map[uuid.UUID]bool{id: true}, &res)
+	require.Empty(t, fake.calls[id])
+	require.Zero(t, res.UnactivatedRolledUp)
+}
+
+func TestRunUnactivatedRollup_PerAccountFailureIsCountedNotFatal(t *testing.T) {
+	bad, good := uuid.New(), uuid.New()
+	fake := &fakeUnactivatedRoller{candidates: []uuid.UUID{bad, good}, fail: map[uuid.UUID]error{bad: errors.New("boom")}}
+	res := cycleResult{}
+	runUnactivatedRollup(context.Background(), fake, time.Now().UTC(), nil, &res)
+	require.Equal(t, 1, res.UnactivatedFailed)
+	require.Equal(t, 1, res.UnactivatedRolledUp)
+	require.Len(t, fake.calls[good], 1)
 }
