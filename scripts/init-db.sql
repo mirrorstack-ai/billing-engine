@@ -82,3 +82,7 @@
 
 -- 050: durable exact ownership for combined creation-proration attempts.
 \i migrations/billing/050_combined_proration_attempts.up.sql
+
+-- 051–052: Heavy/GPU substrate catalog followed by the exact managed g5g rate.
+\i migrations/billing/051_heavy_tier_rates.up.sql
+\i migrations/billing/052_g5g_task_gpu_price.up.sql

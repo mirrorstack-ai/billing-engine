@@ -387,6 +387,18 @@ func (f *fakeStore) MetricPriceMicros(_ context.Context, moduleID uuid.UUID, met
 	if f.errPrice != nil {
 		return 0, false, f.errPrice
 	}
+	if metric == "infra.task.gpu.hours" {
+		if !usage.IsAdmittedTaskGPUModel(model) {
+			return 0, false, cycle.ErrTaskGPUModelPrice
+		}
+		if f.inactiveModelPrices[modelPriceKey(metric, model)] {
+			return 0, false, cycle.ErrTaskGPUModelPrice
+		}
+		if p, ok := f.modelPrices[modelPriceKey(metric, model)]; ok && p > 0 {
+			return p, true, nil
+		}
+		return 0, false, cycle.ErrTaskGPUModelPrice
+	}
 	// VERSION-FIRST (migration 044): an immutable version snapshot wins
 	// outright over both the per-model and catalog paths, mirroring the
 	// pgxStore's resolution order. A miss falls through unchanged.
@@ -2454,6 +2466,69 @@ func TestRollupThenSettle_IncomeFromAggregates(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 150_000, set.Settlements[0].PlatformTakeMicros)
 	require.EqualValues(t, 850_000, set.Settlements[0].DeveloperOwedMicros)
+}
+
+// --- RollupPeriod: exact managed task GPU pricing (migration 052) -----------
+
+func TestRollupPeriod_TaskGPUExactModelPriceBeatsEveryFallback(t *testing.T) {
+	store := newFakeStore()
+	app, mod := uuid.New(), uuid.New()
+	model := usage.TaskGPUModelG5GXlarge
+	store.raws = []cycle.RawAggregate{rawAggModel(app, mod, "infra.task.gpu.hours", usage.KindSum, model, "1")}
+	store.raws[0].ModuleVersion = "v1"
+	store.modelPrices[modelPriceKey("infra.task.gpu.hours", model)] = 566900
+	store.versionPrices[versionPriceKey(mod, "infra.task.gpu.hours", "v1")] = 1
+	store.prices[priceKey(mod, "infra.task.gpu.hours")] = 710000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	require.Len(t, resp.Aggregates, 1)
+	a := resp.Aggregates[0]
+	require.EqualValues(t, 566900, a.UnitPriceMicros)
+	require.EqualValues(t, 566900, a.RawCostMicros)
+	require.EqualValues(t, 680280, a.ChargedMicros)
+}
+
+func TestRollupPeriod_TaskGPUUnknownModelCannotUseHistoricalPriceOrCatalogFallback(t *testing.T) {
+	store := newFakeStore()
+	app := uuid.New()
+	model := "g4dn.xlarge"
+	store.raws = []cycle.RawAggregate{rawAggModel(app, usage.PlatformInfraModuleID(), "infra.task.gpu.hours", usage.KindSum, model, "1")}
+	store.modelPrices[modelPriceKey("infra.task.gpu.hours", model)] = 710000
+	store.prices[priceKey(usage.PlatformInfraModuleID(), "infra.task.gpu.hours")] = 710000
+
+	_, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "active exact price")
+}
+
+func TestRollupPeriod_TaskGPUAdmittedModelFailsWhenExactRowIsMissing(t *testing.T) {
+	store := newFakeStore()
+	app := uuid.New()
+	model := usage.TaskGPUModelG5GXlarge
+	store.raws = []cycle.RawAggregate{rawAggModel(app, usage.PlatformInfraModuleID(), "infra.task.gpu.hours", usage.KindSum, model, "1")}
+	store.prices[priceKey(usage.PlatformInfraModuleID(), "infra.task.gpu.hours")] = 566900
+
+	_, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "active exact price")
+}
+
+func TestRollupPeriod_TaskGPURejectsNonPositiveExactPrice(t *testing.T) {
+	for _, price := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("price_%d", price), func(t *testing.T) {
+			store := newFakeStore()
+			app := uuid.New()
+			model := usage.TaskGPUModelG5GXlarge
+			store.raws = []cycle.RawAggregate{rawAggModel(app, usage.PlatformInfraModuleID(), "infra.task.gpu.hours", usage.KindSum, model, "1")}
+			store.modelPrices[modelPriceKey("infra.task.gpu.hours", model)] = price
+			store.prices[priceKey(usage.PlatformInfraModuleID(), "infra.task.gpu.hours")] = 566900
+
+			_, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "positive active exact price")
+		})
+	}
 }
 
 // --- RollupPeriod: per-model AI token pricing (migration 018) --------------

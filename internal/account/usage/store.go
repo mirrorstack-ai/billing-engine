@@ -638,6 +638,12 @@ type pgxStore struct {
 	walletAccess  func(uuid.UUID) bool
 }
 
+// ModelPrice is one exact per-(metric, model) raw COGS row.
+type ModelPrice struct {
+	UnitPriceMicros int64
+	Active          bool
+}
+
 func (s *pgxStore) LookupMetricDefinition(ctx context.Context, moduleID uuid.UUID, metric string) (MetricDefinition, bool, error) {
 	row, err := s.q.LookupMetricDefinition(ctx, db.LookupMetricDefinitionParams{
 		ModuleID: moduleID.String(),
@@ -656,6 +662,17 @@ func (s *pgxStore) LookupMetricDefinition(ctx context.Context, moduleID uuid.UUI
 		Priced:          row.UnitPriceMicros.Valid,
 		Active:          row.Active,
 	}, true, nil
+}
+
+func (s *pgxStore) LookupModelPrice(ctx context.Context, metric, model string) (ModelPrice, bool, error) {
+	row, err := s.q.LookupModelPrice(ctx, db.LookupModelPriceParams{Metric: metric, Model: model})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ModelPrice{}, false, nil
+	}
+	if err != nil {
+		return ModelPrice{}, false, err
+	}
+	return ModelPrice{UnitPriceMicros: row.UnitPriceMicros, Active: row.Active}, true, nil
 }
 
 func (s *pgxStore) UpsertMetricDefinitions(ctx context.Context, defs []MetricDeclaration) error {

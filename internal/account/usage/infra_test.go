@@ -3,6 +3,7 @@ package usage_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -525,7 +526,7 @@ func TestRecordInfraUsage_AcceptsHeavyTaskMetrics(t *testing.T) {
 	}{
 		{"infra.task.vcpu.hours", ""},
 		{"infra.task.memory.gib_hours", ""},
-		{"infra.task.gpu.hours", "g4dn.xlarge"},
+		{"infra.task.gpu.hours", usage.TaskGPUModelG5GXlarge},
 	} {
 		t.Run(tc.metric, func(t *testing.T) {
 			store := newFakeStore()
@@ -548,14 +549,14 @@ func TestRecordInfraUsage_AcceptsHeavyTaskMetrics(t *testing.T) {
 func TestRecordInfraUsage_GPUHoursCarriesInstanceType(t *testing.T) {
 	store := newFakeStore()
 	req := validInfra()
-	req.EventID = "gpu-g4dn-xlarge"
+	req.EventID = "gpu-g5g-xlarge"
 	req.Metric = "infra.task.gpu.hours"
-	req.Model = "g4dn.xlarge"
+	req.Model = usage.TaskGPUModelG5GXlarge
 
 	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
 	require.NoError(t, err)
 	require.True(t, resp.Recorded)
-	require.Equal(t, "g4dn.xlarge", store.events[req.EventID].Model)
+	require.Equal(t, usage.TaskGPUModelG5GXlarge, store.events[req.EventID].Model)
 }
 
 func TestRecordInfraUsage_GPUHoursRequiresInstanceType(t *testing.T) {
@@ -569,6 +570,83 @@ func TestRecordInfraUsage_GPUHoursRequiresInstanceType(t *testing.T) {
 	require.Empty(t, store.events)
 }
 
+func TestAdmittedTaskGPUModels_ContainsOnlyProvisionedG5G(t *testing.T) {
+	models := usage.AdmittedTaskGPUModels()
+	require.Equal(t, []string{usage.TaskGPUModelG5GXlarge}, models)
+	require.True(t, usage.IsAdmittedTaskGPUModel(usage.TaskGPUModelG5GXlarge))
+	require.False(t, usage.IsAdmittedTaskGPUModel("g4dn.xlarge"))
+
+	// The caller receives a copy and cannot mutate the central contract.
+	models[0] = "g4dn.xlarge"
+	require.Equal(t, []string{usage.TaskGPUModelG5GXlarge}, usage.AdmittedTaskGPUModels())
+}
+
+func TestRecordInfraUsage_GPUHoursRejectsUnknownModelEvenWhenPriced(t *testing.T) {
+	store := newFakeStore()
+	store.modelPrices[modelPriceKey("infra.task.gpu.hours", "g4dn.xlarge")] = usage.ModelPrice{
+		UnitPriceMicros: 710000,
+		Active:          true,
+	}
+	req := validInfra()
+	req.EventID = "gpu-historical-priced-model"
+	req.Metric = "infra.task.gpu.hours"
+	req.Model = "g4dn.xlarge"
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+	require.Empty(t, store.events, "historical price rows must not expand managed task admission")
+}
+
+func TestRecordInfraUsage_GPUHoursFailsClosedWithoutExactPrice(t *testing.T) {
+	store := newFakeStore()
+	delete(store.modelPrices, modelPriceKey("infra.task.gpu.hours", usage.TaskGPUModelG5GXlarge))
+	req := validInfra()
+	req.EventID = "gpu-missing-price"
+	req.Metric = "infra.task.gpu.hours"
+	req.Model = usage.TaskGPUModelG5GXlarge
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInternal)
+	require.Empty(t, store.events, "an admitted model without its exact row must not be recorded")
+}
+
+func TestRecordInfraUsage_GPUHoursRejectsNonPositiveExactPrice(t *testing.T) {
+	for _, price := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("price_%d", price), func(t *testing.T) {
+			store := newFakeStore()
+			store.modelPrices[modelPriceKey("infra.task.gpu.hours", usage.TaskGPUModelG5GXlarge)] = usage.ModelPrice{
+				UnitPriceMicros: price,
+				Active:          true,
+			}
+			req := validInfra()
+			req.EventID = fmt.Sprintf("gpu-non-positive-%d", price)
+			req.Metric = "infra.task.gpu.hours"
+			req.Model = usage.TaskGPUModelG5GXlarge
+
+			_, err := newService(store).RecordInfraUsage(context.Background(), req)
+			requireCode(t, err, billing.CodeInternal)
+			require.Empty(t, store.events)
+		})
+	}
+}
+
+func TestRecordInfraUsage_GPUHoursDuplicateEventRemainsIdempotent(t *testing.T) {
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "gpu-duplicate-attempt-metric"
+	req.Metric = "infra.task.gpu.hours"
+	req.Model = usage.TaskGPUModelG5GXlarge
+	svc := newService(store)
+
+	first, err := svc.RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, first.Recorded)
+	second, err := svc.RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, second.Recorded)
+	require.Len(t, store.events, 1, "duplicate delivery must retain one usage fact")
+}
+
 func TestRecordInfraUsage_RejectsModelOnUndimensionedHeavyTaskMetrics(t *testing.T) {
 	for _, metric := range []string{
 		"infra.task.vcpu.hours",
@@ -579,7 +657,7 @@ func TestRecordInfraUsage_RejectsModelOnUndimensionedHeavyTaskMetrics(t *testing
 			req := validInfra()
 			req.EventID = "heavy-model-" + metric
 			req.Metric = metric
-			req.Model = "g4dn.xlarge"
+			req.Model = usage.TaskGPUModelG5GXlarge
 
 			_, err := newService(store).RecordInfraUsage(context.Background(), req)
 			requireCode(t, err, billing.CodeInvalidInput)

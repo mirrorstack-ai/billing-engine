@@ -28,6 +28,10 @@ import (
 var (
 	ErrInactiveModelPrice = errors.New("per-model price is retired (active=false)")
 
+	// ErrTaskGPUModelPrice means task GPU usage cannot resolve a positive active
+	// exact price. It never falls back to another pricing source.
+	ErrTaskGPUModelPrice = errors.New("task GPU model is not admitted or has no positive active exact price")
+
 	// ErrCreditRailRequired means a fresh Stripe claim lost the account-lock
 	// race to a standard→credits transition. No Stripe marker or network call
 	// exists; the service must retry the charge through the wallet rail.
@@ -66,16 +70,19 @@ type Store interface {
 
 	// MetricPriceMicros returns the per-unit customer price snapshotted onto the
 	// aggregate. Resolution order (usage-time-pricing Phase 1, migration 044):
-	//  1. VERSION-FIRST: when moduleVersion != "", try the IMMUTABLE
+	//  1. TASK-GPU FIRST: infra.task.gpu.hours requires an admitted model and
+	//     an active exact metric_model_prices row. It never uses a version,
+	//     per-module, or catalog fallback.
+	//  2. VERSION-FIRST: when moduleVersion != "", try the IMMUTABLE
 	//     per-(module, metric, module_version) snapshot (metric_version_prices).
 	//     A hit wins outright — this is what stops a later version's re-price
 	//     from retroactively re-billing an earlier version's already-accrued
 	//     usage (the snapshot, once written, can never be overwritten). A miss
-	//     (no snapshot for this version) falls through to step 2.
-	//  2. When model != "" it resolves the AUTHORITATIVE per-(metric, model)
+	//     (no snapshot for this version) falls through to step 3.
+	//  3. When model != "" it resolves the AUTHORITATIVE per-(metric, model)
 	//     price from metric_model_prices (migration 018), falling back to the
 	//     catalog row when no per-model price exists.
-	//  3. model == "" (and no version snapshot) resolves the (module, metric)
+	//  4. model == "" (and no version snapshot) resolves the (module, metric)
 	//     catalog row directly.
 	// priced=false (NULL/absent price) → the metric is metered-but-unpriced and
 	// prices to 0. A per-model row that EXISTS but is RETIRED (active=false)
@@ -1026,6 +1033,25 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 }
 
 func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model, moduleVersion string) (int64, bool, error) {
+	// Enforce exact task GPU pricing before every generic fallback. This also
+	// catches direct ledger writes that bypass RecordInfraUsage.
+	if metric == "infra.task.gpu.hours" {
+		if !usage.IsAdmittedTaskGPUModel(model) {
+			return 0, false, fmt.Errorf("%w: metric=%s model=%s", ErrTaskGPUModelPrice, metric, model)
+		}
+		row, err := s.q.LookupModelPrice(ctx, db.LookupModelPriceParams{Metric: metric, Model: model})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, fmt.Errorf("%w: metric=%s model=%s", ErrTaskGPUModelPrice, metric, model)
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		if !row.Active || row.UnitPriceMicros <= 0 {
+			return 0, false, fmt.Errorf("%w: metric=%s model=%s active=%t price=%d", ErrTaskGPUModelPrice, metric, model, row.Active, row.UnitPriceMicros)
+		}
+		return row.UnitPriceMicros, true, nil
+	}
+
 	// VERSION-FIRST (usage-time-pricing Phase 1, migration 044): an event
 	// stamped with a module_version resolves its price from the IMMUTABLE
 	// per-(module, metric, module_version) snapshot BEFORE anything else. A
