@@ -15,6 +15,25 @@ FROM ms_billing.app_module_overage_timers
 WHERE app_id = $1
   AND removed_at IS NULL;
 
+-- LiveOverModuleTimerCountForApp attributes the account-wide pooled overage
+-- back to one app for GetAppBill's current-period estimate. The charge spine's
+-- canonical FIFO rule stays unchanged: rank every live timer across the whole
+-- account, skip the first @included_modules rows, then count only the over rows
+-- owned by @app_id. This makes the per-app bill reconcile with the account bill
+-- without granting a second five-module allowance per app.
+-- name: LiveOverModuleTimerCountForApp :one
+WITH live_fifo AS (
+    SELECT app_id,
+           row_number() OVER (ORDER BY installed_at, id) AS fifo_position
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = @account_id::uuid
+      AND removed_at IS NULL
+)
+SELECT COALESCE(count(*), 0)::bigint AS over_count
+FROM live_fifo
+WHERE app_id = @app_id::uuid
+  AND fifo_position > @included_modules::int;
+
 -- InsertModuleOverageTimers inserts N identical install timers for one app, all
 -- anchored at the SAME installed_at / grace_expires_at (RegisterApp's K
 -- co-created modules share created_at; a SyncAppModules grow shares now()).

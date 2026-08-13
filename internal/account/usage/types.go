@@ -408,11 +408,19 @@ type GetAppBillResponse struct {
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
 
-	// BaseFeeMicros is 基本費用 — the FLAT fixed per-app/period platform fee (see
-	// the bill.go consts). Module overage is NO LONGER folded in here: it is
-	// account-wide pooled (migration 032) and surfaced on GetAccountBill's
-	// AccountOverageMicros. Bundles the PaaS infra credit surfaced below.
+	// BaseFeeMicros is 基本費用. For the current period it is the fixed per-app
+	// fee PLUS this app's attributed share of the account-wide pooled module
+	// overage; for a historical period it is the exact frozen base snapshot.
+	// GetAccountBill keeps the same current overage as a separate account line,
+	// so callers must not add the two APIs together.
 	BaseFeeMicros int64 `json:"base_fee_micros"`
+	// InstalledModuleCount is the billing mirror's authoritative live install
+	// snapshot, including installed modules with no metered usage this period.
+	InstalledModuleCount int `json:"installed_module_count"`
+	// ModuleOverageMicros is the current-period subset of BaseFeeMicros attributed
+	// from this app's account-FIFO over timers. It is informational (already
+	// included in BaseFeeMicros), and zero for historical periods.
+	ModuleOverageMicros int64 `json:"module_overage_micros"`
 
 	// ModuleUsage is 模組使用量 — one line per (module, metric, model,
 	// module_version) of metered CUSTOM usage, quantity × declared unit price with
