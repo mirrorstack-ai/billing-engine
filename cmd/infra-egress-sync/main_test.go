@@ -139,6 +139,10 @@ func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, _ uuid.UUI
 	return 0, nil
 }
 
+func (f *fakeStore) LiveOverModuleTimerCountForApp(_ context.Context, _, _ uuid.UUID, _ int) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (int, error) {
 	return 0, nil
 }

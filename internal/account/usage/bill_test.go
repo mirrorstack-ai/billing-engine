@@ -76,6 +76,45 @@ func TestGetAppBill_PerAppBaseIsFlatEvenWithManyModules(t *testing.T) {
 	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros, "per-app base is flat; overage is pooled at the account")
 }
 
+func TestGetAppBill_CurrentBaseIncludesAttributedAccountOverage(t *testing.T) {
+	store := newFakeStore()
+	owner, accountID, appID := uuid.New(), uuid.New(), uuid.New()
+	store.accounts[owner] = accountID
+	store.appMirrors[appID] = usage.AppMirrorInfo{ModuleCount: 9}
+	store.liveOverTimerCounts[appID] = 4
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{
+		OwnerUserID: owner,
+		AppID:       appID,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 9, resp.InstalledModuleCount)
+	require.EqualValues(t, 12_000_000, resp.ModuleOverageMicros)
+	require.EqualValues(t, 32_000_000, resp.BaseFeeMicros)
+	require.Equal(t, resp.BaseFeeMicros, resp.TotalMicros)
+}
+
+func TestGetAppBill_HistoricalBaseDoesNotUseLiveOverage(t *testing.T) {
+	store := newFakeStore()
+	owner, accountID, appID, periodID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	store.accounts[owner] = accountID
+	store.appMirrors[appID] = usage.AppMirrorInfo{ModuleCount: 9}
+	store.liveOverTimerCounts[appID] = 4
+	start := time.Date(2026, time.July, 11, 0, 0, 0, 0, time.UTC)
+	store.periodWindows[periodID] = periodWindow{start: start, end: start.AddDate(0, 1, 0)}
+	store.baseSnapshots[baseSnapKey(appID, start)] = usage.AppBaseSnapshotInfo{BaseMicros: 20_000_000}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{
+		OwnerUserID: owner,
+		AppID:       appID,
+		PeriodID:    periodID,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 9, resp.InstalledModuleCount)
+	require.Zero(t, resp.ModuleOverageMicros)
+	require.EqualValues(t, 20_000_000, resp.BaseFeeMicros)
+}
+
 func TestGetAppBill_ModuleCountIsDistinctModulesNotLines(t *testing.T) {
 	// Many lines across only 2 distinct modules (multiple metrics/versions per
 	// module) → the installed-module proxy counts 2, still within the bundle.

@@ -73,9 +73,11 @@ type fakeStore struct {
 	// GetAccountBill's steady-state account-overage estimate. The single-account
 	// usage fake models it as Σ module_count over its live appMirrors (one live
 	// timer per installed module), so display tests set counts on appMirrors.
-	errLiveTimerCount  error
-	liveDomainCount    int
-	errLiveDomainCount error
+	errLiveTimerCount     error
+	liveOverTimerCounts   map[uuid.UUID]int
+	errLiveOverTimerCount error
+	liveDomainCount       int
+	errLiveDomainCount    error
 
 	// usageAppIDs is what AppIDsWithUsage enumerates (the usage half of
 	// GetAccountBill's roster); the mirror half is DERIVED from appMirrors with
@@ -158,8 +160,10 @@ func newFakeStore() *fakeStore {
 		appOwnerOrgs:                map[uuid.UUID]uuid.UUID{},
 		events:                      map[string]usage.UsageEvent{},
 		anchorDays:                  map[uuid.UUID]int{},
+		periodWindows:               map[uuid.UUID]periodWindow{},
 		visibility:                  map[uuid.UUID]usage.Visibility{},
 		appMirrors:                  map[uuid.UUID]usage.AppMirrorInfo{},
+		liveOverTimerCounts:         map[uuid.UUID]int{},
 		baseSnapshots:               map[string]usage.AppBaseSnapshotInfo{},
 		appBillRowsByApp:            map[uuid.UUID][]usage.AppMetricUsageRaw{},
 		appInfraBillRowsByApp:       map[uuid.UUID][]usage.AppInfraUsage{},
@@ -365,6 +369,16 @@ func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, _ uuid.UUI
 		}
 	}
 	return sum, nil
+}
+
+// LiveOverModuleTimerCountForApp returns the fixture's exact attribution for
+// one app. Tests opt in explicitly so the fake never invents account FIFO order
+// from its unordered appMirrors map.
+func (f *fakeStore) LiveOverModuleTimerCountForApp(_ context.Context, _, appID uuid.UUID, _ int) (int, error) {
+	if f.errLiveOverTimerCount != nil {
+		return 0, f.errLiveOverTimerCount
+	}
+	return f.liveOverTimerCounts[appID], nil
 }
 
 // LiveDomainCountForAccount returns the configured current live-domain count

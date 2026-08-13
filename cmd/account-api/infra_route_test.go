@@ -97,6 +97,10 @@ func (stubUsageStore) LiveModuleTimerCountForAccount(context.Context, uuid.UUID)
 	return 0, nil
 }
 
+func (stubUsageStore) LiveOverModuleTimerCountForApp(context.Context, uuid.UUID, uuid.UUID, int) (int, error) {
+	return 0, nil
+}
+
 func (stubUsageStore) LiveDomainCountForAccount(context.Context, uuid.UUID) (int, error) {
 	return 0, nil
 }
