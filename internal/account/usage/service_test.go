@@ -55,6 +55,8 @@ type fakeStore struct {
 	coCreatedOverTimerCounts map[uuid.UUID]int      // app_id → account-FIFO over-count for pending creation preview
 	errSettledNewApp         error
 	errPendingNewApp         error
+	settledDomainCharges     []usage.SettledDomainCreationChargeRaw
+	errSettledDomains        error
 	gotPendingGraceCutoff    time.Time // captured graceCutoff the service resolved (now − GraceDays)
 
 	// GetAccountBill's single-snapshot unresolved one-time projection fixtures.
@@ -78,6 +80,8 @@ type fakeStore struct {
 	errLiveOverTimerCount error
 	liveDomainCount       int
 	errLiveDomainCount    error
+	activatedRecurring    *usage.RecurringFeeCounts
+	errActivatedRecurring error
 
 	// usageAppIDs is what AppIDsWithUsage enumerates (the usage half of
 	// GetAccountBill's roster); the mirror half is DERIVED from appMirrors with
@@ -217,8 +221,8 @@ func (f *fakeStore) MirroredAppIDs(_ context.Context, _ uuid.UUID, start, end ti
 }
 
 // SettledNewCreationCharges re-implements the SettledNewCreationCharges SQL contract in
-// Go over appMirrors + the proration/invoice fixtures: apps with created_at in
-// [start, end) whose proration guard is armed, joined to their invoice,
+// Go over appMirrors + the proration/invoice fixtures: apps whose settlement is
+// in [start, end) and whose proration guard is armed, joined to their invoice,
 // excluding voided / $0 invoices, ordered by the invoice created_at DESC (app_id
 // tie-break) — so service tests prove the assembly, not the fake's map order.
 func (f *fakeStore) SettledNewCreationCharges(_ context.Context, _ uuid.UUID, start, end time.Time) ([]usage.SettledNewCreationChargeRaw, error) {
@@ -227,9 +231,6 @@ func (f *fakeStore) SettledNewCreationCharges(_ context.Context, _ uuid.UUID, st
 	}
 	out := make([]usage.SettledNewCreationChargeRaw, 0)
 	for id, m := range f.appMirrors {
-		if m.CreatedAt.Before(start) || !m.CreatedAt.Before(end) {
-			continue // created_at ∉ [start, end)
-		}
 		sid := f.newAppProrationInvoiceID[id]
 		if sid == "" {
 			continue // guard NULL → not settled (skipped / no-charge / still pending)
@@ -240,6 +241,9 @@ func (f *fakeStore) SettledNewCreationCharges(_ context.Context, _ uuid.UUID, st
 		}
 		if inv.status == "void" || inv.amountMicros <= 0 {
 			continue // SQL drops voided / $0 invoices
+		}
+		if inv.createdAt.Before(start) || !inv.createdAt.Before(end) {
+			continue // settlement instant ∉ [start, end)
 		}
 		out = append(out, usage.SettledNewCreationChargeRaw{
 			AppID:           id,
@@ -261,6 +265,19 @@ func (f *fakeStore) SettledNewCreationCharges(_ context.Context, _ uuid.UUID, st
 		}
 		return out[i].AppID.String() < out[j].AppID.String()
 	})
+	return out, nil
+}
+
+func (f *fakeStore) SettledDomainCreationCharges(_ context.Context, _ uuid.UUID, start, end time.Time) ([]usage.SettledDomainCreationChargeRaw, error) {
+	if f.errSettledDomains != nil {
+		return nil, f.errSettledDomains
+	}
+	out := make([]usage.SettledDomainCreationChargeRaw, 0, len(f.settledDomainCharges))
+	for _, charge := range f.settledDomainCharges {
+		if !charge.ChargedAt.Before(start) && charge.ChargedAt.Before(end) {
+			out = append(out, charge)
+		}
+	}
 	return out, nil
 }
 
@@ -388,6 +405,38 @@ func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (i
 		return 0, f.errLiveDomainCount
 	}
 	return f.liveDomainCount, nil
+}
+
+func (f *fakeStore) ActivatedRecurringFeeCounts(_ context.Context, _ uuid.UUID, _ int) (usage.RecurringFeeCounts, error) {
+	if f.errActivatedRecurring != nil {
+		return usage.RecurringFeeCounts{}, f.errActivatedRecurring
+	}
+	if f.activatedRecurring != nil {
+		return *f.activatedRecurring, nil
+	}
+	// Unrelated account-bill tests predate the activation markers in this fake;
+	// preserve their all-settled posture unless a test opts into exact counts.
+	apps := 0
+	for _, app := range f.appMirrors {
+		if !app.Deleted {
+			apps++
+		}
+	}
+	return usage.RecurringFeeCounts{
+		Apps:           apps,
+		ModuleOverages: max(0, f.liveModuleTimerCount()-usage.IncludedModules),
+		CustomDomains:  f.liveDomainCount,
+	}, nil
+}
+
+func (f *fakeStore) liveModuleTimerCount() int {
+	total := 0
+	for _, app := range f.appMirrors {
+		if !app.Deleted {
+			total += app.ModuleCount
+		}
+	}
+	return total
 }
 
 // AccountAnchorDay returns the configured anchor day for an account, defaulting

@@ -105,3 +105,74 @@ SELECT COALESCE(count(*), 0)::bigint AS live_count
 FROM ms_billing.app_custom_domains
 WHERE account_id = $1
   AND removed_at IS NULL;
+
+-- ActivatedRecurringFeeCounts is the CURRENT next-period recurring-base input.
+-- A live entity joins the forecast only after its one-time activation charge
+-- has reached a durable charged state:
+--   * app: creation-proration guard armed (or a legacy advance snapshot proves
+--     it was charged before the guard existed);
+--   * module overage: current account-FIFO over row with grace_charged_at set;
+--   * custom domain: activation charge recorded in charged_at.
+-- Pending creations stay solely in the one-time projection. This gives the UI
+-- an atomic handoff: create Aug 30 → creation charge Sep 2 (covering the
+-- remaining creation window plus the straddled window) → recurring base joins
+-- only after that Sep 2 settlement succeeds.
+-- name: ActivatedRecurringFeeCounts :one
+WITH live_timer_fifo AS (
+    SELECT grace_charged_at,
+           row_number() OVER (ORDER BY installed_at, id) AS fifo_position
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = @account_id::uuid
+      AND removed_at IS NULL
+)
+SELECT (
+           SELECT count(*)::bigint
+           FROM ms_billing.apps app
+           WHERE app.account_id = @account_id::uuid
+             AND app.deleted_at IS NULL
+             AND (
+                 app.proration_invoice_id IS NOT NULL
+                 OR EXISTS (
+                     SELECT 1
+                     FROM ms_billing.app_base_snapshots snap
+                     WHERE snap.app_id = app.app_id
+                       AND snap.source = 'advance'
+                 )
+             )
+       ) AS app_count,
+       (
+           SELECT count(*)::bigint
+           FROM live_timer_fifo
+           WHERE fifo_position > @included_modules::int
+             AND grace_charged_at IS NOT NULL
+       ) AS module_overage_count,
+       (
+           SELECT count(*)::bigint
+           FROM ms_billing.app_custom_domains domain_row
+           WHERE domain_row.account_id = @account_id::uuid
+             AND domain_row.removed_at IS NULL
+             AND domain_row.charged_at IS NOT NULL
+       ) AS custom_domain_count;
+
+-- SettledDomainCreationCharges feeds 本期新建立 with custom-domain activation
+-- charges. Membership follows charged_at (the actual settlement instant), so a
+-- delayed charge appears in the period that collected it. The service derives
+-- the exact charged line amount from activated_at and the account anchor; the
+-- invoice total is intentionally not used because customer credits can reduce
+-- amount_due to zero without erasing the paid domain line.
+-- name: SettledDomainCreationCharges :many
+SELECT domain_row.id,
+       domain_row.app_id,
+       domain_row.hostname,
+       domain_row.activated_at,
+       domain_row.charged_at,
+       invoice.id AS invoice_id,
+       invoice.number
+FROM ms_billing.app_custom_domains domain_row
+JOIN ms_billing.invoices invoice
+  ON invoice.stripe_invoice_id = domain_row.charge_invoice_id
+WHERE domain_row.account_id = @account_id::uuid
+  AND domain_row.charged_at >= @period_start::timestamptz
+  AND domain_row.charged_at < @period_end::timestamptz
+  AND invoice.status <> 'void'
+ORDER BY domain_row.charged_at DESC, domain_row.id;

@@ -610,23 +610,24 @@ SELECT a.app_id,
        COALESCE(i.id, a.app_id) AS invoice_id,
        COALESCE(i.number, NULLIF(a.proration_invoice_id, i.stripe_invoice_id)) AS number,
        (CASE
-           WHEN a.proration_invoice_id LIKE 'wallet:%' THEN
-               (SELECT COALESCE(-SUM(cl.amount_micros), 0)::numeric
-                  FROM ms_billing.credit_ledger cl
-                 WHERE cl.account_id = a.account_id
-                   AND cl.status = 'settled'
-                   AND cl.type = 'usage_draw'
-                   AND cl.idempotency_key LIKE 'wallet-draw:app-creation:' || a.app_id::text || ':%') / 10000
+           WHEN a.proration_invoice_id LIKE 'wallet:%' THEN wallet_draw.amount_due
            ELSE i.amount_due
        END)::numeric AS amount_due,
-       COALESCE(i.created_at, a.updated_at) AS recorded_at
+       COALESCE(i.created_at, wallet_draw.recorded_at) AS recorded_at
 FROM ms_billing.apps a
 LEFT JOIN ms_billing.invoices i ON i.stripe_invoice_id = a.proration_invoice_id
 LEFT JOIN ms_billing.app_base_snapshots s
        ON s.app_id = a.app_id AND s.source = 'proration'
+LEFT JOIN LATERAL (
+    SELECT COALESCE(-SUM(cl.amount_micros), 0)::numeric / 10000 AS amount_due,
+           MIN(cl.created_at) AS recorded_at
+    FROM ms_billing.credit_ledger cl
+    WHERE cl.account_id = a.account_id
+      AND cl.status = 'settled'
+      AND cl.type = 'usage_draw'
+      AND cl.idempotency_key LIKE 'wallet-draw:app-creation:' || a.app_id::text || ':%'
+) wallet_draw ON a.proration_invoice_id LIKE 'wallet:%'
 WHERE a.account_id = $1::uuid
-  AND a.created_at >= $2::timestamptz
-  AND a.created_at < $3::timestamptz
   AND a.proration_invoice_id IS NOT NULL
   AND (
       a.proration_invoice_id LIKE 'wallet:%'
@@ -636,6 +637,8 @@ WHERE a.account_id = $1::uuid
           AND i.amount_due > 0
       )
   )
+  AND COALESCE(i.created_at, wallet_draw.recorded_at) >= $2::timestamptz
+  AND COALESCE(i.created_at, wallet_draw.recorded_at) < $3::timestamptz
 ORDER BY recorded_at DESC, a.app_id
 `
 
@@ -661,14 +664,17 @@ type SettledNewCreationChargesRow struct {
 // in the resolved window whose creation-proration guard is armed. Stripe-settled
 // rows join their invoice mirror; credit-wallet rows deliberately have no
 // invoice mirror and instead recover the settled base draw from credit_ledger.
-// Membership is the app's created_at ∈ [@period_start, @period_end). Stripe's
+// Membership is the SETTLEMENT instant ∈ [@period_start, @period_end), not the
+// app's created_at. Creation grace can cross an anchored period boundary (for
+// example, create Aug 30, settle Sep 2); the charge belongs in the period in
+// which it actually settled. Stripe's
 // amount_due > 0 AND status <> 'void' filters apply only to its branch. The
 // wallet branch exposes its synthetic proration ref as the stable display
 // identity and converts the ledger's micro-dollar sum to NUMERIC cents so the
 // store's established cents-to-micros boundary remains unchanged. The wallet
-// recorded_at fallback is apps.updated_at, which is stamped when the guard is
-// armed in the same transaction as the draw. Ordered newest-first with app_id
-// breaking ties for a deterministic scan.
+// recorded_at comes from the wallet ledger itself, so later app metadata syncs
+// cannot move a settled charge into a different display period. Ordered
+// newest-first with app_id breaking ties for a deterministic scan.
 //
 // The per-component BREAKDOWN columns let the UI split the row into
 // "基礎費用" + "N 加購模組": a.name is the frozen display name (037);
@@ -721,11 +727,11 @@ JOIN ms_billing.invoices i ON i.stripe_invoice_id = a.proration_invoice_id
 LEFT JOIN ms_billing.app_base_snapshots s
        ON s.app_id = a.app_id AND s.source = 'proration'
 WHERE a.account_id = $1::uuid
-  AND a.created_at >= $2::timestamptz
-  AND a.created_at < $3::timestamptz
   AND a.proration_invoice_id IS NOT NULL
   AND i.status <> 'void'
   AND i.amount_due > 0
+  AND i.created_at >= $2::timestamptz
+  AND i.created_at < $3::timestamptz
 ORDER BY i.created_at DESC, a.app_id
 `
 

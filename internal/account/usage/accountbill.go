@@ -273,6 +273,25 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		}
 	}
 	projectedBaseFeeTotal := liveAppCount * resolveBaseFeeMicros(plan)
+	projectedRecurringSurcharges := accountOverage + customDomains
+	if periodID == "" {
+		store, ok := s.store.(interface {
+			ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int) (RecurringFeeCounts, error)
+		})
+		if !ok {
+			return nil, billing.Internal("activated recurring fee count store unavailable", nil)
+		}
+		counts, err := store.ActivatedRecurringFeeCounts(ctx, accountID, IncludedModules)
+		if err != nil {
+			return nil, billing.Internal("activated recurring fee counts failed", err)
+		}
+		projectedBaseFeeTotal = int64(counts.Apps)*resolveBaseFeeMicros(plan) +
+			int64(counts.ModuleOverages)*ModuleOverageFeeMicros +
+			int64(counts.CustomDomains)*DomainFeeMicros
+		// The current-period base line is the complete activation-gated recurring
+		// forecast, so module/domain units are folded into it exactly once.
+		projectedRecurringSurcharges = 0
+	}
 	response.ProjectedBaseFeeTotalMicros = projectedBaseFeeTotal
 
 	// Creation-proration and per-install grace charges are one-time money due IN
@@ -293,9 +312,8 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	response.ProjectedTotalMicros = projectedBaseFeeTotal +
 		moduleUsageTotal +
 		infraTotal +
-		accountOverage +
+		projectedRecurringSurcharges +
 		agent.TotalMicros +
-		customDomains -
 		paasCredit +
 		unresolvedOneTimeTotal
 
