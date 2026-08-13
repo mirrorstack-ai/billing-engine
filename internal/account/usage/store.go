@@ -248,9 +248,9 @@ type Store interface {
 	// fee line on GetAccountBill.
 	LiveDomainCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
 
-	// SettledNewCreationCharges reads the SETTLED half of ListNewCreationCharges: every
-	// app CREATED in [periodStart, periodEnd) whose creation-proration guard is
-	// armed. Stripe rows carry the mirrored invoice's actual settled total;
+	// SettledNewCreationCharges reads the SETTLED half of ListNewCreationCharges:
+	// every app whose creation charge SETTLED in [periodStart, periodEnd). Stripe
+	// rows carry the mirrored invoice's actual settled total;
 	// wallet rows carry the settled creation usage-draw sum and synthetic wallet
 	// ref without creating an invoice mirror. $0 / voided filters constrain only
 	// Stripe rows; skipped / no-charge prorations never armed the guard. Ordered
@@ -296,8 +296,8 @@ type Store interface {
 	CoCreatedOverModuleTimerCount(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) (int, error)
 }
 
-// SettledNewCreationChargeRaw is one decoded SettledNewCreationCharges row: a settled
-// creation-proration charge for an app created in the window. For Stripe rows,
+// SettledNewCreationChargeRaw is one decoded SettledNewCreationCharges row: a
+// creation-proration charge settled in the selected window. For Stripe rows,
 // InvoiceID is the mirror UUID and Number is the customer-facing number (""
 // before finalization enrichment). For wallet rows, InvoiceID is the stable app
 // UUID fallback and Number is the synthetic wallet ref exposed as the identity.
@@ -317,6 +317,29 @@ type SettledNewCreationChargeRaw struct {
 	Name               string
 	CreatedModuleCount int
 	BaseMicros         int64
+}
+
+// RecurringFeeCounts is the activation-gated CURRENT forecast input. Counts
+// are kept separate because app base fees are plan-aware while module/domain
+// unit prices are fixed billing constants.
+type RecurringFeeCounts struct {
+	Apps           int
+	ModuleOverages int
+	CustomDomains  int
+}
+
+// SettledDomainCreationChargeRaw is one charged custom-domain activation. Its
+// invoice identity is display-only; the service recomputes the exact charged
+// line from ActivatedAt and the account's immutable anchor so customer credits
+// reducing invoice amount_due cannot turn the line into $0.
+type SettledDomainCreationChargeRaw struct {
+	ID          uuid.UUID
+	AppID       uuid.UUID
+	Hostname    string
+	ActivatedAt time.Time
+	ChargedAt   time.Time
+	InvoiceID   uuid.UUID
+	Number      string
 }
 
 // PendingNewCreationChargeRaw is one decoded PendingNewCreationCharges row: an app still
@@ -890,8 +913,8 @@ type settledNewCreationDBRow struct {
 	recordedAt         time.Time
 }
 
-// SettledNewCreationCharges reads the settled creation-proration charges for
-// apps created in the window — see the Store interface doc. With the wallet
+// SettledNewCreationCharges reads creation-proration charges by settlement
+// window — see the Store interface doc. With the wallet
 // disabled it executes the pre-048 Stripe-only query, which names no wallet
 // object. With the wallet enabled, SQL normalizes both the mirror amount and
 // the wallet ledger sum to NUMERIC cents; centsNumericToMicros performs the
@@ -1138,6 +1161,57 @@ func (s *pgxStore) LiveDomainCountForAccount(ctx context.Context, accountID uuid
 		return 0, err
 	}
 	return int(n), nil
+}
+
+func (s *pgxStore) ActivatedRecurringFeeCounts(ctx context.Context, accountID uuid.UUID, includedModules int) (RecurringFeeCounts, error) {
+	row, err := s.q.ActivatedRecurringFeeCounts(ctx, db.ActivatedRecurringFeeCountsParams{
+		AccountID:       accountID.String(),
+		IncludedModules: int32(includedModules), //nolint:gosec // pricing allowance is a small positive constant
+	})
+	if err != nil {
+		return RecurringFeeCounts{}, err
+	}
+	return RecurringFeeCounts{
+		Apps:           int(row.AppCount),
+		ModuleOverages: int(row.ModuleOverageCount),
+		CustomDomains:  int(row.CustomDomainCount),
+	}, nil
+}
+
+func (s *pgxStore) SettledDomainCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]SettledDomainCreationChargeRaw, error) {
+	rows, err := s.q.SettledDomainCreationCharges(ctx, db.SettledDomainCreationChargesParams{
+		AccountID:   accountID.String(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SettledDomainCreationChargeRaw, 0, len(rows))
+	for _, row := range rows {
+		id, err := uuid.Parse(row.ID)
+		if err != nil {
+			return nil, fmt.Errorf("decode custom-domain charge id %q: %w", row.ID, err)
+		}
+		appID, err := uuid.Parse(row.AppID)
+		if err != nil {
+			return nil, fmt.Errorf("decode custom-domain app id %q: %w", row.AppID, err)
+		}
+		invoiceID, err := uuid.Parse(row.InvoiceID)
+		if err != nil {
+			return nil, fmt.Errorf("decode custom-domain invoice id %q: %w", row.InvoiceID, err)
+		}
+		out = append(out, SettledDomainCreationChargeRaw{
+			ID:          id,
+			AppID:       appID,
+			Hostname:    row.Hostname,
+			ActivatedAt: row.ActivatedAt,
+			ChargedAt:   row.ChargedAt.Time,
+			InvoiceID:   invoiceID,
+			Number:      row.Number.String,
+		})
+	}
+	return out, nil
 }
 
 // parseAppIDs decodes a generated query's text app_id column into uuid.UUIDs,

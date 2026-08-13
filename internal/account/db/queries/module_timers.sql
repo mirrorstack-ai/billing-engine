@@ -337,11 +337,12 @@ ORDER BY min(ranked.grace_expires_at), ranked.app_id;
 -- A legacy attempted app without a migration-050 header is explicitly flagged
 -- so the service fails closed instead of reconstructing unknown ownership.
 --
--- Frozen rows carry raw micros and both exact snapshot windows. The service
--- subtracts a recurring unit only when the frozen full-period snapshot exactly
--- equals the projected next period AND that exact app/child is still represented
--- by the live recurring forecast. Declared/actual child counts are repeated on
--- every frozen row (including the base), making incomplete ownership loud.
+-- Frozen rows carry raw micros and both exact snapshot windows. An unresolved
+-- unit is never in the activation-gated recurring forecast, so every dynamic
+-- and frozen row reports counts_toward_recurring=false. Settlement atomically
+-- removes it here and admits it to ActivatedRecurringFeeCounts. Declared/actual
+-- child counts are repeated on every frozen row (including the base), making
+-- incomplete ownership loud.
 -- name: UnresolvedOneTimeCharges :many
 WITH live_timer_ranks AS (
     SELECT id,
@@ -368,7 +369,7 @@ dynamic_creations AS (
            app.created_at AS charge_at,
            app.created_at + make_interval(hours => @grace_hours::int) AS grace_expires_at,
            account.activated_at,
-           (app.deleted_at IS NULL) AS counts_toward_recurring,
+           false AS counts_toward_recurring,
            false AS frozen,
            0::bigint AS frozen_amount_micros,
            NULL::timestamptz AS frozen_snapshot_period_start,
@@ -420,10 +421,7 @@ dynamic_timers AS (
            timer.installed_at AS charge_at,
            timer.grace_expires_at,
            account.activated_at,
-           (
-               timer.removed_at IS NULL
-               AND rank.rn > @included_modules::int
-           ) AS counts_toward_recurring,
+           false AS counts_toward_recurring,
            false AS frozen,
            0::bigint AS frozen_amount_micros,
            NULL::timestamptz AS frozen_snapshot_period_start,
@@ -472,7 +470,7 @@ frozen_bases AS (
            app.created_at AS charge_at,
            app.created_at + make_interval(hours => @grace_hours::int) AS grace_expires_at,
            account.activated_at,
-           (app.deleted_at IS NULL) AS counts_toward_recurring,
+           false AS counts_toward_recurring,
            true AS frozen,
            frozen.base_charge_micros AS frozen_amount_micros,
            frozen.snapshot_period_start AS frozen_snapshot_period_start,
@@ -496,10 +494,7 @@ frozen_timers AS (
            timer.installed_at AS charge_at,
            timer.grace_expires_at,
            account.activated_at,
-           (
-               timer.removed_at IS NULL
-               AND rank.rn > @included_modules::int
-           ) AS counts_toward_recurring,
+           false AS counts_toward_recurring,
            true AS frozen,
            frozen.module_charge_micros AS frozen_amount_micros,
            frozen.snapshot_period_start AS frozen_snapshot_period_start,

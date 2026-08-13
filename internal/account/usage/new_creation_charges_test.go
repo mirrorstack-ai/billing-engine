@@ -87,6 +87,62 @@ func TestListNewCreationCharges_SettledDerivation(t *testing.T) {
 	require.Nil(t, c.ChargeETA) // settled rows carry no ETA
 }
 
+func TestListNewCreationCharges_SettledAppBelongsToChargePeriodAcrossBoundary(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store) // [May 1, Jun 1)
+
+	appID := uuid.New()
+	createdAt := time.Date(2026, 4, 30, 8, 0, 0, 0, time.UTC)
+	chargedAt := time.Date(2026, 5, 3, 8, 0, 0, 0, time.UTC)
+	seedSettledApp(store, appID, createdAt, "in_cross", "INV-CROSS", "paid", 21_000_000, chargedAt)
+
+	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+	require.Equal(t, appID, resp.Charges[0].AppID)
+	require.Equal(t, chargedAt, resp.Charges[0].RecordedAt.UTC())
+	require.Equal(t, usage.NewCreationChargeKindApp, resp.Charges[0].Kind)
+}
+
+func TestListNewCreationCharges_IncludesSettledCustomDomainAtExactChargedLineAmount(t *testing.T) {
+	store := newFakeStore()
+	owner, accountID := uuid.New(), uuid.New()
+	store.accounts[owner] = accountID
+	store.anchorDays[accountID] = 1
+	pid := mirrorPeriod(store) // [May 1, Jun 1)
+
+	domainID, appID, invoiceID := uuid.New(), uuid.New(), uuid.New()
+	activatedAt := time.Date(2026, 5, 20, 17, 0, 0, 0, time.UTC)
+	chargedAt := time.Date(2026, 5, 20, 17, 5, 0, 0, time.UTC)
+	store.settledDomainCharges = []usage.SettledDomainCreationChargeRaw{{
+		ID: domainID, AppID: appID, Hostname: "mirrorstack.ai",
+		ActivatedAt: activatedAt, ChargedAt: chargedAt,
+		InvoiceID: invoiceID, Number: "INV-DOMAIN",
+	}}
+
+	resp, err := newService(store).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Charges, 1)
+	charge := resp.Charges[0]
+	require.Equal(t, domainID, charge.ChargeID)
+	require.Equal(t, usage.NewCreationChargeKindCustomDomain, charge.Kind)
+	require.Equal(t, appID, charge.AppID)
+	require.Equal(t, "mirrorstack.ai", charge.Name)
+	require.Equal(t, "INV-DOMAIN", charge.InvoiceID)
+	require.EqualValues(t, usage.DomainCreationChargeMicros(
+		activatedAt,
+		time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+	), charge.AmountMicros)
+	require.Equal(t, charge.AmountMicros, charge.BaseFeeMicros)
+}
+
 // TestListNewCreationCharges_SettledBreakdown: a settled 7-module app splits its
 // invoice total into base (the 'proration' snapshot) + add-ons, surfaces the app
 // name, and reports addon_module_count = max(0, 7 − IncludedModules) = 2 — with

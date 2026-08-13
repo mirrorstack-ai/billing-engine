@@ -637,8 +637,10 @@ type GetAccountBillResponse struct {
 	// the credit cap.
 	TotalMicros int64 `json:"total_micros"`
 
-	// ProjectedBaseFeeTotalMicros is the full next-period base fee for every
-	// live app in Apps, without using the current period's accrued base.
+	// ProjectedBaseFeeTotalMicros is the activation-gated next-period recurring
+	// base. For the current live bill it includes app bases, module-overage
+	// units, and custom domains only after each initial charge succeeds; pending
+	// creations remain in ProjectedTotalMicros as one-time exposure instead.
 	ProjectedBaseFeeTotalMicros int64 `json:"projected_base_fee_total_micros"`
 	// ProjectedTotalMicros has the same composition as TotalMicros, with
 	// ProjectedBaseFeeTotalMicros substituted for BaseFeeTotalMicros. On the

@@ -649,8 +649,9 @@ func TestGetAccountBill_ProjectedTotalIncludesUnresolvedCreationUntilDurableTerm
 		}
 	}
 
-	// Match the reported bill: five live apps project $100 next-period base,
-	// one app carries $0.06 usage, and the account agent carries $0.01.
+	// Four settled apps project $80 next-period base. The fifth is still in its
+	// creation-charge lifecycle and remains one-time exposure until settlement.
+	// One app carries $0.06 usage, and the account agent carries $0.01.
 	store.appBillRowsByApp[apps[0]] = []usage.AppMetricUsageRaw{
 		customLine(uuid.New(), "views.count", "", 60_000),
 	}
@@ -668,8 +669,9 @@ func TestGetAccountBill_ProjectedTotalIncludesUnresolvedCreationUntilDurableTerm
 		ChargeAt:              createdAt,
 		GraceExpiresAt:        usage.GraceExpiry(createdAt),
 		ActivatedAt:           activatedAt,
-		CountsTowardRecurring: true,
+		CountsTowardRecurring: false,
 	}}
+	store.activatedRecurring = &usage.RecurringFeeCounts{Apps: 4}
 
 	svc := newService(store).WithNow(func() time.Time { return now })
 	bill, err := svc.GetAccountBill(context.Background(), usage.GetAccountBillRequest{
@@ -678,11 +680,11 @@ func TestGetAccountBill_ProjectedTotalIncludesUnresolvedCreationUntilDurableTerm
 	require.NoError(t, err)
 
 	const (
-		recurringProjection = int64(100_070_000) // $100.07
-		pendingCreation     = int64(10_967_742)  // $10.967742 → UI $10.97
-		wantProjection      = int64(111_037_742) // UI rounds to $111.04
+		recurringProjection = int64(80_070_000) // $80.07
+		pendingCreation     = int64(10_967_742) // $10.967742 → UI $10.97
+		wantProjection      = int64(91_037_742) // UI rounds to $91.04
 	)
-	require.Equal(t, int64(5)*usage.BaseFeeMicros, bill.ProjectedBaseFeeTotalMicros)
+	require.Equal(t, int64(4)*usage.BaseFeeMicros, bill.ProjectedBaseFeeTotalMicros)
 	require.Equal(t, recurringProjection, bill.ProjectedTotalMicros-pendingCreation)
 	require.Equal(t, wantProjection, bill.ProjectedTotalMicros)
 
@@ -714,13 +716,49 @@ func TestGetAccountBill_ProjectedTotalIncludesUnresolvedCreationUntilDurableTerm
 	require.Equal(t, wantProjection, frozenRetry.ProjectedTotalMicros)
 
 	// The store query drops the row atomically when either the settled guard or
-	// permanent-skip guard arms. Settled charges are never added back.
+	// permanent-skip guard arms. A successful settlement simultaneously admits
+	// the app to the recurring forecast.
 	store.unresolvedOneTimeCharges = nil
+	store.activatedRecurring = &usage.RecurringFeeCounts{Apps: 5}
 	terminal, err := svc.GetAccountBill(context.Background(), usage.GetAccountBillRequest{
 		OwnerUserID: owner,
 	})
 	require.NoError(t, err)
-	require.Equal(t, recurringProjection, terminal.ProjectedTotalMicros)
+	require.Equal(t, int64(100_070_000), terminal.ProjectedTotalMicros)
+}
+
+func TestGetAccountBill_CurrentProjectedBaseJoinsOnlyAfterInitialChargesSettle(t *testing.T) {
+	store := newFakeStore()
+	owner, accountID := uuid.New(), uuid.New()
+	store.accounts[owner] = accountID
+	createdAt := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	for i := byte(1); i <= 5; i++ {
+		store.appMirrors[seqUUID(i)] = usage.AppMirrorInfo{CreatedAt: createdAt}
+	}
+	// One app owns nine modules, so the live account pool has four overage
+	// units. Before that app and those four timers settle, neither belongs to
+	// the next-period recurring base.
+	app := store.appMirrors[seqUUID(5)]
+	app.ModuleCount = 9
+	store.appMirrors[seqUUID(5)] = app
+	store.activatedRecurring = &usage.RecurringFeeCounts{Apps: 4}
+
+	bill, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 80_000_000, bill.ProjectedBaseFeeTotalMicros)
+
+	// The creation settlement is the atomic handoff. It can occur after a
+	// period boundary; once durable, the app's $20 and four charged $3 timer
+	// units join the forecast: $20×5 + $3×4 = $112.
+	store.activatedRecurring = &usage.RecurringFeeCounts{Apps: 5, ModuleOverages: 4}
+	bill, err = newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 112_000_000, bill.ProjectedBaseFeeTotalMicros)
+	require.Equal(t, bill.ProjectedBaseFeeTotalMicros, bill.ProjectedTotalMicros)
 }
 
 func TestGetAccountBill_UnresolvedOneTimeChargeShapesAndRecurringDedup(t *testing.T) {
@@ -846,7 +884,7 @@ func TestGetAccountBill_UnresolvedOneTimeChargeShapesAndRecurringDedup(t *testin
 				OwnerUserID: owner,
 			})
 			require.NoError(t, err)
-			recurring := bill.ProjectedBaseFeeTotalMicros + bill.AccountOverageMicros
+			recurring := bill.ProjectedBaseFeeTotalMicros
 			require.Equal(t, tc.wantIncrementMicros, bill.ProjectedTotalMicros-recurring)
 		})
 	}
@@ -971,7 +1009,7 @@ func TestGetAccountBill_FrozenCombinedAttemptUsesExactMoneyAndExactRecurringMemb
 				OwnerUserID: owner,
 			})
 			require.NoError(t, err)
-			recurring := bill.ProjectedBaseFeeTotalMicros + bill.AccountOverageMicros
+			recurring := bill.ProjectedBaseFeeTotalMicros
 			require.Equal(t, tc.wantPending, bill.ProjectedTotalMicros-recurring)
 		})
 	}
@@ -1037,7 +1075,7 @@ func TestProjectedCreditChargeContainsOnlyUnpaidUsageExposure(t *testing.T) {
 		bill.PaasCreditMicros
 	require.Equal(t, wantExposure, projection.AmountMicros)
 	require.Equal(t,
-		bill.ProjectedBaseFeeTotalMicros+bill.AccountOverageMicros+bill.CustomDomainsMicros,
+		bill.ProjectedBaseFeeTotalMicros,
 		bill.ProjectedTotalMicros-projection.AmountMicros,
 		"recurring fees already settled by advance/proration legs are excluded from post-draw exposure")
 	require.True(t, projection.PeriodStart.Equal(bill.PeriodStart))

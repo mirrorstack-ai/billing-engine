@@ -86,6 +86,17 @@ func CreationChargeOverageMicros(createdAt, periodStart, periodEnd time.Time) in
 	return cents * microsPerCent
 }
 
+// DomainCreationChargeMicros is the exact whole-cent custom-domain activation
+// line minted by cycle.ChargeDomain, returned in micros for the billing wire.
+// Domain activations have no grace or straddle top-up: only the remainder of
+// the activation-containing period is charged, then the domain joins recurring
+// base after that settlement succeeds.
+func DomainCreationChargeMicros(activatedAt, periodStart, periodEnd time.Time) int64 {
+	m := ProratedBaseMicros(DomainFeeMicros, activatedAt, periodStart, periodEnd)
+	cents := (m + microsPerCent/2) / microsPerCent
+	return cents * microsPerCent
+}
+
 // ProratedBaseMicros prorates an app's per-period base fee for the period
 // [periodStart, periodEnd) given the app's creation instant:
 //

@@ -77,6 +77,81 @@ func TestLiveOverModuleTimerCountForApp_Integration_AttributesAccountFIFO(t *tes
 	require.Equal(t, 4, overB, "only one of app B's five timers occupies the final included slot")
 }
 
+func TestActivatedRecurringFeeCountsAndSettledDomains_Integration(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	accountID := appSeedAccount(t, pool)
+	chargedApp, legacyApp, pendingApp := uuid.New(), uuid.New(), uuid.New()
+	seedMirrorApp(t, pool, accountID, chargedApp, "2026-06-01T00:00:00Z", "")
+	seedMirrorApp(t, pool, accountID, legacyApp, "2026-06-02T00:00:00Z", "")
+	seedMirrorApp(t, pool, accountID, pendingApp, "2026-06-03T00:00:00Z", "")
+
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.apps SET proration_invoice_id = 'in_app' WHERE app_id = $1`,
+		chargedApp)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.app_base_snapshots
+		   (app_id, period_start, period_end, module_count, base_micros, source)
+		 VALUES ($1, $2, $3, 0, 20000000, 'advance')`,
+		legacyApp, appPeriodStart, appPeriodEnd)
+	require.NoError(t, err)
+
+	for i := 0; i < 9; i++ {
+		installedAt := appMustTime(t, "2026-06-04T00:00:00Z").Add(time.Duration(i) * time.Minute)
+		var chargedAt any
+		if i == 5 || i == 6 {
+			chargedAt = installedAt.Add(usage.GraceDays * 24 * time.Hour)
+		}
+		_, err = pool.Exec(ctx,
+			`INSERT INTO ms_billing.app_module_overage_timers
+			   (account_id, app_id, installed_at, grace_expires_at, grace_charged_at)
+			 VALUES ($1, $2, $3, $4, $5)`,
+			accountID, chargedApp, installedAt,
+			installedAt.Add(usage.GraceDays*24*time.Hour), chargedAt)
+		require.NoError(t, err)
+	}
+
+	invoiceID := uuid.New()
+	chargedAt := appMustTime(t, "2026-06-18T12:30:00Z")
+	seedInvoiceMirror(t, pool, accountID, invoiceID, "in_domain", "paid", 200, 200,
+		chargedAt, "MS-0042", "", "", false)
+	chargedDomainID, pendingDomainID := uuid.New(), uuid.New()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.app_custom_domains
+		   (id, account_id, app_id, hostname, activated_at, charged_at,
+		    charge_resolved, charge_invoice_id)
+		 VALUES
+		   ($1, $2, $3, 'mirrorstack.ai', $4, $5, true, 'in_domain'),
+		   ($6, $2, $3, 'pending.example', $4, NULL, false, NULL)`,
+		chargedDomainID, accountID, chargedApp,
+		appMustTime(t, "2026-06-15T00:00:00Z"), chargedAt, pendingDomainID)
+	require.NoError(t, err)
+
+	readStore, ok := store.(interface {
+		ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int) (usage.RecurringFeeCounts, error)
+		SettledDomainCreationCharges(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.SettledDomainCreationChargeRaw, error)
+	})
+	require.True(t, ok)
+
+	counts, err := readStore.ActivatedRecurringFeeCounts(ctx, accountID, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Equal(t, usage.RecurringFeeCounts{Apps: 2, ModuleOverages: 2, CustomDomains: 1}, counts,
+		"only durably charged live entities join the next-period recurring base")
+
+	domains, err := readStore.SettledDomainCreationCharges(ctx, accountID,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+	require.NoError(t, err)
+	require.Len(t, domains, 1)
+	require.Equal(t, chargedDomainID, domains[0].ID)
+	require.Equal(t, "mirrorstack.ai", domains[0].Hostname)
+	require.True(t, chargedAt.Equal(domains[0].ChargedAt))
+	require.Equal(t, invoiceID, domains[0].InvoiceID)
+	require.Equal(t, "MS-0042", domains[0].Number)
+}
+
 // TestAppIDsWithUsage_Integration: the usage half enumerates the UNION of
 // rolled (usage_aggregates for the period) and live (usage_events in the
 // window) app_ids, deduped, account-gated, window-bounded on the live half,
@@ -172,13 +247,14 @@ func TestSettledNewCreationCharges_Integration_ShadowSelectedWalletDraw(t *testi
 	const amountMicros = int64(3_250_123)
 	walletRef := "wallet:app-proration:" + appID.String()
 	recordedAt := appMustTime(t, "2026-06-18T12:30:00Z")
+	laterAppUpdate := appMustTime(t, "2026-07-10T09:00:00Z")
 
 	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.apps
 		   (app_id, account_id, module_count, created_module_count, name, created_at,
 		    proration_invoice_id, updated_at)
 		 VALUES ($1, $2, 3, 3, 'wallet app', $3, $4, $5)`,
-		appID.String(), acct.String(), "2026-06-15T00:00:00Z", walletRef, recordedAt)
+		appID.String(), acct.String(), "2026-05-30T00:00:00Z", walletRef, laterAppUpdate)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.app_base_snapshots
@@ -453,9 +529,10 @@ func TestUnresolvedOneTimeCharges_Integration_CreationTerminalsAndD11(t *testing
 			got[deletedAfter].ChargeID,
 		},
 	)
-	require.True(t, got[inGrace].CountsTowardRecurring)
-	require.True(t, got[postETA].CountsTowardRecurring,
-		"post-ETA/pre-sweep creation remains unresolved without a now cutoff")
+	require.False(t, got[inGrace].CountsTowardRecurring,
+		"an unresolved creation is one-time exposure, not recurring base")
+	require.False(t, got[postETA].CountsTowardRecurring,
+		"the ETA-to-sweep gap stays one-time until the durable charge guard arms")
 	require.False(t, got[deletedExactly].CountsTowardRecurring)
 	require.False(t, got[deletedAfter].CountsTowardRecurring)
 	require.Equal(t, usage.GraceExpiry(got[inGrace].ChargeAt), got[inGrace].GraceExpiresAt)
