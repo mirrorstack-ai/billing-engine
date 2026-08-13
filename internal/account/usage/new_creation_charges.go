@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // ============================================================================
@@ -20,7 +21,8 @@ import (
 // base through Stripe or, for credits-mode accounts, the wallet. Both rails arm
 // apps.proration_invoice_id (migration 027); only Stripe settlement writes an
 // ms_billing.invoices mirror. This read surfaces, for the resolved period, the
-// apps CREATED in it whose base is charged via that leg:
+// creations SETTLED in it. App/module rows come from the creation-proration
+// leg; custom domains come from their zero-grace activation leg:
 //
 //   - SETTLED: the proration already fired — a Stripe row carries the actual
 //     invoice total (which may include co-created over-module line items),
@@ -55,6 +57,12 @@ const (
 	NewCreationChargeStatusPending = "pending"
 )
 
+const (
+	NewCreationChargeKindApp          = "app"
+	NewCreationChargeKindModuleAddon  = "module_addon"
+	NewCreationChargeKindCustomDomain = "custom_domain"
+)
+
 // ListNewCreationChargesRequest is the payload of ListNewCreationCharges: the account
 // OWNER principal (the payer — exactly one of OwnerUserID / OwnerOrgID, mirroring
 // GetAccountBillRequest) plus an OPTIONAL period reference. "" / omitted PeriodID
@@ -70,8 +78,9 @@ type ListNewCreationChargesRequest struct {
 	PeriodID string `json:"period_id,omitempty"`
 }
 
-// NewCreationCharge is one 本期新建立 row: an app created in the resolved period whose
-// base is (or will be) charged via the creation-proration leg. For a SETTLED row
+// NewCreationCharge is one 本期新建立 row: a newly activated billable entity
+// whose initial charge settled in the resolved period, or is still pending in
+// the current period. For a SETTLED row
 // AmountMicros is the rail's actual settled total, RecordedAt is its recorded
 // time, and InvoiceID is the invoice number/UUID or synthetic wallet ref; for a
 // PENDING row AmountMicros/BaseFeeMicros previews CreationChargeBaseMicros —
@@ -102,6 +111,8 @@ type ListNewCreationChargesRequest struct {
 // The UI derives the descriptor from the partition: base only, base + N
 // add-ons, or N add-ons only.
 type NewCreationCharge struct {
+	ChargeID             uuid.UUID  `json:"charge_id"`
+	Kind                 string     `json:"kind"`
 	AppID                uuid.UUID  `json:"app_id"`
 	Status               string     `json:"status"`
 	AmountMicros         int64      `json:"amount_micros"`
@@ -127,8 +138,8 @@ func addonModuleCount(createdModuleCount int) int {
 
 // ListNewCreationChargesResponse is the ordered 本期新建立 list: settled rows first
 // (newest-first by recorded_at), then pending rows (soonest-first by charge_eta).
-// Charges is an empty slice (never nil) when the account has no new apps in the
-// window.
+// Charges is an empty slice (never nil) when the account has no new billable
+// entities in the window.
 type ListNewCreationChargesResponse struct {
 	Charges []NewCreationCharge `json:"charges"`
 }
@@ -141,9 +152,9 @@ type ListNewCreationChargesResponse struct {
 //     billing_periods id → that frozen window, account-scoped else NOT_FOUND),
 //  3. lazy account (no billing account row): an EMPTY list — no app could have
 //     been charged yet, the same posture ListInvoices takes,
-//  4. reads the SETTLED rows (apps created in the window with an armed
-//     proration guard, sourced from the invoice mirror or wallet ledger) —
-//     newest-first from SQL,
+//  4. reads SETTLED app rows by settlement time (sourced from the invoice
+//     mirror or wallet ledger) and settled custom-domain rows by charged_at,
+//     then merges them newest-first,
 //  5. for the CURRENT live window ONLY (resolved period id == ""), reads the
 //     PENDING rows (still-in-grace apps) and appends them with a charge ETA
 //     (GraceExpiry(created_at)), the exact CreationChargeBaseMicros base amount,
@@ -202,6 +213,8 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 		// a base-only wallet settlement has no remainder. By construction base +
 		// addon == AmountMicros (the contract invariant).
 		charges = append(charges, NewCreationCharge{
+			ChargeID:         r.AppID,
+			Kind:             NewCreationChargeKindApp,
 			AppID:            r.AppID,
 			Status:           NewCreationChargeStatusSettled,
 			AmountMicros:     r.AmountDueMicros,
@@ -213,6 +226,47 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			AddonMicros:      r.AmountDueMicros - r.BaseMicros,
 		})
 	}
+
+	domainStore, ok := s.store.(interface {
+		SettledDomainCreationCharges(context.Context, uuid.UUID, time.Time, time.Time) ([]SettledDomainCreationChargeRaw, error)
+	})
+	if !ok {
+		return nil, billing.Internal("settled custom-domain charge store unavailable", nil)
+	}
+	domains, err := domainStore.SettledDomainCreationCharges(ctx, accountID, periodStart, periodEnd)
+	if err != nil {
+		return nil, billing.Internal("settled custom-domain charges query failed", err)
+	}
+	anchorDay, err := s.store.AccountAnchorDay(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("account anchor lookup failed", err)
+	}
+	for _, r := range domains {
+		activationStart, activationEnd := billingperiod.AnchoredPeriodWindow(r.ActivatedAt, anchorDay)
+		amount := DomainCreationChargeMicros(r.ActivatedAt, activationStart, activationEnd)
+		invoiceID := r.Number
+		if invoiceID == "" {
+			invoiceID = r.InvoiceID.String()
+		}
+		recordedAt := r.ChargedAt
+		charges = append(charges, NewCreationCharge{
+			ChargeID:      r.ID,
+			Kind:          NewCreationChargeKindCustomDomain,
+			AppID:         r.AppID,
+			Status:        NewCreationChargeStatusSettled,
+			AmountMicros:  amount,
+			RecordedAt:    &recordedAt,
+			InvoiceID:     invoiceID,
+			Name:          r.Hostname,
+			BaseFeeMicros: amount,
+		})
+	}
+	slices.SortStableFunc(charges, func(a, b NewCreationCharge) int {
+		if c := b.RecordedAt.Compare(*a.RecordedAt); c != 0 {
+			return c
+		}
+		return bytes.Compare(a.ChargeID[:], b.ChargeID[:])
+	})
 
 	// PENDING rows exist only in the CURRENT live window (resolved id == ""): a
 	// past period has no still-in-grace apps or in-grace install timers.
@@ -241,8 +295,10 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			}
 			projectedAddon := CreationChargeOverageMicros(r.CreatedAt, periodStart, periodEnd) * int64(overCount)
 			charges = append(charges, NewCreationCharge{
-				AppID:  r.AppID,
-				Status: NewCreationChargeStatusPending,
+				ChargeID: r.AppID,
+				Kind:     NewCreationChargeKindApp,
+				AppID:    r.AppID,
+				Status:   NewCreationChargeStatusPending,
 				// Exact CreationChargeBaseMicros preview: creation-period
 				// proration plus the full-base straddle top-up when applicable.
 				// AmountMicros remains base-only. ProjectedAddonMicros separately
@@ -273,6 +329,8 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			eta := r.ChargeETA
 			amount := ModuleOverageFeeMicros * int64(r.AddonCount)
 			charges = append(charges, NewCreationCharge{
+				ChargeID:         r.AppID,
+				Kind:             NewCreationChargeKindModuleAddon,
 				AppID:            r.AppID,
 				Status:           NewCreationChargeStatusPending,
 				AmountMicros:     amount,
