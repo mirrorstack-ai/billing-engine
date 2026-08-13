@@ -44,6 +44,39 @@ func seedMirrorApp(t *testing.T, pool *pgxpool.Pool, acct, app uuid.UUID, create
 	require.NoError(t, err)
 }
 
+func TestLiveOverModuleTimerCountForApp_Integration_AttributesAccountFIFO(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	appA, appB := uuid.New(), uuid.New()
+	seedMirrorApp(t, pool, acct, appA, "2026-06-01T00:00:00Z", "")
+	seedMirrorApp(t, pool, acct, appB, "2026-06-02T00:00:00Z", "")
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO ms_billing.app_module_overage_timers
+			(account_id, app_id, installed_at, grace_expires_at)
+		SELECT $1, $2, '2026-06-01T00:00:00Z'::timestamptz,
+		       '2026-06-04T00:00:00Z'::timestamptz
+		FROM generate_series(1, 4)`, acct.String(), appA.String())
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		INSERT INTO ms_billing.app_module_overage_timers
+			(account_id, app_id, installed_at, grace_expires_at)
+		SELECT $1, $2, '2026-06-02T00:00:00Z'::timestamptz,
+		       '2026-06-05T00:00:00Z'::timestamptz
+		FROM generate_series(1, 5)`, acct.String(), appB.String())
+	require.NoError(t, err)
+
+	overA, err := store.LiveOverModuleTimerCountForApp(ctx, acct, appA, usage.IncludedModules)
+	require.NoError(t, err)
+	overB, err := store.LiveOverModuleTimerCountForApp(ctx, acct, appB, usage.IncludedModules)
+	require.NoError(t, err)
+	require.Zero(t, overA, "the first four account-FIFO installs stay included")
+	require.Equal(t, 4, overB, "only one of app B's five timers occupies the final included slot")
+}
+
 // TestAppIDsWithUsage_Integration: the usage half enumerates the UNION of
 // rolled (usage_aggregates for the period) and live (usage_events in the
 // window) app_ids, deduped, account-gated, window-bounded on the live half,

@@ -216,7 +216,24 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		return nil, billing.Internal("compute paas credit failed", err)
 	}
 
-	total := parts.BaseFeeMicros + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros - paasCredit
+	// The charge model pools the first IncludedModules timers account-wide, then
+	// charges each later timer independently. GetAccountBill shows that as one
+	// account line; the per-app page attributes the same LIVE over rows to the app
+	// that owns them and folds that share into its 基本費用. Only the current
+	// period uses this steady-state estimate: historical periods retain their
+	// exact base snapshot because there is no frozen per-timer allocation ledger.
+	baseFee := parts.BaseFeeMicros
+	var moduleOverage int64
+	if req.PeriodID == uuid.Nil && found && !parts.IsDeleted {
+		overCount, err := s.store.LiveOverModuleTimerCountForApp(ctx, accountID, req.AppID, IncludedModules)
+		if err != nil {
+			return nil, billing.Internal("app module overage attribution failed", err)
+		}
+		moduleOverage = int64(overCount) * ModuleOverageFeeMicros
+		baseFee += moduleOverage
+	}
+
+	total := baseFee + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros - paasCredit
 
 	return &GetAppBillResponse{
 		AppID:                  req.AppID,
@@ -225,7 +242,9 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		PeriodID:               periodID,
 		PeriodStart:            periodStart,
 		PeriodEnd:              periodEnd,
-		BaseFeeMicros:          parts.BaseFeeMicros,
+		BaseFeeMicros:          baseFee,
+		InstalledModuleCount:   parts.InstalledModuleCount,
+		ModuleOverageMicros:    moduleOverage,
 		ModuleUsage:            parts.ModuleUsage,
 		ModuleUsageTotalMicros: parts.ModuleUsageTotalMicros,
 		InfraTotalMicros:       parts.InfraTotalMicros,
@@ -283,6 +302,9 @@ func (s *Service) resolveBillPeriod(ctx context.Context, accountID uuid.UUID, fo
 type appBillParts struct {
 	// BaseFeeMicros is 基本費用 resolved SNAPSHOT-FIRST (see computeAppBill).
 	BaseFeeMicros int64
+	// InstalledModuleCount is the billing mirror's authoritative live snapshot.
+	// It includes installed-but-idle modules, unlike the usage-ledger lines.
+	InstalledModuleCount int
 	// ModuleUsage are the non-reserved 模組使用量 lines; ModuleUsageTotalMicros
 	// is Σ their ChargedMicros.
 	ModuleUsage            []AppMetricUsage
@@ -538,6 +560,7 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 
 	return &appBillParts{
 		BaseFeeMicros:          baseFee,
+		InstalledModuleCount:   mirror.ModuleCount,
 		ModuleUsage:            moduleUsage,
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,

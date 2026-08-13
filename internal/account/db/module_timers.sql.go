@@ -237,6 +237,39 @@ func (q *Queries) LiveModuleTimerRankBefore(ctx context.Context, arg LiveModuleT
 	return rank, err
 }
 
+const liveOverModuleTimerCountForApp = `-- name: LiveOverModuleTimerCountForApp :one
+WITH live_fifo AS (
+    SELECT app_id,
+           row_number() OVER (ORDER BY installed_at, id) AS fifo_position
+    FROM ms_billing.app_module_overage_timers
+    WHERE account_id = $3::uuid
+      AND removed_at IS NULL
+)
+SELECT COALESCE(count(*), 0)::bigint AS over_count
+FROM live_fifo
+WHERE app_id = $1::uuid
+  AND fifo_position > $2::int
+`
+
+type LiveOverModuleTimerCountForAppParams struct {
+	AppID           string `json:"app_id"`
+	IncludedModules int32  `json:"included_modules"`
+	AccountID       string `json:"account_id"`
+}
+
+// LiveOverModuleTimerCountForApp attributes the account-wide pooled overage
+// back to one app for GetAppBill's current-period estimate. The charge spine's
+// canonical FIFO rule stays unchanged: rank every live timer across the whole
+// account, skip the first @included_modules rows, then count only the over rows
+// owned by @app_id. This makes the per-app bill reconcile with the account bill
+// without granting a second five-module allowance per app.
+func (q *Queries) LiveOverModuleTimerCountForApp(ctx context.Context, arg LiveOverModuleTimerCountForAppParams) (int64, error) {
+	row := q.db.QueryRow(ctx, liveOverModuleTimerCountForApp, arg.AppID, arg.IncludedModules, arg.AccountID)
+	var over_count int64
+	err := row.Scan(&over_count)
+	return over_count, err
+}
+
 const markModuleTimerChargeAttempted = `-- name: MarkModuleTimerChargeAttempted :execrows
 UPDATE ms_billing.app_module_overage_timers
 SET charge_attempted_at = COALESCE(charge_attempted_at, $2)

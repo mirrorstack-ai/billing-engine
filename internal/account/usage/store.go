@@ -236,6 +236,13 @@ type Store interface {
 	// stays tied to the exact rows the charge legs tier on.
 	LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
 
+	// LiveOverModuleTimerCountForApp returns the subset of one app's live
+	// install timers whose account-wide FIFO position falls beyond the shared
+	// included-module allowance. It is the attribution read behind the current
+	// per-app bill; the account pool is ranked once, so this never grants a
+	// second allowance per app.
+	LiveOverModuleTimerCountForApp(ctx context.Context, accountID, appID uuid.UUID, includedModules int) (int, error)
+
 	// LiveDomainCountForAccount returns the account's currently-live custom-
 	// domain count (removed_at IS NULL) — the DISPLAY input to the flat per-domain
 	// fee line on GetAccountBill.
@@ -1102,6 +1109,21 @@ func (s *pgxStore) CoCreatedOverModuleTimerCount(ctx context.Context, accountID,
 // shown overage stays tied to the exact rows the charge legs tier on.
 func (s *pgxStore) LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
 	n, err := s.q.CountLiveModuleTimersForAccount(ctx, accountID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// LiveOverModuleTimerCountForApp attributes the account-wide FIFO overage to
+// the app that owns each over timer. The underlying query ranks the whole live
+// account pool before filtering by app, matching the charge spine exactly.
+func (s *pgxStore) LiveOverModuleTimerCountForApp(ctx context.Context, accountID, appID uuid.UUID, includedModules int) (int, error) {
+	n, err := s.q.LiveOverModuleTimerCountForApp(ctx, db.LiveOverModuleTimerCountForAppParams{
+		AccountID:       accountID.String(),
+		AppID:           appID.String(),
+		IncludedModules: int32(includedModules), //nolint:gosec // pricing allowance is a small positive constant
+	})
 	if err != nil {
 		return 0, err
 	}
