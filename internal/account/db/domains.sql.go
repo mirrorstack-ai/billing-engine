@@ -46,13 +46,14 @@ SELECT (
            FROM ms_billing.app_custom_domains domain_row
            WHERE domain_row.account_id = $1::uuid
              AND domain_row.removed_at IS NULL
-             AND domain_row.charged_at IS NOT NULL
+             AND domain_row.activated_at < $3::timestamptz
        ) AS custom_domain_count
 `
 
 type ActivatedRecurringFeeCountsParams struct {
-	AccountID       string `json:"account_id"`
-	IncludedModules int32  `json:"included_modules"`
+	AccountID       string    `json:"account_id"`
+	IncludedModules int32     `json:"included_modules"`
+	PeriodEnd       time.Time `json:"period_end"`
 }
 
 type ActivatedRecurringFeeCountsRow struct {
@@ -62,19 +63,20 @@ type ActivatedRecurringFeeCountsRow struct {
 }
 
 // ActivatedRecurringFeeCounts is the CURRENT next-period recurring-base input.
-// A live entity joins the forecast only after its one-time activation charge
-// has reached a durable charged state:
+// A live entity joins the recurring forecast by domain type:
 //   - app: creation-proration guard armed (or a legacy advance snapshot proves
 //     it was charged before the guard existed);
 //   - module overage: current account-FIFO over row with grace_charged_at set;
-//   - custom domain: activation charge recorded in charged_at.
+//   - custom domain: same-account live activation before the next boundary.
 //
-// Pending creations stay solely in the one-time projection. This gives the UI
+// Pending creations stay solely in the one-time projection. Recurring timing depends
+// only on activation timing, so a settled one-time row may overlap a recurring row
+// in the same period.
 // an atomic handoff: create Aug 30 → creation charge Sep 2 (covering the
 // remaining creation window plus the straddled window) → recurring base joins
 // only after that Sep 2 settlement succeeds.
 func (q *Queries) ActivatedRecurringFeeCounts(ctx context.Context, arg ActivatedRecurringFeeCountsParams) (ActivatedRecurringFeeCountsRow, error) {
-	row := q.db.QueryRow(ctx, activatedRecurringFeeCounts, arg.AccountID, arg.IncludedModules)
+	row := q.db.QueryRow(ctx, activatedRecurringFeeCounts, arg.AccountID, arg.IncludedModules, arg.PeriodEnd)
 	var i ActivatedRecurringFeeCountsRow
 	err := row.Scan(&i.AppCount, &i.ModuleOverageCount, &i.CustomDomainCount)
 	return i, err

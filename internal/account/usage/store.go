@@ -1163,10 +1163,11 @@ func (s *pgxStore) LiveDomainCountForAccount(ctx context.Context, accountID uuid
 	return int(n), nil
 }
 
-func (s *pgxStore) ActivatedRecurringFeeCounts(ctx context.Context, accountID uuid.UUID, includedModules int) (RecurringFeeCounts, error) {
+func (s *pgxStore) ActivatedRecurringFeeCounts(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (RecurringFeeCounts, error) {
 	row, err := s.q.ActivatedRecurringFeeCounts(ctx, db.ActivatedRecurringFeeCountsParams{
 		AccountID:       accountID.String(),
 		IncludedModules: int32(includedModules), //nolint:gosec // pricing allowance is a small positive constant
+		PeriodEnd:       periodEnd,
 	})
 	if err != nil {
 		return RecurringFeeCounts{}, err

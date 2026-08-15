@@ -116,33 +116,38 @@ func TestActivatedRecurringFeeCountsAndSettledDomains_Integration(t *testing.T) 
 
 	invoiceID := uuid.New()
 	chargedAt := appMustTime(t, "2026-06-18T12:30:00Z")
+	periodStart := appMustTime(t, appPeriodStart)
+	periodEnd := appMustTime(t, appPeriodEnd)
 	seedInvoiceMirror(t, pool, accountID, invoiceID, "in_domain", "paid", 200, 200,
 		chargedAt, "MS-0042", "", "", false)
-	chargedDomainID, pendingDomainID := uuid.New(), uuid.New()
+	chargedDomainID, periodClosedDomainID, zeroCentsDomainID, skippedPrepaidDomainID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.app_custom_domains
 		   (id, account_id, app_id, hostname, activated_at, charged_at,
 		    charge_resolved, charge_invoice_id)
 		 VALUES
 		   ($1, $2, $3, 'mirrorstack.ai', $4, $5, true, 'in_domain'),
-		   ($6, $2, $3, 'pending.example', $4, NULL, false, NULL)`,
+		   ($6, $2, $3, 'closed.example', $4, NULL, true, NULL),
+		   ($7, $2, $3, 'zero.example', $4, NULL, true, NULL),
+		   ($8, $2, $3, 'prepaid.example', $4, NULL, false, NULL)`,
 		chargedDomainID, accountID, chargedApp,
-		appMustTime(t, "2026-06-15T00:00:00Z"), chargedAt, pendingDomainID)
+		appMustTime(t, "2026-06-15T00:00:00Z"), chargedAt,
+		periodClosedDomainID, zeroCentsDomainID, skippedPrepaidDomainID)
 	require.NoError(t, err)
 
 	readStore, ok := store.(interface {
-		ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int) (usage.RecurringFeeCounts, error)
+		ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int, time.Time) (usage.RecurringFeeCounts, error)
 		SettledDomainCreationCharges(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.SettledDomainCreationChargeRaw, error)
 	})
 	require.True(t, ok)
 
-	counts, err := readStore.ActivatedRecurringFeeCounts(ctx, accountID, usage.IncludedModules)
+	counts, err := readStore.ActivatedRecurringFeeCounts(ctx, accountID, usage.IncludedModules, periodEnd)
 	require.NoError(t, err)
-	require.Equal(t, usage.RecurringFeeCounts{Apps: 2, ModuleOverages: 2, CustomDomains: 1}, counts,
-		"only durably charged live entities join the next-period recurring base")
+	require.Equal(t, usage.RecurringFeeCounts{Apps: 2, ModuleOverages: 2, CustomDomains: 4}, counts,
+		"any live domain activated before the boundary joins the recurring forecast, including terminal rows that do not write charged_at")
 
 	domains, err := readStore.SettledDomainCreationCharges(ctx, accountID,
-		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+		periodStart, periodEnd)
 	require.NoError(t, err)
 	require.Len(t, domains, 1)
 	require.Equal(t, chargedDomainID, domains[0].ID)

@@ -276,12 +276,12 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	projectedRecurringSurcharges := accountOverage + customDomains
 	if periodID == "" {
 		store, ok := s.store.(interface {
-			ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int) (RecurringFeeCounts, error)
+			ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int, time.Time) (RecurringFeeCounts, error)
 		})
 		if !ok {
 			return nil, billing.Internal("activated recurring fee count store unavailable", nil)
 		}
-		counts, err := store.ActivatedRecurringFeeCounts(ctx, accountID, IncludedModules)
+		counts, err := store.ActivatedRecurringFeeCounts(ctx, accountID, IncludedModules, periodEnd)
 		if err != nil {
 			return nil, billing.Internal("activated recurring fee counts failed", err)
 		}
@@ -309,15 +309,35 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		}
 	}
 	response.unresolvedOneTimeMicros = unresolvedOneTimeTotal
-	response.ProjectedTotalMicros = projectedBaseFeeTotal +
+	response.ProjectedTotalMicros = projectedTotalMicros(
+		projectedBaseFeeTotal,
+		moduleUsageTotal,
+		infraTotal,
+		projectedRecurringSurcharges,
+		agent.TotalMicros,
+		paasCredit,
+		unresolvedOneTimeTotal,
+	)
+
+	return response, nil
+}
+
+func projectedTotalMicros(
+	projectedBaseFeeTotal int64,
+	moduleUsageTotal int64,
+	infraTotal int64,
+	projectedRecurringSurcharges int64,
+	agentTotalMicros int64,
+	paasCredit int64,
+	unresolvedOneTimeTotal int64,
+) int64 {
+	return projectedBaseFeeTotal +
 		moduleUsageTotal +
 		infraTotal +
 		projectedRecurringSurcharges +
-		agent.TotalMicros +
+		agentTotalMicros -
 		paasCredit +
 		unresolvedOneTimeTotal
-
-	return response, nil
 }
 
 // unresolvedOneTimeChargeMicros is the authoritative current-bill projection

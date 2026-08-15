@@ -407,7 +407,7 @@ func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (i
 	return f.liveDomainCount, nil
 }
 
-func (f *fakeStore) ActivatedRecurringFeeCounts(_ context.Context, _ uuid.UUID, _ int) (usage.RecurringFeeCounts, error) {
+func (f *fakeStore) ActivatedRecurringFeeCounts(_ context.Context, _ uuid.UUID, _ int, _ time.Time) (usage.RecurringFeeCounts, error) {
 	if f.errActivatedRecurring != nil {
 		return usage.RecurringFeeCounts{}, f.errActivatedRecurring
 	}
