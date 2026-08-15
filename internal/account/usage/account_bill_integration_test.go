@@ -84,13 +84,22 @@ func TestActivatedRecurringFeeCountsAndSettledDomains_Integration(t *testing.T) 
 
 	accountID := appSeedAccount(t, pool)
 	chargedApp, legacyApp, pendingApp := uuid.New(), uuid.New(), uuid.New()
+	// D1d: created before the account activated, so the creation proration was
+	// permanently SKIPPED — no invoice id is ever written, yet the boundary
+	// advance leg still bills its full recurring base.
+	skippedApp := uuid.New()
 	seedMirrorApp(t, pool, accountID, chargedApp, "2026-06-01T00:00:00Z", "")
 	seedMirrorApp(t, pool, accountID, legacyApp, "2026-06-02T00:00:00Z", "")
 	seedMirrorApp(t, pool, accountID, pendingApp, "2026-06-03T00:00:00Z", "")
+	seedMirrorApp(t, pool, accountID, skippedApp, "2026-05-20T00:00:00Z", "")
 
 	_, err := pool.Exec(ctx,
 		`UPDATE ms_billing.apps SET proration_invoice_id = 'in_app' WHERE app_id = $1`,
 		chargedApp)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.apps SET proration_skipped_at = $2 WHERE app_id = $1`,
+		skippedApp, appMustTime(t, "2026-06-05T00:00:00Z"))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.app_base_snapshots
@@ -102,15 +111,27 @@ func TestActivatedRecurringFeeCountsAndSettledDomains_Integration(t *testing.T) 
 	for i := 0; i < 9; i++ {
 		installedAt := appMustTime(t, "2026-06-04T00:00:00Z").Add(time.Duration(i) * time.Minute)
 		var chargedAt any
-		if i == 5 || i == 6 {
+		graceResolved := false
+		switch i {
+		case 5, 6:
+			// Charged: the sweep stamped both the charge and the verdict.
 			chargedAt = installedAt.Add(usage.GraceDays * 24 * time.Hour)
+			graceResolved = true
+		case 7:
+			// D1d: MarkModuleTimerIncluded stamps a TERMINAL verdict with NO
+			// charge — grace_charged_at stays NULL forever. The boundary still
+			// bills this over-FIFO timer every period
+			// (CountOngoingOverModuleTimers reads no resolution state), so the
+			// forecast has to count it too.
+			graceResolved = true
 		}
 		_, err = pool.Exec(ctx,
 			`INSERT INTO ms_billing.app_module_overage_timers
-			   (account_id, app_id, installed_at, grace_expires_at, grace_charged_at)
-			 VALUES ($1, $2, $3, $4, $5)`,
+			   (account_id, app_id, installed_at, grace_expires_at, grace_charged_at,
+			    grace_resolved)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
 			accountID, chargedApp, installedAt,
-			installedAt.Add(usage.GraceDays*24*time.Hour), chargedAt)
+			installedAt.Add(usage.GraceDays*24*time.Hour), chargedAt, graceResolved)
 		require.NoError(t, err)
 	}
 
@@ -143,8 +164,10 @@ func TestActivatedRecurringFeeCountsAndSettledDomains_Integration(t *testing.T) 
 
 	counts, err := readStore.ActivatedRecurringFeeCounts(ctx, accountID, usage.IncludedModules, periodEnd)
 	require.NoError(t, err)
-	require.Equal(t, usage.RecurringFeeCounts{Apps: 2, ModuleOverages: 2, CustomDomains: 4}, counts,
-		"any live domain activated before the boundary joins the recurring forecast, including terminal rows that do not write charged_at")
+	require.Equal(t, usage.RecurringFeeCounts{Apps: 3, ModuleOverages: 3, CustomDomains: 4}, counts,
+		"the forecast counts what the BOUNDARY will bill: the D1d-skipped app, the "+
+			"D1d-resolved-but-uncharged over-module timer, and every live domain "+
+			"activated before the boundary — none of which ever write a charge marker")
 
 	domains, err := readStore.SettledDomainCreationCharges(ctx, accountID,
 		periodStart, periodEnd)

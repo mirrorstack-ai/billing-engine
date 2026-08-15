@@ -107,10 +107,13 @@ WHERE account_id = $1
   AND removed_at IS NULL;
 
 -- ActivatedRecurringFeeCounts is the CURRENT next-period recurring-base input.
--- A live entity joins the recurring forecast by domain type:
---   * app: creation-proration guard armed (or a legacy advance snapshot proves
---     it was charged before the guard existed);
---   * module overage: current account-FIFO over row with grace_charged_at set;
+-- Membership mirrors what the BOUNDARY will actually bill, per entity type —
+-- never a mutable "was it charged yet" marker, which is what let three classes
+-- of live entity forecast as $0 while the boundary billed them:
+--   * app: creation-proration guard armed, a legacy advance snapshot, or a D1d
+--     terminal skip (all three mean the boundary advance leg owns it now);
+--   * module overage: current account-FIFO over row that is durably RESOLVED,
+--     charged or D1d-forgiven;
 --   * custom domain: same-account live activation before the next boundary.
 -- Pending creations stay solely in the one-time projection. Recurring timing depends
 -- only on activation timing, so a settled one-time row may overlap a recurring row
@@ -121,6 +124,7 @@ WHERE account_id = $1
 -- name: ActivatedRecurringFeeCounts :one
 WITH live_timer_fifo AS (
     SELECT grace_charged_at,
+           grace_resolved,
            row_number() OVER (ORDER BY installed_at, id) AS fifo_position
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = @account_id::uuid
@@ -133,6 +137,15 @@ SELECT (
              AND app.deleted_at IS NULL
              AND (
                  app.proration_invoice_id IS NOT NULL
+                 -- D1d terminal no-charge verdict: the creation proration was
+                 -- permanently skipped (app created before the account
+                 -- activated), so no invoice id will ever be written. The
+                 -- boundary advance leg still bills this app's full recurring
+                 -- base — LiveAppModuleCountsCreatedBefore reads no proration
+                 -- state — and UnresolvedOneTimeCharges excludes a
+                 -- skipped-never-attempted app, so without this arm the app is
+                 -- in NEITHER projection and forecasts as $0.
+                 OR app.proration_skipped_at IS NOT NULL
                  OR EXISTS (
                      SELECT 1
                      FROM ms_billing.app_base_snapshots snap
@@ -145,7 +158,14 @@ SELECT (
            SELECT count(*)::bigint
            FROM live_timer_fifo
            WHERE fifo_position > @included_modules::int
-             AND grace_charged_at IS NOT NULL
+             -- Durably RESOLVED, not merely charged. CountOngoingOverModuleTimers
+             -- (the boundary precharge input) reads no resolution state at all,
+             -- so a timer resolved with no charge under D1d — MarkModuleTimerIncluded
+             -- sets grace_resolved and leaves grace_charged_at NULL — is billed at
+             -- every subsequent boundary while the charged-marker gate kept it out
+             -- of the forecast forever. A resolved row ranked inside the allowance
+             -- cannot leak in: FIFO rank is stable, so it fails fifo_position.
+             AND (grace_charged_at IS NOT NULL OR grace_resolved)
        ) AS module_overage_count,
        (
            SELECT count(*)::bigint
