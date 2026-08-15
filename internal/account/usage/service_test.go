@@ -24,6 +24,7 @@ func inf() float64 { return math.Inf(1) }
 
 type fakeStore struct {
 	defs                   map[string]usage.MetricDefinition   // key: module/metric
+	modelPrices            map[string]usage.ModelPrice         // key: metric/model
 	versionPrices          map[string]usage.MetricVersionPrice // key: module/metric/version (migration 044)
 	accounts               map[uuid.UUID]uuid.UUID             // owner userID → accountID
 	appOwnerOrgs           map[uuid.UUID]uuid.UUID             // app roster owner_org_id
@@ -158,7 +159,10 @@ type periodWindow struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		defs:                        map[string]usage.MetricDefinition{},
+		defs: map[string]usage.MetricDefinition{},
+		modelPrices: map[string]usage.ModelPrice{
+			modelPriceKey("infra.task.gpu.hours", usage.TaskGPUModelG5GXlarge): {UnitPriceMicros: 566900, Active: true},
+		},
 		versionPrices:               map[string]usage.MetricVersionPrice{},
 		accounts:                    map[uuid.UUID]uuid.UUID{},
 		appOwnerOrgs:                map[uuid.UUID]uuid.UUID{},
@@ -454,12 +458,19 @@ func (f *fakeStore) AccountAnchorDay(_ context.Context, accountID uuid.UUID) (in
 
 func defKey(moduleID uuid.UUID, metric string) string { return moduleID.String() + "/" + metric }
 
+func modelPriceKey(metric, model string) string { return metric + "/" + model }
+
 func (f *fakeStore) LookupMetricDefinition(_ context.Context, moduleID uuid.UUID, metric string) (usage.MetricDefinition, bool, error) {
 	if f.errLookup != nil {
 		return usage.MetricDefinition{}, false, f.errLookup
 	}
 	d, ok := f.defs[defKey(moduleID, metric)]
 	return d, ok, nil
+}
+
+func (f *fakeStore) LookupModelPrice(_ context.Context, metric, model string) (usage.ModelPrice, bool, error) {
+	price, ok := f.modelPrices[modelPriceKey(metric, model)]
+	return price, ok, nil
 }
 
 func (f *fakeStore) UpsertMetricDefinitions(_ context.Context, defs []usage.MetricDeclaration) error {
