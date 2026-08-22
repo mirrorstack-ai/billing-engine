@@ -96,6 +96,8 @@ const insertCombinedProrationAttempt = `-- name: InsertCombinedProrationAttempt 
 INSERT INTO ms_billing.app_combined_proration_attempts (
     app_id,
     account_id,
+    charge_funding_account_id,
+    charge_funding_generation,
     attempted_at,
     currency,
     base_charge_micros,
@@ -117,48 +119,52 @@ INSERT INTO ms_billing.app_combined_proration_attempts (
 ) VALUES (
     $1::uuid,
     $2::uuid,
-    $3::timestamptz,
-    $4,
-    $5,
+    $3::uuid,
+    $4::uuid,
+    $5::timestamptz,
     $6,
     $7,
     $8,
     $9,
-    $10::timestamptz,
-    $11::timestamptz,
-    $12,
-    $13,
-    $14::timestamptz,
-    $15::timestamptz,
-    $16,
-    $17,
+    $10,
+    $11,
+    $12::timestamptz,
+    $13::timestamptz,
+    $14,
+    $15,
+    $16::timestamptz,
+    $17::timestamptz,
     $18,
     $19,
-    $20
+    $20,
+    $21,
+    $22
 )
 `
 
 type InsertCombinedProrationAttemptParams struct {
-	AppID               string             `json:"app_id"`
-	AccountID           string             `json:"account_id"`
-	AttemptedAt         time.Time          `json:"attempted_at"`
-	Currency            string             `json:"currency"`
-	BaseChargeMicros    int64              `json:"base_charge_micros"`
-	BaseChargeCents     int64              `json:"base_charge_cents"`
-	ModuleChargeMicros  int64              `json:"module_charge_micros"`
-	ModuleChargeCents   int64              `json:"module_charge_cents"`
-	TimerCount          int32              `json:"timer_count"`
-	CoverageStart       time.Time          `json:"coverage_start"`
-	CoverageEnd         time.Time          `json:"coverage_end"`
-	BaseDescription     string             `json:"base_description"`
-	ModuleDescription   string             `json:"module_description"`
-	SnapshotPeriodStart time.Time          `json:"snapshot_period_start"`
-	SnapshotPeriodEnd   time.Time          `json:"snapshot_period_end"`
-	SnapshotBaseMicros  int64              `json:"snapshot_base_micros"`
-	SnapshotModuleCount int32              `json:"snapshot_module_count"`
-	StraddlePeriodStart pgtype.Timestamptz `json:"straddle_period_start"`
-	StraddlePeriodEnd   pgtype.Timestamptz `json:"straddle_period_end"`
-	StraddleBaseMicros  pgtype.Int8        `json:"straddle_base_micros"`
+	AppID                   string             `json:"app_id"`
+	AccountID               string             `json:"account_id"`
+	ChargeFundingAccountID  string             `json:"charge_funding_account_id"`
+	ChargeFundingGeneration string             `json:"charge_funding_generation"`
+	AttemptedAt             time.Time          `json:"attempted_at"`
+	Currency                string             `json:"currency"`
+	BaseChargeMicros        int64              `json:"base_charge_micros"`
+	BaseChargeCents         int64              `json:"base_charge_cents"`
+	ModuleChargeMicros      int64              `json:"module_charge_micros"`
+	ModuleChargeCents       int64              `json:"module_charge_cents"`
+	TimerCount              int32              `json:"timer_count"`
+	CoverageStart           time.Time          `json:"coverage_start"`
+	CoverageEnd             time.Time          `json:"coverage_end"`
+	BaseDescription         string             `json:"base_description"`
+	ModuleDescription       string             `json:"module_description"`
+	SnapshotPeriodStart     time.Time          `json:"snapshot_period_start"`
+	SnapshotPeriodEnd       time.Time          `json:"snapshot_period_end"`
+	SnapshotBaseMicros      int64              `json:"snapshot_base_micros"`
+	SnapshotModuleCount     int32              `json:"snapshot_module_count"`
+	StraddlePeriodStart     pgtype.Timestamptz `json:"straddle_period_start"`
+	StraddlePeriodEnd       pgtype.Timestamptz `json:"straddle_period_end"`
+	StraddleBaseMicros      pgtype.Int8        `json:"straddle_base_micros"`
 }
 
 // InsertCombinedProrationAttempt is called only while the owning app row is
@@ -168,6 +174,8 @@ func (q *Queries) InsertCombinedProrationAttempt(ctx context.Context, arg Insert
 	_, err := q.db.Exec(ctx, insertCombinedProrationAttempt,
 		arg.AppID,
 		arg.AccountID,
+		arg.ChargeFundingAccountID,
+		arg.ChargeFundingGeneration,
 		arg.AttemptedAt,
 		arg.Currency,
 		arg.BaseChargeMicros,
@@ -370,6 +378,8 @@ const selectCombinedProrationAttempt = `-- name: SelectCombinedProrationAttempt 
 
 SELECT app_id,
        account_id,
+       charge_funding_account_id,
+       charge_funding_generation,
        attempted_at,
        currency,
        base_charge_micros,
@@ -395,6 +405,33 @@ WHERE app_id = $1
 FOR UPDATE
 `
 
+type SelectCombinedProrationAttemptRow struct {
+	AppID                   string             `json:"app_id"`
+	AccountID               string             `json:"account_id"`
+	ChargeFundingAccountID  pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration pgtype.UUID        `json:"charge_funding_generation"`
+	AttemptedAt             time.Time          `json:"attempted_at"`
+	Currency                string             `json:"currency"`
+	BaseChargeMicros        int64              `json:"base_charge_micros"`
+	BaseChargeCents         int64              `json:"base_charge_cents"`
+	ModuleChargeMicros      int64              `json:"module_charge_micros"`
+	ModuleChargeCents       int64              `json:"module_charge_cents"`
+	TimerCount              int32              `json:"timer_count"`
+	CoverageStart           time.Time          `json:"coverage_start"`
+	CoverageEnd             time.Time          `json:"coverage_end"`
+	BaseDescription         string             `json:"base_description"`
+	ModuleDescription       string             `json:"module_description"`
+	SnapshotPeriodStart     time.Time          `json:"snapshot_period_start"`
+	SnapshotPeriodEnd       time.Time          `json:"snapshot_period_end"`
+	SnapshotBaseMicros      int64              `json:"snapshot_base_micros"`
+	SnapshotModuleCount     int32              `json:"snapshot_module_count"`
+	StraddlePeriodStart     pgtype.Timestamptz `json:"straddle_period_start"`
+	StraddlePeriodEnd       pgtype.Timestamptz `json:"straddle_period_end"`
+	StraddleBaseMicros      pgtype.Int8        `json:"straddle_base_micros"`
+	ResolvedAt              pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedInvoiceID       pgtype.Text        `json:"resolved_invoice_id"`
+}
+
 // Durable ownership for the combined app-creation Stripe charge (migration
 // 050). The header is the "known set" bit: zero child rows is an intentionally
 // empty timer set, while an app attempt marker without a header is legacy /
@@ -402,12 +439,14 @@ FOR UPDATE
 // SelectCombinedProrationAttempt reads the immutable request/snapshot shape
 // plus terminal state. Child IDs are read separately so an empty set remains
 // distinguishable from no header.
-func (q *Queries) SelectCombinedProrationAttempt(ctx context.Context, appID string) (MsBillingAppCombinedProrationAttempt, error) {
+func (q *Queries) SelectCombinedProrationAttempt(ctx context.Context, appID string) (SelectCombinedProrationAttemptRow, error) {
 	row := q.db.QueryRow(ctx, selectCombinedProrationAttempt, appID)
-	var i MsBillingAppCombinedProrationAttempt
+	var i SelectCombinedProrationAttemptRow
 	err := row.Scan(
 		&i.AppID,
 		&i.AccountID,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
 		&i.AttemptedAt,
 		&i.Currency,
 		&i.BaseChargeMicros,

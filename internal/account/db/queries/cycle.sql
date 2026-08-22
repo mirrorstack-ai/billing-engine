@@ -38,7 +38,12 @@
 -- name: ActivatedAccounts :many
 SELECT id, activated_at
 FROM ms_billing.accounts
-WHERE activated_at IS NOT NULL;
+WHERE activated_at IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE ms_billing.accounts.owner_kind = 'org'
+        AND f.org_id = ms_billing.accounts.owner_org_id
+  );
 
 -- LatestClosedPeriodEnd returns the newest billing_periods.period_end for an
 -- account; pgx.ErrNoRows when it has no period yet (the Go store maps that to
@@ -69,7 +74,14 @@ SELECT DISTINCT account_id::uuid AS account_id
 FROM ms_billing.usage_events
 WHERE account_id  IS NOT NULL
   AND recorded_at >= $1
-  AND recorded_at <  $2;
+  AND recorded_at <  $2
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ms_billing.accounts a
+      JOIN ms_billing.org_deletion_finalizations f
+        ON a.owner_kind = 'org' AND f.org_id = a.owner_org_id
+      WHERE a.id = ms_billing.usage_events.account_id
+  );
 
 -- AccountsWithUnbilledUsage returns the distinct accounts that have at least
 -- one usage_aggregates row for the EXACT closed window [period_start,
@@ -104,13 +116,18 @@ WHERE account_id  IS NOT NULL
 SELECT DISTINCT ua.account_id AS account_id
 FROM ms_billing.usage_aggregates ua
 JOIN ms_billing.billing_periods bp ON bp.id = ua.period_id
+JOIN ms_billing.accounts account ON account.id = ua.account_id
 LEFT JOIN ms_billing.billing_runs br
        ON br.account_id   = ua.account_id
       AND br.period_start = bp.period_start
       AND br.period_end   = bp.period_end
 WHERE bp.period_start = $1
   AND bp.period_end   = $2
-  AND (br.id IS NULL OR br.status <> 'invoiced');
+  AND (br.id IS NULL OR br.status <> 'invoiced')
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE account.owner_kind = 'org' AND f.org_id = account.owner_org_id
+  );
 
 -- PeriodChargedTotal sums charged_micros across an account's usage_aggregates
 -- for a period window — the customer-billable arrears total (before
@@ -219,7 +236,9 @@ WHERE id = $1
 -- name: FreezeBillingRunCharge :exec
 UPDATE ms_billing.billing_runs
 SET frozen_charge_cents     = $2,
-    frozen_charge_with_base = $3
+    frozen_charge_with_base = $3,
+    charge_funding_account_id = @charge_funding_account_id::uuid,
+    charge_funding_generation = @charge_funding_generation::uuid
 WHERE id = $1
   AND frozen_charge_cents IS NULL
   AND status <> 'invoiced';
@@ -230,9 +249,20 @@ WHERE id = $1
 -- freezes the freshly-computed values and charges them; on a reclaim they are the
 -- amount already charged, which the retry REUSES verbatim.
 -- name: BillingRunFrozenCharge :one
-SELECT frozen_charge_cents, frozen_charge_with_base
+SELECT frozen_charge_cents, frozen_charge_with_base,
+       charge_funding_account_id, charge_funding_generation
 FROM ms_billing.billing_runs
 WHERE id = $1;
+
+-- LockBillingRunFundingArm is the atomic funding-claim serialization point.
+-- A fresh freezer chooses the current rotating authorization while this row is
+-- locked; a retry consumes the first-write pinned funder verbatim.
+-- name: LockBillingRunFundingArm :one
+SELECT account_id, status, frozen_charge_cents, frozen_charge_with_base,
+       charge_funding_account_id, charge_funding_generation
+FROM ms_billing.billing_runs
+WHERE id = $1
+FOR UPDATE;
 
 -- LockBillingRunCharge is the serialization point between a first wallet debit,
 -- a competing Stripe freeze, and a terminal run write. The boundary wallet
@@ -240,7 +270,8 @@ WHERE id = $1;
 -- daemon already froze a Stripe request, the wallet transaction may recover an
 -- existing period draw but must never create a new one beside that request.
 -- name: LockBillingRunCharge :one
-SELECT status, frozen_charge_cents, frozen_charge_with_base
+SELECT status, frozen_charge_cents, frozen_charge_with_base,
+       charge_funding_account_id, charge_funding_generation
 FROM ms_billing.billing_runs
 WHERE id = $1
 FOR UPDATE;
@@ -258,9 +289,11 @@ FOR UPDATE;
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
-    period_start, period_end, is_large_auto_collect, ever_failed
+    period_start, period_end, is_large_auto_collect, ever_failed,
+    charge_funding_account_id, charge_funding_generation
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    @charge_funding_account_id::uuid, @charge_funding_generation::uuid
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
@@ -271,7 +304,25 @@ DO UPDATE SET
     period_start          = EXCLUDED.period_start,
     period_end            = EXCLUDED.period_end,
     is_large_auto_collect = EXCLUDED.is_large_auto_collect,
-    ever_failed           = ms_billing.invoices.ever_failed OR EXCLUDED.ever_failed;
+    ever_failed           = ms_billing.invoices.ever_failed OR EXCLUDED.ever_failed,
+    charge_funding_account_id = COALESCE(
+        ms_billing.invoices.charge_funding_account_id,
+        EXCLUDED.charge_funding_account_id
+    ),
+    charge_funding_generation = COALESCE(
+        ms_billing.invoices.charge_funding_generation,
+        EXCLUDED.charge_funding_generation
+    ),
+    charge_funding_legacy_unresolved = (
+        ms_billing.invoices.charge_funding_legacy_unresolved
+        AND EXCLUDED.charge_funding_account_id IS NULL
+    )
+WHERE ms_billing.invoices.account_id = EXCLUDED.account_id
+  AND (
+      ms_billing.invoices.charge_funding_account_id IS NULL
+      OR EXCLUDED.charge_funding_account_id IS NULL
+      OR ms_billing.invoices.charge_funding_account_id = EXCLUDED.charge_funding_account_id
+  );
 
 -- HasUsableDefaultPM is the no-PM charge gate: true iff the account has at
 -- least one active (not soft-deleted), not-expired payment_methods_mirror row.
@@ -301,7 +352,11 @@ FROM ms_billing.usage_events e
 JOIN ms_billing.accounts a ON a.id = e.account_id
 WHERE a.activated_at IS NULL
   AND e.recorded_at >= $1
-  AND e.recorded_at <  $2;
+  AND e.recorded_at <  $2
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE a.owner_kind = 'org' AND f.org_id = a.owner_org_id
+  );
 
 -- AccountStripeCustomer resolves the account's Stripe Customer id for the
 -- charge. COALESCE to '' so the Go layer distinguishes "no Customer yet" (empty)

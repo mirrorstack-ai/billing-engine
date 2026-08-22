@@ -643,9 +643,13 @@ func TestUnresolvedOneTimeCharges_Integration_TimerFIFORecoveryAndTerminals(t *t
 		}
 		attemptedTimer := timers[len(timers)-1]
 		_, err := pool.Exec(ctx,
-			`UPDATE ms_billing.app_module_overage_timers
-			 SET charge_attempted_at = $2
-			 WHERE id = $1`,
+			`UPDATE ms_billing.app_module_overage_timers timer
+			 SET charge_attempted_at = $2,
+			     charge_funding_account_id = funding.funding_account_id,
+			     charge_funding_generation = funding.generation
+			 FROM ms_billing.account_funding_authorizations funding
+			 WHERE timer.id = $1
+			   AND funding.account_id = timer.account_id`,
 			attemptedTimer, appMustTime(t, "2026-07-05T00:00:00Z"))
 		require.NoError(t, err)
 		_, err = pool.Exec(ctx,
@@ -760,9 +764,16 @@ func TestUnresolvedOneTimeCharges_Integration_FrozenCombinedOwnership(t *testing
 		accountID := uuid.New()
 		_, err := pool.Exec(ctx,
 			`INSERT INTO ms_billing.accounts
-			   (id, owner_kind, owner_user_id, activated_at)
-			 VALUES ($1, 'user', $2, $3)`,
-			accountID, uuid.New(), activatedAt)
+			   (id, owner_kind, owner_user_id, stripe_customer_id, activated_at)
+			 VALUES ($1, 'user', $2, $3, $4)`,
+			accountID, uuid.New(), "cus_usage_frozen_"+accountID.String(), activatedAt)
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx,
+			`INSERT INTO ms_billing.payment_methods_mirror
+			   (id, account_id, stripe_payment_method_id, brand, last4,
+			    exp_month, exp_year, is_default)
+			 VALUES ($1, $2, $3, 'visa', '4242', 12, 2099, true)`,
+			uuid.New(), accountID, "pm_usage_frozen_"+accountID.String())
 		require.NoError(t, err)
 
 		appID := uuid.New()

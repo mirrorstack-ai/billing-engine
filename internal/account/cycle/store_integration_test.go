@@ -276,13 +276,22 @@ func TestUpsertInvoice_Integration_EverFailedIsSticky(t *testing.T) {
 	store := cycle.NewStore(pool)
 	ctx := context.Background()
 	acct := seedAccount(t, pool)
+	var fundingAccountID, fundingGeneration uuid.UUID
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT funding_account_id, generation
+		FROM ms_billing.account_funding_authorizations
+		WHERE account_id=$1`, acct).Scan(&fundingAccountID, &fundingGeneration))
 
 	open := cycle.InvoiceMirror{
-		AccountID: acct, StripeInvoiceID: "in_failed", Status: "open",
+		AccountID: acct, ChargeFundingAccountID: fundingAccountID,
+		ChargeFundingGeneration: fundingGeneration,
+		StripeInvoiceID:         "in_failed", Status: "open",
 		AmountDueCents: 200, Currency: "usd", EverFailed: true,
 	}
 	paid := cycle.InvoiceMirror{
-		AccountID: acct, StripeInvoiceID: "in_paid", Status: "paid",
+		AccountID: acct, ChargeFundingAccountID: fundingAccountID,
+		ChargeFundingGeneration: fundingGeneration,
+		StripeInvoiceID:         "in_paid", Status: "paid",
 		AmountDueCents: 200, AmountPaidCents: 200, Currency: "usd",
 	}
 	require.NoError(t, store.UpsertInvoice(ctx, open))

@@ -458,6 +458,10 @@ SELECT
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     expires_at,
     created_at
 FROM ms_billing.credit_ledger
@@ -478,6 +482,10 @@ SELECT
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at
 FROM ms_billing.credit_ledger
 WHERE id = sqlc.arg(purchase_id)::uuid
@@ -535,7 +543,88 @@ RETURNING
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at;
+
+-- ArmPendingCreditPurchase is the manual-purchase money boundary. It either
+-- reuses the row's immutable claim or snapshots the current rotating funding
+-- authorization plus its Stripe Customer in the same statement. The update
+-- trigger acquires both customer and funder lifecycle locks before this commit;
+-- no Stripe request may run until this row is returned.
+-- name: ArmPendingCreditPurchase :one
+WITH target AS MATERIALIZED (
+    SELECT purchase.id,
+           purchase.account_id,
+           purchase.charge_funding_account_id,
+           purchase.charge_funding_generation,
+           purchase.attempt_stripe_customer_id,
+           purchase.stripe_invoice_id
+    FROM ms_billing.credit_ledger purchase
+    WHERE purchase.id = sqlc.arg(purchase_id)::uuid
+      AND purchase.account_id = sqlc.arg(account_id)::uuid
+      AND purchase.type = 'purchase'
+      AND purchase.status = 'pending'
+      AND NOT purchase.charge_funding_legacy_unresolved
+    FOR UPDATE
+), funding_authorization AS MATERIALIZED (
+    SELECT target.id,
+           funding_auth.funding_account_id,
+           funding_auth.generation,
+           funding.stripe_customer_id
+    FROM target
+    JOIN ms_billing.account_funding_authorizations funding_auth
+      ON funding_auth.account_id = target.account_id
+    JOIN ms_billing.accounts funding
+      ON funding.id = funding_auth.funding_account_id
+    WHERE target.charge_funding_account_id IS NULL
+      AND target.charge_funding_generation IS NULL
+      AND target.attempt_stripe_customer_id IS NULL
+      AND target.stripe_invoice_id IS NULL
+      AND NULLIF(BTRIM(funding.stripe_customer_id), '') IS NOT NULL
+), claim AS MATERIALIZED (
+    SELECT target.id,
+           COALESCE(target.charge_funding_account_id,
+                    funding_authorization.funding_account_id) AS funding_account_id,
+           COALESCE(target.charge_funding_generation,
+                    funding_authorization.generation) AS generation,
+           COALESCE(target.attempt_stripe_customer_id,
+                    funding_authorization.stripe_customer_id) AS stripe_customer_id
+    FROM target
+    LEFT JOIN funding_authorization
+      ON funding_authorization.id = target.id
+    WHERE (
+        target.charge_funding_account_id IS NOT NULL
+        AND target.charge_funding_generation IS NOT NULL
+        AND NULLIF(BTRIM(target.attempt_stripe_customer_id), '') IS NOT NULL
+    ) OR funding_authorization.id IS NOT NULL
+), armed AS (
+    UPDATE ms_billing.credit_ledger purchase
+    SET charge_funding_account_id = claim.funding_account_id,
+        charge_funding_generation = claim.generation,
+        attempt_stripe_customer_id = claim.stripe_customer_id
+    FROM claim
+    WHERE purchase.id = claim.id
+    RETURNING purchase.*
+)
+SELECT id,
+       account_id,
+       amount_micros,
+       type,
+       status,
+       balance_after_micros,
+       actor,
+       COALESCE(idempotency_key, '')::text AS idempotency_key,
+       COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+       COALESCE(receipt_url, '')::text AS receipt_url,
+       charge_funding_account_id,
+       charge_funding_generation,
+       COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+       charge_funding_legacy_unresolved,
+       created_at
+FROM armed;
 
 -- AttachCreditPurchaseInvoice records Stripe's durable invoice identity and
 -- hosted URL without allowing a retry to replace an already-attached invoice.
@@ -552,6 +641,10 @@ WHERE id = sqlc.arg(purchase_id)::uuid
   AND account_id = sqlc.arg(account_id)::uuid
   AND type = 'purchase'
   AND status = 'pending'
+  AND NOT charge_funding_legacy_unresolved
+  AND charge_funding_account_id IS NOT NULL
+  AND charge_funding_generation IS NOT NULL
+  AND attempt_stripe_customer_id = sqlc.arg(stripe_customer_id)::text
   AND (
       stripe_invoice_id IS NULL
       OR stripe_invoice_id = sqlc.arg(stripe_invoice_id)::text
@@ -567,6 +660,10 @@ RETURNING
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at;
 
 -- FinalizeCreditPurchase is the sole purchase status transition primitive.
@@ -597,6 +694,10 @@ RETURNING
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at;
 
 -- UpsertCreditAutoTopUp owns the one-row-per-account mutable configuration.
@@ -681,6 +782,24 @@ JOIN ms_billing.accounts customer
  AND customer.owner_org_id = designation.org_id
 WHERE designation.org_id = sqlc.arg(customer_org_id)::uuid
   AND designation.funding = 'sponsor';
+
+-- LockDistributorCustomerAccountForMutation repeats the exact authority lookup
+-- under a row lock. The lock keeps a designation UPDATE/DELETE from revoking or
+-- redirecting authority after a distributor mutation has re-authorized inside
+-- its write transaction; the relationship change linearizes after that write.
+-- name: LockDistributorCustomerAccountForMutation :one
+SELECT customer.id AS account_id
+FROM ms_billing.org_billing_designations designation
+JOIN ms_billing.accounts distributor
+  ON distributor.id = designation.sponsor_account_id
+ AND distributor.owner_kind = 'org'
+ AND distributor.owner_org_id = sqlc.arg(distributor_org_id)::uuid
+JOIN ms_billing.accounts customer
+  ON customer.owner_kind = 'org'
+ AND customer.owner_org_id = designation.org_id
+WHERE designation.org_id = sqlc.arg(customer_org_id)::uuid
+  AND designation.funding = 'sponsor'
+FOR UPDATE OF designation;
 
 -- ListDistributorCustomerSnapshots lists every customer whose designation
 -- names the distributor's org account, including the wallet fields needed for

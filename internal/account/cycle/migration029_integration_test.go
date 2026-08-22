@@ -84,7 +84,7 @@ func TestChargeProrationLocked_Integration_Semantics(t *testing.T) {
 	live := uuid.New()
 	require.NoError(t, store.InsertAppMirror(ctx, live, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 	liveCharge := mkCharge(live, "in_live")
-	freezeProrationForCharge(t, ctx, store, acct, live, liveCharge)
+	freezeProrationForCharge(t, ctx, pool, store, acct, live, liveCharge)
 	called := false
 	outcome, invID, err := store.ChargeProrationLocked(ctx, live, func(l cycle.AppMirror) (*cycle.ProrationCharge, error) {
 		called = true

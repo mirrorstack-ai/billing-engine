@@ -141,6 +141,7 @@ func TestCustomDomains_Integration_UnactivatedGateAndResolvedForgiveness(t *test
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.accounts SET activated_at = $2 WHERE id = $1`,
 		acct.String(), mustTime(t, "2026-06-15T00:00:00Z"))
 	require.NoError(t, err)
+	installStandardPaymentMethod(t, pool, acct, "cus_domain_attempt_marker")
 	cands, err = store.DomainsPendingCharge(ctx, mustTime(t, "2026-06-20T00:00:00Z"))
 	require.NoError(t, err)
 	require.Len(t, cands, 1)
@@ -149,7 +150,10 @@ func TestCustomDomains_Integration_UnactivatedGateAndResolvedForgiveness(t *test
 
 	// The attempt marker is first-write-wins and surfaces on the next work-list
 	// read (drives recovery-before-fresh-charge).
-	require.NoError(t, store.MarkDomainChargeAttempted(ctx, dom.ID, mustTime(t, "2026-06-20T00:00:00Z")))
+	claim, err := store.ArmDomainStripeCharge(ctx, dom.ID, mustTime(t, "2026-06-20T00:00:00Z"))
+	require.NoError(t, err)
+	require.Equal(t, cycle.StripeRailClaimed, claim.Outcome)
+	require.Equal(t, acct, claim.FundingAccountID)
 	cands, err = store.DomainsPendingCharge(ctx, mustTime(t, "2026-06-21T00:00:00Z"))
 	require.NoError(t, err)
 	require.Len(t, cands, 1)

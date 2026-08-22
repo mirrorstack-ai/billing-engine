@@ -18,10 +18,12 @@ func TestStoreFailExactVoidCommitsOnceWithoutAdvancingBalance(t *testing.T) {
 	ctx := context.Background()
 	accountID, ledgerID := uuid.New(), uuid.New()
 	_, err := pool.Exec(ctx,
-		`INSERT INTO ms_billing.accounts (id, owner_kind, owner_user_id)
-		 VALUES ($1, 'user', $2)`,
+		`INSERT INTO ms_billing.accounts
+		    (id, owner_kind, owner_user_id, stripe_customer_id)
+		 VALUES ($1, 'user', $2, $3)`,
 		accountID,
 		uuid.New(),
+		"cus_"+accountID.String(),
 	)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx,
@@ -37,9 +39,15 @@ func TestStoreFailExactVoidCommitsOnceWithoutAdvancingBalance(t *testing.T) {
 	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.credit_ledger
 		   (id, account_id, amount_micros, type, status, balance_after_micros,
-		    actor, idempotency_key, stripe_invoice_id)
-		 VALUES ($1, $2, 5000000, 'purchase', 'pending', 6000000,
-		         'self', $3, 'in_manual_void')`,
+		    actor, idempotency_key, stripe_invoice_id,
+		    attempt_stripe_customer_id, charge_funding_account_id,
+		    charge_funding_generation)
+		 SELECT $1, $2, 5000000, 'purchase', 'pending', 6000000,
+		        'self', $3, 'in_manual_void', account.stripe_customer_id,
+		        funding.funding_account_id, funding.generation
+		 FROM ms_billing.account_funding_authorizations funding
+		 JOIN ms_billing.accounts account ON account.id=funding.funding_account_id
+		 WHERE funding.account_id=$2`,
 		ledgerID,
 		accountID,
 		"purchase:"+ledgerID.String(),

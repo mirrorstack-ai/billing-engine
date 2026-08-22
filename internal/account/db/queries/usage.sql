@@ -751,4 +751,9 @@ ORDER BY app_id;
 -- name: AppOwnerOrg :one
 SELECT owner_org_id
 FROM ms_billing.apps
-WHERE app_id = $1;
+WHERE app_id = $1
+  AND deleted_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = ms_billing.apps.owner_org_id
+  );

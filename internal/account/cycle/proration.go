@@ -409,7 +409,10 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	var recoveredInv *billingstripe.Invoice
 	moneyMayHaveMoved := false
 	if app.ProrationAttempted {
-		custID, err = s.recoveryCustomer(ctx, app.AccountID)
+		if preflightAttempt == nil || preflightAttempt.ChargeFundingAccountID == uuid.Nil {
+			return nil, billing.Internal("app has an attempted proration charge without a pinned funding account", nil)
+		}
+		custID, err = s.store.AccountStripeCustomer(ctx, preflightAttempt.ChargeFundingAccountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
@@ -460,6 +463,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// in a second short transaction, then and only then reaches Stripe.
 	var cents int64
 	var concurrentlyResolvedInvoice string
+	atomicNoPM := false
 	outcome, invID, err := s.store.ChargeProrationLocked(ctx, appID, func(locked AppMirror) (*ProrationCharge, error) {
 		var candidate CombinedProrationChargeShape
 		if locked.ProrationAttempted {
@@ -516,6 +520,9 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		switch claim {
 		case StripeRailWalletRequired:
 			return nil, ErrCreditRailRequired
+		case StripeRailNoPaymentMethod:
+			atomicNoPM = true
+			return nil, nil
 		case StripeRailStale:
 			return nil, nil
 		}
@@ -524,6 +531,16 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			// then completed while this worker waited on the freeze locks.
 			concurrentlyResolvedInvoice = attempt.ResolvedInvoiceID
 			return nil, nil
+		}
+		if attempt.ChargeFundingAccountID == uuid.Nil {
+			return nil, billing.Internal("combined proration attempt has no pinned funding account", nil)
+		}
+		custID, err = s.store.AccountStripeCustomer(ctx, attempt.ChargeFundingAccountID)
+		if err != nil {
+			return nil, billing.Internal("combined proration funding customer lookup failed", err)
+		}
+		if custID == "" {
+			return nil, billing.Internal("combined proration funder has a usable PM but no Stripe customer id", nil)
 		}
 
 		expectedTotalCents, err := combinedProrationTotalCents(attempt)
@@ -578,15 +595,17 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			Cents:      attempt.Shape.BaseChargeCents,
 			ResolvedAt: resolvedAt,
 			Invoice: InvoiceMirror{
-				AccountID:          attempt.Shape.AccountID,
-				StripeInvoiceID:    inv.ID,
-				Status:             inv.Status,
-				AmountDueCents:     inv.AmountDue,
-				AmountPaidCents:    inv.AmountPaid,
-				Currency:           attempt.Shape.Currency,
-				PeriodStart:        attempt.Shape.CoverageStart,
-				PeriodEnd:          attempt.Shape.CoverageEnd,
-				IsLargeAutoCollect: flagLargeAutoCollect(totalMicros, acct),
+				AccountID:               attempt.Shape.AccountID,
+				ChargeFundingAccountID:  attempt.ChargeFundingAccountID,
+				ChargeFundingGeneration: attempt.ChargeFundingGeneration,
+				StripeInvoiceID:         inv.ID,
+				Status:                  inv.Status,
+				AmountDueCents:          inv.AmountDue,
+				AmountPaidCents:         inv.AmountPaid,
+				Currency:                attempt.Shape.Currency,
+				PeriodStart:             attempt.Shape.CoverageStart,
+				PeriodEnd:               attempt.Shape.CoverageEnd,
+				IsLargeAutoCollect:      flagLargeAutoCollect(totalMicros, acct),
 			},
 			Snapshot:         attempt.Shape.Snapshot,
 			StraddleSnapshot: attempt.Shape.StraddleSnapshot,
@@ -626,6 +645,9 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	case ProrationLockedNotFound:
 		return &ProrationResult{AppID: appID, Status: ProrationStatusNotFound}, nil
 	default: // ProrationLockedNoCharge
+		if atomicNoPM {
+			return &ProrationResult{AppID: appID, Status: ProrationStatusNoPM}, nil
+		}
 		if concurrentlyResolvedInvoice != "" {
 			return &ProrationResult{
 				AppID:              appID,

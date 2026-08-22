@@ -225,10 +225,14 @@ func TestBillingRunWalletDraw_Integration_ConcurrentStripeFreezeWinsBeforeAlloca
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = freezeTx.Rollback(ctx) })
 	_, err = freezeTx.Exec(ctx, `
-		UPDATE ms_billing.billing_runs
+		UPDATE ms_billing.billing_runs run
 		SET frozen_charge_cents = 100,
-		    frozen_charge_with_base = false
-		WHERE id = $1`,
+		    frozen_charge_with_base = false,
+		    charge_funding_account_id = funding.funding_account_id,
+		    charge_funding_generation = funding.generation
+		FROM ms_billing.account_funding_authorizations funding
+		WHERE run.id = $1
+		  AND funding.account_id = run.account_id`,
 		runID,
 	)
 	require.NoError(t, err)

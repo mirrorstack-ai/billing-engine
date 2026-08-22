@@ -16,6 +16,11 @@ const activateAccountIfUnset = `-- name: ActivateAccountIfUnset :execrows
 UPDATE ms_billing.accounts
 SET activated_at = $2
 WHERE id = $1 AND activated_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = ms_billing.accounts.owner_org_id
+  )
 `
 
 type ActivateAccountIfUnsetParams struct {
@@ -39,6 +44,10 @@ const attachOrgAppsToAccount = `-- name: AttachOrgAppsToAccount :execrows
 UPDATE ms_billing.apps
 SET account_id = $2
 WHERE owner_org_id = $1 AND account_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = $1
+  )
 `
 
 type AttachOrgAppsToAccountParams struct {
@@ -67,6 +76,10 @@ LEFT JOIN ms_billing.org_billing_designations d
    AND d.org_id = a.owner_org_id
    AND d.funding = 'sponsor'
 WHERE a.id = $1
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE a.owner_kind = 'org' AND f.org_id = a.owner_org_id
+  )
 `
 
 // ChargeFundingAccount maps an account to the account whose Stripe customer /
@@ -292,6 +305,10 @@ FROM ms_billing.payment_methods_mirror pmm
 JOIN ms_billing.accounts a ON a.id = pmm.account_id
 WHERE a.owner_kind = 'org' AND a.owner_org_id = $1
   AND pmm.id = $2 AND pmm.deleted_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = a.owner_org_id
+  )
 `
 
 type PaymentMethodTargetForOrgParams struct {
@@ -322,6 +339,10 @@ SET account_id     = $1::uuid,
     recorded_at    = GREATEST(recorded_at, $2::timestamptz)
 WHERE account_id IS NULL
   AND app_id IN (SELECT app_id FROM ms_billing.apps WHERE owner_org_id = $3::uuid)
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = $3::uuid
+  )
 `
 
 type RepointOrgNullAccountEventsParams struct {
@@ -354,6 +375,10 @@ JOIN ms_billing.accounts a
     ON a.owner_kind = 'org' AND a.owner_org_id = d.org_id
 WHERE d.org_id = $1
   AND a.activated_at IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = d.org_id
+  )
 `
 
 // ResolveOrgFundedAccount is THE org account resolution (ingest, reads,
@@ -376,6 +401,10 @@ const selectAccountByOrg = `-- name: SelectAccountByOrg :one
 SELECT id, COALESCE(stripe_customer_id, '')::text AS stripe_customer_id
 FROM ms_billing.accounts
 WHERE owner_kind = 'org' AND owner_org_id = $1
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = $1
+  )
 `
 
 type SelectAccountByOrgRow struct {

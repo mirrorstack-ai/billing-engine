@@ -190,7 +190,11 @@ func paySetup(status string) (*fakeStore, *fakeStripe, uuid.UUID, uuid.UUID) {
 	store.hasUsableDefPM[accountID] = true
 	store.payTargets[invoiceID] = fakePayTarget{
 		accountID: accountID,
-		target:    billing.InvoicePayTarget{StripeInvoiceID: "in_123", Status: status},
+		target: billing.InvoicePayTarget{
+			StripeInvoiceID:        "in_123",
+			Status:                 status,
+			ChargeFundingAccountID: accountID,
+		},
 	}
 	return store, &fakeStripe{getInvoiceCustomer: "cus_pay"}, userID, invoiceID
 }
@@ -527,7 +531,11 @@ func TestPayInvoice_SponsorFundedOrg_CardGateHopsToSponsor(t *testing.T) {
 	store.stripeCustomerOf[sponsorAcct] = "cus_sponsor"
 	store.payTargets[invoiceID] = fakePayTarget{
 		accountID: orgAcct,
-		target:    billing.InvoicePayTarget{StripeInvoiceID: "in_org", Status: "open"},
+		target: billing.InvoicePayTarget{
+			StripeInvoiceID:        "in_org",
+			Status:                 "open",
+			ChargeFundingAccountID: sponsorAcct,
+		},
 	}
 	sc := &fakeStripe{getInvoiceCustomer: "cus_sponsor"}
 	svc := billing.NewService(store, sc, "")

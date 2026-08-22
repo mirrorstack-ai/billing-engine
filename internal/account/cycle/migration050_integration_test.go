@@ -57,6 +57,7 @@ func seedCombinedAttemptApp(
 	t.Helper()
 	ctx := context.Background()
 	accountID := seedAccount(t, pool)
+	installStandardPaymentMethod(t, pool, accountID, "cus_combined_attempt_"+accountID.String())
 	appID := uuid.New()
 	createdAt := time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC)
 	require.NoError(t, store.InsertAppMirror(
@@ -221,9 +222,9 @@ func TestCombinedProrationAttempt_Integration_FrozenSetSurvivesRankAndRemoval(t 
 
 	// A standalone Stripe marker and wallet draw also lose to the durable owner.
 	selected := attempt.TimerIDs[0]
-	stamped, err := store.MarkModuleTimerChargeAttempted(ctx, selected, attemptedAt.Add(2*time.Minute))
+	claim, err := store.ArmModuleTimerStripeCharge(ctx, selected, attemptedAt.Add(2*time.Minute))
 	require.NoError(t, err)
-	require.Zero(t, stamped)
+	require.Equal(t, cycle.StripeRailStale, claim.Outcome)
 	outcome, _, err := store.DrawModuleOverageFromWallet(ctx, selected, cycle.ModuleOverageWalletCharge{
 		Ref:          "wallet:must-not-win",
 		AmountMicros: 1_500_000,
@@ -534,9 +535,13 @@ func TestCombinedProrationAttempt_Integration_SelectionRecheckLosesToStandaloneM
 	require.NoError(t, err)
 	defer func() { _ = markerTx.Rollback(ctx) }()
 	_, err = markerTx.Exec(ctx, `
-		UPDATE ms_billing.app_module_overage_timers
-		SET charge_attempted_at = $2
-		WHERE id = $1`,
+		UPDATE ms_billing.app_module_overage_timers timer
+		SET charge_attempted_at = $2,
+		    charge_funding_account_id = funding.funding_account_id,
+		    charge_funding_generation = funding.generation
+		FROM ms_billing.account_funding_authorizations funding
+		WHERE timer.id = $1
+		  AND funding.account_id = timer.account_id`,
 		over[0].String(),
 		createdAt.AddDate(0, 0, usage.GraceDays),
 	)
