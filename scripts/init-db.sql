@@ -82,3 +82,8 @@
 
 -- 050: durable exact ownership for combined creation-proration attempts.
 \i migrations/billing/050_combined_proration_attempts.up.sql
+
+-- 051–052: heavy-task substrate rates and immutable organization billing
+-- retirement.
+\i migrations/billing/051_heavy_tier_rates.up.sql
+\i migrations/billing/052_org_deletion_finalizations.up.sql

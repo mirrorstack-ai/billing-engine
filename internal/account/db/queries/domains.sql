@@ -41,7 +41,9 @@ WHERE app_id = @app_id::uuid
 -- charge_attempted_at drives recovery-before-fresh-charge on retries.
 -- name: DomainsPendingCharge :many
 SELECT d.id, d.account_id, d.app_id, d.hostname, d.activated_at,
-       d.charge_attempted_at, a.activated_at AS account_activated_at
+       d.charge_attempted_at, d.charge_funding_account_id,
+       d.charge_funding_generation,
+       a.activated_at AS account_activated_at
 FROM ms_billing.app_custom_domains d
 JOIN ms_billing.accounts a ON a.id = d.account_id
 WHERE d.removed_at IS NULL
@@ -58,13 +60,72 @@ SELECT (removed_at IS NULL AND charge_resolved = false)::bool AS pending
 FROM ms_billing.app_custom_domains
 WHERE id = $1;
 
--- MarkDomainChargeAttempted stamps the first recovery marker before Stripe is
--- called. First-write-wins and is never cleared.
--- name: MarkDomainChargeAttempted :exec
-UPDATE ms_billing.app_custom_domains
-SET charge_attempted_at = $2
-WHERE id = $1
-  AND charge_attempted_at IS NULL;
+-- ArmDomainStripeCharge is the atomic funding/marker boundary. It row-locks
+-- the candidate, chooses the existing first-write claim or the account's
+-- current rotating authorization, verifies a usable PM on that exact funder,
+-- and persists the claim before returning the Stripe customer. A designation
+-- change racing this statement linearizes wholly before or after the arm.
+-- name: ArmDomainStripeCharge :one
+WITH target AS MATERIALIZED (
+    SELECT account_id, charge_attempted_at,
+           charge_funding_account_id, charge_funding_generation
+    FROM ms_billing.app_custom_domains
+    WHERE id = @domain_id::uuid
+      AND removed_at IS NULL
+      AND charge_resolved = false
+      AND NOT charge_funding_legacy_unresolved
+    FOR UPDATE
+), selected AS MATERIALIZED (
+    SELECT target.account_id,
+           COALESCE(target.charge_funding_account_id,
+                    funding_auth.funding_account_id) AS funding_account_id,
+           COALESCE(target.charge_funding_generation,
+                    funding_auth.generation) AS funding_generation
+    FROM target
+    JOIN ms_billing.account_funding_authorizations funding_auth
+      ON funding_auth.account_id = target.account_id
+), funding AS MATERIALIZED (
+    SELECT selected.account_id,
+           selected.funding_account_id,
+           selected.funding_generation,
+           COALESCE(account.stripe_customer_id, '')::text AS stripe_customer_id,
+           EXISTS (
+               SELECT 1
+               FROM ms_billing.payment_methods_mirror payment_method
+               WHERE payment_method.account_id = selected.funding_account_id
+                 AND payment_method.deleted_at IS NULL
+                 AND (payment_method.exp_year, payment_method.exp_month) >= (
+                     EXTRACT(YEAR FROM current_date)::INT,
+                     EXTRACT(MONTH FROM current_date)::INT
+                 )
+           ) AS has_usable_payment_method
+    FROM selected
+    JOIN ms_billing.accounts account
+      ON account.id = selected.funding_account_id
+), armed AS (
+    UPDATE ms_billing.app_custom_domains domain_row
+    SET charge_attempted_at = COALESCE(domain_row.charge_attempted_at,
+                                       @attempted_at::timestamptz),
+        charge_funding_account_id = COALESCE(
+            domain_row.charge_funding_account_id,
+            funding.funding_account_id
+        ),
+        charge_funding_generation = COALESCE(
+            domain_row.charge_funding_generation,
+            funding.funding_generation
+        )
+    FROM funding
+    WHERE domain_row.id = @domain_id::uuid
+      AND funding.has_usable_payment_method
+    RETURNING domain_row.id
+)
+SELECT funding.account_id,
+       funding.funding_account_id,
+       funding.funding_generation,
+       funding.stripe_customer_id,
+       funding.has_usable_payment_method,
+       EXISTS (SELECT 1 FROM armed)::boolean AS armed
+FROM funding;
 
 -- MarkDomainChargeResolved terminally forgives an activation period under D1d
 -- (the account activated at/after that period closed). No money moved.

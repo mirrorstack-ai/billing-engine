@@ -380,6 +380,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.RepointOrgUsage(ctx, req)
 
+	case "FinalizeOrgDeletion":
+		var req cycle.FinalizeOrgDeletionRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.FinalizeOrgDeletion(ctx, req)
+
 	case "ListSponsoredOrgs":
 		var req cycle.ListSponsoredOrgsRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -739,6 +746,7 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.GetOrgDesignation", makeHTTPHandler(d, "GetOrgDesignation"))
 		r.Post("/v1/billing.RevokeSponsorship", makeHTTPHandler(d, "RevokeSponsorship"))
 		r.Post("/v1/billing.RepointOrgUsage", makeHTTPHandler(d, "RepointOrgUsage"))
+		r.Post("/v1/billing.FinalizeOrgDeletion", makeHTTPHandler(d, "FinalizeOrgDeletion"))
 		// Sponsored-orgs read (org-billing W1): the /me sponsored-orgs list.
 		// A control-plane read — internal secret, NOT the meter seam.
 		r.Post("/v1/billing.ListSponsoredOrgs", makeHTTPHandler(d, "ListSponsoredOrgs"))

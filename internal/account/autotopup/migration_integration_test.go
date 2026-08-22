@@ -44,7 +44,11 @@ func TestMigration049_ExactConstraintAndIndexShapesAndMoneyAuditDeleteSemantics(
 			definition: "CHECK ((((type = 'auto_topup'::text) AND (attempt_payment_method_id IS NOT NULL) " +
 				"AND (NULLIF(btrim(attempt_stripe_payment_method_id), ''::text) IS NOT NULL) " +
 				"AND (NULLIF(btrim(attempt_stripe_customer_id), ''::text) IS NOT NULL) " +
-				"AND (attempt_expires_at IS NOT NULL)) OR ((type <> 'auto_topup'::text) " +
+				"AND (attempt_expires_at IS NOT NULL)) OR ((type = 'purchase'::text) " +
+				"AND (attempt_payment_method_id IS NULL) " +
+				"AND (attempt_stripe_payment_method_id IS NULL) " +
+				"AND (attempt_expires_at IS NULL) AND (failure_code IS NULL)) OR " +
+				"((type <> ALL (ARRAY['auto_topup'::text, 'purchase'::text])) " +
 				"AND (attempt_payment_method_id IS NULL) " +
 				"AND (attempt_stripe_payment_method_id IS NULL) " +
 				"AND (attempt_stripe_customer_id IS NULL) AND (attempt_expires_at IS NULL) " +

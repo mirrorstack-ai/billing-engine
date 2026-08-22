@@ -40,9 +40,13 @@ func seedInvoiceMirror(t *testing.T, pool *pgxpool.Pool, acct, id uuid.UUID, str
 	}
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO ms_billing.invoices
-		   (id, account_id, stripe_invoice_id, status, amount_due, amount_paid, currency,
+		   (id, account_id, charge_funding_account_id, charge_funding_generation,
+		    stripe_invoice_id, status, amount_due, amount_paid, currency,
 		    created_at, number, hosted_invoice_url, invoice_pdf, ever_failed)
-		 VALUES ($1,$2,$3,$4,$5,$6,'usd',$7,$8,$9,$10,$11)`,
+		 SELECT $1, $2, auth.funding_account_id, auth.generation,
+		        $3, $4, $5, $6, 'usd', $7, $8, $9, $10, $11
+		 FROM ms_billing.account_funding_authorizations auth
+		 WHERE auth.account_id = $2`,
 		id.String(), acct.String(), stripeID, status, dueCents, paidCents, createdAt,
 		numberArg, hostedArg, pdfArg, everFailed)
 	require.NoError(t, err)

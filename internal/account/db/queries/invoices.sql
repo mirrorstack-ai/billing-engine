@@ -77,7 +77,10 @@ ORDER BY created_at ASC, id ASC;
 -- rides along so the service can short-circuit an already-paid row and
 -- reject non-payable states before touching Stripe.
 -- name: InvoiceForPayment :one
-SELECT stripe_invoice_id, status
+SELECT stripe_invoice_id,
+       status,
+       charge_funding_account_id,
+       charge_funding_legacy_unresolved
 FROM ms_billing.invoices
 WHERE id = $1
   AND account_id = $2;

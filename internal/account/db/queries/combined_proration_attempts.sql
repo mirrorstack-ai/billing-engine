@@ -9,6 +9,8 @@
 -- name: SelectCombinedProrationAttempt :one
 SELECT app_id,
        account_id,
+       charge_funding_account_id,
+       charge_funding_generation,
        attempted_at,
        currency,
        base_charge_micros,
@@ -46,6 +48,8 @@ ORDER BY timer_id;
 INSERT INTO ms_billing.app_combined_proration_attempts (
     app_id,
     account_id,
+    charge_funding_account_id,
+    charge_funding_generation,
     attempted_at,
     currency,
     base_charge_micros,
@@ -67,6 +71,8 @@ INSERT INTO ms_billing.app_combined_proration_attempts (
 ) VALUES (
     @app_id::uuid,
     @account_id::uuid,
+    @charge_funding_account_id::uuid,
+    @charge_funding_generation::uuid,
     @attempted_at::timestamptz,
     @currency,
     @base_charge_micros,

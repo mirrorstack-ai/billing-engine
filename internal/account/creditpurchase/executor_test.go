@@ -50,11 +50,13 @@ func (s *fakeStore) AttachInvoice(
 		s.attempt.StripeInvoiceID != invoice.ID {
 		return Attempt{}, errors.New("different invoice already attached")
 	}
+	if s.attempt.StripeCustomerID != invoice.CustomerID {
+		return Attempt{}, errors.New("invoice customer mismatch")
+	}
 	s.attempt.StripeInvoiceID = invoice.ID
 	if invoice.HostedInvoiceURL != "" {
 		s.attempt.ReceiptURL = invoice.HostedInvoiceURL
 	}
-	s.attempt.StripeCustomerID = invoice.CustomerID
 	return s.attempt, nil
 }
 
@@ -217,12 +219,14 @@ func (s *fakeStripe) VoidInvoice(
 
 func testAttempt(status string) Attempt {
 	return Attempt{
-		ID:               uuid.New(),
-		AccountID:        uuid.New(),
-		AmountMicros:     5_000_000,
-		Status:           status,
-		StripeInvoiceID:  "in_manual",
-		StripeCustomerID: "cus_original",
+		ID:                uuid.New(),
+		AccountID:         uuid.New(),
+		AmountMicros:      5_000_000,
+		Status:            status,
+		StripeInvoiceID:   "in_manual",
+		FundingAccountID:  uuid.New(),
+		FundingGeneration: uuid.New(),
+		StripeCustomerID:  "cus_original",
 	}
 }
 

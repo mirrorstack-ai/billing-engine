@@ -227,8 +227,10 @@ type UnpaidInvoiceRow struct {
 // mirror invoice to: the Stripe-side id to pay and the mirror's current
 // status (for the paid short-circuit / non-payable rejection).
 type InvoicePayTarget struct {
-	StripeInvoiceID string
-	Status          string
+	StripeInvoiceID         string
+	Status                  string
+	ChargeFundingAccountID  uuid.UUID
+	FundingLegacyUnresolved bool
 }
 
 // GetServiceStatusRequest is the payload of GetServiceStatus — the account is
@@ -451,35 +453,43 @@ type CreditStandingRow struct {
 }
 
 type CreditPurchaseRow struct {
-	ID                 uuid.UUID
-	AccountID          uuid.UUID
-	AmountMicros       int64
-	Type               string
-	Status             string
-	BalanceAfterMicros int64
-	Actor              string
-	IdempotencyKey     string
-	StripeInvoiceID    string
-	ReceiptURL         string
-	CreatedAt          time.Time
+	ID                      uuid.UUID
+	AccountID               uuid.UUID
+	AmountMicros            int64
+	Type                    string
+	Status                  string
+	BalanceAfterMicros      int64
+	Actor                   string
+	IdempotencyKey          string
+	StripeInvoiceID         string
+	ReceiptURL              string
+	ChargeFundingAccountID  uuid.UUID
+	ChargeFundingGeneration uuid.UUID
+	StripeCustomerID        string
+	FundingLegacyUnresolved bool
+	CreatedAt               time.Time
 	// Transitioned is true only when this store call performed the
 	// pending-to-terminal transition.
 	Transitioned bool
 }
 
 type CreditLedgerRecord struct {
-	ID                 uuid.UUID
-	AccountID          uuid.UUID
-	AmountMicros       int64
-	Type               string
-	Status             string
-	BalanceAfterMicros int64
-	Actor              string
-	IdempotencyKey     string
-	StripeInvoiceID    string
-	ReceiptURL         string
-	ExpiresAt          *time.Time
-	CreatedAt          time.Time
+	ID                      uuid.UUID
+	AccountID               uuid.UUID
+	AmountMicros            int64
+	Type                    string
+	Status                  string
+	BalanceAfterMicros      int64
+	Actor                   string
+	IdempotencyKey          string
+	StripeInvoiceID         string
+	ReceiptURL              string
+	ChargeFundingAccountID  uuid.UUID
+	ChargeFundingGeneration uuid.UUID
+	StripeCustomerID        string
+	FundingLegacyUnresolved bool
+	ExpiresAt               *time.Time
+	CreatedAt               time.Time
 }
 
 type CreditLedgerCursor struct {

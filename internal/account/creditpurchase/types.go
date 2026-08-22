@@ -14,17 +14,19 @@ import (
 const microsPerCent int64 = 10_000
 
 // Attempt is the durable identity a Stripe resource must prove before it can
-// advance wallet money. StripeCustomerID is required only while creating or
-// recovering an unattached invoice. Once attached, the exact invoice customer
-// is frozen by that resource and must also own the successful PaymentIntent.
+// advance wallet money. FundingAccountID, FundingGeneration, and
+// StripeCustomerID are one immutable database claim armed before Stripe. The
+// invoice and successful PaymentIntent must both prove that exact customer.
 type Attempt struct {
-	ID               uuid.UUID
-	AccountID        uuid.UUID
-	AmountMicros     int64
-	Status           string
-	StripeInvoiceID  string
-	ReceiptURL       string
-	StripeCustomerID string
+	ID                uuid.UUID
+	AccountID         uuid.UUID
+	AmountMicros      int64
+	Status            string
+	StripeInvoiceID   string
+	ReceiptURL        string
+	FundingAccountID  uuid.UUID
+	FundingGeneration uuid.UUID
+	StripeCustomerID  string
 }
 
 // Result is the latest independently-read Stripe truth. TerminalFailure is

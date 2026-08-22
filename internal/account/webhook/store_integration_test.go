@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -108,6 +109,120 @@ func TestPgxStore_MarkEventProcessed_FirstTimeAndDuplicate(t *testing.T) {
 	require.False(t, firstTime2, "second insert of same event_id should return firstTime=false")
 }
 
+func TestRouter_LateInvoicePaidForRetiredOrgACKsWithoutRelaxingCollection(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	orgID, accountID, operationID := uuid.New(), uuid.New(), uuid.New()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO ms_billing.accounts
+		    (id, owner_kind, owner_org_id, usage_billing_mode)
+		VALUES ($1, 'org', $2, 'prepaid')`, accountID, orgID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		INSERT INTO ms_billing.invoices
+		    (account_id, charge_funding_account_id, charge_funding_generation,
+		     stripe_invoice_id, status, amount_due, amount_paid)
+		SELECT $1, auth.funding_account_id, auth.generation,
+		       'in_retired_paid', 'paid', 0, 1200
+		FROM ms_billing.account_funding_authorizations auth
+		WHERE auth.account_id = $1`, accountID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		INSERT INTO ms_billing.org_deletion_finalizations
+		    (org_id, operation_id, finalized_at)
+		VALUES ($1, $2, now())`, orgID, operationID)
+	require.NoError(t, err)
+
+	verifier := &webhooktest.FakeVerifier{
+		Event: invoiceEvent(
+			"evt_retired_paid",
+			"invoice.paid",
+			"in_retired_paid",
+			"paid",
+			1200,
+			0,
+		),
+	}
+	stripe := &webhooktest.FakeChargeRetriever{}
+	router := webhook.NewRouter(
+		verifier,
+		webhook.NewStore(pool),
+		stripe,
+		stripe,
+		webhooktest.SilentLogger(),
+	)
+
+	result := router.Process(ctx, []byte(`{}`), "sig")
+	require.Equal(t, 200, result.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, result.Status)
+	var mode string
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT usage_billing_mode FROM ms_billing.accounts WHERE id=$1`,
+		accountID).Scan(&mode))
+	require.Equal(t, "prepaid", mode,
+		"late invoice.paid reconciliation must not reactivate a retired account")
+}
+
+func TestPgxStore_RelaxPaidInvoiceWaitsForFinalizerThenNoOps(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	orgID, accountID, operationID := uuid.New(), uuid.New(), uuid.New()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO ms_billing.accounts
+		    (id, owner_kind, owner_org_id, usage_billing_mode)
+		VALUES ($1, 'org', $2, 'prepaid')`, accountID, orgID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		INSERT INTO ms_billing.invoices
+		    (account_id, charge_funding_account_id, charge_funding_generation,
+		     stripe_invoice_id, status, amount_due, amount_paid)
+		SELECT $1, auth.funding_account_id, auth.generation,
+		       'in_relax_race', 'paid', 0, 1200
+		FROM ms_billing.account_funding_authorizations auth
+		WHERE auth.account_id = $1`, accountID)
+	require.NoError(t, err)
+
+	finalizer, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = finalizer.Rollback(context.Background()) })
+	_, err = finalizer.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(
+		    hashtextextended('ms_billing.org.lifecycle:' || $1::uuid::text, 0)
+		)`, orgID)
+	require.NoError(t, err)
+	_, err = finalizer.Exec(ctx, `
+		INSERT INTO ms_billing.org_deletion_finalizations
+		    (org_id, operation_id, finalized_at)
+		VALUES ($1, $2, now())`, orgID, operationID)
+	require.NoError(t, err)
+
+	type result struct {
+		relaxed bool
+		err     error
+	}
+	done := make(chan result, 1)
+	store := webhook.NewStore(pool)
+	go func() {
+		relaxed, relaxErr := store.RelaxCollectionOnPaidInvoice(
+			context.Background(), "in_relax_race",
+		)
+		done <- result{relaxed: relaxed, err: relaxErr}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("relax bypassed in-progress finalization: %+v", got)
+	case <-time.After(150 * time.Millisecond):
+	}
+	require.NoError(t, finalizer.Commit(ctx))
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		require.False(t, got.relaxed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("relax did not resume after finalization committed")
+	}
+}
+
 func TestRouter_InvoicePaidSettlesManualCreditWithoutInvoiceMirror(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	ctx := context.Background()
@@ -116,9 +231,15 @@ func TestRouter_InvoicePaidSettlesManualCreditWithoutInvoiceMirror(t *testing.T)
 	_, err := pool.Exec(ctx,
 		`INSERT INTO ms_billing.credit_ledger
 		   (id, account_id, amount_micros, type, status, balance_after_micros,
-		    actor, idempotency_key, stripe_invoice_id)
-		 VALUES ($1, $2, 5000000, 'purchase', 'pending', 5000000,
-		         'self', $3, 'in_credit_webhook')`,
+		    actor, idempotency_key, stripe_invoice_id,
+		    attempt_stripe_customer_id, charge_funding_account_id,
+		    charge_funding_generation)
+		 SELECT $1, $2, 5000000, 'purchase', 'pending', 5000000,
+		        'self', $3, 'in_credit_webhook', account.stripe_customer_id,
+		        funding.funding_account_id, funding.generation
+		 FROM ms_billing.account_funding_authorizations funding
+		 JOIN ms_billing.accounts account ON account.id=funding.funding_account_id
+		 WHERE funding.account_id=$2`,
 		ledgerID, accountID, "purchase:"+ledgerID.String(),
 	)
 	require.NoError(t, err)
@@ -339,7 +460,7 @@ func TestPgxStore_InsertPaymentMethod_Success(t *testing.T) {
 	store := webhook.NewStore(pool)
 	_ = seedAccount(t, pool, "cus_pm_x")
 
-	found, becameDefault, err := store.InsertPaymentMethod(context.Background(), "cus_pm_x", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err := store.InsertPaymentMethod(context.Background(), "cus_pm_x", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_new_1",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -349,6 +470,7 @@ func TestPgxStore_InsertPaymentMethod_Success(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.True(t, becameDefault)
+	require.False(t, retired)
 
 	var count int
 	err = pool.QueryRow(context.Background(),
@@ -366,7 +488,7 @@ func TestPgxStore_InsertPaymentMethod_Drift_NoAccountsRow(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := webhook.NewStore(pool)
 
-	found, becameDefault, err := store.InsertPaymentMethod(context.Background(), "cus_orphan", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err := store.InsertPaymentMethod(context.Background(), "cus_orphan", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_orphan",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -376,6 +498,7 @@ func TestPgxStore_InsertPaymentMethod_Drift_NoAccountsRow(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, found, "expected drift signal (no accounts row)")
 	require.False(t, becameDefault)
+	require.False(t, retired)
 
 	var count int
 	err = pool.QueryRow(context.Background(),
@@ -393,7 +516,7 @@ func TestPgxStore_InsertPaymentMethod_DefaultRedeliveryReturnsPersistedDefault(t
 	store := webhook.NewStore(pool)
 	_ = seedAccount(t, pool, "cus_idem")
 
-	found, becameDefault, err := store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err := store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_idem_1",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -403,9 +526,10 @@ func TestPgxStore_InsertPaymentMethod_DefaultRedeliveryReturnsPersistedDefault(t
 	require.NoError(t, err)
 	require.True(t, found)
 	require.True(t, becameDefault)
+	require.False(t, retired)
 
 	// Duplicate insert (simulated Stripe webhook retry).
-	found, becameDefault, err = store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err = store.InsertPaymentMethod(context.Background(), "cus_idem", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_idem_1",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -415,6 +539,7 @@ func TestPgxStore_InsertPaymentMethod_DefaultRedeliveryReturnsPersistedDefault(t
 	require.NoError(t, err)
 	require.True(t, found, "redelivered insert should return found=true")
 	require.True(t, becameDefault, "redelivery should return the persisted advisory default")
+	require.False(t, retired)
 
 	var count int
 	err = pool.QueryRow(context.Background(),
@@ -430,7 +555,7 @@ func TestPgxStore_InsertPaymentMethod_NonDefaultRedeliveryReturnsPersistedFalse(
 	_ = seedAccount(t, pool, "cus_idem_nondefault")
 	ctx := context.Background()
 
-	found, becameDefault, err := store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err := store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_idem_first",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -440,8 +565,9 @@ func TestPgxStore_InsertPaymentMethod_NonDefaultRedeliveryReturnsPersistedFalse(
 	require.NoError(t, err)
 	require.True(t, found)
 	require.True(t, becameDefault)
+	require.False(t, retired)
 
-	found, becameDefault, err = store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err = store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_idem_second",
 		Brand:                 "mastercard",
 		Last4:                 "4444",
@@ -451,10 +577,11 @@ func TestPgxStore_InsertPaymentMethod_NonDefaultRedeliveryReturnsPersistedFalse(
 	require.NoError(t, err)
 	require.True(t, found)
 	require.False(t, becameDefault)
+	require.False(t, retired)
 
 	// Redelivery of the same second-card PM takes the ON CONFLICT path and
 	// returns its persisted advisory is_default=false.
-	found, becameDefault, err = store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err = store.InsertPaymentMethod(ctx, "cus_idem_nondefault", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_idem_second",
 		Brand:                 "mastercard",
 		Last4:                 "4444",
@@ -464,6 +591,7 @@ func TestPgxStore_InsertPaymentMethod_NonDefaultRedeliveryReturnsPersistedFalse(
 	require.NoError(t, err)
 	require.True(t, found)
 	require.False(t, becameDefault)
+	require.False(t, retired)
 
 	var count int
 	err = pool.QueryRow(ctx,
@@ -479,7 +607,7 @@ func TestPgxStore_InsertPaymentMethod_DedupeSkipHasNoPMRow(t *testing.T) {
 	_ = seedAccount(t, pool, "cus_insert_dedupe")
 	ctx := context.Background()
 
-	found, becameDefault, err := store.InsertPaymentMethod(ctx, "cus_insert_dedupe", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err := store.InsertPaymentMethod(ctx, "cus_insert_dedupe", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_dedupe_original",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -489,11 +617,12 @@ func TestPgxStore_InsertPaymentMethod_DedupeSkipHasNoPMRow(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.True(t, becameDefault)
+	require.False(t, retired)
 
 	// A different Stripe PM id with the same card tuple is skipped by the
 	// insert-time dedupe. No row exists under this PM id, so the persisted
 	// default lookup yields ErrNoRows and the store reports false.
-	found, becameDefault, err = store.InsertPaymentMethod(ctx, "cus_insert_dedupe", webhook.InsertPaymentMethodParams{
+	found, becameDefault, retired, err = store.InsertPaymentMethod(ctx, "cus_insert_dedupe", webhook.InsertPaymentMethodParams{
 		StripePaymentMethodID: "pm_dedupe_skipped",
 		Brand:                 "visa",
 		Last4:                 "4242",
@@ -503,6 +632,7 @@ func TestPgxStore_InsertPaymentMethod_DedupeSkipHasNoPMRow(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.False(t, becameDefault)
+	require.False(t, retired)
 
 	var count int
 	err = pool.QueryRow(ctx,
@@ -510,6 +640,129 @@ func TestPgxStore_InsertPaymentMethod_DedupeSkipHasNoPMRow(t *testing.T) {
 		"pm_dedupe_skipped").Scan(&count)
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "dedupe skip must not mirror the new Stripe PM id")
+}
+
+func TestPgxStore_InsertPaymentMethod_RetiredOrgNoOpsIncludingDeletedRedelivery(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	orgID, accountID, operationID := uuid.New(), uuid.New(), uuid.New()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO ms_billing.accounts
+		    (id, owner_kind, owner_org_id, stripe_customer_id)
+		VALUES ($1, 'org', $2, 'cus_retired_attach')`, accountID, orgID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		INSERT INTO ms_billing.payment_methods_mirror
+		    (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year,
+		     is_default, deleted_at)
+		VALUES ($1, 'pm_retired_existing', 'visa', '4242', 12, 2099,
+		        false, now())`, accountID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		INSERT INTO ms_billing.org_deletion_finalizations
+		    (org_id, operation_id, finalized_at)
+		VALUES ($1, $2, now())`, orgID, operationID)
+	require.NoError(t, err)
+
+	store := webhook.NewStore(pool)
+	for _, pmID := range []string{"pm_retired_late", "pm_retired_existing"} {
+		found, becameDefault, retired, insertErr := store.InsertPaymentMethod(ctx, "cus_retired_attach", webhook.InsertPaymentMethodParams{
+			StripePaymentMethodID: pmID,
+			Brand:                 "visa",
+			Last4:                 "4242",
+			ExpMonth:              12,
+			ExpYear:               2099,
+		})
+		require.NoError(t, insertErr, pmID)
+		require.True(t, found, pmID)
+		require.True(t, retired, pmID)
+		require.False(t, becameDefault, pmID)
+	}
+
+	var activeCount, lateCount, existingDeletedCount int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM ms_billing.payment_methods_mirror
+		WHERE account_id = $1 AND deleted_at IS NULL`, accountID).Scan(&activeCount))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM ms_billing.payment_methods_mirror
+		WHERE stripe_payment_method_id = 'pm_retired_late'`,
+	).Scan(&lateCount))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM ms_billing.payment_methods_mirror
+		WHERE stripe_payment_method_id = 'pm_retired_existing'
+		  AND deleted_at IS NOT NULL`,
+	).Scan(&existingDeletedCount))
+	require.Zero(t, activeCount, "a late attach must not restore any active card")
+	require.Zero(t, lateCount, "a previously unseen late card must not be mirrored")
+	require.Equal(t, 1, existingDeletedCount, "redelivery must preserve the audit row as soft-deleted")
+}
+
+func TestPgxStore_InsertPaymentMethod_WaitsForFinalizerThenNoOps(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	orgID, accountID, operationID := uuid.New(), uuid.New(), uuid.New()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO ms_billing.accounts
+		    (id, owner_kind, owner_org_id, stripe_customer_id)
+		VALUES ($1, 'org', $2, 'cus_attach_finalize_race')`, accountID, orgID)
+	require.NoError(t, err)
+
+	finalizer, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = finalizer.Rollback(context.Background()) })
+	_, err = finalizer.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(
+		    hashtextextended('ms_billing.org.lifecycle:' || $1::uuid::text, 0)
+		)`, orgID)
+	require.NoError(t, err)
+	_, err = finalizer.Exec(ctx, `
+		INSERT INTO ms_billing.org_deletion_finalizations
+		    (org_id, operation_id, finalized_at)
+		VALUES ($1, $2, now())`, orgID, operationID)
+	require.NoError(t, err)
+
+	type result struct {
+		found, becameDefault, retired bool
+		err                           error
+	}
+	done := make(chan result, 1)
+	store := webhook.NewStore(pool)
+	go func() {
+		found, becameDefault, retired, insertErr := store.InsertPaymentMethod(
+			context.Background(),
+			"cus_attach_finalize_race",
+			webhook.InsertPaymentMethodParams{
+				StripePaymentMethodID: "pm_attach_finalize_race",
+				Brand:                 "visa",
+				Last4:                 "4242",
+				ExpMonth:              12,
+				ExpYear:               2099,
+			},
+		)
+		done <- result{found: found, becameDefault: becameDefault, retired: retired, err: insertErr}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("attach bypassed in-progress finalization: %+v", got)
+	case <-time.After(150 * time.Millisecond):
+	}
+	require.NoError(t, finalizer.Commit(ctx))
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		require.True(t, got.found)
+		require.True(t, got.retired)
+		require.False(t, got.becameDefault)
+	case <-time.After(5 * time.Second):
+		t.Fatal("attach did not resume after finalization committed")
+	}
+
+	var count int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM ms_billing.payment_methods_mirror
+		WHERE stripe_payment_method_id = 'pm_attach_finalize_race'`,
+	).Scan(&count))
+	require.Zero(t, count)
 }
 
 func TestPgxStore_SoftDeletePaymentMethod_FoundAndIdempotent(t *testing.T) {
@@ -917,8 +1170,12 @@ func seedInvoice(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, stripeIn
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO ms_billing.invoices
-		   (account_id, stripe_invoice_id, status, amount_paid, amount_due, currency)
-		 VALUES ($1, $2, $3, $4, $5, 'usd')`,
+		   (account_id, charge_funding_account_id, charge_funding_generation,
+		    stripe_invoice_id, status, amount_paid, amount_due, currency)
+		 SELECT $1, auth.funding_account_id, auth.generation,
+		        $2, $3, $4, $5, 'usd'
+		 FROM ms_billing.account_funding_authorizations auth
+		 WHERE auth.account_id = $1`,
 		accountID, stripeInvoiceID, status, amountPaid, amountDue,
 	)
 	require.NoError(t, err)
@@ -1109,8 +1366,12 @@ func seedInvoiceAt(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, stripe
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO ms_billing.invoices
-		   (account_id, stripe_invoice_id, status, amount_due, currency, ever_failed, created_at)
-		 VALUES ($1, $2, $3, 1200, 'usd', $4, $5::timestamptz)`,
+		   (account_id, charge_funding_account_id, charge_funding_generation,
+		    stripe_invoice_id, status, amount_due, currency, ever_failed, created_at)
+		 SELECT $1, auth.funding_account_id, auth.generation,
+		        $2, $3, 1200, 'usd', $4, $5::timestamptz
+		 FROM ms_billing.account_funding_authorizations auth
+		 WHERE auth.account_id = $1`,
 		accountID, stripeInvoiceID, status, everFailed, createdAt,
 	)
 	require.NoError(t, err)

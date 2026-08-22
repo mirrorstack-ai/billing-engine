@@ -25,13 +25,25 @@ RETURNING id;
 
 -- SetAddCardRequestSetupIntent stamps the Stripe setup_intent_id onto a
 -- still-pending request row. WHERE status='pending' is the idempotency
--- guard: a webhook may already have resolved the row. :execrows so the
--- store can log a debug no-op stamp when rows==0 (the row was already
--- resolved), matching SetStripeCustomer's RowsAffected pattern.
--- name: SetAddCardRequestSetupIntent :execrows
-UPDATE ms_billing.add_card_requests
-SET setup_intent_id = $2
-WHERE id = $1 AND status = 'pending';
+-- guard: a webhook may already have resolved the row. A completed/duplicate
+-- race remains accepted, while failed/missing returns false so Start cannot
+-- expose a session canceled by organization finalization.
+-- name: SetAddCardRequestSetupIntent :one
+WITH stamped AS (
+    UPDATE ms_billing.add_card_requests request
+    SET setup_intent_id = $2
+    WHERE request.id = $1 AND request.status = 'pending'
+    RETURNING 1
+)
+SELECT (
+    EXISTS (SELECT 1 FROM stamped)
+    OR EXISTS (
+        SELECT 1
+        FROM ms_billing.add_card_requests request
+        WHERE request.id = $1
+          AND request.status IN ('completed', 'duplicate')
+    )
+)::boolean AS accepted;
 
 -- GetAddCardRequest returns the request's status plus the resolved
 -- payment method via LEFT JOIN. pm.id is the nullable sentinel — NULL

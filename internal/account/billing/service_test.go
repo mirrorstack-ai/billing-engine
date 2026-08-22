@@ -163,6 +163,7 @@ func (s *fakeCreditPurchaseStore) AttachInvoice(
 		attempt.ID,
 		attempt.AccountID,
 		invoice.ID,
+		invoice.CustomerID,
 		invoice.HostedInvoiceURL,
 	); err != nil {
 		return creditpurchase.Attempt{}, err
@@ -171,7 +172,6 @@ func (s *fakeCreditPurchaseStore) AttachInvoice(
 	if err != nil {
 		return creditpurchase.Attempt{}, err
 	}
-	current.StripeCustomerID = invoice.CustomerID
 	return current, nil
 }
 
@@ -239,12 +239,15 @@ func fakeCreditPurchaseAttempt(
 	purchase billing.CreditPurchaseRow,
 ) creditpurchase.Attempt {
 	return creditpurchase.Attempt{
-		ID:              purchase.ID,
-		AccountID:       purchase.AccountID,
-		AmountMicros:    purchase.AmountMicros,
-		Status:          purchase.Status,
-		StripeInvoiceID: purchase.StripeInvoiceID,
-		ReceiptURL:      purchase.ReceiptURL,
+		ID:                purchase.ID,
+		AccountID:         purchase.AccountID,
+		AmountMicros:      purchase.AmountMicros,
+		Status:            purchase.Status,
+		StripeInvoiceID:   purchase.StripeInvoiceID,
+		ReceiptURL:        purchase.ReceiptURL,
+		FundingAccountID:  purchase.ChargeFundingAccountID,
+		FundingGeneration: purchase.ChargeFundingGeneration,
+		StripeCustomerID:  purchase.StripeCustomerID,
 	}
 }
 
@@ -388,14 +391,17 @@ func (s *fakeStore) InsertAddCardRequest(_ context.Context, accountID uuid.UUID)
 	return id, nil
 }
 
-func (s *fakeStore) SetAddCardRequestSetupIntent(_ context.Context, requestID uuid.UUID, setupIntentID string) error {
+func (s *fakeStore) SetAddCardRequestSetupIntent(_ context.Context, requestID uuid.UUID, setupIntentID string) (bool, error) {
 	if s.errSetSetupIntent != nil {
-		return s.errSetSetupIntent
+		return false, s.errSetSetupIntent
 	}
 	if r, ok := s.addCardRequests[requestID]; ok && r.status == billing.AddCardStatusPending {
 		r.setupIntentID = setupIntentID
+		return true, nil
+	} else if ok && (r.status == billing.AddCardStatusCompleted || r.status == billing.AddCardStatusDuplicate) {
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 func (s *fakeStore) GetAddCardRequest(_ context.Context, requestID, accountID uuid.UUID) (*billing.AddCardRequestStatus, error) {
@@ -554,7 +560,30 @@ func (s *fakeStore) CreditPurchase(_ context.Context, purchaseID, accountID uuid
 	return purchase, true, nil
 }
 
-func (s *fakeStore) AttachCreditPurchaseInvoice(_ context.Context, purchaseID, accountID uuid.UUID, stripeInvoiceID, receiptURL string) error {
+func (s *fakeStore) ArmCreditPurchase(_ context.Context, purchaseID, accountID uuid.UUID) (billing.CreditPurchaseRow, error) {
+	purchase, ok := s.creditPurchases[purchaseID]
+	if !ok || purchase.AccountID != accountID {
+		return billing.CreditPurchaseRow{}, errors.New("credit purchase not found")
+	}
+	if purchase.ChargeFundingAccountID == uuid.Nil {
+		fundingID := s.fundingOf[accountID]
+		if fundingID == uuid.Nil {
+			fundingID = accountID
+		}
+		customerID := s.stripeCustomerOf[fundingID]
+		if customerID == "" {
+			return billing.CreditPurchaseRow{}, errors.New("credit purchase funding customer unavailable")
+		}
+		purchase.ChargeFundingAccountID = fundingID
+		purchase.ChargeFundingGeneration = uuid.New()
+		purchase.StripeCustomerID = customerID
+		s.creditPurchases[purchaseID] = purchase
+		s.putCreditPurchaseRecord(purchase)
+	}
+	return purchase, nil
+}
+
+func (s *fakeStore) AttachCreditPurchaseInvoice(_ context.Context, purchaseID, accountID uuid.UUID, stripeInvoiceID, stripeCustomerID, receiptURL string) error {
 	s.creditPurchaseAttaches++
 	purchase, ok := s.creditPurchases[purchaseID]
 	if !ok || purchase.AccountID != accountID {
@@ -562,6 +591,9 @@ func (s *fakeStore) AttachCreditPurchaseInvoice(_ context.Context, purchaseID, a
 	}
 	if purchase.StripeInvoiceID != "" && purchase.StripeInvoiceID != stripeInvoiceID {
 		return errors.New("credit purchase already attached to another invoice")
+	}
+	if purchase.StripeCustomerID != stripeCustomerID {
+		return errors.New("credit purchase invoice customer mismatch")
 	}
 	purchase.StripeInvoiceID = stripeInvoiceID
 	if receiptURL != "" {
@@ -613,7 +645,7 @@ func (s *fakeStore) CreditGateSnapshot(_ context.Context, accountID uuid.UUID) (
 	}, nil
 }
 
-func (s *fakeStore) SetCreditBillingMode(_ context.Context, accountID uuid.UUID, mode billing.BillingMode, creditLimitMicros int64) (bool, error) {
+func (s *fakeStore) SetCreditBillingMode(_ context.Context, accountID uuid.UUID, _ *billing.DistributorMutationAuthority, mode billing.BillingMode, creditLimitMicros int64) (bool, error) {
 	s.creditBillingModeWrites++
 	standing := s.creditStanding[accountID]
 	changed := standing.BillingMode != mode || standing.CreditLimitMicros != creditLimitMicros
@@ -637,7 +669,7 @@ func (s *fakeStore) ListDistributorCustomerStates(_ context.Context, distributor
 	return s.distributorStates[distributorOrgID], nil
 }
 
-func (s *fakeStore) InsertCreditGrant(_ context.Context, accountID uuid.UUID, amountMicros int64, actor, idempotencyKey string, expiresAt *time.Time) (billing.CreditLedgerRecord, error) {
+func (s *fakeStore) InsertCreditGrant(_ context.Context, accountID uuid.UUID, _ *billing.DistributorMutationAuthority, amountMicros int64, actor, idempotencyKey string, expiresAt *time.Time) (billing.CreditLedgerRecord, error) {
 	s.creditGrantInserts++
 	standing := s.creditStanding[accountID]
 	record := billing.CreditLedgerRecord{
@@ -660,17 +692,21 @@ func (s *fakeStore) InsertCreditGrant(_ context.Context, accountID uuid.UUID, am
 
 func (s *fakeStore) putCreditPurchaseRecord(purchase billing.CreditPurchaseRow) {
 	s.creditLedgerByKey[purchase.IdempotencyKey] = billing.CreditLedgerRecord{
-		ID:                 purchase.ID,
-		AccountID:          purchase.AccountID,
-		AmountMicros:       purchase.AmountMicros,
-		Type:               purchase.Type,
-		Status:             purchase.Status,
-		BalanceAfterMicros: purchase.BalanceAfterMicros,
-		Actor:              purchase.Actor,
-		IdempotencyKey:     purchase.IdempotencyKey,
-		StripeInvoiceID:    purchase.StripeInvoiceID,
-		ReceiptURL:         purchase.ReceiptURL,
-		CreatedAt:          purchase.CreatedAt,
+		ID:                      purchase.ID,
+		AccountID:               purchase.AccountID,
+		AmountMicros:            purchase.AmountMicros,
+		Type:                    purchase.Type,
+		Status:                  purchase.Status,
+		BalanceAfterMicros:      purchase.BalanceAfterMicros,
+		Actor:                   purchase.Actor,
+		IdempotencyKey:          purchase.IdempotencyKey,
+		StripeInvoiceID:         purchase.StripeInvoiceID,
+		ReceiptURL:              purchase.ReceiptURL,
+		ChargeFundingAccountID:  purchase.ChargeFundingAccountID,
+		ChargeFundingGeneration: purchase.ChargeFundingGeneration,
+		StripeCustomerID:        purchase.StripeCustomerID,
+		FundingLegacyUnresolved: purchase.FundingLegacyUnresolved,
+		CreatedAt:               purchase.CreatedAt,
 	}
 }
 
@@ -712,6 +748,7 @@ type fakeStripe struct {
 	errCreateInvoiceItem     error
 	errFinalizeInvoice       error
 	errFindInvoice           error
+	beforeCheckout           func()
 }
 
 type creditDraftInvoiceCall struct {
@@ -750,6 +787,9 @@ func (f *fakeStripe) UpdateCustomerEmail(_ context.Context, stripeCustomerID, em
 }
 
 func (f *fakeStripe) CreateCheckoutSession(_ context.Context, _, _ string) (*stripego.CheckoutSession, error) {
+	if f.beforeCheckout != nil {
+		f.beforeCheckout()
+	}
 	if f.errCreateCheckoutSession != nil {
 		return nil, f.errCreateCheckoutSession
 	}

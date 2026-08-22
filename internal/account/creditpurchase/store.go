@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
@@ -43,6 +44,10 @@ func (s *pgxStore) Get(
 		row.Status,
 		row.StripeInvoiceID,
 		row.ReceiptUrl,
+		row.ChargeFundingAccountID,
+		row.ChargeFundingGeneration,
+		row.AttemptStripeCustomerID,
+		row.ChargeFundingLegacyUnresolved,
 	)
 }
 
@@ -94,11 +99,19 @@ func (s *pgxStore) AttachInvoice(
 	if invoice.ID == "" {
 		return Attempt{}, fmt.Errorf("stripe invoice id required")
 	}
+	if invoice.CustomerID != attempt.StripeCustomerID {
+		return Attempt{}, fmt.Errorf(
+			"manual purchase invoice customer %q does not match durable customer %q",
+			invoice.CustomerID,
+			attempt.StripeCustomerID,
+		)
+	}
 	row, err := s.q.AttachCreditPurchaseInvoice(ctx, db.AttachCreditPurchaseInvoiceParams{
-		StripeInvoiceID: invoice.ID,
-		ReceiptUrl:      invoice.HostedInvoiceURL,
-		PurchaseID:      attempt.ID.String(),
-		AccountID:       attempt.AccountID.String(),
+		StripeInvoiceID:  invoice.ID,
+		StripeCustomerID: invoice.CustomerID,
+		ReceiptUrl:       invoice.HostedInvoiceURL,
+		PurchaseID:       attempt.ID.String(),
+		AccountID:        attempt.AccountID.String(),
 	})
 	if err != nil {
 		return Attempt{}, err
@@ -110,6 +123,10 @@ func (s *pgxStore) AttachInvoice(
 		row.Status,
 		row.StripeInvoiceID,
 		row.ReceiptUrl,
+		row.ChargeFundingAccountID,
+		row.ChargeFundingGeneration,
+		row.AttemptStripeCustomerID,
+		row.ChargeFundingLegacyUnresolved,
 	)
 	if err != nil {
 		return Attempt{}, err
@@ -121,7 +138,6 @@ func (s *pgxStore) AttachInvoice(
 			current.StripeInvoiceID,
 		)
 	}
-	current.StripeCustomerID = invoice.CustomerID
 	return current, nil
 }
 
@@ -160,6 +176,10 @@ func (s *pgxStore) Fail(
 			row.Status,
 			row.StripeInvoiceID,
 			row.ReceiptUrl,
+			row.ChargeFundingAccountID,
+			row.ChargeFundingGeneration,
+			row.AttemptStripeCustomerID,
+			row.ChargeFundingLegacyUnresolved,
 		)
 		if err != nil {
 			return err
@@ -195,6 +215,10 @@ func (s *pgxStore) Fail(
 			failed.Status,
 			failed.StripeInvoiceID,
 			failed.ReceiptUrl,
+			failed.ChargeFundingAccountID,
+			failed.ChargeFundingGeneration,
+			failed.AttemptStripeCustomerID,
+			failed.ChargeFundingLegacyUnresolved,
 		)
 		if err != nil {
 			return err
@@ -212,6 +236,9 @@ func decodeAttempt(
 	idRaw, accountIDRaw string,
 	amountMicros int64,
 	status, stripeInvoiceID, receiptURL string,
+	fundingAccountRaw, fundingGenerationRaw pgtype.UUID,
+	stripeCustomerID string,
+	fundingLegacyUnresolved bool,
 ) (Attempt, error) {
 	id, err := uuid.Parse(idRaw)
 	if err != nil {
@@ -221,12 +248,27 @@ func decodeAttempt(
 	if err != nil {
 		return Attempt{}, fmt.Errorf("parse manual purchase account id: %w", err)
 	}
+	if fundingLegacyUnresolved {
+		return Attempt{}, fmt.Errorf(
+			"manual purchase %s has unresolved legacy funding provenance",
+			id,
+		)
+	}
+	if !fundingAccountRaw.Valid || !fundingGenerationRaw.Valid || stripeCustomerID == "" {
+		return Attempt{}, fmt.Errorf(
+			"manual purchase %s has no durable funding claim",
+			id,
+		)
+	}
 	return Attempt{
-		ID:              id,
-		AccountID:       accountID,
-		AmountMicros:    amountMicros,
-		Status:          status,
-		StripeInvoiceID: stripeInvoiceID,
-		ReceiptURL:      receiptURL,
+		ID:                id,
+		AccountID:         accountID,
+		AmountMicros:      amountMicros,
+		Status:            status,
+		StripeInvoiceID:   stripeInvoiceID,
+		ReceiptURL:        receiptURL,
+		FundingAccountID:  uuid.UUID(fundingAccountRaw.Bytes),
+		FundingGeneration: uuid.UUID(fundingGenerationRaw.Bytes),
+		StripeCustomerID:  stripeCustomerID,
 	}, nil
 }

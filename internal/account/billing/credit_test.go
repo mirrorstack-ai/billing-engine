@@ -197,6 +197,7 @@ func TestCreditMutationObserversRunOnlyForFirstDurableTransition(t *testing.T) {
 		store := newFakeStore()
 		userID, accountID, purchaseID := uuid.New(), uuid.New(), uuid.New()
 		store.accountsByUser[userID] = fakeAccount{id: accountID}
+		store.stripeCustomerOf[accountID] = "cus_original_sponsor"
 		store.creditPurchases[purchaseID] = billing.CreditPurchaseRow{
 			ID: purchaseID, AccountID: accountID,
 			AmountMicros: billing.MinCreditPurchaseMicros,
@@ -425,12 +426,15 @@ func TestFinishCreditPurchase_AttachedSponsorInvoiceSurvivesFundingDrift(t *test
 	store.stripeCustomerOf[newSponsorAccountID] = "cus_new_sponsor"
 	store.creditPurchases[purchaseID] = billing.CreditPurchaseRow{
 		ID: purchaseID, AccountID: accountID,
-		AmountMicros:       billing.MinCreditPurchaseMicros,
-		Type:               "purchase",
-		Status:             "failed",
-		IdempotencyKey:     "sponsor-drift-recovery",
-		StripeInvoiceID:    "in_old_sponsor_paid",
-		BalanceAfterMicros: billing.MinCreditPurchaseMicros,
+		AmountMicros:            billing.MinCreditPurchaseMicros,
+		Type:                    "purchase",
+		Status:                  "failed",
+		IdempotencyKey:          "sponsor-drift-recovery",
+		StripeInvoiceID:         "in_old_sponsor_paid",
+		BalanceAfterMicros:      billing.MinCreditPurchaseMicros,
+		ChargeFundingAccountID:  accountID,
+		ChargeFundingGeneration: uuid.New(),
+		StripeCustomerID:        "cus_original_sponsor",
 	}
 	stripeFake := &fakeStripe{}
 	stripeFake.seedExactCreditPurchaseInvoice(
@@ -461,11 +465,14 @@ func TestFinishCreditPurchase_ExcludedSettlementDoesNotEnterRolloutGraph(t *test
 	store.accountsByUser[userID] = fakeAccount{id: accountID}
 	store.creditPurchases[purchaseID] = billing.CreditPurchaseRow{
 		ID: purchaseID, AccountID: accountID,
-		AmountMicros:    billing.MinCreditPurchaseMicros,
-		Type:            "purchase",
-		Status:          "failed",
-		IdempotencyKey:  "excluded-paid-recovery",
-		StripeInvoiceID: "in_excluded_paid",
+		AmountMicros:            billing.MinCreditPurchaseMicros,
+		Type:                    "purchase",
+		Status:                  "failed",
+		IdempotencyKey:          "excluded-paid-recovery",
+		StripeInvoiceID:         "in_excluded_paid",
+		ChargeFundingAccountID:  accountID,
+		ChargeFundingGeneration: uuid.New(),
+		StripeCustomerID:        "cus_excluded_original",
 	}
 	stripeFake := &fakeStripe{}
 	stripeFake.seedExactCreditPurchaseInvoice(

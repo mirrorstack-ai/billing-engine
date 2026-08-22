@@ -7,7 +7,11 @@
 -- name: SelectAccountByOrg :one
 SELECT id, COALESCE(stripe_customer_id, '')::text AS stripe_customer_id
 FROM ms_billing.accounts
-WHERE owner_kind = 'org' AND owner_org_id = $1;
+WHERE owner_kind = 'org' AND owner_org_id = $1
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = $1
+  );
 
 -- InsertOrgAccount creates a fresh org-owned account (the org leg of the
 -- advisory-locked get-or-create — the lock, namespace 'lbto', is the
@@ -60,7 +64,11 @@ FROM ms_billing.org_billing_designations d
 JOIN ms_billing.accounts a
     ON a.owner_kind = 'org' AND a.owner_org_id = d.org_id
 WHERE d.org_id = $1
-  AND a.activated_at IS NOT NULL;
+  AND a.activated_at IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = d.org_id
+  );
 
 -- ChargeFundingAccount maps an account to the account whose Stripe customer /
 -- default PM pays its invoices: itself, unless it is an org account whose
@@ -74,7 +82,11 @@ LEFT JOIN ms_billing.org_billing_designations d
     ON a.owner_kind = 'org'
    AND d.org_id = a.owner_org_id
    AND d.funding = 'sponsor'
-WHERE a.id = $1;
+WHERE a.id = $1
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE a.owner_kind = 'org' AND f.org_id = a.owner_org_id
+  );
 
 -- ActivateAccountIfUnset stamps the ADR-0006 activation anchor when the org
 -- account activates by SPONSOR designation (its anchor = designation day; the
@@ -83,7 +95,12 @@ WHERE a.id = $1;
 -- name: ActivateAccountIfUnset :execrows
 UPDATE ms_billing.accounts
 SET activated_at = $2
-WHERE id = $1 AND activated_at IS NULL;
+WHERE id = $1 AND activated_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = ms_billing.accounts.owner_org_id
+  );
 
 -- OrgUnbilledBacklogMicros estimates the org's pre-designation unbilled
 -- backlog: every NULL-account event attributable to the org (through its
@@ -113,7 +130,11 @@ WHERE e.account_id IS NULL
 -- name: AttachOrgAppsToAccount :execrows
 UPDATE ms_billing.apps
 SET account_id = $2
-WHERE owner_org_id = $1 AND account_id IS NULL;
+WHERE owner_org_id = $1 AND account_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = $1
+  );
 
 -- RepointOrgNullAccountEvents folds the org's pre-designation NULL-account
 -- events into its funded account — the events half of the sweep. The rollup
@@ -131,7 +152,11 @@ SET account_id     = @account_id::uuid,
                           THEN recorded_at ELSE repointed_from END,
     recorded_at    = GREATEST(recorded_at, @window_start::timestamptz)
 WHERE account_id IS NULL
-  AND app_id IN (SELECT app_id FROM ms_billing.apps WHERE owner_org_id = @org_id::uuid);
+  AND app_id IN (SELECT app_id FROM ms_billing.apps WHERE owner_org_id = @org_id::uuid)
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = @org_id::uuid
+  );
 
 -- OrgLiveAppIDs lists the org's live roster rows — the timer-synthesis loop
 -- of the RepointOrgUsage sweep reconciles each one after attach.
@@ -150,7 +175,11 @@ SELECT
 FROM ms_billing.payment_methods_mirror pmm
 JOIN ms_billing.accounts a ON a.id = pmm.account_id
 WHERE a.owner_kind = 'org' AND a.owner_org_id = $1
-  AND pmm.id = $2 AND pmm.deleted_at IS NULL;
+  AND pmm.id = $2 AND pmm.deleted_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE f.org_id = a.owner_org_id
+  );
 
 -- ListSponsoredOrgIDs lists the orgs a user sponsors (org-billing W1, the /me
 -- sponsored-orgs read). funding='sponsor' means the sponsor pair is the acting

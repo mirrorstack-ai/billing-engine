@@ -297,6 +297,26 @@ func TestProcess_PaymentMethodAttached_NoAccountRow_DriftWarning(t *testing.T) {
 	require.Empty(t, s.ActivatedCustomers)
 }
 
+func TestProcess_PaymentMethodAttached_RetiredOrgACKsWithoutDownstreamWork(t *testing.T) {
+	v := &webhooktest.FakeVerifier{Event: cardPMEvent("evt_pma_retired", "payment_method.attached", "pm_late", "cus_retired", "visa", "4242", 12, 2029)}
+	s := webhooktest.NewFakeStore()
+	s.InsertBecameDefault = true
+	s.InsertRetired = true
+	stripe := &webhooktest.FakeChargeRetriever{}
+	notifier := &recordingNotifier{}
+	r := newRouterWithCharges(v, s, stripe).WithServingBlockNotifier(notifier)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, 200, res.HTTPStatus)
+	require.Equal(t, webhook.StatusOK, res.Status)
+	require.Len(t, s.Inserts, 1, "the store owns the atomic active-vs-retired decision")
+	require.Empty(t, stripe.DefaultsSet, "a retired attach must not mutate Stripe defaults")
+	require.Empty(t, s.ActivatedCustomers, "a retired attach must not reactivate billing")
+	require.Empty(t, s.ResolvedPMs, "a retired attach must not revive an add-card request")
+	require.Empty(t, notifier.customers, "no standing mutation occurred")
+}
+
 // TestProcess_PaymentMethodAttached_StampErrorIsBestEffort proves an
 // activation-stamp failure never fails the attach: the card is still mirrored and
 // the webhook ACKs 200/OK (the next bind re-stamps the still-NULL anchor).

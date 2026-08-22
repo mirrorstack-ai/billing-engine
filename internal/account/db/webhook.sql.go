@@ -205,31 +205,51 @@ func (q *Queries) FlagPaymentMethodFraud(ctx context.Context, arg FlagPaymentMet
 }
 
 const insertPaymentMethod = `-- name: InsertPaymentMethod :one
-WITH acct AS (
-    SELECT id FROM ms_billing.accounts WHERE stripe_customer_id = $1
+WITH acct AS MATERIALIZED (
+    SELECT account.id,
+           ms_billing.account_org_billing_active_after_shared_lock(account.id)
+               AS billing_active
+    FROM ms_billing.accounts account
+    WHERE account.stripe_customer_id = $1
+), inserted AS (
+    INSERT INTO ms_billing.payment_methods_mirror
+        (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default, fingerprint)
+    SELECT acct.id, $2, $3, $4, $5, $6,
+        -- ADVISORY first-card default (see header). Authoritative default is
+        -- set by customer.updated → SetDefaultPaymentMethodByCustomer.
+        NOT EXISTS (
+            SELECT 1 FROM ms_billing.payment_methods_mirror p
+            WHERE p.account_id = acct.id AND p.deleted_at IS NULL
+        ),
+        NULLIF($7, '')
+    FROM acct
+    WHERE acct.billing_active
+      AND NOT EXISTS (
+        SELECT 1 FROM ms_billing.payment_methods_mirror p2
+        WHERE p2.account_id = acct.id
+          AND p2.deleted_at IS NULL
+          AND p2.brand = $3
+          AND p2.last4 = $4
+          AND p2.exp_month = $5
+          AND p2.exp_year = $6
+    )
+    ON CONFLICT (stripe_payment_method_id) DO NOTHING
+    RETURNING account_id, is_default
 )
-INSERT INTO ms_billing.payment_methods_mirror
-    (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default, fingerprint)
-SELECT acct.id, $2, $3, $4, $5, $6,
-    -- ADVISORY first-card default (see header). Authoritative default is
-    -- set by customer.updated → SetDefaultPaymentMethodByCustomer.
-    NOT EXISTS (
-        SELECT 1 FROM ms_billing.payment_methods_mirror p
-        WHERE p.account_id = acct.id AND p.deleted_at IS NULL
-    ),
-    NULLIF($7, '')
-FROM acct
-WHERE NOT EXISTS (
-    SELECT 1 FROM ms_billing.payment_methods_mirror p2
-    WHERE p2.account_id = acct.id
-      AND p2.deleted_at IS NULL
-      AND p2.brand = $3
-      AND p2.last4 = $4
-      AND p2.exp_month = $5
-      AND p2.exp_year = $6
-)
-ON CONFLICT (stripe_payment_method_id) DO NOTHING
-RETURNING is_default
+SELECT EXISTS (SELECT 1 FROM acct)::boolean AS account_found,
+       COALESCE((SELECT NOT billing_active FROM acct), false)::boolean AS retired,
+       COALESCE(
+           (SELECT is_default FROM inserted),
+           (
+               SELECT mirror.is_default
+               FROM ms_billing.payment_methods_mirror mirror
+               JOIN acct ON acct.id = mirror.account_id
+               WHERE acct.billing_active
+                 AND mirror.stripe_payment_method_id = $2
+                 AND mirror.deleted_at IS NULL
+           ),
+           false
+       )::boolean AS became_default
 `
 
 type InsertPaymentMethodParams struct {
@@ -242,12 +262,22 @@ type InsertPaymentMethodParams struct {
 	Column7               interface{} `json:"column_7"`
 }
 
+type InsertPaymentMethodRow struct {
+	AccountFound  bool `json:"account_found"`
+	Retired       bool `json:"retired"`
+	BecameDefault bool `json:"became_default"`
+}
+
 // InsertPaymentMethod mirrors a Stripe PM into payment_methods_mirror.
 // First active card on the account becomes the default (NOT EXISTS).
 // Skips when an active row already shares brand/last4/exp (best-effort
 // insert-time dedupe). fingerprint stored via NULLIF($7,”). RETURNING
 // is_default lets the Go layer sync an advisory first-card default to Stripe.
-// The Go layer disambiguates a 0-row result via AccountExists.
+// The lifecycle predicate takes the shared retirement barrier and then reads
+// the post-wait tombstone state. A late attach for a retired organization is
+// therefore an acknowledged no-op, not a trigger error and never a card
+// resurrection. The final SELECT always returns one outcome row so the router
+// can stop before Stripe-default, activation, add-card, and notification work.
 //
 // is_default on INSERT is ADVISORY (the first-card auto-default feature
 // from #14): it gives a brand-new account a usable default without an
@@ -256,7 +286,7 @@ type InsertPaymentMethodParams struct {
 // which PM is default. This INSERT-time value matches #14's raw
 // InsertPaymentMethod exactly (NOT EXISTS over non-soft-deleted rows);
 // do not "promote" it to authoritative here.
-func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMethodParams) (bool, error) {
+func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMethodParams) (InsertPaymentMethodRow, error) {
 	row := q.db.QueryRow(ctx, insertPaymentMethod,
 		arg.StripeCustomerID,
 		arg.StripePaymentMethodID,
@@ -266,9 +296,9 @@ func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMeth
 		arg.ExpYear,
 		arg.Column7,
 	)
-	var is_default bool
-	err := row.Scan(&is_default)
-	return is_default, err
+	var i InsertPaymentMethodRow
+	err := row.Scan(&i.AccountFound, &i.Retired, &i.BecameDefault)
+	return i, err
 }
 
 const markEventProcessed = `-- name: MarkEventProcessed :execrows
@@ -377,6 +407,9 @@ WHERE a.id = (
         WHERE inv.stripe_invoice_id = $1
       )
   AND a.usage_billing_mode = 'prepaid'
+  -- Invoice reconciliation remains legal after organization retirement, but
+  -- paid webhooks must never reactivate the retired account's collection rail.
+  AND ms_billing.account_org_billing_active_after_shared_lock(a.id)
   AND NOT EXISTS (
         SELECT 1 FROM ms_billing.invoices i
         WHERE i.account_id = a.id
@@ -505,7 +538,9 @@ func (q *Queries) SoftDeletePaymentMethod(ctx context.Context, stripePaymentMeth
 const stampAccountActivated = `-- name: StampAccountActivated :execrows
 UPDATE ms_billing.accounts
 SET activated_at = now()
-WHERE stripe_customer_id = $1 AND activated_at IS NULL
+WHERE stripe_customer_id = $1
+  AND activated_at IS NULL
+  AND ms_billing.account_org_billing_active_after_shared_lock(id)
 `
 
 // StampAccountActivated freezes the billing-period ANCHOR (migration 025): the

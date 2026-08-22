@@ -427,18 +427,8 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		return res, nil
 	}
 
-	// PM gate (same posture as the proration leg): no usable PM → skip WITHOUT
-	// resolving, re-attempted next sweep (the per-timer idem keys stay stable).
-	custID, ok, err := s.resolveChargeableCustomer(ctx, cand.AccountID)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		res.Status = ModuleOverageSkippedNoPM
-		return res, nil
-	}
-
-	// Stamp the migration-036 recovery marker BEFORE the first Stripe call
+	// Atomically select the current funder, apply its PM gate, and stamp the
+	// migration-036 recovery marker BEFORE the first Stripe call
 	// (first-write-wins): from here on, any retry — however late — reconciles
 	// against Stripe rather than trusting a recomputed live verdict. The stamp
 	// ALSO guards grace_resolved = false, making it the serialization point against
@@ -449,13 +439,21 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// is already settled — ABORT as stale rather than draft/finalize a second charge
 	// (a Stripe charge beside a wallet debit is a double charge). This holds for
 	// standard accounts too: a resolved timer must never be re-charged by any rail.
-	stamped, err := s.store.MarkModuleTimerChargeAttempted(ctx, cand.ID, at.UTC())
+	claim, err := s.store.ArmModuleTimerStripeCharge(ctx, cand.ID, at.UTC())
 	if err != nil {
-		return nil, billing.Internal("mark module timer charge attempted failed", err)
+		return nil, billing.Internal("arm module timer Stripe charge failed", err)
 	}
-	if stamped == 0 {
+	switch claim.Outcome {
+	case StripeRailNoPaymentMethod:
+		res.Status = ModuleOverageSkippedNoPM
+		return res, nil
+	case StripeRailStale:
 		res.Status = ModuleOverageSkippedStale
 		return res, nil
+	}
+	custID := claim.StripeCustomerID
+	if custID == "" {
+		return nil, billing.Internal("module timer funding account has a usable PM but no Stripe customer id", nil)
 	}
 
 	// Charge via a per-timer draft→pinned-item→finalize flow with deterministic
@@ -488,12 +486,14 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	}
 
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:       cand.AccountID,
-		StripeInvoiceID: inv.ID,
-		Status:          inv.Status,
-		AmountDueCents:  inv.AmountDue,
-		AmountPaidCents: inv.AmountPaid,
-		Currency:        chargeCurrency,
+		AccountID:               cand.AccountID,
+		ChargeFundingAccountID:  claim.FundingAccountID,
+		ChargeFundingGeneration: claim.FundingGeneration,
+		StripeInvoiceID:         inv.ID,
+		Status:                  inv.Status,
+		AmountDueCents:          inv.AmountDue,
+		AmountPaidCents:         inv.AmountPaid,
+		Currency:                chargeCurrency,
 		// The coverage window the shape priced — [install day, coverage end) in
 		// the normal case; narrowed to the straddled period alone under the D1d
 		// straddle rule — so the mirrored window and the charged amount agree by
@@ -641,7 +641,10 @@ func (s *Service) SweepModuleOverage(ctx context.Context, at time.Time) (*SweepM
 // blocked by a PM removed after the crash (an idem/finalize failure lands in
 // the sweep's retried-error path instead).
 func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOverageCandidate, at time.Time, res *ModuleOverageResult) (bool, error) {
-	custID, err := s.recoveryCustomer(ctx, cand.AccountID)
+	if cand.ChargeFundingAccountID == uuid.Nil || cand.ChargeFundingGeneration == uuid.Nil {
+		return false, billing.Internal("module overage recovery marker has no pinned funding authorization", nil)
+	}
+	custID, err := s.store.AccountStripeCustomer(ctx, cand.ChargeFundingAccountID)
 	if err != nil {
 		return false, billing.Internal("stripe customer lookup failed (module overage recovery)", err)
 	}
@@ -728,15 +731,17 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 		return false, billing.Internal("account collection lookup failed", err)
 	}
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:          cand.AccountID,
-		StripeInvoiceID:    inv.ID,
-		Status:             inv.Status,
-		AmountDueCents:     inv.AmountDue,
-		AmountPaidCents:    inv.AmountPaid,
-		Currency:           chargeCurrency,
-		PeriodStart:        coverageStart,
-		PeriodEnd:          coverageEnd,
-		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
+		AccountID:               cand.AccountID,
+		ChargeFundingAccountID:  cand.ChargeFundingAccountID,
+		ChargeFundingGeneration: cand.ChargeFundingGeneration,
+		StripeInvoiceID:         inv.ID,
+		Status:                  inv.Status,
+		AmountDueCents:          inv.AmountDue,
+		AmountPaidCents:         inv.AmountPaid,
+		Currency:                chargeCurrency,
+		PeriodStart:             coverageStart,
+		PeriodEnd:               coverageEnd,
+		IsLargeAutoCollect:      flagLargeAutoCollect(proratedMicros, acct),
 	}); err != nil {
 		return false, billing.Internal("invoice mirror upsert failed (module overage recovery)", err)
 	}

@@ -145,9 +145,13 @@ func TestModuleOverageTimers_Integration_RemovedAttemptedRecoveryCarveOut(t *tes
 	)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, `
-		UPDATE ms_billing.app_module_overage_timers
-		SET charge_attempted_at = $1::timestamptz
-		WHERE id = ANY($2::uuid[])`,
+		UPDATE ms_billing.app_module_overage_timers timer
+		SET charge_attempted_at = $1::timestamptz,
+		    charge_funding_account_id = funding.funding_account_id,
+		    charge_funding_generation = funding.generation
+		FROM ms_billing.account_funding_authorizations funding
+		WHERE timer.id = ANY($2::uuid[])
+		  AND funding.account_id = timer.account_id`,
 		removedAt, []string{attempted.String(), resolved.String()},
 	)
 	require.NoError(t, err)

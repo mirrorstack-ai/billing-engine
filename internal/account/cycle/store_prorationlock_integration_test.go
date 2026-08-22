@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
@@ -43,11 +44,13 @@ func mkProrationCharge(acct, appID uuid.UUID, invID string, periodEnd time.Time)
 func freezeProrationForCharge(
 	t *testing.T,
 	ctx context.Context,
+	pool *pgxpool.Pool,
 	store cycle.Store,
 	acct, appID uuid.UUID,
 	pc *cycle.ProrationCharge,
 ) cycle.CombinedProrationAttempt {
 	t.Helper()
+	installStandardPaymentMethod(t, pool, acct, "cus_proration_lock_"+acct.String())
 	attempt, outcome, err := store.FreezeCombinedProrationAttempt(ctx, appID, pc.Invoice.PeriodEnd, cycle.CombinedProrationChargeShape{
 		AccountID:          acct,
 		Currency:           pc.Invoice.Currency,
@@ -76,7 +79,7 @@ func TestChargeProrationLocked_Integration_LockNotHeldAcrossStripeCall(t *testin
 	appID := uuid.New()
 	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 	pc := mkProrationCharge(acct, appID, "in_slow", mustTime(t, "2026-07-04T00:00:00Z"))
-	freezeProrationForCharge(t, ctx, store, acct, appID, pc)
+	freezeProrationForCharge(t, ctx, pool, store, acct, appID, pc)
 
 	insideCallback := make(chan struct{})
 	release := make(chan struct{})
@@ -131,7 +134,7 @@ func TestChargeProrationLocked_Integration_ConcurrentDeleteDoesNotBlockOnLock(t 
 	appID := uuid.New()
 	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, mustTime(t, "2026-07-01T08:00:00Z"), ""))
 	pc := mkProrationCharge(acct, appID, "in_slow_del", mustTime(t, "2026-07-04T00:00:00Z"))
-	freezeProrationForCharge(t, ctx, store, acct, appID, pc)
+	freezeProrationForCharge(t, ctx, pool, store, acct, appID, pc)
 
 	insideCallback := make(chan struct{})
 	release := make(chan struct{})
@@ -190,7 +193,7 @@ func TestChargeProrationLocked_Integration_PersistsInvoiceFlags(t *testing.T) {
 
 	pc := mkProrationCharge(acct, appID, "in_large_flag", mustTime(t, "2026-07-04T00:00:00Z"))
 	pc.Invoice.IsLargeAutoCollect = true
-	freezeProrationForCharge(t, ctx, store, acct, appID, pc)
+	freezeProrationForCharge(t, ctx, pool, store, acct, appID, pc)
 
 	outcome, invID, err := store.ChargeProrationLocked(ctx, appID, func(cycle.AppMirror) (*cycle.ProrationCharge, error) {
 		return pc, nil

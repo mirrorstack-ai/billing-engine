@@ -337,6 +337,14 @@ type MsBillingAccount struct {
 	BillingMode string `json:"billing_mode"`
 }
 
+// Rotating funding authority for atomic pre-Stripe charge arms. Every designation mutation creates a new generation; durable attempts retain the exact generation and funder they armed under.
+type MsBillingAccountFundingAuthorization struct {
+	AccountID        string    `json:"account_id"`
+	Generation       string    `json:"generation"`
+	FundingAccountID string    `json:"funding_account_id"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
 type MsBillingAddCardRequest struct {
 	ID              string                        `json:"id"`
 	AccountID       string                        `json:"account_id"`
@@ -378,28 +386,31 @@ type MsBillingAppBaseSnapshot struct {
 }
 
 type MsBillingAppCombinedProrationAttempt struct {
-	AppID               string             `json:"app_id"`
-	AccountID           string             `json:"account_id"`
-	AttemptedAt         time.Time          `json:"attempted_at"`
-	Currency            string             `json:"currency"`
-	BaseChargeMicros    int64              `json:"base_charge_micros"`
-	BaseChargeCents     int64              `json:"base_charge_cents"`
-	ModuleChargeMicros  int64              `json:"module_charge_micros"`
-	ModuleChargeCents   int64              `json:"module_charge_cents"`
-	TimerCount          int32              `json:"timer_count"`
-	CoverageStart       time.Time          `json:"coverage_start"`
-	CoverageEnd         time.Time          `json:"coverage_end"`
-	BaseDescription     string             `json:"base_description"`
-	ModuleDescription   string             `json:"module_description"`
-	SnapshotPeriodStart time.Time          `json:"snapshot_period_start"`
-	SnapshotPeriodEnd   time.Time          `json:"snapshot_period_end"`
-	SnapshotBaseMicros  int64              `json:"snapshot_base_micros"`
-	SnapshotModuleCount int32              `json:"snapshot_module_count"`
-	StraddlePeriodStart pgtype.Timestamptz `json:"straddle_period_start"`
-	StraddlePeriodEnd   pgtype.Timestamptz `json:"straddle_period_end"`
-	StraddleBaseMicros  pgtype.Int8        `json:"straddle_base_micros"`
-	ResolvedAt          pgtype.Timestamptz `json:"resolved_at"`
-	ResolvedInvoiceID   pgtype.Text        `json:"resolved_invoice_id"`
+	AppID                         string             `json:"app_id"`
+	AccountID                     string             `json:"account_id"`
+	AttemptedAt                   time.Time          `json:"attempted_at"`
+	Currency                      string             `json:"currency"`
+	BaseChargeMicros              int64              `json:"base_charge_micros"`
+	BaseChargeCents               int64              `json:"base_charge_cents"`
+	ModuleChargeMicros            int64              `json:"module_charge_micros"`
+	ModuleChargeCents             int64              `json:"module_charge_cents"`
+	TimerCount                    int32              `json:"timer_count"`
+	CoverageStart                 time.Time          `json:"coverage_start"`
+	CoverageEnd                   time.Time          `json:"coverage_end"`
+	BaseDescription               string             `json:"base_description"`
+	ModuleDescription             string             `json:"module_description"`
+	SnapshotPeriodStart           time.Time          `json:"snapshot_period_start"`
+	SnapshotPeriodEnd             time.Time          `json:"snapshot_period_end"`
+	SnapshotBaseMicros            int64              `json:"snapshot_base_micros"`
+	SnapshotModuleCount           int32              `json:"snapshot_module_count"`
+	StraddlePeriodStart           pgtype.Timestamptz `json:"straddle_period_start"`
+	StraddlePeriodEnd             pgtype.Timestamptz `json:"straddle_period_end"`
+	StraddleBaseMicros            pgtype.Int8        `json:"straddle_base_micros"`
+	ResolvedAt                    pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedInvoiceID             pgtype.Text        `json:"resolved_invoice_id"`
+	ChargeFundingAccountID        pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID        `json:"charge_funding_generation"`
+	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 }
 
 type MsBillingAppCombinedProrationAttemptTimer struct {
@@ -408,18 +419,21 @@ type MsBillingAppCombinedProrationAttemptTimer struct {
 }
 
 type MsBillingAppCustomDomain struct {
-	ID                  string             `json:"id"`
-	AccountID           string             `json:"account_id"`
-	AppID               string             `json:"app_id"`
-	Hostname            string             `json:"hostname"`
-	ActivatedAt         time.Time          `json:"activated_at"`
-	RemovedAt           pgtype.Timestamptz `json:"removed_at"`
-	ChargeAttemptedAt   pgtype.Timestamptz `json:"charge_attempted_at"`
-	ChargedAt           pgtype.Timestamptz `json:"charged_at"`
-	ChargeResolved      bool               `json:"charge_resolved"`
-	ChargeInvoiceID     pgtype.Text        `json:"charge_invoice_id"`
-	ChargeInvoiceItemID pgtype.Text        `json:"charge_invoice_item_id"`
-	CreatedAt           time.Time          `json:"created_at"`
+	ID                            string             `json:"id"`
+	AccountID                     string             `json:"account_id"`
+	AppID                         string             `json:"app_id"`
+	Hostname                      string             `json:"hostname"`
+	ActivatedAt                   time.Time          `json:"activated_at"`
+	RemovedAt                     pgtype.Timestamptz `json:"removed_at"`
+	ChargeAttemptedAt             pgtype.Timestamptz `json:"charge_attempted_at"`
+	ChargedAt                     pgtype.Timestamptz `json:"charged_at"`
+	ChargeResolved                bool               `json:"charge_resolved"`
+	ChargeInvoiceID               pgtype.Text        `json:"charge_invoice_id"`
+	ChargeInvoiceItemID           pgtype.Text        `json:"charge_invoice_item_id"`
+	CreatedAt                     time.Time          `json:"created_at"`
+	ChargeFundingAccountID        pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID        `json:"charge_funding_generation"`
+	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 }
 
 type MsBillingAppModuleOverageTimer struct {
@@ -435,7 +449,10 @@ type MsBillingAppModuleOverageTimer struct {
 	GraceInvoiceItemID pgtype.Text        `json:"grace_invoice_item_id"`
 	CreatedAt          time.Time          `json:"created_at"`
 	// First instant a Leg-1 (or combined-invoice) charge attempt for this timer reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set reconciles against Stripe (ms_charge_ref) before recomputing any live verdict.
-	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
+	ChargeAttemptedAt             pgtype.Timestamptz `json:"charge_attempted_at"`
+	ChargeFundingAccountID        pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID        `json:"charge_funding_generation"`
+	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 }
 
 type MsBillingBillingPeriod struct {
@@ -448,16 +465,19 @@ type MsBillingBillingPeriod struct {
 }
 
 type MsBillingBillingRun struct {
-	ID                   string         `json:"id"`
-	AccountID            string         `json:"account_id"`
-	PeriodStart          time.Time      `json:"period_start"`
-	PeriodEnd            time.Time      `json:"period_end"`
-	Status               string         `json:"status"`
-	StripeInvoiceID      pgtype.Text    `json:"stripe_invoice_id"`
-	TotalAmount          pgtype.Numeric `json:"total_amount"`
-	CreatedAt            time.Time      `json:"created_at"`
-	FrozenChargeCents    pgtype.Int8    `json:"frozen_charge_cents"`
-	FrozenChargeWithBase pgtype.Bool    `json:"frozen_charge_with_base"`
+	ID                            string         `json:"id"`
+	AccountID                     string         `json:"account_id"`
+	PeriodStart                   time.Time      `json:"period_start"`
+	PeriodEnd                     time.Time      `json:"period_end"`
+	Status                        string         `json:"status"`
+	StripeInvoiceID               pgtype.Text    `json:"stripe_invoice_id"`
+	TotalAmount                   pgtype.Numeric `json:"total_amount"`
+	CreatedAt                     time.Time      `json:"created_at"`
+	FrozenChargeCents             pgtype.Int8    `json:"frozen_charge_cents"`
+	FrozenChargeWithBase          pgtype.Bool    `json:"frozen_charge_with_base"`
+	ChargeFundingAccountID        pgtype.UUID    `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID    `json:"charge_funding_generation"`
+	ChargeFundingLegacyUnresolved bool           `json:"charge_funding_legacy_unresolved"`
 }
 
 type MsBillingBudget struct {
@@ -516,7 +536,10 @@ type MsBillingCreditLedger struct {
 	// End of the bounded in-flight grace. Expired attempts reconcile before retry.
 	AttemptExpiresAt pgtype.Timestamptz `json:"attempt_expires_at"`
 	// Stable terminal payment failure token; NULL while pending or after settlement.
-	FailureCode pgtype.Text `json:"failure_code"`
+	FailureCode                   pgtype.Text `json:"failure_code"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
 }
 
 type MsBillingDeveloperSettlement struct {
@@ -555,7 +578,10 @@ type MsBillingInvoice struct {
 	// Server-computed at invoice-create time: true iff the charged amount (netted arrears + advance base, micros) exceeded the account auto_collect_threshold_micros (or the default when NULL) that applied WHEN THE CHARGE FIRED. Post-hoc disclosure only.
 	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
 	// Sticky, set-only: true once this invoice failed a payment (payment_failed / marked_uncollectible), never cleared. Lets the service-block gate DERIVE the failed-charge streak at read time — counting (ever_failed OR uncollectible) invoices created after the last paid one — so it survives a later flip to paid and is immune to webhook delivery order.
-	EverFailed bool `json:"ever_failed"`
+	EverFailed                    bool        `json:"ever_failed"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
 }
 
 type MsBillingMetricDefinition struct {
@@ -604,6 +630,22 @@ type MsBillingOrgBillingDesignation struct {
 	UpdatedBy              string      `json:"updated_by"`
 	CreatedAt              time.Time   `json:"created_at"`
 	UpdatedAt              time.Time   `json:"updated_at"`
+}
+
+// Immutable operation-keyed tombstone for a fully retired organization billing principal; financial history is retained in its original tables.
+type MsBillingOrgDeletionFinalization struct {
+	OrgID       string    `json:"org_id"`
+	OperationID string    `json:"operation_id"`
+	FinalizedAt time.Time `json:"finalized_at"`
+}
+
+// Immutable audit of live outbound sponsor designations removed by organization billing retirement. Charge authority is carried by the generation-pinned attempt markers below, never inferred from this history.
+type MsBillingOrgDeletionRetiredSponsorship struct {
+	RetiredSponsorOrgID string    `json:"retired_sponsor_org_id"`
+	CustomerOrgID       string    `json:"customer_org_id"`
+	SponsorAccountID    string    `json:"sponsor_account_id"`
+	OperationID         string    `json:"operation_id"`
+	RetiredAt           time.Time `json:"retired_at"`
 }
 
 type MsBillingPaymentMethodsMirror struct {

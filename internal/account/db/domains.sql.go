@@ -80,6 +80,102 @@ func (q *Queries) ActivatedRecurringFeeCounts(ctx context.Context, arg Activated
 	return i, err
 }
 
+const armDomainStripeCharge = `-- name: ArmDomainStripeCharge :one
+WITH target AS MATERIALIZED (
+    SELECT account_id, charge_attempted_at,
+           charge_funding_account_id, charge_funding_generation
+    FROM ms_billing.app_custom_domains
+    WHERE id = $1::uuid
+      AND removed_at IS NULL
+      AND charge_resolved = false
+      AND NOT charge_funding_legacy_unresolved
+    FOR UPDATE
+), selected AS MATERIALIZED (
+    SELECT target.account_id,
+           COALESCE(target.charge_funding_account_id,
+                    funding_auth.funding_account_id) AS funding_account_id,
+           COALESCE(target.charge_funding_generation,
+                    funding_auth.generation) AS funding_generation
+    FROM target
+    JOIN ms_billing.account_funding_authorizations funding_auth
+      ON funding_auth.account_id = target.account_id
+), funding AS MATERIALIZED (
+    SELECT selected.account_id,
+           selected.funding_account_id,
+           selected.funding_generation,
+           COALESCE(account.stripe_customer_id, '')::text AS stripe_customer_id,
+           EXISTS (
+               SELECT 1
+               FROM ms_billing.payment_methods_mirror payment_method
+               WHERE payment_method.account_id = selected.funding_account_id
+                 AND payment_method.deleted_at IS NULL
+                 AND (payment_method.exp_year, payment_method.exp_month) >= (
+                     EXTRACT(YEAR FROM current_date)::INT,
+                     EXTRACT(MONTH FROM current_date)::INT
+                 )
+           ) AS has_usable_payment_method
+    FROM selected
+    JOIN ms_billing.accounts account
+      ON account.id = selected.funding_account_id
+), armed AS (
+    UPDATE ms_billing.app_custom_domains domain_row
+    SET charge_attempted_at = COALESCE(domain_row.charge_attempted_at,
+                                       $2::timestamptz),
+        charge_funding_account_id = COALESCE(
+            domain_row.charge_funding_account_id,
+            funding.funding_account_id
+        ),
+        charge_funding_generation = COALESCE(
+            domain_row.charge_funding_generation,
+            funding.funding_generation
+        )
+    FROM funding
+    WHERE domain_row.id = $1::uuid
+      AND funding.has_usable_payment_method
+    RETURNING domain_row.id
+)
+SELECT funding.account_id,
+       funding.funding_account_id,
+       funding.funding_generation,
+       funding.stripe_customer_id,
+       funding.has_usable_payment_method,
+       EXISTS (SELECT 1 FROM armed)::boolean AS armed
+FROM funding
+`
+
+type ArmDomainStripeChargeParams struct {
+	DomainID    string    `json:"domain_id"`
+	AttemptedAt time.Time `json:"attempted_at"`
+}
+
+type ArmDomainStripeChargeRow struct {
+	AccountID              string `json:"account_id"`
+	FundingAccountID       string `json:"funding_account_id"`
+	FundingGeneration      string `json:"funding_generation"`
+	StripeCustomerID       string `json:"stripe_customer_id"`
+	HasUsablePaymentMethod bool   `json:"has_usable_payment_method"`
+	Armed                  bool   `json:"armed"`
+}
+
+// ArmDomainStripeCharge is the atomic funding/marker boundary. It row-locks
+// the candidate, chooses the existing first-write claim or the account's
+// current rotating authorization, verifies a usable PM on that exact funder,
+// and persists the claim before returning the Stripe customer. A designation
+// change racing this statement linearizes wholly before or after the arm.
+func (q *Queries) ArmDomainStripeCharge(ctx context.Context, arg ArmDomainStripeChargeParams) (ArmDomainStripeChargeRow, error) {
+	row := q.db.QueryRow(ctx, armDomainStripeCharge, arg.DomainID, arg.AttemptedAt)
+	var i ArmDomainStripeChargeRow
+	err := row.Scan(
+		&i.AccountID,
+		&i.FundingAccountID,
+		&i.FundingGeneration,
+		&i.StripeCustomerID,
+		&i.HasUsablePaymentMethod,
+		&i.Armed,
+	)
+	return i, err
+}
+
 const countLiveDomainsActivatedBefore = `-- name: CountLiveDomainsActivatedBefore :one
 SELECT COALESCE(count(*), 0)::bigint AS live_count
 FROM ms_billing.app_custom_domains
@@ -176,7 +272,9 @@ func (q *Queries) DomainStillPending(ctx context.Context, id string) (bool, erro
 
 const domainsPendingCharge = `-- name: DomainsPendingCharge :many
 SELECT d.id, d.account_id, d.app_id, d.hostname, d.activated_at,
-       d.charge_attempted_at, a.activated_at AS account_activated_at
+       d.charge_attempted_at, d.charge_funding_account_id,
+       d.charge_funding_generation,
+       a.activated_at AS account_activated_at
 FROM ms_billing.app_custom_domains d
 JOIN ms_billing.accounts a ON a.id = d.account_id
 WHERE d.removed_at IS NULL
@@ -187,13 +285,15 @@ ORDER BY d.activated_at, d.id
 `
 
 type DomainsPendingChargeRow struct {
-	ID                 string             `json:"id"`
-	AccountID          string             `json:"account_id"`
-	AppID              string             `json:"app_id"`
-	Hostname           string             `json:"hostname"`
-	ActivatedAt        time.Time          `json:"activated_at"`
-	ChargeAttemptedAt  pgtype.Timestamptz `json:"charge_attempted_at"`
-	AccountActivatedAt pgtype.Timestamptz `json:"account_activated_at"`
+	ID                      string             `json:"id"`
+	AccountID               string             `json:"account_id"`
+	AppID                   string             `json:"app_id"`
+	Hostname                string             `json:"hostname"`
+	ActivatedAt             time.Time          `json:"activated_at"`
+	ChargeAttemptedAt       pgtype.Timestamptz `json:"charge_attempted_at"`
+	ChargeFundingAccountID  pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration pgtype.UUID        `json:"charge_funding_generation"`
+	AccountActivatedAt      pgtype.Timestamptz `json:"account_activated_at"`
 }
 
 // DomainsPendingCharge is the activation-period sweep work list. With no grace
@@ -217,6 +317,8 @@ func (q *Queries) DomainsPendingCharge(ctx context.Context, at time.Time) ([]Dom
 			&i.Hostname,
 			&i.ActivatedAt,
 			&i.ChargeAttemptedAt,
+			&i.ChargeFundingAccountID,
+			&i.ChargeFundingGeneration,
 			&i.AccountActivatedAt,
 		); err != nil {
 			return nil, err
@@ -260,25 +362,6 @@ func (q *Queries) InsertDomain(ctx context.Context, arg InsertDomainParams) erro
 		arg.Hostname,
 		arg.ActivatedAt,
 	)
-	return err
-}
-
-const markDomainChargeAttempted = `-- name: MarkDomainChargeAttempted :exec
-UPDATE ms_billing.app_custom_domains
-SET charge_attempted_at = $2
-WHERE id = $1
-  AND charge_attempted_at IS NULL
-`
-
-type MarkDomainChargeAttemptedParams struct {
-	ID                string             `json:"id"`
-	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
-}
-
-// MarkDomainChargeAttempted stamps the first recovery marker before Stripe is
-// called. First-write-wins and is never cleared.
-func (q *Queries) MarkDomainChargeAttempted(ctx context.Context, arg MarkDomainChargeAttemptedParams) error {
-	_, err := q.db.Exec(ctx, markDomainChargeAttempted, arg.ID, arg.ChargeAttemptedAt)
 	return err
 }
 

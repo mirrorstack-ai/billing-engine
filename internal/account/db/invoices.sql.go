@@ -39,7 +39,10 @@ func (q *Queries) CountUnpaidInvoicesForAccount(ctx context.Context, accountID s
 }
 
 const invoiceForPayment = `-- name: InvoiceForPayment :one
-SELECT stripe_invoice_id, status
+SELECT stripe_invoice_id,
+       status,
+       charge_funding_account_id,
+       charge_funding_legacy_unresolved
 FROM ms_billing.invoices
 WHERE id = $1
   AND account_id = $2
@@ -51,8 +54,10 @@ type InvoiceForPaymentParams struct {
 }
 
 type InvoiceForPaymentRow struct {
-	StripeInvoiceID string `json:"stripe_invoice_id"`
-	Status          string `json:"status"`
+	StripeInvoiceID               string      `json:"stripe_invoice_id"`
+	Status                        string      `json:"status"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
 }
 
 // InvoiceForPayment resolves a mirror invoice by (id, account) for the
@@ -63,7 +68,12 @@ type InvoiceForPaymentRow struct {
 func (q *Queries) InvoiceForPayment(ctx context.Context, arg InvoiceForPaymentParams) (InvoiceForPaymentRow, error) {
 	row := q.db.QueryRow(ctx, invoiceForPayment, arg.ID, arg.AccountID)
 	var i InvoiceForPaymentRow
-	err := row.Scan(&i.StripeInvoiceID, &i.Status)
+	err := row.Scan(
+		&i.StripeInvoiceID,
+		&i.Status,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingLegacyUnresolved,
+	)
 	return i, err
 }
 
