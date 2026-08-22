@@ -209,27 +209,32 @@ func (s *Service) resumeCreditPurchase(ctx context.Context, purchase CreditPurch
 	if s.creditPurchases == nil {
 		return nil, Internal("manual credit purchase reconciler is not configured", nil)
 	}
-	attempt := creditpurchase.Attempt{
-		ID:              purchase.ID,
-		AccountID:       purchase.AccountID,
-		AmountMicros:    purchase.AmountMicros,
-		Status:          purchase.Status,
-		StripeInvoiceID: purchase.StripeInvoiceID,
-		ReceiptURL:      purchase.ReceiptURL,
+	if purchase.FundingLegacyUnresolved {
+		return nil, Unavailable("manual credit purchase funding provenance requires reconciliation")
 	}
-	if purchase.StripeInvoiceID == "" && purchase.Status == "pending" {
-		fundingAccountID, err := s.store.ChargeFundingAccount(ctx, purchase.AccountID)
-		if err != nil {
-			return nil, Internal("funding account lookup failed", err)
-		}
-		stripeCustomerID, err := s.store.AccountStripeCustomer(ctx, fundingAccountID)
-		if err != nil {
-			return nil, Internal("stripe customer lookup failed", err)
-		}
-		if stripeCustomerID == "" {
+	if purchase.Status == "pending" {
+		armed, err := s.store.ArmCreditPurchase(ctx, purchase.ID, purchase.AccountID)
+		switch {
+		case errors.Is(err, errCreditPurchaseFundingUnavailable):
 			return nil, PaymentRequired("Stripe customer required before purchasing credits")
+		case errors.Is(err, errCreditPurchaseLegacyFunding):
+			return nil, Unavailable("manual credit purchase funding provenance requires reconciliation")
+		case err != nil:
+			return nil, Internal("arm manual credit purchase failed", err)
+		default:
+			purchase = armed
 		}
-		attempt.StripeCustomerID = stripeCustomerID
+	}
+	attempt := creditpurchase.Attempt{
+		ID:                purchase.ID,
+		AccountID:         purchase.AccountID,
+		AmountMicros:      purchase.AmountMicros,
+		Status:            purchase.Status,
+		StripeInvoiceID:   purchase.StripeInvoiceID,
+		ReceiptURL:        purchase.ReceiptURL,
+		FundingAccountID:  purchase.ChargeFundingAccountID,
+		FundingGeneration: purchase.ChargeFundingGeneration,
+		StripeCustomerID:  purchase.StripeCustomerID,
 	}
 
 	result, err := s.creditPurchases.Resume(ctx, attempt)
@@ -418,6 +423,7 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 	}
 
 	var accountID uuid.UUID
+	var authority *DistributorMutationAuthority
 	if req.DistributorOrgID != uuid.Nil {
 		var found bool
 		var err error
@@ -427,6 +433,10 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 		}
 		if !found {
 			return nil, InvalidInput("distributor does not manage customer org")
+		}
+		authority = &DistributorMutationAuthority{
+			DistributorOrgID: req.DistributorOrgID,
+			CustomerOrgID:    req.OwnerOrgID,
 		}
 	} else {
 		var err error
@@ -449,8 +459,11 @@ func (s *Service) SetCustomerBillingMode(ctx context.Context, req SetCustomerBil
 	} else if req.BillingMode == BillingModeCredits {
 		creditLimit = DefaultCreditsLimitMicros
 	}
-	changed, err := s.store.SetCreditBillingMode(ctx, accountID, req.BillingMode, creditLimit)
+	changed, err := s.store.SetCreditBillingMode(ctx, accountID, authority, req.BillingMode, creditLimit)
 	if err != nil {
+		if errors.Is(err, errDistributorAuthorityChanged) {
+			return nil, InvalidInput("distributor does not manage customer org")
+		}
 		if errors.Is(err, errPendingAutoTopUpModeChange) {
 			return nil, InvalidInput("cannot switch billing mode while an auto top-up is pending")
 		}
@@ -530,6 +543,7 @@ func (s *Service) GrantCredits(ctx context.Context, req GrantCreditsRequest) (*G
 	}
 
 	var accountID uuid.UUID
+	var authority *DistributorMutationAuthority
 	if req.Actor == "distributor" {
 		var found bool
 		var err error
@@ -539,6 +553,10 @@ func (s *Service) GrantCredits(ctx context.Context, req GrantCreditsRequest) (*G
 		}
 		if !found {
 			return nil, InvalidInput("distributor does not manage customer org")
+		}
+		authority = &DistributorMutationAuthority{
+			DistributorOrgID: req.DistributorOrgID,
+			CustomerOrgID:    req.CustomerOrgID,
 		}
 	} else {
 		var found bool
@@ -564,8 +582,11 @@ func (s *Service) GrantCredits(ctx context.Context, req GrantCreditsRequest) (*G
 		return &GrantCreditsResponse{LedgerID: existing.ID.String(), BalanceMicros: existing.BalanceAfterMicros}, nil
 	}
 
-	grant, err := s.store.InsertCreditGrant(ctx, accountID, req.AmountMicros, req.Actor, req.IdempotencyKey, req.ExpiresAt)
+	grant, err := s.store.InsertCreditGrant(ctx, accountID, authority, req.AmountMicros, req.Actor, req.IdempotencyKey, req.ExpiresAt)
 	if err != nil {
+		if errors.Is(err, errDistributorAuthorityChanged) {
+			return nil, InvalidInput("distributor does not manage customer org")
+		}
 		// Resolve a concurrent idempotent insert exactly as the purchase path does.
 		existing, found, lookupErr := s.store.CreditLedgerByIdempotencyKey(ctx, req.IdempotencyKey)
 		if lookupErr == nil && found {
@@ -624,17 +645,21 @@ func validateExistingPurchase(existing CreditLedgerRecord, accountID uuid.UUID, 
 
 func creditPurchaseFromRecord(record CreditLedgerRecord) CreditPurchaseRow {
 	return CreditPurchaseRow{
-		ID:                 record.ID,
-		AccountID:          record.AccountID,
-		AmountMicros:       record.AmountMicros,
-		Type:               record.Type,
-		Status:             record.Status,
-		BalanceAfterMicros: record.BalanceAfterMicros,
-		Actor:              record.Actor,
-		IdempotencyKey:     record.IdempotencyKey,
-		StripeInvoiceID:    record.StripeInvoiceID,
-		ReceiptURL:         record.ReceiptURL,
-		CreatedAt:          record.CreatedAt,
+		ID:                      record.ID,
+		AccountID:               record.AccountID,
+		AmountMicros:            record.AmountMicros,
+		Type:                    record.Type,
+		Status:                  record.Status,
+		BalanceAfterMicros:      record.BalanceAfterMicros,
+		Actor:                   record.Actor,
+		IdempotencyKey:          record.IdempotencyKey,
+		StripeInvoiceID:         record.StripeInvoiceID,
+		ReceiptURL:              record.ReceiptURL,
+		ChargeFundingAccountID:  record.ChargeFundingAccountID,
+		ChargeFundingGeneration: record.ChargeFundingGeneration,
+		StripeCustomerID:        record.StripeCustomerID,
+		FundingLegacyUnresolved: record.FundingLegacyUnresolved,
+		CreatedAt:               record.CreatedAt,
 	}
 }
 

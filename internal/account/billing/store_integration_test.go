@@ -236,8 +236,12 @@ func seedMirrorInvoice(t *testing.T, pool *pgxpool.Pool, acct uuid.UUID, stripeI
 	id := uuid.New()
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO ms_billing.invoices
-		   (id, account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, created_at)
-		 VALUES ($1, $2, $3, $4, $5, 0, 'usd', $6)`,
+		   (id, account_id, charge_funding_account_id, charge_funding_generation,
+		    stripe_invoice_id, status, amount_due, amount_paid, currency, created_at)
+		 SELECT $1, $2, auth.funding_account_id, auth.generation,
+		        $3, $4, $5, 0, 'usd', $6
+		 FROM ms_billing.account_funding_authorizations auth
+		 WHERE auth.account_id = $2`,
 		id, acct, stripeID, status, dueCents, createdAt,
 	)
 	require.NoError(t, err)
@@ -295,6 +299,8 @@ func TestPgxStore_InvoiceForPayment_OwnershipScope(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, "in_owned", target.StripeInvoiceID)
 	require.Equal(t, "open", target.Status)
+	require.Equal(t, owner, target.ChargeFundingAccountID)
+	require.False(t, target.FundingLegacyUnresolved)
 
 	_, found, err = store.InvoiceForPayment(ctx, invID, stranger)
 	require.NoError(t, err)
@@ -314,8 +320,12 @@ func TestPgxStore_SyncInvoiceMirror_Integration(t *testing.T) {
 	stripeInvoiceID := "in_pay_sync"
 	_, err := pool.Exec(ctx,
 		`INSERT INTO ms_billing.invoices
-		   (id, account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, ever_failed)
-		 VALUES ($1, $2, $3, 'open', 200, 0, 'usd', true)`,
+		   (id, account_id, charge_funding_account_id, charge_funding_generation,
+		    stripe_invoice_id, status, amount_due, amount_paid, currency, ever_failed)
+		 SELECT $1, $2, auth.funding_account_id, auth.generation,
+		        $3, 'open', 200, 0, 'usd', true
+		 FROM ms_billing.account_funding_authorizations auth
+		 WHERE auth.account_id = $2`,
 		uuid.New(), accountID, stripeInvoiceID,
 	)
 	require.NoError(t, err)

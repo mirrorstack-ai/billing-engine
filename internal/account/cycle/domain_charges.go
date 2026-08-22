@@ -109,17 +109,21 @@ func (s *Service) ChargeDomain(ctx context.Context, cand DomainChargeCandidate, 
 		return res, nil
 	}
 
-	custID, ok, err := s.resolveChargeableCustomer(ctx, cand.AccountID)
+	claim, err := s.store.ArmDomainStripeCharge(ctx, cand.ID, at.UTC())
 	if err != nil {
-		return nil, err
+		return nil, billing.Internal("arm domain Stripe charge failed", err)
 	}
-	if !ok {
+	switch claim.Outcome {
+	case StripeRailNoPaymentMethod:
 		res.Status = DomainChargeSkippedNoPM
 		return res, nil
+	case StripeRailStale:
+		res.Status = DomainChargeSkippedStale
+		return res, nil
 	}
-
-	if err := s.store.MarkDomainChargeAttempted(ctx, cand.ID, at.UTC()); err != nil {
-		return nil, billing.Internal("mark domain charge attempted failed", err)
+	custID := claim.StripeCustomerID
+	if custID == "" {
+		return nil, billing.Internal("domain funding account has a usable PM but no Stripe customer id", nil)
 	}
 
 	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, domainChargeRef(cand.ID), domainInvoiceIdemKey(cand.ID))
@@ -142,15 +146,17 @@ func (s *Service) ChargeDomain(ctx context.Context, cand DomainChargeCandidate, 
 		return nil, billing.Internal("account collection lookup failed", err)
 	}
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:          cand.AccountID,
-		StripeInvoiceID:    inv.ID,
-		Status:             inv.Status,
-		AmountDueCents:     inv.AmountDue,
-		AmountPaidCents:    inv.AmountPaid,
-		Currency:           chargeCurrency,
-		PeriodStart:        coverageStart,
-		PeriodEnd:          coverageEnd,
-		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
+		AccountID:               cand.AccountID,
+		ChargeFundingAccountID:  claim.FundingAccountID,
+		ChargeFundingGeneration: claim.FundingGeneration,
+		StripeInvoiceID:         inv.ID,
+		Status:                  inv.Status,
+		AmountDueCents:          inv.AmountDue,
+		AmountPaidCents:         inv.AmountPaid,
+		Currency:                chargeCurrency,
+		PeriodStart:             coverageStart,
+		PeriodEnd:               coverageEnd,
+		IsLargeAutoCollect:      flagLargeAutoCollect(proratedMicros, acct),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}
@@ -210,7 +216,10 @@ func (s *Service) SweepDomainCharges(ctx context.Context, at time.Time) (*SweepD
 // stamped before a prior process died. A found finalized invoice is mirrored
 // and marked; a found draft is completed with the deterministic line and keys.
 func (s *Service) recoverDomainCharge(ctx context.Context, cand DomainChargeCandidate, at time.Time, res *DomainChargeResult) (bool, error) {
-	custID, err := s.recoveryCustomer(ctx, cand.AccountID)
+	if cand.ChargeFundingAccountID == uuid.Nil || cand.ChargeFundingGeneration == uuid.Nil {
+		return false, billing.Internal("domain recovery marker has no pinned funding authorization", nil)
+	}
+	custID, err := s.store.AccountStripeCustomer(ctx, cand.ChargeFundingAccountID)
 	if err != nil {
 		return false, billing.Internal("stripe customer lookup failed (domain recovery)", err)
 	}
@@ -272,15 +281,17 @@ func (s *Service) recoverDomainCharge(ctx context.Context, cand DomainChargeCand
 		return false, billing.Internal("account collection lookup failed", err)
 	}
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:          cand.AccountID,
-		StripeInvoiceID:    inv.ID,
-		Status:             inv.Status,
-		AmountDueCents:     inv.AmountDue,
-		AmountPaidCents:    inv.AmountPaid,
-		Currency:           chargeCurrency,
-		PeriodStart:        coverageStart,
-		PeriodEnd:          coverageEnd,
-		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
+		AccountID:               cand.AccountID,
+		ChargeFundingAccountID:  cand.ChargeFundingAccountID,
+		ChargeFundingGeneration: cand.ChargeFundingGeneration,
+		StripeInvoiceID:         inv.ID,
+		Status:                  inv.Status,
+		AmountDueCents:          inv.AmountDue,
+		AmountPaidCents:         inv.AmountPaid,
+		Currency:                chargeCurrency,
+		PeriodStart:             coverageStart,
+		PeriodEnd:               coverageEnd,
+		IsLargeAutoCollect:      flagLargeAutoCollect(proratedMicros, acct),
 	}); err != nil {
 		return false, billing.Internal("invoice mirror upsert failed (domain recovery)", err)
 	}

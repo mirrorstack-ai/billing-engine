@@ -43,13 +43,46 @@ type StripeRailClaimOutcome uint8
 const (
 	StripeRailClaimed StripeRailClaimOutcome = iota
 	StripeRailWalletRequired
+	StripeRailNoPaymentMethod
 	StripeRailStale
 )
+
+// StripeChargeClaim is the exact funding authority persisted by an atomic
+// pre-Stripe arm. Recovery uses FundingAccountID rather than following a later
+// org designation.
+type StripeChargeClaim struct {
+	FundingAccountID  uuid.UUID
+	FundingGeneration uuid.UUID
+	StripeCustomerID  string
+	Outcome           StripeRailClaimOutcome
+}
+
+func stripeChargeClaim(fundingAccountID, generation, customerID string) (StripeChargeClaim, error) {
+	funder, err := uuid.Parse(fundingAccountID)
+	if err != nil {
+		return StripeChargeClaim{}, fmt.Errorf("parse charge funding account: %w", err)
+	}
+	gen, err := uuid.Parse(generation)
+	if err != nil {
+		return StripeChargeClaim{}, fmt.Errorf("parse charge funding generation: %w", err)
+	}
+	return StripeChargeClaim{
+		FundingAccountID: funder, FundingGeneration: gen, StripeCustomerID: customerID,
+	}, nil
+}
 
 // Store is the persistence interface the rollup + settlement Service depends
 // on. Narrow on purpose — every method maps to a specific rollup step — so
 // tests satisfy it with a small in-memory fake (see service_test.go).
 type Store interface {
+	// FinalizeOrgDeletionBilling atomically retires every future-billing
+	// surface for one organization while retaining its financial history. The
+	// operation id is the immutable idempotency identity: the same operation
+	// replays successfully and a different operation fails closed. The store
+	// performs the final collectible-invoice and in-flight-money rechecks while
+	// holding the shared org lifecycle lock.
+	FinalizeOrgDeletionBilling(ctx context.Context, orgID, operationID uuid.UUID, finalizedAt time.Time) (OrgDeletionFinalizationOutcome, error)
+
 	// OpenPeriodForAccount upserts the billing_periods row keyed
 	// (account_id, period_start) and returns its id. Idempotent: a re-run for
 	// the same window returns the existing row's id rather than duplicating it.
@@ -231,7 +264,7 @@ type Store interface {
 	// computed amount under the shared idem keys would send Stripe two different
 	// bodies for the same key (the H6 race). The retry path likewise never sends
 	// a request that differs from what a prior attempt froze.
-	FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error)
+	FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, StripeRailClaimOutcome, error)
 
 	// BillingRunFrozenCharge reads a run's frozen boundary charge; ok=false when no
 	// prior attempt reached the Stripe call (a fresh run). On a reclaim it is the
@@ -478,16 +511,10 @@ type Store interface {
 	// for an app — the app-deletion path. Idempotent (WHERE removed_at IS NULL).
 	SoftRemoveAllModuleTimersForApp(ctx context.Context, appID uuid.UUID, removedAt time.Time) error
 
-	// MarkModuleTimerChargeAttempted stamps the migration-036 recovery marker
-	// BEFORE a charge attempt's first Stripe call — first-write-wins, never
-	// cleared. A later retry seeing it set reconciles against Stripe (the
-	// ms_charge_ref anchor) before recomputing any live verdict or minting new
-	// Stripe objects. It also guards grace_resolved = false (billing-engine Job 3
-	// hardening) so it serializes against a concurrent credit-wallet settlement:
-	// it returns the rows affected, and a 0 means the timer was already resolved
-	// (a concurrent wallet draw armed grace_resolved) — the Stripe leg MUST abort
-	// as stale rather than charge a second time.
-	MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) (int64, error)
+	// ArmModuleTimerStripeCharge atomically stamps the migration-036 recovery
+	// marker and exact rotating funding authority before the first Stripe call.
+	// The claim also serializes against wallet settlement and stale candidates.
+	ArmModuleTimerStripeCharge(ctx context.Context, timerID uuid.UUID, at time.Time) (StripeChargeClaim, error)
 
 	// ModuleTimerStillPending re-verifies, immediately before acting on a sweep
 	// candidate, that the timer is STILL live and unresolved — the work list is
@@ -642,9 +669,9 @@ type Store interface {
 	// domain remains live and unresolved.
 	DomainStillPending(ctx context.Context, domainID uuid.UUID) (bool, error)
 
-	// MarkDomainChargeAttempted stamps the durable recovery marker before the
-	// first Stripe call. First-write-wins and is never cleared.
-	MarkDomainChargeAttempted(ctx context.Context, domainID uuid.UUID, at time.Time) error
+	// ArmDomainStripeCharge atomically stamps the durable recovery marker and
+	// exact rotating funding authority before the first Stripe call.
+	ArmDomainStripeCharge(ctx context.Context, domainID uuid.UUID, at time.Time) (StripeChargeClaim, error)
 
 	// MarkDomainChargeResolved stamps the terminal no-charge D1d verdict for an
 	// activation period that closed before the owning account activated.
@@ -684,7 +711,9 @@ type DomainChargeCandidate struct {
 	ActivatedAt        time.Time
 	AccountActivatedAt time.Time
 	// ChargeAttemptedAt is zero until an attempt reaches its Stripe section.
-	ChargeAttemptedAt time.Time
+	ChargeAttemptedAt       time.Time
+	ChargeFundingAccountID  uuid.UUID
+	ChargeFundingGeneration uuid.UUID
 }
 
 // ModuleOverageCandidate is one per-module-instance install timer the Leg 1
@@ -702,7 +731,9 @@ type ModuleOverageCandidate struct {
 	// ChargeAttemptedAt: a prior charge attempt reached its Stripe section
 	// (migration 036 recovery marker); zero = never attempted. A retried
 	// candidate reconciles against Stripe BEFORE recomputing any live verdict.
-	ChargeAttemptedAt time.Time
+	ChargeAttemptedAt       time.Time
+	ChargeFundingAccountID  uuid.UUID
+	ChargeFundingGeneration uuid.UUID
 }
 
 // AppModuleCount pairs one live roster app with its module_count snapshot —
@@ -776,8 +807,10 @@ type AccountAnchor struct {
 // frozen tuple verbatim rather than re-deriving a possibly-drifted live total —
 // keeping every retry's Stripe request byte-identical under the stable key.
 type FrozenBoundaryCharge struct {
-	Cents    int64
-	WithBase bool
+	Cents                   int64
+	WithBase                bool
+	ChargeFundingAccountID  uuid.UUID
+	ChargeFundingGeneration uuid.UUID
 }
 
 // CombinedProrationChargeShape is the complete immutable app-base + per-timer
@@ -805,12 +838,14 @@ type CombinedProrationChargeShape struct {
 // and ResolvedInvoiceID are both empty until the same transaction that arms the
 // app and timer terminal guards commits.
 type CombinedProrationAttempt struct {
-	AppID             uuid.UUID
-	AttemptedAt       time.Time
-	Shape             CombinedProrationChargeShape
-	TimerIDs          []uuid.UUID
-	ResolvedAt        time.Time
-	ResolvedInvoiceID string
+	AppID                   uuid.UUID
+	AttemptedAt             time.Time
+	ChargeFundingAccountID  uuid.UUID
+	ChargeFundingGeneration uuid.UUID
+	Shape                   CombinedProrationChargeShape
+	TimerIDs                []uuid.UUID
+	ResolvedAt              time.Time
+	ResolvedInvoiceID       string
 }
 
 // UnresolvedCombinedProrationAmount is the exact raw amount owned by one
@@ -874,14 +909,16 @@ const (
 // spine writes after creating a Stripe invoice. Amounts are whole cents (Stripe
 // minor units).
 type InvoiceMirror struct {
-	AccountID       uuid.UUID
-	StripeInvoiceID string
-	Status          string
-	AmountDueCents  int64
-	AmountPaidCents int64
-	Currency        string
-	PeriodStart     time.Time
-	PeriodEnd       time.Time
+	AccountID               uuid.UUID
+	ChargeFundingAccountID  uuid.UUID
+	ChargeFundingGeneration uuid.UUID
+	StripeInvoiceID         string
+	Status                  string
+	AmountDueCents          int64
+	AmountPaidCents         int64
+	Currency                string
+	PeriodStart             time.Time
+	PeriodEnd               time.Time
 	// IsLargeAutoCollect is the server-computed post-hoc disclosure flag
 	// (migration 034): true iff the charged amount exceeded the account's
 	// resolved auto-collect threshold WHEN THE CHARGE FIRED. Set by every
@@ -1362,8 +1399,17 @@ func (s *pgxStore) drawWalletCredits(
 				)
 			}
 			out.BoundaryCharge = FrozenBoundaryCharge{
-				Cents:    run.FrozenChargeCents.Int64,
-				WithBase: run.FrozenChargeWithBase.Bool,
+				Cents:                   run.FrozenChargeCents.Int64,
+				WithBase:                run.FrozenChargeWithBase.Bool,
+				ChargeFundingAccountID:  uuidFromPg(run.ChargeFundingAccountID),
+				ChargeFundingGeneration: uuidFromPg(run.ChargeFundingGeneration),
+			}
+			if out.BoundaryCharge.ChargeFundingAccountID == uuid.Nil ||
+				out.BoundaryCharge.ChargeFundingGeneration == uuid.Nil {
+				return WalletDrawdown{}, fmt.Errorf(
+					"billing run %s has an incomplete frozen funding claim",
+					runID,
+				)
 			}
 			out.BoundaryChargeFrozen = true
 			markerBlocksNew = true
@@ -1382,10 +1428,21 @@ func (s *pgxStore) drawWalletCredits(
 			if err != nil {
 				return WalletDrawdown{}, fmt.Errorf("freeze wallet remainder: %w", err)
 			}
+			// The wallet debit and Stripe remainder marker are one atomic money
+			// decision. Pin the exact rotating funding authorization in this same
+			// transaction even when the funder currently has no usable PM: a later
+			// reclaim may proceed only against this generation, never a designation
+			// that changed after the wallet money was committed.
+			fundingAuth, err := qtx.StripeFundingAuthorization(ctx, accountID.String())
+			if err != nil {
+				return WalletDrawdown{}, err
+			}
 			if err := qtx.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
-				ID:                   runID.String(),
-				FrozenChargeCents:    pgtype.Int8{Int64: remainderCents, Valid: true},
-				FrozenChargeWithBase: pgtype.Bool{Bool: withBase, Valid: true},
+				ID:                      runID.String(),
+				FrozenChargeCents:       pgtype.Int8{Int64: remainderCents, Valid: true},
+				FrozenChargeWithBase:    pgtype.Bool{Bool: withBase, Valid: true},
+				ChargeFundingAccountID:  fundingAuth.FundingAccountID,
+				ChargeFundingGeneration: fundingAuth.Generation,
 			}); err != nil {
 				return WalletDrawdown{}, err
 			}
@@ -1393,7 +1450,8 @@ func (s *pgxStore) drawWalletCredits(
 			if err != nil {
 				return WalletDrawdown{}, err
 			}
-			if !row.FrozenChargeCents.Valid || !row.FrozenChargeWithBase.Valid {
+			if !row.FrozenChargeCents.Valid || !row.FrozenChargeWithBase.Valid ||
+				!row.ChargeFundingAccountID.Valid || !row.ChargeFundingGeneration.Valid {
 				// FreezeBillingRunCharge refuses an already-invoiced run. This
 				// error rolls the transaction back, so a concurrent terminal
 				// mark can never leave a debit without its recovery marker.
@@ -1403,8 +1461,10 @@ func (s *pgxStore) drawWalletCredits(
 				)
 			}
 			out.BoundaryCharge = FrozenBoundaryCharge{
-				Cents:    row.FrozenChargeCents.Int64,
-				WithBase: row.FrozenChargeWithBase.Bool,
+				Cents:                   row.FrozenChargeCents.Int64,
+				WithBase:                row.FrozenChargeWithBase.Bool,
+				ChargeFundingAccountID:  uuidFromPg(row.ChargeFundingAccountID),
+				ChargeFundingGeneration: uuidFromPg(row.ChargeFundingGeneration),
 			}
 			out.BoundaryChargeFrozen = true
 		}
@@ -1660,17 +1720,25 @@ func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {
 	if err != nil {
 		return err
 	}
+	// Invoice payer identity must come from the durable pre-Stripe attempt. A
+	// mirror write is never allowed to infer historical provenance from today's
+	// mutable designation.
+	if inv.ChargeFundingAccountID == uuid.Nil || inv.ChargeFundingGeneration == uuid.Nil {
+		return errors.New("invoice mirror requires exact durable funding provenance")
+	}
 	return s.q.UpsertInvoice(ctx, db.UpsertInvoiceParams{
-		AccountID:          inv.AccountID.String(),
-		StripeInvoiceID:    inv.StripeInvoiceID,
-		Status:             inv.Status,
-		AmountDue:          due,
-		AmountPaid:         paid,
-		Currency:           inv.Currency,
-		PeriodStart:        pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
-		PeriodEnd:          pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
-		IsLargeAutoCollect: inv.IsLargeAutoCollect,
-		EverFailed:         inv.EverFailed,
+		AccountID:               inv.AccountID.String(),
+		StripeInvoiceID:         inv.StripeInvoiceID,
+		Status:                  inv.Status,
+		AmountDue:               due,
+		AmountPaid:              paid,
+		Currency:                inv.Currency,
+		PeriodStart:             pgtype.Timestamptz{Time: inv.PeriodStart, Valid: !inv.PeriodStart.IsZero()},
+		PeriodEnd:               pgtype.Timestamptz{Time: inv.PeriodEnd, Valid: !inv.PeriodEnd.IsZero()},
+		IsLargeAutoCollect:      inv.IsLargeAutoCollect,
+		EverFailed:              inv.EverFailed,
+		ChargeFundingAccountID:  inv.ChargeFundingAccountID.String(),
+		ChargeFundingGeneration: inv.ChargeFundingGeneration.String(),
 	})
 }
 
@@ -1695,27 +1763,80 @@ func (s *pgxStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID u
 	return rows > 0, nil
 }
 
-func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, error) {
+func (s *pgxStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge FrozenBoundaryCharge) (FrozenBoundaryCharge, StripeRailClaimOutcome, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return FrozenBoundaryCharge{}, StripeRailStale, err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	locked, err := qtx.LockBillingRunFundingArm(ctx, runID.String())
+	if err != nil {
+		return FrozenBoundaryCharge{}, StripeRailStale, err
+	}
+	if locked.FrozenChargeCents.Valid {
+		if !locked.ChargeFundingAccountID.Valid || !locked.ChargeFundingGeneration.Valid {
+			return FrozenBoundaryCharge{}, StripeRailStale,
+				fmt.Errorf("billing run %s is frozen without a funding authorization", runID)
+		}
+		surviving := FrozenBoundaryCharge{
+			Cents:                   locked.FrozenChargeCents.Int64,
+			WithBase:                locked.FrozenChargeWithBase.Bool,
+			ChargeFundingAccountID:  uuidFromPg(locked.ChargeFundingAccountID),
+			ChargeFundingGeneration: uuidFromPg(locked.ChargeFundingGeneration),
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return FrozenBoundaryCharge{}, StripeRailStale, err
+		}
+		return surviving, StripeRailClaimed, nil
+	}
+	if locked.Status == string(RunStatusInvoiced) {
+		return FrozenBoundaryCharge{}, StripeRailStale, nil
+	}
+	fundingAuth, err := qtx.StripeFundingAuthorization(ctx, locked.AccountID)
+	if err != nil {
+		return FrozenBoundaryCharge{}, StripeRailStale, err
+	}
+	if !fundingAuth.HasUsablePaymentMethod {
+		return FrozenBoundaryCharge{}, StripeRailNoPaymentMethod, nil
+	}
+	if fundingAuth.StripeCustomerID == "" {
+		return FrozenBoundaryCharge{}, StripeRailStale,
+			errors.New("boundary funder has a usable PM but no Stripe customer id")
+	}
+
 	// WHERE frozen_charge_cents IS NULL makes this first-write-wins; the
 	// terminal-status predicate also refuses a stale freeze after another daemon
 	// completed a zero-charge run. The read-back returns the surviving value
 	// regardless of which freeze won. If the terminal predicate won there is no
 	// value and this method errors before the caller can enter Stripe.
-	if err := s.q.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
-		ID:                   runID.String(),
-		FrozenChargeCents:    pgtype.Int8{Int64: charge.Cents, Valid: true},
-		FrozenChargeWithBase: pgtype.Bool{Bool: charge.WithBase, Valid: true},
+	if err := qtx.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
+		ID:                      runID.String(),
+		FrozenChargeCents:       pgtype.Int8{Int64: charge.Cents, Valid: true},
+		FrozenChargeWithBase:    pgtype.Bool{Bool: charge.WithBase, Valid: true},
+		ChargeFundingAccountID:  fundingAuth.FundingAccountID,
+		ChargeFundingGeneration: fundingAuth.Generation,
 	}); err != nil {
-		return FrozenBoundaryCharge{}, err
+		return FrozenBoundaryCharge{}, StripeRailStale, err
 	}
-	surviving, ok, err := s.BillingRunFrozenCharge(ctx, runID)
+	row, err := qtx.BillingRunFrozenCharge(ctx, runID.String())
 	if err != nil {
-		return FrozenBoundaryCharge{}, err
+		return FrozenBoundaryCharge{}, StripeRailStale, err
 	}
-	if !ok {
-		return FrozenBoundaryCharge{}, fmt.Errorf("billing run %s has no frozen charge immediately after freezing", runID)
+	if !row.FrozenChargeCents.Valid || !row.ChargeFundingAccountID.Valid || !row.ChargeFundingGeneration.Valid {
+		return FrozenBoundaryCharge{}, StripeRailStale, fmt.Errorf("billing run %s has no complete frozen funding claim immediately after freezing", runID)
 	}
-	return surviving, nil
+	surviving := FrozenBoundaryCharge{
+		Cents:                   row.FrozenChargeCents.Int64,
+		WithBase:                row.FrozenChargeWithBase.Bool,
+		ChargeFundingAccountID:  uuidFromPg(row.ChargeFundingAccountID),
+		ChargeFundingGeneration: uuidFromPg(row.ChargeFundingGeneration),
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return FrozenBoundaryCharge{}, StripeRailStale, err
+	}
+	return surviving, StripeRailClaimed, nil
 }
 
 func (s *pgxStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) (FrozenBoundaryCharge, bool, error) {
@@ -1726,9 +1847,14 @@ func (s *pgxStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) 
 	if !row.FrozenChargeCents.Valid {
 		return FrozenBoundaryCharge{}, false, nil // fresh run — no prior attempt froze
 	}
+	if !row.ChargeFundingAccountID.Valid || !row.ChargeFundingGeneration.Valid {
+		return FrozenBoundaryCharge{}, false, fmt.Errorf("billing run %s is frozen without a complete funding claim", runID)
+	}
 	return FrozenBoundaryCharge{
-		Cents:    row.FrozenChargeCents.Int64,
-		WithBase: row.FrozenChargeWithBase.Bool,
+		Cents:                   row.FrozenChargeCents.Int64,
+		WithBase:                row.FrozenChargeWithBase.Bool,
+		ChargeFundingAccountID:  uuidFromPg(row.ChargeFundingAccountID),
+		ChargeFundingGeneration: uuidFromPg(row.ChargeFundingGeneration),
 	}, true, nil
 }
 
@@ -2051,14 +2177,16 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 		return 0, "", err
 	}
 	if err := qtx.UpsertInvoice(ctx, db.UpsertInvoiceParams{
-		AccountID:       pc.Invoice.AccountID.String(),
-		StripeInvoiceID: pc.Invoice.StripeInvoiceID,
-		Status:          pc.Invoice.Status,
-		AmountDue:       due,
-		AmountPaid:      paid,
-		Currency:        pc.Invoice.Currency,
-		PeriodStart:     pgtype.Timestamptz{Time: pc.Invoice.PeriodStart, Valid: !pc.Invoice.PeriodStart.IsZero()},
-		PeriodEnd:       pgtype.Timestamptz{Time: pc.Invoice.PeriodEnd, Valid: !pc.Invoice.PeriodEnd.IsZero()},
+		AccountID:               pc.Invoice.AccountID.String(),
+		ChargeFundingAccountID:  attempt.ChargeFundingAccountID.String(),
+		ChargeFundingGeneration: attempt.ChargeFundingGeneration.String(),
+		StripeInvoiceID:         pc.Invoice.StripeInvoiceID,
+		Status:                  pc.Invoice.Status,
+		AmountDue:               due,
+		AmountPaid:              paid,
+		Currency:                pc.Invoice.Currency,
+		PeriodStart:             pgtype.Timestamptz{Time: pc.Invoice.PeriodStart, Valid: !pc.Invoice.PeriodStart.IsZero()},
+		PeriodEnd:               pgtype.Timestamptz{Time: pc.Invoice.PeriodEnd, Valid: !pc.Invoice.PeriodEnd.IsZero()},
 		// Scenario 5 — the disclosure flag the charge callback computed for the FULL
 		// combined debit (base + co-created overage lines). Dropping it here would
 		// silently write false for every creation/combined invoice.
@@ -2504,11 +2632,29 @@ func (s *pgxStore) InsertModuleOverageTimers(ctx context.Context, accountID, app
 	})
 }
 
-func (s *pgxStore) MarkModuleTimerChargeAttempted(ctx context.Context, timerID uuid.UUID, at time.Time) (int64, error) {
-	return s.q.MarkModuleTimerChargeAttempted(ctx, db.MarkModuleTimerChargeAttemptedParams{
-		ID:                timerID.String(),
-		ChargeAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
+func (s *pgxStore) ArmModuleTimerStripeCharge(ctx context.Context, timerID uuid.UUID, at time.Time) (StripeChargeClaim, error) {
+	row, err := s.q.ArmModuleTimerStripeCharge(ctx, db.ArmModuleTimerStripeChargeParams{
+		TimerID: timerID.String(), AttemptedAt: at,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return StripeChargeClaim{Outcome: StripeRailStale}, nil
+	}
+	if err != nil {
+		return StripeChargeClaim{}, err
+	}
+	claim, err := stripeChargeClaim(row.FundingAccountID, row.FundingGeneration, row.StripeCustomerID)
+	if err != nil {
+		return StripeChargeClaim{}, err
+	}
+	switch {
+	case !row.HasUsablePaymentMethod:
+		claim.Outcome = StripeRailNoPaymentMethod
+	case !row.Armed:
+		claim.Outcome = StripeRailStale
+	default:
+		claim.Outcome = StripeRailClaimed
+	}
+	return claim, nil
 }
 
 func (s *pgxStore) ModuleTimerStillPending(ctx context.Context, timerID uuid.UUID) (bool, error) {
@@ -2548,6 +2694,11 @@ func readCombinedProrationAttempt(ctx context.Context, q *db.Queries, appID uuid
 	if err != nil {
 		return CombinedProrationAttempt{}, false, err
 	}
+	if !row.ChargeFundingAccountID.Valid || !row.ChargeFundingGeneration.Valid {
+		return CombinedProrationAttempt{}, false, fmt.Errorf(
+			"combined proration attempt %s has no pinned funding authorization", appID,
+		)
+	}
 	timerIDs := make([]uuid.UUID, 0, len(timerRows))
 	for _, raw := range timerRows {
 		timerID, err := uuid.Parse(raw)
@@ -2557,8 +2708,10 @@ func readCombinedProrationAttempt(ctx context.Context, q *db.Queries, appID uuid
 		timerIDs = append(timerIDs, timerID)
 	}
 	attempt := CombinedProrationAttempt{
-		AppID:       appID,
-		AttemptedAt: row.AttemptedAt,
+		AppID:                   appID,
+		AttemptedAt:             row.AttemptedAt,
+		ChargeFundingAccountID:  uuidFromPg(row.ChargeFundingAccountID),
+		ChargeFundingGeneration: uuidFromPg(row.ChargeFundingGeneration),
 		Shape: CombinedProrationChargeShape{
 			AccountID:          accountID,
 			Currency:           row.Currency,
@@ -2760,6 +2913,17 @@ func (s *pgxStore) FreezeCombinedProrationAttempt(
 		// can safely retry the full charge through the wallet transaction.
 		return CombinedProrationAttempt{}, StripeRailWalletRequired, nil
 	}
+	fundingAuth, err := qtx.StripeFundingAuthorization(ctx, accountID.String())
+	if err != nil {
+		return CombinedProrationAttempt{}, StripeRailStale, err
+	}
+	if !fundingAuth.HasUsablePaymentMethod {
+		return CombinedProrationAttempt{}, StripeRailNoPaymentMethod, nil
+	}
+	if fundingAuth.StripeCustomerID == "" {
+		return CombinedProrationAttempt{}, StripeRailStale,
+			errors.New("combined proration funder has a usable PM but no Stripe customer id")
+	}
 
 	var selected []string
 	if shape.ModuleChargeMicros > 0 && shape.ModuleChargeCents > 0 {
@@ -2815,26 +2979,28 @@ func (s *pgxStore) FreezeCombinedProrationAttempt(
 	}
 	at = at.UTC()
 	if err := qtx.InsertCombinedProrationAttempt(ctx, db.InsertCombinedProrationAttemptParams{
-		AppID:               appID.String(),
-		AccountID:           accountID.String(),
-		AttemptedAt:         at,
-		Currency:            shape.Currency,
-		BaseChargeMicros:    shape.BaseChargeMicros,
-		BaseChargeCents:     shape.BaseChargeCents,
-		ModuleChargeMicros:  shape.ModuleChargeMicros,
-		ModuleChargeCents:   shape.ModuleChargeCents,
-		TimerCount:          int32(len(selected)), //nolint:gosec // checked against MaxInt32 above
-		CoverageStart:       shape.CoverageStart,
-		CoverageEnd:         shape.CoverageEnd,
-		BaseDescription:     shape.BaseDescription,
-		ModuleDescription:   shape.ModuleDescription,
-		SnapshotPeriodStart: shape.Snapshot.PeriodStart,
-		SnapshotPeriodEnd:   shape.Snapshot.PeriodEnd,
-		SnapshotBaseMicros:  shape.Snapshot.BaseMicros,
-		SnapshotModuleCount: int32(shape.Snapshot.ModuleCount), //nolint:gosec // validated ≤ maxModuleCount
-		StraddlePeriodStart: straddleStart,
-		StraddlePeriodEnd:   straddleEnd,
-		StraddleBaseMicros:  straddleMicros,
+		AppID:                   appID.String(),
+		AccountID:               accountID.String(),
+		ChargeFundingAccountID:  fundingAuth.FundingAccountID,
+		ChargeFundingGeneration: fundingAuth.Generation,
+		AttemptedAt:             at,
+		Currency:                shape.Currency,
+		BaseChargeMicros:        shape.BaseChargeMicros,
+		BaseChargeCents:         shape.BaseChargeCents,
+		ModuleChargeMicros:      shape.ModuleChargeMicros,
+		ModuleChargeCents:       shape.ModuleChargeCents,
+		TimerCount:              int32(len(selected)), //nolint:gosec // checked against MaxInt32 above
+		CoverageStart:           shape.CoverageStart,
+		CoverageEnd:             shape.CoverageEnd,
+		BaseDescription:         shape.BaseDescription,
+		ModuleDescription:       shape.ModuleDescription,
+		SnapshotPeriodStart:     shape.Snapshot.PeriodStart,
+		SnapshotPeriodEnd:       shape.Snapshot.PeriodEnd,
+		SnapshotBaseMicros:      shape.Snapshot.BaseMicros,
+		SnapshotModuleCount:     int32(shape.Snapshot.ModuleCount), //nolint:gosec // validated ≤ maxModuleCount
+		StraddlePeriodStart:     straddleStart,
+		StraddlePeriodEnd:       straddleEnd,
+		StraddleBaseMicros:      straddleMicros,
 	}); err != nil {
 		return CombinedProrationAttempt{}, StripeRailStale, err
 	}
@@ -3052,6 +3218,8 @@ func (s *pgxStore) ModuleOverageTimersPastGrace(ctx context.Context, at time.Tim
 		}
 		if r.ChargeAttemptedAt.Valid {
 			cand.ChargeAttemptedAt = r.ChargeAttemptedAt.Time
+			cand.ChargeFundingAccountID = uuidFromPg(r.ChargeFundingAccountID)
+			cand.ChargeFundingGeneration = uuidFromPg(r.ChargeFundingGeneration)
 		}
 		out = append(out, cand)
 	}
@@ -3361,6 +3529,8 @@ func (s *pgxStore) DomainsPendingCharge(ctx context.Context, at time.Time) ([]Do
 		}
 		if row.ChargeAttemptedAt.Valid {
 			cand.ChargeAttemptedAt = row.ChargeAttemptedAt.Time
+			cand.ChargeFundingAccountID = uuidFromPg(row.ChargeFundingAccountID)
+			cand.ChargeFundingGeneration = uuidFromPg(row.ChargeFundingGeneration)
 		}
 		out = append(out, cand)
 	}
@@ -3375,11 +3545,29 @@ func (s *pgxStore) DomainStillPending(ctx context.Context, domainID uuid.UUID) (
 	return pending, err
 }
 
-func (s *pgxStore) MarkDomainChargeAttempted(ctx context.Context, domainID uuid.UUID, at time.Time) error {
-	return s.q.MarkDomainChargeAttempted(ctx, db.MarkDomainChargeAttemptedParams{
-		ID:                domainID.String(),
-		ChargeAttemptedAt: pgtype.Timestamptz{Time: at, Valid: true},
+func (s *pgxStore) ArmDomainStripeCharge(ctx context.Context, domainID uuid.UUID, at time.Time) (StripeChargeClaim, error) {
+	row, err := s.q.ArmDomainStripeCharge(ctx, db.ArmDomainStripeChargeParams{
+		DomainID: domainID.String(), AttemptedAt: at,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return StripeChargeClaim{Outcome: StripeRailStale}, nil
+	}
+	if err != nil {
+		return StripeChargeClaim{}, err
+	}
+	claim, err := stripeChargeClaim(row.FundingAccountID, row.FundingGeneration, row.StripeCustomerID)
+	if err != nil {
+		return StripeChargeClaim{}, err
+	}
+	switch {
+	case !row.HasUsablePaymentMethod:
+		claim.Outcome = StripeRailNoPaymentMethod
+	case !row.Armed:
+		claim.Outcome = StripeRailStale
+	default:
+		claim.Outcome = StripeRailClaimed
+	}
+	return claim, nil
 }
 
 func (s *pgxStore) MarkDomainChargeResolved(ctx context.Context, domainID uuid.UUID) error {

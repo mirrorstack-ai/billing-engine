@@ -99,7 +99,7 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 		// on the same account to set status='duplicate'.
 		Fingerprint: pm.Card.Fingerprint,
 	}
-	found, becameDefault, err := r.store.InsertPaymentMethod(ctx, pm.Customer.ID, params)
+	found, becameDefault, retired, err := r.store.InsertPaymentMethod(ctx, pm.Customer.ID, params)
 	if err != nil {
 		r.log.ErrorContext(ctx, "payment_method.attached insert failed", "event_id", event.ID, "error", err)
 		return Result{HTTPStatus: 500, Status: StatusInternal}
@@ -107,6 +107,14 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 	if !found {
 		r.log.WarnContext(ctx, "payment_method.attached drift: no accounts row for customer", "event_id", event.ID, "stripe_customer_id", pm.Customer.ID)
 		return Result{HTTPStatus: 200, Status: StatusDriftWarning}
+	}
+	if retired {
+		// A delayed or redelivered attach for a retired organization is already
+		// obsolete. The store made the active-vs-retired decision behind the
+		// lifecycle barrier, so acknowledge it without restoring a mirror row or
+		// running any downstream Stripe/default/activation/request side effect.
+		r.log.InfoContext(ctx, "payment_method.attached ignored for retired organization", "event_id", event.ID, "stripe_customer_id", pm.Customer.ID, "stripe_payment_method_id", pm.ID)
+		return Result{HTTPStatus: 200, Status: StatusOK}
 	}
 	if becameDefault {
 		if err := r.pmSetter.SetDefaultPaymentMethod(ctx, pm.Customer.ID, pm.ID); err != nil {

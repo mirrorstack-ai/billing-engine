@@ -180,10 +180,10 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 		return nil, InvalidInput("invoice is not payable")
 	}
 
-	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
-	if err != nil {
-		return nil, Internal("funding account lookup failed", err)
+	if target.FundingLegacyUnresolved || target.ChargeFundingAccountID == uuid.Nil {
+		return nil, InvalidInput("invoice funding account is unresolved — contact support")
 	}
+	fundingID := target.ChargeFundingAccountID
 	hasPM, err := s.store.HasUsableDefaultPM(ctx, fundingID)
 	if err != nil {
 		return nil, Internal("usable PM check failed", err)
@@ -192,12 +192,9 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 		return nil, PaymentRequired("no usable payment card on file; add a card before paying")
 	}
 
-	// Gate/charge coherence: Stripe collects from the INVOICE's customer,
-	// frozen at invoice creation — while the gates above checked the owner's
-	// CURRENT funding account. After an org funding-designation switch the
-	// two diverge, and paying would charge the previous funding account's
-	// card. The mirror doesn't carry the invoice's customer, so read it from
-	// Stripe and compare before any money moves.
+	// Gate/charge coherence: Stripe collects from the invoice's immutable
+	// Customer, so use the exact funder persisted with that invoice rather than
+	// following the owner's mutable current designation.
 	fundingCustomer, err := s.store.AccountStripeCustomer(ctx, fundingID)
 	if err != nil {
 		return nil, Internal("funding customer lookup failed", err)

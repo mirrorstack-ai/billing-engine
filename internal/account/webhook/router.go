@@ -86,7 +86,7 @@ type Store interface {
 	// reflects the row's advisory first-card default on insert and same-PM replay,
 	// and means it must also be written to the Stripe Customer. An insert-time
 	// dedupe skip returns false because that PM id was never mirrored.
-	InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (found bool, becameDefault bool, err error)
+	InsertPaymentMethod(ctx context.Context, stripeCustomerID string, pm InsertPaymentMethodParams) (found bool, becameDefault bool, retired bool, err error)
 
 	// StampAccountActivated freezes the billing-period anchor (migration 025):
 	// the first-card-bind instant, keyed by stripe_customer_id. FIRST-BIND-WINS

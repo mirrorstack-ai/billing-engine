@@ -328,6 +328,7 @@ func TestSetCreditBillingMode_Integration_PartialWalletDrawGuardsModeFlipUntilRu
 	changed, err := billingStore.SetCreditBillingMode(
 		ctx,
 		accountID,
+		nil,
 		billing.BillingModeStandard,
 		updatedLimit,
 	)
@@ -337,6 +338,7 @@ func TestSetCreditBillingMode_Integration_PartialWalletDrawGuardsModeFlipUntilRu
 	changed, err = billingStore.SetCreditBillingMode(
 		ctx,
 		accountID,
+		nil,
 		billing.BillingModeStandard,
 		updatedLimit,
 	)
@@ -479,6 +481,7 @@ func TestSetCreditBillingMode_Integration_ConcurrentModeFlipAndDrawSerializeToCo
 		changed, setErr := billingStore.SetCreditBillingMode(
 			ctx,
 			accountID,
+			nil,
 			billing.BillingModeCredits,
 			billing.DefaultCreditsLimitMicros,
 		)

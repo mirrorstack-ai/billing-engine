@@ -159,11 +159,12 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		require.False(t, reclaimed)
 
 		const frozenCents int64 = 137
-		frozen, err := store.FreezeBillingRunCharge(ctx, runID, cycle.FrozenBoundaryCharge{
+		frozen, claim, err := store.FreezeBillingRunCharge(ctx, runID, cycle.FrozenBoundaryCharge{
 			Cents:    frozenCents,
 			WithBase: true,
 		})
 		require.NoError(t, err)
+		require.Equal(t, cycle.StripeRailClaimed, claim)
 		require.EqualValues(t, frozenCents, frozen.Cents)
 		require.True(t, frozen.WithBase)
 		require.NoError(t, store.MarkBillingRun(ctx, runID, cycle.RunStatusFailed, "in_stale", 999))
@@ -202,13 +203,15 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 	t.Run("reclaimed frozen equal to zero", func(t *testing.T) {
 		store := cycle.NewStore(pool)
 		accountID := seedAccount(t, pool)
+		installStandardPaymentMethod(t, pool, accountID, "cus_standard_frozen_zero")
 
 		runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.True(t, shouldCharge)
 		require.False(t, reclaimed)
-		_, err = store.FreezeBillingRunCharge(ctx, runID, cycle.FrozenBoundaryCharge{})
+		_, claim, err := store.FreezeBillingRunCharge(ctx, runID, cycle.FrozenBoundaryCharge{})
 		require.NoError(t, err)
+		require.Equal(t, cycle.StripeRailClaimed, claim)
 		require.NoError(t, store.MarkBillingRun(ctx, runID, cycle.RunStatusFailed, "", 0))
 
 		sc := newFakeStripe()
@@ -253,18 +256,19 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 
 			type freezeResult struct {
 				charge cycle.FrozenBoundaryCharge
+				claim  cycle.StripeRailClaimOutcome
 				err    error
 			}
 			started := make(chan struct{})
 			result := make(chan freezeResult, 1)
 			go func() {
 				close(started)
-				charge, freezeErr := store.FreezeBillingRunCharge(
+				charge, claim, freezeErr := store.FreezeBillingRunCharge(
 					ctx,
 					runID,
 					cycle.FrozenBoundaryCharge{Cents: 211, WithBase: true},
 				)
-				result <- freezeResult{charge: charge, err: freezeErr}
+				result <- freezeResult{charge: charge, claim: claim, err: freezeErr}
 			}()
 			<-started
 			select {
@@ -276,7 +280,8 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 			require.NoError(t, tx.Commit(ctx))
 			select {
 			case got := <-result:
-				require.Error(t, got.err,
+				require.NoError(t, got.err)
+				require.Equal(t, cycle.StripeRailStale, got.claim,
 					"a freeze that loses to terminal invoiced must not manufacture a charge")
 			case <-time.After(5 * time.Second):
 				t.Fatal("stale freeze did not resume after terminal commit")
@@ -299,10 +304,15 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 			tx, err := pool.Begin(ctx)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = tx.Rollback(ctx) })
-			err = db.New(tx).FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
-				ID:                   runID.String(),
-				FrozenChargeCents:    pgtype.Int8{Int64: 311, Valid: true},
-				FrozenChargeWithBase: pgtype.Bool{Bool: false, Valid: true},
+			qtx := db.New(tx)
+			fundingAuth, err := qtx.StripeFundingAuthorization(ctx, accountID.String())
+			require.NoError(t, err)
+			err = qtx.FreezeBillingRunCharge(ctx, db.FreezeBillingRunChargeParams{
+				ID:                      runID.String(),
+				FrozenChargeCents:       pgtype.Int8{Int64: 311, Valid: true},
+				FrozenChargeWithBase:    pgtype.Bool{Bool: false, Valid: true},
+				ChargeFundingAccountID:  fundingAuth.FundingAccountID,
+				ChargeFundingGeneration: fundingAuth.Generation,
 			})
 			require.NoError(t, err)
 

@@ -12,6 +12,130 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const armPendingCreditPurchase = `-- name: ArmPendingCreditPurchase :one
+WITH target AS MATERIALIZED (
+    SELECT purchase.id,
+           purchase.account_id,
+           purchase.charge_funding_account_id,
+           purchase.charge_funding_generation,
+           purchase.attempt_stripe_customer_id,
+           purchase.stripe_invoice_id
+    FROM ms_billing.credit_ledger purchase
+    WHERE purchase.id = $1::uuid
+      AND purchase.account_id = $2::uuid
+      AND purchase.type = 'purchase'
+      AND purchase.status = 'pending'
+      AND NOT purchase.charge_funding_legacy_unresolved
+    FOR UPDATE
+), funding_authorization AS MATERIALIZED (
+    SELECT target.id,
+           funding_auth.funding_account_id,
+           funding_auth.generation,
+           funding.stripe_customer_id
+    FROM target
+    JOIN ms_billing.account_funding_authorizations funding_auth
+      ON funding_auth.account_id = target.account_id
+    JOIN ms_billing.accounts funding
+      ON funding.id = funding_auth.funding_account_id
+    WHERE target.charge_funding_account_id IS NULL
+      AND target.charge_funding_generation IS NULL
+      AND target.attempt_stripe_customer_id IS NULL
+      AND target.stripe_invoice_id IS NULL
+      AND NULLIF(BTRIM(funding.stripe_customer_id), '') IS NOT NULL
+), claim AS MATERIALIZED (
+    SELECT target.id,
+           COALESCE(target.charge_funding_account_id,
+                    funding_authorization.funding_account_id) AS funding_account_id,
+           COALESCE(target.charge_funding_generation,
+                    funding_authorization.generation) AS generation,
+           COALESCE(target.attempt_stripe_customer_id,
+                    funding_authorization.stripe_customer_id) AS stripe_customer_id
+    FROM target
+    LEFT JOIN funding_authorization
+      ON funding_authorization.id = target.id
+    WHERE (
+        target.charge_funding_account_id IS NOT NULL
+        AND target.charge_funding_generation IS NOT NULL
+        AND NULLIF(BTRIM(target.attempt_stripe_customer_id), '') IS NOT NULL
+    ) OR funding_authorization.id IS NOT NULL
+), armed AS (
+    UPDATE ms_billing.credit_ledger purchase
+    SET charge_funding_account_id = claim.funding_account_id,
+        charge_funding_generation = claim.generation,
+        attempt_stripe_customer_id = claim.stripe_customer_id
+    FROM claim
+    WHERE purchase.id = claim.id
+    RETURNING purchase.id, purchase.account_id, purchase.amount_micros, purchase.type, purchase.status, purchase.balance_after_micros, purchase.actor, purchase.idempotency_key, purchase.stripe_invoice_id, purchase.receipt_url, purchase.expires_at, purchase.period_id, purchase.source_credit_id, purchase.created_at, purchase.attempt_payment_method_id, purchase.attempt_stripe_payment_method_id, purchase.attempt_stripe_customer_id, purchase.attempt_expires_at, purchase.failure_code, purchase.charge_funding_account_id, purchase.charge_funding_generation, purchase.charge_funding_legacy_unresolved
+)
+SELECT id,
+       account_id,
+       amount_micros,
+       type,
+       status,
+       balance_after_micros,
+       actor,
+       COALESCE(idempotency_key, '')::text AS idempotency_key,
+       COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
+       COALESCE(receipt_url, '')::text AS receipt_url,
+       charge_funding_account_id,
+       charge_funding_generation,
+       COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+       charge_funding_legacy_unresolved,
+       created_at
+FROM armed
+`
+
+type ArmPendingCreditPurchaseParams struct {
+	PurchaseID string `json:"purchase_id"`
+	AccountID  string `json:"account_id"`
+}
+
+type ArmPendingCreditPurchaseRow struct {
+	ID                            string      `json:"id"`
+	AccountID                     string      `json:"account_id"`
+	AmountMicros                  int64       `json:"amount_micros"`
+	Type                          string      `json:"type"`
+	Status                        string      `json:"status"`
+	BalanceAfterMicros            int64       `json:"balance_after_micros"`
+	Actor                         string      `json:"actor"`
+	IdempotencyKey                string      `json:"idempotency_key"`
+	StripeInvoiceID               string      `json:"stripe_invoice_id"`
+	ReceiptUrl                    string      `json:"receipt_url"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
+	AttemptStripeCustomerID       string      `json:"attempt_stripe_customer_id"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	CreatedAt                     time.Time   `json:"created_at"`
+}
+
+// ArmPendingCreditPurchase is the manual-purchase money boundary. It either
+// reuses the row's immutable claim or snapshots the current rotating funding
+// authorization plus its Stripe Customer in the same statement. The update
+// trigger acquires both customer and funder lifecycle locks before this commit;
+// no Stripe request may run until this row is returned.
+func (q *Queries) ArmPendingCreditPurchase(ctx context.Context, arg ArmPendingCreditPurchaseParams) (ArmPendingCreditPurchaseRow, error) {
+	row := q.db.QueryRow(ctx, armPendingCreditPurchase, arg.PurchaseID, arg.AccountID)
+	var i ArmPendingCreditPurchaseRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AmountMicros,
+		&i.Type,
+		&i.Status,
+		&i.BalanceAfterMicros,
+		&i.Actor,
+		&i.IdempotencyKey,
+		&i.StripeInvoiceID,
+		&i.ReceiptUrl,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+		&i.AttemptStripeCustomerID,
+		&i.ChargeFundingLegacyUnresolved,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const attachCreditPurchaseInvoice = `-- name: AttachCreditPurchaseInvoice :one
 UPDATE ms_billing.credit_ledger
 SET stripe_invoice_id = $1::text,
@@ -23,6 +147,10 @@ WHERE id = $3::uuid
   AND account_id = $4::uuid
   AND type = 'purchase'
   AND status = 'pending'
+  AND NOT charge_funding_legacy_unresolved
+  AND charge_funding_account_id IS NOT NULL
+  AND charge_funding_generation IS NOT NULL
+  AND attempt_stripe_customer_id = $5::text
   AND (
       stripe_invoice_id IS NULL
       OR stripe_invoice_id = $1::text
@@ -38,28 +166,37 @@ RETURNING
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at
 `
 
 type AttachCreditPurchaseInvoiceParams struct {
-	StripeInvoiceID string `json:"stripe_invoice_id"`
-	ReceiptUrl      string `json:"receipt_url"`
-	PurchaseID      string `json:"purchase_id"`
-	AccountID       string `json:"account_id"`
+	StripeInvoiceID  string `json:"stripe_invoice_id"`
+	ReceiptUrl       string `json:"receipt_url"`
+	PurchaseID       string `json:"purchase_id"`
+	AccountID        string `json:"account_id"`
+	StripeCustomerID string `json:"stripe_customer_id"`
 }
 
 type AttachCreditPurchaseInvoiceRow struct {
-	ID                 string    `json:"id"`
-	AccountID          string    `json:"account_id"`
-	AmountMicros       int64     `json:"amount_micros"`
-	Type               string    `json:"type"`
-	Status             string    `json:"status"`
-	BalanceAfterMicros int64     `json:"balance_after_micros"`
-	Actor              string    `json:"actor"`
-	IdempotencyKey     string    `json:"idempotency_key"`
-	StripeInvoiceID    string    `json:"stripe_invoice_id"`
-	ReceiptUrl         string    `json:"receipt_url"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                            string      `json:"id"`
+	AccountID                     string      `json:"account_id"`
+	AmountMicros                  int64       `json:"amount_micros"`
+	Type                          string      `json:"type"`
+	Status                        string      `json:"status"`
+	BalanceAfterMicros            int64       `json:"balance_after_micros"`
+	Actor                         string      `json:"actor"`
+	IdempotencyKey                string      `json:"idempotency_key"`
+	StripeInvoiceID               string      `json:"stripe_invoice_id"`
+	ReceiptUrl                    string      `json:"receipt_url"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
+	AttemptStripeCustomerID       string      `json:"attempt_stripe_customer_id"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	CreatedAt                     time.Time   `json:"created_at"`
 }
 
 // AttachCreditPurchaseInvoice records Stripe's durable invoice identity and
@@ -72,6 +209,7 @@ func (q *Queries) AttachCreditPurchaseInvoice(ctx context.Context, arg AttachCre
 		arg.ReceiptUrl,
 		arg.PurchaseID,
 		arg.AccountID,
+		arg.StripeCustomerID,
 	)
 	var i AttachCreditPurchaseInvoiceRow
 	err := row.Scan(
@@ -85,6 +223,10 @@ func (q *Queries) AttachCreditPurchaseInvoice(ctx context.Context, arg AttachCre
 		&i.IdempotencyKey,
 		&i.StripeInvoiceID,
 		&i.ReceiptUrl,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+		&i.AttemptStripeCustomerID,
+		&i.ChargeFundingLegacyUnresolved,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -114,6 +256,10 @@ RETURNING
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at
 `
 
@@ -126,17 +272,21 @@ type FinalizeCreditPurchaseParams struct {
 }
 
 type FinalizeCreditPurchaseRow struct {
-	ID                 string    `json:"id"`
-	AccountID          string    `json:"account_id"`
-	AmountMicros       int64     `json:"amount_micros"`
-	Type               string    `json:"type"`
-	Status             string    `json:"status"`
-	BalanceAfterMicros int64     `json:"balance_after_micros"`
-	Actor              string    `json:"actor"`
-	IdempotencyKey     string    `json:"idempotency_key"`
-	StripeInvoiceID    string    `json:"stripe_invoice_id"`
-	ReceiptUrl         string    `json:"receipt_url"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                            string      `json:"id"`
+	AccountID                     string      `json:"account_id"`
+	AmountMicros                  int64       `json:"amount_micros"`
+	Type                          string      `json:"type"`
+	Status                        string      `json:"status"`
+	BalanceAfterMicros            int64       `json:"balance_after_micros"`
+	Actor                         string      `json:"actor"`
+	IdempotencyKey                string      `json:"idempotency_key"`
+	StripeInvoiceID               string      `json:"stripe_invoice_id"`
+	ReceiptUrl                    string      `json:"receipt_url"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
+	AttemptStripeCustomerID       string      `json:"attempt_stripe_customer_id"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	CreatedAt                     time.Time   `json:"created_at"`
 }
 
 // FinalizeCreditPurchase is the sole purchase status transition primitive.
@@ -163,6 +313,10 @@ func (q *Queries) FinalizeCreditPurchase(ctx context.Context, arg FinalizeCredit
 		&i.IdempotencyKey,
 		&i.StripeInvoiceID,
 		&i.ReceiptUrl,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+		&i.AttemptStripeCustomerID,
+		&i.ChargeFundingLegacyUnresolved,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -324,6 +478,10 @@ SELECT
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     expires_at,
     created_at
 FROM ms_billing.credit_ledger
@@ -331,18 +489,22 @@ WHERE idempotency_key = $1::text
 `
 
 type GetCreditLedgerEntryByIdempotencyKeyRow struct {
-	ID                 string             `json:"id"`
-	AccountID          string             `json:"account_id"`
-	AmountMicros       int64              `json:"amount_micros"`
-	Type               string             `json:"type"`
-	Status             string             `json:"status"`
-	BalanceAfterMicros int64              `json:"balance_after_micros"`
-	Actor              string             `json:"actor"`
-	IdempotencyKey     string             `json:"idempotency_key"`
-	StripeInvoiceID    string             `json:"stripe_invoice_id"`
-	ReceiptUrl         string             `json:"receipt_url"`
-	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
-	CreatedAt          time.Time          `json:"created_at"`
+	ID                            string             `json:"id"`
+	AccountID                     string             `json:"account_id"`
+	AmountMicros                  int64              `json:"amount_micros"`
+	Type                          string             `json:"type"`
+	Status                        string             `json:"status"`
+	BalanceAfterMicros            int64              `json:"balance_after_micros"`
+	Actor                         string             `json:"actor"`
+	IdempotencyKey                string             `json:"idempotency_key"`
+	StripeInvoiceID               string             `json:"stripe_invoice_id"`
+	ReceiptUrl                    string             `json:"receipt_url"`
+	ChargeFundingAccountID        pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID        `json:"charge_funding_generation"`
+	AttemptStripeCustomerID       string             `json:"attempt_stripe_customer_id"`
+	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
+	ExpiresAt                     pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt                     time.Time          `json:"created_at"`
 }
 
 // GetCreditLedgerEntryByIdempotencyKey resolves the migration-048 global
@@ -363,6 +525,10 @@ func (q *Queries) GetCreditLedgerEntryByIdempotencyKey(ctx context.Context, idem
 		&i.IdempotencyKey,
 		&i.StripeInvoiceID,
 		&i.ReceiptUrl,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+		&i.AttemptStripeCustomerID,
+		&i.ChargeFundingLegacyUnresolved,
 		&i.ExpiresAt,
 		&i.CreatedAt,
 	)
@@ -381,6 +547,10 @@ SELECT
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at
 FROM ms_billing.credit_ledger
 WHERE id = $1::uuid
@@ -395,17 +565,21 @@ type GetCreditPurchaseByIDParams struct {
 }
 
 type GetCreditPurchaseByIDRow struct {
-	ID                 string    `json:"id"`
-	AccountID          string    `json:"account_id"`
-	AmountMicros       int64     `json:"amount_micros"`
-	Type               string    `json:"type"`
-	Status             string    `json:"status"`
-	BalanceAfterMicros int64     `json:"balance_after_micros"`
-	Actor              string    `json:"actor"`
-	IdempotencyKey     string    `json:"idempotency_key"`
-	StripeInvoiceID    string    `json:"stripe_invoice_id"`
-	ReceiptUrl         string    `json:"receipt_url"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                            string      `json:"id"`
+	AccountID                     string      `json:"account_id"`
+	AmountMicros                  int64       `json:"amount_micros"`
+	Type                          string      `json:"type"`
+	Status                        string      `json:"status"`
+	BalanceAfterMicros            int64       `json:"balance_after_micros"`
+	Actor                         string      `json:"actor"`
+	IdempotencyKey                string      `json:"idempotency_key"`
+	StripeInvoiceID               string      `json:"stripe_invoice_id"`
+	ReceiptUrl                    string      `json:"receipt_url"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
+	AttemptStripeCustomerID       string      `json:"attempt_stripe_customer_id"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	CreatedAt                     time.Time   `json:"created_at"`
 }
 
 // GetCreditPurchaseByID scopes the Finish RPC handle to its owning account.
@@ -425,6 +599,10 @@ func (q *Queries) GetCreditPurchaseByID(ctx context.Context, arg GetCreditPurcha
 		&i.IdempotencyKey,
 		&i.StripeInvoiceID,
 		&i.ReceiptUrl,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+		&i.AttemptStripeCustomerID,
+		&i.ChargeFundingLegacyUnresolved,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -654,6 +832,10 @@ RETURNING
     COALESCE(idempotency_key, '')::text AS idempotency_key,
     COALESCE(stripe_invoice_id, '')::text AS stripe_invoice_id,
     COALESCE(receipt_url, '')::text AS receipt_url,
+    charge_funding_account_id,
+    charge_funding_generation,
+    COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    charge_funding_legacy_unresolved,
     created_at
 `
 
@@ -665,17 +847,21 @@ type InsertPendingCreditPurchaseParams struct {
 }
 
 type InsertPendingCreditPurchaseRow struct {
-	ID                 string    `json:"id"`
-	AccountID          string    `json:"account_id"`
-	AmountMicros       int64     `json:"amount_micros"`
-	Type               string    `json:"type"`
-	Status             string    `json:"status"`
-	BalanceAfterMicros int64     `json:"balance_after_micros"`
-	Actor              string    `json:"actor"`
-	IdempotencyKey     string    `json:"idempotency_key"`
-	StripeInvoiceID    string    `json:"stripe_invoice_id"`
-	ReceiptUrl         string    `json:"receipt_url"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                            string      `json:"id"`
+	AccountID                     string      `json:"account_id"`
+	AmountMicros                  int64       `json:"amount_micros"`
+	Type                          string      `json:"type"`
+	Status                        string      `json:"status"`
+	BalanceAfterMicros            int64       `json:"balance_after_micros"`
+	Actor                         string      `json:"actor"`
+	IdempotencyKey                string      `json:"idempotency_key"`
+	StripeInvoiceID               string      `json:"stripe_invoice_id"`
+	ReceiptUrl                    string      `json:"receipt_url"`
+	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
+	AttemptStripeCustomerID       string      `json:"attempt_stripe_customer_id"`
+	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	CreatedAt                     time.Time   `json:"created_at"`
 }
 
 // InsertPendingCreditPurchase creates the durable handle before Stripe is
@@ -700,6 +886,10 @@ func (q *Queries) InsertPendingCreditPurchase(ctx context.Context, arg InsertPen
 		&i.IdempotencyKey,
 		&i.StripeInvoiceID,
 		&i.ReceiptUrl,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+		&i.AttemptStripeCustomerID,
+		&i.ChargeFundingLegacyUnresolved,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -1008,6 +1198,37 @@ func (q *Queries) LockCreditAccountBalance(ctx context.Context, accountID string
 	var i LockCreditAccountBalanceRow
 	err := row.Scan(&i.BillingMode, &i.CreditLimitMicros, &i.BalanceMicros)
 	return i, err
+}
+
+const lockDistributorCustomerAccountForMutation = `-- name: LockDistributorCustomerAccountForMutation :one
+SELECT customer.id AS account_id
+FROM ms_billing.org_billing_designations designation
+JOIN ms_billing.accounts distributor
+  ON distributor.id = designation.sponsor_account_id
+ AND distributor.owner_kind = 'org'
+ AND distributor.owner_org_id = $1::uuid
+JOIN ms_billing.accounts customer
+  ON customer.owner_kind = 'org'
+ AND customer.owner_org_id = designation.org_id
+WHERE designation.org_id = $2::uuid
+  AND designation.funding = 'sponsor'
+FOR UPDATE OF designation
+`
+
+type LockDistributorCustomerAccountForMutationParams struct {
+	DistributorOrgID string `json:"distributor_org_id"`
+	CustomerOrgID    string `json:"customer_org_id"`
+}
+
+// LockDistributorCustomerAccountForMutation repeats the exact authority lookup
+// under a row lock. The lock keeps a designation UPDATE/DELETE from revoking or
+// redirecting authority after a distributor mutation has re-authorized inside
+// its write transaction; the relationship change linearizes after that write.
+func (q *Queries) LockDistributorCustomerAccountForMutation(ctx context.Context, arg LockDistributorCustomerAccountForMutationParams) (string, error) {
+	row := q.db.QueryRow(ctx, lockDistributorCustomerAccountForMutation, arg.DistributorOrgID, arg.CustomerOrgID)
+	var account_id string
+	err := row.Scan(&account_id)
+	return account_id, err
 }
 
 const lockWalletAccount = `-- name: LockWalletAccount :one

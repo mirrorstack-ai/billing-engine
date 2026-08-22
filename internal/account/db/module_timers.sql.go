@@ -12,6 +12,121 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const armModuleTimerStripeCharge = `-- name: ArmModuleTimerStripeCharge :one
+WITH target AS MATERIALIZED (
+    SELECT account_id, charge_attempted_at,
+           charge_funding_account_id, charge_funding_generation
+    FROM ms_billing.app_module_overage_timers timer
+    WHERE timer.id = $1::uuid
+      AND timer.removed_at IS NULL
+      AND timer.grace_resolved = false
+      AND NOT timer.charge_funding_legacy_unresolved
+      AND NOT EXISTS (
+          SELECT 1
+          FROM ms_billing.app_combined_proration_attempt_timers owned
+          JOIN ms_billing.app_combined_proration_attempts attempt
+            ON attempt.app_id = owned.app_id
+          WHERE owned.timer_id = timer.id
+            AND attempt.resolved_at IS NULL
+      )
+    FOR UPDATE
+), selected AS MATERIALIZED (
+    SELECT target.account_id,
+           COALESCE(target.charge_funding_account_id,
+                    funding_auth.funding_account_id) AS funding_account_id,
+           COALESCE(target.charge_funding_generation,
+                    funding_auth.generation) AS funding_generation
+    FROM target
+    JOIN ms_billing.account_funding_authorizations funding_auth
+      ON funding_auth.account_id = target.account_id
+), funding AS MATERIALIZED (
+    SELECT selected.account_id,
+           selected.funding_account_id,
+           selected.funding_generation,
+           COALESCE(account.stripe_customer_id, '')::text AS stripe_customer_id,
+           EXISTS (
+               SELECT 1
+               FROM ms_billing.payment_methods_mirror payment_method
+               WHERE payment_method.account_id = selected.funding_account_id
+                 AND payment_method.deleted_at IS NULL
+                 AND (payment_method.exp_year, payment_method.exp_month) >= (
+                     EXTRACT(YEAR FROM current_date)::INT,
+                     EXTRACT(MONTH FROM current_date)::INT
+                 )
+           ) AS has_usable_payment_method
+    FROM selected
+    JOIN ms_billing.accounts account
+      ON account.id = selected.funding_account_id
+), armed AS (
+    UPDATE ms_billing.app_module_overage_timers timer
+    SET charge_attempted_at = COALESCE(timer.charge_attempted_at,
+                                       $2::timestamptz),
+        charge_funding_account_id = COALESCE(
+            timer.charge_funding_account_id,
+            funding.funding_account_id
+        ),
+        charge_funding_generation = COALESCE(
+            timer.charge_funding_generation,
+            funding.funding_generation
+        )
+    FROM funding
+    WHERE timer.id = $1::uuid
+      AND funding.has_usable_payment_method
+    RETURNING timer.id
+)
+SELECT funding.account_id,
+       funding.funding_account_id,
+       funding.funding_generation,
+       funding.stripe_customer_id,
+       funding.has_usable_payment_method,
+       EXISTS (SELECT 1 FROM armed)::boolean AS armed
+FROM funding
+`
+
+type ArmModuleTimerStripeChargeParams struct {
+	TimerID     string    `json:"timer_id"`
+	AttemptedAt time.Time `json:"attempted_at"`
+}
+
+type ArmModuleTimerStripeChargeRow struct {
+	AccountID              string `json:"account_id"`
+	FundingAccountID       string `json:"funding_account_id"`
+	FundingGeneration      string `json:"funding_generation"`
+	StripeCustomerID       string `json:"stripe_customer_id"`
+	HasUsablePaymentMethod bool   `json:"has_usable_payment_method"`
+	Armed                  bool   `json:"armed"`
+}
+
+// ArmModuleTimerStripeCharge stamps the recovery marker (036) BEFORE a
+// charge attempt's first Stripe call. First-write-wins (the FIRST attempt instant
+// is the durable one, preserved by COALESCE); never cleared. The grace_resolved =
+// false guard (billing-engine Job 3 hardening) makes this stamp the serialization
+// point against a concurrent credit-wallet settlement: DrawModuleOverageFromWallet
+// arms grace_resolved (+ grace_charged_at) inside its own row-locked transaction,
+// so a Stripe worker that lost the race matches 0 rows here and MUST abort as stale
+// rather than draft/finalize a second charge on an already-settled timer. Returns
+// rows-affected so the caller can detect the lost race: 0 rows ⟺ grace_resolved is
+// already true. It deliberately does NOT gate on charge_attempted_at IS NULL — a
+// crash-recovery retry (marker set by a prior attempt that died before creating its
+// invoice, with nothing found on Stripe) must still re-charge, so it matches the
+// row (1 affected) while COALESCE keeps the original attempt instant.
+// It also selects and persists the exact rotating funding authorization in the
+// same row-locked statement, so a stale in-memory candidate can never arm one
+// sponsor and then charge another.
+func (q *Queries) ArmModuleTimerStripeCharge(ctx context.Context, arg ArmModuleTimerStripeChargeParams) (ArmModuleTimerStripeChargeRow, error) {
+	row := q.db.QueryRow(ctx, armModuleTimerStripeCharge, arg.TimerID, arg.AttemptedAt)
+	var i ArmModuleTimerStripeChargeRow
+	err := row.Scan(
+		&i.AccountID,
+		&i.FundingAccountID,
+		&i.FundingGeneration,
+		&i.StripeCustomerID,
+		&i.HasUsablePaymentMethod,
+		&i.Armed,
+	)
+	return i, err
+}
+
 const coCreatedOverModuleTimers = `-- name: CoCreatedOverModuleTimers :many
 SELECT id
 FROM (
@@ -270,47 +385,6 @@ func (q *Queries) LiveOverModuleTimerCountForApp(ctx context.Context, arg LiveOv
 	return over_count, err
 }
 
-const markModuleTimerChargeAttempted = `-- name: MarkModuleTimerChargeAttempted :execrows
-UPDATE ms_billing.app_module_overage_timers
-SET charge_attempted_at = COALESCE(charge_attempted_at, $2)
-WHERE id = $1
-  AND grace_resolved = false
-  AND NOT EXISTS (
-      SELECT 1
-      FROM ms_billing.app_combined_proration_attempt_timers owned
-      JOIN ms_billing.app_combined_proration_attempts attempt
-        ON attempt.app_id = owned.app_id
-      WHERE owned.timer_id = ms_billing.app_module_overage_timers.id
-        AND attempt.resolved_at IS NULL
-  )
-`
-
-type MarkModuleTimerChargeAttemptedParams struct {
-	ID                string             `json:"id"`
-	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
-}
-
-// MarkModuleTimerChargeAttempted stamps the recovery marker (036) BEFORE a
-// charge attempt's first Stripe call. First-write-wins (the FIRST attempt instant
-// is the durable one, preserved by COALESCE); never cleared. The grace_resolved =
-// false guard (billing-engine Job 3 hardening) makes this stamp the serialization
-// point against a concurrent credit-wallet settlement: DrawModuleOverageFromWallet
-// arms grace_resolved (+ grace_charged_at) inside its own row-locked transaction,
-// so a Stripe worker that lost the race matches 0 rows here and MUST abort as stale
-// rather than draft/finalize a second charge on an already-settled timer. Returns
-// rows-affected so the caller can detect the lost race: 0 rows ⟺ grace_resolved is
-// already true. It deliberately does NOT gate on charge_attempted_at IS NULL — a
-// crash-recovery retry (marker set by a prior attempt that died before creating its
-// invoice, with nothing found on Stripe) must still re-charge, so it matches the
-// row (1 affected) while COALESCE keeps the original attempt instant.
-func (q *Queries) MarkModuleTimerChargeAttempted(ctx context.Context, arg MarkModuleTimerChargeAttemptedParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markModuleTimerChargeAttempted, arg.ID, arg.ChargeAttemptedAt)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const markModuleTimerCharged = `-- name: MarkModuleTimerCharged :exec
 UPDATE ms_billing.app_module_overage_timers
 SET grace_resolved        = true,
@@ -370,7 +444,8 @@ func (q *Queries) MarkModuleTimerIncluded(ctx context.Context, id string) error 
 
 const moduleOverageTimersPastGrace = `-- name: ModuleOverageTimersPastGrace :many
 SELECT t.id, t.account_id, t.app_id, t.installed_at, t.grace_expires_at,
-       t.charge_attempted_at, a.activated_at
+       t.charge_attempted_at, t.charge_funding_account_id,
+       t.charge_funding_generation, a.activated_at
 FROM ms_billing.app_module_overage_timers t
 JOIN ms_billing.accounts a ON a.id = t.account_id
 WHERE (t.removed_at IS NULL OR t.charge_attempted_at IS NOT NULL)
@@ -381,13 +456,15 @@ ORDER BY t.installed_at, t.id
 `
 
 type ModuleOverageTimersPastGraceRow struct {
-	ID                string             `json:"id"`
-	AccountID         string             `json:"account_id"`
-	AppID             string             `json:"app_id"`
-	InstalledAt       time.Time          `json:"installed_at"`
-	GraceExpiresAt    time.Time          `json:"grace_expires_at"`
-	ChargeAttemptedAt pgtype.Timestamptz `json:"charge_attempted_at"`
-	ActivatedAt       pgtype.Timestamptz `json:"activated_at"`
+	ID                      string             `json:"id"`
+	AccountID               string             `json:"account_id"`
+	AppID                   string             `json:"app_id"`
+	InstalledAt             time.Time          `json:"installed_at"`
+	GraceExpiresAt          time.Time          `json:"grace_expires_at"`
+	ChargeAttemptedAt       pgtype.Timestamptz `json:"charge_attempted_at"`
+	ChargeFundingAccountID  pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration pgtype.UUID        `json:"charge_funding_generation"`
+	ActivatedAt             pgtype.Timestamptz `json:"activated_at"`
 }
 
 // ModuleOverageTimersPastGrace is Leg 1's work list: unresolved install timers
@@ -418,6 +495,8 @@ func (q *Queries) ModuleOverageTimersPastGrace(ctx context.Context, graceExpires
 			&i.InstalledAt,
 			&i.GraceExpiresAt,
 			&i.ChargeAttemptedAt,
+			&i.ChargeFundingAccountID,
+			&i.ChargeFundingGeneration,
 			&i.ActivatedAt,
 		); err != nil {
 			return nil, err
@@ -624,7 +703,7 @@ WITH live_timer_ranks AS (
       AND removed_at IS NULL
 ),
 frozen_headers AS (
-    SELECT attempt.app_id, attempt.account_id, attempt.attempted_at, attempt.currency, attempt.base_charge_micros, attempt.base_charge_cents, attempt.module_charge_micros, attempt.module_charge_cents, attempt.timer_count, attempt.coverage_start, attempt.coverage_end, attempt.base_description, attempt.module_description, attempt.snapshot_period_start, attempt.snapshot_period_end, attempt.snapshot_base_micros, attempt.snapshot_module_count, attempt.straddle_period_start, attempt.straddle_period_end, attempt.straddle_base_micros, attempt.resolved_at, attempt.resolved_invoice_id,
+    SELECT attempt.app_id, attempt.account_id, attempt.attempted_at, attempt.currency, attempt.base_charge_micros, attempt.base_charge_cents, attempt.module_charge_micros, attempt.module_charge_cents, attempt.timer_count, attempt.coverage_start, attempt.coverage_end, attempt.base_description, attempt.module_description, attempt.snapshot_period_start, attempt.snapshot_period_end, attempt.snapshot_base_micros, attempt.snapshot_module_count, attempt.straddle_period_start, attempt.straddle_period_end, attempt.straddle_base_micros, attempt.resolved_at, attempt.resolved_invoice_id, attempt.charge_funding_account_id, attempt.charge_funding_generation, attempt.charge_funding_legacy_unresolved,
            (
                SELECT count(*)::bigint
                FROM ms_billing.app_combined_proration_attempt_timers child

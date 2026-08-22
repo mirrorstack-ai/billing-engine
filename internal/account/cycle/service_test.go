@@ -140,14 +140,19 @@ type fakeStore struct {
 	// seeds each org's pending NULL-account event count, consumed by the
 	// repoint sweep (swept rows never match again); repointCalls records the
 	// sweep's events half so tests can assert the window clamp.
-	accountsByOrg   map[uuid.UUID]uuid.UUID
-	orgDesignations map[uuid.UUID]cycle.OrgDesignation
-	appOwnerOrg     map[uuid.UUID]uuid.UUID
-	orgBacklog      map[uuid.UUID]int64
-	orgNullEvents   map[uuid.UUID]int64
-	repointCalls    []repointCall
-	orgUnswept      []uuid.UUID
-	errOrgResolve   map[uuid.UUID]error
+	accountsByOrg      map[uuid.UUID]uuid.UUID
+	orgDesignations    map[uuid.UUID]cycle.OrgDesignation
+	appOwnerOrg        map[uuid.UUID]uuid.UUID
+	orgBacklog         map[uuid.UUID]int64
+	orgNullEvents      map[uuid.UUID]int64
+	repointCalls       []repointCall
+	orgUnswept         []uuid.UUID
+	errOrgResolve      map[uuid.UUID]error
+	orgDeletionOutcome cycle.OrgDeletionFinalizationOutcome
+	errOrgDeletion     error
+	orgDeletionOrg     uuid.UUID
+	orgDeletionOp      uuid.UUID
+	orgDeletionAt      time.Time
 	// sponsoredOrgs seeds ListSponsoredOrgIDs (sponsor user → the funded,
 	// activated orgs they sponsor) — the /me sponsored-orgs read's roster.
 	sponsoredOrgs map[uuid.UUID][]uuid.UUID
@@ -159,7 +164,8 @@ type fakeStore struct {
 	timers map[uuid.UUID]*fakeTimer
 
 	// captured charge writes
-	insertedRuns  map[string]uuid.UUID                     // (account/start/end) → run id (the idempotency gate state)
+	insertedRuns  map[string]uuid.UUID // (account/start/end) → run id (the idempotency gate state)
+	runAccounts   map[uuid.UUID]uuid.UUID
 	runStatus     map[uuid.UUID]cycle.BillingRunStatus     // run id → current status (models the DB row's terminal state)
 	markedRuns    map[uuid.UUID]markedRun                  // run id → terminal mark
 	invoices      map[string]cycle.InvoiceMirror           // stripe_invoice_id → mirror
@@ -234,21 +240,34 @@ type fakeStore struct {
 	errCoCreatedOver           error // CoCreatedOverModuleTimers
 }
 
+func (f *fakeStore) FinalizeOrgDeletionBilling(
+	_ context.Context,
+	orgID, operationID uuid.UUID,
+	finalizedAt time.Time,
+) (cycle.OrgDeletionFinalizationOutcome, error) {
+	f.orgDeletionOrg = orgID
+	f.orgDeletionOp = operationID
+	f.orgDeletionAt = finalizedAt
+	return f.orgDeletionOutcome, f.errOrgDeletion
+}
+
 // fakeTimer models one ms_billing.app_module_overage_timers row (migration 033).
 type fakeTimer struct {
-	id                 uuid.UUID
-	accountID          uuid.UUID
-	appID              uuid.UUID
-	installedAt        time.Time
-	graceExpiresAt     time.Time
-	removed            bool
-	removedAt          time.Time
-	graceResolved      bool
-	graceCharged       bool
-	graceChargedAt     time.Time
-	graceInvoiceID     string
-	graceInvoiceItemID string
-	chargeAttemptedAt  time.Time // migration-036 recovery marker
+	id                      uuid.UUID
+	accountID               uuid.UUID
+	appID                   uuid.UUID
+	installedAt             time.Time
+	graceExpiresAt          time.Time
+	removed                 bool
+	removedAt               time.Time
+	graceResolved           bool
+	graceCharged            bool
+	graceChargedAt          time.Time
+	graceInvoiceID          string
+	graceInvoiceItemID      string
+	chargeAttemptedAt       time.Time // migration-036 recovery marker
+	chargeFundingAccountID  uuid.UUID
+	chargeFundingGeneration uuid.UUID
 }
 
 type fakeWalletSource struct {
@@ -267,12 +286,14 @@ type fakeWalletDraw struct {
 // fakeDomain carries the migration-047 mirror plus the one-shot activation
 // charge state used by the domain sweep tests.
 type fakeDomain struct {
-	domain              cycle.Domain
-	chargeAttemptedAt   time.Time
-	chargeResolved      bool
-	chargedAt           time.Time
-	chargeInvoiceID     string
-	chargeInvoiceItemID string
+	domain                  cycle.Domain
+	chargeAttemptedAt       time.Time
+	chargeFundingAccountID  uuid.UUID
+	chargeFundingGeneration uuid.UUID
+	chargeResolved          bool
+	chargedAt               time.Time
+	chargeInvoiceID         string
+	chargeInvoiceItemID     string
 }
 
 // snapKey mirrors the app_base_snapshots PRIMARY KEY (app_id, period_start).
@@ -315,6 +336,7 @@ func newFakeStore() *fakeStore {
 		settlements:               map[string]cycle.ModuleSettlement{},
 		insertedRuns:              map[string]uuid.UUID{},
 		runStatus:                 map[uuid.UUID]cycle.BillingRunStatus{},
+		runAccounts:               map[uuid.UUID]uuid.UUID{},
 		markedRuns:                map[uuid.UUID]markedRun{},
 		invoices:                  map[string]cycle.InvoiceMirror{},
 		frozenCharges:             map[uuid.UUID]cycle.FrozenBoundaryCharge{},
@@ -459,6 +481,7 @@ func (f *fakeStore) InsertBillingRun(_ context.Context, accountID uuid.UUID, sta
 	}
 	id := uuid.New()
 	f.insertedRuns[k] = id
+	f.runAccounts[id] = accountID
 	f.runStatus[id] = "pending"
 	return id, true, false, nil
 }
@@ -595,6 +618,15 @@ func (f *fakeStore) DrawBillingRunWalletCredits(
 		hook(f, runID)
 	}
 	if frozen, exists := f.frozenCharges[runID]; exists {
+		if frozen.ChargeFundingAccountID == uuid.Nil {
+			funder, err := f.ChargeFundingAccount(ctx, accountID)
+			if err != nil {
+				return cycle.WalletDrawdown{}, err
+			}
+			frozen.ChargeFundingAccountID = funder
+			frozen.ChargeFundingGeneration = uuid.New()
+			f.frozenCharges[runID] = frozen
+		}
 		// A marker that won before the transaction's run-row lock forbids any
 		// fresh debit, but an already-recorded period debit is recoverable.
 		draw, err := f.DrawWalletCredits(
@@ -630,9 +662,15 @@ func (f *fakeStore) DrawBillingRunWalletCredits(
 			remainderCents++
 		}
 		if _, exists := f.frozenCharges[runID]; !exists {
+			funder, err := f.ChargeFundingAccount(ctx, accountID)
+			if err != nil {
+				return cycle.WalletDrawdown{}, err
+			}
 			f.frozenCharges[runID] = cycle.FrozenBoundaryCharge{
-				Cents:    remainderCents,
-				WithBase: withBase,
+				Cents:                   remainderCents,
+				WithBase:                withBase,
+				ChargeFundingAccountID:  funder,
+				ChargeFundingGeneration: uuid.New(),
 			}
 		}
 		draw.BoundaryCharge = f.frozenCharges[runID]
@@ -740,9 +778,9 @@ func (f *fakeStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID 
 	return true, nil
 }
 
-func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, charge cycle.FrozenBoundaryCharge) (cycle.FrozenBoundaryCharge, error) {
+func (f *fakeStore) FreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, charge cycle.FrozenBoundaryCharge) (cycle.FrozenBoundaryCharge, cycle.StripeRailClaimOutcome, error) {
 	if f.errFreezeCharge != nil {
-		return cycle.FrozenBoundaryCharge{}, f.errFreezeCharge
+		return cycle.FrozenBoundaryCharge{}, cycle.StripeRailStale, f.errFreezeCharge
 	}
 	// onFreezeCharge, when set, runs BEFORE this process's write — modeling a
 	// concurrent second daemon that reclaimed the same run and froze first (its
@@ -752,7 +790,7 @@ func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, c
 		f.onFreezeCharge(runID)
 	}
 	if f.runStatus[runID] == cycle.RunStatusInvoiced {
-		return cycle.FrozenBoundaryCharge{}, fmt.Errorf(
+		return cycle.FrozenBoundaryCharge{}, cycle.StripeRailStale, fmt.Errorf(
 			"billing run %s has no frozen charge immediately after freezing",
 			runID,
 		)
@@ -760,16 +798,45 @@ func (f *fakeStore) FreezeBillingRunCharge(_ context.Context, runID uuid.UUID, c
 	// First-write-wins, returning the SURVIVING value (mirrors the SQL's
 	// WHERE frozen_charge_cents IS NULL AND status <> 'invoiced' + read-back).
 	if _, exists := f.frozenCharges[runID]; !exists {
+		accountID := f.runAccounts[runID]
+		funder, err := f.ChargeFundingAccount(ctx, accountID)
+		if err != nil {
+			return cycle.FrozenBoundaryCharge{}, cycle.StripeRailStale, err
+		}
+		hasPM, err := f.HasUsableDefaultPM(ctx, funder)
+		if err != nil {
+			return cycle.FrozenBoundaryCharge{}, cycle.StripeRailStale, err
+		}
+		if !hasPM {
+			return cycle.FrozenBoundaryCharge{}, cycle.StripeRailNoPaymentMethod, nil
+		}
+		charge.ChargeFundingAccountID = funder
+		charge.ChargeFundingGeneration = uuid.New()
 		f.frozenCharges[runID] = charge
 	}
-	return f.frozenCharges[runID], nil
+	surviving := f.frozenCharges[runID]
+	if surviving.ChargeFundingAccountID == uuid.Nil {
+		funder, err := f.ChargeFundingAccount(ctx, f.runAccounts[runID])
+		if err != nil {
+			return cycle.FrozenBoundaryCharge{}, cycle.StripeRailStale, err
+		}
+		surviving.ChargeFundingAccountID = funder
+		surviving.ChargeFundingGeneration = uuid.New()
+		f.frozenCharges[runID] = surviving
+	}
+	return surviving, cycle.StripeRailClaimed, nil
 }
 
-func (f *fakeStore) BillingRunFrozenCharge(_ context.Context, runID uuid.UUID) (cycle.FrozenBoundaryCharge, bool, error) {
+func (f *fakeStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) (cycle.FrozenBoundaryCharge, bool, error) {
 	if f.errFrozenCharge != nil {
 		return cycle.FrozenBoundaryCharge{}, false, f.errFrozenCharge
 	}
 	c, ok := f.frozenCharges[runID]
+	if ok && c.ChargeFundingAccountID == uuid.Nil {
+		c.ChargeFundingAccountID, _ = f.ChargeFundingAccount(ctx, f.runAccounts[runID])
+		c.ChargeFundingGeneration = uuid.New()
+		f.frozenCharges[runID] = c
+	}
 	return c, ok, nil
 }
 
@@ -1047,7 +1114,7 @@ func (f *fakeStore) RemoveDomain(_ context.Context, appID uuid.UUID, hostname st
 	return nil
 }
 
-func (f *fakeStore) DomainsPendingCharge(_ context.Context, activatedBefore time.Time) ([]cycle.DomainChargeCandidate, error) {
+func (f *fakeStore) DomainsPendingCharge(ctx context.Context, activatedBefore time.Time) ([]cycle.DomainChargeCandidate, error) {
 	if f.errDomainsPending != nil {
 		return nil, f.errDomainsPending
 	}
@@ -1056,14 +1123,22 @@ func (f *fakeStore) DomainsPendingCharge(_ context.Context, activatedBefore time
 		if d.domain.Removed || d.chargeResolved || d.domain.ActivatedAt.After(activatedBefore) {
 			continue
 		}
+		if !d.chargeAttemptedAt.IsZero() && d.chargeFundingAccountID == uuid.Nil {
+			d.chargeFundingAccountID, _ = f.ChargeFundingAccount(ctx, d.domain.AccountID)
+		}
+		if !d.chargeAttemptedAt.IsZero() && d.chargeFundingGeneration == uuid.Nil {
+			d.chargeFundingGeneration = uuid.New()
+		}
 		out = append(out, cycle.DomainChargeCandidate{
-			ID:                 d.domain.ID,
-			AccountID:          d.domain.AccountID,
-			AppID:              d.domain.AppID,
-			Hostname:           d.domain.Hostname,
-			ActivatedAt:        d.domain.ActivatedAt,
-			AccountActivatedAt: f.activation[d.domain.AccountID],
-			ChargeAttemptedAt:  d.chargeAttemptedAt,
+			ID:                      d.domain.ID,
+			AccountID:               d.domain.AccountID,
+			AppID:                   d.domain.AppID,
+			Hostname:                d.domain.Hostname,
+			ActivatedAt:             d.domain.ActivatedAt,
+			AccountActivatedAt:      f.activation[d.domain.AccountID],
+			ChargeAttemptedAt:       d.chargeAttemptedAt,
+			ChargeFundingAccountID:  d.chargeFundingAccountID,
+			ChargeFundingGeneration: d.chargeFundingGeneration,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1083,14 +1158,44 @@ func (f *fakeStore) DomainStillPending(_ context.Context, domainID uuid.UUID) (b
 	return ok && !d.domain.Removed && !d.chargeResolved, nil
 }
 
-func (f *fakeStore) MarkDomainChargeAttempted(_ context.Context, domainID uuid.UUID, at time.Time) error {
+func (f *fakeStore) ArmDomainStripeCharge(ctx context.Context, domainID uuid.UUID, at time.Time) (cycle.StripeChargeClaim, error) {
 	if f.errDomainAttempted != nil {
-		return f.errDomainAttempted
+		return cycle.StripeChargeClaim{}, f.errDomainAttempted
 	}
-	if d, ok := f.domains[domainID]; ok && d.chargeAttemptedAt.IsZero() {
-		d.chargeAttemptedAt = at
+	d, ok := f.domains[domainID]
+	if !ok || d.domain.Removed || d.chargeResolved {
+		return cycle.StripeChargeClaim{Outcome: cycle.StripeRailStale}, nil
 	}
-	return nil
+	funder := d.chargeFundingAccountID
+	if funder == uuid.Nil {
+		var err error
+		funder, err = f.ChargeFundingAccount(ctx, d.domain.AccountID)
+		if err != nil {
+			return cycle.StripeChargeClaim{}, err
+		}
+	}
+	hasPM, err := f.HasUsableDefaultPM(ctx, funder)
+	if err != nil {
+		return cycle.StripeChargeClaim{}, err
+	}
+	generation := d.chargeFundingGeneration
+	if generation == uuid.Nil {
+		generation = uuid.New()
+	}
+	claim := cycle.StripeChargeClaim{FundingAccountID: funder, FundingGeneration: generation}
+	if !hasPM {
+		claim.Outcome = cycle.StripeRailNoPaymentMethod
+		return claim, nil
+	}
+	claim.StripeCustomerID, err = f.AccountStripeCustomer(ctx, funder)
+	if err != nil {
+		return cycle.StripeChargeClaim{}, err
+	}
+	d.chargeAttemptedAt = at
+	d.chargeFundingAccountID = funder
+	d.chargeFundingGeneration = generation
+	claim.Outcome = cycle.StripeRailClaimed
+	return claim, nil
 }
 
 func (f *fakeStore) MarkDomainChargeResolved(_ context.Context, domainID uuid.UUID) error {
@@ -1549,7 +1654,7 @@ func (f *fakeStore) SoftRemoveAllModuleTimersForApp(_ context.Context, appID uui
 	return nil
 }
 
-func (f *fakeStore) ModuleOverageTimersPastGrace(_ context.Context, at time.Time) ([]cycle.ModuleOverageCandidate, error) {
+func (f *fakeStore) ModuleOverageTimersPastGrace(ctx context.Context, at time.Time) ([]cycle.ModuleOverageCandidate, error) {
 	if f.errTimersPastGrace != nil {
 		return nil, f.errTimersPastGrace
 	}
@@ -1562,14 +1667,22 @@ func (f *fakeStore) ModuleOverageTimersPastGrace(_ context.Context, at time.Time
 		if !activated {
 			continue // activated_at IS NOT NULL gate
 		}
+		if !t.chargeAttemptedAt.IsZero() && t.chargeFundingAccountID == uuid.Nil {
+			t.chargeFundingAccountID, _ = f.ChargeFundingAccount(ctx, t.accountID)
+		}
+		if !t.chargeAttemptedAt.IsZero() && t.chargeFundingGeneration == uuid.Nil {
+			t.chargeFundingGeneration = uuid.New()
+		}
 		out = append(out, cycle.ModuleOverageCandidate{
-			ID:                t.id,
-			AccountID:         t.accountID,
-			AppID:             t.appID,
-			InstalledAt:       t.installedAt,
-			GraceExpiresAt:    t.graceExpiresAt,
-			ChargeAttemptedAt: t.chargeAttemptedAt,
-			ActivatedAt:       activatedAt,
+			ID:                      t.id,
+			AccountID:               t.accountID,
+			AppID:                   t.appID,
+			InstalledAt:             t.installedAt,
+			GraceExpiresAt:          t.graceExpiresAt,
+			ChargeAttemptedAt:       t.chargeAttemptedAt,
+			ChargeFundingAccountID:  t.chargeFundingAccountID,
+			ChargeFundingGeneration: t.chargeFundingGeneration,
+			ActivatedAt:             activatedAt,
 		})
 	}
 	// Ordered (installed_at, id) like the query, so the sweep charges oldest-first
@@ -1600,7 +1713,7 @@ func (f *fakeStore) LiveModuleTimerRankBefore(_ context.Context, accountID, time
 	return rank, nil
 }
 
-func (f *fakeStore) MarkModuleTimerChargeAttempted(_ context.Context, timerID uuid.UUID, at time.Time) (int64, error) {
+func (f *fakeStore) ArmModuleTimerStripeCharge(ctx context.Context, timerID uuid.UUID, at time.Time) (cycle.StripeChargeClaim, error) {
 	// Mirrors the SQL: UPDATE ... SET charge_attempted_at = COALESCE(charge_attempted_at, $2)
 	// WHERE id = $1 AND grace_resolved = false. A timer already resolved (e.g. by a
 	// concurrent wallet settlement) matches 0 rows → the Stripe leg aborts stale
@@ -1609,15 +1722,43 @@ func (f *fakeStore) MarkModuleTimerChargeAttempted(_ context.Context, timerID uu
 	// retry still re-charges.
 	t, ok := f.timers[timerID]
 	if !ok || t.graceResolved {
-		return 0, nil
+		return cycle.StripeChargeClaim{Outcome: cycle.StripeRailStale}, nil
 	}
 	if owned, _ := f.TimerHasUnresolvedCombinedProrationOwner(context.Background(), timerID); owned {
-		return 0, nil
+		return cycle.StripeChargeClaim{Outcome: cycle.StripeRailStale}, nil
+	}
+	funder := t.chargeFundingAccountID
+	if funder == uuid.Nil {
+		var err error
+		funder, err = f.ChargeFundingAccount(ctx, t.accountID)
+		if err != nil {
+			return cycle.StripeChargeClaim{}, err
+		}
+	}
+	hasPM, err := f.HasUsableDefaultPM(ctx, funder)
+	if err != nil {
+		return cycle.StripeChargeClaim{}, err
+	}
+	generation := t.chargeFundingGeneration
+	if generation == uuid.Nil {
+		generation = uuid.New()
+	}
+	claim := cycle.StripeChargeClaim{FundingAccountID: funder, FundingGeneration: generation}
+	if !hasPM {
+		claim.Outcome = cycle.StripeRailNoPaymentMethod
+		return claim, nil
+	}
+	claim.StripeCustomerID, err = f.AccountStripeCustomer(ctx, funder)
+	if err != nil {
+		return cycle.StripeChargeClaim{}, err
 	}
 	if t.chargeAttemptedAt.IsZero() {
 		t.chargeAttemptedAt = at // first-write-wins, mirroring COALESCE
 	}
-	return 1, nil
+	t.chargeFundingAccountID = funder
+	t.chargeFundingGeneration = generation
+	claim.Outcome = cycle.StripeRailClaimed
+	return claim, nil
 }
 
 func (f *fakeStore) ModuleTimerStillPending(_ context.Context, timerID uuid.UUID) (bool, error) {
@@ -1647,7 +1788,7 @@ func cloneCombinedProrationAttempt(attempt cycle.CombinedProrationAttempt) cycle
 }
 
 func (f *fakeStore) FreezeCombinedProrationAttempt(
-	_ context.Context,
+	ctx context.Context,
 	appID uuid.UUID,
 	at time.Time,
 	shape cycle.CombinedProrationChargeShape,
@@ -1657,6 +1798,11 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, f.errFreezeCombined
 	}
 	if attempt, ok := f.combinedProrationAttempts[appID]; ok {
+		if attempt.ChargeFundingAccountID == uuid.Nil {
+			attempt.ChargeFundingAccountID, _ = f.ChargeFundingAccount(ctx, attempt.Shape.AccountID)
+			attempt.ChargeFundingGeneration = uuid.New()
+			f.combinedProrationAttempts[appID] = attempt
+		}
 		return cloneCombinedProrationAttempt(attempt), cycle.StripeRailClaimed, nil
 	}
 	app, ok := f.apps[appID]
@@ -1672,6 +1818,17 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 	}
 	if creditRailEnabled && f.walletMode == cycle.CreditBillingModeCredits {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailWalletRequired, nil
+	}
+	funder, err := f.ChargeFundingAccount(ctx, app.AccountID)
+	if err != nil {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, err
+	}
+	hasPM, err := f.HasUsableDefaultPM(ctx, funder)
+	if err != nil {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, err
+	}
+	if !hasPM {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailNoPaymentMethod, nil
 	}
 	timerIDs, err := f.CoCreatedOverModuleTimers(context.Background(), app.AccountID, appID, app.CreatedAt, usage.IncludedModules)
 	if err != nil {
@@ -1689,10 +1846,12 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 	}
 	sort.Slice(filtered, func(i, j int) bool { return filtered[i].String() < filtered[j].String() })
 	attempt := cycle.CombinedProrationAttempt{
-		AppID:       appID,
-		AttemptedAt: at.UTC(),
-		Shape:       shape,
-		TimerIDs:    filtered,
+		AppID:                   appID,
+		AttemptedAt:             at.UTC(),
+		ChargeFundingAccountID:  funder,
+		ChargeFundingGeneration: uuid.New(),
+		Shape:                   shape,
+		TimerIDs:                filtered,
 	}
 	f.combinedProrationAttempts[appID] = cloneCombinedProrationAttempt(attempt)
 	app.ProrationAttempted = true
@@ -1700,11 +1859,16 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 	return cloneCombinedProrationAttempt(attempt), cycle.StripeRailClaimed, nil
 }
 
-func (f *fakeStore) CombinedProrationAttempt(_ context.Context, appID uuid.UUID) (cycle.CombinedProrationAttempt, bool, error) {
+func (f *fakeStore) CombinedProrationAttempt(ctx context.Context, appID uuid.UUID) (cycle.CombinedProrationAttempt, bool, error) {
 	if f.errCombinedAttempt != nil {
 		return cycle.CombinedProrationAttempt{}, false, f.errCombinedAttempt
 	}
 	attempt, ok := f.combinedProrationAttempts[appID]
+	if ok && attempt.ChargeFundingAccountID == uuid.Nil {
+		attempt.ChargeFundingAccountID, _ = f.ChargeFundingAccount(ctx, attempt.Shape.AccountID)
+		attempt.ChargeFundingGeneration = uuid.New()
+		f.combinedProrationAttempts[appID] = attempt
+	}
 	return cloneCombinedProrationAttempt(attempt), ok, nil
 }
 

@@ -83,7 +83,8 @@ WHERE app_id = $1
 -- FIFO ordering). Backed by app_module_overage_timers_sweep_idx.
 -- name: ModuleOverageTimersPastGrace :many
 SELECT t.id, t.account_id, t.app_id, t.installed_at, t.grace_expires_at,
-       t.charge_attempted_at, a.activated_at
+       t.charge_attempted_at, t.charge_funding_account_id,
+       t.charge_funding_generation, a.activated_at
 FROM ms_billing.app_module_overage_timers t
 JOIN ms_billing.accounts a ON a.id = t.account_id
 WHERE (t.removed_at IS NULL OR t.charge_attempted_at IS NOT NULL)
@@ -92,7 +93,7 @@ WHERE (t.removed_at IS NULL OR t.charge_attempted_at IS NOT NULL)
   AND a.activated_at IS NOT NULL
 ORDER BY t.installed_at, t.id;
 
--- MarkModuleTimerChargeAttempted stamps the recovery marker (036) BEFORE a
+-- ArmModuleTimerStripeCharge stamps the recovery marker (036) BEFORE a
 -- charge attempt's first Stripe call. First-write-wins (the FIRST attempt instant
 -- is the durable one, preserved by COALESCE); never cleared. The grace_resolved =
 -- false guard (billing-engine Job 3 hardening) makes this stamp the serialization
@@ -105,19 +106,78 @@ ORDER BY t.installed_at, t.id;
 -- crash-recovery retry (marker set by a prior attempt that died before creating its
 -- invoice, with nothing found on Stripe) must still re-charge, so it matches the
 -- row (1 affected) while COALESCE keeps the original attempt instant.
--- name: MarkModuleTimerChargeAttempted :execrows
-UPDATE ms_billing.app_module_overage_timers
-SET charge_attempted_at = COALESCE(charge_attempted_at, $2)
-WHERE id = $1
-  AND grace_resolved = false
-  AND NOT EXISTS (
-      SELECT 1
-      FROM ms_billing.app_combined_proration_attempt_timers owned
-      JOIN ms_billing.app_combined_proration_attempts attempt
-        ON attempt.app_id = owned.app_id
-      WHERE owned.timer_id = ms_billing.app_module_overage_timers.id
-        AND attempt.resolved_at IS NULL
-  );
+-- It also selects and persists the exact rotating funding authorization in the
+-- same row-locked statement, so a stale in-memory candidate can never arm one
+-- sponsor and then charge another.
+-- name: ArmModuleTimerStripeCharge :one
+WITH target AS MATERIALIZED (
+    SELECT account_id, charge_attempted_at,
+           charge_funding_account_id, charge_funding_generation
+    FROM ms_billing.app_module_overage_timers timer
+    WHERE timer.id = @timer_id::uuid
+      AND timer.removed_at IS NULL
+      AND timer.grace_resolved = false
+      AND NOT timer.charge_funding_legacy_unresolved
+      AND NOT EXISTS (
+          SELECT 1
+          FROM ms_billing.app_combined_proration_attempt_timers owned
+          JOIN ms_billing.app_combined_proration_attempts attempt
+            ON attempt.app_id = owned.app_id
+          WHERE owned.timer_id = timer.id
+            AND attempt.resolved_at IS NULL
+      )
+    FOR UPDATE
+), selected AS MATERIALIZED (
+    SELECT target.account_id,
+           COALESCE(target.charge_funding_account_id,
+                    funding_auth.funding_account_id) AS funding_account_id,
+           COALESCE(target.charge_funding_generation,
+                    funding_auth.generation) AS funding_generation
+    FROM target
+    JOIN ms_billing.account_funding_authorizations funding_auth
+      ON funding_auth.account_id = target.account_id
+), funding AS MATERIALIZED (
+    SELECT selected.account_id,
+           selected.funding_account_id,
+           selected.funding_generation,
+           COALESCE(account.stripe_customer_id, '')::text AS stripe_customer_id,
+           EXISTS (
+               SELECT 1
+               FROM ms_billing.payment_methods_mirror payment_method
+               WHERE payment_method.account_id = selected.funding_account_id
+                 AND payment_method.deleted_at IS NULL
+                 AND (payment_method.exp_year, payment_method.exp_month) >= (
+                     EXTRACT(YEAR FROM current_date)::INT,
+                     EXTRACT(MONTH FROM current_date)::INT
+                 )
+           ) AS has_usable_payment_method
+    FROM selected
+    JOIN ms_billing.accounts account
+      ON account.id = selected.funding_account_id
+), armed AS (
+    UPDATE ms_billing.app_module_overage_timers timer
+    SET charge_attempted_at = COALESCE(timer.charge_attempted_at,
+                                       @attempted_at::timestamptz),
+        charge_funding_account_id = COALESCE(
+            timer.charge_funding_account_id,
+            funding.funding_account_id
+        ),
+        charge_funding_generation = COALESCE(
+            timer.charge_funding_generation,
+            funding.funding_generation
+        )
+    FROM funding
+    WHERE timer.id = @timer_id::uuid
+      AND funding.has_usable_payment_method
+    RETURNING timer.id
+)
+SELECT funding.account_id,
+       funding.funding_account_id,
+       funding.funding_generation,
+       funding.stripe_customer_id,
+       funding.has_usable_payment_method,
+       EXISTS (SELECT 1 FROM armed)::boolean AS armed
+FROM funding;
 
 -- ModuleTimerStillPending is the charge-time re-verification read (review
 -- 2026-07-06, M2): the sweep's work list is read ONCE and can be minutes stale

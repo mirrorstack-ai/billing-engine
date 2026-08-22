@@ -76,6 +76,7 @@ const accountsWithUnbilledUsage = `-- name: AccountsWithUnbilledUsage :many
 SELECT DISTINCT ua.account_id AS account_id
 FROM ms_billing.usage_aggregates ua
 JOIN ms_billing.billing_periods bp ON bp.id = ua.period_id
+JOIN ms_billing.accounts account ON account.id = ua.account_id
 LEFT JOIN ms_billing.billing_runs br
        ON br.account_id   = ua.account_id
       AND br.period_start = bp.period_start
@@ -83,6 +84,10 @@ LEFT JOIN ms_billing.billing_runs br
 WHERE bp.period_start = $1
   AND bp.period_end   = $2
   AND (br.id IS NULL OR br.status <> 'invoiced')
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE account.owner_kind = 'org' AND f.org_id = account.owner_org_id
+  )
 `
 
 type AccountsWithUnbilledUsageParams struct {
@@ -147,6 +152,13 @@ FROM ms_billing.usage_events
 WHERE account_id  IS NOT NULL
   AND recorded_at >= $1
   AND recorded_at <  $2
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ms_billing.accounts a
+      JOIN ms_billing.org_deletion_finalizations f
+        ON a.owner_kind = 'org' AND f.org_id = a.owner_org_id
+      WHERE a.id = ms_billing.usage_events.account_id
+  )
 `
 
 type AccountsWithUsageEventsParams struct {
@@ -188,6 +200,11 @@ const activatedAccounts = `-- name: ActivatedAccounts :many
 SELECT id, activated_at
 FROM ms_billing.accounts
 WHERE activated_at IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE ms_billing.accounts.owner_kind = 'org'
+        AND f.org_id = ms_billing.accounts.owner_org_id
+  )
 `
 
 type ActivatedAccountsRow struct {
@@ -253,14 +270,17 @@ func (q *Queries) ActivatedAccounts(ctx context.Context) ([]ActivatedAccountsRow
 }
 
 const billingRunFrozenCharge = `-- name: BillingRunFrozenCharge :one
-SELECT frozen_charge_cents, frozen_charge_with_base
+SELECT frozen_charge_cents, frozen_charge_with_base,
+       charge_funding_account_id, charge_funding_generation
 FROM ms_billing.billing_runs
 WHERE id = $1
 `
 
 type BillingRunFrozenChargeRow struct {
-	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
-	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+	FrozenChargeCents       pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase    pgtype.Bool `json:"frozen_charge_with_base"`
+	ChargeFundingAccountID  pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration pgtype.UUID `json:"charge_funding_generation"`
 }
 
 // BillingRunFrozenCharge reads a run's frozen boundary-charge amount + description
@@ -271,23 +291,32 @@ type BillingRunFrozenChargeRow struct {
 func (q *Queries) BillingRunFrozenCharge(ctx context.Context, id string) (BillingRunFrozenChargeRow, error) {
 	row := q.db.QueryRow(ctx, billingRunFrozenCharge, id)
 	var i BillingRunFrozenChargeRow
-	err := row.Scan(&i.FrozenChargeCents, &i.FrozenChargeWithBase)
+	err := row.Scan(
+		&i.FrozenChargeCents,
+		&i.FrozenChargeWithBase,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+	)
 	return i, err
 }
 
 const freezeBillingRunCharge = `-- name: FreezeBillingRunCharge :exec
 UPDATE ms_billing.billing_runs
 SET frozen_charge_cents     = $2,
-    frozen_charge_with_base = $3
+    frozen_charge_with_base = $3,
+    charge_funding_account_id = $4::uuid,
+    charge_funding_generation = $5::uuid
 WHERE id = $1
   AND frozen_charge_cents IS NULL
   AND status <> 'invoiced'
 `
 
 type FreezeBillingRunChargeParams struct {
-	ID                   string      `json:"id"`
-	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
-	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+	ID                      string      `json:"id"`
+	FrozenChargeCents       pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase    pgtype.Bool `json:"frozen_charge_with_base"`
+	ChargeFundingAccountID  string      `json:"charge_funding_account_id"`
+	ChargeFundingGeneration string      `json:"charge_funding_generation"`
 }
 
 // FreezeBillingRunCharge records, BEFORE the boundary Stripe charge, the exact
@@ -302,7 +331,13 @@ type FreezeBillingRunChargeParams struct {
 // successfully marked the run invoiced, no later stale non-zero computation may
 // install a charge marker and enter Stripe.
 func (q *Queries) FreezeBillingRunCharge(ctx context.Context, arg FreezeBillingRunChargeParams) error {
-	_, err := q.db.Exec(ctx, freezeBillingRunCharge, arg.ID, arg.FrozenChargeCents, arg.FrozenChargeWithBase)
+	_, err := q.db.Exec(ctx, freezeBillingRunCharge,
+		arg.ID,
+		arg.FrozenChargeCents,
+		arg.FrozenChargeWithBase,
+		arg.ChargeFundingAccountID,
+		arg.ChargeFundingGeneration,
+	)
 	return err
 }
 
@@ -428,16 +463,19 @@ func (q *Queries) LatestClosedPeriodEnd(ctx context.Context, accountID string) (
 }
 
 const lockBillingRunCharge = `-- name: LockBillingRunCharge :one
-SELECT status, frozen_charge_cents, frozen_charge_with_base
+SELECT status, frozen_charge_cents, frozen_charge_with_base,
+       charge_funding_account_id, charge_funding_generation
 FROM ms_billing.billing_runs
 WHERE id = $1
 FOR UPDATE
 `
 
 type LockBillingRunChargeRow struct {
-	Status               string      `json:"status"`
-	FrozenChargeCents    pgtype.Int8 `json:"frozen_charge_cents"`
-	FrozenChargeWithBase pgtype.Bool `json:"frozen_charge_with_base"`
+	Status                  string      `json:"status"`
+	FrozenChargeCents       pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase    pgtype.Bool `json:"frozen_charge_with_base"`
+	ChargeFundingAccountID  pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration pgtype.UUID `json:"charge_funding_generation"`
 }
 
 // LockBillingRunCharge is the serialization point between a first wallet debit,
@@ -448,7 +486,47 @@ type LockBillingRunChargeRow struct {
 func (q *Queries) LockBillingRunCharge(ctx context.Context, id string) (LockBillingRunChargeRow, error) {
 	row := q.db.QueryRow(ctx, lockBillingRunCharge, id)
 	var i LockBillingRunChargeRow
-	err := row.Scan(&i.Status, &i.FrozenChargeCents, &i.FrozenChargeWithBase)
+	err := row.Scan(
+		&i.Status,
+		&i.FrozenChargeCents,
+		&i.FrozenChargeWithBase,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+	)
+	return i, err
+}
+
+const lockBillingRunFundingArm = `-- name: LockBillingRunFundingArm :one
+SELECT account_id, status, frozen_charge_cents, frozen_charge_with_base,
+       charge_funding_account_id, charge_funding_generation
+FROM ms_billing.billing_runs
+WHERE id = $1
+FOR UPDATE
+`
+
+type LockBillingRunFundingArmRow struct {
+	AccountID               string      `json:"account_id"`
+	Status                  string      `json:"status"`
+	FrozenChargeCents       pgtype.Int8 `json:"frozen_charge_cents"`
+	FrozenChargeWithBase    pgtype.Bool `json:"frozen_charge_with_base"`
+	ChargeFundingAccountID  pgtype.UUID `json:"charge_funding_account_id"`
+	ChargeFundingGeneration pgtype.UUID `json:"charge_funding_generation"`
+}
+
+// LockBillingRunFundingArm is the atomic funding-claim serialization point.
+// A fresh freezer chooses the current rotating authorization while this row is
+// locked; a retry consumes the first-write pinned funder verbatim.
+func (q *Queries) LockBillingRunFundingArm(ctx context.Context, id string) (LockBillingRunFundingArmRow, error) {
+	row := q.db.QueryRow(ctx, lockBillingRunFundingArm, id)
+	var i LockBillingRunFundingArmRow
+	err := row.Scan(
+		&i.AccountID,
+		&i.Status,
+		&i.FrozenChargeCents,
+		&i.FrozenChargeWithBase,
+		&i.ChargeFundingAccountID,
+		&i.ChargeFundingGeneration,
+	)
 	return i, err
 }
 
@@ -540,6 +618,10 @@ JOIN ms_billing.accounts a ON a.id = e.account_id
 WHERE a.activated_at IS NULL
   AND e.recorded_at >= $1
   AND e.recorded_at <  $2
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.org_deletion_finalizations f
+      WHERE a.owner_kind = 'org' AND f.org_id = a.owner_org_id
+  )
 `
 
 type UnactivatedAccountsWithUsageParams struct {
@@ -607,9 +689,11 @@ const upsertInvoice = `-- name: UpsertInvoice :exec
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
-    period_start, period_end, is_large_auto_collect, ever_failed
+    period_start, period_end, is_large_auto_collect, ever_failed,
+    charge_funding_account_id, charge_funding_generation
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+    $11::uuid, $12::uuid
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
@@ -620,20 +704,40 @@ DO UPDATE SET
     period_start          = EXCLUDED.period_start,
     period_end            = EXCLUDED.period_end,
     is_large_auto_collect = EXCLUDED.is_large_auto_collect,
-    ever_failed           = ms_billing.invoices.ever_failed OR EXCLUDED.ever_failed
+    ever_failed           = ms_billing.invoices.ever_failed OR EXCLUDED.ever_failed,
+    charge_funding_account_id = COALESCE(
+        ms_billing.invoices.charge_funding_account_id,
+        EXCLUDED.charge_funding_account_id
+    ),
+    charge_funding_generation = COALESCE(
+        ms_billing.invoices.charge_funding_generation,
+        EXCLUDED.charge_funding_generation
+    ),
+    charge_funding_legacy_unresolved = (
+        ms_billing.invoices.charge_funding_legacy_unresolved
+        AND EXCLUDED.charge_funding_account_id IS NULL
+    )
+WHERE ms_billing.invoices.account_id = EXCLUDED.account_id
+  AND (
+      ms_billing.invoices.charge_funding_account_id IS NULL
+      OR EXCLUDED.charge_funding_account_id IS NULL
+      OR ms_billing.invoices.charge_funding_account_id = EXCLUDED.charge_funding_account_id
+  )
 `
 
 type UpsertInvoiceParams struct {
-	AccountID          string             `json:"account_id"`
-	StripeInvoiceID    string             `json:"stripe_invoice_id"`
-	Status             string             `json:"status"`
-	AmountDue          pgtype.Numeric     `json:"amount_due"`
-	AmountPaid         pgtype.Numeric     `json:"amount_paid"`
-	Currency           string             `json:"currency"`
-	PeriodStart        pgtype.Timestamptz `json:"period_start"`
-	PeriodEnd          pgtype.Timestamptz `json:"period_end"`
-	IsLargeAutoCollect bool               `json:"is_large_auto_collect"`
-	EverFailed         bool               `json:"ever_failed"`
+	AccountID               string             `json:"account_id"`
+	StripeInvoiceID         string             `json:"stripe_invoice_id"`
+	Status                  string             `json:"status"`
+	AmountDue               pgtype.Numeric     `json:"amount_due"`
+	AmountPaid              pgtype.Numeric     `json:"amount_paid"`
+	Currency                string             `json:"currency"`
+	PeriodStart             pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd               pgtype.Timestamptz `json:"period_end"`
+	IsLargeAutoCollect      bool               `json:"is_large_auto_collect"`
+	EverFailed              bool               `json:"ever_failed"`
+	ChargeFundingAccountID  string             `json:"charge_funding_account_id"`
+	ChargeFundingGeneration string             `json:"charge_funding_generation"`
 }
 
 // UpsertInvoice mirrors a Stripe invoice into ms_billing.invoices, keyed on the
@@ -657,6 +761,8 @@ func (q *Queries) UpsertInvoice(ctx context.Context, arg UpsertInvoiceParams) er
 		arg.PeriodEnd,
 		arg.IsLargeAutoCollect,
 		arg.EverFailed,
+		arg.ChargeFundingAccountID,
+		arg.ChargeFundingGeneration,
 	)
 	return err
 }

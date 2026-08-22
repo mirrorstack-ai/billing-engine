@@ -217,6 +217,7 @@ func TestDrawCreationProrationFromWallet_Integration_AttemptedDefersBeforeDraw(t
 	ctx := context.Background()
 
 	accountID := seedAccount(t, pool)
+	installStandardPaymentMethod(t, pool, accountID, "cus_wallet_attempted_"+accountID.String())
 	appID := uuid.New()
 	createdAt := mustTime(t, "2026-06-19T12:00:00Z")
 	require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, createdAt, "race app"))

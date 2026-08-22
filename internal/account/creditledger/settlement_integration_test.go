@@ -198,9 +198,10 @@ func seedCreditAccount(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	t.Helper()
 	accountID := uuid.New()
 	_, err := pool.Exec(context.Background(),
-		`INSERT INTO ms_billing.accounts (id, owner_kind, owner_user_id)
-		 VALUES ($1, 'user', $2)`,
-		accountID, uuid.New(),
+		`INSERT INTO ms_billing.accounts
+		    (id, owner_kind, owner_user_id, stripe_customer_id)
+		 VALUES ($1, 'user', $2, $3)`,
+		accountID, uuid.New(), "cus_"+accountID.String(),
 	)
 	require.NoError(t, err)
 	return accountID
@@ -229,8 +230,15 @@ func seedManualPurchase(
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO ms_billing.credit_ledger
 		   (id, account_id, amount_micros, type, status, balance_after_micros,
-		    actor, idempotency_key, stripe_invoice_id)
-		 VALUES ($1, $2, $3, 'purchase', $4, 0, 'self', $5, $6)`,
+		    actor, idempotency_key, stripe_invoice_id,
+		    attempt_stripe_customer_id, charge_funding_account_id,
+		    charge_funding_generation)
+		 SELECT $1, $2, $3, 'purchase', $4, 0, 'self', $5, $6,
+		        account.stripe_customer_id, funding.funding_account_id,
+		        funding.generation
+		 FROM ms_billing.account_funding_authorizations funding
+		 JOIN ms_billing.accounts account ON account.id=funding.funding_account_id
+		 WHERE funding.account_id=$2`,
 		ledgerID, accountID, amount, status, "purchase:"+ledgerID.String(), stripeInvoiceID,
 	)
 	require.NoError(t, err)

@@ -151,7 +151,10 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("frozen boundary charge is negative", nil)
 	}
 	if hasFrozen && frozen.Cents > 0 {
-		custID, err := s.recoveryCustomer(ctx, accountID)
+		if frozen.ChargeFundingAccountID == uuid.Nil {
+			return nil, billing.Internal("frozen boundary charge has no pinned funding account", nil)
+		}
+		custID, err := s.store.AccountStripeCustomer(ctx, frozen.ChargeFundingAccountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
@@ -535,7 +538,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// as a skip over moved money. Only the Customer id is required there.
 	var custID string
 	if moneyMayHaveMoved {
-		custID, err = s.recoveryCustomer(ctx, accountID)
+		custID, err = s.store.AccountStripeCustomer(ctx, frozen.ChargeFundingAccountID)
 		if err != nil {
 			return nil, billing.Internal("stripe customer lookup failed", err)
 		}
@@ -543,8 +546,18 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			return nil, billing.Internal("billing run has a recovered Stripe invoice but the funding account has no Stripe customer id", nil)
 		}
 	} else {
-		var ok bool
-		custID, ok, err = s.resolveChargeableCustomer(ctx, accountID)
+		ok := false
+		if hasFrozen {
+			if frozen.ChargeFundingAccountID == uuid.Nil {
+				return nil, billing.Internal("frozen boundary charge has no pinned funding account", nil)
+			}
+			ok, err = s.store.HasUsableDefaultPM(ctx, frozen.ChargeFundingAccountID)
+			if err == nil && ok {
+				custID, err = s.store.AccountStripeCustomer(ctx, frozen.ChargeFundingAccountID)
+			}
+		} else {
+			custID, ok, err = s.resolveChargeableCustomer(ctx, accountID)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -617,12 +630,31 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			summary.Status = RunStatusInvoiced
 			return summary, nil
 		}
-		surviving, err := s.store.FreezeBillingRunCharge(ctx, runID, FrozenBoundaryCharge{Cents: cents, WithBase: withBase})
+		surviving, claim, err := s.store.FreezeBillingRunCharge(ctx, runID, FrozenBoundaryCharge{Cents: cents, WithBase: withBase})
 		if err != nil {
 			return nil, billing.Internal("freeze boundary charge failed", err)
 		}
+		if claim == StripeRailNoPaymentMethod {
+			if err := s.store.MarkBillingRun(ctx, runID, RunStatusSkippedNoPM, "", 0); err != nil {
+				return nil, billing.Internal("mark billing run (atomic skipped_no_pm) failed", err)
+			}
+			summary.Status = RunStatusSkippedNoPM
+			return summary, nil
+		}
+		if claim != StripeRailClaimed {
+			return nil, billing.Internal("boundary funding arm lost its durable claim", nil)
+		}
 		cents = surviving.Cents
 		withBase = surviving.WithBase
+		frozen = surviving
+		hasFrozen = true
+		custID, err = s.store.AccountStripeCustomer(ctx, surviving.ChargeFundingAccountID)
+		if err != nil {
+			return nil, billing.Internal("boundary pinned funding customer lookup failed", err)
+		}
+		if custID == "" {
+			return nil, billing.Internal("boundary pinned funder has a usable PM but no Stripe customer id", nil)
+		}
 	}
 	summary.ChargedCents = cents
 
@@ -695,15 +727,17 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// ms_billing.invoices in lockstep with the hosted Stripe invoice, so the boundary
 	// leg never shows a narrower window than Stripe disclosed for the same invoice.
 	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:          accountID,
-		StripeInvoiceID:    inv.ID,
-		Status:             inv.Status,
-		AmountDueCents:     inv.AmountDue,
-		AmountPaidCents:    inv.AmountPaid,
-		Currency:           chargeCurrency,
-		PeriodStart:        linePeriod.Start,
-		PeriodEnd:          linePeriod.End,
-		IsLargeAutoCollect: flagLargeAutoCollect(chargedMicros, postChargeAcct),
+		AccountID:               accountID,
+		ChargeFundingAccountID:  frozen.ChargeFundingAccountID,
+		ChargeFundingGeneration: frozen.ChargeFundingGeneration,
+		StripeInvoiceID:         inv.ID,
+		Status:                  inv.Status,
+		AmountDueCents:          inv.AmountDue,
+		AmountPaidCents:         inv.AmountPaid,
+		Currency:                chargeCurrency,
+		PeriodStart:             linePeriod.Start,
+		PeriodEnd:               linePeriod.End,
+		IsLargeAutoCollect:      flagLargeAutoCollect(chargedMicros, postChargeAcct),
 	}); err != nil {
 		return nil, billing.Internal("invoice mirror upsert failed", err)
 	}

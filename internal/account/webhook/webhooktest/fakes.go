@@ -58,6 +58,7 @@ type FakeStore struct {
 	TouchedFound        bool // returned by TouchAccountByStripeCustomer
 	InsertFound         bool // returned by InsertPaymentMethod
 	InsertBecameDefault bool // returned by InsertPaymentMethod
+	InsertRetired       bool // returned by InsertPaymentMethod
 	SoftDelFound        bool // returned by SoftDeletePaymentMethod
 	InvoiceFound        bool // returned by ApplyInvoiceStatus
 	Relaxed             bool // returned by RelaxCollectionOnPaidInvoice
@@ -140,19 +141,22 @@ func (s *FakeStore) SetDefaultPaymentMethod(_ context.Context, customerID, defau
 	return nil
 }
 
-func (s *FakeStore) InsertPaymentMethod(_ context.Context, _ string, params webhook.InsertPaymentMethodParams) (bool, bool, error) {
+func (s *FakeStore) InsertPaymentMethod(_ context.Context, _ string, params webhook.InsertPaymentMethodParams) (bool, bool, bool, error) {
 	if s.ErrInsert != nil {
-		return false, false, s.ErrInsert
+		return false, false, false, s.ErrInsert
 	}
 	s.Inserts = append(s.Inserts, params)
+	if s.InsertRetired {
+		return s.InsertFound, false, true, nil
+	}
 	if s.insertedDefaults == nil {
 		s.insertedDefaults = map[string]bool{}
 	}
 	if isDefault, ok := s.insertedDefaults[params.StripePaymentMethodID]; ok {
-		return s.InsertFound, isDefault, nil
+		return s.InsertFound, isDefault, false, nil
 	}
 	s.insertedDefaults[params.StripePaymentMethodID] = s.InsertBecameDefault
-	return s.InsertFound, s.InsertBecameDefault, nil
+	return s.InsertFound, s.InsertBecameDefault, false, nil
 }
 
 func (s *FakeStore) StampAccountActivated(_ context.Context, customerID string) (bool, error) {

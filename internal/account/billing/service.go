@@ -311,8 +311,12 @@ func (s *Service) StartAddPaymentMethod(ctx context.Context, req StartAddPayment
 	// the one Stripe will emit setup_intent.succeeded for. Defensive
 	// nil-check: stripe-go has marked SetupIntent optional historically.
 	if session.SetupIntent != nil && session.SetupIntent.ID != "" {
-		if err := s.store.SetAddCardRequestSetupIntent(ctx, requestID, session.SetupIntent.ID); err != nil {
+		active, err := s.store.SetAddCardRequestSetupIntent(ctx, requestID, session.SetupIntent.ID)
+		if err != nil {
 			return nil, Internal("persist setup_intent_id failed", err)
+		}
+		if !active {
+			return nil, Unavailable("add-card request is no longer active")
 		}
 	}
 

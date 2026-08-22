@@ -25,14 +25,12 @@ func NewExecutor(store Store, settler Settler, stripe StripeClient) *Executor {
 }
 
 // Resume drives a fresh or already-authorized foreground purchase. The durable
-// attempt is loaded before Stripe work, but an expected customer supplied for
-// an unattached attempt is preserved so invoice search/create cannot drift to a
-// different payer.
+// attempt is the sole payer authority; caller-supplied customer state is never
+// allowed to redirect an already-created ledger row.
 func (e *Executor) Resume(ctx context.Context, supplied Attempt) (Result, error) {
 	if err := validateAttempt(supplied); err != nil {
 		return Result{}, err
 	}
-	expectedCustomerID := supplied.StripeCustomerID
 	attempt, err := e.store.Get(ctx, supplied.AccountID, supplied.ID)
 	if err != nil {
 		return Result{}, fmt.Errorf("load manual credit purchase: %w", err)
@@ -50,11 +48,8 @@ func (e *Executor) Resume(ctx context.Context, supplied Attempt) (Result, error)
 			attempt.Status,
 		)
 	}
-	if attempt.StripeInvoiceID == "" {
-		attempt.StripeCustomerID = expectedCustomerID
-		if attempt.Status == "failed" {
-			return Result{Attempt: attempt}, nil
-		}
+	if attempt.StripeInvoiceID == "" && attempt.Status == "failed" {
+		return Result{Attempt: attempt}, nil
 	}
 
 	invoice, attempt, err := e.recoverOrCreateInvoice(ctx, attempt)
@@ -107,7 +102,6 @@ func (e *Executor) ReconcileWebhookPaid(
 	if err != nil {
 		return result, fmt.Errorf("retrieve paid manual credit purchase invoice: %w", err)
 	}
-	attempt.StripeCustomerID = invoice.CustomerID
 	items, err := e.stripe.ListInvoiceItems(ctx, invoice.ID)
 	if err != nil {
 		return result, fmt.Errorf("list paid manual credit purchase invoice items: %w", err)
@@ -166,7 +160,6 @@ func (e *Executor) ReconcileWebhookFailure(
 			err,
 		)
 	}
-	attempt.StripeCustomerID = invoice.CustomerID
 	reconciled, err := e.reconcileResource(ctx, attempt, invoice)
 	if err != nil {
 		return result, err
@@ -208,7 +201,6 @@ func (e *Executor) recoverOrCreateInvoice(
 				err,
 			)
 		}
-		attempt.StripeCustomerID = invoice.CustomerID
 	} else {
 		if strings.TrimSpace(attempt.StripeCustomerID) == "" {
 			return billingstripe.Invoice{}, attempt, fmt.Errorf(
@@ -473,7 +465,6 @@ func (e *Executor) reconcileResource(
 				)
 			}
 			attempt = updated
-			attempt.StripeCustomerID = invoice.CustomerID
 		}
 		return Result{Attempt: attempt, Invoice: invoice}, nil
 	default:
@@ -637,6 +628,14 @@ func validateAttempt(attempt Attempt) error {
 	if attempt.ID == [16]byte{} || attempt.AccountID == [16]byte{} {
 		return fmt.Errorf("manual credit purchase requires ledger and account ids")
 	}
+	if attempt.FundingAccountID == [16]byte{} ||
+		attempt.FundingGeneration == [16]byte{} ||
+		strings.TrimSpace(attempt.StripeCustomerID) == "" {
+		return fmt.Errorf(
+			"manual credit purchase %s requires a durable funding claim",
+			attempt.ID,
+		)
+	}
 	if attempt.AmountMicros <= 0 {
 		return fmt.Errorf("manual credit purchase %s has non-positive amount", attempt.ID)
 	}
@@ -661,8 +660,7 @@ func validateInvoiceIdentity(
 	if invoice.CustomerID == "" {
 		return fmt.Errorf("manual credit purchase invoice %s has no customer", invoice.ID)
 	}
-	if attempt.StripeCustomerID != "" &&
-		invoice.CustomerID != attempt.StripeCustomerID {
+	if invoice.CustomerID != attempt.StripeCustomerID {
 		return fmt.Errorf(
 			"manual credit purchase invoice %s customer is %q; expected %q",
 			invoice.ID,
