@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -498,13 +499,14 @@ func (f *fakeStore) UpsertMetricVersionPrices(_ context.Context, prices []usage.
 	return nil
 }
 
-// UpsertInfraPriceOverrides mirrors the real store: all-or-nothing, and each
-// override inherits kind + unit from the SENTINEL catalog row (defKey(sentinel,
-// metric)) — a missing sentinel row errors (the real store's INSERT ... SELECT
-// affects 0 rows → error), never a silent write. The written row keys the REAL
-// moduleID with the override price, so a test can assert f.defs[defKey(module,
-// metric)] carries the override price + the sentinel's kind/unit.
-func (f *fakeStore) UpsertInfraPriceOverrides(_ context.Context, moduleID uuid.UUID, overrides []usage.InfraPriceOverride) error {
+// SyncInfraPriceOverrides mirrors the real store's three steps in order:
+// absorb-all expands from the SENTINEL rows (the catalog is the set — no list of
+// metric names lives in the fake either), explicit overrides upsert on top and
+// win, and everything the manifest no longer declares is deleted. A missing
+// sentinel row errors (the real store's INSERT ... SELECT affects 0 rows), never
+// a silent write. The written rows key the REAL moduleID, so a test asserts
+// f.defs[defKey(module, metric)].
+func (f *fakeStore) SyncInfraPriceOverrides(_ context.Context, moduleID uuid.UUID, absorbAll bool, overrides []usage.InfraPriceOverride) error {
 	if f.errUpsertOverride != nil {
 		return f.errUpsertOverride // all-or-nothing: nothing is written on error
 	}
@@ -515,17 +517,56 @@ func (f *fakeStore) UpsertInfraPriceOverrides(_ context.Context, moduleID uuid.U
 			return errors.New("no sentinel catalog row for infra metric " + o.Metric)
 		}
 	}
-	for _, o := range overrides {
-		base := f.defs[defKey(sentinel, o.Metric)]
-		f.defs[defKey(moduleID, o.Metric)] = usage.MetricDefinition{
+
+	keep := map[string]bool{}
+	write := func(metric string, price int64) {
+		base := f.defs[defKey(sentinel, metric)]
+		f.defs[defKey(moduleID, metric)] = usage.MetricDefinition{
 			Kind:            base.Kind, // inherited from the sentinel row
 			Unit:            base.Unit, // inherited from the sentinel row
-			UnitPriceMicros: o.UnitPriceMicros,
+			UnitPriceMicros: price,
 			Priced:          true,
 			Active:          true,
 		}
+		keep[metric] = true
+	}
+
+	if absorbAll {
+		for key, def := range f.defs {
+			mod, metric, ok := splitDefKey(key)
+			if !ok || mod != sentinel.String() || !def.Active {
+				continue
+			}
+			write(metric, 0)
+		}
+	}
+	for _, o := range overrides {
+		write(o.Metric, o.UnitPriceMicros) // after the absorb, so it wins
+	}
+
+	// Withdraw: reserved rows under THIS module that the manifest dropped. A
+	// module's own custom metric rows are SetMetricDefinitions' business and must
+	// survive, so the sweep is scoped to the reserved namespaces.
+	for key := range f.defs {
+		mod, metric, ok := splitDefKey(key)
+		if !ok || mod != moduleID.String() || keep[metric] {
+			continue
+		}
+		if strings.HasPrefix(metric, "infra.") || strings.HasPrefix(metric, "platform.") {
+			delete(f.defs, key)
+		}
 	}
 	return nil
+}
+
+// splitDefKey inverts defKey (module/metric). A metric name may itself contain
+// "/" in principle, so split on the FIRST separator only.
+func splitDefKey(key string) (module, metric string, ok bool) {
+	i := strings.Index(key, "/")
+	if i < 0 {
+		return "", "", false
+	}
+	return key[:i], key[i+1:], true
 }
 
 func (f *fakeStore) InsertUsageEvent(_ context.Context, ev usage.UsageEvent) (bool, error) {
@@ -1715,12 +1756,180 @@ func TestSetInfraPriceOverrides_AllOrNothingRejectsWholeBatch(t *testing.T) {
 	require.Empty(t, store.defs[defKey(mod, "infra.compute.walltime.ms")].Unit, "no override written when any in the batch is invalid")
 }
 
-func TestSetInfraPriceOverrides_EmptyOverridesNoOp(t *testing.T) {
-	resp, err := newService(newFakeStore()).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
-		ModuleID: uuid.New(),
+// 🔴 AN EMPTY CALL IS A WITHDRAWAL, NOT A NO-OP. This is the whole reason the
+// store method is Sync and not Upsert: when a module deletes its ms.Price line,
+// the manifest arrives carrying nothing, and if that means "do nothing" the old
+// row keeps pricing the app owner's bill at a price no module declares.
+func TestSetInfraPriceOverrides_EmptyPayloadWithdrawsThePreviousSet(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+	svc := newService(store)
+
+	_, err := svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5}},
 	})
 	require.NoError(t, err)
+	require.True(t, store.defs[defKey(mod, "infra.compute.walltime.ms")].Priced, "precondition: the override exists")
+
+	// The author deletes the declaration and republishes.
+	resp, err := svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{ModuleID: mod})
+	require.NoError(t, err)
 	require.Equal(t, 0, resp.Synced)
+	_, still := store.defs[defKey(mod, "infra.compute.walltime.ms")]
+	require.False(t, still, "the withdrawn override is gone, so the line reverts to the platform default")
+}
+
+// Dropping ONE of several overrides withdraws only that one — the sweep is
+// keyed on the metrics the manifest still names, not on the whole set being empty.
+func TestSetInfraPriceOverrides_WithdrawsOnlyTheDroppedMetric(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	seedSentinelInfra(store, "infra.egress.api.bytes", usage.KindSum, "GiB", 90_000)
+	mod := uuid.New()
+	svc := newService(store)
+
+	_, err := svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID: mod,
+		Overrides: []usage.InfraPriceOverride{
+			{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5},
+			{Metric: "infra.egress.api.bytes", UnitPriceMicros: 45_000},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.egress.api.bytes", UnitPriceMicros: 45_000}},
+	})
+	require.NoError(t, err)
+
+	_, compute := store.defs[defKey(mod, "infra.compute.walltime.ms")]
+	require.False(t, compute, "the dropped metric is withdrawn")
+	require.Equal(t, int64(45_000), store.defs[defKey(mod, "infra.egress.api.bytes")].UnitPriceMicros,
+		"the still-declared metric keeps its override")
+}
+
+// 🔴 THE SWEEP MUST NOT REACH A MODULE'S OWN CUSTOM METRICS. Both live in
+// metric_definitions under the same module_id; only the reserved namespaces are
+// this call's business, and SetMetricDefinitions owns the rest.
+func TestSetInfraPriceOverrides_WithdrawalLeavesCustomMetricsAlone(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+	store.defs[defKey(mod, "video.publish")] = usage.MetricDefinition{
+		Kind: usage.KindCount, Unit: "video", UnitPriceMicros: 30_000, Priced: true, Active: true,
+	}
+	svc := newService(store)
+
+	_, err := svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5}},
+	})
+	require.NoError(t, err)
+	_, err = svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{ModuleID: mod})
+	require.NoError(t, err)
+
+	require.Equal(t, int64(30_000), store.defs[defKey(mod, "video.publish")].UnitPriceMicros,
+		"the module's own custom metric survives an infra withdrawal")
+}
+
+// --- ms.AbsorbInfra() ------------------------------------------------------
+
+func TestSetInfraPriceOverrides_AbsorbAllZeroesEveryActiveSentinelMetric(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	seedSentinelInfra(store, "infra.egress.api.bytes", usage.KindSum, "GiB", 90_000)
+	seedSentinelInfra(store, "infra.storage.gib_hours", usage.KindTimeWeighted, "GiB-hour", 32)
+	mod := uuid.New()
+
+	resp, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		AbsorbAll: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, resp.Synced, "Synced counts EXPLICIT overrides; the absorbed set is the catalog's size")
+	require.True(t, resp.AbsorbAll)
+
+	// The module never named a metric — the set came from the sentinel catalog.
+	for _, m := range []string{"infra.compute.walltime.ms", "infra.egress.api.bytes", "infra.storage.gib_hours"} {
+		got, ok := store.defs[defKey(mod, m)]
+		require.True(t, ok, "%s absorbed", m)
+		require.Equal(t, int64(0), got.UnitPriceMicros, "%s passes through at 0", m)
+		require.True(t, got.Priced, "%s is priced-at-0, not unpriced", m)
+	}
+	// kind + unit still come from the sentinel row, never from the caller.
+	require.Equal(t, "GiB-hour", store.defs[defKey(mod, "infra.storage.gib_hours")].Unit)
+}
+
+// "Absorb everything except egress, which I mark up" — the explicit override is
+// applied after the expansion, so it wins.
+func TestSetInfraPriceOverrides_ExplicitOverrideBeatsAbsorbAll(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	seedSentinelInfra(store, "infra.egress.api.bytes", usage.KindSum, "GiB", 90_000)
+	mod := uuid.New()
+
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		AbsorbAll: true,
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.egress.api.bytes", UnitPriceMicros: 120_000}},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, int64(0), store.defs[defKey(mod, "infra.compute.walltime.ms")].UnitPriceMicros, "absorbed")
+	require.Equal(t, int64(120_000), store.defs[defKey(mod, "infra.egress.api.bytes")].UnitPriceMicros,
+		"the named metric overwrites the absorbed 0, not the other way round")
+}
+
+// A metric the platform has since DEACTIVATED is not re-absorbed, and its stale
+// row from an earlier publish is swept — otherwise absorb-all would resurrect a
+// price for a metric the catalog retired.
+func TestSetInfraPriceOverrides_AbsorbAllSkipsAndSweepsInactiveSentinelMetrics(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+	svc := newService(store)
+
+	_, err := svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID: mod, AbsorbAll: true,
+	})
+	require.NoError(t, err)
+	require.True(t, store.defs[defKey(mod, "infra.compute.walltime.ms")].Priced, "precondition: absorbed")
+
+	// The platform retires it.
+	sentinel := store.defs[defKey(usage.PlatformInfraModuleID(), "infra.compute.walltime.ms")]
+	sentinel.Active = false
+	store.defs[defKey(usage.PlatformInfraModuleID(), "infra.compute.walltime.ms")] = sentinel
+
+	_, err = svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID: mod, AbsorbAll: true,
+	})
+	require.NoError(t, err)
+	_, still := store.defs[defKey(mod, "infra.compute.walltime.ms")]
+	require.False(t, still, "a retired metric is neither re-absorbed nor left behind")
+}
+
+// Withdrawing ms.AbsorbInfra() itself clears the whole expanded set.
+func TestSetInfraPriceOverrides_WithdrawingAbsorbAllClearsEverything(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	seedSentinelInfra(store, "infra.egress.api.bytes", usage.KindSum, "GiB", 90_000)
+	mod := uuid.New()
+	svc := newService(store)
+
+	_, err := svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID: mod, AbsorbAll: true,
+	})
+	require.NoError(t, err)
+
+	_, err = svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{ModuleID: mod})
+	require.NoError(t, err)
+	for _, m := range []string{"infra.compute.walltime.ms", "infra.egress.api.bytes"} {
+		_, still := store.defs[defKey(mod, m)]
+		require.False(t, still, "%s reverts to the platform default", m)
+	}
 }
 
 func TestSetInfraPriceOverrides_InternalOnStoreError(t *testing.T) {
