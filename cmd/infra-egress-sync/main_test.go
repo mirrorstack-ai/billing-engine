@@ -86,7 +86,7 @@ func (f *fakeStore) UpsertMetricDefinitions(_ context.Context, _ []usage.MetricD
 func (f *fakeStore) UpsertMetricVersionPrices(_ context.Context, _ []usage.MetricVersionPrice) error {
 	return nil
 }
-func (f *fakeStore) UpsertInfraPriceOverrides(_ context.Context, _ uuid.UUID, _ []usage.InfraPriceOverride) error {
+func (f *fakeStore) SyncInfraPriceOverrides(_ context.Context, _ uuid.UUID, _ bool, _ []usage.InfraPriceOverride) error {
 	return nil
 }
 func (f *fakeStore) CurrentPeriodUsage(_ context.Context, _ uuid.UUID, _, _ time.Time) ([]usage.MetricUsageRaw, error) {

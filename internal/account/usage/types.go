@@ -782,12 +782,34 @@ type InfraPriceOverride struct {
 // row under the REAL module_id (never the sentinel), so the app bill's
 // dual-price resolution (decision 19 §4.2) resolves the module line at the
 // override while the sentinel row stays the platform default.
+// The call is AUTHORITATIVE, not additive: whatever it omits is withdrawn. An
+// empty payload (no absorb, no overrides) is the legitimate way to say "this
+// module declares no reserved pricing any more", so api-platform must fire it on
+// every version record, not only when the manifest happens to contain one.
 type SetInfraPriceOverridesRequest struct {
-	ModuleID  uuid.UUID            `json:"module_id"`
+	ModuleID uuid.UUID `json:"module_id"`
+	// AbsorbAll is ms.AbsorbInfra(): pass EVERY platform infra metric through to
+	// the customer at 0, for a module that bills through its own meters and adds
+	// no infrastructure passthrough on top.
+	//
+	// 🔴 THE SET IS RESOLVED HERE, FROM THE SENTINEL CATALOG — the caller sends a
+	// boolean, never a list. A module cannot enumerate the platform's infra
+	// metrics correctly for long: the SDK's own documented example named
+	// infra.compute.ms after migration 019 renamed it and 022 deleted it, so the
+	// override it produced matched nothing (and, being validated all-or-nothing,
+	// took the module's other overrides down with it). A boolean cannot drift,
+	// and a metric seeded next quarter is absorbed with no republish.
+	//
+	// Explicit Overrides are applied AFTER the absorb and WIN, so "absorb
+	// everything except egress, which I mark up" is expressible.
+	AbsorbAll bool                 `json:"absorb_all,omitempty"`
 	Overrides []InfraPriceOverride `json:"overrides"`
 }
 
-// SetInfraPriceOverridesResponse reports how many overrides were synced.
+// SetInfraPriceOverridesResponse reports how many explicit overrides were
+// written. It does NOT count the absorb-all expansion (that set is the catalog's
+// size, not the module's declaration) — AbsorbAll echoes back what was applied.
 type SetInfraPriceOverridesResponse struct {
-	Synced int `json:"synced"`
+	Synced    int  `json:"synced"`
+	AbsorbAll bool `json:"absorb_all,omitempty"`
 }
