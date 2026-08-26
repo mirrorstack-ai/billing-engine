@@ -613,6 +613,17 @@ func (s *Service) SetMetricVersionPrices(ctx context.Context, req SetMetricVersi
 //     sentinel), so the bill's dual-price resolution (decision 19 §4.2, W1)
 //     finds it via LEFT JOIN on the event's real module_id. ms.Price(0) →
 //     override 0 → full absorb, no special case.
+//   - AbsorbAll (ms.AbsorbInfra) does that for EVERY active sentinel metric at
+//     once, expanded from the catalog in the store — never from a list of metric
+//     names held by the caller, the SDK, or this package (see the request type).
+//     Explicit overrides apply after it and win.
+//
+// 🔴 AUTHORITATIVE, NOT ADDITIVE. The set this call carries REPLACES the module's
+// reserved overrides; anything absent is deleted. An EMPTY payload is therefore
+// meaningful and must still reach the store — it is how a module withdraws the
+// last ms.Price it declared. The predecessor upserted and returned early on an
+// empty list, which made an override write-once: the price outlived the
+// declaration and the app owner kept paying it.
 //
 // Platform CONTROL-PLANE call (internal secret, not the meter secret),
 // all-or-nothing (one transaction in the store), idempotent per
@@ -654,10 +665,10 @@ func (s *Service) SetInfraPriceOverrides(ctx context.Context, req SetInfraPriceO
 		}
 		overrides = append(overrides, o)
 	}
-	if err := s.store.UpsertInfraPriceOverrides(ctx, req.ModuleID, overrides); err != nil {
-		return nil, billing.Internal("upsert infra price overrides failed", err)
+	if err := s.store.SyncInfraPriceOverrides(ctx, req.ModuleID, req.AbsorbAll, overrides); err != nil {
+		return nil, billing.Internal("sync infra price overrides failed", err)
 	}
-	return &SetInfraPriceOverridesResponse{Synced: len(overrides)}, nil
+	return &SetInfraPriceOverridesResponse{Synced: len(overrides), AbsorbAll: req.AbsorbAll}, nil
 }
 
 // SetModuleVisibility upserts the developer margin-share mirror. It

@@ -50,17 +50,30 @@ type Store interface {
 	// already-snapshotted price.
 	UpsertMetricVersionPrices(ctx context.Context, prices []MetricVersionPrice) error
 
-	// UpsertInfraPriceOverrides writes a module's per-metric price OVERRIDES
-	// for the reserved platform-infra metrics (decision 19 §4.3), keyed
-	// (module_id, metric) with the REAL module_id. Each row is PRICE-ONLY:
-	// kind + unit are copied from the SENTINEL base catalog row (the seeded
-	// platform-infra row) in one INSERT ... SELECT, so the caller never
-	// supplies them. All-or-nothing (one transaction); idempotent (a re-sync
-	// updates unit_price_micros in place). A metric with no sentinel catalog
-	// row (a seed drift — the service already gated it as registered) makes
-	// the INSERT ... SELECT affect 0 rows, which the method surfaces as an
-	// error rather than silently writing nothing.
-	UpsertInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, overrides []InfraPriceOverride) error
+	// SyncInfraPriceOverrides makes a module's reserved-metric price overrides
+	// (decision 19 §4.3) match its manifest EXACTLY, in one transaction:
+	//
+	//   1. absorbAll (ms.AbsorbInfra) writes a price-0 row for every ACTIVE
+	//      sentinel metric, read from the catalog itself so no list of infra
+	//      metric names exists outside the DB to drift out of step.
+	//   2. Each explicit override upserts on top, so it WINS over the absorbed
+	//      0 — "absorb everything except egress" is expressible.
+	//   3. Anything the manifest no longer declares is DELETED.
+	//
+	// 🔴 STEP 3 IS WHY THIS IS Sync AND NOT Upsert. The upsert-only predecessor
+	// made an override write-once: removing ms.Price from a manifest left the row
+	// behind and the app owner kept paying a price no module declared. An empty
+	// call (no absorb, no overrides) is therefore MEANINGFUL — it clears the set —
+	// so callers must not skip it the way an empty upsert could be skipped.
+	//
+	// Every row is PRICE-ONLY: kind + unit are copied from the SENTINEL base
+	// catalog row in one INSERT ... SELECT, never supplied by the caller. The
+	// delete is scoped to the reserved namespaces, so a module's own custom
+	// metric_definitions rows (SetMetricDefinitions' business) survive untouched.
+	// A metric with no sentinel row (seed drift the service can't catch — it
+	// validates against the in-Go registry, not the DB) affects 0 rows and is
+	// surfaced as an error rather than a silent no-op.
+	SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, absorbAll bool, overrides []InfraPriceOverride) error
 
 	// InsertUsageEvent writes one raw metered fact, idempotent on
 	// event_id. recorded=false means ON CONFLICT(event_id) DO NOTHING
@@ -743,17 +756,15 @@ func (s *pgxStore) UpsertMetricVersionPrices(ctx context.Context, prices []Metri
 	return tx.Commit(ctx)
 }
 
-// UpsertInfraPriceOverrides upserts each price-only infra override in one
-// transaction (all-or-nothing, mirroring UpsertMetricDefinitions). The
-// generated UpsertInfraPriceOverride copies kind + unit from the sentinel
-// catalog row via INSERT ... SELECT and returns the affected-row count:
-// 0 means the sentinel row was absent (a seed drift the service could not
-// catch — it validates against the in-Go platformInfraKind registry, not the
-// DB), so surface it as an error instead of a silent no-op.
-func (s *pgxStore) UpsertInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, overrides []InfraPriceOverride) error {
-	if len(overrides) == 0 {
-		return nil
-	}
+// SyncInfraPriceOverrides makes the module's reserved-metric override set match
+// its manifest exactly — absorb-all, then the explicit overrides on top, then a
+// scoped delete of everything the manifest dropped. See the Store interface for
+// why the delete is the point and why an empty call must still run.
+//
+// 🔴 NO EARLY RETURN ON AN EMPTY SET. The predecessor's `if len(overrides) == 0
+// { return nil }` is precisely what made an override unwithdrawable: the one call
+// that means "I declare nothing any more" was the one call that did nothing.
+func (s *pgxStore) SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, absorbAll bool, overrides []InfraPriceOverride) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -763,6 +774,19 @@ func (s *pgxStore) UpsertInfraPriceOverrides(ctx context.Context, moduleID uuid.
 	defer tx.Rollback(ctx)
 
 	qtx := s.q.WithTx(tx)
+
+	// 1. ms.AbsorbInfra(): price 0 for every active sentinel metric. Read from
+	//    the catalog, so a metric seeded after this module published is absorbed
+	//    without a republish.
+	if absorbAll {
+		if _, err := qtx.AbsorbAllInfraPriceOverrides(ctx, moduleID.String()); err != nil {
+			return err
+		}
+	}
+
+	// 2. Explicit ms.Meter("infra.X", ms.Price(n)) — applied AFTER the absorb so
+	//    a named metric overwrites the 0 rather than the other way round.
+	keep := make([]string, 0, len(overrides))
 	for _, o := range overrides {
 		affected, err := qtx.UpsertInfraPriceOverride(ctx, db.UpsertInfraPriceOverrideParams{
 			ModuleID:        moduleID.String(),
@@ -775,6 +799,25 @@ func (s *pgxStore) UpsertInfraPriceOverrides(ctx context.Context, moduleID uuid.
 		if affected == 0 {
 			return fmt.Errorf("no sentinel catalog row for infra metric %q (seed drift): cannot inherit kind/unit for the override", o.Metric)
 		}
+		keep = append(keep, o.Metric)
+	}
+
+	// 3. Withdraw whatever the manifest no longer declares. Under absorb-all the
+	//    keep set is "everything still ACTIVE in the sentinel catalog, plus the
+	//    named ones" — a metric the platform has since retired loses its row too.
+	if absorbAll {
+		_, err = qtx.DeleteInfraPriceOverridesNotInOrActive(ctx, db.DeleteInfraPriceOverridesNotInOrActiveParams{
+			ModuleID: moduleID.String(),
+			Keep:     keep,
+		})
+	} else {
+		_, err = qtx.DeleteInfraPriceOverridesNotIn(ctx, db.DeleteInfraPriceOverridesNotInParams{
+			ModuleID: moduleID.String(),
+			Keep:     keep,
+		})
+	}
+	if err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }

@@ -103,6 +103,86 @@ DO UPDATE SET
     unit_price_micros = EXCLUDED.unit_price_micros,
     active            = true;
 
+-- AbsorbAllInfraPriceOverrides writes a price-0 override for EVERY active
+-- platform-infra metric in one statement — the ms.AbsorbInfra() declaration, for
+-- a module that bills its customer through its own meters and passes no platform
+-- infrastructure cost through on top.
+--
+-- 🔴 THE SET IS THE SENTINEL CATALOG, NOT A LIST IN CODE. Enumerating "all infra
+-- metrics" anywhere but here — in the SDK, in api-platform, in a Go slice beside
+-- platformInfraKind — is a copy that drifts. It already did: the SDK's own
+-- documented example named infra.compute.ms for a year after migration 019
+-- renamed it and 022 deleted it, so the override it produced resolved to nothing.
+-- Reading the sentinel rows means a metric seeded tomorrow is absorbed tomorrow,
+-- with no republish and no second list to keep in step.
+--
+-- Same INSERT ... SELECT shape as UpsertInfraPriceOverride (kind + unit inherited
+-- from the sentinel, price supplied), just unfiltered by metric and pinned to 0.
+-- Runs BEFORE the per-metric upserts in the same transaction, so an explicit
+-- ms.Meter("infra.X", ms.Price(n)) overwrites the 0 and wins — "absorb everything
+-- except egress" is expressible. :execrows so the store can report the count.
+-- name: AbsorbAllInfraPriceOverrides :execrows
+INSERT INTO ms_billing.metric_definitions (
+    module_id, metric, kind, unit, unit_price_micros, active
+)
+SELECT
+    @module_id::uuid,
+    sentinel.metric,
+    sentinel.kind,
+    sentinel.unit,
+    0,
+    true
+FROM ms_billing.metric_definitions sentinel
+WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
+  AND sentinel.active
+ON CONFLICT (module_id, metric)
+DO UPDATE SET
+    unit_price_micros = 0,
+    active            = true;
+
+-- DeleteInfraPriceOverridesNotIn makes a module's reserved-metric override set
+-- AUTHORITATIVE: whatever the manifest no longer declares stops applying.
+--
+-- 🔴 WITHOUT THIS AN OVERRIDE IS WRITE-ONCE. The sync was upsert-only, so
+-- deleting ms.Meter("infra.X", ms.Price(n)) from a module left the row in place
+-- and the app owner kept being charged at a price the module no longer declares
+-- — silently, forever, and now visibly: the app bill renders an overridden infra
+-- line at that price, toned as a deliberate discount or markup.
+--
+-- Scoped three ways so it can only ever remove what this sync owns: to ONE
+-- module_id (never the all-zero sentinel — the service rejects that caller), to
+-- the RESERVED namespaces (a module's own custom metric_definitions rows are
+-- SetMetricDefinitions' business and must survive untouched), and to metrics
+-- absent from @keep. An empty @keep clears every override the module has, which
+-- is exactly what removing the last declaration must do.
+-- name: DeleteInfraPriceOverridesNotIn :execrows
+DELETE FROM ms_billing.metric_definitions
+WHERE module_id = @module_id::uuid
+  AND (metric LIKE 'infra.%' OR metric LIKE 'platform.%')
+  AND NOT (metric = ANY(@keep::text[]));
+
+-- DeleteInfraPriceOverridesNotInOrActive is the ms.AbsorbInfra() counterpart of
+-- DeleteInfraPriceOverridesNotIn: the module keeps a row for every ACTIVE
+-- sentinel metric (AbsorbAllInfraPriceOverrides just wrote them) plus anything
+-- explicitly named in @keep, and loses the rest.
+--
+-- The "rest" is not empty: a metric the sentinel catalog has since DEACTIVATED
+-- still has this module's stale override row, and absorb-all skips it (it
+-- selects `sentinel.active`). Leaving it would resurrect a price for a metric
+-- the platform retired.
+-- name: DeleteInfraPriceOverridesNotInOrActive :execrows
+DELETE FROM ms_billing.metric_definitions t
+WHERE t.module_id = @module_id::uuid
+  AND (t.metric LIKE 'infra.%' OR t.metric LIKE 'platform.%')
+  AND NOT (t.metric = ANY(@keep::text[]))
+  AND NOT EXISTS (
+      SELECT 1
+      FROM ms_billing.metric_definitions sentinel
+      WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
+        AND sentinel.active
+        AND sentinel.metric = t.metric
+  );
+
 -- LookupMetricDefinition returns the authoritative kind + per-unit customer
 -- price for a (module, metric). The ingest path uses it to REJECT an
 -- undeclared metric (no row → INVALID_INPUT) and to snapshot `kind` onto
