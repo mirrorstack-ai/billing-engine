@@ -243,7 +243,7 @@ type Store interface {
 	// LiveModuleTimerCountForAccount returns the account's currently-live install-
 	// timer count (removed_at IS NULL) — the DISPLAY input to GetAccountBill's
 	// account-overage line under the per-module-instance overage model (migration
-	// 033), shown as the steady-state estimate $3 × max(0, live − IncludedModules)
+	// 033), shown as the steady-state estimate $5 × ceil(max(0, live − IncludedModules) / 5)
 	// (usage.AccountOverageMicros). Reads the timer table (the overage model's
 	// source of truth) rather than SUM(apps.module_count), so the shown overage
 	// stays tied to the exact rows the charge legs tier on.
@@ -1169,7 +1169,7 @@ func (s *pgxStore) CoCreatedOverModuleTimerCount(ctx context.Context, accountID,
 
 // LiveModuleTimerCountForAccount counts the account's currently-live install
 // timers (removed_at IS NULL) — the live input to GetAccountBill's steady-state
-// account-overage estimate ($3 × max(0, live − IncludedModules)). Under the
+// account-overage estimate ($5 × ceil(max(0, live − IncludedModules) / 5)). Under the
 // per-module-instance overage model (migration 033) the display reads the timer
 // table (the model's source of truth) instead of SUM(apps.module_count), so the
 // shown overage stays tied to the exact rows the charge legs tier on.

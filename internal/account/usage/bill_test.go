@@ -89,8 +89,10 @@ func TestGetAppBill_CurrentBaseIncludesAttributedAccountOverage(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, 9, resp.InstalledModuleCount)
-	require.EqualValues(t, 12_000_000, resp.ModuleOverageMicros)
-	require.EqualValues(t, 32_000_000, resp.BaseFeeMicros)
+	// Per-app attribution is the AMORTIZED per-timer share of the account's
+	// block cost, never a whole block: 4 over-timers × $1 = $4.
+	require.EqualValues(t, 4_000_000, resp.ModuleOverageMicros)
+	require.EqualValues(t, 24_000_000, resp.BaseFeeMicros)
 	require.Equal(t, resp.BaseFeeMicros, resp.TotalMicros)
 }
 

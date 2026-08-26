@@ -189,7 +189,7 @@ func TestModuleOverageTimers_Integration_RemovedAttemptedRecoveryCarveOut(t *tes
 // Regression (review 2026-07-06, H7): timer synthesis is a count-then-insert
 // reconcile in a fire-and-forget-with-retry RPC environment — two CONCURRENT
 // executions for the same app used to both read the same live count and both
-// insert the full deficit, minting phantom timers wrongfully charged $3 each at
+// insert the full deficit, minting phantom timers wrongfully charged at
 // every boundary. ReconcileModuleTimersToTarget serializes per app under a
 // pg_advisory_xact_lock; hammer it concurrently and assert the invariant.
 func TestModuleOverageTimers_Integration_ConcurrentReconcileNeverDoubleInserts(t *testing.T) {

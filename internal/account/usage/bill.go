@@ -51,12 +51,49 @@ const (
 	// spec 2026-07-05. Tunable ("may change"); becomes plan-resolved later.
 	IncludedModules = 5
 
-	// ModuleOverageFeeMicros is the surcharge for EACH installed module beyond the
-	// account-wide pooled IncludedModules. Owner spec 2026-07-05: $3.00/module/
-	// period. Account overage for a period = Overage × max(0, Σ live-app
-	// module_count − IncludedModules) — see AccountOverageMicros, the ONE place
-	// that formula lives. Tunable; becomes plan-resolved later.
-	ModuleOverageFeeMicros int64 = 3_000_000 // $3.00
+	// ModuleBlockSize is how many over-modules one purchased block covers (owner
+	// spec 2026-08-27, superseding the 2026-07-05 per-module rate). Overage is
+	// sold in WHOLE BLOCKS, not per module: an account pays for
+	// ceil(over_count / ModuleBlockSize) blocks. Tunable.
+	ModuleBlockSize = 5
+
+	// ModuleBlockFeeMicros is the RECURRING price of one such block — the money
+	// the customer actually sees each period. Account overage for a period =
+	// ModuleBlockFeeMicros × ceil(max(0, Σ live-app module_count −
+	// IncludedModules) / ModuleBlockSize); see AccountOverageMicros /
+	// ModuleBlockMicros (basefee.go), the ONE place that formula lives. Tunable.
+	//
+	// Why blocks: the per-module rate priced the PLATFORM'S decomposition
+	// granularity rather than customer value — splitting one module into two for
+	// architectural reasons raised a tenant's bill while delivering them nothing.
+	// A block absorbs that churn: inside a block, a split is free.
+	ModuleBlockFeeMicros int64 = 5_000_000 // $5.00 per block of ModuleBlockSize
+
+	// ModuleOverageFeeMicros is the per-module AMORTIZED rate, DERIVED from the
+	// block price — never tuned independently, so the two can never drift.
+	//
+	// Block pricing is NON-ADDITIVE (the price of a set of modules is not the sum
+	// of their individual prices), but the ONE-TIME charge legs are inherently
+	// per-timer: Leg 1's grace sweep, the combined creation invoice, and their
+	// crash-recovery replays each price a SINGLE install timer, and
+	// cycle.moduleOverageChargeShape is load-bearingly built on every input being
+	// IMMUTABLE so a fresh charge, an idem-key replay and the post-idem-window
+	// recovery all recompute the identical amount. A timer's live FIFO rank is
+	// MUTABLE, so pricing a one-time leg in blocks would let a replay reuse a
+	// Stripe idempotency key with a different amount.
+	//
+	// So the split is by LEG, not by call site:
+	//   - RECURRING money (the period bill line + the boundary advance leg) is
+	//     priced in whole blocks — that is the customer-visible monthly price;
+	//   - ONE-TIME mid-period stubs (a module installed partway through a period)
+	//     stay per-module at this amortized rate, keeping every immutability and
+	//     idempotency property intact.
+	// The account settles onto the exact block price at the next boundary. The
+	// stub can under-collect within a period (6 modules installed mid-period bill
+	// 6 × this rate, not 2 blocks); that is bounded to one period, self-corrects
+	// at the boundary, and errs in the customer's favour — the same direction as
+	// the D1e no-refund-on-shrink asymmetry.
+	ModuleOverageFeeMicros int64 = ModuleBlockFeeMicros / ModuleBlockSize // $1.00
 
 	// DomainFeeMicros is the recurring fee for EACH active custom domain.
 	// Domains have no included allowance; every live domain contributes this
@@ -222,6 +259,14 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	// that owns them and folds that share into its 基本費用. Only the current
 	// period uses this steady-state estimate: historical periods retain their
 	// exact base snapshot because there is no frozen per-timer allocation ledger.
+	//
+	// Priced at the AMORTIZED per-module rate, NOT in blocks — deliberately. A
+	// block is ACCOUNT-wide and its timers can span several apps, so there is no
+	// non-arbitrary way to hand one app a whole block. The amortized rate is the
+	// right per-timer primitive: each over-timer carries exactly one module's
+	// share of a block, so the per-app shares sum to the account total whenever
+	// the account's blocks are full. The account bill stays authoritative — see
+	// BaseFeeMicros' doc: callers must not add the two APIs together.
 	baseFee := parts.BaseFeeMicros
 	var moduleOverage int64
 	if req.PeriodID == uuid.Nil && found && !parts.IsDeleted {

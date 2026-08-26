@@ -317,7 +317,7 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 		// Pending ADD-ON rows: over-modules installed AFTER creation (never
 		// co-created — those ride the app's own pending row above) whose own
 		// grace timers (migration 033) have not yet elapsed. One row per app,
-		// PROJECTED at the steady flat surcharge per timer ($3 each — Leg 1's
+		// PROJECTED at the steady flat surcharge per timer ($1 stub each — Leg 1's
 		// exact proration is the sweep's to mint), base 0, ETA = the earliest
 		// timer expiry. An app past ITS creation grace can still surface here —
 		// installing a 6th+ module later mints a new upcoming charge.

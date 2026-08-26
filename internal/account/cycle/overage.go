@@ -21,7 +21,8 @@ package cycle
 //         install always gets the latest installed_at, so an existing row's rank
 //         can only improve over→included, never included→over) makes this a
 //         PERMANENT verdict — the row is never re-evaluated.
-//       * over → charge ModuleOverageFeeMicros ($3) prorated from the install's
+//       * over → charge ModuleOverageFeeMicros ($1, the amortized per-module
+//         stub rate — one-time legs never price in blocks) prorated from the install's
 //         UTC day to the install period's end (install-anchored — the correction
 //         vs. the prior account-wide attempt, which anchored to grace-elapse),
 //         via a per-timer Stripe invoice with deterministic idem keys derived
@@ -70,7 +71,9 @@ const (
 	// relax back to arrears lets the deferred charge fire through the same keys.
 	ModuleOverageSkippedPrepaid ModuleOverageStatus = "skipped_prepaid"
 	// ModuleOverageSkippedZeroCents: "over" but the prorated overage rounded to 0
-	// cents (unreachable for a real ≥1-day over module at $3) — resolved with no
+	// cents (still unreachable for a real ≥1-day over module at the $1 stub rate:
+	// the worst case is $1 × 1/31 = 3¢, though the margin is thinner than at $3)
+	// — resolved with no
 	// charge so it never re-sweeps forever.
 	ModuleOverageSkippedZeroCents ModuleOverageStatus = "zero_cents"
 	// ModuleOveragePeriodClosed: "over" but the account only activated AT OR AFTER
@@ -275,7 +278,7 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		return res, nil
 	}
 
-	// "Over": price $3 prorated from the install's UTC day over the install's own
+	// "Over": price the $1 per-module stub prorated from the install's UTC day over the install's own
 	// anchored period (ADR 0005 anchor from activation) — install-anchored, NOT
 	// grace-elapse-anchored and NOT now-anchored — plus, for a grace that
 	// STRADDLES the period boundary, the full fee for the period the grace

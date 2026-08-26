@@ -16,11 +16,14 @@ func day(y int, m time.Month, d int) time.Time {
 // --- AccountOverageMicros: account-wide POOLED overage tier boundaries -------
 
 func TestAccountOverageMicros_PooledBoundaries(t *testing.T) {
-	// Owner spec 2026-07-05 / migration 032: $3 × max(0, pooledCount − 5), where
-	// pooledCount is Σ live-app module_count for the WHOLE account. The boundary
-	// cases pin the tier edges: ≤5 pooled modules cost nothing, the 6th costs
-	// exactly one overage, and the overage is NOT the flat base (it is the
-	// account-level surcharge only).
+	// Owner spec 2026-08-27 (supersedes the 2026-07-05 per-module rate):
+	// $5 × ceil(max(0, pooledCount − 5) / 5), where pooledCount is Σ live-app
+	// module_count for the WHOLE account. The boundary cases pin BOTH edges that
+	// matter: the allowance edge (≤5 pooled costs nothing, the 6th opens a block)
+	// and the BLOCK edges — every count inside one block costs the same, so a
+	// module split inside a block is free, and the price only steps at
+	// included + k×blockSize + 1.
+	blk := usage.ModuleBlockFeeMicros
 	for _, tc := range []struct {
 		name   string
 		pooled int
@@ -29,13 +32,47 @@ func TestAccountOverageMicros_PooledBoundaries(t *testing.T) {
 		{"zero pooled → no overage", 0, 0},
 		{"under pool (3) → no overage", 3, 0},
 		{"exactly included (5) → no overage", usage.IncludedModules, 0},
-		{"included+1 (6) → one $3 overage", usage.IncludedModules + 1, usage.ModuleOverageFeeMicros},
-		{"included+10 → ten overages", usage.IncludedModules + 10, 10 * usage.ModuleOverageFeeMicros},
+		{"included+1 (6) → opens block 1", usage.IncludedModules + 1, blk},
+		// Free headroom: 7, 8, 9, 10 all ride block 1 at the same price.
+		{"included+2 (7) → still block 1", usage.IncludedModules + 2, blk},
+		{"included+4 (9) → still block 1", usage.IncludedModules + 4, blk},
+		{"included+blockSize (10) → block 1 exactly full", usage.IncludedModules + usage.ModuleBlockSize, blk},
+		{"included+blockSize+1 (11) → opens block 2", usage.IncludedModules + usage.ModuleBlockSize + 1, 2 * blk},
+		// twkpa-edu's real shape: 13 installed modules → 8 over → 2 blocks = $10,
+		// so the whole app bills $20 base + $10 = $30/period.
+		{"13 pooled (twkpa-edu) → 2 blocks", 13, 2 * blk},
+		{"15 pooled → block 2 exactly full", 15, 2 * blk},
+		{"16 pooled → opens block 3", 16, 3 * blk},
+		{"included+2×blockSize (15) → two blocks", usage.IncludedModules + 2*usage.ModuleBlockSize, 2 * blk},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.want, usage.AccountOverageMicros(tc.pooled))
 		})
 	}
+}
+
+// The per-module stub rate is DERIVED from the block price so the two can never
+// drift; it must divide evenly or the amortization is a lie (and the one-time
+// legs would silently under/over-collect against the recurring line).
+func TestModuleOverageFeeMicros_IsTheExactAmortizedBlockRate(t *testing.T) {
+	require.Zero(t, usage.ModuleBlockFeeMicros%usage.ModuleBlockSize,
+		"block fee must divide evenly by block size")
+	require.Equal(t, usage.ModuleBlockFeeMicros/usage.ModuleBlockSize, usage.ModuleOverageFeeMicros)
+	// A full block's worth of per-module stubs equals exactly one block.
+	require.Equal(t, usage.ModuleBlockFeeMicros, usage.ModuleOverageFeeMicros*usage.ModuleBlockSize)
+}
+
+// ModuleOverageBlocks is total on non-positive input so no caller pre-clamps.
+func TestModuleOverageBlocks_CeilAndClamp(t *testing.T) {
+	require.Zero(t, usage.ModuleOverageBlocks(-3))
+	require.Zero(t, usage.ModuleOverageBlocks(0))
+	require.EqualValues(t, 1, usage.ModuleOverageBlocks(1))
+	require.EqualValues(t, 1, usage.ModuleOverageBlocks(usage.ModuleBlockSize))
+	require.EqualValues(t, 2, usage.ModuleOverageBlocks(usage.ModuleBlockSize+1))
+	require.EqualValues(t, 2, usage.ModuleOverageBlocks(2*usage.ModuleBlockSize))
+	require.EqualValues(t, 3, usage.ModuleOverageBlocks(2*usage.ModuleBlockSize+1))
+	require.Zero(t, usage.ModuleBlockMicros(0))
+	require.Equal(t, usage.ModuleBlockFeeMicros, usage.ModuleBlockMicros(1))
 }
 
 // --- ProratedBaseMicros: creation-period proration ---------------------------
@@ -206,24 +243,24 @@ func TestCreationChargeOverageMicros_MatchesPerTimerSweepRounding(t *testing.T) 
 			createdAt: day(2026, 6, 19),
 			start:     day(2026, 6, 4),
 			end:       day(2026, 7, 4),
-			want:      1_500_000,
+			want:      500_000,
 		},
 		{
-			// $3 × 5/8 = $1.875, which the sweep rounds half-up to $1.88.
+			// $1 × 5/8 = $0.625, which the sweep rounds half-up to $0.63.
 			name:      "non-straddle exact half-cent rounds up",
 			createdAt: day(2026, 1, 4),
 			start:     day(2026, 1, 1),
 			end:       day(2026, 1, 9),
-			want:      1_880_000,
+			want:      630_000,
 		},
 		{
-			// The three-day creation proration is 290,323 micros; adding the
-			// full $3 straddle fee yields 3,290,323 micros, rounded once to $3.29.
+			// The three-day creation proration is 96,774 micros; adding the
+			// full $1 straddle fee yields 1,096,774 micros, rounded once to $1.10.
 			name:      "straddle rounds the combined per-timer amount once",
 			createdAt: day(2026, 8, 8),
 			start:     day(2026, 7, 11),
 			end:       day(2026, 8, 11),
-			want:      3_290_000,
+			want:      1_100_000,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

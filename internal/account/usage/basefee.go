@@ -14,32 +14,53 @@ const microsPerCent = 10_000
 // integer micro-dollars; the arithmetic here is pure int64 (no big.Rat needed:
 // the operands are bounded — see ProratedBaseMicros).
 //
-// The flat $20/app base is per-app; the $3/module surcharge applies to the
+// The flat $20/app base is per-app; the $5-per-block-of-5 surcharge applies to the
 // account's over-count, max(0, live module count − IncludedModules). Under the
 // per-module-instance model (migration 033) the charge legs tier per install
 // TIMER (each on its own grace), while the DISPLAY reads the live timer count
 // through AccountOverageMicros. There is deliberately NO per-app overage helper:
 // an app's base is just the flat (plan-resolved) fee.
 
+// ModuleOverageBlocks is the number of WHOLE overage blocks an over-count
+// occupies: ceil(overCount / ModuleBlockSize), clamped to 0. Overage is sold in
+// blocks, so an over-count of 1 and of ModuleBlockSize both cost one block —
+// that free headroom inside a block is the point (see ModuleBlockFeeMicros).
+// Total on non-positive input, so callers never pre-clamp.
+func ModuleOverageBlocks(overCount int64) int64 {
+	if overCount <= 0 {
+		return 0
+	}
+	return (overCount + ModuleBlockSize - 1) / ModuleBlockSize
+}
+
+// ModuleBlockMicros prices an over-count in whole blocks —
+// ModuleBlockFeeMicros × ModuleOverageBlocks(overCount). This is the ONE home of
+// the RECURRING overage price: both the displayed bill line
+// (AccountOverageMicros) and the boundary advance leg (cycle.charge) go through
+// it, so the page and the invoice cannot disagree. Overflow is not reachable —
+// overCount is a live-row count, bounded by the timer table.
+func ModuleBlockMicros(overCount int64) int64 {
+	return ModuleOverageBlocks(overCount) * ModuleBlockFeeMicros
+}
+
 // AccountOverageMicros is the account's module overage shown for one period:
 //
-//	ModuleOverageFeeMicros × max(0, liveModuleCount − IncludedModules)
+//	ModuleBlockFeeMicros × ceil(max(0, liveModuleCount − IncludedModules) / ModuleBlockSize)
 //
 // liveModuleCount is the account's live installed-module count (the count of live
 // install timers, migration 033 — one pool of IncludedModules for the WHOLE
 // account, not per app). The first IncludedModules live installs (by FIFO) are
 // "included"; the rest are "over", so max(0, live − included) is exactly the live
-// over-count. A liveModuleCount ≤ IncludedModules yields 0 (the max(0, …) clamp
-// makes the function total; a negative count cannot occur — a live-row count).
+// over-count, which ModuleBlockMicros then rounds UP to whole blocks. A
+// liveModuleCount ≤ IncludedModules yields 0 (ModuleOverageBlocks is total on
+// non-positive input; a negative count cannot occur — a live-row count).
 // GetAccountBill uses this current-live steady-state amount as the next-period
 // recurring overage forecast inside ProjectedTotalMicros; unresolved one-time
 // timer proration is layered on separately and any exact next-period straddle
-// overlap is counted once.
+// overlap is counted once — at the per-module amortized rate, which is exactly
+// one module's marginal share of a full block.
 func AccountOverageMicros(liveModuleCount int) int64 {
-	if extra := liveModuleCount - IncludedModules; extra > 0 {
-		return ModuleOverageFeeMicros * int64(extra)
-	}
-	return 0
+	return ModuleBlockMicros(int64(liveModuleCount) - IncludedModules)
 }
 
 // GraceExpiry is the single home of the "grace elapses at t + GraceDays" rule
@@ -115,7 +136,7 @@ func DomainCreationChargeMicros(activatedAt, periodStart, periodEnd time.Time) i
 // Period boundaries are midnight-UTC anchored (billingperiod), so the
 // day counts are exact divisions; createdAt is truncated to its UTC date
 // (creation-day inclusive). Overflow: base is bounded by the module_count
-// INT column (≤ ~2^31 × $3 ≈ 6.4e15 micros) and day counts by ~31, so
+// INT column (≤ ~2^31 × $5 ≈ 1.1e16 micros) and day counts by ~31, so
 // base × remain_days stays far inside int64 — plain integer math is exact.
 func ProratedBaseMicros(baseMicros int64, createdAt, periodStart, periodEnd time.Time) int64 {
 	coverageStart := ProrationCoverageStart(createdAt, periodStart)

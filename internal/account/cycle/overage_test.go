@@ -203,9 +203,10 @@ func TestModuleOverage_D1dStraddleChargesThePostActivationPeriod(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, res.Charged, "the straddled post-activation period is owed — only the install period is forgiven")
 	require.True(t, store.timers[over].graceCharged)
-	// Full $3 for the straddled period alone, window narrowed to it.
+	// Full $1 per-module stub for the straddled period alone, window narrowed to
+	// it. (One-time legs price per module at the amortized rate, not in blocks.)
 	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 300, sc.itemCalls[0].amountCfg)
+	require.EqualValues(t, 100, sc.itemCalls[0].amountCfg)
 	requireLinePeriod(t, sc.itemCalls[0].period,
 		time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC))
@@ -264,10 +265,10 @@ func TestModuleOverage_GraceStraddlingBoundaryCoversStraddledPeriod(t *testing.T
 	require.Equal(t, 1, res.Charged)
 	require.True(t, store.timers[over].graceCharged)
 
-	// $3 × 2/30 days (Jul 2 → Jul 4 of the 30-day install period, round-half-up
-	// = $0.20) + the FULL $3 for the straddled [Jul 4, Aug 4) period = $3.20.
+	// $1 × 2/30 days (Jul 2 → Jul 4 of the 30-day install period, round-half-up
+	// = $0.07) + the FULL $1 for the straddled [Jul 4, Aug 4) period = $1.07.
 	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 320, sc.itemCalls[0].amountCfg,
+	require.EqualValues(t, 107, sc.itemCalls[0].amountCfg,
 		"install-period proration + the full straddled period")
 	requireLinePeriod(t, sc.itemCalls[0].period,
 		time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC),
@@ -300,9 +301,9 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 	require.Equal(t, 1, res.Charged)
 	require.True(t, store.timers[over].graceCharged)
 
-	// $3 × 24/30 days (Jun 10 → Jul 4) = $2.40 — and nothing more.
+	// $1 × 24/30 days (Jun 10 → Jul 4) = $0.80 — and nothing more.
 	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg)
+	require.EqualValues(t, 80, sc.itemCalls[0].amountCfg)
 	requireLinePeriod(t, sc.itemCalls[0].period,
 		time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC))
@@ -380,7 +381,7 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	require.Empty(t, sc.invoiceCalls, "the found draft is completed — never a second CreateDraftInvoice")
 	require.Len(t, sc.itemCalls, 1)
 	require.Equal(t, "in_orphan_draft", sc.itemCalls[0].invoiceID, "the line lands on the crashed attempt's own draft")
-	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg)
+	require.EqualValues(t, 80, sc.itemCalls[0].amountCfg)
 	requireLinePeriod(t, sc.itemCalls[0].period,
 		time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC))
