@@ -194,7 +194,7 @@ WHERE account_id = $1
 // CountLiveModuleTimersForAccount returns the account's currently-live
 // (removed_at IS NULL) install-timer count — the DISPLAY read behind
 // GetAccountBill's account-overage line under the per-module-instance model
-// (migration 033). The steady-state estimate $3 × max(0, live − included) counts
+// (migration 033). The steady-state estimate $5 × ceil(max(0, live − included)/5) counts
 // the live "over" rows (the FIFO tail past the included 5); reading the timer
 // table (the overage model's source of truth) rather than SUM(apps.module_count)
 // keeps the shown overage tied to the rows the charge legs actually tier on.
@@ -228,7 +228,7 @@ type CountOngoingOverModuleTimersParams struct {
 
 // CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario 6):
 // the count of the account's currently-live install timers that are "over"
-// (live-FIFO rank >= included) AND owed a FULL $3 precharge for the NEW period
+// (live-FIFO rank >= included) AND owed a FULL block precharge for the NEW period
 // [@period_end, next boundary) — ongoing over-modules continuing into it.
 // row_number() over the whole live set gives every live timer its 1-based FIFO
 // rank; rn > @included_modules is exactly the 0-based rank >= included ("over")

@@ -14,7 +14,7 @@ package cycle_test
 // app created 2026-06-19 has remain_days = whole UTC days in [Jun 19, Jul 4) = 15,
 // exactly HALF the period, so each prorated amount is a clean half:
 //   * base   $20 × 15/30 = $10.00 → 1000¢
-//   * overage $3 × 15/30 =  $1.50 →  150¢
+//   * overage $1 × 15/30 =  $0.50 →   50¢   (per-module one-time stub rate)
 
 import (
 	"context"
@@ -152,8 +152,8 @@ func TestScenario3_PoolOverFromDayZeroOneCombinedInvoice(t *testing.T) {
 	require.Len(t, sc.itemCalls, 3)
 	require.EqualValues(t, 1000, sc.itemCalls[0].amountCfg, "base: $20 × 15/30 = $10.00")
 	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
-	require.EqualValues(t, 150, sc.itemCalls[1].amountCfg, "overage: $3 × 15/30 = $1.50")
-	require.EqualValues(t, 150, sc.itemCalls[2].amountCfg)
+	require.EqualValues(t, 50, sc.itemCalls[1].amountCfg, "overage: $1 × 15/30 = $0.50")
+	require.EqualValues(t, 50, sc.itemCalls[2].amountCfg)
 	for _, item := range sc.itemCalls {
 		requireLinePeriod(t, item.period,
 			timeUTC(2026, 6, 19, 0), timeUTC(2026, 7, 4, 0))
@@ -282,12 +282,12 @@ func TestScenario4_PoolCrossesFiveLaterPerModuleTimers(t *testing.T) {
 	timerA := seedTimer(store, acct, app, timeUTC(2026, 6, 10, 0))
 	timerB := seedTimer(store, acct, app, timeUTC(2026, 6, 11, 0))
 
-	// Sweep Jun 13: only A is past its own grace → one charge, $2.40.
+	// Sweep Jun 13: only A is past its own grace → one charge, $0.80.
 	resA, err := svc.SweepModuleOverage(ctx, timeUTC(2026, 6, 13, 9))
 	require.NoError(t, err)
 	require.Equal(t, 1, resA.Charged)
 	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 240, sc.itemCalls[0].amountCfg, "A: $3 × 24/30 = $2.40")
+	require.EqualValues(t, 80, sc.itemCalls[0].amountCfg, "A: $1 × 24/30 = $0.80")
 	require.Equal(t, "mod-overage-ii-"+timerA.String(), sc.itemCalls[0].idemKey)
 	require.False(t, store.timers[timerB].graceResolved, "B is still in its own grace")
 
@@ -297,7 +297,7 @@ func TestScenario4_PoolCrossesFiveLaterPerModuleTimers(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, resB.Charged)
 	require.Len(t, sc.itemCalls, 2, "A must not be charged again")
-	require.EqualValues(t, 230, sc.itemCalls[1].amountCfg, "B: $3 × 23/30 = $2.30")
+	require.EqualValues(t, 77, sc.itemCalls[1].amountCfg, "B: $1 × 23/30 = $0.77")
 	require.Equal(t, "mod-overage-ii-"+timerB.String(), sc.itemCalls[1].idemKey)
 	require.True(t, store.timers[timerA].graceCharged)
 	require.True(t, store.timers[timerB].graceCharged)
@@ -336,13 +336,13 @@ func TestScenario5_LargeAutoCollectFlagAtEveryChargeSite(t *testing.T) {
 			sc := newFakeStripe()
 			svc := cycle.NewService(store, sc)
 			seedIncluded(store, acct, uuid.New(), timeUTC(2026, 5, 4, 0), 5)
-			seedTimer(store, acct, uuid.New(), timeUTC(2026, 6, 19, 0)) // over, $1.50
+			seedTimer(store, acct, uuid.New(), timeUTC(2026, 6, 19, 0)) // over, $0.50
 			_, err := svc.SweepModuleOverage(context.Background(), timeUTC(2026, 6, 25, 9))
 			require.NoError(t, err)
 			return onlyInvoiceMirror(t, store)
 		}
-		require.True(t, run(ptrI64(1_000_000)).IsLargeAutoCollect, "$1.50 overage > $1 threshold → flagged")
-		require.False(t, run(nil).IsLargeAutoCollect, "$1.50 overage < $100 default → not flagged")
+		require.True(t, run(ptrI64(250_000)).IsLargeAutoCollect, "$0.50 overage > $0.25 threshold → flagged")
+		require.False(t, run(nil).IsLargeAutoCollect, "$0.50 overage < $100 default → not flagged")
 	})
 
 	t.Run("boundary leg (Leg 2)", func(t *testing.T) {
@@ -457,14 +457,14 @@ func TestScenario6_BoundaryPrechargesOngoingOverModulesOnly(t *testing.T) {
 	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 	require.EqualValues(t, 1_000_000, resp.ArrearsMicros)
 	require.EqualValues(t, usage.BaseFeeMicros, resp.AdvanceBaseMicros, "one live app → $20 base")
-	require.EqualValues(t, 2*usage.ModuleOverageFeeMicros, resp.AdvanceOverageMicros,
-		"only the 2 ONGOING over-modules are precharged; the in-grace one is excluded")
+	require.EqualValues(t, usage.ModuleBlockFeeMicros, resp.AdvanceOverageMicros,
+		"only the 2 ONGOING over-modules are precharged (1 block); the in-grace one is excluded")
 
-	// One invoice, ONE pooled line: $1 arrears + $20 base + 2 × $3 overage = $27 → 2700¢.
+	// One invoice, ONE pooled line: $1 arrears + $20 base + 1 block ($5) = $26 → 2600¢.
 	require.Len(t, sc.invoiceCalls, 1)
 	require.Len(t, sc.itemCalls, 1, "arrears + base + overage pool into ONE line")
-	require.EqualValues(t, 2_700, resp.ChargedCents)
-	require.EqualValues(t, 2_700, sc.itemCalls[0].amountCfg)
+	require.EqualValues(t, 2_600, resp.ChargedCents)
+	require.EqualValues(t, 2_600, sc.itemCalls[0].amountCfg)
 }
 
 // Regression (review 2026-07-06, H1): a module installed INSIDE the new period
@@ -515,7 +515,7 @@ func TestScenario6_ExpiredButUnresolvedTimerStillPrecharged(t *testing.T) {
 	sc := newFakeStripe()
 	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
-	require.EqualValues(t, usage.ModuleOverageFeeMicros, resp.AdvanceOverageMicros,
+	require.EqualValues(t, usage.ModuleBlockFeeMicros, resp.AdvanceOverageMicros,
 		"an expired-but-unresolved over-module is ongoing — its own Leg 1 charge stops at the boundary, so skipping it here gaps the new period")
 }
 
@@ -539,7 +539,7 @@ func TestScenario6_D1dResolvedUnchargedOverModuleStillPrecharged(t *testing.T) {
 	sc := newFakeStripe()
 	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
-	require.EqualValues(t, usage.ModuleOverageFeeMicros, resp.AdvanceOverageMicros,
+	require.EqualValues(t, usage.ModuleBlockFeeMicros, resp.AdvanceOverageMicros,
 		"a D1d resolved-uncharged over-module is ongoing — only its pre-activation install period is forgiven, not every period after")
 }
 

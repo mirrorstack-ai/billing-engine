@@ -220,10 +220,10 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	}
 
 	// Account overage line (migration 033): the steady-state monthly estimate
-	// from the CURRENT live install timers — $3 × max(0, live − IncludedModules).
+	// from the CURRENT live install timers — $5 × ceil(max(0, live − IncludedModules) / 5).
 	// Under the per-module-instance model overage is billed per install on its own
 	// grace timer (Leg 1) / at the boundary (Leg 2); the display sums the live
-	// "over" timer rows and prices them at the steady-state $3 each — the timer
+	// "over" timer rows and prices them in whole $5 blocks — the timer
 	// table is the overage model's source of truth. The display does not prorate
 	// (the charge legs own proration), so this is an estimate of the period's
 	// overage, not a per-line replay of the exact prorated amounts invoiced (that
@@ -285,8 +285,11 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		if err != nil {
 			return nil, billing.Internal("activated recurring fee counts failed", err)
 		}
+		// Modules are a RECURRING leg → whole blocks, matching the boundary
+		// advance leg (cycle.charge) and AccountOverageMicros to the micro. Apps
+		// and domains stay per-unit — neither has an allowance or a block.
 		projectedBaseFeeTotal = int64(counts.Apps)*resolveBaseFeeMicros(plan) +
-			int64(counts.ModuleOverages)*ModuleOverageFeeMicros +
+			ModuleBlockMicros(int64(counts.ModuleOverages)) +
 			int64(counts.CustomDomains)*DomainFeeMicros
 		// The current-period base line is the complete activation-gated recurring
 		// forecast, so module/domain units are folded into it exactly once.
@@ -368,6 +371,17 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 // ProjectedBaseFeeTotalMicros/AccountOverageMicros, subtract its full unit once.
 // Delayed older charges keep their full straddle because their coverage does
 // not overlap the currently projected recurring period.
+//
+// APPROXIMATE for module timers, deliberately. The recurring line is priced in
+// whole BLOCKS while this deduction is per-charge, so the two cannot cancel
+// exactly: k overlapping timers deduct k × ModuleOverageFeeMicros against a
+// recurring contribution of ceil(over/ModuleBlockSize) × ModuleBlockFeeMicros.
+// Deducting the amortized per-module rate is the right per-charge answer (it is
+// exactly one module's marginal share of a full block) and the residual is
+// bounded by one block. This is a FORECAST, not money charged — the invoice
+// legs are exact — and the residual errs HIGH, so the projection never
+// under-promises what the customer will owe. Making it exact would need a
+// cross-charge view this per-charge function does not have.
 func unresolvedOneTimeChargeIncrementMicros(
 	charge UnresolvedOneTimeChargeRaw,
 	projectedPeriodStart time.Time,
@@ -509,7 +523,7 @@ func (s *Service) ProjectedCreditCharge(ctx context.Context, ownerUserID, ownerO
 }
 
 // accountOverageMicros resolves the account overage shown on the bill: the
-// steady-state monthly estimate AccountOverageMicros(live timer count) = $3 ×
+// steady-state monthly estimate AccountOverageMicros(live timer count) = $5 × ceil(…/5) of
 // max(0, live − IncludedModules), where `live` is the count of the account's
 // currently-live install timers (migration 033) — the overage model's source of
 // truth. The first IncludedModules live timers (by FIFO) are "included"; the rest

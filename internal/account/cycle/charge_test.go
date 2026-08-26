@@ -427,15 +427,20 @@ func TestRunBillingCycle_SponsorRevokedDegradesToNoPMSkip(t *testing.T) {
 
 func TestRunBillingCycle_ReclaimReusesFrozenBoundaryChargeAmount(t *testing.T) {
 	// Reproduces the exact failure scenario. Account X's boundary run computes
-	// arrears $1 + advance base $40 (2 apps) + advance overage $6 (2 ongoing
-	// over-modules) = $47 (4700¢), calls Stripe under ii-<run>/inv-<run> (the money
-	// moves), but crashes before MarkBillingRun commits — the run stays 'pending'.
-	// Before the retry a customer uninstalls one over-module, so a LIVE recompute
-	// would now yield only $44 (4400¢). InsertBillingRun RECLAIMS the SAME run id
-	// (same idem keys). Pre-fix, the retry re-sent those keys with the recomputed
-	// $44 — a mismatched body under a used idem key — which Stripe rejects,
-	// permanently stalling the run. Fixed: the retry REUSES the frozen $47 under the
-	// same keys and completes.
+	// arrears $1 + advance base $40 (2 apps) + advance overage $10 (6 ongoing
+	// over-modules → ceil(6/5) = 2 blocks) = $51 (5100¢), calls Stripe under
+	// ii-<run>/inv-<run> (the money moves), but crashes before MarkBillingRun
+	// commits — the run stays 'pending'. Before the retry a customer uninstalls one
+	// over-module, dropping to 5 over → ONE block, so a LIVE recompute would now
+	// yield only $46 (4600¢). InsertBillingRun RECLAIMS the SAME run id (same idem
+	// keys). Pre-fix, the retry re-sent those keys with the recomputed $46 — a
+	// mismatched body under a used idem key — which Stripe rejects, permanently
+	// stalling the run. Fixed: the retry REUSES the frozen $51 under the same keys
+	// and completes.
+	//
+	// The over-module count STRADDLES A BLOCK BOUNDARY deliberately: under block
+	// pricing a removal that stays inside the same block leaves the live total
+	// unchanged, which would make this regression test pass vacuously.
 	store := newFakeStore()
 	store.chargedTotal = 1_000_000 // $1 usage arrears
 	store.hasPM = true
@@ -444,15 +449,17 @@ func TestRunBillingCycle_ReclaimReusesFrozenBoundaryChargeAmount(t *testing.T) {
 	// 2 live apps created before the new period → $40 advance base.
 	seedApp(store, chargeAccount, 0, false)
 	app2 := seedApp(store, chargeAccount, 0, false)
-	// 5 included (ranks 0-4) + 2 ongoing over-modules already charged in a prior
-	// period (ranks 5-6) → overCount 2 → $6 advance overage.
+	// 5 included (ranks 0-4) + 6 ongoing over-modules already charged in a prior
+	// period (ranks 5-10) → overCount 6 → 2 blocks → $10 advance overage.
 	seedIncluded(store, chargeAccount, app2, timeUTC(2026, 5, 1, 0), 5)
-	o1 := seedTimer(store, chargeAccount, app2, timeUTC(2026, 5, 10, 0))
-	o2 := seedTimer(store, chargeAccount, app2, timeUTC(2026, 5, 11, 0))
-	for _, id := range []uuid.UUID{o1, o2} {
+	var over []uuid.UUID
+	for i := range 6 {
+		id := seedTimer(store, chargeAccount, app2, timeUTC(2026, 5, 10+i, 0))
 		store.timers[id].graceResolved = true
 		store.timers[id].graceCharged = true // charged in a prior period → ongoing
+		over = append(over, id)
 	}
+	o2 := over[len(over)-1] // the newest — removing it drops 6 over → 5, i.e. 2 blocks → 1
 
 	sc := newFakeStripe()
 
@@ -462,17 +469,17 @@ func TestRunBillingCycle_ReclaimReusesFrozenBoundaryChargeAmount(t *testing.T) {
 	_, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.Error(t, err, "the mark failed → the run is left pending, resumable")
 	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 4700, sc.itemCalls[0].amountCfg, "$1 + $40 + 2×$3 = $47")
+	require.EqualValues(t, 5100, sc.itemCalls[0].amountCfg, "$1 + $40 + 2 blocks ($10) = $51")
 	firstIdem := sc.itemCalls[0].idemKey
 
-	// Between attempts: a customer uninstalls one over-module → a LIVE recompute
-	// would now yield overCount 1 → $44, NOT $47.
+	// Between attempts: a customer uninstalls one over-module → overCount drops
+	// 6 → 5, i.e. 2 blocks → 1, so a LIVE recompute would yield $46, NOT $51.
 	store.timers[o2].removed = true
 	store.timers[o2].removedAt = timeUTC(2026, 6, 15, 0)
 	store.errMarkRun = nil // the retry's mark succeeds
 
 	// RETRY: reclaims the SAME run id (same idem keys). It must charge the FROZEN
-	// $47, never the recomputed $44 — otherwise Stripe rejects the reused key.
+	// $51, never the recomputed $46 — otherwise Stripe rejects the reused key.
 	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.True(t, resp.FirstRun, "a reclaimed non-terminal run is a fresh charge attempt")
@@ -480,12 +487,12 @@ func TestRunBillingCycle_ReclaimReusesFrozenBoundaryChargeAmount(t *testing.T) {
 	require.Len(t, sc.itemCalls, 2)
 	require.Equal(t, firstIdem, sc.itemCalls[1].idemKey,
 		"the reclaim reuses the same run id → the same Stripe idem key")
-	require.EqualValues(t, 4700, sc.itemCalls[1].amountCfg,
-		"so the amount under that key must be the frozen $47, not the recomputed $44")
-	require.EqualValues(t, 4700, resp.ChargedCents)
+	require.EqualValues(t, 5100, sc.itemCalls[1].amountCfg,
+		"so the amount under that key must be the frozen $51, not the recomputed $46")
+	require.EqualValues(t, 5100, resp.ChargedCents)
 	for _, m := range store.markedRuns {
 		require.Equal(t, cycle.RunStatusInvoiced, m.status)
-		require.EqualValues(t, 4700, m.totalCents)
+		require.EqualValues(t, 5100, m.totalCents)
 	}
 }
 

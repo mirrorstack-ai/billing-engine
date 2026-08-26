@@ -110,12 +110,12 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.Equal(t, usage.BaseFeeMicros+524, resp.Apps[2].TotalMicros)
 
 	// Account totals are the column sums plus the account-wide POOLED overage.
-	// All three apps are flat, so BaseFeeTotal = 3 × $20. Pool 7 → 2 over → $6.
+	// All three apps are flat, so BaseFeeTotal = 3 × $20. Pool 7 → 2 over → 1 block → $5.
 	require.Equal(t, 3*usage.BaseFeeMicros, resp.BaseFeeTotalMicros)
 	require.EqualValues(t, 1500, resp.ModuleUsageTotalMicros)
 	require.EqualValues(t, 224, resp.InfraTotalMicros)
 	require.Equal(t, usage.AccountOverageMicros(7), resp.AccountOverageMicros)
-	require.EqualValues(t, 6_000_000, resp.AccountOverageMicros) // 2 over × $3
+	require.EqualValues(t, 5_000_000, resp.AccountOverageMicros) // 2 over → ceil(2/5) = 1 block × $5
 	require.EqualValues(t, 3*usage.DomainFeeMicros, resp.CustomDomainsMicros)
 	require.EqualValues(t, 6_000_000, resp.CustomDomainsMicros) // 3 domains × $2
 	require.Zero(t, resp.PaasCreditMicros)
@@ -577,8 +577,8 @@ func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.Apps, 1)
 	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "per-app base is flat regardless of count")
-	require.EqualValues(t, 9_000_000, resp.AccountOverageMicros,
-		"un-snapshotted current period estimates the pooled overage from the live pool 8 → 3 over → $9")
+	require.EqualValues(t, 5_000_000, resp.AccountOverageMicros,
+		"un-snapshotted current period estimates the pooled overage from the live pool 8 → 3 over → 1 block → $5")
 }
 
 func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
@@ -750,14 +750,14 @@ func TestGetAccountBill_CurrentProjectedBaseJoinsOnlyAfterInitialChargesSettle(t
 	require.EqualValues(t, 80_000_000, bill.ProjectedBaseFeeTotalMicros)
 
 	// The creation settlement is the atomic handoff. It can occur after a
-	// period boundary; once durable, the app's $20 and four charged $3 timer
-	// units join the forecast: $20×5 + $3×4 = $112.
+	// period boundary; once durable, the app's $20 and the block covering four
+	// charged timer units join the forecast: $20×5 + ceil(4/5)×$5 = $105.
 	store.activatedRecurring = &usage.RecurringFeeCounts{Apps: 5, ModuleOverages: 4}
 	bill, err = newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
 		OwnerUserID: owner,
 	})
 	require.NoError(t, err)
-	require.EqualValues(t, 112_000_000, bill.ProjectedBaseFeeTotalMicros)
+	require.EqualValues(t, 105_000_000, bill.ProjectedBaseFeeTotalMicros)
 	require.Equal(t, bill.ProjectedBaseFeeTotalMicros, bill.ProjectedTotalMicros)
 }
 
@@ -832,7 +832,7 @@ func TestGetAccountBill_UnresolvedOneTimeChargeShapesAndRecurringDedup(t *testin
 			graceExpiresAt:        time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
 			countsTowardRecurring: true,
 			moduleCount:           usage.IncludedModules + 1,
-			wantIncrementMicros:   2_129_032, // raw $3 × 22 remaining days / 31
+			wantIncrementMicros:   709_677, // raw $1 × 22 remaining days / 31
 		},
 		{
 			name:                  "module straddle uses raw wallet micros and removes overlapping recurring fee",
@@ -843,7 +843,7 @@ func TestGetAccountBill_UnresolvedOneTimeChargeShapesAndRecurringDedup(t *testin
 			graceExpiresAt:        time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
 			countsTowardRecurring: true,
 			moduleCount:           usage.IncludedModules + 1,
-			wantIncrementMicros:   193_548, // $3 × 2 remaining days / 31, not Stripe-cent rounded
+			wantIncrementMicros:   64_516, // $1 × 2 remaining days / 31, not Stripe-cent rounded
 		},
 		{
 			name:                  "attempted timer now included keeps full unresolved recovery shape",
@@ -854,7 +854,7 @@ func TestGetAccountBill_UnresolvedOneTimeChargeShapesAndRecurringDedup(t *testin
 			graceExpiresAt:        time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
 			countsTowardRecurring: false,
 			moduleCount:           usage.IncludedModules,
-			wantIncrementMicros:   3_193_548,
+			wantIncrementMicros:   1_064_516,
 		},
 	}
 
@@ -920,7 +920,11 @@ func TestGetAccountBill_FrozenCombinedAttemptUsesExactMoneyAndExactRecurringMemb
 			secondTimerRecurring: true,
 			snapshotStart:        projectedStart,
 			snapshotEnd:          projectedEnd,
-			wantPending:          1_677_419,
+			// Frozen money is historical and unchanged; the recurring-overlap
+			// deduction is one per-module stub ($1) per recurring child. The block-
+			// priced recurring line and the per-module deduction do not cancel
+			// exactly — see unresolvedOneTimeChargeIncrementMicros.
+			wantPending: 5_677_419,
 		},
 		{
 			name:                 "deleted app keeps full frozen base and timer recovery money",

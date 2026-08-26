@@ -571,7 +571,7 @@ type Store interface {
 	// orphans instead of inserting). A grow inserts the deficit anchored at
 	// installedAt/graceExpiresAt, a shrink LIFO-soft-removes the surplus at
 	// removedAt. The lock also serializes concurrent executions so two retries
-	// can never both insert the full deficit (phantom $3 timers).
+	// can never both insert the full deficit (phantom timers).
 	ReconcileModuleTimersToTarget(ctx context.Context, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error
 
 	// MarkAppDeletedAndRemoveTimers soft-deletes the roster row AND soft-removes
