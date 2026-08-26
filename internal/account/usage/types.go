@@ -608,14 +608,14 @@ type GetAccountBillResponse struct {
 	InfraTotalMicros       int64 `json:"infra_total_micros"`
 
 	// AccountOverageMicros is the account's module overage for the period
-	// (migration 033): $3 × max(0, Σ live-app module_count − IncludedModules),
+	// (migration 033): $5 × ceil(max(0, Σ live-app module_count − IncludedModules) / 5),
 	// an ACCOUNT line (NOT per app, NOT folded into any Apps[].base_fee_micros).
 	// Under the per-module-instance model overage is billed per install on its
 	// own grace timer (Leg 1); this display value is the steady-state estimate
 	// from the CURRENT live pool. Included in TotalMicros below; inside
 	// ProjectedTotalMicros the same steady-state amount is interpreted as the
 	// NEXT-period recurring overage forecast. Therefore normal one-time timer
-	// proration is additional, while an exact straddled-next-period $3 is
+	// proration is additional, while an exact straddled-next-period $1 stub is
 	// de-duplicated from the unresolved increment.
 	AccountOverageMicros int64 `json:"account_overage_micros"`
 

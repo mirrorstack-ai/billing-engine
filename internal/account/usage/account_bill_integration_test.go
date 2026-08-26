@@ -373,7 +373,7 @@ func TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO(t *testi
 		wantOverCount      = 5
 		perAppOverCount    = 7 - usage.IncludedModules
 		testMicrosPerCent  = int64(10_000)
-		wantPerTimerMicros = int64(1_500_000)
+		wantPerTimerMicros = int64(500_000)
 	)
 	overCount, err := store.CoCreatedOverModuleTimerCount(ctx, acct, appA, createdAt, usage.IncludedModules)
 	require.NoError(t, err)
@@ -397,11 +397,11 @@ func TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO(t *testi
 	require.Equal(t, periodEnd, sweepEnd)
 
 	perTimerMicros := usage.CreationChargeOverageMicros(createdAt, periodStart, periodEnd)
-	require.Equal(t, wantPerTimerMicros, perTimerMicros, "$3 x 15/30 = $1.50 per timer")
+	require.Equal(t, wantPerTimerMicros, perTimerMicros, "$1 stub x 15/30 = $0.50 per timer")
 	wantProjectedMicros := int64(wantOverCount) * perTimerMicros
 	perAppProjectedMicros := int64(perAppOverCount) * perTimerMicros
-	require.Equal(t, int64(7_500_000), wantProjectedMicros)
-	require.Equal(t, int64(3_000_000), perAppProjectedMicros)
+	require.Equal(t, int64(2_500_000), wantProjectedMicros)
+	require.Equal(t, int64(1_000_000), perAppProjectedMicros)
 	require.NotEqual(t, perAppProjectedMicros, wantProjectedMicros,
 		"a regression to created_module_count - IncludedModules must fail")
 
@@ -427,7 +427,7 @@ func TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO(t *testi
 		sweepPerTimerMicros += usage.ModuleOverageFeeMicros
 	}
 	sweepPerTimerCents := (sweepPerTimerMicros + testMicrosPerCent/2) / testMicrosPerCent
-	require.Equal(t, int64(150), sweepPerTimerCents)
+	require.Equal(t, int64(50), sweepPerTimerCents)
 	require.Equal(t, sweepPerTimerCents, perTimerMicros/testMicrosPerCent,
 		"preview rounds one timer to cents exactly where the sweep does")
 }

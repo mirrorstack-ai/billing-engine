@@ -43,7 +43,7 @@ import (
 //     account with NO mirror rows (pre-backfill) gets base 0 — exactly the
 //     pre-027 arrears-only invoice — until the api-platform backfill populates
 //     the roster.
-//     3b. ADVANCE overage leg (scenario 6, Leg 2): the NEW period's FULL $3-per-
+//     3b. ADVANCE overage leg (scenario 6, Leg 2): the NEW period's FULL $5-per-block-of-5-
 //     module precharge for every ONGOING over-module — a live install timer that
 //     is "over" per the live FIFO AND already charged at least once (survived its
 //     grace in an earlier period, continuing into the new one). On the SAME
@@ -255,7 +255,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		advanceBase += usage.BaseFeeMicros
 	}
 
-	// ADVANCE OVERAGE leg (scenario 6, Leg 2): the NEW period's $3-per-module
+	// ADVANCE OVERAGE leg (scenario 6, Leg 2): the NEW period's $5-per-block
 	// precharge for every ONGOING over-module — a live install timer that is both
 	// "over" per the live FIFO AND already charged at least once (grace_charged_at
 	// set), i.e. a module that survived its own grace in an earlier period and
@@ -276,7 +276,11 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("ongoing over-module timer count failed", err)
 	}
-	advanceOverage := usage.ModuleOverageFeeMicros * int64(overCount)
+	// RECURRING leg → priced in WHOLE BLOCKS (usage.ModuleBlockMicros), never
+	// per module: this is the customer-visible monthly overage. The one-time
+	// grace legs stay per-module at the amortized rate — see
+	// usage.ModuleOverageFeeMicros for why the split is by leg.
+	advanceOverage := usage.ModuleBlockMicros(int64(overCount))
 
 	// ADVANCE DOMAINS leg: every live custom domain activated before the new
 	// period opened contributes one full $2 fee for that new period. Deliberately
@@ -607,7 +611,8 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	//     this guards against (the bug ee5043c fixed once for the account-wide
 	//     model, whose freeze migration 033 dropped).
 	//   - Fresh: the cents==0 sub-half-cent short-circuit applies (never call
-	//     Stripe for $0 — an advance base/overage, when present, is always ≥ $3
+	//     Stripe for $0 — an advance base/overage, when present, is always ≥ $5
+	//     (a whole block, or the $20 base; leg 2 never prorates)
 	//     and can never round to 0; nothing was ever put through Stripe for this
 	//     run), then freeze BEFORE the first Stripe call. The freeze is
 	//     first-write-wins AND returns the SURVIVING row value (H6): a concurrent
