@@ -517,3 +517,33 @@ type PaymentMethod struct {
 	ExpYear               int       `json:"exp_year"`
 	IsDefault             bool      `json:"is_default"`
 }
+
+// SetOrgDistributorRequest binds customer org C to distributor org B
+// (migration 053). Source is 'registration' when the link is derived from the
+// org context the customer signed up through (?org= or the distributor's org
+// custom domain) and 'manual' when set explicitly; an existing 'manual' link
+// is never silently downgraded back to 'registration'.
+type SetOrgDistributorRequest struct {
+	CustomerOrgID    uuid.UUID `json:"customer_org_id"`
+	DistributorOrgID uuid.UUID `json:"distributor_org_id"`
+	Source           string    `json:"source,omitempty"`
+}
+
+// SetOrgDistributorResponse echoes the stored link.
+type SetOrgDistributorResponse struct {
+	CustomerOrgID    uuid.UUID `json:"customer_org_id"`
+	DistributorOrgID uuid.UUID `json:"distributor_org_id"`
+	Source           string    `json:"source"`
+}
+
+// ClearOrgDistributorRequest removes customer org C's distributor link.
+type ClearOrgDistributorRequest struct {
+	CustomerOrgID uuid.UUID `json:"customer_org_id"`
+}
+
+// ClearOrgDistributorResponse reports whether a link was actually removed, so
+// a caller can distinguish "unlinked" from "was never linked" instead of
+// reading success into a no-op.
+type ClearOrgDistributorResponse struct {
+	Removed bool `json:"removed"`
+}

@@ -21,12 +21,16 @@ import (
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
-	accountsByUser   map[uuid.UUID]fakeAccount
-	hasUsablePM      map[uuid.UUID]bool
-	hasUnpaidInvoice map[uuid.UUID]bool
-	paymentMethodsBy map[uuid.UUID][]billing.PaymentMethod
-	serviceSignals   map[uuid.UUID]billing.ServiceSignals
-	addCardRequests  map[uuid.UUID]*fakeAddCardRequest
+	// org distributor links (migration 053): customer org -> distributor org,
+	// plus each link's provenance.
+	orgDistributors       map[uuid.UUID]uuid.UUID
+	orgDistributorSources map[uuid.UUID]string
+	accountsByUser        map[uuid.UUID]fakeAccount
+	hasUsablePM           map[uuid.UUID]bool
+	hasUnpaidInvoice      map[uuid.UUID]bool
+	paymentMethodsBy      map[uuid.UUID][]billing.PaymentMethod
+	serviceSignals        map[uuid.UUID]billing.ServiceSignals
+	addCardRequests       map[uuid.UUID]*fakeAddCardRequest
 
 	// PM-target lookups for detach / set-default, keyed by payment method id.
 	pmTargets map[uuid.UUID]pmTarget
@@ -422,6 +426,32 @@ func (s *fakeStore) EnsureOrgAccount(_ context.Context, orgID uuid.UUID) (uuid.U
 	a := fakeAccount{id: uuid.New()}
 	s.accountsByOrg[orgID] = a
 	return a.id, "", nil
+}
+
+func (s *fakeStore) UpsertOrgDistributor(_ context.Context, customerOrgID, distributorOrgID uuid.UUID, source string) (string, error) {
+	if s.orgDistributors == nil {
+		s.orgDistributors = map[uuid.UUID]uuid.UUID{}
+	}
+	if s.orgDistributorSources == nil {
+		s.orgDistributorSources = map[uuid.UUID]string{}
+	}
+	// Mirrors the query's ON CONFLICT: an existing 'manual' link is never
+	// downgraded back to 'registration'.
+	if s.orgDistributorSources[customerOrgID] == "manual" {
+		source = "manual"
+	}
+	s.orgDistributors[customerOrgID] = distributorOrgID
+	s.orgDistributorSources[customerOrgID] = source
+	return source, nil
+}
+
+func (s *fakeStore) DeleteOrgDistributor(_ context.Context, customerOrgID uuid.UUID) (bool, error) {
+	if _, ok := s.orgDistributors[customerOrgID]; !ok {
+		return false, nil
+	}
+	delete(s.orgDistributors, customerOrgID)
+	delete(s.orgDistributorSources, customerOrgID)
+	return true, nil
 }
 
 func (s *fakeStore) AccountByOrg(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {

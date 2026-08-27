@@ -206,6 +206,13 @@ type Store interface {
 	// represented by org_billing_designations and returns the customer account.
 	DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error)
 
+	// UpsertOrgDistributor binds customer→distributor (migration 053) and
+	// returns the STORED source, which may differ from the requested one: an
+	// existing 'manual' link is never downgraded to 'registration'.
+	UpsertOrgDistributor(ctx context.Context, customerOrgID, distributorOrgID uuid.UUID, source string) (string, error)
+	// DeleteOrgDistributor removes the link, reporting whether a row existed.
+	DeleteOrgDistributor(ctx context.Context, customerOrgID uuid.UUID) (bool, error)
+
 	// ListDistributorCustomerStates returns wallet snapshots for every related
 	// customer org, sorted deterministically by org id.
 	ListDistributorCustomerStates(ctx context.Context, distributorOrgID uuid.UUID) ([]DistributorCustomerState, error)
@@ -1032,6 +1039,26 @@ func (s *pgxStore) SetCreditBillingMode(ctx context.Context, accountID uuid.UUID
 		return nil
 	})
 	return changed, err
+}
+
+func (s *pgxStore) UpsertOrgDistributor(ctx context.Context, customerOrgID, distributorOrgID uuid.UUID, source string) (string, error) {
+	row, err := s.q.UpsertOrgDistributor(ctx, db.UpsertOrgDistributorParams{
+		CustomerOrgID:    customerOrgID.String(),
+		DistributorOrgID: distributorOrgID.String(),
+		Source:           source,
+	})
+	if err != nil {
+		return "", err
+	}
+	return row.Source, nil
+}
+
+func (s *pgxStore) DeleteOrgDistributor(ctx context.Context, customerOrgID uuid.UUID) (bool, error) {
+	n, err := s.q.DeleteOrgDistributor(ctx, customerOrgID.String())
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *pgxStore) DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {

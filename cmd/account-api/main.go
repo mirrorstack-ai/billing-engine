@@ -177,6 +177,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.svc.SetCustomerBillingMode(ctx, req)
 
+	case "SetOrgDistributor":
+		var req billing.SetOrgDistributorRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.SetOrgDistributor(ctx, req)
+
+	case "ClearOrgDistributor":
+		var req billing.ClearOrgDistributorRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.ClearOrgDistributor(ctx, req)
+
 	case "ListDistributorCustomers":
 		var req billing.ListDistributorCustomersRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -663,6 +677,8 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.SetAutoTopUp", makeHTTPHandler(d, "SetAutoTopUp"))
 		r.Post("/v1/billing.RecoverAutoTopUp", makeHTTPHandler(d, "RecoverAutoTopUp"))
 		r.Post("/v1/billing.SetCustomerBillingMode", makeHTTPHandler(d, "SetCustomerBillingMode"))
+		r.Post("/v1/billing.SetOrgDistributor", makeHTTPHandler(d, "SetOrgDistributor"))
+		r.Post("/v1/billing.ClearOrgDistributor", makeHTTPHandler(d, "ClearOrgDistributor"))
 		r.Post("/v1/billing.ListDistributorCustomers", makeHTTPHandler(d, "ListDistributorCustomers"))
 		r.Post("/v1/billing.GrantCredits", makeHTTPHandler(d, "GrantCredits"))
 		r.Post("/v1/billing.DetachPaymentMethod", makeHTTPHandler(d, "DetachPaymentMethod"))

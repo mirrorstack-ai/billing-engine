@@ -214,3 +214,52 @@ WHERE EXISTS (
         JOIN ms_billing.apps ap ON ap.app_id = e.app_id
         WHERE ap.owner_org_id = d.org_id AND e.account_id IS NULL)
 ORDER BY d.org_id;
+
+-- UpsertOrgDistributor binds customer org C to distributor org B (migration
+-- 053). PK on customer_org_id makes a re-bind an UPDATE, never a second row,
+-- so "who distributes C" stays a single unambiguous fact.
+--
+-- source is written on INSERT and PRESERVED on re-bind unless it changes from
+-- 'registration' to 'manual': an operator overriding a registration-derived
+-- link should be visible as manual, but a later registration-time write must
+-- not silently downgrade a deliberate manual override back to 'registration'.
+-- name: UpsertOrgDistributor :one
+INSERT INTO ms_billing.org_distributors (
+    customer_org_id, distributor_org_id, source
+) VALUES (
+    sqlc.arg(customer_org_id)::uuid,
+    sqlc.arg(distributor_org_id)::uuid,
+    sqlc.arg(source)::text
+)
+ON CONFLICT (customer_org_id) DO UPDATE SET
+    distributor_org_id = EXCLUDED.distributor_org_id,
+    source             = CASE
+                             WHEN ms_billing.org_distributors.source = 'manual'
+                             THEN 'manual'
+                             ELSE EXCLUDED.source
+                         END,
+    updated_at         = now()
+RETURNING customer_org_id, distributor_org_id, source;
+
+-- DeleteOrgDistributor clears C's distributor link. Returns the rows removed
+-- so the caller can distinguish "unlinked" from "was never linked" rather
+-- than reporting success for a no-op.
+-- name: DeleteOrgDistributor :execrows
+DELETE FROM ms_billing.org_distributors
+WHERE customer_org_id = sqlc.arg(customer_org_id)::uuid;
+
+-- GetOrgDistributor returns the distributor org that distributes C, if any.
+-- name: GetOrgDistributor :one
+SELECT distributor_org_id, source
+FROM ms_billing.org_distributors
+WHERE customer_org_id = sqlc.arg(customer_org_id)::uuid;
+
+-- OrgIsDistributor derives is_distributor: an org IS a distributor iff it
+-- distributes at least one customer. Deliberately DERIVED rather than stored
+-- as a flag, so the answer can never drift from the links themselves.
+-- Backed by org_distributors_distributor_idx.
+-- name: OrgIsDistributor :one
+SELECT EXISTS (
+    SELECT 1 FROM ms_billing.org_distributors
+    WHERE distributor_org_id = sqlc.arg(distributor_org_id)::uuid
+)::boolean AS is_distributor;

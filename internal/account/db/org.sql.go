@@ -110,6 +110,22 @@ func (q *Queries) DeleteOrgDesignation(ctx context.Context, orgID string) (int64
 	return result.RowsAffected(), nil
 }
 
+const deleteOrgDistributor = `-- name: DeleteOrgDistributor :execrows
+DELETE FROM ms_billing.org_distributors
+WHERE customer_org_id = $1::uuid
+`
+
+// DeleteOrgDistributor clears C's distributor link. Returns the rows removed
+// so the caller can distinguish "unlinked" from "was never linked" rather
+// than reporting success for a no-op.
+func (q *Queries) DeleteOrgDistributor(ctx context.Context, customerOrgID string) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOrgDistributor, customerOrgID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getOrgDesignation = `-- name: GetOrgDesignation :one
 SELECT org_id, funding, sponsor_account_id, sponsor_user_id,
        disclosed_backlog_micros, updated_by, updated_at
@@ -140,6 +156,25 @@ func (q *Queries) GetOrgDesignation(ctx context.Context, orgID string) (GetOrgDe
 		&i.UpdatedBy,
 		&i.UpdatedAt,
 	)
+	return i, err
+}
+
+const getOrgDistributor = `-- name: GetOrgDistributor :one
+SELECT distributor_org_id, source
+FROM ms_billing.org_distributors
+WHERE customer_org_id = $1::uuid
+`
+
+type GetOrgDistributorRow struct {
+	DistributorOrgID string `json:"distributor_org_id"`
+	Source           string `json:"source"`
+}
+
+// GetOrgDistributor returns the distributor org that distributes C, if any.
+func (q *Queries) GetOrgDistributor(ctx context.Context, customerOrgID string) (GetOrgDistributorRow, error) {
+	row := q.db.QueryRow(ctx, getOrgDistributor, customerOrgID)
+	var i GetOrgDistributorRow
+	err := row.Scan(&i.DistributorOrgID, &i.Source)
 	return i, err
 }
 
@@ -197,6 +232,24 @@ func (q *Queries) ListSponsoredOrgIDs(ctx context.Context, sponsorUserID pgtype.
 		return nil, err
 	}
 	return items, nil
+}
+
+const orgIsDistributor = `-- name: OrgIsDistributor :one
+SELECT EXISTS (
+    SELECT 1 FROM ms_billing.org_distributors
+    WHERE distributor_org_id = $1::uuid
+)::boolean AS is_distributor
+`
+
+// OrgIsDistributor derives is_distributor: an org IS a distributor iff it
+// distributes at least one customer. Deliberately DERIVED rather than stored
+// as a flag, so the answer can never drift from the links themselves.
+// Backed by org_distributors_distributor_idx.
+func (q *Queries) OrgIsDistributor(ctx context.Context, distributorOrgID string) (bool, error) {
+	row := q.db.QueryRow(ctx, orgIsDistributor, distributorOrgID)
+	var is_distributor bool
+	err := row.Scan(&is_distributor)
+	return is_distributor, err
 }
 
 const orgLiveAppIDs = `-- name: OrgLiveAppIDs :many
@@ -459,4 +512,50 @@ func (q *Queries) UpsertOrgDesignation(ctx context.Context, arg UpsertOrgDesigna
 		arg.UpdatedBy,
 	)
 	return err
+}
+
+const upsertOrgDistributor = `-- name: UpsertOrgDistributor :one
+INSERT INTO ms_billing.org_distributors (
+    customer_org_id, distributor_org_id, source
+) VALUES (
+    $1::uuid,
+    $2::uuid,
+    $3::text
+)
+ON CONFLICT (customer_org_id) DO UPDATE SET
+    distributor_org_id = EXCLUDED.distributor_org_id,
+    source             = CASE
+                             WHEN ms_billing.org_distributors.source = 'manual'
+                             THEN 'manual'
+                             ELSE EXCLUDED.source
+                         END,
+    updated_at         = now()
+RETURNING customer_org_id, distributor_org_id, source
+`
+
+type UpsertOrgDistributorParams struct {
+	CustomerOrgID    string `json:"customer_org_id"`
+	DistributorOrgID string `json:"distributor_org_id"`
+	Source           string `json:"source"`
+}
+
+type UpsertOrgDistributorRow struct {
+	CustomerOrgID    string `json:"customer_org_id"`
+	DistributorOrgID string `json:"distributor_org_id"`
+	Source           string `json:"source"`
+}
+
+// UpsertOrgDistributor binds customer org C to distributor org B (migration
+// 053). PK on customer_org_id makes a re-bind an UPDATE, never a second row,
+// so "who distributes C" stays a single unambiguous fact.
+//
+// source is written on INSERT and PRESERVED on re-bind unless it changes from
+// 'registration' to 'manual': an operator overriding a registration-derived
+// link should be visible as manual, but a later registration-time write must
+// not silently downgrade a deliberate manual override back to 'registration'.
+func (q *Queries) UpsertOrgDistributor(ctx context.Context, arg UpsertOrgDistributorParams) (UpsertOrgDistributorRow, error) {
+	row := q.db.QueryRow(ctx, upsertOrgDistributor, arg.CustomerOrgID, arg.DistributorOrgID, arg.Source)
+	var i UpsertOrgDistributorRow
+	err := row.Scan(&i.CustomerOrgID, &i.DistributorOrgID, &i.Source)
+	return i, err
 }
