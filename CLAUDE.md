@@ -1,6 +1,17 @@
 # `billing-engine` — agent guide
 
-The billing service for the MirrorStack platform. Owns Stripe credentials, the polymorphic billing-entity row, subscription state, invoice mirror, and (later) usage metering.
+The public billing boundary for the MirrorStack platform. It owns metering,
+pricing, customer billing authority, payment-provider execution, reconciliation,
+and financial receipts.
+
+> **Target architecture is proposed, not deployed.** Read `README.md` and
+> `docs/DESIGN.md` before changing money behavior. Current `main` contains direct
+> Stripe paths that do not yet meet the intent/notice/authorization boundary.
+> Never describe the target documents as current production guarantees.
+>
+> **Automatic merge and promotion are paused for this rebuild.** Work on a
+> branch, preserve manual billing/security review, and do not enable collection
+> merely because CI passes.
 
 > **This repo is v1.** A v0 attempt with a different schema (`ms_billing_account`) lives at `mirrorstack-ai/billing-engine-old` for reference. **Do not import patterns from v0 without re-deriving** — the schema shape changed and the design decisions are different.
 
@@ -38,6 +49,46 @@ api-platform/account ─internal HTTP (X-MS-Internal-Secret)─► billing-engin
 - `api-platform` **never** touches Stripe. All Stripe API calls happen here.
 - `billing-engine` is the **only** service with `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`.
 - `billing-engine` reads narrow columns from `ms_account.users` (and future `ms_account.orgs`) via soft FK; it never writes outside `ms_billing.*`.
+
+## Target money boundary
+
+The accepted destination is documented publicly in:
+
+- `docs/DESIGN.md` — intent lifecycle and capability separation;
+- `docs/CHARGES.md` — exhaustive monetary-effect vocabulary;
+- `docs/LEDGER-AND-RECEIPTS.md` — append-only truth and provider trace;
+- `docs/TAX.md` — fail-closed versioned tax boundary;
+- `docs/THREAT-MODEL.md` — adversaries, assumptions, and limits; and
+- `docs/VERIFICATION.md` — deployed-source and receipt verification.
+
+Build toward these invariants:
+
+- The private caller reports constrained facts; it never supplies an amount,
+  price, tax, total, payment method, provider, notice status, or execution time.
+- Every debit consumes one immutable `ChargeIntent`, exact notice evidence, and
+  a live bounded `BillingAuthorization`.
+- Unknown price, tax, notice, authorization, build identity, or provider outcome
+  produces no new monetary effect.
+- Only an isolated executor has payment-provider write capability. Read, status,
+  metering, infrastructure sync, notification, and reconciliation components
+  cannot compile against the write port.
+- Provider integrations use small consumer-owned Go interfaces and composition.
+  Do not pass one universal provider client through the service graph.
+- Stripe is an adapter, not the domain model. NewebPay/Taiwan is the next planned
+  adapter; provider-specific objects live in `PaymentAttempt`/evidence only.
+- A read-only provider port can trace intent → attempt → provider objects → cash
+  movement/payout/refund/dispute without moving money.
+- One intent settles at most once across every provider and retry.
+- Provider invoices/callbacks are evidence; the append-only ledger is monetary
+  truth.
+- Infrastructure cost is internal and is never a customer charge kind.
+- Tax unknown is distinct from final zero and cannot execute.
+- Corrections, refunds, and late usage append linked records; they never rewrite
+  settled history.
+
+The weakest reachable legacy path defines the actual guarantee. Do not call the
+deployment intent-only until `Capabilities` reports `legacyMoneyPaths: 0`, every
+caller has migrated, and legacy provider credentials are revoked.
 
 ## Commit identity
 
