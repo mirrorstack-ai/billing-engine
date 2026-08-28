@@ -117,14 +117,24 @@ resolves that exact conflict.
 Tax is calculated before the intent is sealed and before exact notice is sent.
 The receipt exposes the exact order:
 
-```text
-enumerated customer lines
-  → eligible discounts/credits allocation
-  → taxable basis by line/classification
-  → jurisdiction/rate components or inclusive extraction
-  → documented per-line/invoice rounding
-  → final tax line
-  → sealed total
+```mermaid
+flowchart TD
+    Lines["Enumerated customer lines"]
+    Credits["Allocate eligible discounts and credits"]
+    Basis["Taxable basis by line and classification"]
+    Evidence{"All required location, classification,<br/>policy, and provider evidence final?"}
+    Rates["Final jurisdiction and rate components<br/>or inclusive extraction"]
+    Rounding["Documented per-line or invoice rounding"]
+    Tax["Final tax line"]
+    Zero["Final zero / not_applicable tax line<br/>with explicit reason and evidence"]
+    Unknown["tax.status = unknown"]
+    Blocked["Non-executable intent<br/>no collection"]
+    Total["Sealed total"]
+
+    Lines --> Credits --> Basis --> Evidence
+    Evidence -->|tax applies and is final| Rates --> Rounding --> Tax --> Total
+    Evidence -->|final zero or not applicable| Zero --> Total
+    Evidence -->|missing, conflicting, timeout,<br/>or unsupported| Unknown --> Blocked
 ```
 
 The rater uses exact integer/rational arithmetic in the named currency scale.

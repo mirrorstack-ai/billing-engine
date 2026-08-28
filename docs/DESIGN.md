@@ -288,30 +288,162 @@ It is sufficient for the public verifier to recompute the amount offline. See
 
 The canonical lifecycle is:
 
-```text
-immutable facts
-    │
-    ▼
-DescribeCharge (read-only provisional result)
-    │
-    ▼
-ProposeChargeIntent
-    │
-    ├── unresolved price/tax/authority ──► refused or quarantined
-    ▼
-proposed ──► notice_pending ──► disclosed ──► executable
-                                                   │
-                                                   ▼
-                                               executing
-                                              /    │     \
-                                  action_required │ execution_unknown
-                                              \    │     /
-                                                   ▼
-                                                succeeded
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> proposed: create and seal exact intent
+    proposed --> notice_pending: queue exact disclosure
+    notice_pending --> disclosed: record exact NoticeReceipt
+    disclosed --> executable: public wait and predicate pass
+    executable --> executing: acquire one cross-provider settlement claim
+    executing --> action_required: customer step required
+    action_required --> executing: resume the same frozen attempt
+    executing --> execution_unknown: provider result ambiguous
+    execution_unknown --> succeeded: reconciliation proves success
+    execution_unknown --> Voided: same provider proves it did not and cannot collect
+    executing --> succeeded: provider proves success
+    succeeded --> [*]
+
+    proposed --> canceled
+    notice_pending --> canceled
+    disclosed --> canceled
+    executable --> canceled
+    canceled --> [*]
+
+    proposed --> expired
+    notice_pending --> expired
+    disclosed --> expired
+    executable --> expired
+    expired --> [*]
+
+    state "voided" as Voided
+    executing --> Voided: provider proves it did not and cannot collect
+    action_required --> Voided: provider proves it did not and cannot collect
+    Voided --> [*]
 ```
 
 Terminal non-settlement exits are `canceled`, `expired`, and `voided`.
 Superseding an intent creates a new intent; it does not edit the old one.
+
+Proposal and disclosure are one bounded sequence:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant Caller as MirrorStack private service<br/>(facts only)
+    participant Engine as billing-engine<br/>(public intent boundary)
+    participant Notice as Notifier
+
+    Customer->>Engine: accept bounded BillingAuthorization<br/>(scope, currency, caps, and notice rules)
+    Engine-->>Customer: authorization receipt + digest
+    Caller->>Engine: DescribeCharge(payer, action/window)
+    Engine->>Engine: rate immutable facts with accepted policies
+    Engine-->>Caller: provisional, fully explained result
+
+    Caller->>Engine: ProposeChargeIntent(payer, action/window)
+    Engine->>Engine: select facts, prices, final tax,<br/>credits, authorization, and rail
+    alt price, tax, or authority is unresolved
+        Engine-->>Caller: typed refusal or quarantine<br/>(no executable intent)
+    else every monetary input is final
+        Engine->>Engine: create and seal immutable ChargeIntent (proposed)
+        Engine->>Notice: exact canonical intent (notice_pending)
+        loop bounded delivery attempts with backoff until success or expiry
+            Notice-->>Customer: exact amount, lines, tax, policies,<br/>and execute-not-before time
+            Notice-->>Engine: append delivery-attempt evidence
+        end
+
+        Note over Customer,Notice: Delivery evidence does not claim that a human read the notice.
+        alt exact delivery is not proven
+            Engine-->>Caller: remain notice_pending or expire<br/>(nothing can execute)
+        else the exact bytes are delivered
+            Engine->>Engine: append NoticeReceipt and schedule<br/>eligibility at executeNotBefore
+            Engine-->>Caller: disclosed intent + immutable digest
+        end
+    end
+```
+
+The private caller names only the payer and action/window. The engine derives
+every financial field, and any unresolved input fails closed. Notice retries are
+bounded and backed off; waiting is scheduled rather than implemented as a busy
+poll.
+
+Execution uses a separate capability path:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant Scheduler as Eligibility scheduler
+    participant Engine as billing-engine<br/>(intent and settlement claims)
+    participant Executor as Isolated executor
+    participant Rail as Payment provider<br/>(Stripe / NewebPay)
+    participant Ledger as Append-only ledger
+
+    Scheduler->>Executor: ExecuteChargeIntent(intent ID only)
+    Note over Scheduler,Executor: The scheduler cannot send an amount,<br/>payment method, rail request, or execution time.
+    Executor->>Engine: reload every gate and atomically acquire<br/>one cross-provider settlement claim
+    alt a gate fails or the claim is unavailable
+        Engine-->>Executor: refusal, with no provider mutation
+    else one frozen rail is selected
+        Engine-->>Executor: AuthorizedPayment with sealed amount,<br/>currency, rail, and deterministic reference
+        Executor->>Rail: execute the frozen operation
+        Note over Executor,Rail: A callback may reconcile only this known attempt.<br/>It cannot create or enlarge a charge.
+
+        alt customer action is required
+            Rail-->>Executor: action_required for the frozen attempt
+            Executor-->>Customer: authenticated next action
+            Customer->>Rail: complete provider action
+            Rail-->>Executor: authoritative success evidence
+            Executor->>Ledger: append balanced settlement + ChargeReceipt
+        else exact settlement is verified immediately
+            Rail-->>Executor: authoritative success evidence
+            Executor->>Ledger: append balanced settlement + ChargeReceipt
+        else provider result is ambiguous
+            Rail--xExecutor: timeout, crash, conflict, or malformed response
+            Executor->>Engine: latch execution_unknown<br/>and retain the settlement claim
+            Engine-->>Executor: schedule read-only reconciliation<br/>with no retry or provider fallback
+        end
+    end
+```
+
+Only the executor has provider-write credentials. Provider evidence is checked
+against the frozen attempt before any balanced settlement or receipt is
+appended.
+
+Ambiguous outcome reconciliation is deliberately separate:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Engine as billing-engine<br/>(intent and settlement claims)
+    participant Reconciler as Read-only reconciler
+    participant Rail as Same payment provider
+    participant Ledger as Append-only ledger
+
+    Engine->>Reconciler: reconcile known execution_unknown attempt<br/>with its deterministic reference
+    Note over Reconciler,Rail: The reconciler has provider-read credentials only.
+    loop scheduled, rate-limited reads with backoff
+        Reconciler->>Rail: lookup the exact frozen operation
+        Rail-->>Reconciler: success, impossible-to-collect, or still unknown
+    end
+    Reconciler-->>Engine: normalized authoritative evidence
+
+    alt evidence proves exact settlement
+        Engine->>Ledger: append balanced settlement + ChargeReceipt
+        Engine->>Engine: mark succeeded and close the claim
+    else evidence proves it did not and cannot collect
+        Engine->>Ledger: append void evidence, with no debit
+        Engine->>Engine: mark voided with no automatic rail fallback
+    else evidence remains missing or contradictory
+        Engine->>Engine: retain execution_unknown and the claim<br/>with no retry or provider fallback
+    end
+```
+
+An ambiguous result retains the single settlement claim. Only same-provider
+read-only reconciliation can resolve it; an operator may attach evidence but
+cannot clear the latch by assertion.
 
 ### `DescribeCharge`
 
@@ -386,19 +518,28 @@ policy, and receipt. Enabling general billing never silently enables auto top-up
 The desired engine supports Stripe today and a NewebPay Taiwan adapter next.
 Neither provider defines the domain model.
 
-```text
-ChargeIntent + BillingAuthorization
-                 │
-                 ▼
-       provider-neutral executor
-          │                 │
-          ▼                 ▼
-     Stripe adapter    NewebPay adapter
-          │                 │
-          └──────► PaymentAttempt
-                         │
-                         ▼
-                LedgerTransaction + receipt
+```mermaid
+flowchart TD
+    Eligible["Sealed ChargeIntent + valid BillingAuthorization<br/>+ NoticeReceipt + elapsed wait"]
+    Executor["Provider-neutral executor"]
+    Claim["Atomic cross-provider<br/>settlement claim"]
+    Rail{"Frozen selected rail"}
+    Attempt["PaymentAttempt freezes provider,<br/>amount, currency, and reference"]
+    Stripe["Stripe adapter"]
+    NewebPay["NewebPay adapter"]
+    Verify{"Core verifies authoritative evidence<br/>against the frozen attempt"}
+    Unknown["execution_unknown<br/>same-provider reads only"]
+    Void["voided<br/>did not and cannot collect"]
+    Ledger["Balanced LedgerTransaction<br/>+ ChargeReceipt"]
+
+    Eligible --> Executor --> Claim --> Rail --> Attempt
+    Attempt -->|Stripe| Stripe --> Verify
+    Attempt -->|NewebPay| NewebPay --> Verify
+    Verify -->|exact settlement| Ledger
+    Verify -->|timeout or conflict| Unknown
+    Verify -->|affirmative no-collection proof| Void
+    Unknown -->|exact success| Ledger
+    Unknown -->|did not and cannot collect| Void
 ```
 
 ### Go structure: composition and narrow ports
@@ -482,25 +623,25 @@ authorized customer line in [`CHARGES.md`](CHARGES.md).
 
 A timeout after a provider request produces `execution_unknown`, not an automatic
 retry. The adapter re-reads by deterministic reference and verifies provider,
-merchant account, payer, amount, currency, and intent metadata. Only a proven
-absence permits another attempt. If the provider cannot offer a safe lookup, the
-attempt requires manual reconciliation.
+merchant account, payer, amount, currency, and intent metadata. Only
+provider-authoritative evidence that the operation did not and cannot collect
+permits the attempt to close as `voided`; any later attempt requires a new
+explicit eligibility decision and is never an automatic rail fallback. If the
+provider cannot offer a safe lookup, the attempt remains `execution_unknown`.
+Manual investigation may attach evidence but cannot clear the ambiguity latch by
+assertion.
 
 ### Read-only provider cash-flow trace
 
 Provider neutrality does not mean losing Stripe visibility. `PaymentReader`
-reconnects a receipt to the provider and returns a normalized, read-only trace:
+reconnects a receipt to the provider and returns a normalized, read-only trace.
+The canonical diagram and API contract are in
+[`LEDGER-AND-RECEIPTS.md` §6](LEDGER-AND-RECEIPTS.md#6-cash-flow-trace-api).
 
-```text
-ChargeIntent
-  └─ PaymentAttempt
-       └─ provider order / invoice
-            └─ payment transaction
-                 ├─ provider balance movement
-                 ├─ payout or settlement batch, when exposed
-                 ├─ refund / reversal
-                 └─ dispute / chargeback
-```
+Normal receipt and trace reads return append-only local evidence immediately and
+make no provider call. An explicit refresh follows only exact stored references,
+uses a rate-limited or batched `PaymentReader`, and appends observations without
+changing the intent or ledger.
 
 For Stripe, the adapter follows the Stripe objects and balance evidence that are
 actually available for the account and API version. For NewebPay, the adapter

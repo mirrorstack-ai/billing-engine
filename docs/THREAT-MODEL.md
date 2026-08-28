@@ -218,33 +218,15 @@ a new intent that names and supersedes the old one. The old intent becomes
 
 ## The lifecycle
 
-The public states are:
+The single canonical public state machine is in
+[`DESIGN.md` §4](DESIGN.md#4-intent-lifecycle). This threat model does not define
+a second topology. It adds these security meanings to those states:
 
-```text
-proposed
-   │
-   ▼
-notice_pending ───────► action_required
-   │                         │
-   ▼                         │ resolved without mutation
-disclosed                    │
-   │ notice interval         │
-   ▼                         │
-executable ◄─────────────────┘
-   │ one durable lease
-   ▼
-executing ─────────────► execution_unknown
-   │                           │ same-provider reconciliation only
-   ▼                           └───────────────┐
-succeeded ◄───────────────────────────────────┘
-
-terminal before collection: canceled · expired
-terminal provider object with proven no collection: voided
-```
-
-- `proposed` means derivation completed but no disclosure claim is made.
+- `proposed` means the exact intent was created and sealed, but no disclosure
+  claim is made.
 - `notice_pending` means exact disclosure bytes exist but delivery has not been
-  established. Delivery failure stays here or moves to `action_required`.
+  established. Delivery failure stays here until retry policy expires; it does
+  not become executable or a provider action.
 - `disclosed` means delivery evidence is recorded. It does not mean "read."
 - `executable` means every gate currently passes and `executeNotBefore` has
   arrived.
@@ -255,15 +237,16 @@ terminal provider object with proven no collection: voided
   same-provider reconciliation, never a fresh charge or provider fallback.
 - `succeeded` requires provider-authoritative evidence that exactly the frozen
   amount and currency settled for the frozen merchant operation.
-- `action_required` names what is missing: customer presence, notice delivery,
-  tax evidence, payment method, provider capability, or a recoverable decline.
-  Resolving it cannot mutate a disclosed intent; a changed total creates a new
-  one.
+- `action_required` exists only for customer presence on a known, frozen
+  provider attempt. Missing notice, tax evidence, authorization, capability, or
+  payment method is a pre-execution refusal or non-executable gate, not a state
+  that can bypass disclosure. Resolving provider action cannot mutate the
+  disclosed intent; a changed total creates a new one.
 - `canceled` is a pre-collection customer or policy stop.
 - `expired` means time, authorization, or policy validity ended before
   collection.
 - `voided` requires affirmative provider evidence that a created provider
-  object cannot and did not collect. A paid operation cannot be relabeled
+  object did not and cannot collect. A paid operation cannot be relabeled
   `voided`; refunds are separate ledger events and remain visible on the receipt.
 
 Every transition is compare-and-swap against the prior state and append-only in
@@ -403,8 +386,9 @@ The desired tax decision freezes:
 `Capabilities` reports tax as `ready`, `degraded`, or `unsupported`. Only
 `ready` may produce an executable automatic intent. Timeout, conflicting
 location evidence, missing classification, expired exemption evidence, unknown
-jurisdiction, or policy lookup failure produces `action_required`; it never
-falls back to an old rule or zero.
+jurisdiction, or policy lookup failure leaves tax `unknown` and the intent
+non-executable; it never becomes provider `action_required` and never falls back
+to an old rule or zero.
 
 An explicit zero-tax result names the rule and evidence that derived zero. A
 payment provider's automatically added tax, fee, or invoice line is not accepted
@@ -495,23 +479,17 @@ A provider invoice, order, payment, or dashboard is settlement evidence, not the
 billing ledger. The canonical `GetChargeReceipt` is generated from the immutable
 intent and the core's append-only transition history, with provider observations
 attached. If the provider artifact disagrees with the intent, the result is an
-incident and `execution_unknown` or `action_required`, not whichever number is
-larger.
+incident and `execution_unknown`, not whichever number is larger.
 
 ### Read-only cash-flow tracing
 
 The engine exposes an authenticated, read-only evidence walk for a customer or
-financial operator:
+financial operator. The canonical sequence and response contract are in
+[`LEDGER-AND-RECEIPTS.md` §6](LEDGER-AND-RECEIPTS.md#6-cash-flow-trace-api).
 
-```text
-ChargeIntent
-  → PaymentAttempt
-  → provider invoice / order
-  → payment / authorization / capture
-  → balance transaction
-  → payout
-  ↘ refund · reversal · dispute · chargeback
-```
+The default trace is served from append-only local observations. An explicit,
+authorized refresh may use the read-only `PaymentReader`; it is rate-limited,
+follows exact stored references, and cannot compile against provider writes.
 
 Each edge comes from an explicit stored reference or a provider-authoritative
 read. The tracer never guesses an edge from an email address, amount, timestamp,

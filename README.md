@@ -75,47 +75,57 @@ reviewed. No document on this branch authorizes a production rollout.
 
 ## The target boundary
 
-```text
-private services / module SDK
-          │
-          │ constrained facts only
-          ▼
-     usage ingress ──► immutable facts
-                              │
-                              ▼
-                 pure provider-neutral rater
-                              │
-                  price + final tax + credits
-                              │
-                              ▼
-                    immutable ChargeIntent
-                         │             │
-                         │             └──► exact notice + receipt
-                         ▼
-                BillingAuthorization check
-                         │
-                  executeNotBefore passed
-                         │
-                         ▼
-              isolated payment executor
-                   │              │
-                   ▼              ▼
-             Stripe adapter   NewebPay adapter
-                   │              │
-                   └──────┬───────┘
-                          ▼
-              PaymentAttempt + provider evidence
-                          │
-                          ▼
-              append-only ledger + ChargeReceipt
-                          │
-                          ▼
-                 public offline verifier
+> **Target sequence, not current production:** current `main` still has the
+> direct Stripe-writing paths described above. This flow is not deployed until
+> every legacy money path is removed and the readiness gates pass.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant Private as MirrorStack private services<br/>/ module SDK
+    participant Engine as billing-engine<br/>(public intent boundary)
+    participant Executor as Isolated payment executor
+    participant Provider as Payment provider<br/>(Stripe / NewebPay)
+    participant Verifier as Public offline verifier
+
+    Customer->>Engine: accept bounded BillingAuthorization<br/>(scope, currency, caps, and notice rules)
+    Engine-->>Customer: authorization receipt + digest
+    Customer->>Private: use an accepted platform or module capability
+    Private->>Engine: record constrained usage facts
+    Note over Private,Engine: The private caller cannot send an amount,<br/>price, tax result, payment method, provider,<br/>notice claim, or execution time.
+    Engine->>Engine: append immutable facts and rate with<br/>accepted prices, final tax, and credits
+    Private->>Engine: ProposeChargeIntent(payer, action/window)
+    Note over Engine: Any unresolved price, tax, notice, or authority<br/>is a typed non-executable result.
+    Engine->>Engine: create and seal immutable ChargeIntent
+    Engine-->>Customer: deliver exact intent, digest, lines,<br/>tax, and execute-not-before time
+    Engine->>Engine: record NoticeReceipt and schedule<br/>eligibility at executeNotBefore
+    Engine->>Executor: ExecuteChargeIntent(intent ID only)
+    Executor->>Engine: reload all gates and atomically acquire<br/>one cross-provider settlement claim
+    Engine-->>Executor: AuthorizedPayment with sealed amount,<br/>currency, frozen rail, and deterministic reference
+    Note over Executor,Provider: Only the isolated executor has<br/>payment-provider write credentials.
+    Executor->>Provider: execute the frozen operation
+    Provider-->>Executor: authoritative exact-success evidence
+    Executor->>Engine: append attempt + balanced settlement<br/>+ ChargeReceipt
+    Engine-->>Customer: receipt + canonical verification bundle
+    Customer->>Verifier: verify charge-bundle.json offline
+    Verifier-->>Customer: recomputed total, policies,<br/>build identity, and evidence
 ```
 
 Only the isolated executor has a payment-provider write capability. It receives
 an intent id and reloads every precondition; it never accepts an amount from a
 caller.
+
+The sequence shows the success path. Its fail-closed branches are detailed in
+[`docs/DESIGN.md` §4](docs/DESIGN.md#4-intent-lifecycle):
+
+- a missing gate or unavailable settlement claim refuses before any provider
+  mutation;
+- authoritative proof that an operation did not and cannot collect appends void
+  evidence with no debit and no automatic rail fallback; and
+- a timeout or conflict latches `execution_unknown`, retains the settlement
+  claim, and permits only same-provider read-only reconciliation. It creates no
+  settlement, receipt, retry, or provider fallback.
 
 Read and write provider interfaces are separate. Support/reconciliation can
 trace Stripe or NewebPay evidence without possessing the capability to collect,
@@ -219,16 +229,32 @@ reconstructed from today's code.
 [`docs/LEDGER-AND-RECEIPTS.md`](docs/LEDGER-AND-RECEIPTS.md) separates internal
 monetary truth from external evidence.
 
-A customer can trace both directions:
+A customer can follow the evidence chain end to end:
 
-```text
-ChargeIntent
-  → PaymentAttempt
-    → Stripe/NewebPay order, invoice, or payment evidence
-      → balance movement / settlement or payout evidence when exposed
-        → refund, reversal, dispute, or chargeback
-          → LedgerTransaction
-            → ChargeReceipt
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 280}}}%%
+flowchart LR
+    Intent["ChargeIntent"]
+    Attempt["PaymentAttempt"]
+    Ledger["Append-only<br/>LedgerTransaction"]
+    Receipt["ChargeReceipt"]
+    Provider["Stripe / NewebPay order,<br/>invoice, or payment evidence"]
+    Settlement["Balance movement, settlement,<br/>or payout evidence when exposed"]
+    Effects["Refund, reversal,<br/>dispute, or chargeback"]
+    Compare["Read-only evidence comparison"]
+    View["Customer trace"]
+    Mismatch["Missing / mismatch /<br/>execution_unknown reported"]
+
+    Intent --> Attempt --> Ledger --> Receipt
+    Attempt --> Provider
+    Provider --> Settlement
+    Provider --> Effects
+    Ledger --> Compare
+    Provider --> Compare
+    Settlement --> Compare
+    Effects --> Compare
+    Compare --> View
+    Compare --> Mismatch
 ```
 
 Provider observations are append-only snapshots. A mismatch opens a

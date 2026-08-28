@@ -99,20 +99,29 @@ permits at most one successful debit across all providers.
 
 Suggested attempt states are:
 
-```text
-created
-  ├─ customer_action_required ─► submitted
-  ├─ submitted
-  └─ provider_pending
-        ├─ succeeded
-        ├─ failed
-        ├─ canceled / voided
-        └─ outcome_unknown
+```mermaid
+stateDiagram-v2
+    [*] --> created
+    created --> customer_action_required: customer presence required
+    created --> canceled: canceled before provider submission
+    customer_action_required --> submitted: customer completes action
+    customer_action_required --> canceled: canceled before provider submission
+    created --> submitted: submit immediately
+    created --> provider_pending: asynchronous provider
+    submitted --> provider_pending: accepted for processing
+    provider_pending --> succeeded: exact settlement verified
+    provider_pending --> failed: authoritative failure
+    provider_pending --> voided: provider proves it did not and cannot collect
+    provider_pending --> outcome_unknown: timeout, crash, or conflict
+    outcome_unknown --> succeeded: same-provider reconciliation
+    outcome_unknown --> voided: same provider proves it did not and cannot collect
 ```
 
 Transitions are appended as events. An `outcome_unknown` attempt blocks another
-attempt until read-only provider reconciliation proves absence or an operator
-records a reviewed resolution.
+attempt until same-provider authoritative reconciliation proves exact success or
+proves that the operation did not and cannot collect. An operator may attach
+reviewed evidence or escalate the incident, but cannot clear the ambiguity latch
+by assertion.
 
 The attempt freezes:
 
@@ -125,7 +134,8 @@ The attempt freezes:
 - creation/expiry times and selected customer-action flow.
 
 Retries do not automatically switch provider. A rail switch creates a new
-attempt only after the prior rail is proven not to have settled and the
+attempt only after the prior rail is authoritatively proven not to have collected
+and incapable of later collection, a fresh eligibility decision passes, and the
 authorization permits the new rail.
 
 ---
@@ -192,33 +202,47 @@ the intent or ledger to make the mismatch disappear.
 
 ## 6. Cash-flow trace API
 
-`TracePayment` is customer-read-only and returns a normalized graph:
+`TracePayment` is customer-read-only and follows stored references into a
+normalized provider trace:
 
-```text
-BillingAuthorization
-        │
-ChargeIntent ── NoticeReceipt
-        │
-PaymentAttempt
-        │
-provider order/invoice
-        │
-payment transaction
-   ┌────┼───────────┐
-balance movement  refund/reversal  dispute
-        │
-payout/settlement batch (when provider exposes it)
-        │
-LedgerTransaction ── ChargeReceipt
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant API as billing-engine<br/>read API
+    participant Ledger as Intent and ledger<br/>(canonical truth)
+    participant Reader as PaymentReader<br/>(read-only adapter)
+    participant Provider as Stripe, NewebPay,<br/>or another provider
+
+    Customer->>API: TracePayment(intent id, refresh=false)
+    API->>Ledger: load authorization, intent,<br/>notice, attempt, ledger, and receipt
+    Ledger-->>API: immutable records + append-only<br/>provider snapshots and references
+
+    opt explicit refresh is authorized and rate limit permits
+        loop each stale, supported, exact stored reference
+            API->>Reader: refresh known attempt reference
+            Reader->>Provider: read order / invoice / payment
+            Provider-->>Reader: authoritative provider evidence
+            opt provider exposes downstream cash movement
+                Reader->>Provider: read balance movement / payout<br/>/ refund / reversal / dispute
+                Provider-->>Reader: linked evidence or unsupported capability
+            end
+            Reader-->>API: normalized append-only observation
+        end
+    end
+
+    Note over API,Reader: The API, ledger, and reader have no<br/>payment-write credential or interface.
+    API-->>Customer: linked trace + mismatches + unsupported edges<br/>+ canonical ChargeReceipt
 ```
 
 Each node is labelled `recorded`, `provider_verified`, `pending`, `unsupported`,
 or `mismatch`. Unsupported evidence is different from absent evidence.
 
-The trace is safe to call repeatedly. It may append new observations but cannot
-retry payment, finalize an invoice, issue a refund, trigger auto top-up, mutate a
-budget, or change an intent. Read paths are incapable of provider writes by
-interface and deployed credential.
+The default trace is local and makes no provider call. An explicit refresh is
+rate-limited or batched by the adapter and may append new observations, but it
+cannot retry payment, finalize an invoice, issue a refund, trigger auto top-up,
+mutate a budget, or change an intent. Read paths are incapable of provider writes
+by interface and deployed credential.
 
 This is a critical migration requirement: current `main` contains a status-read
 path that can synchronously trigger auto top-up. The intent-only deployment may
