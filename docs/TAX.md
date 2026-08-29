@@ -6,9 +6,18 @@ notice, authorization, receipt, and verification boundary as every other line.
 
 > **Status: unresolved target policy.** Current `main` has no authoritative tax
 > calculation, jurisdiction evidence, exemption model, tax line, or refund
-> allocation. A mocked `$0.00` UI value is presentation only. Production
+> allocation. Any mocked UI tax value, including a positive percentage preview,
+> is presentation only and not an authoritative determination. Production
 > collection under this design fails closed until the merchant-of-record and tax
 > decisions in §11 are accepted and implemented.
+
+> **Target execution rule:** independently verified automatic collection is
+> permitted only when the customer-side public verifier can reproduce the exact
+> tax state and amount from a pinned public rule artifact, a deterministic public
+> calculation specification, and the customer-visible or customer-held input
+> evidence committed by the intent. A proprietary calculator assertion or
+> provider attestation alone is classified as unsupported and non-executable. It
+> must never be presented as independently verified.
 
 This document defines the safety shape. It does not provide legal or tax advice
 and does not infer a jurisdictional obligation from code.
@@ -21,21 +30,35 @@ Every proposed intent has a `TaxDetermination` in exactly one state:
 
 | state | meaning | executable? |
 |---|---|---|
-| `final` | calculation completed under one immutable policy/evidence snapshot; amount may be zero or positive | yes, subject to all other controls |
-| `not_applicable` | a versioned rule explicitly explains why no tax applies | yes, subject to all other controls |
-| `unknown` | evidence, policy, provider result, or jurisdiction decision is missing/conflicting/unavailable | **no** |
+| `final` | the exact calculation is independently reproducible under one immutable public policy/evidence snapshot; amount may be zero or positive | yes, subject to successful public-verifier reproduction and all other controls |
+| `not_applicable` | an immutable public rule and its inputs independently reproduce why no tax applies | yes, subject to successful public-verifier reproduction and all other controls |
+| `unknown` | evidence, public rule material, calculator result, or jurisdiction decision is missing, conflicting, unavailable, proprietary-only, or otherwise not independently reproducible | **no** |
 
 `unknown` is never converted to zero. A final zero result includes the reason,
 tax category/jurisdiction outcome, rule revision, and evidence that distinguish
 it from an outage or unsupported location.
 
+`TaxDetermination.verificationClass` records either
+`independently_reproducible`, `provider_attested`, or `unverified`. A
+provider-attested result may be retained and disclosed as evidence, but it cannot
+promote a determination to `final` or `not_applicable`; for automatic collection
+its state remains `unknown` with an `unsupported_verification` reason. Missing or
+incomplete evidence is `unverified` and also remains `unknown`.
+
 ---
 
 ## 2. Authority boundary
 
-The private caller may provide authenticated customer-owned facts through a
-dedicated tax-profile flow—for example a billing address or tax registration
-identifier—but it cannot supply:
+The private caller may relay an unchanged, encrypted candidate billing address,
+tax registration, or exemption document, but it cannot establish that the facts
+belong to the customer or are valid. Tax-profile enrollment and every material
+change use an engine-issued canonical envelope through the independent
+customer-factor proof stream. The resulting versioned `TaxProfileReceipt` binds
+the payer/account, exact evidence commitments, issuer/source, validation status,
+effective/expiry time, engine audience, nonce, replay identity, and proof-stream
+sequence/head. Tax ids, certificates, and authoritative location evidence also
+require the policy-named issuer validation where applicable. A private caller
+cannot supply:
 
 - jurisdiction verdict,
 - taxable classification,
@@ -47,9 +70,24 @@ identifier—but it cannot supply:
 - tax line or total, or
 - `taxKnown`/`taxExempt` boolean.
 
-The tax resolver combines verified customer evidence with an immutable
+The tax resolver combines that customer-factor-bound and issuer-validated
+evidence with an immutable
 `TaxPolicyRevision` and, where selected, a versioned external tax-calculator
 result. It cannot call a payment provider or execute an intent.
+
+`BillingAuthorization` and `ChargeIntent` commit the exact tax-profile receipt
+revision/digest and the permitted tax-policy revision/change rule. A substituted
+wrong-payer profile, unproven address, unvalidated tax id, or profile change after
+acceptance is `unverified` and produces `unknown`; it cannot reuse the earlier
+authorization or executable intent.
+
+A `BillingResponsibilityTransfer` never moves a tax profile or commercial
+identity. At the cutoff, old accrued lines retain the old payer/entity/profile/
+`CommercialIdentityBinding`. The new payer must enroll its own
+`TaxProfileReceipt` and accept that commercial identity plus a compatible bounded
+settlement-route policy before new service or collection can become executable.
+Liability/receivable and wallet-liability transfers are unsupported in this closed
+target. They cannot relabel an old determination or lot by field update.
 
 Payment adapters do not calculate or alter customer tax. If a provider-hosted
 flow requires tax configuration or returns a total that differs from the sealed
@@ -62,7 +100,14 @@ intent, the attempt is refused/quarantined and the discrepancy is recorded.
 A revision is append-only and content-addressed. It includes:
 
 - policy id, digest, publication time, and future effective window,
-- seller/merchant entity and registration scope,
+- a content-addressed, publicly retrievable rule artifact and license sufficient
+  for independent verification,
+- the deterministic calculation specification and verifier/golden-vector
+  revision used to interpret that artifact,
+- content-addressed allowed `CommercialIdentityBinding` set, including legal
+  seller, tax-registration set/market, currency, and binding revision, plus the
+  accepted `MerchantBindingSet`/compatibility-policy digest that later constrains
+  settlement routes,
 - supported customer jurisdictions and required location evidence,
 - product/charge-kind tax classifications,
 - business/consumer and exemption/reverse-charge rules,
@@ -77,6 +122,32 @@ There is no mutable "current tax policy" fallback. An intent names one exact
 effective revision. Publishing a replacement never changes an already-sealed or
 settled intent.
 
+The referenced `MerchantBindingSet` is canonical and indexed. The policy and
+`Capabilities` publish identical limits for canonical set bytes, member count,
+membership-proof bytes/depth, and hash operations. Tax resolution consumes only
+the selected commercial-identity proof; final route selection later consumes one
+bounded compatibility proof. A duplicate, ambiguous, max+1, or over-depth set or
+proof refuses policy publication/authority and is never truncated or scanned
+without bound.
+
+Here, public means retrievable without an operator, payment-provider, or tax-
+vendor secret and usable by the public offline verifier. Sensitive payer inputs
+do not become public: the intent commits to their canonical form, and the payer
+can supply the corresponding private evidence to its verifier. If a rule source
+cannot be redistributed or deterministically evaluated, that jurisdiction is
+unsupported for independently verified automatic collection rather than silently
+falling back to an attestation.
+
+The rule artifact is canonical, typed declarative data evaluated by a versioned
+non-I/O interpreter; it is never a native plugin, arbitrary script, dynamically
+imported module, or unrestricted WASM program. The language has no network,
+filesystem, environment, clock, randomness, recursion, or unbounded iteration.
+`Capabilities` and the policy digest publish maximum artifact/input/output bytes,
+AST nodes/depth, evaluation fuel, and memory. The core and offline verifier apply
+identical limits before evaluation. Parse failure, max+1 input, fuel/memory
+exhaustion, unknown operator, or an attempted external effect returns `unknown`
+and cannot make an intent executable.
+
 Tax-law/rate updates use a new revision with the legally/product-required
 effective time. Whether they require advance customer notice or renewed terms is
 an accepted policy decision and is published, not hardcoded privately.
@@ -89,10 +160,15 @@ A final determination records only the evidence needed for audit and customer
 verification, with sensitive values protected:
 
 - payer and billing entity,
-- seller/merchant entity,
+- exact canonical `CommercialIdentityBinding` and bounded membership proof from
+  the policy's allowed set, including seller, registrations/market, currency, and
+  revision, plus the accepted `MerchantBindingSet` and compatibility-policy
+  digests used by final settlement-route selection,
 - transaction time and service/period location rule,
 - customer location evidence types, issuer/source, collection time, and stable
-  commitments to sensitive values,
+  binding+hiding commitments to sensitive values,
+- `TaxProfileReceipt` revision/digest, customer-factor proof reference,
+  proof-stream sequence/head, and payer/account binding,
 - business/consumer classification where legally relevant,
 - verified tax id/exemption certificate reference and validation status,
 - currency,
@@ -104,8 +180,21 @@ verification, with sensitive values protected:
 - final amount/status and explanation.
 
 Raw addresses, tax ids, and certificates are encrypted and access-controlled.
-The customer bundle contains readable outcomes and stable hashes/references
-needed to prove which evidence was used without publishing personal data.
+The customer bundle contains readable outcomes, the pinned public rule artifact,
+the deterministic calculation revision, and binding+hiding commitments/references
+needed to reproduce which evidence was used without publishing personal data. A
+customer holding the private input evidence can verify that it opens the committed
+values.
+
+Low-entropy PII is never committed with a raw deterministic hash. Each field uses
+a domain-separated binding+hiding commitment over purpose, payer, object, field,
+value, and a unique cryptographically random nonce (at least 256 bits). The nonce/
+opening is encrypted to the owning payer and never reused across fields, objects,
+or payers; public exports contain only the commitment. Re-encryption/key rotation
+preserves the historical opening, while corrected evidence creates a new object/
+nonce/commitment and append-only link. A verifier that lacks the owner-provided
+opening reports the field commitment intact without attempting a dictionary
+guess.
 
 Conflicting required location evidence yields `unknown` unless an accepted rule
 resolves that exact conflict.
@@ -122,7 +211,7 @@ flowchart TD
     Lines["Enumerated customer lines"]
     Credits["Allocate eligible discounts and credits"]
     Basis["Taxable basis by line and classification"]
-    Evidence{"All required location, classification,<br/>policy, and provider evidence final?"}
+    Evidence{"All required inputs final and exact result<br/>reproducible from pinned public rules?"}
     Rates["Final jurisdiction and rate components<br/>or inclusive extraction"]
     Rounding["Documented per-line or invoice rounding"]
     Tax["Final tax line"]
@@ -134,7 +223,7 @@ flowchart TD
     Lines --> Credits --> Basis --> Evidence
     Evidence -->|tax applies and is final| Rates --> Rounding --> Tax --> Total
     Evidence -->|final zero or not applicable| Zero --> Total
-    Evidence -->|missing, conflicting, timeout,<br/>or unsupported| Unknown --> Blocked
+    Evidence -->|missing, conflicting, timeout,<br/>proprietary-only, or unsupported| Unknown --> Blocked
 ```
 
 The rater uses exact integer/rational arithmetic in the named currency scale.
@@ -162,14 +251,17 @@ The customer notice shows:
 - whether a tax id/exemption/reverse-charge result was used, and
 - final amount/currency.
 
-If tax changes after notice—even by one settlement unit—the old intent is
-superseded. A new intent, digest, notice, waiting period, and authorization check
-are required.
+If tax changes after disclosure—even by one settlement unit—the old intent is
+superseded. A new intent/digest and authorization check are required, plus either
+fresh exact customer-present disclosure/proof or standing notice and delivery-
+relative wait, as applicable.
 
 A tax calculator outage after an intent is sealed does not change that intent.
-Execution verifies the frozen final determination and policy validity; policy
-revocation rules must state whether a known defective determination blocks
-execution and requires replacement.
+Execution runs the public verifier against the frozen final determination,
+committed inputs, rule artifact, and policy validity. A cache hit or a signed
+vendor response is not a substitute for reproduction. Policy revocation rules
+must state whether a known defective determination blocks execution and requires
+replacement.
 
 ---
 
@@ -182,6 +274,14 @@ A refund or correction references the original intent, line allocation, tax
 determination, payment settlement, and ledger transaction. It produces a new
 refund/credit tax determination and append-only entries. It never edits the
 original tax line.
+
+If a correction would increase what the customer owes, it is a new linked
+`ChargeIntent` with an exact positive tax line, replacement determination/rule,
+immutable digest, applicable service/accrual authority, exact disclosure and
+notice/wait or fresh customer-present proof, and current collection authority
+before settlement. It cannot post a free-standing positive ledger adjustment.
+Only a value-returning credit/refund correction may avoid a new debit intent, and
+it still remains source-linked and receipt-visible.
 
 Partial refunds must preserve the accepted jurisdiction's allocation and
 rounding rule. The provider adapter cannot choose a tax refund amount from a
@@ -206,10 +306,18 @@ provider-neutral `TaxResolver` interface. The adapter:
 - performs no payment-provider operation.
 
 The public offline verifier can validate how the frozen result was incorporated
-and rounded. Whether it can independently recompute the legal rate without the
-external proprietary ruleset is a product/vendor decision and must be disclosed.
-"Calculator verified" is not described as "fully independently recomputed"
-unless it actually is.
+and rounded only when it also has the exact pinned public rules and sufficient
+committed/customer-held inputs to reproduce the jurisdiction, basis, rate,
+rounding steps, tax line, and total. That successful reproduction is required
+before a `final` or `not_applicable` determination becomes executable.
+
+If an external calculator exposes only a proprietary result or vendor
+attestation, the result is recorded as `provider_attested`, disclosed as
+unsupported for independent verification, and leaves the determination
+`unknown` and non-executable for automatic collection. It may support a clearly
+labelled non-authoritative estimate or manual investigation, but it cannot
+authorize collection and is never labelled "verified", "independently
+recomputed", or equivalent. Vendor selection cannot weaken this invariant.
 
 ---
 
@@ -237,24 +345,53 @@ and tested.
 Tests must demonstrate:
 
 - `unknown` can never become executable or serialize as zero;
+- `final` and `not_applicable` cannot become executable unless the public
+  verifier reproduces the exact result from the pinned rule artifact and
+  committed/customer-held inputs;
+- a proprietary-only rule, network-only calculator dependency, or
+  provider-attested result remains `unknown` with
+  `unsupported_verification`, even when its signature is valid;
+- changing or withholding a public rule artifact, calculation revision, or
+  committed input makes verification fail closed;
+- provider-attested evidence is never rendered or serialized as independently
+  verified;
 - final zero and not-applicable each require an explicit versioned reason;
 - missing/conflicting/stale customer evidence fails closed;
+- a tax profile without customer-factor proof and any required issuer validation
+  is `unverified` and remains `unknown`;
+- wrong-payer address/tax-id substitution, same-payer profile revision
+  substitution, and a profile change after authorization/intent seal all fail
+  binding and require new authority/intent as applicable;
+- responsibility transfer preserves old-line tax identity and cannot reuse the
+  old payer's profile/binding for the new payer or relabel old tax/liability;
+- substituting any legal seller, tax-registration set/market, currency, or
+  commercial-binding revision fails exact `CommercialIdentityBinding` equality
+  from source and determination through settlement; substituting provider,
+  merchant account, rail, environment, route revision, or compatibility proof
+  fails the final composite `MerchantOfRecordBinding`/funding equality;
+- provider-, merchant-account-, or rail-sensitive tax is
+  `unknown(unsupported_settlement_sensitive_tax)` in this closed target; route
+  selection happens only after final tax and cannot change taxable basis or tax;
 - a new policy cannot apply before its effective time or retroactively;
 - every charge kind has an explicit taxable classification;
 - credits and partial refunds preserve line allocation and rounding;
 - any provider/calculator amount or currency mismatch is refused;
 - changing any input/rule/result changes the intent digest;
-- tax changes after notice require a new intent and notice; and
+- tax changes after disclosure require a replacement intent and the applicable
+  fresh customer-present proof or standing notice/wait ceremony; and
 - tax callbacks/results cannot call a payment writer.
 
-Golden vectors cover inclusive/exclusive, zero, exemption, reverse-charge where
-supported, compound/multiple components where supported, invoice/per-line
+Public golden vectors cover inclusive/exclusive, zero, exemption, reverse-charge
+where supported, compound/multiple components where supported, invoice/per-line
 rounding, credits, full/partial refund, unsupported jurisdiction, conflict, and
 calculator outage.
 
 Mutation tests deliberately turn `unknown` into zero, bypass effective time,
-remove evidence binding, change rounding, omit a refund allocation, and accept a
-provider total mismatch; each mutation must be killed by a named test.
+trust a private-caller tax profile, substitute wrong-payer or later-profile
+evidence, remove issuer/customer-proof binding, change rounding, omit a refund
+allocation, accept a provider total mismatch, permit rule-artifact I/O or unknown
+operators, remove evaluation fuel/memory limits, and accept max+1 artifacts;
+each mutation must be killed by a named test.
 
 ---
 
@@ -269,7 +406,9 @@ and record:
 4. product/charge-kind classifications;
 5. tax-inclusive versus tax-exclusive pricing/display;
 6. location evidence and conflict/staleness rules;
-7. rate/rule source and whether an external calculator is authoritative;
+7. rate/rule source, redistribution rights, deterministic public verifier
+   artifact, and whether an external calculator can provide independently
+   reproducible evidence (authority alone is insufficient);
 8. invoice versus line rounding and credit allocation;
 9. cancellation, refund, partial refund, dispute, and bad-debt adjustments;
 10. invoice/e-invoice issuance, numbering, retention, and correction duties;

@@ -1,6 +1,8 @@
 # `billing-engine` — agent guide
 
-The public billing boundary for the MirrorStack platform. It owns metering,
+The public-source billing authority for the MirrorStack platform. Its runtime is
+private: customers reach `api-platform`, which invokes this engine through an
+IAM-gated production RPC (or secret-gated local HTTP). It owns metering,
 pricing, customer billing authority, payment-provider execution, reconciliation,
 and financial receipts.
 
@@ -23,11 +25,19 @@ The design discussion that produced this schema lives in the parent workspace at
 
 ## Layout
 
+Abbreviated current layout; the command list is security-relevant and deliberately
+shows every shipped binary family rather than implying there are only two:
+
 ```
 billing-engine/
 ├── cmd/
-│   ├── account-api/        Lambda: HTTP endpoints for api-platform
-│   └── account-webhook/    Lambda: Stripe webhook receiver
+│   ├── account-api/        Lambda: IAM-gated internal RPC; local HTTP for dev
+│   ├── account-webhook/    Lambda: Stripe HTTPS webhook receiver
+│   ├── account-webhook-eventbridge/  Stripe partner EventBridge consumer
+│   ├── billing-cycle/      scheduled billing-cycle worker
+│   ├── infra-egress-sync/  infrastructure egress synchronizer
+│   ├── infra-ssr-compute-sync/  infrastructure compute synchronizer
+│   └── pm-default-backfill/  payment-method backfill worker
 ├── internal/               private packages — added per-PR as handlers ship
 ├── migrations/billing/     ms_billing schema (001_init.up.sql for v1)
 ├── scripts/                init-db.sql + future helper scripts
@@ -37,17 +47,46 @@ billing-engine/
 
 ## Architecture (trust boundary)
 
+Current topology includes known release blockers:
+
 ```
-api-platform/account ─internal HTTP (X-MS-Internal-Secret)─► billing-engine/account-api ─► Stripe API
-                                                                     ▲
-                                                                     │ webhook (Stripe-Signature verified)
-                                                              Stripe → billing-engine/account-webhook ─► ms_billing.*
+Customer/browser ─► api-platform account/applications API ─IAM lambda.Invoke─► billing-engine/account-api
+Module runtime ─► api-platform dispatch ─broad Lambda.Invoke─► full account-api dispatcher
+Stripe webhook/EventBridge ─► current callback routers ─► Stripe-writing auto-top-up/credit-purchase executors
+billing-cycle / infrastructure sync paths ─► current billing coordinators and provider writers
+
+These callback-to-writer and broad-dispatch edges are not target guarantees.
+They must be removed before intent-only readiness.
+```
+
+Target topology:
+
+```
+Customer/browser ─► api-platform ─private account RPC─► billing-engine core
+Module runtime ─► api-platform meter-only ingress ─fact-only role─► billing-engine core
+billing-engine isolated permit-gated executor ─► Stripe / future NewebPay
+Provider callback ─► bounded callback verifier/ingress ─observation only─► core/read-only reconciliation
+
+Local control-plane RPC uses X-MS-Internal-Secret; RecordUsage uses
+X-MS-Meter-Secret.
 ```
 
 **Hard rules:**
 
 - `api-platform` **never** touches Stripe. All Stripe API calls happen here.
-- `billing-engine` is the **only** service with `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`.
+- `billing-engine/account-api` is **never customer-reachable**. Its only public
+  HTTP route is a static health response that returns before RPC dispatch;
+  provider webhook ingress is a separate binary and capability.
+- `api-platform` initiates account RPCs. Asynchronous engine state is pulled
+  through authenticated reads or delivered by the notifier; the engine does not
+  call the browser or push into the customer-facing account API.
+- Do not call the production metering seam dedicated until IAM/resource and
+  action dispatch enforce a meter-only capability. The current dispatch role can
+  invoke the full account-api Lambda and is a known release blocker.
+- A mutation-capable provider secret belongs to exactly one scoped
+  `ProviderCredentialEnclave`. Public webhook ingress may hold only a public key
+  or provider-enforced verification-only secret; a callback secret that also has
+  mutation scope stays inside the enclave's fixed verifier.
 - `billing-engine` reads narrow columns from `ms_account.users` (and future `ms_account.orgs`) via soft FK; it never writes outside `ms_billing.*`.
 
 ## Target money boundary
@@ -63,15 +102,33 @@ The accepted destination is documented publicly in:
 
 Build toward these invariants:
 
-- The private caller reports constrained facts; it never supplies an amount,
-  price, tax, total, payment method, provider, notice status, or execution time.
-- Every debit consumes one immutable `ChargeIntent`, exact notice evidence, and
-  a live bounded `BillingAuthorization`.
-- Unknown price, tax, notice, authorization, build identity, or provider outcome
-  produces no new monetary effect.
-- Only an isolated executor has payment-provider write capability. Read, status,
-  metering, infrastructure sync, notification, and reconciliation components
-  cannot compile against the write port.
+- The private caller cannot make money authoritative. Usage ingress reports only
+  constrained facts. A product route may relay one closed non-authoritative
+  engine catalog/template selection; the core validates it, derives every
+  financial field, and requires independent exact customer proof.
+- Every debit consumes one immutable `ChargeIntent` and live bounded authority,
+  plus either fresh exact customer-present acceptance or, for automatic/standing
+  collection, terminal destination-delivery evidence and the public wait.
+- `api-platform` may relay a signed disclosure but is not the acceptance or
+  revocation path. A separate proof-only consent edge appends customer-signed
+  envelopes to an inbox consumed by the core. The engine verifies a
+  customer-controlled proof over independently rendered canonical fields;
+  otherwise automatic execution stays disabled.
+- Unknown pre-effect price, tax, notice, authorization, capability, or build
+  identity prevents dispatch. An ambiguous provider outcome after dispatch may
+  already represent moved cash; it permits no further mutation or ledger-success
+  assertion and retains the claim until authoritative same-operation resolution.
+- Each actual provider-enforced mutation-credential scope has one exclusive
+  attested `ProviderCredentialEnclave` owner; provider/environment/merchant/
+  capability scope is preferred, while any broader blast radius is disclosed.
+  Isolated instances prevent a global multi-rail secret vault. Its purpose-matched
+  writers require exported opaque permit structs with unexported fields/
+  constructors and mandatory durable journal authentication. If a
+  provider lacks native read-only credentials, its fixed-read broker stays inside
+  this enclave and external reconciliation remains credential-free.
+- One consumed permit may emit one outbound mutation request. Disable SDK/HTTP
+  retries and redirects, fence the actual transport send, and route ambiguity to
+  read-only same-operation reconciliation.
 - Provider integrations use small consumer-owned Go interfaces and composition.
   Do not pass one universal provider client through the service graph.
 - Stripe is an adapter, not the domain model. NewebPay/Taiwan is the next planned

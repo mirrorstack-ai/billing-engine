@@ -1,7 +1,11 @@
-# Every monetary effect billing-engine may create
+# Every monetary effect billing-engine may create or record
 
-This is the exhaustive customer and provider effect catalog for the target
-intent-only engine.
+This is the exhaustive customer-collection, wallet, and accounting-effect
+catalog for the target intent-only engine. Its purpose-separated provider-write
+vocabulary is limited to customer setup, payment, mandate revocation, void, and
+refund. Developer payouts and tax remittance are outside the billing-engine
+command surface; this engine may only
+record their independently verified accounting evidence.
 
 > **Status: proposed, not implemented.** Current `main` has fragmented,
 > Stripe-shaped charge paths and additional mutable pricing inputs. This catalog
@@ -17,11 +21,47 @@ The boundary is:
 A private caller, module, payment adapter, webhook, tax provider, or operator
 cannot create a new kind with free text.
 
+Every provider plan step also uses one closed effect class:
+
+| effect class | allowed consequence |
+|---|---|
+| `non_adverse_prepare` | creates only a non-collectible prerequisite; no hold, debit, reusable mandate, or provider-autonomous future path |
+| `mandate_setup` | creates only the exact accepted reusable mandate scope under setup proof; never holds or debits |
+| `funds_hold` | places one exact disclosed hold for the accepted amount/duration; it is adverse and retains claim/exposure until capture or verified release |
+| `debit` | collects the one exact provider remainder; at most one per charge plan |
+| `return` | returns the one exact provider-refund remainder; at most one per refund plan |
+| `release` | releases/voids one known hold, collectible continuation, or unsettled object; cannot collect or return new cash |
+
+Setup, payment, mandate-revoke, void, and refund plans enumerate every server
+mutation as its own step. A composite adapter call, read-only reconciliation
+disguised as a mutation step, or provider-native autonomous schedule is outside
+the vocabulary and fails conformance. A setup plan creates at most one exact
+`mandate_setup` output; a charge/refund plan has at most one exact `debit`/
+`return`; holds stay within the accepted aggregate count/amount/duration; and
+every `release` is bound to a known prior collectible object.
+
+The machine-checked purpose/effect matrix is exhaustive:
+
+| purpose | allowed mutation effects |
+|---|---|
+| `setup` | `non_adverse_prepare`, `mandate_setup`, source-bound `release` cleanup |
+| `payment` | `non_adverse_prepare`, exact disclosed `funds_hold`, exact sealed `debit`, source-bound `release` cleanup |
+| `refund` | `non_adverse_prepare`, exact source-linked `return`, source-bound `release` cleanup |
+| `void` | source-bound `release` only |
+| `mandate_revoke` | source-bound `release` only |
+
+Setup never performs even a temporary verification hold. A rail that requires one
+must use a separately disclosed and authorized payment/hold intent. A forbidden
+pair is rejected before disclosure, envelope persistence, consume, and adapter
+invocation; a customer-hosted actor cannot widen the table.
+
 ---
 
 ## 1. Customer bill lines
 
-The customer-facing positive vocabulary is intentionally small:
+The customer-facing charge-line vocabulary is intentionally small. In the
+equations below, `positiveServiceLines` means only the positive non-tax service
+lines; `tax` is added exactly once as its own line:
 
 | kind | purpose | authoritative quantity | authoritative rate | normal timing |
 |---|---|---|---|---|
@@ -62,7 +102,6 @@ charge:
 
 | kind | source | rule |
 |---|---|---|
-| `credit_applied` | immutable wallet/credit source lots owned by the payer | exact lot allocation; never exceeds eligible positive lines or available settled credit unless an accepted credit policy permits bounded exposure |
 | `promotional_credit` | typed grant with issuer, authorization, reason, and terms | applied only to permitted line kinds/windows; expiration and refundability are disclosed |
 | `adjustment_credit` | reviewed correction linked to a prior intent/ledger entry | append-only; never edits the original charge |
 | `tax_credit` | final replacement/refund tax determination | references original tax line and rule/evidence |
@@ -76,20 +115,89 @@ Negative invoice totals are not silently sent to a payment provider. Product and
 finance must choose whether they become wallet credit, refund intent, or carried
 credit; the receipt states which.
 
+### Stored-value wallet funding is not a negative bill line
+
+`promotional_credit`, `adjustment_credit`, and `tax_credit` are rating/tax lines
+that reduce the obligation under their published rules. A settled stored-value
+wallet lot is different: it is a funding source allocated by `FundingPlan` after
+the obligation is calculated. It does not reduce taxable basis, appear as a
+second negative line, or change `grossObligation`.
+
+The canonical equations are kind-specific so a stored-value purchase cannot
+accidentally have zero principal:
+
+```text
+serviceGrossObligation = positiveServiceLines - eligibleRatingTaxCredits + tax + rounding
+fundingGrossObligation = cashPurchasePrincipal + tax + rounding
+collectionGrossObligation = sourceRemainingCollectibleReserved
+grossObligation = serviceGrossObligation OR fundingGrossObligation OR collectionGrossObligation, selected by intent kind
+grossObligation = walletFunding + providerRemainder
+```
+
+`credit_purchase` and `auto_topup` use `fundingGrossObligation`; their positive
+`cashPurchasePrincipal`, exact `creditGranted`, any explicit `bonusCredit`, unit/
+currency, restrictions, and expiry are all digest- and receipt-bound. Bonus output
+never reduces the cash principal.
+
+`collect_receivable` uses `collectionGrossObligation`. Its digest binds the source
+intent/receipt/ledger references, original obligation, prior collections, applied
+credits/write-offs, exact remaining collectible amount, and unique source-capacity
+reservation. It does not reapply tax or create an arbitrary collection principal.
+
+Every credit/grant kind declares exactly one semantic class: `rating_credit` or
+`stored_value`. The same source id/lot cannot participate in both equations.
+Customer displays may show “wallet applied,” but it is settlement allocation, not
+an invoice discount.
+
+Deferred prepaid service may reserve only a stored-value slice whose accepted lot
+terms preserve that reservation through terminal consume/release for the bound
+service window, even if nominal expiry passes. Nominal expiry blocks new
+allocations but cannot retire the reserved slice. A lot without that preservation
+rule may fund only an immediate same-transaction settlement while eligible; it
+cannot admit deferred prepaid service. Expiry, close, compaction, refund, and
+clawback serialize on the same lot generation/range fence, so expiry can retire
+only unreserved value and can never turn prepaid service into debt or card
+fallback.
+
 ---
 
 ## 3. Funding and collection intents
 
 These are monetary effects but not extra service lines on a recurring bill.
 
+### `subscription_start`
+
+The first SaaS-period purchase is an exact customer-present intent sourced by an
+accepted immutable `SubscriptionOffer`, `pending_first_settlement` schedule, and
+one-time acceptance/replay identity. It may contain the published first-period
+`platform_base` and only applicable `module_usage`, `module_capacity`, or
+`custom_domain` kinds from the closed §1 catalog that the offer explicitly
+enumerates, each under its frozen policy revision, plus tax and rounding. No
+free-form or unlisted add-on kind is valid. It posts
+no pre-settlement receivable and grants no service/accrual authority. Wallet
+settlement first requires the same accepted responsibility/schedule generation or
+refuses/cancels pre-adverse. Exact provider settlement is always recorded, but
+activates `SubscriptionScheduleReceipt`, the first window/anchor, and bound service
+authority only when that generation CAS succeeds. Already-dispatched old-payer cash
+settling after a transfer enters source-linked refund/credit/manual resolution and
+opens no service. Refusal, pending/unknown, revocation, or crash leaves the schedule
+pending and admits no billable usage. Later periods use the ordinary service/cycle
+source-allocation rules, never a provider-native subscription.
+
 ### `credit_purchase`
 
-A customer-triggered one-time purchase of MirrorStack credit. The engine-served
-page displays the exact currency, amount, credit received, restrictions, expiry,
-refund terms, payment rail, and intent digest before the customer submits.
+A customer-triggered one-time purchase of MirrorStack credit. `api-platform`
+relays an engine-signed canonical disclosure containing the exact currency,
+amount, credit received, restrictions, expiry, refund terms, payment rail, and
+intent digest. An independently verifiable consent client or origin renders
+those fields before the customer submits a proof the private relay cannot mint.
 
 The payment adapter receives that exact authorized total. Credit is granted only
 after verified provider evidence and the balanced ledger settlement commit.
+Neither existing stored value nor a rating/tax credit may fund a credit purchase:
+`walletFunding = 0` and `providerRemainder = grossObligation`. Any bonus credit is
+an explicit disclosed output under the accepted package/promotion revision, never
+a way to recursively buy more value with wallet value.
 
 ### `auto_topup`
 
@@ -108,6 +216,13 @@ status read, usage ingest, infrastructure sync, or provider callback cannot
 synchronously collect money. They may append a trigger fact; only the intent
 lifecycle and isolated executor can act.
 
+Auto top-up creates stored value and therefore cannot consume existing stored
+value or rating/tax credits: `walletFunding = 0` and
+`providerRemainder = grossObligation`. Threshold evaluation and trigger-epoch
+reservation are one transaction. The consume transaction rechecks canonical
+balance/pending funding; if the threshold recovered before dispatch, it cancels
+and releases rather than performing an unnecessary top-up.
+
 ### `collect_receivable`
 
 Settlement of one already-sealed service intent. Manual pay is customer-triggered
@@ -115,6 +230,12 @@ one-time authorization against the exact receipt/intent. Automatic pay consumes
 a valid standing authorization after notice and waiting.
 
 Paying an existing invoice/receivable does not re-rate it and cannot add lines.
+The engine creates a linked `collect_receivable` intent for only the remaining
+amount, freezes a new `FundingPlan`, and atomically reserves source collection
+capacity. It posts no second obligation. Customer-present payment requires fresh
+exact proof; standing collection requires current authority plus terminal notice
+evidence and wait. Pending/unknown retains the reservation, and concurrent
+collection intents cannot spend the same remaining receivable.
 
 ---
 
@@ -122,6 +243,8 @@ Paying an existing invoice/receivable does not re-rate it and cannot add lines.
 
 | effect | required authority and source | provider consequence |
 |---|---|---|
+| `payment_method_setup` | exact setup acceptance + `ProviderMerchantSetupBinding` + no-debit finite plan | creates only the accepted reusable scope; cannot debit |
+| `mandate_revoke` | engine-effective customer revocation + exact setup receipt/method identity + finite revoke plan | detaches/revokes only that mandate; engine use is already cut off even while provider status is pending |
 | `void` | known unsettled attempt + intent/operation ownership + typed reason | cancels only the verified provider object if the adapter supports it |
 | `refund` | settled attempt + linked refund intent + allowed amount/currency | provider refund through executor; never exceeds remaining refundable amount |
 | `partial_refund` | as refund plus exact line/tax allocation | only when adapter capability and accepted policy support it |
@@ -134,6 +257,15 @@ value returned to the original payment rail or only to a MirrorStack balance.
 
 Provider callbacks may confirm these effects but cannot originate an unlinked
 refund or debit.
+
+Refunding a settled `credit_purchase` or `auto_topup` additionally requires a
+`GrantedValueClawbackReservation`. In the same source-capacity transaction it
+freezes the exact unspent granted-principal lots and any bonus lots required by
+the accepted refund policy. A pending/unknown provider return keeps those lots
+unspendable. Verified cash return atomically cancels the reserved outputs and
+records the provider return; authoritative no-return proof releases them. Cash
+cannot be returned while the corresponding granted value remains spendable, and
+already consumed value cannot be silently refunded as if unused.
 
 ---
 
@@ -150,14 +282,18 @@ without exposing customer data to the developer. Publisher/private take rates,
 eligibility, reserve, refund, dispute, and payout timing require a published
 policy revision.
 
-A developer payout adapter is not a customer collection adapter and has separate
-credentials and execution authorization.
+Billing-engine accrues the payable liability and records independently verified
+payout evidence, but it has no developer-payout credential or execution port.
+A future payout service must publish and review its own intent, authorization,
+non-coercible `AuthorizedPayout`, credential, reconciliation, and receipt contract
+before it can move money; these billing documents do not authorize that service.
 
 ### Tax remittance and provider payout
 
 Tax liability/remittance and provider settlement/payout are accounting/cash
-effects connected by the ledger and provider trace. They never become additional
-customer lines merely because a provider reports a fee or net payout.
+effects connected by the ledger and provider trace. Billing-engine records their
+verified evidence but cannot initiate them. They never become additional customer
+lines merely because a provider reports a fee or net payout.
 
 ---
 
@@ -209,16 +345,25 @@ For each prorated kind, the price policy fixes:
 - whether it joins the next consolidated cycle or requires a separate one-time
   intent.
 
-The preferred target is one consolidated cycle intent. Creating an app,
-installing a module, or activating a domain should update the read-only estimate
-and future facts, not silently finalize an immediate provider invoice.
+The preferred target is one consolidated cycle intent per compatible group:
+payer, exact commercial seller/tax identity, tax profile, currency,
+service/collection authority, funding mode/policy, accepted settlement-route
+policy/instrument class, and window must all match. After tax and wallet
+allocation, the group selects one compatible exact settlement route and composite
+merchant binding; otherwise it splits or refuses. Creating an app, installing a
+module, or activating a domain should update the read-only estimate and future
+facts, not silently finalize an immediate provider invoice.
 
 ---
 
 ## 8. Payment-rail relationship
 
-`ChargeIntent` freezes the total before a provider is selected/executed. A
-provider adapter may transform only representation required by its API:
+Before sealing and disclosure, the engine freezes the total, `FundingPlan`,
+selected rail, merchant-account policy, and routing-policy digest. A later rail
+change creates a replacement intent with a new digest and eligibility decision,
+plus either fresh exact customer-present disclosure/proof or standing notice and
+delivery-relative wait, as applicable. The chosen provider adapter may transform only the
+representation required by its API:
 
 - named currency to its declared settlement-unit integer,
 - engine operation id to an opaque provider reference,
@@ -227,6 +372,8 @@ provider adapter may transform only representation required by its API:
 
 It cannot re-rate, add tax, add a fee, change currency, select another payer, or
 split an amount in a way that changes the customer's obligation.
+The settlement integer is the sealed `providerRemainder`, never
+`grossObligation` or wallet funding.
 
 Stripe and NewebPay attempts map back to the same effect catalog and receipt
 schema. Unsupported provider capabilities fail before any external mutation.
@@ -269,13 +416,14 @@ CI compares:
 
 1. the domain `ChargeKind` and financial-effect enums,
 2. canonical receipt schema variants,
-3. the generated inventory of provider/wallet mutation sites,
+3. the generated inventory of billing-engine provider/wallet mutation sites,
 4. adapter conformance fixtures, and
 5. this catalog's machine-readable index.
 
-A new enum without documentation or a provider mutation without a mapped effect
-fails the build. Free-text line creation is not part of any public or internal
-API.
+A new enum without documentation or a billing-engine provider mutation without a
+mapped effect fails the build. External payout/remittance input is evidence-only
+and must not expose a writer in this repository. Free-text line creation is not
+part of any public or internal API.
 
 ---
 
