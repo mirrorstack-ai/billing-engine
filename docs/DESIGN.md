@@ -150,13 +150,25 @@ no document or UI may claim otherwise.
 standing. A standing authorization declares charge kinds, currencies, cadence,
 price and terms revisions, ceilings, notice rules, effective time, and expiry.
 
-A private service credential must not create, accept, widen, or revive an
-authorization by assertion. `api-platform` may relay the signed disclosure;
-acceptance and revocation enter only through the proof-only consent edge and its
-append-only inbox. The engine may activate authority only after independently
-verifying a `CustomerAcceptanceProof` that binds payer, account, engine audience,
-displayed digest, nonce, expiry, and replay identity to a factor the private
-caller cannot mint.
+A private service credential must not create, widen, or revive an authorization
+by assertion, and must never supply the amount. The engine must derive every
+financial field. That constraint is enforceable against a private caller, and it
+stays.
+
+Authority must be established by an engine-signed disclosure that `api-platform`
+relays unchanged, plus an acceptance receipt bound to the disclosure digest. The
+engine must record that receipt against the authorization and must reproduce it
+in the charge bundle.
+
+This is a trust assumption, not a control. `api-platform` holds the customer
+session, and the engine treats the caller-supplied subject id as opaque
+(`internal/account/billing/service.go:105-109`). It can therefore assert an
+acceptance the customer never made, and the engine cannot disprove it. The
+disclosure, the digest, and the receipt all stay reproducible afterwards. That is
+detection, not prevention.
+
+The stronger form — an engine able to distrust `api-platform` about consent — is
+decision 16 in [§12](#12-open-product-decisions).
 
 ### INV-007
 
@@ -282,9 +294,10 @@ not replace them with a bare `ok` claim.
 
 **Proof ordering and the execution claim are one serialization boundary.**
 
-The consent edge appends customer-signed commands to one billing-owned, gap-free,
-monotonic stream per payer. An edge acceptance is returned only after durable
-sequence assignment.
+The engine must append each recorded acceptance receipt to one engine-owned,
+gap-free, monotonic authority log per payer — the payer stream. That log is
+internal to the engine, and no external caller may append to it. A sequence is
+assigned only by a durable write.
 
 Exactly two operations lock that payer stream:
 
@@ -319,8 +332,12 @@ transactional outbox for each of these: a sealed intent, a proof result, a notic
 or eligibility result, a refusal, a nonterminal attempt state, a settlement, a
 revocation, and a correction. The independent evidence edge may serve those
 records but must not create or mutate them. Reads require a payer-bound
-`CustomerReadProof`; an `api-platform` identity assertion, or possession of an
-object id, is not sufficient.
+`CustomerReadProof` (unbuilt); an `api-platform` identity assertion, or
+possession of an object id, is not sufficient.
+
+`CustomerReadProof` binds an independently enrolled customer factor that does not
+exist. This stronger form therefore waits on decision 16 in
+[§12](#12-open-product-decisions).
 
 ---
 
@@ -342,7 +359,6 @@ a security property, and the invariant it enforces. Nothing else.
 | `CustomerProofStream` | INV-013, INV-014 | unbuilt |
 | `AuthorityEvidence` | INV-005, INV-006 | unbuilt |
 | `BillingDecisionProof` | INV-012, INV-014 | unbuilt |
-| Customer-factor bootstrap | INV-006 | unbuilt |
 | `FundingPlan`, `CreditReservation`, `AuthorizationExposureReservation` | INV-006 | unbuilt |
 | `AutoTopupTriggerReservation` | INV-006, INV-008 | unbuilt |
 | `RefundIntent`, `RefundPlan`, `RefundCapacityReservation` | INV-011 | unbuilt |
@@ -478,7 +494,7 @@ profiles and authorizations never transfer implicitly.
 
 `ApplyBillingResponsibilityTransfer(transferID)` accepts no proof bytes: one
 serializable transaction locks both payer proof heads in payer-id order, requires
-`appliedHead == currentHead` for both, verifies two distinct factor-bound proofs,
+`appliedHead == currentHead` for both, verifies both payers' recorded receipts,
 and CASes the responsibility, schedule, source, and exposure generations. A
 missed deadline expires the transfer or yields `activation_failed`, and the
 blocked interval is never backdated into debt. Involuntary transfer, appeal and
@@ -487,22 +503,23 @@ cooling, and liability reassignment are unresolved; see
 
 #### `CustomerProofStream` (unbuilt)
 
-The mechanism behind [INV-013](#inv-013) and [INV-014](#inv-014). The public
-consent and revocation edge has only an append procedure into billing-owned
-storage. Each envelope carries the payer and account, purpose, object digest,
-factor revision, engine audience, nonce, expiry, replay identity, prior head
-commitment, and customer signature. Before assigning a sequence the billing-owned
-procedure verifies all of them plus the schema size limits; an invalid candidate
-consumes no sequence and must not jam the stream. The signed
-`EdgeAcceptanceReceipt` returns only after durability and proves ordering, not
-application.
+The mechanism behind [INV-013](#inv-013) and [INV-014](#inv-014). It is an
+internal, engine-owned authority log per payer, not a public surface, and only
+the engine may append to it. Each record carries the payer and account, purpose,
+disclosure digest, the relayed acceptance receipt, engine audience, nonce,
+expiry, replay identity, prior head commitment, and the engine signature. Before
+assigning a sequence the billing-owned procedure must verify all of them plus the
+schema size limits. An invalid candidate consumes no sequence and must not jam
+the log. The sequence must be durable before the engine treats a receipt as
+recorded, which proves ordering, not application.
 
 The core advances a per-payer applied high-watermark with a priority worker and
 must never rescan from sequence 1. The two lockers named in
 [INV-013](#inv-013) apply at most `maxProofApplyBatch` inside the
 transaction-time budget and fail closed on a gap or stale head; usage admission
-is not one of them. If revocation wins before any adverse step, the capability
-becomes `revoked` and claim and reservations are released atomically. If the
+is not one of them, and neither is the relay. If revocation wins before any
+adverse step, the capability becomes `revoked` and claim and reservations are
+released atomically. If the
 dispatch CAS wins, the revocation receipt names that cutoff and must not claim a
 successful cancellation.
 
@@ -511,13 +528,13 @@ successful cancellation.
 Every setup or debit bundle carries a tagged, mutually exclusive authority
 branch, not an unconditional notice field. Enforces INV-005 and INV-006.
 
-- `setup_customer_present` — the setup acceptance and proof, payer sequence, head
-  and cutoff, factor revision, and dispatch-time revocation state. It contains no
-  debit `BillingAuthorization`.
+- `setup_customer_present` — the setup acceptance receipt, payer sequence, head
+  and cutoff, the disclosure digest, and dispatch-time revocation state. It
+  contains no debit `BillingAuthorization`.
 - `debit_customer_present` — the engine-effective `CustomerAcceptanceReceipt`,
   the accepted intent digest, and the current authorization with its evaluated
   scope, caps, instrument and lineage revision.
-- `standing_automatic` — the current lineage head and its acceptance proof, the
+- `standing_automatic` — the current lineage head and its acceptance receipt, the
   terminal `NoticeReceipt`, the completed public wait, and a fresh
   `RevocationPathReadinessReceipt`.
 
@@ -548,25 +565,6 @@ delay or authorize a charge. Missing publication reports
 `state_transparency: pending|unsupported`; a conflicting signed history is
 `invalid` and opens an incident. Witness quorums, threshold signatures, and
 gossip are out of scope until a second independent relay exists.
-
-#### Customer-factor bootstrap, rotation, and recovery (unbuilt)
-
-The first customer factor must not be enrolled from an `api-platform` bearer, a
-session, an email assertion, or a private IAM claim. Enforces INV-006. The
-ceremony requires proof of possession of the new factor plus an independently
-verifiable `AccountAuthorityCredential` under a pinned public identity root.
-Lost-factor recovery uses that root or a documented offline recovery authority,
-plus a published cooling interval and notification to every enrolled destination;
-operators must not shorten cooling or assert identity themselves.
-
-A web verifier must run at an independently distributed top-level origin with an
-attested release, `frame-ancestors 'none'`, and opener-null external launches,
-accepting no opener-controlled navigation as approval. Amount and lines, seller,
-payment method, caps, destination, and consequences must be visible before a
-distinct, non-programmatic approval gesture. Native verifiers stay `unsupported`
-until each OS has a versioned public profile. The identity issuer, the verifier
-device, and any offline recovery authority are declared trusted-computing-base
-members whose roots must be published in `Capabilities`.
 
 ### Funding and reservations
 
@@ -934,7 +932,6 @@ sequenceDiagram
     participant AP as api-platform<br/>(private caller)
     participant Engine as billing-engine<br/>(this repository)
     participant Notice as notice destination<br/>(customer-held)
-    participant Edge as consent edge<br/>(public, append-only proof inbox)
     participant Rail as payment provider<br/>(one selected rail)
     participant Ledger as ms_billing<br/>(db — settled history append-only, INV-011)
 
@@ -950,9 +947,11 @@ sequenceDiagram
         Notice-->>Engine: delivery evidence
     end
     Note over Engine,Notice: the wait runs from DELIVERY, not from sealing. Its lead<br/>time is published by Capabilities (§12), never a deployment constant.
-    You->>Edge: CustomerAcceptanceProof, never through the private caller
-    Edge->>Ledger: append to the payer proof stream
-    Engine->>Ledger: apply proofs at the authenticated head
+    You->>AP: accept
+    AP->>Engine: relay the acceptance receipt for the disclosure digest, unchanged
+    Engine->>Ledger: record the receipt against the authorization
+    Note over AP,Engine: api-platform relays the receipt and could assert one the<br/>customer never gave. The engine records what it was told and<br/>can reproduce it later. That is detection, not prevention.
+    Engine->>Ledger: apply the payer stream at the authenticated head
     AP->>Engine: ExecuteChargeIntent(intent id only)
     Engine->>Engine: the execution predicate — one gate
     Note over Engine: its clauses have exactly one owner, below.<br/>A refusal here mutates no provider.
@@ -965,11 +964,12 @@ sequenceDiagram
 
 Three things the picture carries that the state machine below does not:
 
-- **The customer appears twice, and neither appearance is `api-platform`.**
-  Step 7 is a disclosure the engine sent. Step 9 is a proof it verified.
-- **One arrow reaches the provider.** The permit authorizing step 12 is spent by
+- **The customer appears twice, and the second appearance is relayed.** Step 7 is
+  a disclosure the engine sent. Step 9 is an acceptance `api-platform` carries in
+  step 10, which the engine records but cannot independently verify.
+- **One arrow reaches the provider.** The permit authorizing step 15 is spent by
   the send, not by the reply.
-- **Step 11 is one box on purpose.** Its clauses are enumerated once, in
+- **Step 14 is one box on purpose.** Its clauses are enumerated once, in
   [`ExecuteChargeIntent`](#executechargeintent) below.
 
 The lifecycle is deliberately small. Provider step detail is a substate, never a
@@ -978,7 +978,7 @@ second way to settle an intent.
 ```mermaid
 flowchart TD
     Start([start]) --> Proposed[proposed<br/>intent sealed]
-    Proposed -->|customer-present proof| Eligible[eligible<br/>all current gates pass]
+    Proposed -->|recorded acceptance receipt| Eligible[eligible<br/>all current gates pass]
     Proposed -->|standing authority| NoticePending[notice_pending]
     NoticePending -->|terminal NoticeReceipt| Disclosed[disclosed<br/>delivered, not read]
     Disclosed -->|public wait + all gates| Eligible
@@ -1043,18 +1043,17 @@ constants.
 Card binding creates a reusable provider mandate and a verifiable setup receipt.
 It creates no debit and no `BillingAuthorization`; subscription and auto top-up
 must later request their own authority against that mandate. The core seals an
-immutable `PaymentMethodSetup` and returns an engine-signed disclosure;
-`api-platform` relays it unchanged, including the "no debit" statement; the
-customer-held verifier renders it and obtains the factor proof through the
-consent edge; the core then freezes the no-debit setup plan and authorizes its
-first step. Card data goes to the provider, never through `api-platform` or the
-engine.
+immutable `PaymentMethodSetup` and returns an engine-signed disclosure.
+`api-platform` must relay it unchanged, including the "no debit" statement, then
+return an acceptance receipt naming the disclosure digest. The core records that
+receipt, freezes the no-debit setup plan, and authorizes its first step. Card
+data goes to the provider, never through `api-platform` or the engine.
 
 The resulting `PaymentMethodSetupReceipt` is a historical verification bundle. It
 binds the setup digest and opaque reference to the provider-verified readable
 identity: provider and entity, brand or method type, masked suffix, expiry, and
-mandate scope. It also binds the acceptance receipt, the payer stream sequence
-and cutoff, the factor and verifier revisions, and the revocation state at both
+mandate scope. It also binds the acceptance receipt, the disclosure digest it
+names, the payer stream sequence and cutoff, and the revocation state at both
 dispatch and terminal completion. Completion reapplies the current proof head; if
 revocation won, the engine refuses a usable receipt and revokes the mandate
 through the frozen plan. A current `Health` response is not historical proof.
@@ -1190,20 +1189,21 @@ sequenceDiagram
 
 ### Customer-triggered payment
 
-A one-time payment may become executable inside its short customer-present window
-when two things hold: the customer verifies the engine-signed disclosure, and the
-independent proof inbox delivers a `CustomerAcceptanceProof`. The engine verifies
-that the proof binds the same payer, account, audience, digest, nonce, expiry,
-and replay identity to a factor the private caller cannot mint. An internal
-caller's statement that a page was shown or clicked has no effect.
+A one-time payment may become executable inside its short customer-present
+window when two things hold. The engine must have sealed and signed the
+disclosure. `api-platform` must then return an acceptance receipt naming that
+disclosure digest. The engine must check that the receipt names the same payer,
+account, audience, digest, nonce, expiry, and replay identity, then record it. A
+bare `accepted: true` flag carrying no disclosure digest has no effect.
 
-Signing an opaque digest is not sufficient when the private UI may lie about what
-it displayed, so the ceremony must render the engine-signed fields in an
-independently verifiable client before the factor signs them. Until that path is
-deployment-attested, customer presence is unproven and automatic execution stays
-disabled. The two gates are mutually exclusive: a fresh intent acceptance receipt
-is the customer-present gate, while a standing authorization requires a
-`NoticeReceipt` and its delivery-relative wait.
+The engine cannot tell a relayed acceptance from an invented one, because
+`api-platform` holds the customer session and the engine treats the subject id as
+opaque (`internal/account/billing/service.go:105-109`). Customer presence here is
+therefore a trust assumption recorded for later reproduction, not an independent
+proof. The stronger form waits on decision 16 in
+[§12](#12-open-product-decisions). The two gates stay mutually exclusive: a fresh
+intent acceptance receipt is the customer-present gate, while a standing
+authorization requires a `NoticeReceipt` and its delivery-relative wait.
 
 ### Consolidation
 
@@ -1394,9 +1394,8 @@ boundary. The CI checks that enforce this are in
 | pure rater | derive lines from immutable inputs | network, clock, database writes, provider calls |
 | tax resolver | obtain and version tax evidence and public rule artifacts | collect money; return zero silently; treat a proprietary result as verified |
 | intent sealer | append an immutable intent | notify; execute; edit a sealed intent |
-| customer-held consent verifier | pin the billing root, verify engine signatures, render the fields, obtain factor proof | trust opaque private-UI text; accept a runtime-supplied root |
-| public consent edge | verify envelope and proof shape and append through the narrow payer-stream procedure | mint proof; skip or renumber accepted commands; dispatch account RPC |
-| billing-owned proof inbox | assign gap-free payer sequence and serialize proof application with claim acquisition | accept an unsigned customer command; treat edge acceptance as engine effect |
+| customer-held consent verifier, only under [§12](#12-open-product-decisions) decision 16 | pin the billing root, verify engine signatures, render the fields | trust opaque private-UI text; accept a runtime-supplied root |
+| billing-owned payer authority log | assign a gap-free payer sequence and serialize receipt application with claim acquisition | accept an acceptance claim naming no engine-issued disclosure digest; treat a recorded receipt as proof the customer acted |
 | notifier and attested notice reader | deliver sealed content; relay or read back carrier proof for one known message | assert terminal delivery or delivered time; write core state; alter totals |
 | eligibility scheduler | queue eligible intent ids | supply amounts or payment methods |
 | provider-credential enclave | alone hold any mutation-capable payment credential; run guarded writers and, where no read-only credential exists, a fixed-read broker | expose the broad credential; accept caller money; coerce authority across purposes; decide claim release |
@@ -1413,26 +1412,27 @@ boundary. The CI checks that enforce this are in
 ## 7. What callers may send
 
 The target vocabulary spans several separately credentialed surfaces. Customer
-acceptance, cancellation, contact enrollment, and revocation arrive only through
-the proof-only edge and inbox. Provider writes are not RPC actions.
+acceptance, cancellation, contact enrollment, and revocation arrive as receipts
+that `api-platform` relays and the engine records. Provider writes are not RPC
+actions.
 
 | surface | caller-supplied selection | monetary effect |
 |---|---|---|
 | metering / `RecordUsage` | subject, meter, module version, quantity, occurrence, event id | in-request, only prepaid wallet capacity is reserved, because refusing service is the point; the `ServiceAccrualExposure` reservation is a post-landing admission step over the immutable `usage_events` landing zone; no settlement, no provider write |
 | private core / `DescribeCharge`, `ProposeChargeIntent` | payer + action/window + optional closed `ProposalSelection` | derives every financial field; `ProposeChargeIntent` seals a proposal; no provider write |
 | private core / `ProposeBillingResponsibilityTransfer` | app or account + the two payer ids + a closed policy selection | signs one transfer envelope; no transfer, authority, or provider write |
-| consent edge / `AppendCustomerProof`; inbox / `ApplyCustomerProofs` | unchanged engine envelope + factor proof; then payer stream + authenticated head | append-only ordering, then authority establishment, revocation, or cancellation before the dispatch CAS; no provider write |
+| private core / `RecordAcceptanceReceipt` (unbuilt) | the unchanged engine disclosure envelope + an acceptance receipt naming its digest; then payer stream + authenticated head | one appended sequence, then authority establishment, revocation, or cancellation before the dispatch CAS; no provider write |
 | private core / `ApplyBillingResponsibilityTransfer` | transfer id only | after both heads and both proofs verify, CASes responsibility and source generations; no provider write |
 | private core / `ExecutePaymentMethodSetup`, `ExecuteChargeIntent`, next-step authorizer, `RequestMandateRevocation`, `RequestVoid`, `RequestRefund` | the id of the setup, intent, attempt, or reserved `RefundIntent`, plus verified prior-step evidence | persists only the next purpose-matched `Authorized*StepEnvelope`; no provider write |
 | grant consumer / consume purpose step | the matching `Authorized*StepEnvelope` | after the full recheck and CAS, returns the matching opaque `*StepDispatchPermit`; no provider write |
 | guarded writers, one per purpose | the matching `*StepDispatchPermit` only | exactly one plan step of that purpose; a writer cannot debit, refund, or set up outside its purpose |
 | evidence ingress / notice, execution, reconciliation | the role credential + evidence bound to the notice, capability, or attempt | none by assertion; the core decides every transition |
 | public provider callback ingress | declared raw bytes and headers; public-key or verification-only secret, otherwise the enclave `VerifyCallback` | an authenticated replay-bound observation only; no account action, no provider read or write |
-| private core / `CancelChargeIntent`, `RevokeBillingAuthorization` | applied customer proof or a typed operator policy reason | blocks future execution; cannot erase settlement |
+| private core / `CancelChargeIntent`, `RevokeBillingAuthorization` | an applied acceptance receipt or a typed operator policy reason | blocks future execution; cannot erase settlement |
 | private read / `GetChargeReceipt`, `TracePayment`, `Capabilities`, `Health`; evidence edge / `ReadEvidence` | an owned reference with a verified read scope, or a `CustomerReadProof` | none |
 
-Only the proof-inbox role may deliver applied customer proof, and possession of
-an account-RPC transport credential grants no authority. A boolean such as
+Only the engine may append to the payer stream, and possession of an account-RPC
+transport credential grants no authority. A boolean such as
 `accepted: true`, a bearer identity assertion, or an opaque digest chosen by a
 private caller is never a control. Administrative corrections must name an
 existing intent or ledger entry plus a typed correction reason, and the engine
@@ -1709,11 +1709,11 @@ jurisdiction verdict, taxable classification, presentation rule or rate. It must
 supply none of the exemption or reverse-charge verdict, rounding result, tax
 line or total.
 
-Enrollment and every material change must use an engine-issued envelope through
-the independent customer-factor proof stream. The resulting versioned
+Enrollment and every material change must use an engine-issued envelope, relayed
+unchanged and recorded on the payer stream. The resulting versioned
 `TaxProfileReceipt` (unbuilt) binds payer and account, the evidence commitments,
 issuer, validation status, effective and expiry times, engine audience, replay
-identity, and the proof-stream sequence and head.
+identity, and the payer-stream sequence and head.
 
 The resolver combines that issuer-validated evidence with an immutable
 `TaxPolicyRevision` (unbuilt) and, where selected, a versioned external
@@ -2213,6 +2213,32 @@ one. Each item names the gate it blocks. Per-item ownership is the repository ow
     基礎設施 line and its 12/10 markup is disclosed, folded into a published base
     price, or removed. Blocks G1 and G2: §8.1 and INV-010 disagree with the
     shipped code until the second is decided (§8.2).
+16. **Consent authority and customer-verifiable reads.** Whether billing-engine
+    must be able to distrust `api-platform` about who accepted a charge, and
+    about who may read evidence. That independence needs a public consent edge,
+    dropped as a mechanism and kept here as a costed option. Its price is a
+    separate identity product, and the requirements are concrete. The first
+    customer factor must not be enrolled from an `api-platform` bearer, a
+    session, or an email assertion. Enrollment
+    must require proof of possession plus an `AccountAuthorityCredential`
+    (unbuilt) under a pinned public identity root. A customer-held verifier must
+    run at an independently distributed top-level origin, with a reproducible
+    signed release and `frame-ancestors 'none'`. It must show amount and lines,
+    seller, payment method, caps, destination, and consequences before a
+    distinct, non-programmatic approval gesture. Lost-factor recovery must use
+    that root or a documented offline recovery authority, with a published
+    cooling interval and notice to every enrolled destination. Operators must not
+    shorten cooling or assert identity themselves. Native verifiers stay
+    `unsupported` until each OS has a versioned public profile. The identity
+    issuer, the verifier device, and any offline recovery authority are
+    trusted-computing-base members whose roots must be published in
+    `Capabilities`. Declining that cost is the current position. Acceptance then
+    rests on a receipt `api-platform` relays, so [INV-006](#inv-006) is a trust
+    assumption with after-the-fact reproduction, not independent verification.
+    [INV-014](#inv-014) has the same dependency, because `CustomerReadProof`
+    (unbuilt) binds an enrolled customer factor that does not exist. One answer
+    governs both. Blocks G1 and G4: independent verification of acceptance, and
+    the customer-verifiable evidence read, stay unavailable until this settles.
 
 Until each is accepted as an immutable policy revision and an ADR, these stay
 named decisions. They must not be reconstructed from current constants, code

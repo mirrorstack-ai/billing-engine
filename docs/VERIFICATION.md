@@ -107,9 +107,10 @@ transparency anchoring or trust-root distribution is `unknown`.
 
 ### Customer proof and evidence-edge contracts
 
-- The consent edge must accept only an engine-issued envelope plus a
-  customer-factor signature, over a gap-free monotonic payer stream. It must
-  acknowledge only after durable sequence assignment and a head update.
+- The engine must accept an acceptance receipt only when it names an
+  engine-issued disclosure digest. It must record that receipt on a gap-free
+  monotonic payer stream only the engine appends to. The receipt must be durable,
+  with the head updated, before authority counts as established.
 - The settlement-claim transaction must prove it locked the authoritative
   current head, consumed every sequence through it, and ran revocation and gate
   checks before the claim compare-and-swap — INV-013 in
