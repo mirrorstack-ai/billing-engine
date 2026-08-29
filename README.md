@@ -3,7 +3,9 @@
 The public-source billing authority for [MirrorStack](https://mirrorstack.ai).
 It holds the Stripe credentials, the `ms_billing` schema, subscription and
 invoice mirror state, usage metering, and the credit wallet. `api-platform`
-calls it over private RPC; customers never reach it directly.
+calls it over private RPC. The only surface a customer reaches directly is a
+static health answer that touches neither the dispatcher nor the database
+(`cmd/account-api/main.go:829-842`).
 
 The repository is public so a customer or their developer can answer one scoped
 question about real money by reading code and checking their own receipt:
@@ -20,12 +22,15 @@ of the claim are in [`SECURITY.md#adversary-model`](SECURITY.md#adversary-model)
 > implement it.** Read [`docs/DESIGN.md`](docs/DESIGN.md) as a specification to
 > build, never as a description of production.
 
-- The most serious known structural gap is a capability leak: a nominal
-  billing-status read can reach the auto-top-up executor and collect from a
-  saved payment method. A component that reads must not be able to charge.
-- The public health answer is the literal `{"status":"ok"}`
-  (`cmd/account-api/main.go:786`). It does not name the deployed commit, so a
-  customer cannot yet tie a charge to a public source revision.
+- The most serious known structural gap is a capability leak. The nominal
+  `GetServiceStatus` read reaches the auto-top-up trigger and can collect from a
+  saved payment method (`internal/account/billing/service.go:475`,
+  `internal/account/credit/coordinator.go:316`, `:363`). A component that reads
+  must not be able to charge.
+- The public health answer is the literal `{"status":"ok"}`, returned by the
+  Lambda before the dispatcher runs (`cmd/account-api/main.go:836-842`). It does
+  not name the deployed commit, so a customer cannot yet tie a charge to a
+  public source revision.
 - Every other current defect is enumerated in exactly one place,
   [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps). No other
   file in this repository keeps a second list.
@@ -35,35 +40,49 @@ this branch authorizes a rollout.
 
 ## Runtime and trust boundary
 
-`billing-engine` is public source, not a public endpoint. Four facts define the
+`billing-engine` is public source, not a public endpoint. Six facts define the
 deployed boundary, each citable in the tree:
 
 - In production the account API is a Lambda invoked by `api-platform` by ARN and
-  gated by IAM `lambda:InvokeFunction`. It is not exposed through API Gateway
-  (`cmd/account-api/main.go:11-16`, `:821-827`).
+  gated by IAM `lambda:InvokeFunction`. The RPC dispatcher is not exposed through
+  API Gateway (`cmd/account-api/main.go:11-16`, `:821-827`). One API Gateway
+  route reaches the same Lambda: `/billing/healthz` returns a static 200 before
+  the dispatcher (`cmd/account-api/main.go:18-25`, `:829-842`).
 - In local development the control-plane RPC routes check `X-MS-Internal-Secret`
   (`internal/shared/auth/internal_secret.go:80`). `RecordUsage` sits behind a
   separate `X-MS-Meter-Secret` header, so the metering credential rotates on its
-  own (`cmd/account-api/main.go:771-777`, `internal_secret.go:81`). Both secrets
-  are fail-closed: an unset secret returns 503 (`internal_secret.go:17-46`).
-- Provider events enter through separate binaries, never the RPC dispatcher.
-  `cmd/account-webhook` verifies the `Stripe-Signature` header. The EventBridge
-  receiver verifies no HMAC, trusting instead a partner bus only Stripe can
-  publish to (`cmd/account-webhook-eventbridge/main.go:1-12`).
-- Card data goes to the payment provider. It passes through neither
-  `api-platform` nor this engine.
+  own (`cmd/account-api/main.go:774-777`, `internal_secret.go:81`). Both secrets
+  are fail-closed: an unset secret returns 503 (`internal_secret.go:54-61`).
+- Provider events enter through separate binaries, never the RPC dispatcher. Both
+  receivers are built and uploaded per commit
+  (`.github/workflows/publish.yml:37-38`).
+- Stripe events are intended to arrive over EventBridge. Only Stripe can publish
+  to that partner bus, and only this receiver's rule can invoke on it, so
+  `cmd/account-webhook-eventbridge` verifies no HMAC
+  (`cmd/account-webhook-eventbridge/main.go:1-11`).
+- `cmd/account-webhook` verifies `Stripe-Signature` only when
+  `STRIPE_WEBHOOK_SECRET` is set. An empty secret rejects every signed delivery
+  (`cmd/account-webhook/main.go:81-89`,
+  `internal/shared/stripe/client.go:640-645`). For Stripe that HTTPS receiver is
+  redundant today. A future rail such as NewebPay may still need one.
+- Card data goes to the payment provider. This engine opens a setup-mode
+  Checkout Session and never reads a card number
+  (`internal/shared/stripe/client.go:96-111`).
 
 ```mermaid
 flowchart LR
     Browser["Customer browser"] --> AP["api-platform<br/>(authenticated routes)"]
     AP -->|"prod: IAM lambda.Invoke<br/>dev: X-MS-Internal-Secret"| API["billing-engine"]
-    SDK["Module SDK ingress"] -->|"X-MS-Meter-Secret<br/>RecordUsage only"| API
-    Stripe["Stripe"] -->|"Stripe-Signature verified"| WH["cmd/account-webhook"]
-    Stripe -->|"partner event bus"| EB["cmd/account-webhook-eventbridge"]
+    SDK["Module SDK ingress"] --> AP
+    AP -->|"RecordUsage<br/>dev HTTP only: X-MS-Meter-Secret"| API
+    Stripe["Stripe"] -->|"partner event bus"| EB["cmd/account-webhook-eventbridge"]
+    Stripe -.->|"HTTPS, redundant today<br/>Stripe-Signature when set"| WH["cmd/account-webhook"]
     API --> DB[("ms_billing")]
     WH --> DB
     EB --> DB
     API -->|"STRIPE_SECRET_KEY"| Stripe
+    WH -->|"STRIPE_SECRET_KEY"| Stripe
+    EB -->|"STRIPE_SECRET_KEY"| Stripe
 ```
 
 ## Repository layout
@@ -72,7 +91,7 @@ flowchart LR
 billing-engine/
 ├── cmd/
 │   ├── account-api/                 internal RPC Lambda; local HTTP on :8091
-│   ├── account-webhook/             Stripe HTTPS webhook receiver
+│   ├── account-webhook/             Stripe HTTPS webhook receiver (redundant)
 │   ├── account-webhook-eventbridge/ Stripe EventBridge receiver (dual-run)
 │   ├── billing-cycle/               scheduled per-period usage charge driver
 │   ├── infra-egress-sync/           pulls CDN egress totals from Cloudflare
@@ -86,6 +105,9 @@ billing-engine/
 └── README.md
 ```
 
+The first six binaries are built and uploaded per commit. `pm-default-backfill`
+is not, and is run by hand (`.github/workflows/publish.yml:35-41`).
+
 ## Running the current checks
 
 ```bash
@@ -96,7 +118,9 @@ make build      # go build ./...
 make test       # unit tests; no external calls
 ```
 
-`make test-integration` needs a running local database. The verifier, fuzz,
+`make test-integration` needs a reachable Docker daemon, not the `make db`
+instance. Each test boots its own ephemeral Postgres 17 container and skips when
+Docker is unreachable (`internal/shared/testutil/db.go:28-58`). The verifier, fuzz,
 mutation, and adapter-conformance commands described in
 [`docs/VERIFICATION.md`](docs/VERIFICATION.md) will be listed here once their
 scripts exist and run without production credentials.
@@ -131,9 +155,11 @@ migration wins and the doc is the bug.
 
 ## The target design, in one page
 
-Five customer money journeys are specified in
-[`docs/DESIGN.md#4-intent-lifecycle`](docs/DESIGN.md#4-intent-lifecycle). Each
-gets a diagram below.
+Five customer money journeys run through the lifecycle in
+[`docs/DESIGN.md#4-intent-lifecycle`](docs/DESIGN.md#4-intent-lifecycle). Their
+intent kinds are tabulated in
+[`docs/DESIGN.md#85-funding-and-collection-intents`](docs/DESIGN.md#85-funding-and-collection-intents).
+Each gets a diagram below.
 
 > 🔴 **Read every one of the five as a specification.** None is deployed, and
 > none is a guarantee you hold today. Each diagram is written in "must" for that
@@ -198,14 +224,15 @@ Four things this diagram makes obvious:
   request their own authority against that mandate later. The effect classes are
   enumerated in
   [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
-- **Steps 8 and 9 relay bytes the engine signed, and steps 12 to 14 relay your
+- **Steps 8 and 9 relay bytes the engine signed, and steps 12 and 13 relay your
   answer back.** `api-platform` must author neither. It could also assert an
   acceptance you never gave. The engine records what it was told and can
   reproduce it later, which is detection, not prevention —
   [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
-- 🔴 **Step 17 is where today's code diverges, and it costs you a billing
+- 🔴 **Step 18 is where today's code diverges, and it costs you a billing
   period.** A Stripe `payment_method.attached` event currently stamps
-  `accounts.activated_at`, so saving a card starts a cycle. It is filed in
+  `accounts.activated_at` (`internal/account/webhook/handlers.go:132`), so
+  saving a card starts a cycle. It is filed in
   [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
 
 ---
@@ -239,7 +266,11 @@ sequenceDiagram
     Stripe-->>Engine: a session handle the browser can complete
     Engine-->>AP: intent id, engine-signed disclosure, session handle
     AP-->>WA: the same bytes, relayed unchanged
-    WA-->>You: the disclosure, then hand off to the provider
+    WA-->>You: the disclosure, rendered but not authored
+    You->>WA: accept
+    WA->>AP: acceptance receipt for the disclosure digest
+    AP->>Engine: relay the receipt, unchanged
+    Engine->>DB: record the receipt against the sealed intent
 
     Note over You,Stripe: you pay at the provider. This is a one-time purchase, not<br/>a pull from a saved mandate, so nothing here consumes<br/>standing authority. Card details reach only Stripe.
 
@@ -251,23 +282,22 @@ sequenceDiagram
 
 Four things this diagram makes obvious:
 
-- **Step 10 is you paying, not us pulling.** A one-time purchase is settled by a
+- **Step 14 is you paying, not us pulling.** A one-time purchase is settled by a
   customer-present payment at the provider. No saved mandate is consumed and no
   standing authority is spent, which is what separates this flow from
   [flow 3](#flow-3--auto-top-up-a-credit-wallet-from-a-saved-mandate).
-- **This is the one flow where INV-006's trust assumption does not bite.** The
-  authority is step 11, evidence from the provider that you paid, and it does not
-  arrive through `api-platform`. Everywhere else the engine records an acceptance
-  it was told about — [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
+- **INV-006's trust assumption applies here too.** The gate is the relayed
+  acceptance receipt in steps 11 to 13, which `api-platform` could invent. The
+  provider evidence in step 15 proves the money moved, never who accepted —
+  [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
 - **The amount you typed enters as a choice, not as a price.** The engine
   re-derives currency, lines, tax and eligibility from the template it signed,
   then seals the total in step 4 before any session exists —
   [`docs/DESIGN.md#inv-001`](docs/DESIGN.md#inv-001).
-- 🔴 **Today the handoff is a redirect, and it is sequenced wrong.**
-  `StartCreditPurchase` finalizes an auto-advance invoice before the browser
-  holds its client secret, and the engine hands back a `hosted_invoice_url` for
-  the browser to complete rather than a session it opened for this intent
-  (`internal/account/billing/credit.go:624`). Both are filed in
+- 🔴 **Today `StartCreditPurchase` is sequenced wrong.** It finalizes an
+  auto-advance invoice (`internal/account/creditpurchase/executor.go:271`,
+  `internal/shared/stripe/client.go:454-456`) before returning the browser its
+  client secret (`internal/account/billing/credit.go:624-635`). It is filed in
   [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
 
 A credit purchase must never be funded by credit: `walletFunding = 0` and
@@ -340,9 +370,11 @@ Four things this diagram makes obvious:
 Recurring money, on a rail that offers to run the recurrence for us. Declining
 that offer is the point of the flow.
 
-**Target, not deployed.** `ProviderExecutionPlan` and `PaymentAttempt` are
-unbuilt, and `SubscriptionOffer` has only a live stub. The grace and allowance
-numbers below are shipped today and are named where they are cited.
+**Target, not deployed.** `ProviderExecutionPlan`, `PaymentAttempt` and
+`SubscriptionOffer` are unbuilt. What ships is a subscription-capability stub:
+`Ensure` always reports `subscription` missing
+(`internal/account/billing/service.go:101-105`, `:188-190`). The grace and
+allowance numbers below are shipped today and are named where they are cited.
 
 ```mermaid
 sequenceDiagram
@@ -360,7 +392,7 @@ sequenceDiagram
     Engine->>DB: start a grace timer, do not charge yet
     Engine->>DB: lock the accepted responsibility and schedule generation
 
-    Note over Engine,DB: a per-app and per-install grace runs GraceDays before<br/>anything is charged. Delete inside it and the fee never bills.<br/>An org plan charges immediately and has no timer.
+    Note over Engine,DB: a per-app and per-install grace runs GraceDays before<br/>anything is charged. Delete inside it and the fee never bills.<br/>An org plan must charge immediately, with no timer.
 
     Engine->>DB: after grace, seal first-period lines, tax, rail and a plan
     Engine-->>AP: intent id + engine-signed disclosure
@@ -383,11 +415,15 @@ Four things this diagram makes obvious:
 
 - **A SaaS fee is not charged the moment you trigger it.** Creating an app, or
   taking the account past its included modules, starts a grace timer instead.
-  `GraceDays = 3` and `IncludedModules = 5`, with `$5.00` per block of 5 over
-  the allowance (`internal/account/usage/bill.go:118`, `:52`, `:70`). An app
-  deleted inside its grace is never billed, and each install timer carries its
-  own grace. Org plans are the exception: that tier is not built, and when it
-  ships it must charge immediately with no timer.
+  `GraceDays = 3` and `IncludedModules = 5` (`internal/account/usage/bill.go:118`,
+  `:52`). After grace, one over-allowance install bills `$1.00` prorated
+  (`internal/account/usage/bill.go:96`,
+  `internal/account/cycle/overage.go:175`). The recurring boundary leg instead
+  prices `$5.00` per block of 5 (`internal/account/usage/bill.go:70`,
+  `internal/account/cycle/charge.go:283`). An app deleted inside its grace is
+  never billed, and each install timer carries its own grace. Org plans are the
+  exception: that tier is not built, and when it ships it must charge
+  immediately with no timer.
 - **Step 15 is one request, and that is a transport property.** Automatic SDK
   and HTTP retries must be off, `MaxNetworkRetries` set to zero, and a guard at
   the request boundary refuses a second send for that permit —
@@ -443,13 +479,14 @@ sequenceDiagram
     Engine->>DB: append the ledger and open the next window
 ```
 
-Four things this diagram makes obvious:
+Five things this diagram makes obvious:
 
 - **Step 2 is at admission, and it is deliberately early.** Deferring the
   ceiling to close would turn a prepaid wallet into an unauthorized credit
   line, because the service is already rendered. 🔴 Product budgets are
   alert-only today and never stop accrual
-  (`internal/account/budget/service.go:260`).
+  (`internal/account/budget/service.go:260`), filed in
+  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
 - **A boundary charges backward and forward at once.** Steps 6 and 7 put the
   closed period's usage arrears and the next period's advance charges — flat app
   base, module overage, domains — into one total
@@ -462,7 +499,7 @@ Four things this diagram makes obvious:
 - **No arrow lets `api-platform` choose the grouping key.** The namespace is
   derived inside the engine from accepted schedule and metric state, so a
   regrouped call cannot make a source consumable twice.
-- **The latch after step 9 has no timeout release.** An operator may attach
+- **The latch after step 11 has no timeout release.** An operator may attach
   evidence and still cannot clear it —
   [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
 
@@ -493,8 +530,10 @@ can misreport a customer still cannot invent a charge kind or an amount.
 - **One intent settles at most once**, across every rail, through a single
   durable settlement claim rather than per-adapter idempotency —
   [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
-- **Payment providers are adapters.** Stripe is the only rail with code today
-  (`internal/shared/stripe/client.go`); NewebPay is the next planned one. An
+- **Payment providers are adapters.** Stripe is the only rail with a client
+  today (`internal/shared/stripe/client.go`). NewebPay is the next planned one
+  and holds only a reserved wire shape
+  (`internal/account/billing/types.go:338-342`). An
   ambiguous provider outcome must latch `execution_unknown`, and must be
   resolved by reading the same provider, never by a second rail —
   [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
@@ -518,7 +557,8 @@ operations and developer settlement. They must not feed the customer rater, and
 they must not appear as a line whose displayed arithmetic does not reconcile.
 
 **Present state.** Infrastructure already reaches a customer-visible line, with
-a markup applied to it:
+a markup applied to it. Both rows are filed in
+[`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps):
 
 - The multiplier is `infraMarkupNum = 12` over `infraMarkupDen = 10`, so a
   reserved metric is charged at cost x 1.2
@@ -541,8 +581,9 @@ a markup applied to it:
 The live priced catalog is `migrations/billing/019_infra_catalog_hygiene.up.sql`,
 `020_p1_infra_catalog_seed.up.sql`, `045_ssr_compute_metrics.up.sql` and
 `046_ssr_egress_metrics.up.sql`, plus `018_ai_model_prices.up.sql` for
-`ms_billing.metric_model_prices`. Migration 017's compute alias row was removed
-by `022_drop_compute_alias.up.sql`, and `019_infra_catalog_hygiene.up.sql` sets
+`ms_billing.metric_model_prices`. Migration 019 demoted 017's `infra.compute.ms`
+row to a deprecated alias, which `022_drop_compute_alias.up.sql` then deleted,
+and `019_infra_catalog_hygiene.up.sql` sets
 `infra.egress.bytes` to `unit_price_micros = 0`.
 
 ## Migration and readiness
