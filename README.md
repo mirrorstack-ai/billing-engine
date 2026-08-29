@@ -235,37 +235,45 @@ sequenceDiagram
     Note over AP,Engine: the caller sends a signed catalog revision and one<br/>declared choice field — never an amount, price, tax,<br/>currency, provider, or execution time. This is INV-001.
 
     Engine->>DB: derive lines, tax, funding plan and rail, then seal the intent
-    Engine-->>AP: intent id + engine-signed disclosure
+    Engine->>Stripe: open a customer-present payment session for the sealed total
+    Stripe-->>Engine: a session handle the browser can complete
+    Engine-->>AP: intent id, engine-signed disclosure, session handle
     AP-->>WA: the same bytes, relayed unchanged
-    WA-->>You: the disclosure, rendered but not authored
-    You->>WA: accept
-    WA->>AP: acceptance receipt for the disclosure digest
-    AP->>Engine: relay the receipt, unchanged
-    Engine->>DB: record the receipt against the authorization
+    WA-->>You: the disclosure, then hand off to the provider
 
-    Note over AP,Engine: api-platform relays the receipt and could assert one the<br/>customer never gave. The engine records what it was told and<br/>can reproduce it later. That is detection, not prevention.
+    Note over You,Stripe: you pay at the provider. This is a one-time purchase, not<br/>a pull from a saved mandate, so nothing here consumes<br/>standing authority. Card details reach only Stripe.
 
-    AP->>Engine: ExecuteChargeIntent(intent id)
-    Engine->>DB: acquire the settlement claim
-    Engine->>Stripe: one consumed permit, one debit request
-    Stripe-->>Engine: verified debit evidence
+    You->>Stripe: pay the sealed total
+    Stripe-->>Engine: settlement evidence for that session
+    Engine->>DB: match the evidence to the sealed intent and take the claim
     Engine->>DB: append the ledger transaction and grant the credit lot
 ```
 
-Three things this diagram makes obvious:
+Four things this diagram makes obvious:
 
-- **Step 12 carries an id, and that is the whole design.** The scheduler queues
-  an intent id only. What must hold before step 14 has exactly one owner,
-  [`docs/DESIGN.md#executechargeintent`](docs/DESIGN.md#executechargeintent),
-  and this page does not repeat its clauses.
+- **Step 10 is you paying, not us pulling.** A one-time purchase is settled by a
+  customer-present payment at the provider. No saved mandate is consumed and no
+  standing authority is spent, which is what separates this flow from
+  [flow 3](#flow-3--auto-top-up-a-credit-wallet-from-a-saved-mandate).
+- **This is the one flow where INV-006's trust assumption does not bite.** The
+  authority is step 11, evidence from the provider that you paid, and it does not
+  arrive through `api-platform`. Everywhere else the engine records an acceptance
+  it was told about — [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
 - **The amount you typed enters as a choice, not as a price.** The engine
-  re-derives currency, lines, tax and eligibility from the template it signed.
-  A caller's approval statement has no effect —
+  re-derives currency, lines, tax and eligibility from the template it signed,
+  then seals the total in step 4 before any session exists —
   [`docs/DESIGN.md#inv-001`](docs/DESIGN.md#inv-001).
-- **A credit purchase must never be funded by credit.** For this kind
-  `walletFunding = 0` and `providerRemainder = grossObligation`, so the wallet
-  cannot buy itself. The kind-specific equations are in
-  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
+- 🔴 **Today the handoff is a redirect, and it is sequenced wrong.**
+  `StartCreditPurchase` finalizes an auto-advance invoice before the browser
+  holds its client secret, and the engine hands back a `hosted_invoice_url` for
+  the browser to complete rather than a session it opened for this intent
+  (`internal/account/billing/credit.go:624`). Both are filed in
+  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
+
+A credit purchase must never be funded by credit: `walletFunding = 0` and
+`providerRemainder = grossObligation`, so the wallet cannot buy itself. The
+kind-specific equations are in
+[`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
 
 ---
 
