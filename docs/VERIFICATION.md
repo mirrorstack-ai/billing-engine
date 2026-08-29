@@ -158,7 +158,7 @@ Every element below is required unless the "when" column names a condition.
 | 5 | source ids | source event and aggregate ids, or privacy-preserving hashes of them | always |
 | 6 | rating | every rating source commitment, module billing-manifest version, interpreter and limit revision, formula, integer scale, rounding step, subtotal, rating credit, tax and total | always |
 | 7 | policy digests | terms, price book, tax, notice, time readiness, rail routing, autonomy and execution plan, plus observed time uncertainty wherever used | always |
-| 8 | tax | status `final`, `not_applicable` or `unknown`, its `verificationClass` value, and the evidence behind it — state machine in [`DESIGN.md`](DESIGN.md#9-tax) | always |
+| 8 | tax | status `final`, `not_applicable` or `unknown`, its `verificationClass` value, and the evidence behind it — state machine in [`DESIGN.md`](DESIGN.md#7--tax-and-what-it-refuses-to-guess) | always |
 | 9 | funding | frozen `FundingPlan` (unbuilt), every credit-lot and authorization-scope exposure reservation, gross obligation, wallet application, provider remainder, wallet active-index generation and range proof, gross-monotonic cap and window arithmetic, and the funding result | always |
 | 10 | ceilings | ceilings as evaluated at decision time, authorization scope and lineage head, carried exposure, and consume-time validity | always |
 | 11 | authority branch | one tagged debit `AuthorityEvidence` (unbuilt) branch and no other — `debit_customer_present` with intent acceptance, proof and current one-time-or-standing authorization, or `standing_automatic` with authorization acceptance, proof, terminal notice receipt, completed wait and full revocation-path readiness receipt. Either branch binds payer sequence, head and cutoff; factor and verifier revision; authorization scope and lineage; carried exposure; and the dispatch-time revocation result | always |
@@ -281,7 +281,7 @@ fix.
 The current suite is 114 `_test.go` files totalling 46,679 lines, run by
 `.github/workflows/ci.yml` as `go test -race -count=1 ./...` plus an integration
 pass under `-tags=integration`. It covers the shipped engine, not the target
-model in [`DESIGN.md`](DESIGN.md#3-the-durable-model). Test policy for the
+model in [`DESIGN.md`](DESIGN.md#3--what-must-be-true-before-any-money-moves). Test policy for the
 target model belongs beside the tests that implement it, and its backlog belongs
 in a tracking issue on this repository rather than in a customer document.
 
@@ -340,7 +340,7 @@ CI must mechanically enforce:
   today is `migrations/billing/024_billing_svc_grants.up.sql`.
 - **One allow-listed mutation per effect.** Every provider mutation method and
   raw endpoint must map to one closed plan effect from
-  [`DESIGN.md`](DESIGN.md#8-what-customers-may-be-charged-for). Each must also
+  [`DESIGN.md`](DESIGN.md#6--what-you-can-be-charged-for). Each must also
   map to one purpose and step writer, and to at most one SDK or HTTP call.
   Adapter transport tests must require zero mutation retries and no redirects.
 - **Build stamping.** Every shipped binary must stamp its commit and artifact

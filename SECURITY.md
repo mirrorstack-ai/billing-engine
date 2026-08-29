@@ -274,13 +274,13 @@ must not reduce it; they fund it. Every source must be typed `rating_credit` or
 subtract the same lot from the obligation and then spend it again as funding. One
 lot would pay twice, and the customer would be charged for value the platform
 already granted. The enforcing mechanism is a unique-use constraint across those
-domains, in [`docs/DESIGN.md` §3](docs/DESIGN.md#3-the-durable-model).
+domains, in [`docs/DESIGN.md` §3](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves).
 
 ## What is in scope
 
 Anything that breaks a claim made by this repository, once that claim is marked
 implemented. Invariants INV-001 through INV-014 are specified normatively in
-[`docs/DESIGN.md` §2](docs/DESIGN.md#2-the-invariants); they are proposals, not
+[`docs/DESIGN.md` §2](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves); they are proposals, not
 production claims. The index below judges report eligibility; it does not restate
 the rules.
 
@@ -300,7 +300,7 @@ the rules.
 - **INV-012** — receipts name the running build, intent digest, and policy revisions.
 - **INV-013** — proof ordering and execution claim are one serialization boundary, with a generation CAS ([`#inv-013`](docs/DESIGN.md#inv-013)).
 - **INV-014** — customer evidence does not depend on the private relay.
-- Unknown tax is never zero tax; a zero amount needs a versioned policy that positively derives zero ([`§9`](docs/DESIGN.md#9-tax)). Provider ports and capability publication are in [`§5`](docs/DESIGN.md#5-payment-providers-are-adapters).
+- Unknown tax is never zero tax; a zero amount needs a versioned policy that positively derives zero ([`§9`](docs/DESIGN.md#7--tax-and-what-it-refuses-to-guess)). Provider ports and capability publication are in [`§5`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes).
 
 Useful reports include:
 

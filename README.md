@@ -156,16 +156,16 @@ migration wins and the doc is the bug.
 ## The target design, in one page
 
 Five customer money journeys run through the lifecycle in
-[`docs/DESIGN.md#4-intent-lifecycle`](docs/DESIGN.md#4-intent-lifecycle). Their
+[`docs/DESIGN.md#4-intent-lifecycle`](docs/DESIGN.md#4--what-happens-after-you-accept). Their
 intent kinds are tabulated in
-[`docs/DESIGN.md#85-funding-and-collection-intents`](docs/DESIGN.md#85-funding-and-collection-intents).
+[`docs/DESIGN.md#85-funding-and-collection-intents`](docs/DESIGN.md#6--what-you-can-be-charged-for).
 Each gets a diagram below.
 
 > 🔴 **Read every one of the five as a specification.** None is deployed, and
 > none is a guarantee you hold today. Each diagram is written in "must" for that
 > reason. Every durable type they name returns zero files from
 > `git grep <Type> -- '*.go'` on `main`
-> ([`docs/DESIGN.md#3-the-durable-model`](docs/DESIGN.md#3-the-durable-model)).
+> ([`docs/DESIGN.md#3-the-durable-model`](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves)).
 
 ---
 
@@ -223,7 +223,7 @@ Four things this diagram makes obvious:
   `mandate_setup` step and nothing more. Subscription and auto top-up must each
   request their own authority against that mandate later. The effect classes are
   enumerated in
-  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
+  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#6--what-you-can-be-charged-for).
 - **Steps 8 and 9 relay bytes the engine signed, and steps 12 and 13 relay your
   answer back.** `api-platform` must author neither. It could also assert an
   acceptance you never gave. The engine records what it was told and can
@@ -303,7 +303,7 @@ Four things this diagram makes obvious:
 A credit purchase must never be funded by credit: `walletFunding = 0` and
 `providerRemainder = grossObligation`, so the wallet cannot buy itself. The
 kind-specific equations are in
-[`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
+[`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#6--what-you-can-be-charged-for).
 
 ---
 
@@ -360,7 +360,7 @@ Four things this diagram makes obvious:
   the notice arrives — [`docs/DESIGN.md#inv-005`](docs/DESIGN.md#inv-005).
 - 🔴 **The minimum lead time is not a number yet.** It is an open product
   decision published through `Capabilities`, never a hidden deployment constant
-  ([`docs/DESIGN.md#12-open-product-decisions`](docs/DESIGN.md#12-open-product-decisions)).
+  ([`docs/DESIGN.md#12-open-product-decisions`](docs/DESIGN.md#12--what-we-have-not-decided)).
   Turning on general billing must never turn this flow on.
 
 ---
@@ -427,7 +427,7 @@ Four things this diagram makes obvious:
 - **Step 15 is one request, and that is a transport property.** Automatic SDK
   and HTTP retries must be off, `MaxNetworkRetries` set to zero, and a guard at
   the request boundary refuses a second send for that permit —
-  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
+  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes).
 - **Nothing in the picture lets Stripe schedule the next period.** The frozen
   autonomy policy forbids provider-managed subscriptions, auto-advance, smart
   retries, dunning debits and delayed capture. None of them can race your
@@ -501,7 +501,7 @@ Five things this diagram makes obvious:
   regrouped call cannot make a source consumable twice.
 - **The latch after step 11 has no timeout release.** An operator may attach
   evidence and still cannot clear it —
-  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
+  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes).
 
 ---
 
@@ -536,14 +536,14 @@ can misreport a customer still cannot invent a charge kind or an amount.
   (`internal/account/billing/types.go:338-342`). An
   ambiguous provider outcome must latch `execution_unknown`, and must be
   resolved by reading the same provider, never by a second rail —
-  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
+  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes).
 - **What customers may be charged for** is a closed vocabulary —
-  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
+  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#6--what-you-can-be-charged-for).
 - **Tax** must resolve to one of three states. `unknown` must never become zero
-  and must never be executable — [`docs/DESIGN.md#9-tax`](docs/DESIGN.md#9-tax).
+  and must never be executable — [`docs/DESIGN.md#9-tax`](docs/DESIGN.md#7--tax-and-what-it-refuses-to-guess).
 - **Ledger and receipts** must be append-only, with provider observations held
   as read-only snapshots —
-  [`docs/DESIGN.md#10-ledger-and-receipts`](docs/DESIGN.md#10-ledger-and-receipts).
+  [`docs/DESIGN.md#10-ledger-and-receipts`](docs/DESIGN.md#8--where-the-money-is-written-down).
 - **Verification** covers the charge bundle a customer will recompute offline
   ([the charge bundle contract](docs/VERIFICATION.md#3-canonical-charge-bundle))
   and the architecture checks that run against this tree
@@ -597,10 +597,10 @@ or policy evidence.
 
 The conditions that must all hold before production intent execution is enabled
 are listed in
-[`docs/DESIGN.md#11-migration-and-readiness-gate`](docs/DESIGN.md#11-migration-and-readiness-gate).
+[`docs/DESIGN.md#11-migration-and-readiness-gate`](docs/DESIGN.md#11--getting-from-here-to-there).
 The product decisions still open — notice lead time, standing ceilings,
 merchant-of-record, jurisdictions, and price-change notice — are listed in
-[`docs/DESIGN.md#12-open-product-decisions`](docs/DESIGN.md#12-open-product-decisions).
+[`docs/DESIGN.md#12-open-product-decisions`](docs/DESIGN.md#12--what-we-have-not-decided).
 
 ## Security
 

@@ -105,9 +105,9 @@ The destination: every debit must consume one immutable charge intent plus live
 authority, tax must fail closed, and an append-only ledger must outrank any
 provider callback. Nothing on `main` meets that yet. Link, never restate.
 
-- Invariants INV-001..INV-014 — [`docs/DESIGN.md#2-the-invariants`](docs/DESIGN.md#2-the-invariants)
+- Invariants INV-001..INV-014 — [`docs/DESIGN.md#2-the-invariants`](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves)
 - Intent lifecycle and the execution predicate — [`docs/DESIGN.md#executechargeintent`](docs/DESIGN.md#executechargeintent)
-- Charge vocabulary, tax, ledger — DESIGN [§8](docs/DESIGN.md#8-what-customers-may-be-charged-for), [§9](docs/DESIGN.md#9-tax), [§10](docs/DESIGN.md#10-ledger-and-receipts)
+- Charge vocabulary, tax, ledger — DESIGN [§8](docs/DESIGN.md#6--what-you-can-be-charged-for), [§9](docs/DESIGN.md#7--tax-and-what-it-refuses-to-guess), [§10](docs/DESIGN.md#8--where-the-money-is-written-down)
 - Receipt and deployed-source verification — [`docs/VERIFICATION.md`](docs/VERIFICATION.md)
 - Adversaries, assumptions, limits — [`SECURITY.md#adversary-model`](SECURITY.md#adversary-model)
 
