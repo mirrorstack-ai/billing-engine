@@ -1,394 +1,352 @@
-# How customers can verify the billing engine
+# Checking a charge instead of trusting one
 
-Public source is useful only when a customer can connect three things:
+Every other document here asks you to believe something. This one hands you a
+procedure. The question it serves is narrow and yours: **this line on my bill —
+where did the number come from, which code produced it, and who said I agreed?**
 
-1. the rules in this repository,
-2. the artifact that proposed and executed a charge, and
-3. the evidence used for that particular charge.
+Most of the machinery below is a target contract rather than shipped behavior.
+Rather than warn you once at the top, each step says at that step whether you
+can run it today. Where you cannot, it starts 🔴.
 
-> **Status: target contract.** None of §2, §3, §4 or §5 ships on `main` today.
-> The verifier, the charge bundle, public build identity, policy digests, the
-> transparency record and the intent-only capability gate are all unbuilt.
-> Sentences using "must" or "will" are acceptance targets, not claims about
-> current behavior. Current defects are enumerated in exactly one place:
-> [`SECURITY.md`](../SECURITY.md#known-current-gaps).
+The trust boundary, layout and money flows are in [`../README.md`](../README.md).
+The rules are in [`DESIGN.md`](DESIGN.md), linked by invariant, never restated.
 
-Sections §1–§5 address a customer verifying one charge. Sections §6–§8 address
-CI at the release gate. Section §9 states what verification cannot prove.
+---
 
-## 1. Evidence levels
+## 1 · What you can check, and how strong each check is
 
-| level | question answered | required evidence |
+A verification result is worth what its weakest input is worth, so settle first
+which question a given piece of evidence answers. There are seven, and none of
+them substitutes for another.
+
+| level | the question it answers | what you need |
 |---|---|---|
-| source | what is this revision designed to permit? | public code, docs, schemas, tests |
-| build | what code produced the artifact? | Git SHA, signed build provenance, artifact digest |
-| deployment | what artifact and policies are running? | engine-signed `Health`/`Capabilities` evidence |
-| intent | how was this total derived and authorized? | charge bundle plus its digest |
-| runtime state | what serialized transition did the billing core report? | signed `BillingDecisionProof` (unbuilt); non-omission stays `state_assurance: attested` |
+| source | what is this revision designed to permit? | this repository, its docs, schemas and tests |
+| build | which code became the running artifact? | Git commit, build provenance, artifact digest |
+| deployment | which artifact and policies are running now? | engine-signed `Health` and `Capabilities` evidence |
+| intent | how was this total derived and authorized? | the charge bundle of §3, and its digest |
+| runtime state | what transition did the billing core report? | a signed `BillingDecisionProof` (unbuilt) |
 | provider | what did an external rail report happened? | normalized, verified provider evidence |
-| ledger | what monetary transition did MirrorStack commit? | balanced append-only transaction plus correction chain |
+| ledger | what monetary transition did MirrorStack commit? | a balanced append-only transaction and its corrections |
 
-`state_assurance: attested` names the billing engine as the attester. No
-independent witness signs it.
+Reading public source does not tell you which binary charged your card, and a
+provider's `paid` status does not tell you why that amount was allowed. Both are
+the same confusion of levels.
 
-No lower level substitutes for a higher one. A public repository does not prove
-which binary charged a card. A provider's `paid` status does not prove why the
-amount was allowed.
+The runtime-state level is the weakest, and the report says so out loud.
+`state_assurance: attested` names the engine as the attester of its own
+transition. [INV-012](DESIGN.md#inv-012) makes that identity externally visible,
+not externally guaranteed, and §6 says what that costs you.
 
-## 2. Customer-visible runtime identity
+---
 
-`billing-engine` is a private runtime service. In production `cmd/account-api`
-starts as a Lambda invoke handler (`cmd/account-api/main.go:857`), and the local
-HTTP path is gated on `X-MS-Internal-Secret` (`cmd/account-api/main.go:652`).
-Its dispatcher exposes no `Health` or `Capabilities` action today; the only
-local health route is `/__health` (`cmd/account-api/main.go:647`). Both target
-actions must produce engine-signed evidence that `api-platform` can relay
-publicly but cannot alter.
+## 2 · Which build answered you
 
-`Health` must return the same fields on healthy and unhealthy responses. Those
-are the Git commit or the literal `unknown`, the artifact digest, and the build
-provenance identity. It must also return the binary role (`planner`, `notifier`,
-`executor`, `reconciler`), the receipt and bundle schema version, and a
-deployment environment identifier holding no secret. An executor whose build
-identity is `unknown` must refuse to execute.
+You cannot tie a charge to a revision of this repository until the running
+service says which revision it is. Today it will not. The dispatcher's action
+table has no `Health` and no `Capabilities` case (`cmd/account-api/main.go:88`),
+and the one unauthenticated route returns a fixed body carrying no identity
+(`cmd/account-api/main.go:647`).
 
-`Capabilities` must return, as signed fields a verifier can pin:
+`Health` must return the same identity fields whether the service is healthy or
+not. A binary that hides its build while it is sick hides it when that matters
+most. Those fields are the Git commit or the literal `unknown`, the artifact
+digest, the build provenance identity and the binary role. They also carry the
+receipt and bundle schema version, and an environment name holding no secret. An
+executor whose build identity reads `unknown` must refuse to execute.
 
-- the active terms, price-book, tax, notice and routing-policy digests; the
-  currency and scale registry revision; and each adapter's version,
-  capabilities, transport configuration and last conformance revision;
-- every numeric hard limit the verifier must reuse: intent lines and bytes,
-  source-proof and bundle bytes, wallet lots, and rollup depth and arity;
-- the remaining numeric limits: provider-plan steps and bytes, proof-apply
-  batches, and `MerchantBindingSet` (unbuilt) members, proof bytes, depth and
-  hash operations;
-- the price-book, module-manifest and tax-rule interpreter identities and their
-  limits, which must equal the public verifier's;
-- readiness for the notifier, the customer-facing relay, the independent consent
-  and proof verifier, the executor, the evidence edge and the receipt verifier;
-- per-platform trusted-display profiles, where a native profile stays
-  `unsupported` until its OS-specific suite passes;
-- provider evidence strength, and how reconciliation reads are enforced. The two
-  permitted forms are a provider-native read-only credential, or a
-  credential-free reconciler calling a fixed-read broker inside the credential's
-  exclusive owning enclave — INV-007 in [`DESIGN.md`](DESIGN.md#inv-007);
-- the callback-auth credential class and scope, its numeric request, header and
-  time limits, and the verifier artifact and owner;
-- the callback replay policy, and whether verification runs in public ingress or
-  inside that owning enclave; and
-- the minimum notice policy, and the `TimeReadinessPolicy` (unbuilt) identity,
-  source, maximum uncertainty, skew, forward step and readiness; and
-- the audit-only asynchronous transparency status and checkpoint, plus every
-  reachable legacy money-moving path with a count.
+`Capabilities` must return, as signed fields a verifier can pin, everything the
+offline check of §4 has to reuse:
 
-The production intent-only claim requires `legacyMoneyPaths: 0`. A stronger new
-surface beside one weaker legacy route is not a stronger deployment. Build
-identity and non-sensitive capability fields must reach customers as signed
-engine evidence through the public control plane. A private support request is
-not a substitute. Exposing the account RPC is not an acceptable route.
+- the active terms, price-book, tax, notice and routing-policy digests, the
+  currency and scale registry revision, and each adapter's version, transport
+  configuration and last conformance revision;
+- every numeric limit — intent lines and bytes, source proof and bundle bytes,
+  wallet lots, rollup depth and arity, provider-plan steps and bytes, and
+  proof-apply batch size;
+- the price-book, module-manifest, tax-rule and notice interpreter identities,
+  which must equal the public verifier's, since a different interpreter is a
+  different answer;
+- readiness for the notifier, executor, evidence edge, receipt verifier, consent
+  verifier and each display profile, `unsupported` until its own suite passes;
+  and
+- provider evidence strength, the callback credential class and replay policy,
+  which reconciliation read is in force ([INV-007](DESIGN.md#inv-007)), and
+  every reachable legacy money-moving path with a count.
 
-### Verification trust root and signing profiles
+The intent-only claim requires `legacyMoneyPaths: 0`. A strong new surface
+beside one weak legacy route is not a strong deployment. It is the weak route
+with better documentation.
 
-The verifier must pin a billing verification root independently of any runtime
-response. That fingerprint must ship in this repository, in signed verifier
-releases, and in a separately operated transparency channel — a different
-mechanism from the state transparency log. No `api-platform`, consent-edge or
-evidence-edge response may introduce a new root. Every signed disclosure,
-capability statement, receipt and charge bundle must carry an algorithm
-identifier, key id, issuer, audience, environment, schema, signature domain,
-payload digest, validity interval and transparency checkpoint. A key valid for
-`billing-capabilities/v1` therefore cannot sign `customer-acceptance/v1`. Leaf
-rotation must be cross-signed and committed before use. Revocation and emergency
-rotation must be root-signed, append-only events carrying an effective cutoff.
-The verifier must reject an unknown algorithm, a substituted root, a revoked key
-used after its cutoff, a missing chain, a stale checkpoint, or an audience
-mismatch. Automatic execution must stay disabled while key identity,
-transparency anchoring or trust-root distribution is `unknown`.
+**Pin the root, not the response.** A verifier that learns its trust root from
+the service it is checking has checked nothing. That root must ship in this
+repository, in signed releases, and in a separately operated channel, and no
+relayed response may introduce a new one. Every signed statement must carry an
+algorithm, key id, issuer, audience, environment, schema, signature domain,
+payload digest, validity interval and checkpoint. A key valid for
+`billing-capabilities/v1` therefore cannot sign `customer-acceptance/v1`.
 
-### Customer proof and evidence-edge contracts
+---
 
-- The engine must accept an acceptance receipt only when it names an
-  engine-issued disclosure digest. It must record that receipt on a gap-free
-  monotonic payer stream only the engine appends to. The receipt must be durable,
-  with the head updated, before authority counts as established.
-- The settlement-claim transaction must prove it locked the authoritative
-  current head, consumed every sequence through it, and ran revocation and gate
-  checks before the claim compare-and-swap — INV-013 in
-  [`DESIGN.md`](DESIGN.md#inv-013). A local high-watermark without an
-  authenticated current head is not valid.
-- `CustomerReadProof` (unbuilt) must bind the enrolled factor to payer, account,
-  one object or one size-limited collection, audience, nonce, expiry, replay
-  identity and key version. The edge must verify it against the billing-owned
-  factor mapping, never an `api-platform` identity assertion.
-- The edge must return one published status shape, padded size class, timing
-  bucket and rate limit for authorized, absent and unauthorized requests alike.
-  It serves signed, customer-encrypted, checkpointed outbox records that it
-  cannot itself create or edit.
+<a id="3-canonical-charge-bundle"></a>
 
-## 3. Canonical charge bundle
+## 3 · The charge bundle, field by field
 
-This section owns the charge-bundle field contract. Other documents link here
-rather than restating it.
+This is the only place the bundle contract is written down. It lived in four
+places once, the copies drifted, and every other document now links here.
 
 The bundle has one versioned canonical encoding. It fixes field names and order,
-integer and decimal representation, Unicode normalization, timestamps and time
-zones, and absent versus explicit zero or null. It also fixes the ordering of
-lines, sources, evidence and ledger entries, and the digest and signature
-domains. Invalid Unicode, duplicate map keys, unknown critical fields,
-out-of-range integers, unsupported schema versions and non-canonical encodings
-must all be refused. The digest binds canonical bytes, not a lossy parser's
+integer and decimal form, Unicode normalization, timestamps and zones, and
+absent versus explicit zero or null. It also fixes the order of lines, sources,
+evidence and ledger entries, and the digest and signature domains. Invalid
+Unicode, duplicate
+keys, unknown critical fields, out-of-range integers and unsupported schema
+versions are refused. The digest binds canonical bytes, never a lossy parser's
 reading of them.
 
-Customer exports must replace sensitive source fields with domain, payer, object
-and field-bound hiding commitments using unique random nonces. Raw deterministic
-hashes of addresses, tax ids or other low-entropy personal data are forbidden.
-Only the owning payer can obtain the encrypted opening, and nonces are never
-reused. Key rotation must preserve historical openings. Corrected evidence must
-create a new append-only commitment, and redaction must be covered by the
-digest.
+Exports replace sensitive source fields with domain, payer, object and
+field-bound hiding commitments under unique random nonces. A raw hash of an
+address or a tax id is one lookup table away from the value, so it is forbidden.
+Only the owning payer obtains the opening, rotation preserves historical
+openings, and the redaction is covered by the digest.
 
-Every element below is required unless the "when" column names a condition.
+Every element is required unless the "when" column names a condition. Every type
+marked (unbuilt) returns nothing from `git grep` on `origin/main` today.
 
-| # | element | contents | when |
+| # | element | what it binds | when |
 |---|---|---|---|
-| 1 | intent | canonical bytes and digest of the `ChargeIntent` (unbuilt) | always |
-| 2 | commercial identity | the `CommercialIdentityBinding` (unbuilt) used by source, tax and wallet evaluation | always |
-| 3 | merchant of record | composite `MerchantOfRecordBinding` (unbuilt), its `MerchantBindingSet` (unbuilt) membership proof, and the settlement route | always |
-| 4 | source authority | one tagged form: service leaf and window allocation root with signed local checkpoint transition evidence; one-time replay identity; auto-top-up trigger; or receivable capacity | always |
+| 1 | intent | canonical bytes and digest of the sealed `ChargeIntent` (unbuilt) | always |
+| 2 | commercial identity | the `CommercialIdentityBinding` (unbuilt) that source, tax and wallet evaluation used | always |
+| 3 | merchant of record | `MerchantOfRecordBinding` (unbuilt), its `MerchantBindingSet` (unbuilt) membership proof, and the settlement route | always |
+| 4 | source authority | one tagged form: service leaf with window allocation root and signed checkpoint transition, one-time replay identity, auto-top-up trigger, or receivable capacity | always |
 | 5 | source ids | source event and aggregate ids, or privacy-preserving hashes of them | always |
-| 6 | rating | every rating source commitment, module billing-manifest version, interpreter and limit revision, formula, integer scale, rounding step, subtotal, rating credit, tax and total | always |
-| 7 | policy digests | terms, price book, tax, notice, time readiness, rail routing, autonomy and execution plan, plus observed time uncertainty wherever used | always |
-| 8 | tax | status `final`, `not_applicable` or `unknown`, its `verificationClass` value, and the evidence behind it — state machine in [`DESIGN.md`](DESIGN.md#7--tax-and-what-it-refuses-to-guess) | always |
-| 9 | funding | frozen `FundingPlan` (unbuilt), every credit-lot and authorization-scope exposure reservation, gross obligation, wallet application, provider remainder, wallet active-index generation and range proof, gross-monotonic cap and window arithmetic, and the funding result | always |
+| 6 | rating | rating source commitments, module billing-manifest version, interpreter and limit revision, formula, integer scale, rounding step, subtotal, rating credit, tax, total | always |
+| 7 | policy digests | terms, price book, tax, notice, time readiness, rail routing, autonomy and execution plan, plus the observed time uncertainty wherever it was used | always |
+| 8 | tax | status `final`, `not_applicable` or `unknown`, its verification class, and the evidence behind it — [DESIGN §7](DESIGN.md#7--tax-and-what-it-refuses-to-guess) | always |
+| 9 | funding | frozen `FundingPlan` (unbuilt), credit-lot and exposure reservations, gross obligation, wallet application, provider remainder, wallet generation and range proof, caps | always |
 | 10 | ceilings | ceilings as evaluated at decision time, authorization scope and lineage head, carried exposure, and consume-time validity | always |
-| 11 | authority branch | one tagged debit `AuthorityEvidence` (unbuilt) branch and no other — `debit_customer_present` with intent acceptance, proof and current one-time-or-standing authorization, or `standing_automatic` with authorization acceptance, proof, terminal notice receipt, completed wait and full revocation-path readiness receipt. Either branch binds payer sequence, head and cutoff; factor and verifier revision; authorization scope and lineage; carried exposure; and the dispatch-time revocation result | always |
-| 12 | decision proof | signed `BillingDecisionProof` (unbuilt): closed key and predicate schema, authenticated payer proof head, before and after row commitments and generations, transaction, build and policy identities, and the matching outbox record; assurance is `attested` by the engine | always |
-| 13 | build identity | engine Git commit, artifact digest, receipt schema version and build provenance | always |
+| 11 | authority branch | one tagged `AuthorityEvidence` (unbuilt) debit branch and no second one — see the note below | always |
+| 12 | decision proof | signed `BillingDecisionProof` (unbuilt): payer proof head, before and after commitments and generations, transaction, build and policy identity, outbox record | always |
+| 13 | build identity | engine Git commit, artifact digest, receipt schema version, build provenance | always |
 | 14 | ledger | balanced ledger transaction ids and entries, plus the outbox checkpoint | always |
-| 15 | service accrual | `ServiceAccrualExposure` (unbuilt) arithmetic converting the reserved upper bound to the settled line; a deferred prepaid lot additionally binds its expiry-preservation rule, reserved time, service window and scheduled close, nominal expiry, range, amount, generation, and consume or release evidence | a service accrual funded it |
-| 16 | subscription | accepted `SubscriptionOffer` (unbuilt) and its activation-gated schedule receipt: cadence, time zone, anchor, first-period and recognition rules, schedule generation, atomic first-settlement activation compare-and-swap | subscription charge |
-| 17 | responsibility transfer | shared transfer commitment, two audience-specific disclosure and proof digests, both payer-stream heads and applied cutoffs, effective cutoff and deadlines, generation compare-and-swap, source and exposure partition, retained old claims, and the non-transfer of mandates, wallet, tax and notice state; the new-payer view carries no old-payer private financial detail | payer changed |
-| 18 | auto top-up | trigger reservation and epoch, creation balance and other-pending-funding snapshot, owning intent, consume-time recheck snapshot, result and time, and the atomic credit and bonus grant with trigger and pending-funding close | `auto_topup` |
-| 19 | provider plan | autonomy policy and finite `ProviderExecutionPlan` (unbuilt); every step envelope, consume, opaque permit, egress identity and effect class; zero-retry, no-redirect transport configuration and its single outbound-request fence evidence | provider execution occurred |
-| 20 | provider evidence | enclave, executor, adapter, workload and credential attestations each naming its attester; `PaymentAttempt` (unbuilt) transitions; the actual debit instrument binding; and normalized provider evidence with explicit evidence strength and TCB class | provider execution occurred |
-| 21 | read-back or callback | reader, broker or callback-verifier artifact; its workload, credential class and scope; numeric request limits in force; replay result; evidence class; checkpoint; verification location; and attester | that path supplied evidence |
+| 15 | service accrual | `ServiceAccrualExposure` (unbuilt) arithmetic from reserved bound to settled line; a deferred prepaid lot adds its expiry rule, window, generation and release evidence | a service accrual funded it |
+| 16 | subscription | accepted `SubscriptionOffer` (unbuilt) and its activation-gated schedule receipt: cadence, zone, anchor, recognition rules, generation, first-settlement compare-and-swap | subscription charge |
+| 17 | responsibility transfer | shared transfer commitment, two audience-specific disclosure digests, both payer heads and cutoffs, generation CAS, source and exposure partition, retained old claims | payer changed |
+| 18 | auto top-up | trigger reservation and epoch, creation snapshot, owning intent, consume-time recheck, result and time, and the atomic credit and bonus grant with trigger close | `auto_topup` |
+| 19 | provider plan | autonomy policy and finite `ProviderExecutionPlan` (unbuilt), with per-step envelope, consume, opaque permit, egress identity, effect class, and zero-retry transport | provider execution occurred |
+| 20 | provider evidence | enclave, executor, adapter, workload and credential attestations each naming its attester, `PaymentAttempt` (unbuilt) transitions, the debit instrument, evidence strength | provider execution occurred |
+| 21 | read-back or callback | reader, broker or verifier artifact, its workload, credential class and scope, the request limits in force, replay result, evidence class, checkpoint, attester | that path supplied evidence |
 | 22 | corrections | correction, refund and dispute links | any exist |
 
-A current runtime `Health` response can never stand in for these historical
-bindings. Unknown, revoked, expired, wrong-role or substituted artifacts fail
-verification.
+**Row 11 has two forms and never both.** `debit_customer_present` carries the
+intent acceptance, its proof, and a current one-time or standing authorization.
+`standing_automatic` carries the authorization acceptance, its proof, a terminal
+notice receipt, the completed wait, and a revocation-readiness receipt. Either
+binds payer sequence, head and cutoff, factor and verifier revision, scope,
+lineage, exposure, and the revocation result at dispatch —
+[INV-013](DESIGN.md#inv-013).
 
-### Sibling receipts with their own schemas
+**Row 17 is two views, not one.** The new payer's copy carries no private
+financial detail of the old payer, and the transfer moves no mandate, wallet,
+tax or notice state.
 
-Refund, mandate-revocation and payment-method-setup receipts (all unbuilt) use
-distinct schemas and distinct signature domains. None can satisfy debit
-authority, a debit funding plan, or a collection notice.
+A current `Health` response never stands in for a historical binding. Unknown,
+revoked, expired, wrong-role or substituted artifacts fail.
 
-| receipt | binds |
-|---|---|
-| refund | the immutable refund intent; source charge, settlement, ledger and provider commitments; typed return authority; line and tax reversal; wallet-lot restorations and provider-return remainder; refund-capacity reservations; any finite provider plan with per-step evidence; the actual source object and return destination; the `BillingDecisionProof`; balanced return entries; the outbox checkpoint |
-| refund of `credit_purchase` or `auto_topup` | additionally the `GrantedValueClawbackReservation` (unbuilt) and atomic cancellation of the matching unspent principal and bonus lots. Cash return that leaves spendable output is invalid |
-| mandate revocation | the customer proof and cutoff; the setup receipt and method identity; the immediate engine cutoff; the finite revoke steps; the provider evidence and status; separate engine and provider timestamps |
-| payment-method setup | the setup disclosure and digest; provider merchant setup binding; acceptance receipt and its proof commitment; payer sequence, head and cutoff; factor and verifier revision; dispatch and completion proof head and revocation state; the no-debit execution plan; every step consume, permit and egress identity; enclave, executor, adapter and credential attestations; and either core-verifiable provider-signed setup evidence or the trusted reader attestations used for read-back |
+**Sibling receipts are not charge bundles.** Refund, mandate-revocation and
+payment-method-setup receipts (all unbuilt) have their own schemas and signature
+domains. None can satisfy debit authority, a debit funding plan, or a collection
+notice. That matters most for the setup receipt, the one an attacker would pass
+off as permission to charge. What each requires is one table, in
+[DESIGN §6](DESIGN.md#6--what-you-can-be-charged-for), not repeated here.
 
-## 4. Offline verifier
+---
 
-The public command will be:
+## 4 · Checking a charge yourself, offline
+
+🔴 **You cannot run this today.** There is no verifier in the tree: `cmd/` on
+`origin/main` holds seven binaries and none of them is one
+(`.github/workflows/publish.yml:35-41` builds six of them). The command below is
+the target shape, and §5 is the part of this file you could turn on first.
 
 ```bash
 billing-verify verify charge-bundle.json
 ```
 
-It must check, without contacting MirrorStack or a payment provider:
+It must reach a verdict without contacting MirrorStack or any payment provider.
+That constraint is the whole point: a safety property you can check only by
+trusting our staging environment is one you cannot check. It must confirm:
 
-1. canonical encoding and bundle digest;
-2. build, source and policy references;
-3. signed source-allocation transition evidence, leaf and window subject
-   binding, and the conversion from reserved bound to settled line;
-4. module billing-manifest and version binding;
-5. price selection and effective windows;
-6. integer arithmetic, tiers, credits, tax and rounding, reproduced from the
-   content-addressed public tax-rule artifact;
-7. equality of line, subtotal, tax and total;
-8. equality of merchant of record, authorization scope and lineage, carried
-   exposure, currency, cadence, ceilings, method, autonomy policy and window;
-9. the tagged authority branch, per §3 row 11;
-10. funding identity, `gross = wallet allocation + provider remainder`, with lot
-    selection and rollup equivalence inside the limits published in
-    `Capabilities`, credit compatibility and uniqueness, and caps;
-11. subscription offer and schedule fields with atomic first-settlement
-    activation, or the auto-top-up trigger, recheck, grant and close;
-12. a finite provider plan with closed effect classes and cardinalities, and one
-    envelope, consume, permit, egress and evidence chain per step;
-13. the actual debit instrument or refund destination, with at most one debit or
-    return;
-14. the `BillingDecisionProof` (unbuilt) closed predicate and key schema, proof
-    head, before and after commitments and generations, and transaction, build,
-    policy and outbox binding; and
-15. per-currency ledger balance, correction, refund and mandate-revocation
-    structure, and every published hard line, byte, lot and plan limit.
+1. canonical encoding, bundle digest, and the build, source and policy
+   references;
+2. the signed source-allocation transition, its leaf and window binding, and the
+   conversion from reserved bound to settled line;
+3. module billing-manifest version, price selection and effective windows;
+4. integer arithmetic, tiers, credits, tax and rounding, reproduced from the
+   public content-addressed tax artifact, and that line, subtotal, tax and total
+   agree;
+5. that merchant of record, scope, lineage, carried exposure, currency, cadence,
+   ceilings, method, autonomy policy and window all agree;
+6. the tagged authority branch of §3 row 11, and the subscription schedule or
+   auto-top-up trigger, recheck, grant and close behind it;
+7. funding identity, `gross = wallet allocation + provider remainder`, and lot
+   selection and rollup inside the limits `Capabilities` published;
+8. a finite provider plan with closed effect classes, one envelope, consume,
+   permit, egress and evidence chain per step, and at most one debit or return
+   against the named instrument; and
+9. the `BillingDecisionProof` (unbuilt) predicate, heads, generations and outbox
+   binding, then per-currency ledger balance and correction structure.
 
-The verifier must reject a missing or swapped customer-present/standing
-authority branch. A setup bundle instead requires `setup_customer_present`,
-which must be rejected inside a debit bundle. An unverifiable setup receipt
-cannot support standing authority.
+A missing or swapped customer-present branch fails. A setup bundle requires
+`setup_customer_present`, which is rejected inside a debit bundle, and an
+unverifiable setup receipt cannot support standing authority.
 
-The result is structured:
+The result is five fields, not a word:
 
 ```text
-verdict: verified | invalid | unsupported
-state_assurance: attested
-state_transparency: verified | pending | unsupported | invalid
+verdict:                      verified | invalid | unsupported
+state_assurance:              attested
+state_transparency:           verified | pending | unsupported | invalid
 historical_provider_evidence: not_applicable | verified | invalid | unsupported
-live_provider_status: not_requested | verified | pending | unsupported | invalid
+live_provider_status:         not_requested | verified | pending | unsupported | invalid
 ```
 
 `verdict: verified` means the supplied contract, arithmetic, signatures and
-transition chain passed. It never upgrades `state_assurance` beyond the engine's
-own attestation. An unknown required schema or policy is `unsupported`, and
-missing async publication is `pending` or `unsupported` without changing the
-offline arithmetic verdict. A conflicting published history sets
-`state_transparency: invalid` and the aggregate `verdict: invalid`; a report must
-never describe a known conflicting history as verified. A terminal
-provider-funded charge receipt requires its historical debit evidence, so
-missing or invalid evidence makes the aggregate verdict `invalid` and an unknown
-evidence schema makes it `unsupported`. A `pending` or `unsupported` live status
-belongs to the optional later provider refresh and must not weaken already
-verified historical settlement evidence. Optional online mode may refresh
-provider evidence through customer-authorized read-only APIs, but provider
-reachability must never affect an offline verdict.
+transition chain held. It never upgrades `state_assurance`, because arithmetic
+cannot witness a hidden row. An unknown schema is `unsupported` and a missing
+async publication is `pending`, neither of which moves the arithmetic. A
+conflicting published history sets `state_transparency: invalid` and the whole
+verdict with it. A provider-funded charge needs its historical debit evidence,
+so missing evidence is `invalid`. The optional online refresh moves
+`live_provider_status` alone, and reachability never moves an offline verdict.
 
-## 5. Public golden vectors
+**Golden vectors are public evidence, not fixtures.** They must pin canonical
+bytes and digests for intents and receipts, each charge kind and tax status, and
+each currency exponent with its boundary rounding. They must also pin standing
+and one-time authorization with scope supersession, notice bytes and wait
+calculation, ledger and correction chains, and normalized provider fixtures.
+Changing one takes a version change, and regenerating a constant to pass a test
+is not a fix.
 
-Golden vectors are public evidence, not internal fixtures, and they cross
-package and repository boundaries. At minimum they must pin:
+---
 
-- canonical bytes and digests for intents and receipts;
-- each charge kind and tax status;
-- each currency settlement exponent and its boundary rounding;
-- standing and one-time authorization evaluation, with scope-lineage
-  supersession;
-- notice bytes, carrier evidence, destination binding and wait calculation;
-- ledger entries and correction chains; and
-- normalized Stripe and NewebPay fixtures.
+<a id="7-static-architecture-checks"></a>
 
-Changing a golden digest requires a schema or policy version change and an
-explicit migration decision. Regenerating constants to make tests green is not a
-fix.
+## 5 · What CI enforces against this tree
 
-## 6. Testing posture
+Everything above constrains code that does not exist yet. This section
+constrains code that does, which makes it the honest place to start.
 
-The current suite is 114 `_test.go` files totalling 46,679 lines, run by
-`.github/workflows/ci.yml` as `go test -race -count=1 ./...` plus an integration
-pass under `-tags=integration`. It covers the shipped engine, not the target
-model in [`DESIGN.md`](DESIGN.md#3--what-must-be-true-before-any-money-moves). Test policy for the
-target model belongs beside the tests that implement it, and its backlog belongs
-in a tracking issue on this repository rather than in a customer document.
+🔴 None of it runs today. `.github/workflows/ci.yml` applies the migrations,
+then runs `go vet ./...` (`:79`), `go build ./...` (`:82`) and `go test`
+(`:92`, `:100`). That is the whole gate.
 
-Two process rules hold for any mutation or fuzz pass added later. The report is
-created only by running the pass, with survivors and equivalent mutants recorded
-rather than hidden. CI verdicts are judged by process exit status, never by
-grepping output for the names of packages that passed.
+**Provider SDK confinement.** Provider SDK imports and raw provider-mutation
+hosts may appear only in adapter and enclave packages, and in the generated
+egress allow-list. Ten non-test files import `github.com/stripe/stripe-go`
+today, among them `internal/shared/stripe/client.go`,
+`internal/account/webhook/router.go` and
+`internal/account/autotopup/executor.go`.
 
-## 7. Static architecture checks
+**Write-port isolation.** Provider-write interfaces may be injected only into
+the isolated executor deployment. The planner, read, usage-ingress, notifier and
+reconciler binaries must not compile against a write port at all.
 
-These checks constrain code that exists, so they are the first part of this
-document that can be made real. None of them runs today:
-`.github/workflows/ci.yml` runs the migrations, `go vet`, `go build` and
-`go test`, and nothing else.
+**One enclave owner per mutation credential.** Generated secret-to-workload,
+IAM, key and egress inventories must show that each mutation credential has one
+exclusive owning enclave. They must also show that no backup or admin job can
+read it, and that mutation endpoints are denied outside it —
+[INV-007](DESIGN.md#inv-007).
 
-CI must mechanically enforce:
+**Route and IAM inventory.** This check is customer-visible, through the signed
+`Health` evidence of §2, and it is defined nowhere else here. A generated
+inventory must prove the account API is Lambda-invoke-only, and that the public
+health integration cannot dispatch an RPC action. It must prove each provider
+webhook is a separate authenticated ingress, and that dispatch metering reaches
+`RecordUsage` and nothing else. It must be derived from entrypoint and
+infrastructure source, never from a diagram label. It is what stops a status
+read or a usage ingest from triggering a payment.
 
-- **Provider SDK confinement.** Provider SDK imports and raw provider-mutation
-  HTTP hosts may appear only in adapter and enclave packages and the generated
-  egress allow-list. Today 9 non-test Go files import
-  `github.com/stripe/stripe-go`, among them `internal/shared/stripe/client.go`,
-  `internal/account/webhook/router.go` and
-  `internal/account/autotopup/executor.go`.
-- **Write-port isolation.** Provider-write interfaces may be injected only into
-  the isolated executor deployment. Planner, read, usage-ingress, notifier and
-  reconciler binaries must not compile against write ports.
-- **One enclave owner per mutation credential.** Generated secret-to-workload,
-  IAM, KMS and egress inventories must prove each mutation credential has one
-  exclusive owning enclave. They must also prove no second workload, backup or
-  admin job can read it, and that mutation endpoints are denied outside it.
-  INV-007 in [`DESIGN.md`](DESIGN.md#inv-007) is the rule.
-- **Route and IAM inventory.** A generated inventory must prove the account API
-  is Lambda-invoke-only and that the public health integration cannot dispatch
-  RPC actions. It must also prove each provider webhook is a separate
-  authenticated ingress, and that dispatch metering can reach only `RecordUsage`
-  through a separate function and IAM resource. Today
-  `cmd/account-api/main.go:857` starts the Lambda invoke handler; the local HTTP
-  router is gated on `X-MS-Internal-Secret` (`cmd/account-api/main.go:652`); and
-  `RecordUsage` sits behind the separate `X-MS-Meter-Secret` header
-  (`internal/shared/auth/internal_secret.go:47`, `cmd/account-api/main.go:776`);
-  and the webhooks are separate binaries (`cmd/account-webhook`,
-  `cmd/account-webhook-eventbridge`). The inventory must be derived from
-  entrypoint and infrastructure source, never from diagram labels. It is what
-  stops a nominal status read, a usage ingest or an infrastructure sync job from
-  triggering auto top-up or any other payment effect. It reaches customers
-  through the signed `Health` evidence in §2, and it is defined nowhere else in
-  this repository.
-- **Public request struct shape.** Public request structs must carry no monetary
-  or authority fields. No caller-supplied amount may reach the executor.
-- **Database authority.** Generated DB role, table and procedure grants, KMS and
-  signing-key ownership, migration roles and operator paths must prove one
-  thing. Only trusted billing-core procedures may mutate or sign proof heads,
-  authorization, notice, source and exposure, claim, wallet, ledger, receipt and
-  outbox state. Negative tests must attempt each direct write, and no external
-  route, queue or role may reach the ledger writer. The grant baseline in force
-  today is `migrations/billing/024_billing_svc_grants.up.sql`.
-- **One allow-listed mutation per effect.** Every provider mutation method and
-  raw endpoint must map to one closed plan effect from
-  [`DESIGN.md`](DESIGN.md#6--what-you-can-be-charged-for). Each must also
-  map to one purpose and step writer, and to at most one SDK or HTTP call.
-  Adapter transport tests must require zero mutation retries and no redirects.
-- **Build stamping.** Every shipped binary must stamp its commit and artifact
-  identity. Today `.github/workflows/publish.yml:46` builds with
-  `-ldflags="-s -w"` and stamps neither.
-- **No reachable legacy money path.** Production readiness must not pass while
-  any legacy money path is reachable.
+The facts it has to reproduce hold today. `lambda.Start` runs the invoke handler
+(`cmd/account-api/main.go:857`), the internal-secret group wraps the local
+routes (`:652`), and `RecordUsage` alone sits behind `X-MS-Meter-Secret`
+(`:776-777`, `internal/shared/auth/internal_secret.go:47`). The webhook
+receivers are separate binaries (`cmd/account-webhook`,
+`cmd/account-webhook-eventbridge`).
 
-## 8. Transparency and release gate
+**No monetary or authority field on a public request struct.** No
+caller-supplied amount may reach the executor. 🔴 This one fails today.
+`GrantCreditsRequest` carries `AmountMicros` and a caller-asserted `Actor`
+(`internal/account/billing/types.go:434-435`), reached through the
+`GrantCredits` action (`cmd/account-api/main.go:187`). The metering request is
+the shape to aim at, carrying a metric and a value and no money
+(`internal/account/usage/types.go:71`).
 
-No external transparency service sits in the synchronous payment path. The
-signed transactional outbox records engine ordering. The optional asynchronous,
-payer-isolated state transparency log can later reveal a published rollback,
-equivocation or split view. It does not prove an independently witnessed
-pre-execution timestamp, and it does not prove that no row was hidden. A delayed
-checkpoint must never authorize or delay collection. Reports keep
-`state_assurance: attested` and the transparency status as separate fields.
+**Database authority.** Generated role, table and procedure grants, key
+ownership, migration roles and operator paths must show one thing. Only trusted
+billing-core procedures mutate or sign proof heads, authorization, notice,
+source, claim, wallet, ledger, receipt and outbox state. A negative test must
+attempt each direct write. 🔴 The baseline in force is far looser:
+`migrations/billing/024_billing_svc_grants.up.sql` grants `billing_svc` blanket
+`SELECT, INSERT, UPDATE, DELETE` on every table in `ms_billing`.
 
-Release stays manual while this architecture is introduced. Production promotion
-requires:
+**One allow-listed mutation per effect.** Every provider mutation method and raw
+endpoint must map to one closed effect from
+[DESIGN §6](DESIGN.md#6--what-you-can-be-charged-for). Each must also map to one
+purpose and step writer, and to at most one SDK or HTTP call. Adapter transport
+tests must require zero mutation retries and no redirects.
 
-1. reviewed source and target-state document consistency;
-2. signed build provenance;
-3. the full `go test` suite green, per §6, with no result inferred from log text;
-4. shadow-intent reconciliation with no unexplained monetary differences;
-5. public runtime identity, independently verifiable disclosure, a customer
-   proof verifier, pinned trust-root and rotation evidence, an independent
-   evidence edge, and a receipt verifier;
-6. every §7 check passing, the route and IAM inventory included;
-7. customer authorization, notice and tax readiness; and
-8. `legacyMoneyPaths: 0`, with legacy provider credentials revoked.
+**Build stamping.** Every shipped binary must stamp its commit and artifact
+identity, or §2 has nothing to report. 🔴 The build stamps neither today:
+`.github/workflows/publish.yml:46` passes only `-ldflags="-s -w"`.
 
-No automatic merge or deployment is implied by a green unit-test run.
+**No reachable legacy money path.** Readiness must not pass while one is
+reachable, which is the `legacyMoneyPaths: 0` field of §2.
 
-## 9. Known limits
+A green test run implies no merge and no deployment. The conditions that must
+hold before production intent execution is enabled are listed once, in
+[DESIGN §11](DESIGN.md#11--getting-from-here-to-there), and release stays manual
+until they do.
 
-Verification can prove which canonical bytes the independent consent client
-bound into a customer proof. It can prove which notice bytes the carrier
-reported at the configured destination, in the policy's terminal delivered
-state, and when. It cannot prove a person read an email or understood a rendered
-disclosure.
+---
 
-Public source plus build provenance makes tampering detectable. It cannot
-protect against a fully compromised deployment, signing keys, database,
-notification provider and payment-provider account acting together. The
-remaining trust assumptions are stated in
-[`SECURITY.md`](../SECURITY.md#adversary-model).
 
-Provider payout and balance visibility differs by rail and by merchant contract.
-A trace must mark unsupported evidence explicitly and must never treat it as
-proof of absence.
+## 6 · What none of this proves
+
+🔴 **A receipt proves what the engine was told, not that you agreed.** This is
+the largest limit here, and it is not a detail. `api-platform` holds your
+session and relays your acceptance, and the engine treats the subject id it is
+handed as opaque (`internal/account/billing/service.go:105-111`). A compromised
+or buggy caller can assert an acceptance you never made, and nothing here
+disproves it. [INV-006](DESIGN.md#inv-006) states that as a trust assumption
+rather than a control. What survives is
+reproducibility: the disclosure, its digest and the receipt stay readable, so a
+fabricated acceptance is something you can point at afterwards. That is
+detection, not prevention.
+
+🔴 **Almost nothing in §2, §3 and §4 exists.** The offline verifier is unbuilt,
+and so are the signed identity objects it would check. `ChargeIntent`,
+`BillingDecisionProof`, `AuthorityEvidence` and `FundingPlan` return nothing
+from `git grep` on `origin/main`. Until they ship, a customer holding a bill has
+this repository and §5, and no procedure.
+
+**`attested` is not `witnessed`.** The engine signs its own transition. The
+optional transparency log can later reveal a rollback or a split view. It cannot
+prove no row was hidden, and a delayed checkpoint must never delay or authorize
+a collection.
+
+**Delivered is not read.** Verification can prove which bytes a consent client
+bound into your proof, and which bytes a carrier reported delivered, and when.
+It cannot prove a person read them or understood them.
+
+**Provider evidence differs by rail.** Payout and balance visibility depends on
+the rail and the merchant contract. A trace must mark unsupported evidence as
+unsupported, never as proof that nothing happened.
+
+**A total compromise defeats all of it.** Public source plus build provenance
+makes tampering detectable, not impossible. A deployment, its signing keys, its
+database, its notifier and its provider account acting together can produce a
+consistent lie. The trust assumptions are enumerated in
+[`../SECURITY.md`](../SECURITY.md#adversary-model) and the current defects in
+its [gap register](../SECURITY.md#known-current-gaps). This file keeps no second
+copy of either.

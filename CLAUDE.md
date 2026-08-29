@@ -1,121 +1,104 @@
 # `billing-engine` — agent guide
 
-The public-source billing authority for MirrorStack. Its runtime is private:
-`cmd/account-api/main.go:647` registers one unauthenticated route, `/__health`,
-and every other local route requires `X-MS-Internal-Secret`
-(`internal/shared/auth/internal_secret.go:80`). Customers reach `api-platform`.
+The public-source billing authority for MirrorStack. Public source, not a public
+endpoint: `api-platform` calls it over private RPC, and
+[`README.md#runtime-and-trust-boundary`](README.md#runtime-and-trust-boundary)
+owns that boundary with its citations.
 
-> **The target architecture is proposed, not deployed.** Read `README.md` and
-> `docs/DESIGN.md` before changing money behavior. `main` still carries direct
-> Stripe paths outside the intent/notice/authorization boundary. Never describe a
-> target document as a current production guarantee.
+> 🔴 **`docs/DESIGN.md` is a specification, not production.** `main` still
+> carries direct Stripe paths outside the intent, notice, and authorization
+> boundary. Never present a target document as a current guarantee. Overstating
+> the code is a defect of the same class as a code bug, and
+> [`SECURITY.md`](SECURITY.md) treats it that way.
 >
-> **Automatic merge and promotion are paused for this rebuild.** Work on a branch,
-> preserve manual billing and security review, and do not enable collection
-> merely because CI passes.
+> 🔴 **Automatic merge and promotion are paused.** Work on a branch, keep manual
+> billing and security review, and never enable collection because CI went green.
 >
-> Current defects are enumerated in exactly one place:
-> [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps). Do not start
-> a second gap list, here or anywhere else.
->
-> **This repo is v1.** A v0 attempt with a different schema (`ms_billing_account`)
-> lives at `mirrorstack-ai/billing-engine-old`. Do not import a v0 pattern
-> without re-deriving it; the schema shape changed.
-
-## Schema source of truth
-
-`migrations/billing/` is authoritative. The `ms_billing` schema is documented under
-`db/ms_billing/` in [`mirrorstack-ai/mirrorstack-docs`](https://github.com/mirrorstack-ai/mirrorstack-docs).
-If `tables.md` there disagrees with a migration, the migration wins and the doc is the bug.
+> Defects are enumerated in one place,
+> [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps), and nothing
+> starts a second list. This repo is v1; re-derive anything taken from the v0
+> attempt at `mirrorstack-ai/billing-engine-old`.
 
 ## Layout
 
-The command list is security-relevant, so it names every shipped binary.
+Seven binaries. Six are built and uploaded per commit
+(`.github/workflows/publish.yml:35-41`). `pm-default-backfill` is not, and is run
+by hand.
 
-```
-billing-engine/
-├── cmd/
-│   ├── account-api/        Lambda: IAM-gated internal RPC; local HTTP for dev
-│   ├── account-webhook/    Lambda: Stripe HTTPS webhook receiver
-│   ├── account-webhook-eventbridge/  Stripe partner EventBridge consumer
-│   ├── billing-cycle/      scheduled billing-cycle worker
-│   ├── infra-egress-sync/  infrastructure egress synchronizer
-│   ├── infra-ssr-compute-sync/  infrastructure compute synchronizer
-│   └── pm-default-backfill/  payment-method backfill worker
-├── internal/{account,billingperiod,shared}/   195 Go files
-├── migrations/billing/     ms_billing schema; 001..052 up/down (040 unused)
-├── docker-compose.yml      local Postgres 17 (postgres:17-alpine)
-└── Makefile                db / db-init / db-reset / test / lint / build / dev-*
+```text
+cmd/account-api/                  internal RPC Lambda; local HTTP :8091   (published)
+cmd/account-webhook/              Stripe HTTPS receiver, checks signature (published)
+cmd/account-webhook-eventbridge/  Stripe partner EventBridge consumer     (published)
+cmd/billing-cycle/                scheduled per-period usage charge driver (published)
+cmd/infra-egress-sync/            pulls CDN egress totals from Cloudflare (published)
+cmd/infra-ssr-compute-sync/       pulls SSR compute totals from CloudWatch (published)
+cmd/pm-default-backfill/          one-shot Stripe default-PM repair       (by hand)
+internal/{account,billingperiod,shared}/   195 Go files
+migrations/billing/               ms_billing schema, 001..052 up/down (040 unused)
 ```
 
-## Architecture (trust boundary)
+## Schema source of truth
 
-Current topology. The broad-dispatch and callback-to-writer edges are release blockers,
-not target guarantees; they are filed in [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
+`migrations/billing/` is authoritative. The `ms_billing` schema is documented
+under `db/ms_billing/` in
+[`mirrorstack-ai/mirrorstack-docs`](https://github.com/mirrorstack-ai/mirrorstack-docs).
+If `tables.md` there disagrees with a migration, the migration wins and the doc
+is the bug.
 
-```
-Customer/browser ─► api-platform account/applications API ─IAM lambda.Invoke─► account-api
-Module runtime   ─► api-platform dispatch ─broad Lambda.Invoke─► full account-api dispatcher
-Stripe webhook / EventBridge ─► callback routers ─► Stripe-writing auto-top-up + credit-purchase executors
-billing-cycle / infra sync ─► billing coordinators ─► provider writers
-```
+## Two secrets, not one
 
-Target topology.
-```
-Customer/browser ─► api-platform ─private account RPC─► billing-engine core
-Module runtime   ─► api-platform meter-only ingress ─fact-only role─► billing-engine core
-billing-engine isolated permit-gated executor ─► Stripe / future NewebPay
-Provider callback ─► callback verifier ─observation only─► read-only reconciliation
-```
+Both gate local HTTP from `internal/shared/auth/internal_secret.go`, and both
+fail closed: an unset secret returns 503 (`:59`) rather than opening the route.
 
-**Hard rules:**
-- `api-platform` must never touch Stripe. Every Stripe API call belongs in this repo (`internal/shared/stripe/client.go`).
-- `billing-engine/account-api` must never be customer-reachable. Its only
-  unauthenticated route is the static health response at `cmd/account-api/main.go:647`,
-  which returns before RPC dispatch. Webhook ingress is a separate binary.
-- `api-platform` initiates account RPCs. The engine must not call the browser or push
-  into the customer-facing account API. Asynchronous state is pulled by authenticated
-  read, or delivered by the notifier (`internal/account/standing/notifier.go:59`).
-- Do not treat the metering seam as dedicated. `RecordUsage` is gated on
-  `X-MS-Meter-Secret` locally (`cmd/account-api/main.go:776-777`), but the production
-  dispatch role can still invoke the whole account-api Lambda.
-- A mutation-capable provider secret belongs to exactly one scoped
-  `ProviderCredentialEnclave` (unbuilt). Webhook ingress may hold only a public key,
-  or a verification-only secret the provider itself restricts.
-- One consumed permit may emit one outbound mutation request. Disable SDK and HTTP
-  retries and redirects, and fence the transport send. Route an ambiguous outcome to
-  same-provider read-only reconciliation, never to a retry.
-- Provider integrations use small consumer-owned Go interfaces and composition. Do not
-  pass one universal provider client through the service graph.
-- Every table this repo owns lives in `ms_billing.*`. Never write outside it.
-  `owner_user_id` and `owner_org_id` are soft FKs (`migrations/billing/001_init.up.sql:25-26`),
-  and queries do not join across the boundary (`internal/account/db/queries/cycle.sql:375-376`).
-- Infrastructure cost must not become a customer charge kind. It already is one,
-  so do not widen this path — see [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
-  - `internal/account/cycle/types.go:59` sets `infraMarkupNum = 12`, a ×1.2 markup applied once in SQL.
-  - `internal/account/usage/bill.go:509-530` builds `infra_lines` and `module_infra_lines` for the customer bill.
-  - `internal/account/usage/types.go:446-448`: displayed `UnitPriceMicros` is pre-markup COGS while `ChargedMicros` carries the ×1.2. Quantity × displayed unit price does not equal the charge.
-- Do not call the deployment intent-only until `Capabilities` (unbuilt) reports
-  `legacyMoneyPaths: 0`, every caller has migrated, and legacy provider credentials
-  are revoked. The weakest reachable legacy path defines the actual guarantee.
+- `X-MS-Internal-Secret` (`:80`) gates every control-plane RPC route
+  (`cmd/account-api/main.go:652`). `/__health` is the one route outside it (`:647`).
+- `X-MS-Meter-Secret` (`:81`) gates `RecordUsage` alone
+  (`cmd/account-api/main.go:775-778`), so the meter credential rotates on its own.
 
-## Target money boundary
+Production differs, and the difference is a filed gap: the dispatch role can
+invoke the whole account-api Lambda. Never describe the metering seam as
+dedicated.
 
-The destination: every debit must consume one immutable charge intent plus live
-authority, tax must fail closed, and an append-only ledger must outrank any
-provider callback. Nothing on `main` meets that yet. Link, never restate.
+## Hard rules
 
-- Invariants INV-001..INV-014 — [`docs/DESIGN.md#2-the-invariants`](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves)
-- Intent lifecycle and the execution predicate — [`docs/DESIGN.md#executechargeintent`](docs/DESIGN.md#executechargeintent)
-- Charge vocabulary, tax, ledger — DESIGN [§8](docs/DESIGN.md#6--what-you-can-be-charged-for), [§9](docs/DESIGN.md#7--tax-and-what-it-refuses-to-guess), [§10](docs/DESIGN.md#8--where-the-money-is-written-down)
-- Receipt and deployed-source verification — [`docs/VERIFICATION.md`](docs/VERIFICATION.md)
-- Adversaries, assumptions, limits — [`SECURITY.md#adversary-model`](SECURITY.md#adversary-model)
+- **Every table this repo owns lives in `ms_billing.*`. Never write outside it.**
+  `owner_user_id` and `owner_org_id` are soft FKs
+  (`migrations/billing/001_init.up.sql:25-26`); nothing reads `ms_account`
+  (`internal/account/db/queries/cycle.sql:375-376`).
+- **`api-platform` must never touch Stripe.** Every Stripe API call belongs in
+  this repo, behind `internal/shared/stripe/client.go`.
+- **`account-api` must never become customer-reachable.** Its only
+  unauthenticated route is the static health body at
+  `cmd/account-api/main.go:647`. Provider ingress stays in the webhook binaries.
+- **`api-platform` initiates account RPCs.** The engine must not call the browser
+  or push into the customer-facing account API. State is pulled by authenticated
+  read, or delivered by `internal/account/standing/notifier.go`.
+- **Do not widen the infrastructure charge path.** It is already a customer
+  charge kind, against [INV-010](docs/DESIGN.md#inv-010), and
+  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps) holds the
+  detail. Another caller makes the release blocker worse.
+- **Do not call the deployment intent-only** until the `Capabilities` action
+  (unbuilt) reports `legacyMoneyPaths: 0` and legacy provider credentials are
+  revoked. The weakest reachable legacy path defines the real guarantee.
+
+## Where the rules actually live
+
+Link, never restate. [`docs/DESIGN.md`](docs/DESIGN.md) owns every invariant:
+[§3 INV-001..INV-014](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves),
+[the execution predicate](docs/DESIGN.md#executechargeintent),
+[§5 ports and permits](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes),
+[§9 the credential enclave](docs/DESIGN.md#9--where-the-provider-credential-lives),
+[§11 the readiness gate](docs/DESIGN.md#11--getting-from-here-to-there).
+[`SECURITY.md#adversary-model`](SECURITY.md#adversary-model) owns adversaries,
+assumptions, and limits. [`docs/VERIFICATION.md`](docs/VERIFICATION.md) owns
+evidence levels and the charge bundle, and
+[its §5](docs/VERIFICATION.md#5--what-ci-enforces-against-this-tree) owns the
+checks CI should grow. [`README.md`](README.md) owns the five money flows.
 
 ## Commit identity
 
-Commit as **Sheng Kun Chang <nothingchang@mirrorstack.ai>**, or the locally-configured
-`sheng-kun-chang@mirrorstack.ai`. Never as `mirrorstack-ops[bot]`. If the bot is
-configured, override locally:
+Commit as **Sheng Kun Chang <nothingchang@mirrorstack.ai>**, or the local
+`sheng-kun-chang@mirrorstack.ai`. Never as `mirrorstack-ops[bot]` — override it:
 
 ```bash
 git config --local user.name "Sheng Kun Chang"
@@ -123,50 +106,56 @@ git config --local user.email "nothingchang@mirrorstack.ai"
 ```
 
 ## When you edit this repo
-1. **Branch off `main`** — `git checkout -b <type>/<slug>`, where type is `feat`, `fix`, `chore`, `docs`, or `refactor`.
-2. **Make the change.** If you touch the schema, coordinate a matching `mirrorstack-docs/db/ms_billing/` update in the same PR cycle.
-3. **Commit prefix**: `feat:` / `fix:` / `chore:` / `docs:` / `refactor:`. Co-author tail: `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
-4. **Open a PR against `main`.** Never push directly to `main`.
-5. **`Closes #N`** in the PR body for auto-close when a tracking issue exists.
 
-## Core manifest pointer automation
+1. **Branch off `main`** — `git checkout -b <type>/<slug>`, type being `feat`,
+   `fix`, `chore`, `docs`, or `refactor`.
+2. **Make the change.** Touching the schema means a matching
+   `mirrorstack-docs/db/ms_billing/` update in the same PR cycle.
+3. **Commit prefix** `feat:` / `fix:` / `chore:` / `docs:` / `refactor:`.
+   Co-author tail: `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
+4. **Open a PR against `main`.** Never push directly to `main`, and never
+   auto-merge. Add **`Closes #N`** when a tracking issue exists.
 
-After a PR merges to protected `main`, a successful terminal `Publish` run triggers
-`.github/workflows/notify-core-pointer.yml`. It sends the `billing-engine` main SHA to
-`mirrorstack-ai/mirrorstack-core-v2`, where `mirrorstack-core-bot` opens or updates the
-commit-bound pointer PR. It never reviews, merges, promotes, or deploys. Do not hand-edit
-the core gitlink. If the PR is missing, inspect the terminal CI/CD run and the
-`Notify core pointer` run; core's scheduled scan is the fallback.
+After a merge to `main`, a successful terminal `Publish` run triggers
+`.github/workflows/notify-core-pointer.yml`, which opens a pointer PR in
+`mirrorstack-ai/mirrorstack-core-v2`. Do not hand-edit the core gitlink.
 
 ## Cross-repo coordination
 
-A schema change here typically spans two repos.
+A schema change spans two repos, then the parent, in one cycle.
 
-1. In `billing-engine/`: write the migration, open a PR.
-2. In `mirrorstack-docs/`: update `db/ms_billing/{README,tables,migrations}.md` in the same cycle.
-3. In `MirrorStack-AI-V2/` (parent): bump the submodule pointer once both child PRs merge.
+1. `billing-engine/` — write the migration, open a PR.
+2. `mirrorstack-docs/` — update `db/ms_billing/{README,tables,migrations}.md`.
+3. `MirrorStack-AI-V2/` — bump the submodule pointer once both child PRs merge.
 
-## Don't put here
-- Stripe API surface mocks or fixtures with real keys — keep `.env.local` for that.
-- Frontend or `web-*` UI code — that lives in `web-account/` or `web-applications/`.
-- Schema docs for currently-shipped state — those graduate to `mirrorstack-docs/`.
+## Do not put here
+
+- Stripe fixtures or mocks holding real keys. Those stay in `.env.local`.
+- Frontend or `web-*` UI code — `web-account/` or `web-applications/` owns it.
+- Schema docs for shipped state. Those graduate to `mirrorstack-docs/`.
+- A second copy of any rule DESIGN, SECURITY, or README already owns.
 
 ## Quickstart
+
 ```bash
-make db         # boot Postgres 17
-make db-init    # apply migrations
-make test       # unit tests
-make lint       # go vet
+make db         # boot Postgres 17 on localhost:5432
+make db-init    # apply migrations/billing/
+make lint       # go vet ./...
 make build      # go build ./...
+make test       # unit tests, no external calls
 ```
 
-Local Lambda dev. Both binaries detect Lambda through `AWS_LAMBDA_FUNCTION_NAME`
-and fall back to local HTTP.
+`make test-integration` needs a reachable Docker daemon, and not the `make db`
+instance. Each test boots its own ephemeral Postgres 17 container and skips when
+Docker is unreachable (`internal/shared/testutil/db.go:34-58`).
 
-- `cd cmd/account-api && go run .` — account-api on `:8091`, overridable via `ACCOUNT_API_PORT` (`cmd/account-api/main.go:860`).
-- `make dev-webhook` — account-webhook on `:8092`, overridable via `ACCOUNT_WEBHOOK_PORT` (`cmd/account-webhook/main.go:51`). Pair it with `stripe listen --forward-to localhost:8092/webhook` for real test-mode events.
+Lambda-capable binaries switch on `AWS_LAMBDA_FUNCTION_NAME` and otherwise run
+local HTTP (`internal/shared/config/config.go:40`).
 
-Two secrets, not one. Local control-plane RPC uses `X-MS-Internal-Secret`; `RecordUsage`
-uses the separate `X-MS-Meter-Secret` (`internal/shared/auth/internal_secret.go:80-81`).
-An empty configured secret returns 503 rather than opening the route.
-
+- `cd cmd/account-api && go run .` — `:8091`, `ACCOUNT_API_PORT` overrides
+  (`cmd/account-api/main.go:860`).
+- `make dev-webhook` — `:8092`, `ACCOUNT_WEBHOOK_PORT` overrides
+  (`cmd/account-webhook/main.go:51`). Pair with
+  `stripe listen --forward-to localhost:8092/webhook`.
+- `make dev-cycle`, `make dev-egress-sync`, `make dev-ssr-compute-sync` — one-shot
+  runs of the three scheduled workers.

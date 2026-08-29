@@ -1,56 +1,128 @@
 # Security
 
-This repository is public so customers can check the conforming billing-engine
-path themselves. Could this path charge them for something outside its disclosed
-and authorized intent? The evidence should be code and receipts, not a support
-reply. That is the desired property, not the current production claim.
+This repository is public so that one question with real money behind it can be
+settled by reading code and checking a receipt, rather than by trusting a
+support reply:
 
-It is also deliberately scoped: public source cannot prevent a replaced executor,
-or a holder of an unrestricted merchant credential, from charging at the provider
-directly. The [Adversary model](#adversary-model) states that residual limit and
-the controls that detect it, rather than claiming it is impossible.
+> **Can this path collect money you never agreed to?**
 
-> **Status: proposed architecture; current code does not yet meet it.** The
-> intended boundary is specified in [`docs/DESIGN.md`](docs/DESIGN.md). The
-> implementation on the baseline commit from which these documents were written
-> (`78b5c69`) can calculate and finalize automatic charges on its own. It does so
-> without a durable, customer-visible `ChargeIntent` (unbuilt), an
-> engine-recorded pre-charge notice, or a `BillingAuthorization` (unbuilt). Do
-> not read the requirements below as claims about that build.
-> [Known current gaps](#known-current-gaps) is this repository's only
-> enumeration of current defects.
+Answering it that way only works if the file is honest about where the reading
+stops. Both places it stops go before anything else.
 
-The target architecture must be payment-provider-neutral. A provider invoice or
-callback must count as settlement evidence only, never as the billing ledger.
+> 🔴 **The design is proposed, and `main` does not implement it** — see
+> [README's status section](README.md#status-before-anything-else). For a
+> researcher that has one consequence. A requirement in
+> [`docs/DESIGN.md`](docs/DESIGN.md) is not yet a claim, so breaking one is not
+> yet a finding. [§1](#1--reporting-something-you-found) says what is.
 
-## Reporting
+> 🔴 **Public source cannot restrain an unrestricted merchant credential.** A
+> replaced executor can ask the provider to move money outside this code, and no
+> Go interface reaches it. [§5](#5--what-we-assume-and-what-breaks-when-the-assumption-is-wrong)
+> states that limit and the controls that make it narrow or detectable.
 
-**Email `security@mirrorstack.ai`.** Please do not open a public issue for a
-vulnerability or include customer billing data in an issue, discussion, or pull
-request.
+A third limit of that kind, which this file fails to name, is itself worth
+reporting.
 
-Include whatever you have:
+---
 
-- the source revision and file or action involved;
-- what invariant you believe can be bypassed;
-- the smallest sequence that demonstrates it;
-- redacted intent, authorization, receipt, and provider references, if relevant;
-- whether real money moved; and
-- a test, fuzz input, or mutation, if you made one.
+## 1 · Reporting something you found
+
+**Email `security@mirrorstack.ai`.** Please do not open a public issue, and do
+not put customer billing data into an issue, a discussion, or a pull request.
+
+Send the source revision, the file or action, the rule you believe is
+bypassable, and the shortest sequence that shows it. Say whether real money
+moved. A failing test, a fuzz input, or a mutation that survives the suite is a
+good report on its own.
 
 Never send card numbers, payment credentials, notice tokens, webhook secrets,
-provider signatures, or unredacted customer records. Intent IDs and provider
-references may still be sensitive correlation data; redact them unless they are
-needed to investigate.
+provider signatures, or unredacted customer records. Intent ids and provider
+references are correlation data, so redact them unless the investigation needs
+them.
 
-We will acknowledge a report within three working days and give an initial
-assessment within ten. If we disagree, we will explain why in enough detail for
-you to challenge the assessment.
-
-**There is no bounty programme.** We would rather state that plainly than imply
+We acknowledge within three working days and give an assessment within ten. If
+we disagree with you we will say why, in enough detail that you can argue back.
+**There is no bounty programme.** We would rather say that plainly than imply
 one.
 
-## Known current gaps
+### What counts as a finding
+
+Anything that breaks a claim this repository makes and has marked as built.
+The rules live in [`docs/DESIGN.md`](docs/DESIGN.md) and are not repeated here.
+The list below judges eligibility, nothing more.
+
+- a provider write from anywhere but the one permitted writer
+  ([INV-007](docs/DESIGN.md#inv-007)), or one sealed intent settling twice
+  ([INV-008](docs/DESIGN.md#inv-008));
+- an amount changing after disclosure without a replacement intent
+  ([INV-003](docs/DESIGN.md#inv-003)), or a caller field becoming authoritative
+  for amount, currency, tax, lines, or eligibility
+  ([INV-001](docs/DESIGN.md#inv-001), [INV-004](docs/DESIGN.md#inv-004));
+- collection before the notice window, after a cancellation, or above an
+  accepted cap ([INV-005](docs/DESIGN.md#inv-005),
+  [§10](docs/DESIGN.md#10--what-you-can-stop-and-what-you-cannot));
+- a callback, invoice, or dashboard state accepted as ledger truth
+  ([INV-009](docs/DESIGN.md#inv-009)), or customer evidence that only works
+  while the private relay cooperates ([INV-014](docs/DESIGN.md#inv-014));
+- one consumed permit emitting a second outbound request, or a second attempt
+  out of `execution_unknown` without proof the first collected nothing
+  ([§5](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes));
+- an unresolved tax result treated as zero tax
+  ([§7](docs/DESIGN.md#7--tax-and-what-it-refuses-to-guess));
+- a read or reconciliation path handed a provider client that also exposes
+  writes, or any exposure of credentials or cross-tenant evidence; and
+- **a sentence in this repository that overstates what the code guarantees.**
+
+The last one is not filler. In a repository built to be read, a confident false
+sentence can do the harm of a code defect. We treat it as the same class of
+defect. That rule has already blocked work on this branch. It is what turned the
+undisclosed infrastructure markup from a pricing detail into a release blocker —
+rows 15 and 16 of [§2](#known-current-gaps).
+
+### What is not a finding
+
+- Restating a row of [§2](#known-current-gaps). A *new* way to exploit one of
+  those rows is still worth sending.
+- A `docs/DESIGN.md` requirement that the status block above marks
+  unimplemented.
+- Disagreement with a published price or tax policy the engine applied
+  reproducibly. Charging while tax is unresolved, or applying a different
+  policy, is in scope.
+- MirrorStack's private UI or tenancy logic alone. A private-caller defect that
+  makes *this engine* exceed an intent or a tenant boundary is in scope, and it
+  is the boundary this repository exists to hold.
+- Provider outages, card declines, or a provider's documented settlement
+  decision, unless this engine mishandles the result.
+- Compromise of your device or account, our cloud account, a signing root, a
+  tax authority, or a merchant credential. [§5](#5--what-we-assume-and-what-breaks-when-the-assumption-is-wrong)
+  names each as an assumption, and a path here that widens one needlessly is
+  still in scope.
+- Scanner output with no demonstrated impact.
+
+Do not probe production with real charges. Reproduce against test adapters and
+fixtures, and write to us first if an issue can only be shown in production.
+
+### 🔴 INV-006 is a trust assumption, and its existence is not a finding
+
+[INV-006](docs/DESIGN.md#inv-006) says every debit carries customer authority.
+The engine cannot enforce that today. `api-platform` holds your session, and the
+engine treats the subject id it is handed as opaque
+(`internal/account/billing/service.go:105-109`). So `api-platform` can assert an
+acceptance that never happened, and nothing here can disprove it.
+
+What survives is reproducibility. The engine-signed disclosure, its digest, and
+the recorded receipt must stay readable, so that a fabricated acceptance is
+something you can point at afterwards. That is detection, not prevention.
+
+Reasoning about what a hostile caller does with that gap is in scope, and it is
+among the more interesting things you could send us. Reporting that the gap
+exists is not, because it is written here and at
+[INV-006](docs/DESIGN.md#inv-006).
+
+---
+
+<a id="known-current-gaps"></a>
+## 2 · Known current gaps
 
 The following describe the `78b5c69` baseline. They are not accepted final
 behavior, and this section must not be shortened until the corresponding code,
@@ -94,407 +166,213 @@ check must run on a schedule, never as a required pull-request check.
 comment block at lines 6-18), so a required baseline check would turn every pull
 request in the repository red.
 
-## Adversary model
+---
 
-Every billing guarantee is a guarantee against a particular adversary. Naming it
-turns "we use idempotency" into a checkable property, and exposes what we cannot
-solve.
+<a id="adversary-model"></a>
+## 3 · Who this defends your money against
 
-### The primary adversary is MirrorStack's private caller
+Every billing guarantee is a guarantee against somebody in particular. Naming
+them turns "we use idempotency keys" into something you can check, and it shows
+which of your worries this code does not answer at all.
+
+### The adversary is MirrorStack
 
 Not an unauthenticated browser. **Us.**
 
-The billing engine is invoked by MirrorStack's private platform through an IAM- or
-internal-secret-gated surface. The local HTTP path checks
-`X-MS-Internal-Secret`, with a separate `X-MS-Meter-Secret` for metering
-([`internal/shared/auth/internal_secret.go:80-81`](internal/shared/auth/internal_secret.go),
-[`cmd/account-api/main.go:15`](cmd/account-api/main.go)). An outside attacker
-normally has to compromise that platform or its cloud account before reaching the
-engine. The question a public-source billing engine answers is different:
+Nothing customer-facing reaches this engine; README owns that boundary and its
+citations. An outside attacker has to get through `api-platform` or our cloud
+account first, and at that point this engine is not where your problem lives.
+The threat that justifies publishing the source is the other one:
 
-> What prevents MirrorStack's private half — if buggy, compromised, or
-> deliberately malicious — from silently charging a customer's payment method?
+> You have a card on file. What stops the half of MirrorStack you cannot read —
+> buggy, compromised, or deliberately hostile — from charging it?
 
-For this model, the private caller may:
+So the modelled adversary is **the private caller**. Assume it invokes every
+action its credential reaches, and that it submits, omits, duplicates, reorders,
+delays, and replays requests while choosing every identifier in them. Assume it
+lies about what its UI displayed, withholds your cancellation, and has read
+every test here.
 
-- invoke every internal action its production credential reaches;
-- submit, omit, duplicate, reorder, delay, and replay requests;
-- choose every identifier and untrusted business fact present in those requests;
-- lie about what its UI displayed or what a user clicked;
-- attempt to substitute another payer, app, module, policy, payment adapter, or
-  provider reference;
-- withhold a cancellation or a customer-facing response; and
-- know this repository and all of its tests.
-
-The private caller must not hold the billing database key, intent-sealing key,
-notice-channel key, merchant credential, tax-policy signing key, or executor
-credential. A deployment where one credential does all of those has erased the
-boundaries this document depends on.
-
-The rule that follows is the same one used throughout this design:
+That framing has one consequence worth saying flatly:
 
 > **A check the private caller can satisfy with a statement about itself is not
-> a control.**
+> a control.** It is a claim.
 
-An internal field such as `customer_approved: true`, `notice_sent: true`,
-`tax_exempt: true`, `amount: 10200`, or `provider_paid: true` must grant no
-authority. The engine must derive or observe each of those facts through a
-boundary the caller cannot write.
+A field reading `customer_approved: true`, `notice_sent: true`, or
+`amount: 10200` must grant no authority whatever. Each of those facts has to be
+derived here, or observed across a boundary the caller cannot write.
 
-### What the private caller can still influence
+The argument also rests on the deployment keeping keys apart. The private caller
+must hold none of the database, sealing, notice, tax-signing, merchant, or
+executor credentials. One credential holding several erases every boundary
+below.
 
-The caller is often the source of candidate usage and lifecycle facts. The engine
-must validate that an event names a declared metric and belongs to an installed
-module and app. It must also fall within a billing period, deduplicate, and be
-priced by a frozen public rule. Those checks stop a caller supplying money directly.
-They do not prove the customer consumed the reported service.
+### What the caller still influences
 
-A private caller that can fabricate otherwise valid usage can still increase a
-proposed total. This design reduces that risk with a disclosure that requires
-equality with the amount later collected, a notice window before collection, and
-authorization caps per charge and per period. It adds source-evidence export the
-customer can re-derive, cancellation before execution, and dispute evidence after
-it. It does not call private metering an independent witness. A stronger claim needs
-a separately trusted meter, or customer-verifiable provider logs, stated metric by
-metric.
+The caller is the source of usage and lifecycle facts, and always will be. The
+engine must check that an event names a declared metric, belongs to an installed
+module and app, falls inside a period, deduplicates, and prices under a frozen
+public rule. That stops a caller handing us money directly.
 
-### The secondary adversaries are adapters, callbacks, and provider ambiguity
+It does not prove you consumed the service. A caller that fabricates plausible
+usage can still raise a proposed total. Disclosure equality, a notice window,
+caps, exportable source evidence, and cancellation each narrow the damage. None
+of them makes private metering an independent witness, and we do not call it
+one. That claim needs a separately trusted meter, argued metric by metric.
 
-The core must stay provider-neutral. Stripe and NewebPay are payment adapters, not
-billing authorities. Providers differ in their notions of invoice, order,
-authorization, capture, finalization, idempotency, inquiry, void, refund, and
-callback authenticity. The core must never turn the weakest provider's semantics
-into a platform-wide assumption.
+### Adapters, callbacks, and provider ambiguity
 
-For the ledger boundary, executor return values and asynchronous callbacks are
-untrusted. They may be buggy, stale, duplicated, reordered, truncated,
-mistranslated, or dishonest. They may wake reconciliation; they must not declare an
-intent settled.
+Stripe and NewebPay are payment adapters, not billing authorities. Providers
+disagree about what an invoice, an authorization, a capture, a void, and a
+callback mean, and the core must never adopt the weakest one's semantics as a
+platform rule.
 
-- Immediate settlement must require provider-signed evidence the core verifies
-  itself.
-- Otherwise an independently deployed reconciler must read the same provider
-  operation with a provider-enforced read-only credential.
-- Or it must call a fixed-read broker inside the one `ProviderCredentialEnclave`
-  (unbuilt), attested under the customer-pinned deployment signing root named in
-  [Assumptions](#assumptions-and-what-breaks-when-they-are-wrong).
-- That credential-bearing reader, or enclave broker, is inside the trusted
-  computing base.
-- Comparing fields in a normalized response cannot detect a malicious adapter
-  that fabricated every matching field.
+Executor return values and provider callbacks are untrusted input. They may be
+stale, duplicated, reordered, or dishonest. They may wake reconciliation, and
+they must never declare an intent settled. Settlement needs provider-signed
+evidence the core verifies itself, or a read-back through a credential the
+provider restricts to reads. Comparing fields inside a normalized response
+proves nothing against an adapter that fabricated all of them.
 
-There is one unavoidable limit. The `ProviderCredentialEnclave` (unbuilt) holding an
-unrestricted live merchant credential can ask its provider to move money outside the
-public core; no Go interface restrains a deliberately replaced binary. We reduce that
-authority with isolated executor credentials, least-privilege provider keys, public
-adapter code, artifact attestation under the customer-pinned signing root, narrow
-deployment roles, and provider audit logs. We do **not** claim to survive compromise
-of the deployed adapter binary plus its write credential. Where a provider offers a
-narrower per-operation or amount-bound token, its adapter must use it.
+Notice delivery follows the same rule. A signature from our own notifier proves
+which component spoke, not that a carrier delivered the disclosed bytes to the
+enrolled destination. `NoticeReceipt` (unbuilt) must rest on carrier-signed
+proof, or a read-back binding content digest, destination, message id, terminal
+status, and delivered time. Every nonterminal status must fail closed.
 
-What this design does claim is narrower and checkable:
+---
 
-- no private RPC caller can reach an adapter's write capability;
-- an adapter receives one frozen, purpose/step-typed command per finite-plan
-  mutation rather than caller fields, and no permit hides multiple SDK writes;
-- core reconciliation verifies provider-signed proof, or evidence from the
-  explicitly trusted credential-separated read-back path;
-- that evidence is compared with the frozen merchant account, amount, currency,
-  intent, and operation;
-- it is also compared with an authoritative provider payer identity, or an
-  authenticated operation reference bound to the frozen payer and attempt; and
-- a provider artifact never substitutes for the intent ledger or the receipt.
+## 4 · What each party can do
 
-Notice delivery has the same evidence rule. A notifier-role signature proves which
-component spoke. It does not prove that a carrier reported the disclosed bytes at
-the configured destination, in a terminal status the accepted policy defines as
-destination-delivered. `NoticeReceipt` (unbuilt) must require carrier-signed proof
-the core verifies directly, or an authoritative read-back through a
-provider-enforced read-only credential or an attested fixed-read broker. That proof
-must bind content digest, enrolled-destination commitment and revision, provider
-message id, terminal status, delivered time, audience, and replay identity. Queue
-acceptance, submission, bounce or rejection, and any other nonterminal status must
-fail closed. If only an attested reader can establish those facts, that reader and
-the carrier are in the trusted computing base. A compromise that fabricates
-delivered time defeats the notice guarantee, and that is not hidden behind the word
-"authenticated."
-
-### What each party can do
-
-| | customer | private caller | billing core | executor | payment adapter/provider |
+| | you | private caller | billing core | executor | provider |
 |---|---|---|---|---|---|
-| submit candidate usage/lifecycle facts | indirectly | yes | validate and retain evidence | no | no |
-| choose a charge amount | only by accepting terms with a stated cap | **no** | **derive and freeze** | no | no |
-| choose customer-facing line categories | accept/reject policy | **no** | **derive from public policy** | no | render only |
-| establish a `BillingAuthorization` (unbuilt) | **yes, after independently verifiable disclosure and customer proof** | relay only; **cannot mint proof** | verify and seal | read only | may establish payment method |
-| deliver a charge notice | receive it | no authority | create the disclosure | no | notice provider transports bytes |
-| decide an intent is executable | cancel or allow accepted terms | **no** | **yes, from durable gates and proof head** | consume typed capability only | no |
-| reach payment-provider writes | customer-present flows only | **no** | no | **yes, only here** | performs requested operation |
-| declare the ledger settled | no | no | **only after verified evidence** | submit observations | **no** |
-| stop a not-yet-executed intent | **yes** | may request, never override | cancel/expire | must obey | no |
-| explain a completed charge | inspect evidence | proxy only | **produce the receipt** | submit execution evidence | provider artifact is supporting evidence |
+| submit usage and lifecycle facts | indirectly | ✅ | validates, retains evidence | — | — |
+| choose a charge amount | only by accepting a stated cap | 🔴 **no** | ✅ **derives and freezes** | — | — |
+| establish an authorization | ✅ **yours to give** | relay only, cannot mint proof | verifies and seals | — | may attach a method |
+| decide an intent is executable | cancel or allow | 🔴 **no** | ✅ from durable gates | consumes a permit | — |
+| reach a provider write | customer-present flows only | 🔴 **no** | no | ✅ **only here** | performs it |
+| declare the ledger settled | — | — | ✅ only on verified evidence | reports observations | 🔴 **no** |
+| stop an unexecuted intent | ✅ **yours** | may ask, never override | cancels or expires | must obey | — |
+| explain a completed charge | inspect the evidence | proxy only | ✅ produces the receipt | submits evidence | supporting artifact |
 
-The authorization, executability, provider-write, and ledger-settlement rows carry
-the weight. They must remain separate capabilities in code, credentials, deployment
-roles, and tests. Adjacent proof and evidence roles have their own limits.
+Four rows carry the weight: the authorization, the executability decision, the
+provider write, and the settlement declaration. They must stay separate in code,
+credentials, deployment roles, and tests. Collapsing any two collapses the
+argument. One row is also weaker than it reads — "cannot mint proof" is what
+[INV-006](docs/DESIGN.md#inv-006) requires, and §1 says why it is unenforced.
 
-| role | enforced boundary | consequence if compromised |
-|---|---|---|
-| customer-held verifier | pinned, signed release; reproducible build and update provenance; canonical encoding of the disclosure rendered before factor use | a compromised verifier or customer device can misrender terms or misuse the factor, so customer-presence semantics fail unless a separate secure-display factor independently renders and signs the same fields |
-| acceptance-receipt relay (`api-platform`) | relays engine-signed disclosure bytes unchanged and returns a receipt naming their digest; no amount, no provider credential | can assert an acceptance the customer never gave, and cannot choose an amount, renumber the engine-owned payer stream, or reach a provider; the engine records the receipt and can reproduce it later, which is detection, not prevention |
-| provider callback ingress | raw request bytes only, under a published size limit; public-key or dedicated verification-only credential, or a fixed verifier inside the exclusive mutation-credential enclave | can delay or replay traffic, but replay checks and the core prevent attempt creation; it has no account action or provider read/write capability |
-| billing-owned proof state, evidence outbox, and the `ReadEvidence` procedure (unbuilt) | verifies signatures, assigns a gap-free payer sequence and head, and serializes proof application with claim/grant CAS; state and evidence commit together; the only read capability verifies and consumes `CustomerReadProof` (unbuilt) and returns padded encrypted results | compromise is core-state compromise and is inside the billing trusted computing base; edge acceptance alone still never means engine effect |
-| evidence edge | no table, list, or raw-read capability and no provider credential; it can call only `ReadEvidence` | can delay or replay requests, but the billing-owned procedure prevents private-relay trust, cross-tenant existence disclosure, evidence mutation, or provider access |
+### Three substitutes that would look like controls
 
-The verifier binary, its update channel, and the customer device are therefore in
-the customer-presence trusted computing base, unless the enrolled factor has an
-independent secure display. Releases must be signed against a pinned root,
-reproducibly buildable, and carry auditable update provenance. Calling a browser
-component "customer-held" does not make a compromised release safe. The evidence
-edge's limits come from enforced data credentials and the billing-owned
-`ReadEvidence` procedure, not from trusting the edge to check its own proofs.
+- **An opaque id, or a private-UI URL, is not consent.** Neither shows you
+  terms, so neither can stand in for an acceptance.
+- **A local `last_consumed` value is not a cancellation control.** Without the
+  authoritative current head it cannot see a revocation that landed elsewhere.
+- **A customer-facing `api-platform` route is necessary and not sufficient.**
+  Being reachable by a browser says nothing about who authored the bytes.
 
-### Three shortcuts that are not controls
+### The double-spend that the typing rule prevents
 
-Each is the cheapest substitute for a real control, and each leaves the
-customer with nothing.
+Rating and tax credits reduce what you owe. Stored-value wallet lots do not
+reduce it — they fund it. Every source must be typed `rating_credit` or
+`stored_value`, and never both.
 
-- An opaque id or private-UI URL alone is not meaningful consent and cannot be
-  substituted.
-- A local `last_consumed` value without an authoritative current head is not a
-  cancellation control.
-- The `api-platform` route being customer-facing is necessary, but not
-  sufficient.
+Without that typing, a hostile caller subtracts one lot from the obligation and
+then spends the same lot again as funding. The lot pays twice, and you are
+charged for value the platform already gave you. A unique-use constraint across
+both domains is the mechanism, in
+[`docs/DESIGN.md` §3](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves).
 
-### The double-spend the semantic-class typing rule stops
+---
 
-Rating and tax credits must reduce the gross obligation. Stored-value wallet lots
-must not reduce it; they fund it. Every source must be typed `rating_credit` or
-`stored_value`, and never both. Without that typing, a malicious caller could
-subtract the same lot from the obligation and then spend it again as funding. One
-lot would pay twice, and the customer would be charged for value the platform
-already granted. The enforcing mechanism is a unique-use constraint across those
-domains, in [`docs/DESIGN.md` §3](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves).
+## 5 · What we assume, and what breaks when the assumption is wrong
 
-## What is in scope
+An honest threat model is mostly a list of assumptions. Each of these names what
+an attacker gets when it turns out to be false.
 
-Anything that breaks a claim made by this repository, once that claim is marked
-implemented. Invariants INV-001 through INV-014 are specified normatively in
-[`docs/DESIGN.md` §2](docs/DESIGN.md#3--what-must-be-true-before-any-money-moves); they are proposals, not
-production claims. The index below judges report eligibility; it does not restate
-the rules.
+**We assume the deployed artifact is the public artifact.** Public source proves
+nothing about a binary you cannot identify. Health, `Capabilities` evidence
+(unbuilt), and every receipt must name the source commit, artifact digest,
+schema revision, and policy digests. That naming must be attested to a root you
+pin outside every runtime relay. *If it is wrong:* you cannot check that this
+code is the code holding the payment credentials, and no test here closes it.
 
-- **INV-001** — the private caller cannot make amount, currency, tax, lines, destination, or eligibility authoritative.
-- **INV-002** — one derivation must power both preview and settlement.
-- **INV-003** — a sealed intent never changes; a new price, tax result, adapter, method, or amount needs a replacement intent.
-- **INV-004** — an unknown derivation or eligibility input cannot dispatch an effect.
-- **INV-005** — no collection before a notice that requires equality with the charge.
-- **INV-006** — every debit has customer authority, from a proof envelope no relay credential can mint.
-- **INV-007** — one exclusive enclave owner per mutation-capable credential; a Go interface alone is not sufficient ([`#inv-007`](docs/DESIGN.md#inv-007)).
-- **INV-008** — one intent settles at most once across all providers, retries, callbacks, workers, and regions ([`#inv-008`](docs/DESIGN.md#inv-008)).
-- **INV-008** — an ambiguous attempt stays `execution_unknown` and reconciles against the same provider operation.
-- **INV-008** — one consumed permit emits at most one outbound mutation request; a timeout becomes reconciliation.
-- **INV-009** — provider callbacks reconcile and never originate money.
-- **INV-010** — infrastructure is not a customer charge dimension. Present state contradicts this; see [Known current gaps](#known-current-gaps).
-- **INV-011** — settled history is append-only and settled exposure is gross-monotonic, so refund loops cannot reopen capacity.
-- **INV-012** — receipts name the running build, intent digest, and policy revisions.
-- **INV-013** — proof ordering and execution claim are one serialization boundary, with a generation CAS ([`#inv-013`](docs/DESIGN.md#inv-013)).
-- **INV-014** — customer evidence does not depend on the private relay.
-- Unknown tax is never zero tax; a zero amount needs a versioned policy that positively derives zero ([`§9`](docs/DESIGN.md#7--tax-and-what-it-refuses-to-guess)). Provider ports and capability publication are in [`§5`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes).
+**We assume billing-owned storage and keys are isolated.** The private caller
+must have no direct write access to intent, authorization, notice, execution, or
+receipt rows, and must not hold their sealing keys. Provider keys, webhook
+secrets, and tax credentials come from a secrets manager, and never appear in
+source, logs, intents, or receipts. *If it is wrong:* the state machine is
+advisory, because the caller can edit the rows or mint the envelopes. Database
+operators stay powerful even when it holds. Append-only constraints, audit
+export, and backups are the controls, while `BillingDecisionProof` (unbuilt) and
+a transparency log detect a rollback afterwards and gate no payment.
 
-Useful reports include:
+**We assume the acceptance ceremony means what it says.** An authorization is
+only as strong as the presentation you saw and the proof you gave. A bearer
+credential the private caller can mint defends nothing against that caller, and
+a signature over an opaque digest does not prove which terms you read. *If it is
+wrong:* the authorization shows only that some credential answered. Your device
+and the verifier's update channel are inside the trusted base unless your
+enrolled factor has its own secure display.
 
-- replaying, mutating, substituting, or crossing tenants with an intent,
-  authorization, notice acknowledgement, settlement claim, or receipt;
-- reaching a payment-provider write from anywhere except the executor;
-- giving a receipt, callback, inquiry, reconciliation, or cash-flow trace path a
-  composite provider client that also exposes writes;
-- changing an amount after disclosure without creating a replacement intent;
-- executing before the notice window, after cancellation, or above an accepted
-  per-charge or period cap;
-- moving from `execution_unknown` to a second provider attempt without
-  authoritative proof that the first provider did not collect;
-- allowing an SDK, HTTP transport, redirect handler, proxy, or middleware to emit
-  a second mutation request from one consumed permit;
-- accepting an unsigned, replayed, out-of-order, or mismatched callback;
-- treating a provider invoice, webhook payload, or dashboard state as ledger
-  truth without independent validation;
-- charging through an adapter whose published capabilities cannot support the
-  required idempotency and reconciliation semantics;
-- applying a mutable fallback price or tax rule to an executable intent;
-- exposing payment credentials, billing contact data, or cross-tenant billing
-  evidence; and
-- documentation or comments that overstate what the code or deployed artifact
-  guarantees.
+**We assume the notice carrier tells the truth.** Where a carrier signs, the
+core must verify that signature. Otherwise the carrier and the reader are
+trusted for content digest, destination, message id, terminal status, and
+delivered time, so that reader must be credential-separated and attested. *If it
+is wrong:* the engine cannot prove delivery, and unknown evidence strength must
+disable automatic execution rather than downgrade quietly.
 
-The final item matters. In a public billing engine, a confident false sentence
-can cause the same kind of harm as a code defect, and we treat it as one.
+**We assume payment providers enforce their own authenticated operations.** The
+core must verify what it asked for and what the provider later reports, under
+credentials separated by adapter and environment. *If it is wrong:* a provider
+or card network can charge a different amount while falsifying every
+authoritative read. Reconciliation, merchant statements, and your dispute rights
+are then the only external controls.
 
-## What is out of scope
+> 🔴 **This is where the residual risk sits.** A deliberately replaced executor
+> holding an unrestricted merchant credential can exceed its Go interface,
+> because that credential answers to the provider and not to this code.
+> Credential scope, artifact attestation, narrow deployment roles, public
+> adapter source, and provider audit logs make the bypass narrow or detectable.
+> They do not make it impossible, and nothing here should be read as saying they
+> do. Where a provider offers an amount-bound or per-operation token, its
+> adapter must use it.
 
-- Reports about a proposed invariant that is plainly marked unimplemented in the
-  status section. A new exploit of the current gap is still useful; merely
-  restating the gap is not.
-- Tax or legal advice, or disagreement with a published tax policy where the
-  engine applied that exact policy reproducibly. Charging when tax is unresolved
-  or applying a different policy **is** in scope.
-- MirrorStack's private UI or tenancy logic by itself. A private-caller defect
-  that makes this engine exceed an intent, authorization, or tenant boundary is
-  in scope — that is the boundary this repository exists to enforce.
-- Provider availability, a card issuer's decline, or a payment provider's
-  documented settlement decision, unless this engine handles the result in a
-  way that breaks a stated invariant.
-- Compromise of the customer's email account, passkey, payment account, or
-  device, except where this engine claims to remain safe despite it.
-- Compromise of the cloud account, deployment signing root, tax authority, or
-  payment-provider merchant credentials. The assumptions around those systems
-  are stated below. A path in this repository that unnecessarily widens their
-  authority remains in scope.
-- Automated scanner output with no demonstrated impact on a billing invariant,
-  confidentiality boundary, or availability property.
+**We assume the published pricing and tax authorities are legitimate.** The
+engine will prove it applied one immutable rule. It cannot judge whether the
+business was entitled to publish that price, or whether a tax rule is legally
+right. *If it is wrong:* the engine reproducibly applies an illegitimate rule,
+and produces faithful evidence that it did so.
 
-Do not probe production with real charges. Reproduce against test adapters and
-fixtures whenever possible. If a production-only issue cannot be demonstrated
-otherwise, contact us before attempting it.
+**We assume clocks are trusted only inside declared roles.** Notice windows,
+expiries, price windows, service cutoffs, and consume transitions all rest on
+time, so every money-authoritative transition must use a billing-owned monotonic
+source disciplined by an authenticated wall clock. Readiness must go false on a
+forward jump, a rollback, source disagreement, or stale synchronization.
+Recovery may move a transition later, and must never credit elapsed notice time
+or pre-expiry authority. *If it is wrong:* whoever controls time controls
+expiry, so an uncertain ordering has to fail closed with no new debt.
 
-## Assumptions, and what breaks when they are wrong
+---
 
-Seven assumptions carry the design. Each names what an attacker gets when it is false.
-
-### We assume the deployed artifact is the public artifact
-
-Public source proves nothing about a binary customers cannot identify. `Health` and
-`Capabilities` evidence (unbuilt), plus every receipt, must identify the source commit,
-reproducible artifact digest, schema revision, and policy digests. Deployment
-attestation must be signed under a purpose-bound leaf, chaining to a verification
-root customers pin outside every runtime relay. Rotation must be append-only and
-transparency-anchored; an unknown root must disable automatic execution.
-
-**If it is wrong:** customers cannot verify that this code is the code holding
-payment credentials. That root is an assumption, not something tests close.
-
-### We assume billing-owned storage and keys are isolated
-
-The private caller must not have direct write access to intent, authorization,
-notice, execution, or receipt tables, and must not hold their sealing or signing
-keys.
-
-**If it is wrong:** the state machine is advisory only, because the caller can
-edit the rows or mint the envelopes.
-
-Database operators remain powerful. `BillingDecisionProof` (unbuilt) must sign the
-supplied closed predicate and key schema, proof head, before and after commitments
-and generations, transaction, build and policy identities, and outbox binding.
-Global non-omission remains `state_assurance: attested`, with the deployment
-attestation root as the attester. Append-only constraints, audit export, and backups
-are the primary controls. The asynchronous payer-isolated transparency log detects a
-rollback, equivocation, or split view only after a root is published, and it never
-gates payment.
-
-### We assume the customer authentication ceremony means what it says
-
-An accepted authorization is only as strong as its independently verifiable
-presentation and customer proof. A bearer credential the private caller can mint or
-read does not defend against that caller. A signature over an opaque digest does not
-prove which terms the customer saw. The implementation must state the engine-signed
-disclosure format, independent rendering and verifier, customer-controlled factor,
-challenge audience, expiry, replay rule, contact-enrollment process, and
-contact-change cooling period.
-
-**If it is wrong:** the authorization proves only that some credential answered,
-not that a customer agreed. Compromise of the customer's factor or destination is
-not prevented here, and delivery does not prove human reading.
-
-### We assume the notice carrier evidence path is truthful
-
-The core must verify a carrier signature where one exists. Otherwise the notice reader
-and the carrier are trusted to report the disclosed content digest, destination
-commitment, message id, terminal status, and delivered time. That reader must be
-credential-separated and attested under the deployment signing root. A malicious
-notifier assertion alone must never be accepted.
-
-**If it is wrong:** the engine cannot prove delivery, because the carrier or the
-read path fabricated those facts. Transparency checkpoints and complaints are
-detection, not prevention. Such a path must be named in `Capabilities`, and unknown
-evidence strength must disable automatic execution.
-
-### We assume payment providers enforce their authenticated operations
-
-The core must verify what it requests and what the provider later reports.
-Provider credentials must be separated by adapter and environment.
-
-**If it is wrong:** a provider or card network can charge a different amount
-while falsifying every authoritative read, and the core cannot detect it.
-Reconciliation, merchant statements, and customer disputes are the external
-controls. A deliberately malicious deployed adapter holding an unrestricted
-credential can likewise exceed its Go interface; source attestation and credential
-scope are the controls there, not the interface.
-
-### We assume the published pricing and tax authorities are legitimate
-
-The engine will prove that it applied a particular immutable rule. It cannot decide
-whether the business was entitled to publish that price, or whether a tax rule is
-legally correct. Governance, effective dates, customer notice, and signatures bind
-those authorities. Unknown authority means the policy is not executable.
-
-**If it is wrong:** the engine reproducibly applies an illegitimate rule, and
-produces evidence that it did so faithfully.
-
-### We assume clocks are trusted only within declared roles
-
-Notice windows, proof, authorization and capability expiries, price and policy
-windows, service admission and seal, responsibility cutoffs, and consume transitions
-all depend on time. Every money-authoritative transition must use a billing-owned
-monotonic time source, disciplined by an authenticated wall clock.
-`Capabilities` must publish the time-source identity, the maximum accepted
-uncertainty and skew, the maximum forward step, the rollback policy, and current
-readiness. `NoticeReceipt` (unbuilt) and `BillingDecisionProof` (unbuilt) must bind
-that policy revision and the observed uncertainty interval.
-
-Time readiness must be false on a forward jump, a rollback, source disagreement,
-stale synchronization, or an uncertainty interval overlapping the disallowed side of
-any cutoff. Recovery may move a transition later. It can never credit elapsed notice
-time, pre-expiry authority, or an unproven prior service window. Admission, seal,
-setup, customer-hosted issuance, wallet settlement, and provider dispatch use the
-same check.
-
-**If it is wrong:** an attacker who controls time controls expiry. When ordering
-is uncertain, the transition must fail closed with no new debt or effect.
-
-## What this design does not claim
+## 6 · What this design does not claim
 
 These are the limits of the architecture in [`docs/DESIGN.md`](docs/DESIGN.md),
-stated so a reader does not infer more. Even fully built, it will not:
+written down so nobody infers more from it. Even fully built, it will not:
 
 - prove that a person read a delivered notice;
-- prove that private metering facts describe real consumption, unless a metric
-  has an independently documented evidence source;
-- force the private platform to show a billing page, forward a receipt, propose
-  an intent, or continue providing service;
-- prevent a customer approving terms they later regret — it proves which terms
-  constrained the charge and preserves cancellation and cap evidence;
-- prevent compromise of the customer's authentication factor, payment account,
-  billing destination, MirrorStack's cloud signing root, a tax authority, or a
-  merchant credential;
-- guarantee that a payment provider, issuing bank, tax authority, or notice
-  carrier is available;
-- make tax advice or legal claims beyond applying the named public policy
-  reproducibly;
-- equate provider acceptance, invoice finalization, callback receipt, or
-  dashboard status with ledger settlement; or
-- hide refunds, disputes, reversals, credits, or adjustments — they are new,
-  reason-coded ledger events linked to the original receipt.
+- prove that private metering describes real consumption, unless a metric has an
+  independently documented evidence source;
+- force the private platform to show you a billing page, forward a receipt,
+  propose an intent, or keep serving you;
+- stop you accepting terms you later regret — it proves which terms constrained
+  the charge, and keeps the cancellation and cap evidence;
+- survive any of the compromises §5 assumes away, or make a provider, bank, tax
+  authority, or notice carrier available;
+- treat provider acceptance, invoice finalization, callback receipt, or
+  dashboard status as ledger settlement; or
+- hide a refund, dispute, reversal, credit, or adjustment. Each is a new
+  reason-coded ledger event linked to the receipt it corrects.
 
-## Payment credentials and customer data
-
-- Provider API keys, webhook secrets, merchant signing keys, customer payment
-  tokens, and tax-provider credentials must come from a secrets manager or
-  process environment.
-- Those same credentials must never appear in source, intent payloads, logs, or
-  receipts.
-- Billing contacts, jurisdiction evidence, tax identifiers, and provider
-  metadata must be minimized and tenant-scoped. Debug errors and public health
-  responses must carry no customer data.
-- A green CI result does not authorize automatic merge, deployment, or
-  collection enablement. While the legacy paths remain, billing-engine changes
-  are manually reviewed and promoted.
+How any of it gets checked — evidence levels, the charge bundle you recompute
+offline, and the static architecture checks — belongs to
+[`docs/VERIFICATION.md`](docs/VERIFICATION.md), not here.
