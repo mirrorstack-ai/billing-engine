@@ -470,10 +470,20 @@ Four things this diagram makes obvious:
 
 ### What all five have in common
 
+This is what "intent-based" buys, and it is the point of the whole design:
+**`api-platform` cannot charge you for something unrelated.** It does not send a
+charge. It names a payer and picks one option from a catalog the engine signed,
+and the engine derives the rest. A caller that wants to bill something outside
+that closed vocabulary has no way to express it — there is no field for it.
+
 Each money-moving journey must pass a single sealed intent id to one settlement
 contract. The caller must not be able to supply the amount, the funding split,
 the provider, the mandate, the tax result, the notice claim, or the execution
 time. The engine must derive every financial field.
+
+That much holds even though the engine trusts `api-platform` about *who*
+accepted ([INV-006](docs/DESIGN.md#inv-006)). The two are separate: a caller that
+can misreport a customer still cannot invent a charge kind or an amount.
 
 - **No silent charge.** Every collection must satisfy one execution predicate
   before any provider mutation. That predicate has exactly one owner:
