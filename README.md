@@ -341,7 +341,8 @@ Recurring money, on a rail that offers to run the recurrence for us. Declining
 that offer is the point of the flow.
 
 **Target, not deployed.** `ProviderExecutionPlan` and `PaymentAttempt` are
-unbuilt, and `SubscriptionOffer` has only a live stub.
+unbuilt, and `SubscriptionOffer` has only a live stub. The grace and allowance
+numbers below are shipped today and are named where they are cited.
 
 ```mermaid
 sequenceDiagram
@@ -353,11 +354,15 @@ sequenceDiagram
     participant Stripe as Stripe<br/>(payment provider)
     participant DB as ms_billing<br/>(db)
 
-    You->>WA: start this plan
-    WA->>AP: begin a subscription
+    You->>WA: create an app, or install a 6th module
+    WA->>AP: begin a subscription change
     AP->>Engine: ProposeChargeIntent(subscription_start, offer id)
+    Engine->>DB: start a grace timer, do not charge yet
     Engine->>DB: lock the accepted responsibility and schedule generation
-    Engine->>DB: seal first-period lines, tax, rail and a finite provider plan
+
+    Note over Engine,DB: a per-app and per-install grace runs GraceDays before<br/>anything is charged. Delete inside it and the fee never bills.<br/>An org plan charges immediately and has no timer.
+
+    Engine->>DB: after grace, seal first-period lines, tax, rail and a plan
     Engine-->>AP: intent id + engine-signed disclosure
     AP-->>WA: the same bytes, relayed unchanged
     WA-->>You: the disclosure, rendered but not authored
@@ -374,17 +379,24 @@ sequenceDiagram
     Engine->>DB: append the ledger, then activate the window on a successful CAS
 ```
 
-Three things this diagram makes obvious:
+Four things this diagram makes obvious:
 
-- **Step 14 is one request, and that is a transport property.** Automatic SDK
+- **A SaaS fee is not charged the moment you trigger it.** Creating an app, or
+  taking the account past its included modules, starts a grace timer instead.
+  `GraceDays = 3` and `IncludedModules = 5`, with `$5.00` per block of 5 over
+  the allowance (`internal/account/usage/bill.go:118`, `:52`, `:70`). An app
+  deleted inside its grace is never billed, and each install timer carries its
+  own grace. Org plans are the exception: that tier is not built, and when it
+  ships it must charge immediately with no timer.
+- **Step 15 is one request, and that is a transport property.** Automatic SDK
   and HTTP retries must be off, `MaxNetworkRetries` set to zero, and a guard at
   the request boundary refuses a second send for that permit —
   [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
 - **Nothing in the picture lets Stripe schedule the next period.** The frozen
   autonomy policy forbids provider-managed subscriptions, auto-advance, smart
   retries, dunning debits and delayed capture. None of them can race your
-  revocation through the claim CAS in step 13.
-- **Changing the plan or the rail after the seal in step 5 is a new intent.** A sealed
+  revocation through the claim CAS in step 14.
+- **Changing the plan or the rail after the seal in step 6 is a new intent.** A sealed
   intent is never edited, and a replacement carries new funding, digest,
   disclosure and claim — [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
 
@@ -416,7 +428,12 @@ sequenceDiagram
     end
 
     Engine->>DB: seal barrier — verify root, count, and no competing claims
-    Engine->>DB: rate the window and seal one intent per compatible group
+    Engine->>DB: rate the closed window into usage arrears
+    Engine->>DB: add the next period forward — app base, module overage, domains
+
+    Note over Engine,DB: one boundary, one charge. The closed period's arrears and<br/>the next period's SaaS bill together, so a boundary is a<br/>single collection decision covering two periods.
+
+    Engine->>DB: seal one intent per compatible group
     Engine->>You: notice, where the group settles on standing authority
     Engine->>Stripe: one consumed permit for the sealed provider remainder
     Stripe--)Engine: a result, or nothing at all
@@ -433,6 +450,11 @@ Four things this diagram makes obvious:
   line, because the service is already rendered. 🔴 Product budgets are
   alert-only today and never stop accrual
   (`internal/account/budget/service.go:260`).
+- **A boundary charges backward and forward at once.** Steps 6 and 7 put the
+  closed period's usage arrears and the next period's advance charges — flat app
+  base, module overage, domains — into one total
+  (`internal/account/cycle/charge.go:296-299`). Apps still inside `GraceDays`
+  are excluded from the advance base and join at the next boundary.
 - **The loop exists so close is not one enormous transaction.** Batches claim
   leaves and checkpoint; only the small seal barrier in step 5 is
   all-or-nothing. A leaf may enter one allocation lineage, enforced by a
