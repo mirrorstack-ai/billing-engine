@@ -155,38 +155,54 @@ whose blast radius must stay smallest.
 sequenceDiagram
     autonumber
     actor You
+    participant WA as web-account<br/>(browser UI, hosts Stripe Elements)
     participant AP as api-platform<br/>(private caller)
     participant Engine as billing-engine<br/>(this repository)
+    participant Edge as consent edge<br/>(public, append-only proof inbox)
     participant Stripe as Stripe<br/>(payment provider)
-    participant DB as ms_billing<br/>(append-only ledger)
+    participant DB as ms_billing<br/>(db)
 
-    You->>AP: save a card for later
-    AP->>Engine: begin payment-method setup
+    You->>WA: save a card for later
+    WA->>AP: begin payment-method setup
+    AP->>Engine: private RPC, the only account path
     Engine->>DB: seal an immutable PaymentMethodSetup
-    Engine-->>AP: engine-signed disclosure, including "no debit"
-    AP-->>You: the same bytes, relayed unchanged
-    You->>Engine: factor proof, through the consent edge
-    Engine->>DB: freeze the no-debit setup plan
+    Engine->>Stripe: open a setup session
+    Stripe-->>Engine: client secret
+    Engine-->>AP: client secret + engine-signed disclosure, including "no debit"
+    AP-->>WA: the same bytes, relayed unchanged
+    WA-->>You: the disclosure, with Elements mounted on that secret
+
+    Note over WA,Stripe: card details go from the Elements iframe straight to Stripe.<br/>They never reach web-account's server, api-platform, or<br/>this engine. Nothing in this repository can read a card number.
+
+    You->>Stripe: card details, direct to the provider
+    You->>Edge: signed acceptance, never through the private caller
+    Edge->>DB: append to the payer proof stream
 
     Note over Engine,Stripe: the setup plan holds at most one mandate_setup step.<br/>That effect class may create only the accepted<br/>reusable mandate scope. It never holds and never debits.
 
+    Engine->>DB: apply proofs at the head, freeze the no-debit plan
     Engine->>Stripe: authorize step 1 of the frozen plan
-    You->>Stripe: card details, direct to the provider
     Stripe-->>Engine: mandate reference + verified readable identity
     Engine->>DB: PaymentMethodSetupReceipt, after re-applying the proof head
 ```
 
-Three things this diagram makes obvious:
+Four things this diagram makes obvious:
 
-- **No arrow in it creates authority to charge you.** Step 8 authorizes one
+- **Your card number never enters this repository.** Step 10 goes from the
+  Elements iframe to Stripe. `web-account` renders the field but its server
+  never sees the value, and neither `api-platform` nor this engine is on that
+  path. What comes back in step 15 is a mandate reference, not a card.
+- **No arrow creates authority to charge you.** Step 14 authorizes one
   `mandate_setup` step and nothing more. Subscription and auto top-up must each
-  request their own authority against that mandate later. The effect classes are enumerated in
+  request their own authority against that mandate later. The effect classes are
+  enumerated in
   [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
-- **Step 5 is a relay, not an author.** The disclosure is signed by the engine,
-  and `api-platform` must pass the bytes through unchanged. Your acceptance in
-  step 6 must bind to a factor the private caller cannot mint —
+- **Steps 8 and 9 are a relay, not an author, and step 11 does not use them.**
+  The disclosure is signed by the engine, and `api-platform` must pass the bytes
+  through unchanged. Your acceptance goes to the consent edge instead, so it
+  binds to a factor the private caller cannot mint —
   [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
-- 🔴 **Step 11 is where today's code diverges, and it costs you a billing
+- 🔴 **Step 15 is where today's code diverges, and it costs you a billing
   period.** A Stripe `payment_method.attached` event currently stamps
   `accounts.activated_at`, so saving a card starts a cycle. It is filed in
   [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
@@ -205,20 +221,25 @@ decide the amount.
 sequenceDiagram
     autonumber
     actor You
+    participant WA as web-account<br/>(browser UI)
     participant AP as api-platform<br/>(private caller)
     participant Engine as billing-engine<br/>(this repository)
+    participant Edge as consent edge<br/>(public, append-only proof inbox)
     participant Stripe as Stripe<br/>(payment provider)
-    participant DB as ms_billing<br/>(append-only ledger)
+    participant DB as ms_billing<br/>(db)
 
-    You->>AP: top up my wallet
+    You->>WA: top up my wallet
+    WA->>AP: begin a credit purchase
     AP->>Engine: ProposeChargeIntent(payer, credit_purchase, ProposalSelection)
 
     Note over AP,Engine: the caller sends a signed catalog revision and one<br/>declared choice field — never an amount, price, tax,<br/>currency, provider, or execution time. This is INV-001.
 
     Engine->>DB: derive lines, tax, funding plan and rail, then seal the intent
     Engine-->>AP: intent id + engine-signed disclosure
-    AP-->>You: the same bytes, relayed unchanged
-    You->>Engine: CustomerAcceptanceProof, through the proof inbox
+    AP-->>WA: the same bytes, relayed unchanged
+    WA-->>You: the disclosure, rendered but not authored
+    You->>Edge: CustomerAcceptanceProof, never through the private caller
+    Edge->>DB: append to the payer proof stream
     AP->>Engine: ExecuteChargeIntent(intent id)
     Engine->>DB: acquire the settlement claim
     Engine->>Stripe: one consumed permit, one debit request
@@ -228,8 +249,8 @@ sequenceDiagram
 
 Three things this diagram makes obvious:
 
-- **Step 7 carries an id, and that is the whole design.** The scheduler queues
-  an intent id only. What must hold before step 9 has exactly one owner,
+- **Step 10 carries an id, and that is the whole design.** The scheduler queues
+  an intent id only. What must hold before step 12 has exactly one owner,
   [`docs/DESIGN.md#executechargeintent`](docs/DESIGN.md#executechargeintent),
   and this page does not repeat its clauses.
 - **The amount you typed enters as a choice, not as a price.** The engine
@@ -259,7 +280,7 @@ sequenceDiagram
     participant AP as api-platform<br/>(private caller)
     participant Engine as billing-engine<br/>(this repository)
     participant Stripe as Stripe<br/>(payment provider)
-    participant DB as ms_billing<br/>(append-only ledger)
+    participant DB as ms_billing<br/>(db)
 
     AP->>Engine: usage ingest or balance read
     Engine->>DB: append a trigger fact only, never a collection
@@ -313,18 +334,23 @@ unbuilt, and `SubscriptionOffer` has only a live stub.
 sequenceDiagram
     autonumber
     actor You
+    participant WA as web-account<br/>(browser UI)
     participant AP as api-platform<br/>(private caller)
     participant Engine as billing-engine<br/>(this repository)
+    participant Edge as consent edge<br/>(public, append-only proof inbox)
     participant Stripe as Stripe<br/>(payment provider)
-    participant DB as ms_billing<br/>(append-only ledger)
+    participant DB as ms_billing<br/>(db)
 
-    You->>AP: start this plan
+    You->>WA: start this plan
+    WA->>AP: begin a subscription
     AP->>Engine: ProposeChargeIntent(subscription_start, offer id)
     Engine->>DB: lock the accepted responsibility and schedule generation
     Engine->>DB: seal first-period lines, tax, rail and a finite provider plan
     Engine-->>AP: intent id + engine-signed disclosure
-    AP-->>You: the same bytes, relayed unchanged
-    You->>Engine: CustomerAcceptanceProof, through the proof inbox
+    AP-->>WA: the same bytes, relayed unchanged
+    WA-->>You: the disclosure, rendered but not authored
+    You->>Edge: CustomerAcceptanceProof, never through the private caller
+    Edge->>DB: append to the payer proof stream
 
     Note over Engine,DB: one sealed intent settles at most once, across every rail.<br/>The control is one durable settlement claim, taken by CAS —<br/>not per-adapter idempotency, which cannot see a second rail.
 
@@ -336,15 +362,15 @@ sequenceDiagram
 
 Three things this diagram makes obvious:
 
-- **Step 9 is one request, and that is a transport property.** Automatic SDK
+- **Step 12 is one request, and that is a transport property.** Automatic SDK
   and HTTP retries must be off, `MaxNetworkRetries` set to zero, and a guard at
   the request boundary refuses a second send for that permit —
   [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
 - **Nothing in the picture lets Stripe schedule the next period.** The frozen
   autonomy policy forbids provider-managed subscriptions, auto-advance, smart
   retries, dunning debits and delayed capture. None of them can race your
-  revocation through the claim CAS in step 8.
-- **Changing the plan or the rail after the seal in step 4 is a new intent.** A sealed
+  revocation through the claim CAS in step 11.
+- **Changing the plan or the rail after the seal in step 5 is a new intent.** A sealed
   intent is never edited, and a replacement carries new funding, digest,
   disclosure and claim — [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
 
@@ -365,7 +391,7 @@ sequenceDiagram
     participant AP as api-platform<br/>(private caller)
     participant Engine as billing-engine<br/>(this repository)
     participant Stripe as Stripe<br/>(payment provider)
-    participant DB as ms_billing<br/>(append-only ledger)
+    participant DB as ms_billing<br/>(db)
 
     AP->>Engine: RecordUsage — meter, module, integer quantity, occurrence time
     Engine->>DB: reserve a service-accrual upper bound at admission

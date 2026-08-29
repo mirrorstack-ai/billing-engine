@@ -934,8 +934,9 @@ sequenceDiagram
     participant AP as api-platform<br/>(private caller)
     participant Engine as billing-engine<br/>(this repository)
     participant Notice as notice destination<br/>(customer-held)
+    participant Edge as consent edge<br/>(public, append-only proof inbox)
     participant Rail as payment provider<br/>(one selected rail)
-    participant Ledger as append-only ledger<br/>(outranks any callback)
+    participant Ledger as ms_billing<br/>(db — settled history append-only, INV-011)
 
     AP->>Engine: DescribeCharge — facts only, never an amount
     Engine-->>AP: provisional view only, no notifier and no rail
@@ -949,7 +950,9 @@ sequenceDiagram
         Notice-->>Engine: delivery evidence
     end
     Note over Engine,Notice: the wait runs from DELIVERY, not from sealing. Its lead<br/>time is published by Capabilities (§12), never a deployment constant.
-    You->>Engine: CustomerAcceptanceProof<br/>(customer-present path, independent inbox)
+    You->>Edge: CustomerAcceptanceProof, never through the private caller
+    Edge->>Ledger: append to the payer proof stream
+    Engine->>Ledger: apply proofs at the authenticated head
     AP->>Engine: ExecuteChargeIntent(intent id only)
     Engine->>Engine: the execution predicate — one gate
     Note over Engine: its clauses have exactly one owner, below.<br/>A refusal here mutates no provider.
@@ -1156,7 +1159,7 @@ sequenceDiagram
     participant Exec as permit-gated executor<br/>(isolated capability)
     participant Rail as the selected rail<br/>(the same provider, always)
     participant Other as any second rail<br/>(never reached)
-    participant Ledger as append-only ledger<br/>(this repository)
+    participant Ledger as ms_billing<br/>(db — settled history append-only, INV-011)
 
     Engine->>Exec: one permit, one frozen plan step
     Note over Exec: egress is marked durably BEFORE the first send.<br/>SDK network retries 0, redirects off, second transmission refused.
