@@ -34,7 +34,9 @@ import (
 //
 // Skips with t.Skipf if Docker isn't reachable (no Docker daemon, or
 // permission denied). This makes the test suite tolerant of CI
-// environments that gate Docker access.
+// environments that gate Docker access — but a skipped integration
+// package still reports "ok", so set REQUIRE_DOCKER=1 to turn an
+// unreachable daemon into a failure wherever the green is load-bearing.
 func NewTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -52,10 +54,14 @@ func NewTestDB(t *testing.T) *pgxpool.Pool {
 		),
 	)
 	if err != nil {
-		if isDockerUnavailable(err) {
+		switch dockerDisposition(err, os.Getenv("REQUIRE_DOCKER")) {
+		case dispositionSkip:
 			t.Skipf("docker not available: %v", err)
+		case dispositionRequired:
+			t.Fatalf("REQUIRE_DOCKER is set but docker is not available: %v", err)
+		default:
+			t.Fatalf("start postgres container: %v", err)
 		}
-		t.Fatalf("start postgres container: %v", err)
 	}
 	t.Cleanup(func() {
 		// Terminate uses a fresh context — t.Cleanup runs after the
@@ -134,6 +140,39 @@ func projectRoot() (string, error) {
 		}
 		dir = parent
 	}
+}
+
+// disposition names what NewTestDB does with a container-start error.
+type disposition int
+
+const (
+	// dispositionFail: the error is not about Docker being absent, so it
+	// is a real failure however the run was configured.
+	dispositionFail disposition = iota
+	// dispositionSkip: Docker is unreachable and the run tolerates it.
+	dispositionSkip
+	// dispositionRequired: Docker is unreachable but the run asserted it
+	// would be present.
+	dispositionRequired
+)
+
+// dockerDisposition decides how an ephemeral-Postgres start failure is
+// reported. It is split out from NewTestDB, and takes REQUIRE_DOCKER's
+// value rather than reading the environment, so the decision itself is
+// testable without an unreachable daemon.
+//
+// The rule it encodes: a skipped integration package still prints "ok",
+// so a green from a run that asserted Docker (REQUIRE_DOCKER=1, set by
+// `make test-integration`) must never be produced by a package that
+// started no container.
+func dockerDisposition(err error, requireDocker string) disposition {
+	if !isDockerUnavailable(err) {
+		return dispositionFail
+	}
+	if requireDocker != "" {
+		return dispositionRequired
+	}
+	return dispositionSkip
 }
 
 // isDockerUnavailable returns true when err looks like a Docker-not-
