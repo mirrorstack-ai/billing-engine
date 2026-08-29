@@ -52,7 +52,9 @@ make it impossible, and nothing here claims they do.
 >
 > 🔴 **A customer-visible infrastructure line carries a markup its own displayed
 > unit price does not include.** INV-010 says infrastructure is not a customer
-> charge dimension, and §6 owns that rule and the present state, with paths.
+> charge dimension, and §6 owns that rule and the present state, with paths. The
+> remedy is settled — fold the line into a published base price (§12, decision
+> 15) — and the migration has not shipped, so the bill still carries it.
 >
 > The single enumeration of current defects is
 > [`SECURITY.md` § Known current gaps](../SECURITY.md#known-current-gaps). This
@@ -1316,8 +1318,10 @@ through `AppInfraBill` and `AppModuleInfraBill`
 you is pre-markup COGS, while `ChargedMicros` carries the 1.2 multiplier
 (`internal/account/usage/types.go:446-448`). Quantity times the displayed unit
 price does not equal the charge, so a customer who checks the arithmetic on a
-infrastructure line finds it wrong. **Until that is resolved, "the engine cannot charge
-you for infrastructure" is a claim about the target and not about your invoice.**
+infrastructure line finds it wrong. The direction is settled — the line and its
+markup fold into a published base price (§12, decision 15) — but the migration has
+not shipped. **Until it does, "the engine cannot charge you for infrastructure" is
+a claim about the target and not about your invoice.**
 
 Two seeds are dead and must not be cited as evidence about this plane: migration
 017's `infra.compute.ms` row was removed by `022_drop_compute_alias.up.sql`, and
@@ -1954,12 +1958,28 @@ is left **TBD** here rather than invented.
     exportable per provider. And the retention, export, deletion and access
     rules for financial, provider and personal data. Blocks G1, G3
     and G4: §8 refuses aggregate provider objects by default.
-15. **Responsibility transfer, and the infrastructure line.** Payer and organization
-    transfer cutoffs and the source-linked treatment of retained old-payer
-    obligations — never liability reassignment. And whether the infrastructure line and
-    its 12/10 markup is disclosed, folded into a published base price, or
-    removed. Blocks G1 and G2: §6 and INV-010 disagree with the shipped code
-    until the second half is decided.
+15. **Responsibility transfer.** Payer and organization transfer cutoffs and the
+    source-linked treatment of retained old-payer obligations — never liability
+    reassignment. Blocks G1.
+
+    The infrastructure half of this decision is **settled**: the line and its
+    12/10 markup are folded into a published base price, not disclosed and not
+    left as a separate customer line. That is the direction INV-010 already
+    describes, so the target does not change — only the migration does. What
+    remains is execution, and none of it is decided here:
+
+    - the new published base price, and whether one price replaces the flat
+      per-app base or sits beside it;
+    - whether existing accounts are re-priced at their next boundary or
+      grandfathered, and for how long;
+    - the notice each affected customer must receive before the first boundary
+      that charges the new price;
+    - whether the infra metrics keep being measured for internal margin
+      analysis after they stop being rated — §6 says they may, as internal
+      cost only.
+
+    Until that migration ships, the shipped bill still carries the line and the
+    markup. See [`SECURITY.md`](../SECURITY.md#known-current-gaps).
 16. **Consent authority, and reads you can verify yourself.** Whether
     billing-engine must be able to distrust `api-platform` about who accepted a
     charge, and about who may read the evidence.
