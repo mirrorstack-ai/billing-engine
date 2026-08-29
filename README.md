@@ -56,7 +56,7 @@ deployed boundary, each citable in the tree:
 ```mermaid
 flowchart LR
     Browser["Customer browser"] --> AP["api-platform<br/>(authenticated routes)"]
-    AP -->|"prod: IAM lambda.Invoke<br/>dev: X-MS-Internal-Secret"| API["cmd/account-api"]
+    AP -->|"prod: IAM lambda.Invoke<br/>dev: X-MS-Internal-Secret"| API["billing-engine"]
     SDK["Module SDK ingress"] -->|"X-MS-Meter-Secret<br/>RecordUsage only"| API
     Stripe["Stripe"] -->|"Stripe-Signature verified"| WH["cmd/account-webhook"]
     Stripe -->|"partner event bus"| EB["cmd/account-webhook-eventbridge"]
@@ -132,14 +132,281 @@ migration wins and the doc is the bug.
 ## The target design, in one page
 
 Five customer money journeys are specified in
-[`docs/DESIGN.md#4-intent-lifecycle`](docs/DESIGN.md#4-intent-lifecycle). None is
-a deployed guarantee.
+[`docs/DESIGN.md#4-intent-lifecycle`](docs/DESIGN.md#4-intent-lifecycle). Each
+gets a diagram below.
 
-1. Bind a card for recurring use.
-2. Buy credit.
-3. Auto top-up a credit wallet from a saved mandate.
-4. Start or change a card-backed subscription.
-5. Close a module usage period and open the new one.
+> 🔴 **Read every one of the five as a specification.** None is deployed, and
+> none is a guarantee you hold today. Each diagram is written in "must" for that
+> reason. Every durable type they name returns zero files from
+> `git grep <Type> -- '*.go'` on `main`
+> ([`docs/DESIGN.md#3-the-durable-model`](docs/DESIGN.md#3-the-durable-model)).
+
+---
+
+### Flow 1 · bind a card for recurring use
+
+Saving a card must be the cheapest thing you can do with money, in the sense
+that it moves none. This is the flow the other four depend on, so it is the one
+whose blast radius must stay smallest.
+
+**Target, not deployed.** `PaymentMethodSetup` and its receipt are unbuilt.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant AP as api-platform<br/>(private caller)
+    participant Engine as billing-engine<br/>(this repository)
+    participant Stripe as Stripe<br/>(payment provider)
+    participant DB as ms_billing<br/>(append-only ledger)
+
+    You->>AP: save a card for later
+    AP->>Engine: begin payment-method setup
+    Engine->>DB: seal an immutable PaymentMethodSetup
+    Engine-->>AP: engine-signed disclosure, including "no debit"
+    AP-->>You: the same bytes, relayed unchanged
+    You->>Engine: factor proof, through the consent edge
+    Engine->>DB: freeze the no-debit setup plan
+
+    Note over Engine,Stripe: the setup plan holds at most one mandate_setup step.<br/>That effect class may create only the accepted<br/>reusable mandate scope. It never holds and never debits.
+
+    Engine->>Stripe: authorize step 1 of the frozen plan
+    You->>Stripe: card details, direct to the provider
+    Stripe-->>Engine: mandate reference + verified readable identity
+    Engine->>DB: PaymentMethodSetupReceipt, after re-applying the proof head
+```
+
+Three things this diagram makes obvious:
+
+- **No arrow in it creates authority to charge you.** Step 8 authorizes one
+  `mandate_setup` step and nothing more. Subscription and auto top-up must each
+  request their own authority against that mandate later. The effect classes are enumerated in
+  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
+- **Step 5 is a relay, not an author.** The disclosure is signed by the engine,
+  and `api-platform` must pass the bytes through unchanged. Your acceptance in
+  step 6 must bind to a factor the private caller cannot mint —
+  [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
+- 🔴 **Step 11 is where today's code diverges, and it costs you a billing
+  period.** A Stripe `payment_method.attached` event currently stamps
+  `accounts.activated_at`, so saving a card starts a cycle. It is filed in
+  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
+
+---
+
+### Flow 2 · buy credit
+
+A one-time, customer-present purchase of stored value. It is the simplest money
+movement in the set, which makes it the clearest place to see who is allowed to
+decide the amount.
+
+**Target, not deployed.** `ChargeIntent` and `FundingPlan` are unbuilt.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant AP as api-platform<br/>(private caller)
+    participant Engine as billing-engine<br/>(this repository)
+    participant Stripe as Stripe<br/>(payment provider)
+    participant DB as ms_billing<br/>(append-only ledger)
+
+    You->>AP: top up my wallet
+    AP->>Engine: ProposeChargeIntent(payer, credit_purchase, ProposalSelection)
+
+    Note over AP,Engine: the caller sends a signed catalog revision and one<br/>declared choice field — never an amount, price, tax,<br/>currency, provider, or execution time. This is INV-001.
+
+    Engine->>DB: derive lines, tax, funding plan and rail, then seal the intent
+    Engine-->>AP: intent id + engine-signed disclosure
+    AP-->>You: the same bytes, relayed unchanged
+    You->>Engine: CustomerAcceptanceProof, through the proof inbox
+    AP->>Engine: ExecuteChargeIntent(intent id)
+    Engine->>DB: acquire the settlement claim
+    Engine->>Stripe: one consumed permit, one debit request
+    Stripe-->>Engine: verified debit evidence
+    Engine->>DB: append the ledger transaction and grant the credit lot
+```
+
+Three things this diagram makes obvious:
+
+- **Step 7 carries an id, and that is the whole design.** The scheduler queues
+  an intent id only. What must hold before step 9 has exactly one owner,
+  [`docs/DESIGN.md#executechargeintent`](docs/DESIGN.md#executechargeintent),
+  and this page does not repeat its clauses.
+- **The amount you typed enters as a choice, not as a price.** The engine
+  re-derives currency, lines, tax and eligibility from the template it signed.
+  A caller's approval statement has no effect —
+  [`docs/DESIGN.md#inv-001`](docs/DESIGN.md#inv-001).
+- **A credit purchase must never be funded by credit.** For this kind
+  `walletFunding = 0` and `providerRemainder = grossObligation`, so the wallet
+  cannot buy itself. The kind-specific equations are in
+  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#8-what-customers-may-be-charged-for).
+
+---
+
+### Flow 3 · auto top-up a credit wallet from a saved mandate
+
+The only flow in the set with nobody present. That absence is the entire
+difficulty: there is no acceptance to check at the moment of the debit, so
+something else must carry the authority.
+
+**Target, not deployed.** `AutoTopupTriggerReservation` and `NoticeReceipt` are
+unbuilt. Read the first bullet after the diagram before the diagram itself.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant AP as api-platform<br/>(private caller)
+    participant Engine as billing-engine<br/>(this repository)
+    participant Stripe as Stripe<br/>(payment provider)
+    participant DB as ms_billing<br/>(append-only ledger)
+
+    AP->>Engine: usage ingest or balance read
+    Engine->>DB: append a trigger fact only, never a collection
+    Engine->>DB: lock the payer balance row and take one trigger reservation
+    Engine->>DB: seal an auto_topup intent under its standing authorization
+
+    Note over Engine,You: nobody is present, so eligibility must rest on terminal<br/>notice-delivery evidence plus the published wait — never on<br/>a live acceptance. Delivery is not proof anyone read it.
+
+    Engine->>You: the sealed intent bytes, through an allowed carrier
+    Engine->>DB: NoticeReceipt, only on carrier-signed delivery evidence
+
+    loop retries with backoff, until eligibilityNotBefore passes
+        Engine->>Engine: re-check revocation, ceilings and the proof head
+    end
+
+    Engine->>DB: consume the trigger reservation and re-lock the balance
+    Engine->>Stripe: one consumed permit, one debit against the saved mandate
+    Stripe-->>Engine: verified debit evidence
+    Engine->>DB: grant credit, close the trigger epoch, append the ledger
+```
+
+Four things this diagram makes obvious:
+
+- 🔴 **Step 1 must not be able to reach step 9, and today it can.** A nominal
+  billing-status read can reach the auto-top-up executor and collect from a
+  saved payment method. It is the register's most serious entry —
+  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
+- **Step 3 is a reservation, not a counter.** Two concurrent triggers cannot
+  both pass, because the trigger key is unique and the predicate is recomputed
+  under the same lock at consume time —
+  [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
+- **The wait in the loop starts at delivery, not at sealing.** A late delivery
+  moves eligibility later, so the waiting period can never be consumed before
+  the notice arrives — [`docs/DESIGN.md#inv-005`](docs/DESIGN.md#inv-005).
+- 🔴 **The minimum lead time is not a number yet.** It is an open product
+  decision published through `Capabilities`, never a hidden deployment constant
+  ([`docs/DESIGN.md#12-open-product-decisions`](docs/DESIGN.md#12-open-product-decisions)).
+  Turning on general billing must never turn this flow on.
+
+---
+
+### Flow 4 · start or change a card-backed subscription
+
+Recurring money, on a rail that offers to run the recurrence for us. Declining
+that offer is the point of the flow.
+
+**Target, not deployed.** `ProviderExecutionPlan` and `PaymentAttempt` are
+unbuilt, and `SubscriptionOffer` has only a live stub.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant AP as api-platform<br/>(private caller)
+    participant Engine as billing-engine<br/>(this repository)
+    participant Stripe as Stripe<br/>(payment provider)
+    participant DB as ms_billing<br/>(append-only ledger)
+
+    You->>AP: start this plan
+    AP->>Engine: ProposeChargeIntent(subscription_start, offer id)
+    Engine->>DB: lock the accepted responsibility and schedule generation
+    Engine->>DB: seal first-period lines, tax, rail and a finite provider plan
+    Engine-->>AP: intent id + engine-signed disclosure
+    AP-->>You: the same bytes, relayed unchanged
+    You->>Engine: CustomerAcceptanceProof, through the proof inbox
+
+    Note over Engine,DB: one sealed intent settles at most once, across every rail.<br/>The control is one durable settlement claim, taken by CAS —<br/>not per-adapter idempotency, which cannot see a second rail.
+
+    Engine->>DB: acquire the settlement claim
+    Engine->>Stripe: one consumed permit, one debit request
+    Stripe-->>Engine: verified debit evidence
+    Engine->>DB: append the ledger, then activate the window on a successful CAS
+```
+
+Three things this diagram makes obvious:
+
+- **Step 9 is one request, and that is a transport property.** Automatic SDK
+  and HTTP retries must be off, `MaxNetworkRetries` set to zero, and a guard at
+  the request boundary refuses a second send for that permit —
+  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
+- **Nothing in the picture lets Stripe schedule the next period.** The frozen
+  autonomy policy forbids provider-managed subscriptions, auto-advance, smart
+  retries, dunning debits and delayed capture. None of them can race your
+  revocation through the claim CAS in step 8.
+- **Changing the plan or the rail after the seal in step 4 is a new intent.** A sealed
+  intent is never edited, and a replacement carries new funding, digest,
+  disclosure and claim — [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
+
+---
+
+### Flow 5 · close a module usage period and open the new one
+
+The largest flow, and the only one where the money is discovered rather than
+requested. Millions of metered leaves must become one charge exactly once.
+
+**Target, not deployed.** `BillableSourceAllocation` and `ServiceAccrualExposure`
+are unbuilt.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant AP as api-platform<br/>(private caller)
+    participant Engine as billing-engine<br/>(this repository)
+    participant Stripe as Stripe<br/>(payment provider)
+    participant DB as ms_billing<br/>(append-only ledger)
+
+    AP->>Engine: RecordUsage — meter, module, integer quantity, occurrence time
+    Engine->>DB: reserve a service-accrual upper bound at admission
+
+    loop one transaction per batch, until the window high-watermark is met
+        Engine->>DB: claim at most maxSourceClaimBatch leaves into one draft
+        Engine->>DB: advance the durable membership checkpoint
+    end
+
+    Engine->>DB: seal barrier — verify root, count, and no competing claims
+    Engine->>DB: rate the window and seal one intent per compatible group
+    Engine->>You: notice, where the group settles on standing authority
+    Engine->>Stripe: one consumed permit for the sealed provider remainder
+    Stripe--)Engine: a result, or nothing at all
+
+    Note over Engine,Stripe: an ambiguous outcome must latch execution_unknown and<br/>keep the claim. It is resolved only by reading the same<br/>provider — never a second rail, and never by assertion.
+
+    Engine->>DB: append the ledger and open the next window
+```
+
+Four things this diagram makes obvious:
+
+- **Step 2 is at admission, and it is deliberately early.** Deferring the
+  ceiling to close would turn a prepaid wallet into an unauthorized credit
+  line, because the service is already rendered. 🔴 Product budgets are
+  alert-only today and never stop accrual
+  (`internal/account/budget/service.go:260`).
+- **The loop exists so close is not one enormous transaction.** Batches claim
+  leaves and checkpoint; only the small seal barrier in step 5 is
+  all-or-nothing. A leaf may enter one allocation lineage, enforced by a
+  database constraint — [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
+- **No arrow lets `api-platform` choose the grouping key.** The namespace is
+  derived inside the engine from accepted schedule and metric state, so a
+  regrouped call cannot make a source consumable twice.
+- **The latch after step 9 has no timeout release.** An operator may attach
+  evidence and still cannot clear it —
+  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5-payment-providers-are-adapters).
+
+---
+
+### What all five have in common
 
 Each money-moving journey must pass a single sealed intent id to one settlement
 contract. The caller must not be able to supply the amount, the funding split,

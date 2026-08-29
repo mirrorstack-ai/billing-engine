@@ -924,6 +924,51 @@ limits.
 
 ## 4. Intent lifecycle
 
+Nothing below runs on `main`. `ChargeIntent`, `NoticeReceipt`, and `PaymentAttempt`
+each return zero files from `git grep -- '*.go'`. Read every arrow as *must*.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant AP as api-platform<br/>(private caller)
+    participant Engine as billing-engine<br/>(this repository)
+    participant Notice as notice destination<br/>(customer-held)
+    participant Rail as payment provider<br/>(one selected rail)
+    participant Ledger as append-only ledger<br/>(outranks any callback)
+
+    AP->>Engine: DescribeCharge — facts only, never an amount
+    Engine-->>AP: provisional view only, no notifier and no rail
+    AP->>Engine: ProposeChargeIntent(payer, action or window)
+    Engine->>Engine: rate, select policy, seal
+    Note over Engine: a complete immutable intent with a digest,<br/>or a typed refusal. Never a monetary subset.
+    Engine-->>AP: sealed intent + digest
+    Engine->>Notice: the sealed intent bytes
+    Notice-->>You: the disclosure
+    loop notice retry, backoff, never busy-polled
+        Notice-->>Engine: delivery evidence
+    end
+    Note over Engine,Notice: the wait runs from DELIVERY, not from sealing. Its lead<br/>time is published by Capabilities (§12), never a deployment constant.
+    You->>Engine: CustomerAcceptanceProof<br/>(customer-present path, independent inbox)
+    AP->>Engine: ExecuteChargeIntent(intent id only)
+    Engine->>Engine: the execution predicate — one gate
+    Note over Engine: its clauses have exactly one owner, below.<br/>A refusal here mutates no provider.
+    Engine->>Rail: one permit, one request
+    Rail-->>Engine: core-verifiable debit evidence
+    Engine->>Ledger: settlement, credits, and claim close — one transaction
+    Engine-->>AP: receipt
+    AP-->>You: receipt
+```
+
+Three things the picture carries that the state machine below does not:
+
+- **The customer appears twice, and neither appearance is `api-platform`.**
+  Step 7 is a disclosure the engine sent. Step 9 is a proof it verified.
+- **One arrow reaches the provider.** The permit authorizing step 12 is spent by
+  the send, not by the reply.
+- **Step 11 is one box on purpose.** Its clauses are enumerated once, in
+  [`ExecuteChargeIntent`](#executechargeintent) below.
+
 The lifecycle is deliberately small. Provider step detail is a substate, never a
 second way to settle an intent.
 
@@ -1100,6 +1145,45 @@ for the prior step, the next plan index, and no conflicting step.
   also locks the accepted responsibility and schedule generation.
 - Missing or ambiguous prior evidence retains the claim. It must not advance,
   retry under a new identity, or create a replacement attempt.
+
+Every arrow below is unbuilt: `PaymentAttempt` and `ProviderExecutionPlan` return
+zero files from `git grep -- '*.go'`. This is what must happen.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Engine as billing-engine<br/>(this repository)
+    participant Exec as permit-gated executor<br/>(isolated capability)
+    participant Rail as the selected rail<br/>(the same provider, always)
+    participant Other as any second rail<br/>(never reached)
+    participant Ledger as append-only ledger<br/>(this repository)
+
+    Engine->>Exec: one permit, one frozen plan step
+    Note over Exec: egress is marked durably BEFORE the first send.<br/>SDK network retries 0, redirects off, second transmission refused.
+    Exec->>Rail: debit request
+    Rail--xExec: nothing — timeout, reset, or lease expiry
+    Exec->>Engine: no conclusive result
+    Engine->>Engine: watchdog latches submitted_unknown + execution_unknown
+    Note over Engine: the claim and every reservation are RETAINED. There is no<br/>timeout release, and no operator assertion clears the latch.
+    loop until provider-authoritative evidence, same operation, deterministic reference
+        Exec->>Rail: read the operation — READ ONLY
+        Rail-->>Exec: evidence, or nothing
+    end
+    alt evidence proves the debit
+        Engine->>Ledger: succeeded — commit and close the claim
+    else evidence proves it did not and cannot collect
+        Engine->>Ledger: voided — release claim and reservations
+    else no safe lookup, or contradictory evidence
+        Note over Engine: stays execution_unknown. That is a resting state.
+    end
+    Engine--xOther: never
+    Note over Engine,Other: a second rail needs a linked REPLACEMENT intent:<br/>new funding, digest, disclosure, proof, and claim.
+```
+
+- **The retry that is not drawn is the point.** Nothing follows step 2 to `Rail`.
+  One ambiguous timeout costs one investigation, not two charges.
+- **Steps 6 and 7 cannot collect.** They read the same operation at the same
+  provider, so the loop is safe while the claim is still held.
 
 ### Customer-triggered payment
 
