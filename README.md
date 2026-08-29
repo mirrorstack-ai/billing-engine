@@ -73,59 +73,365 @@ reviewed. No document on this branch authorizes a production rollout.
 
 ---
 
-## The target boundary
+## The target customer money flows
 
-> **Target sequence, not current production:** current `main` still has the
-> direct Stripe-writing paths described above. This flow is not deployed until
-> every legacy money path is removed and the readiness gates pass.
+> **Target sequences, not current production:** current `main` still has the
+> direct Stripe-writing paths described above. None of these flows is a deployed
+> guarantee until every legacy money path is removed and the readiness gates
+> pass.
+
+These are separate flows shown in reading order, not one mandatory chain. Auto
+top-up depends on a saved payment mandate. Card-backed PaaS subscription depends
+on a saved mandate plus separate SaaS authority. Credit purchase is optional.
+Period close depends on an accepted subscription and its period anchor.
+Money-moving flows invoke the same exact-settlement contract, shown once after
+flow 5 so their customer-specific parts stay readable.
+
+| customer term | current API value | target funding rule |
+|---|---|---|
+| card-backed PaaS | `standard` | reserve eligible credit lots before notice, collect only the sealed provider remainder, then commit both atomically |
+| prepaid wallet | `credits` | settle the full intent from the wallet; insufficient authorized credit refuses with no card fallback |
+| PaaS credit | not a mode | a possible subscription allowance/benefit; it cannot silently change the funding mode |
+
+The older internal `arrears`/`prepaid` risk state is also separate from these two
+customer funding modes. Every amount is integer minor units in one named
+currency. Credit lots fund only compatible currency/line kinds. Cross-currency
+use requires a separate disclosed FX intent; a provider adapter never converts
+silently.
+
+The target evaluates gross service/accrual caps, wallet-credit application,
+net external collection caps, and auto-top-up funding caps separately. A small
+provider remainder cannot hide a gross obligation above the customer's service
+limit.
+
+### 1 · Bind a card for recurring use
+
+Card binding creates a reusable provider mandate and a verifiable setup receipt.
+It creates no debit and no `BillingAuthorization`. Subscription and auto top-up
+later request their own bounded authority against that mandate.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Customer
-    participant Private as MirrorStack private services<br/>/ module SDK
-    participant Engine as billing-engine<br/>(public intent boundary)
-    participant Executor as Isolated payment executor
-    participant Provider as Payment provider<br/>(Stripe / NewebPay)
-    participant Verifier as Public offline verifier
+    participant Engine as billing-engine<br/>(customer-reachable route)
+    participant Executor as Isolated intent executor
+    participant Provider as Capability-tested payment provider
 
-    Customer->>Engine: accept bounded BillingAuthorization<br/>(scope, currency, caps, and notice rules)
-    Engine-->>Customer: authorization receipt + digest
-    Customer->>Private: use an accepted platform or module capability
-    Private->>Engine: record constrained usage facts
-    Note over Private,Engine: The private caller cannot send an amount,<br/>price, tax result, payment method, provider,<br/>notice claim, or execution time.
-    Engine->>Engine: append immutable facts and rate with<br/>accepted prices, final tax, and credits
-    Private->>Engine: ProposeChargeIntent(payer, action/window)
-    Note over Engine: Any unresolved price, tax, notice, or authority<br/>is a typed non-executable result.
-    Engine->>Engine: create and seal immutable ChargeIntent
-    Engine-->>Customer: deliver exact intent, digest, lines,<br/>tax, and execute-not-before time
-    Engine->>Engine: record NoticeReceipt and schedule<br/>eligibility at executeNotBefore
-    Engine->>Executor: ExecuteChargeIntent(intent ID only)
-    Executor->>Engine: reload all gates and atomically acquire<br/>one cross-provider settlement claim
-    Engine-->>Executor: AuthorizedPayment with sealed amount,<br/>currency, frozen rail, and deterministic reference
-    Note over Executor,Provider: Only the isolated executor has<br/>payment-provider write credentials.
-    Executor->>Provider: execute the frozen operation
-    Provider-->>Executor: authoritative exact-success evidence
-    Executor->>Engine: append attempt + balanced settlement<br/>+ ChargeReceipt
-    Engine-->>Customer: receipt + canonical verification bundle
-    Customer->>Verifier: verify charge-bundle.json offline
-    Verifier-->>Customer: recomputed total, policies,<br/>build identity, and evidence
+    Customer->>Engine: Open recurring-payment setup
+    Engine->>Engine: Create pending immutable PaymentMethodSetup with merchant,<br/>rail capability digest, nonce/state, and expiry
+    Engine-->>Customer: Show its digest, provider + billing entity, reusable/off-session<br/>storage scope, revocation, and “no debit” disclosure
+    Customer->>Engine: Accept the same setup digest + payer-bound challenge
+    Engine->>Engine: Append CustomerAcceptanceReceipt<br/>and activate PaymentMethodSetup
+    Engine->>Executor: Execute PaymentMethodSetup(setup ID only)
+    Executor->>Engine: Acquire setup lease and append frozen MandateSetupAttempt
+    Engine-->>Executor: AuthorizedSetup scoped to a no-debit mandate operation
+    Executor->>Provider: Create reusable payment mandate
+    Provider-->>Customer: Collect card details and any challenge
+    Customer-->>Provider: Confirm with the provider
+    Provider-->>Executor: Authenticated callback or lookup signal
+    Executor->>Provider: Read the known setup attempt by frozen reference
+    Provider-->>Executor: Opaque mandate reference + authoritative status
+    Executor->>Engine: Append attempt transition and bind mandate to setup digest
+    Engine-->>Customer: Saved-payment-method receipt
+    Note over Customer,Provider: This flow is offered only when the adapter proves<br/>a no-debit reusable-mandate capability.
 ```
 
-Only the isolated executor has a payment-provider write capability. It receives
-an intent id and reloads every precondition; it never accepts an amount from a
-caller.
+Card data goes to the provider, not through a private MirrorStack caller. Card
+binding also does not start a billing period. Subscription acceptance establishes
+the period anchor. Current source instead stamps `accounts.activated_at` from a
+Stripe `payment_method.attached` event; that coupling must be removed. If a rail
+requires an initial payment to create a reusable token, it must use an exact
+customer-authorized payment intent instead of this setup flow.
 
-The sequence shows the success path. Its fail-closed branches are detailed in
+### 2 · Buy credit once
+
+A one-time credit purchase is customer-present. The engine page shows the exact
+money paid and the exact credit received before the customer submits the same
+digest.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant Engine as billing-engine<br/>(customer-reachable route)
+    participant Settlement as Shared exact-settlement contract<br/>(shown after flow 5)
+
+    Customer->>Engine: Select a published credit package or amount
+    Engine->>Engine: Create pending one-time authorization ID,<br/>derive final tax, and seal credit_purchase ChargeIntent
+    Engine-->>Customer: Show sealed intent digest, exact payment + credit,<br/>terms, tax, currency, rail, restrictions, and expiry
+    Customer->>Engine: Submit sealed digest + payer-bound challenge
+    Engine->>Engine: Activate the pending one-time BillingAuthorization<br/>and append CustomerAcceptanceReceipt
+    Engine->>Settlement: Settle sealed credit_purchase intent
+    alt Exact settled ChargeReceipt
+        Settlement-->>Engine: ChargeReceipt
+        Engine-->>Customer: Purchase receipt + verification bundle
+    else No exact receipt
+        Settlement-->>Engine: Pre-mutation refusal or typed nonterminal attempt state
+        Engine-->>Customer: Show the exact state and controls<br/>without crediting the wallet
+    end
+```
+
+The customer submission is the exact disclosure and one-time authorization; a
+private RPC cannot perform it. The `CustomerAcceptanceReceipt` is challenge-bound,
+payer-bound, expiring, and replay-protected; it is not an engine-manufactured
+delivery claim. A separate cooling-off period remains a product decision. Credit
+becomes spendable only after verified settlement. A browser return is never
+success evidence.
+
+Current `StartCreditPurchase` can create and finalize an auto-advance Stripe
+invoice before the browser receives its client secret. The target replaces that
+prepare-and-charge ambiguity with an explicit describe, accept, then execute
+sequence. Unknown tax is a typed refusal, never a zero-tax purchase.
+
+### 3 · Enable recurring auto top-up
+
+Auto top-up reuses a saved mandate, but it does not reuse general SaaS billing
+authority. It has its own standing `BillingAuthorization`, digest, limits, notice
+rule, receipt, and revocation control.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant Observer as Threshold observer<br/>(no payment capability)
+    participant Engine as billing-engine<br/>(intent lifecycle)
+    participant Ledger as Append-only ledger / wallet
+    participant Settlement as Shared exact-settlement contract<br/>(shown after flow 5)
+
+    Customer->>Engine: Configure auto top-up with a saved mandate
+    Engine->>Engine: Derive pending standing BillingAuthorization
+    Engine-->>Customer: Show its digest, selected mandate + rail, threshold,<br/>amount/rule, currency, event/frequency/period caps, notice, and expiry
+    Customer->>Engine: Accept the same digest + payer-bound challenge
+    Engine->>Engine: Append CustomerAcceptanceReceipt<br/>and activate the authorization
+    Engine-->>Customer: Auto-top-up authorization receipt + disable control
+
+    Observer->>Engine: Append deduplicated threshold-crossing fact
+    Note over Observer,Engine: Scheduled observation may append a fact.<br/>Customer/API reads remain side-effect-free.
+    Engine->>Ledger: Acquire one outstanding top-up reservation<br/>(payer, wallet, currency, authorization, trigger epoch)
+    Ledger-->>Engine: New reservation or existing outstanding reservation
+    opt New reservation
+        Engine->>Engine: Derive final tax or not-applicable<br/>and seal one exact auto_topup intent
+        Engine-->>Customer: Deliver exact notice, digest,<br/>and execute-not-before time
+        Engine->>Engine: Record NoticeReceipt and schedule eligibility
+        Engine->>Settlement: After the wait, settle the sealed intent<br/>with its trigger reservation
+        alt Exact settled ChargeReceipt
+            Settlement-->>Engine: ChargeReceipt and closed trigger reservation
+            Engine-->>Customer: Top-up receipt + new ledger-derived balance
+        else No exact receipt
+            Settlement-->>Engine: Pre-mutation refusal or typed nonterminal attempt state
+            Engine-->>Customer: Show the exact state<br/>without creating a second top-up
+        end
+    end
+```
+
+Disabling auto top-up revokes its authorization and cancels every waiting intent
+that has not acquired its execution lease. It does not detach the card or change
+SaaS authority. A leased or `execution_unknown` attempt retains its claim and
+reservation until exact settlement or authoritative void proof. Pending funding
+counts in threshold evaluation, so two observations cannot create two top-ups.
+
+Today `GetServiceStatus`, `GetCreditStanding`, fresh usage ingress, and
+infrastructure synchronization can reach the auto-top-up executor. The target
+monitor above is deliberately incapable of doing that.
+
+### 4 · Create a SaaS subscription
+
+This is a proposed domain subscription, not a provider-native subscription.
+`billing-engine` owns the plan revision, period anchor, renewal schedule, and
+every exact charge. Stripe or NewebPay is only a settlement rail and cannot
+invent the next renewal amount.
+
+Current source has no `subscriptions` table or create/change/cancel route;
+requesting the subscription capability always reports it missing. The existing
+“New creation” billing group means app, module-add-on, and domain creation
+charges, not subscription creation. Those fragmented immediate/grace paths are
+consolidated into exact cycle intents in the target.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant Engine as billing-engine<br/>(subscription + intent core)
+    participant Ledger as Append-only ledger / wallet
+    participant Settlement as Shared exact-settlement contract<br/>(shown after flow 5)
+
+    Customer->>Engine: Select a published SaaS plan,<br/>start date, and billing mode
+    Engine->>Engine: Derive SubscriptionOffer with first-period rule,<br/>funding mode, future cadence, caps, and accepted revisions
+    Engine->>Engine: Derive pending immutable SaaS BillingAuthorization with<br/>mandate/rail or wallet-only rule, currency, charge kinds,<br/>notice policy, expiry/revocation, and gross/net bounds
+    Engine-->>Customer: Show subscription terms + OfferDigest<br/>(not a ChargeIntent digest)
+    Engine-->>Customer: Show exact SaaS authority + AuthorizationDigest
+    Customer->>Engine: Submit both unchanged digests<br/>with a payer-bound challenge
+    Engine->>Engine: Append acceptance receipt, activate that authorization,<br/>store the pending schedule + anchor, and create the draft intent
+    Engine->>Engine: Resolve final tax and complete every exact draft line
+    Engine->>Ledger: Reserve exact compatible credit lots / authorized exposure<br/>for the draft intent before sealing
+    Ledger-->>Engine: Durable reservation or typed insufficient-credit refusal
+    alt Reservation acquired
+        Engine->>Engine: Seal subscription_start ChargeIntent containing<br/>platform_base, credits, tax, and total
+        Engine-->>Customer: Show the sealed first-intent digest + exact consequences
+        Customer->>Engine: Accept sealed digest + payer-bound challenge
+        Engine->>Engine: Append CustomerAcceptanceReceipt
+        opt Published recognition rule says the first obligation has accrued
+            Engine->>Ledger: Append line-aware obligation / receivable entries
+        end
+        Engine->>Settlement: Settle the sealed first intent
+        Settlement-->>Engine: ChargeReceipt, typed nonterminal state,<br/>or pre-mutation refusal
+        alt Exact settled ChargeReceipt
+            Engine->>Engine: Activate under the published rule
+            Engine-->>Customer: Subscription receipt + next renewal window
+        else No exact receipt
+            Engine-->>Customer: Keep the subscription pending and show the state<br/>without activation or a new attempt
+        end
+    else Reservation refused
+        Engine-->>Customer: Keep the subscription pending and show<br/>the credit or cap refusal
+    end
+```
+
+The first intent uses the shared settlement contract described after flow 5.
+Later renewals always create a new exact intent, notice, wait, and receipt; no
+provider-side subscription can calculate or collect a renewal independently.
+
+### 5 · Close module usage and open the new SaaS period
+
+At one account-period boundary, one consolidated intent contains the closed
+period's module usage and the newly opened period's SaaS base. This is where the
+new period's `platform_base` is proposed for settlement. Every line names its own
+service window and recognition rule. There is no infrastructure line and no
+per-usage-event payment.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant Meter as Module / platform meter
+    participant Engine as billing-engine<br/>(rater + intent core)
+    participant Ledger as Append-only ledger / wallet
+    participant Settlement as Shared exact-settlement contract<br/>(shown next)
+
+    Meter->>Engine: RecordUsage(event ID, subject, module version,<br/>declared metric, quantity, and event time)
+    Engine->>Engine: Validate the accepted manifest metric<br/>and append immutable UsageFact
+    Engine-->>Meter: Idempotent fact receipt
+    Note over Meter,Engine: Usage ingress sends no price, amount, tax,<br/>billing mode, payment method, or execution request.
+
+    Engine->>Engine: At the anchored boundary, close the previous period
+    Engine->>Engine: Create draft from closed-period module_usage<br/>+ new-period platform_base, each with its service window
+    Engine->>Engine: Resolve final tax and complete every exact draft line
+    Engine->>Ledger: Reserve exact currency-compatible credit lots<br/>and cap exposure before notice or sealing
+    Ledger-->>Engine: Durable reservation or typed refusal
+    alt Reservation acquired
+        Engine->>Engine: Freeze reservation + provider remainder<br/>and seal one exact cycle ChargeIntent
+        Engine->>Ledger: Append closed-period obligation / receivable entries<br/>under the accepted recognition policy
+        Engine-->>Customer: Deliver exact lines, tax, total, digest,<br/>and execute-not-before time
+        Engine->>Engine: Record NoticeReceipt and schedule eligibility
+        alt Card-backed PaaS
+            Engine->>Settlement: After the wait, settle with reserved credits<br/>and the sealed provider remainder
+        else Prepaid wallet
+            Engine->>Settlement: After the wait, settle the full amount<br/>from the reserved wallet with zero provider remainder
+        end
+        Settlement-->>Engine: ChargeReceipt, typed nonterminal state,<br/>or pre-mutation refusal
+        alt Exact settled ChargeReceipt
+            Engine-->>Customer: Cycle receipt + verification bundle
+        else No exact receipt
+            Engine-->>Customer: Show the exact state and service policy<br/>with no rail fallback
+        end
+    else Reservation refused
+        Engine-->>Customer: Show the credit or cap refusal<br/>without sealing an executable intent
+    end
+```
+
+### Shared exact-settlement contract for flows 2–5
+
+Each money-moving flow above passes only a sealed intent id to this contract.
+The caller cannot provide or revise an amount, funding split, provider, mandate,
+tax result, notice claim, or execution time.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Core as billing-engine<br/>(intent core)
+    participant Executor as Isolated intent executor
+    participant Ledger as Append-only ledger / wallet
+    participant Provider as Capability-tested payment provider
+
+    Core->>Executor: ExecuteChargeIntent(intent ID only)
+    Executor->>Core: Reload intent, authority, acceptance, applicable notice/wait,<br/>tax, caps, capabilities, and one settlement claim
+    alt A gate fails or an ambiguous attempt already exists
+        Core-->>Executor: Exact refusal or existing attempt state<br/>before any new provider mutation
+        Executor-->>Core: Return that typed state
+    else Gates pass and no ambiguous settlement exists
+        Core-->>Executor: Package-private AuthorizedSettlement with sealed<br/>reservations, provider remainder, currency, merchant, mandate, and rail
+        Executor->>Ledger: Validate and lock any sealed reservations
+        Ledger-->>Executor: Exact locked set or typed refusal
+        alt Reservation refused
+            Executor-->>Core: Return pre-mutation refusal
+        else Exact reservations locked
+            alt Sealed provider remainder is zero
+                Note over Executor,Provider: Wallet-only settlement performs no provider mutation.
+            else Sealed provider remainder is greater than zero
+                Executor->>Core: Request attempt for this AuthorizedSettlement
+                Core->>Ledger: Atomically append frozen PaymentAttempt<br/>before provider mutation
+                Ledger-->>Executor: AuthorizedPayment with attempt reference,<br/>exact amount/currency/merchant/mandate/rail
+                Executor->>Provider: Submit the frozen operation
+                Provider-->>Executor: Exact success/failure evidence,<br/>typed nonterminal state, or no conclusive reply
+            end
+            alt Exact success or zero provider remainder
+                Executor->>Core: Submit the authoritative outcome
+                Core->>Ledger: Atomically append success transition and provider evidence when present,<br/>balanced intent effects, provider clearing/receivable,<br/>applicable tax/revenue/rounding, ChargeReceipt, and any trigger close
+                Ledger-->>Executor: Exact ChargeReceipt
+                Executor-->>Core: Return ChargeReceipt
+            else Typed non-success result
+                Executor->>Ledger: Append exact state/evidence<br/>and its retain/release decision
+                Executor-->>Core: Return refusal, action_required, provider_pending,<br/>execution_unknown, failure, or void
+            end
+        end
+    end
+```
+
+Card-backed PaaS reserves eligible credits before exact notice and commits them
+only in the same transaction as verified provider settlement. Prepaid wallet
+commits the full reservation atomically with no provider call and no card
+fallback. Auto top-up may later fund the wallet only through flow 3; usage
+ingress and period close never invoke it synchronously.
+
+`action_required`, `provider_pending`, and `execution_unknown` are appended and
+returned as typed states while retaining the settlement claim and reservations.
+Customer completion or a callback can resume reconciliation only for that same
+frozen attempt; neither creates a new provider operation or rail fallback.
+`execution_unknown` records no ledger settlement or `ChargeReceipt`; whether the
+provider debited remains unknown until same-provider authoritative
+reconciliation. Authoritative failure/void releases the claim and reservations
+with append-only evidence. An unaccepted intent's reservation expires with that
+intent without mutating history or consuming wallet value.
+
+Failed collection does not erase accrued service. Closed-period usage remains a
+line-aware receivable. The new-period base accrues only if the accepted service
+start/cancellation policy says that period began; otherwise it is canceled or
+superseded without rewriting the closed usage lines.
+
+The current cycle already combines closed-period usage with several new-period
+fees, but it moves money directly, has no universal exact notice or final tax,
+and records the prepaid-wallet mixed boundary too coarsely. The target keeps each
+intent line and each allocated credit lot independently reproducible.
+
+Across all five flows, the isolated intent executor is the only component with a
+payment-provider write capability. Its setup operation accepts only a setup id
+and is available only for a capability-tested no-debit mandate operation. Its
+payment operation accepts only a sealed intent id, reloads every precondition,
+and receives the exact provider amount from the engine's package-private
+`AuthorizedSettlement`, never from a caller or wallet.
+
+The shared sequence shows the successful funding boundary and typed non-success
+handoff once. The full reconciliation state machine is detailed in
 [`docs/DESIGN.md` §4](docs/DESIGN.md#4-intent-lifecycle):
 
-- a missing gate or unavailable settlement claim refuses before any provider
-  mutation;
+- a missing gate, insufficient authorized credit, or unavailable settlement
+  claim refuses before any provider mutation;
 - authoritative proof that an operation did not and cannot collect appends void
   evidence with no debit and no automatic rail fallback; and
 - a timeout or conflict latches `execution_unknown`, retains the settlement
-  claim, and permits only same-provider read-only reconciliation. It creates no
-  settlement, receipt, retry, or provider fallback.
+  claim and any reservation, and permits only same-provider read-only
+  reconciliation. It records no ledger settlement or receipt and creates no
+  retry or provider fallback; whether the provider debited remains unknown.
 
 Read and write provider interfaces are separate. Support/reconciliation can
 trace Stripe or NewebPay evidence without possessing the capability to collect,
@@ -137,8 +443,14 @@ refund, void, trigger auto top-up, or otherwise mutate a provider.
 
 The domain model is:
 
+- `PaymentMethodSetup` and `MandateSetupAttempt`: a frozen, expiring,
+  capability-tested no-debit provider setup;
 - `BillingAuthorization`: bounded one-time or standing customer authority;
+- `CreditReservation`: a currency-compatible, uniquely constrained hold that is
+  not itself a debit;
 - `ChargeIntent`: the exact provider-neutral monetary proposal;
+- `CustomerAcceptanceReceipt`: replay-protected proof that the authenticated
+  payer submitted one exact digest on an engine-served route;
 - `NoticeReceipt`: evidence that the exact proposal was delivered;
 - `PaymentAttempt`: one provider-specific attempt and state history;
 - `ProviderEvidence`: read-only observations/callback proof from that rail;
@@ -169,14 +481,18 @@ immutable exact intent
 AND exact notice delivered
 AND public waiting period elapsed
 AND customer authorization still valid
-AND total within every ceiling
+AND gross obligation within service/accrual caps
+AND wallet application matches its reservation and cap
+AND net provider remainder within the external collection cap
+AND auto-top-up funding within its separate caps, when applicable
 AND tax final or explicitly not applicable
 AND every policy effective and digest-matching
 AND selected rail supports the exact operation/currency
+AND a frozen PaymentAttempt exists before provider mutation
 AND no prior/ambiguous settlement exists
 ```
 
-Anything else produces no provider mutation.
+Anything else produces no new provider mutation.
 
 Notice evidence proves delivery under a published rule. It does not prove a
 human read an email, and the product will not claim that it does.
