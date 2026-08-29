@@ -1133,7 +1133,7 @@ under a published rule you accepted.
 | `module_capacity` | installed-module capacity above the included tier, if product policy keeps it | versioned installation and timer facts | an immutable platform price-book revision | the cycle; never an immediate sweep |
 | `custom_domain` | the published domain feature, if product policy keeps it | immutable domain activation and active-window facts | an immutable platform price-book revision | the cycle; activation proration by a published rule |
 | `tax` | tax on the listed taxable lines | the frozen taxable basis plus your tax evidence | an immutable tax-policy revision and a versioned determination | before notice, before the seal |
-| 基礎設施 / `infra_total_micros` | **shipped today; not in the target vocabulary** — infrastructure as its own customer line, at cost × 1.2 | `infra.*` and `platform.*` usage rows | `ms_billing.metric_definitions` and `metric_model_prices` | a current-cycle read; the disclosure below |
+| infrastructure / `infra_total_micros` | **shipped today; not in the target vocabulary** — infrastructure as its own customer line, at cost × 1.2 | `infra.*` and `platform.*` usage rows | `ms_billing.metric_definitions` and `metric_model_prices` | a current-cycle read; the disclosure below |
 
 `ChargeIntent` (unbuilt) carries these lines; `FundingPlan` (unbuilt) says what
 pays for them. Prices, allowance, tier shape, grace windows and domain policy
@@ -1316,7 +1316,7 @@ through `AppInfraBill` and `AppModuleInfraBill`
 you is pre-markup COGS, while `ChargedMicros` carries the 1.2 multiplier
 (`internal/account/usage/types.go:446-448`). Quantity times the displayed unit
 price does not equal the charge, so a customer who checks the arithmetic on a
-基礎設施 line finds it wrong. **Until that is resolved, "the engine cannot charge
+infrastructure line finds it wrong. **Until that is resolved, "the engine cannot charge
 you for infrastructure" is a claim about the target and not about your invoice.**
 
 Two seeds are dead and must not be cited as evidence about this plane: migration
@@ -1492,7 +1492,7 @@ invoice finalization. If a NewebPay flow needs Taiwan invoice fields, the
 adapter receives the frozen permitted presentation data and must return evidence
 matching the sealed intent.
 
-Taiwan e-invoice (電子發票) issuance is an obligation the engine must satisfy
+Taiwan e-invoice issuance is an obligation the engine must satisfy
 before collecting in that market, and it is not behavior the engine has today.
 Issuance, numbering, retention and correction duties must be settled and
 recorded as an immutable policy revision (§12 item 10). The resulting invoice
@@ -1954,9 +1954,9 @@ is left **TBD** here rather than invented.
     exportable per provider. And the retention, export, deletion and access
     rules for financial, provider and personal data. Blocks G1, G3
     and G4: §8 refuses aggregate provider objects by default.
-15. **Responsibility transfer, and the 基礎設施 line.** Payer and organization
+15. **Responsibility transfer, and the infrastructure line.** Payer and organization
     transfer cutoffs and the source-linked treatment of retained old-payer
-    obligations — never liability reassignment. And whether the 基礎設施 line and
+    obligations — never liability reassignment. And whether the infrastructure line and
     its 12/10 markup is disclosed, folded into a published base price, or
     removed. Blocks G1 and G2: §6 and INV-010 disagree with the shipped code
     until the second half is decided.
