@@ -40,6 +40,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -49,6 +50,7 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
@@ -59,6 +61,8 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
+	intentstore "github.com/mirrorstack-ai/billing-engine/internal/intent/store"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -375,7 +379,74 @@ func buildService() *cycle.Service {
 		svc.WithBoundaryEstimateReconciler(coordinator).
 			WithWalletMutationObserver(coordinator)
 	}
-	return svc
+	return withIntentCutover(svc, pool, os.Getenv(intentCutoverEnv))
+}
+
+// intentCutoverEnv arms the intent cutover for every leg that has one.
+//
+// It must be set to the literal string below. A flag whose truthiness is
+// inferred from "1", "true" or "yes" would let a typo in a deploy
+// template stop this worker collecting, and a worker that proposes
+// collects nothing at all.
+const (
+	intentCutoverEnv   = "BILLING_CYCLE_INTENT_CUTOVER"
+	intentCutoverArmed = "propose-do-not-collect"
+)
+
+// withIntentCutover attaches the proposer seam, or leaves the service on
+// the legacy collecting path.
+//
+// 🔴 Arming this STOPS THIS WORKER COLLECTING. A cut-over leg derives
+// the same amount, seals it as an intent, stores it and returns — and
+// cmd/intent-executor, which holds the only write port, refuses to start
+// while any legacy money path remains. Nothing downstream picks the
+// intent up yet. So the flag's effect today is a revenue stop, not a
+// migration, and it exists to make the seam REACHABLE rather than to be
+// switched on.
+//
+// Until 2026-08-30 WithIntentProposer had no non-test caller at all: the
+// cutover branch in every leg was unreachable in production, and the two
+// legs described as "cut over" could not propose anything on a
+// deployed worker. That is the failure this function exists to make
+// impossible to repeat — the arming path is now exercised by a test
+// rather than asserted in a comment.
+func withIntentCutover(svc *cycle.Service, pool *pgxpool.Pool, flag string) *cycle.Service {
+	arm, err := intentCutoverDecision(flag)
+	if err != nil {
+		slog.Error("intent cutover flag is not a recognised value; refusing to start",
+			"env", intentCutoverEnv, "error", err)
+		os.Exit(1)
+	}
+	if !arm {
+		return svc
+	}
+	slog.Warn("INTENT CUTOVER ARMED — this worker will propose sealed intents and collect nothing",
+		"env", intentCutoverEnv)
+	return svc.WithIntentProposer(proposer.New(intentstore.New(pool)))
+}
+
+// errUnrecognisedCutoverFlag refuses a flag that is neither unset nor the
+// exact armed value.
+//
+// It refuses rather than defaulting to legacy on purpose. Defaulting
+// would make "BILLING_CYCLE_INTENT_CUTOVER=true" silently collect from
+// customers while an operator believed the worker was only proposing,
+// and a wrong belief about whether money is moving is worse than a
+// worker that will not start.
+var errUnrecognisedCutoverFlag = errors.New("unrecognised intent cutover flag")
+
+// intentCutoverDecision is the whole policy, as a pure function, so the
+// arming path can be exercised by a test instead of reasoned about.
+func intentCutoverDecision(flag string) (arm bool, err error) {
+	switch flag {
+	case "":
+		return false, nil
+	case intentCutoverArmed:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: %q (expected %q or unset)",
+			errUnrecognisedCutoverFlag, flag, intentCutoverArmed)
+	}
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The

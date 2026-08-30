@@ -217,6 +217,16 @@ func (s *Service) WithIntentProposer(p chargeProposer) *Service {
 	return s
 }
 
+// IntentProposerArmed reports whether the intent cutover seam is
+// attached to this service.
+//
+// It exists so a deployment test can prove the wiring, rather than a
+// comment asserting it. WithIntentProposer spent its first two legs
+// with no non-test caller: every cutover branch was unreachable in
+// production and nothing failed, because nothing could observe the
+// difference from outside the package.
+func (s *Service) IntentProposerArmed() bool { return s.proposer != nil }
+
 func (s *Service) WithCreditWallet(enabled bool) *Service {
 	s.walletEnabled = enabled
 	return s
