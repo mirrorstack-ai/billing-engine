@@ -27,16 +27,24 @@ import (
 // that could. The unit tests in internal/account/credit pin the
 // coordinator's side of that. This pins the other side, and the one a
 // unit test cannot: every read route, driven through the real router,
-// the real dispatcher, the real services and a real database, must make
-// no provider call at all.
+// the real dispatcher, the real services and a real database, must
+// change no provider state.
+//
+// Mutations, not calls. A read route that READS from the provider is a
+// latency and coupling question; one that WRITES holds a capability it
+// should not. This test was first named for "no provider call" while
+// asserting only the second, which overclaimed — a provider read would
+// have passed a test whose name said it could not. Verified by
+// injecting each in turn: a GetCustomer passes, a CreateDraftInvoice
+// fails.
 //
 // The provider client is a recorder rather than a fake returning zeros,
 // because "this read did not charge" is not something a fake can show —
 // the call has to be observed and classified. A read that creates a
-// draft invoice has left a customer-visible object behind and holds a
-// capability it should not, even though that call collects nothing, so
-// the assertion here is the stricter RequireNoProviderMutation.
-func TestReadRoutesMakeNoProviderCall(t *testing.T) {
+// draft invoice has left a customer-visible object behind even though
+// that call collects nothing, so the assertion is the stricter
+// RequireNoProviderMutation rather than RequireNoCollection.
+func TestReadRoutesMakeNoProviderMutation(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	recorder := stripetest.New()
 
@@ -124,7 +132,7 @@ func TestReadRoutesMakeNoProviderCall(t *testing.T) {
 // docs/VERIFICATION.md §5 requires that "dispatch metering reaches
 // RecordUsage and nothing else". Recording a fact must not itself move
 // money.
-func TestUsageIngressMakesNoProviderCall(t *testing.T) {
+func TestUsageIngressMakesNoProviderMutation(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	recorder := stripetest.New()
 
@@ -161,7 +169,7 @@ func TestUsageIngressMakesNoProviderCall(t *testing.T) {
 
 // The public health probe answers before any credential is presented,
 // so it must reach nothing at all.
-func TestHealthMakesNoProviderCall(t *testing.T) {
+func TestHealthMakesNoProviderMutation(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	recorder := stripetest.New()
 
@@ -178,7 +186,7 @@ func TestHealthMakesNoProviderCall(t *testing.T) {
 
 // Capabilities is a statement about the build. It must answer without
 // reaching a provider, and without a database.
-func TestCapabilitiesMakesNoProviderCall(t *testing.T) {
+func TestCapabilitiesMakesNoProviderMutation(t *testing.T) {
 	recorder := stripetest.New()
 	d := &dispatcher{}
 
