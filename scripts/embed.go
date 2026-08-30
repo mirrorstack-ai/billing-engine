@@ -16,3 +16,13 @@ import _ "embed"
 //
 //go:embed legacy-drop-preconditions.sql
 var LegacyDropPreconditions string
+
+// BillingCensus is scripts/billing-census.sql.
+//
+// Read-only by construction and asserted so by the same test. It answers how
+// much billing history production holds at all — the question that decides
+// whether DESIGN §11's shadow gate is VACUOUS (the rail never carried
+// traffic) or UNMET (history exists and the diagnostic cannot see it).
+//
+//go:embed billing-census.sql
+var BillingCensus string

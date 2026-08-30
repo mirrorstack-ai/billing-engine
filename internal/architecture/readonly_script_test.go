@@ -32,11 +32,25 @@ var mutatingVerb = regexp.MustCompile(
 // appearing in the file's own prose — which are unavoidable, since it
 // is a file about deletions — do not trip it.
 func TestLegacyDropPreconditionsAreReadOnly(t *testing.T) {
+	// Every operator script embedded into a binary that connects to
+	// production. Adding one to scripts/embed.go without adding it here
+	// would ship an unchecked script, so the list is the contract.
+	for _, name := range []string{
+		"legacy-drop-preconditions.sql",
+		"billing-census.sql",
+	} {
+		t.Run(name, func(t *testing.T) { assertScriptIsReadOnly(t, name) })
+	}
+}
+
+// assertScriptIsReadOnly is the check itself, run per script.
+func assertScriptIsReadOnly(t *testing.T, name string) {
+	t.Helper()
 	root, err := RepoRoot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(root, "scripts", "legacy-drop-preconditions.sql")
+	path := filepath.Join(root, "scripts", name)
 
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -79,15 +93,15 @@ func TestLegacyDropPreconditionsAreReadOnly(t *testing.T) {
 	}
 
 	if len(offending) > 0 {
-		t.Errorf("the precondition script contains %d mutating statement(s). It is run against "+
-			"production to decide whether a deletion is safe, and a script that can write can "+
-			"create the READY answer it reports:\n  %s",
-			len(offending), strings.Join(offending, "\n  "))
+		t.Errorf("%s contains %d mutating statement(s). It is run against production to "+
+			"decide whether a deletion is safe, and a script that can write can create the "+
+			"very answer it reports:\n  %s",
+			name, len(offending), strings.Join(offending, "\n  "))
 	}
 
 	// A file of nothing but comments would also contain no mutating
 	// statements. This is what stops the check passing on an empty one.
 	if selects == 0 {
-		t.Error("the precondition script asks no questions at all")
+		t.Errorf("%s asks no questions at all", name)
 	}
 }
