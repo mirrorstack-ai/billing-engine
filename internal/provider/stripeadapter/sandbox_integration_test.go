@@ -219,6 +219,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
 		Policy: "email/v1", TerminalStatus: "delivered",
+		DeliveredAt:          now.Add(-26 * time.Hour),
 		EligibilityNotBefore: now.Add(-2 * time.Hour), RevocationPathFresh: true,
 	}))
 	require.NoError(t, s.AdvanceState(ctx, sealed.Digest(), "proposed", "eligible"))
