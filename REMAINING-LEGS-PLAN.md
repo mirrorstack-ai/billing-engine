@@ -146,6 +146,34 @@ against it; the provider object is evidence, not the source of the figure.
 
 ---
 
+### 🔴 The receivable leg is DOWNSTREAM of the others — verified 2026-08-30
+
+`billing/unpaid.go` retries an invoice identified by `target.StripeInvoiceID`
+(`unpaid.go:222`) — a Stripe invoice the LEGACY rail created. There is no
+intent behind it.
+
+`collect_receivable` is defined by `CollectRemainderOf(source)`: it links to a
+source intent and collects what is left of it. **You cannot collect the
+remainder of an intent that does not exist.** Every unpaid invoice in the
+system today predates the intent rail, so there is nothing for a receivable to
+link to.
+
+So the order is forced, and it is not a matter of effort:
+
+1. other legs cut over AND **enabled**, so intents exist and settle;
+2. an unpaid invoice arises from one of those intents;
+3. THEN a receivable can link to it and collect the remainder.
+
+**This ties clause 2's completion to the production-access question.** Enabling
+any leg requires shadow reconciliation coming back explained (§11 puts it before
+cutover), and shadow reconciliation requires reading production billing history.
+So "cut over the unpaid-retry leg" is downstream of the read-only DB role
+decision, exactly as the legacy drop is.
+
+The primitives are built and proved (`collects` link, source-capacity
+reservation, funding formula) — what is missing is a source intent to point
+them at.
+
 ## `credit_purchase` — needs the disclosure mechanism
 
 §6: "your acceptance of engine-signed disclosure bytes naming currency, amount,
