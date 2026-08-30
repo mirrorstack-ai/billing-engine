@@ -455,6 +455,34 @@ type MsBillingAppModuleOverageTimer struct {
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 }
 
+type MsBillingBillingAuthorization struct {
+	ID                     string             `json:"id"`
+	Scope                  string             `json:"scope"`
+	SubjectKind            string             `json:"subject_kind"`
+	SubjectID              string             `json:"subject_id"`
+	Currency               string             `json:"currency"`
+	IntentDigest           pgtype.Text        `json:"intent_digest"`
+	ChargeKinds            []string           `json:"charge_kinds"`
+	PerChargeCeilingMicros int64              `json:"per_charge_ceiling_micros"`
+	PeriodCeilingMicros    int64              `json:"period_ceiling_micros"`
+	TermsRevision          string             `json:"terms_revision"`
+	PriceBookRevision      string             `json:"price_book_revision"`
+	NoticePolicy           string             `json:"notice_policy"`
+	EffectiveFrom          time.Time          `json:"effective_from"`
+	ExpiresAt              time.Time          `json:"expires_at"`
+	AcceptanceDigest       string             `json:"acceptance_digest"`
+	RevokedAt              pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt              time.Time          `json:"created_at"`
+	// The most attempts this authorization permits in its period. A COUNT, not an amount: many small attempts stay inside both micro ceilings and are still a runaway. Zero means unbounded and is only legal for a one-time authorization, which covers exactly one document by construction.
+	FrequencyCeiling   int32 `json:"frequency_ceiling"`
+	TriggerBelowMicros int64 `json:"trigger_below_micros"`
+	// The accepted top-up size. A ceiling says "no more than"; this says "exactly this". Zero means the authorization is not balance-triggered.
+	TopUpAmountMicros int64  `json:"top_up_amount_micros"`
+	Provider          string `json:"provider"`
+	MandateReference  string `json:"mandate_reference"`
+	NoticeLeadSeconds int64  `json:"notice_lead_seconds"`
+}
+
 type MsBillingBillingPeriod struct {
 	ID          string                       `json:"id"`
 	AccountID   string                       `json:"account_id"`
@@ -502,6 +530,47 @@ type MsBillingBudgetAlert struct {
 	FiredAt     time.Time `json:"fired_at"`
 }
 
+type MsBillingChargeIntent struct {
+	// Identity of the exact sealed document, over the canonical encoding in internal/intent/canonical.go. Also what a disclosure is bound to and what an acceptance receipt references.
+	Digest            string      `json:"digest"`
+	PayerKind         string      `json:"payer_kind"`
+	PayerID           string      `json:"payer_id"`
+	Currency          string      `json:"currency"`
+	Kind              string      `json:"kind"`
+	PriceBookRevision string      `json:"price_book_revision"`
+	TermsRevision     string      `json:"terms_revision"`
+	NoticePolicy      string      `json:"notice_policy"`
+	TaxJurisdiction   string      `json:"tax_jurisdiction"`
+	TaxRuleRevision   string      `json:"tax_rule_revision"`
+	TaxAmountMicros   int64       `json:"tax_amount_micros"`
+	SubtotalMicros    int64       `json:"subtotal_micros"`
+	TotalMicros       int64       `json:"total_micros"`
+	AuthorizationID   string      `json:"authorization_id"`
+	ExecuteNotBefore  time.Time   `json:"execute_not_before"`
+	ExecuteNotAfter   time.Time   `json:"execute_not_after"`
+	SupersedesDigest  pgtype.Text `json:"supersedes_digest"`
+	State             string      `json:"state"`
+	CreatedAt         time.Time   `json:"created_at"`
+	StateChangedAt    time.Time   `json:"state_changed_at"`
+	ReservedMicros    int64       `json:"reserved_micros"`
+}
+
+type MsBillingChargeIntentLine struct {
+	IntentDigest    string `json:"intent_digest"`
+	LineIndex       int32  `json:"line_index"`
+	Meter           string `json:"meter"`
+	Module          string `json:"module"`
+	ModuleVersion   string `json:"module_version"`
+	Quantity        int64  `json:"quantity"`
+	UnitPriceMicros int64  `json:"unit_price_micros"`
+	AmountMicros    int64  `json:"amount_micros"`
+}
+
+type MsBillingChargeIntentSourceFact struct {
+	IntentDigest   string `json:"intent_digest"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
 type MsBillingCreditAutoTopupConfig struct {
 	AccountID       string      `json:"account_id"`
 	Enabled         bool        `json:"enabled"`
@@ -540,6 +609,7 @@ type MsBillingCreditLedger struct {
 	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
 	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
 	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	ProposedReference             pgtype.Text `json:"proposed_reference"`
 }
 
 type MsBillingDeveloperSettlement struct {
@@ -555,6 +625,22 @@ type MsBillingDeveloperSettlement struct {
 	DeveloperOwedMicros int64                     `json:"developer_owed_micros"`
 	Status              string                    `json:"status"`
 	CreatedAt           time.Time                 `json:"created_at"`
+}
+
+type MsBillingIntentReceivableLink struct {
+	ReceivableDigest string    `json:"receivable_digest"`
+	SourceDigest     string    `json:"source_digest"`
+	ReservedMicros   int64     `json:"reserved_micros"`
+	ReservedAt       time.Time `json:"reserved_at"`
+}
+
+// INV-008 as a primary key: a second settlement of one intent is an integrity violation rather than a race the code must win.
+type MsBillingIntentSettlementClaim struct {
+	IntentDigest string             `json:"intent_digest"`
+	ClaimedBy    string             `json:"claimed_by"`
+	ClaimedAt    time.Time          `json:"claimed_at"`
+	Outcome      pgtype.Text        `json:"outcome"`
+	OutcomeAt    pgtype.Timestamptz `json:"outcome_at"`
 }
 
 type MsBillingInvoice struct {
@@ -619,6 +705,18 @@ type MsBillingModuleVisibility struct {
 	ModuleID   string                    `json:"module_id"`
 	Visibility MsBillingMarginShareClass `json:"visibility"`
 	UpdatedAt  time.Time                 `json:"updated_at"`
+}
+
+type MsBillingNoticeReceipt struct {
+	IntentDigest         string    `json:"intent_digest"`
+	DeliveredDigest      string    `json:"delivered_digest"`
+	Policy               string    `json:"policy"`
+	TerminalStatus       string    `json:"terminal_status"`
+	EligibilityNotBefore time.Time `json:"eligibility_not_before"`
+	RevocationPathFresh  bool      `json:"revocation_path_fresh"`
+	RecordedAt           time.Time `json:"recorded_at"`
+	// When the notice bytes arrived. The wait runs from here, and the accepted lead time is measured against it. NULL on rows written before migration 056, which therefore cannot satisfy the wait -- the right answer, since nothing recorded when their clock started.
+	DeliveredAt pgtype.Timestamptz `json:"delivered_at"`
 }
 
 type MsBillingOrgBillingDesignation struct {

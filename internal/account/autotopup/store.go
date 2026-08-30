@@ -248,6 +248,34 @@ func (s *pgxStore) AttachInvoice(ctx context.Context, attempt Attempt, invoice b
 	return current, nil
 }
 
+// MarkProposed stamps the intent-path terminal marker.
+//
+// The guard is status = 'pending', the same as Fail: an attempt that already
+// settled or failed is not ours to propose. A false return means the row was
+// not pending — the caller lost a race — rather than a silent overwrite of a
+// terminal state.
+func (s *pgxStore) MarkProposed(
+	ctx context.Context,
+	attempt Attempt,
+	intentReference string,
+) (bool, error) {
+	if intentReference == "" {
+		return false, errors.New("autotopup: a proposed attempt needs its intent reference")
+	}
+	_, err := s.q.MarkAutoTopUpProposed(ctx, db.MarkAutoTopUpProposedParams{
+		AttemptID:         attempt.ID.String(),
+		AccountID:         attempt.AccountID.String(),
+		ProposedReference: intentReference,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("mark auto top-up proposed: %w", err)
+	}
+	return true, nil
+}
+
 func (s *pgxStore) Fail(
 	ctx context.Context,
 	attempt Attempt,
