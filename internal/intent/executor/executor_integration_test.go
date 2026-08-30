@@ -235,7 +235,7 @@ func TestConcurrentExecutorsCollectExactlyOnce(t *testing.T) {
 	const racers = 6
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	settled, refused := 0, 0
+	settled, stopped := 0, 0
 
 	for i := 0; i < racers; i++ {
 		wg.Add(1)
@@ -246,19 +246,32 @@ func TestConcurrentExecutorsCollectExactlyOnce(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
-			case errors.Is(err, ErrAlreadyClaimed):
-				refused++
 			case err == nil && out.Settled:
 				settled++
-			case err != nil:
-				t.Errorf("unexpected error: %v", err)
+			case errors.Is(err, ErrAlreadyClaimed):
+				// Lost the claim.
+				stopped++
+			case err == nil && !out.Permitted:
+				// Lost to the PREDICATE instead: the winner had
+				// already advanced the intent past eligible. Two
+				// independent things stop a second settlement, and
+				// which one wins is a matter of timing.
+				stopped++
+			default:
+				t.Errorf("a racer neither settled nor was stopped: out=%+v err=%v", out, err)
 			}
 		}()
 	}
 	wg.Wait()
 
+	// What matters is that exactly one settled and the provider was
+	// touched once. An earlier version also asserted that every loser
+	// lost at the CLAIM, which made it timing-dependent: CI showed a
+	// racer that evaluated after the winner advanced the state and was
+	// refused by the predicate instead. Both are correct stops, and
+	// pinning which one wins tests the scheduler rather than the code.
 	require.Equal(t, 1, settled, "more than one executor settled the same intent")
-	require.Equal(t, racers-1, refused)
+	require.Equal(t, racers-1, stopped, "a racer was neither settled nor stopped")
 	require.Equal(t, 1, collector.count(), "the provider was called more than once for one intent")
 }
 
