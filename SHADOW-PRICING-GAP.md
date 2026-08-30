@@ -93,7 +93,44 @@ reach the historical price at all.
 | C. Reconcile only tier-1 usage, quarantine the rest explicitly | small | coverage — §11 closes over a subset, and that must be stated |
 | D. Add `Model` to `PriceKey` + `FactsFor`, then A or C | large | touches the sealed digest's key space |
 
-## What the four new census counts decide
+## ✅ MEASURED 2026-08-31 — the counts came back, and two of this file's claims were WRONG
+
+    metric_model_prices             26     events_without_account            50
+    aggregates_with_module_version   0     events_inside_a_rolled_period   6937
+    aggregates_with_model            6     periods_with_aggregates            2
+    aggregates_priced_nonzero       10
+
+**🔴 Correction 1 — the fallback is NOT needed, and INV-002 need not be
+weakened.** This file claimed facts carry a non-empty `module_version`, so a
+tier-3 catalog price keyed `{meter, module, ""}` would never match an exact
+lookup. **Wrong.** `aggregates_with_module_version` is **0** — no aggregate
+carries one. `FactsFor` therefore emits `PriceKey{meter, module, ""}` for every
+row, and a tier-3 catalog entry keyed the same way matches EXACTLY.
+
+So **option A is unnecessary**. `UnitPriceMicros` keeps single-path resolution,
+and INV-002 survives intact. What was framed as the hard decision does not
+arise.
+
+**🔴 Correction 2 — tier 2 is REQUIRED, not contingent.**
+`aggregates_with_model` is **6 of 12**. Half the priced usage resolved through
+`metric_model_prices`, which `intent.PriceKey` cannot express. **Option D is
+mandatory for that half**, not an option to be avoided if the count came back
+zero. It came back non-zero.
+
+Tier 1 is dead weight: it has never priced anything, because no aggregate
+carries a version. That is consistent with no module version ever having been
+published.
+
+**Revised plan, and it is now mostly mechanical:**
+
+1. Add `Model` to `intent.PriceKey` and carry it in `FactsFor` (option D).
+2. Build the price book from tier 2 and tier 3, keyed exactly — no fallback.
+3. Keep tier 1 in the book for correctness; it contributes nothing today.
+
+Step 1 touches the sealed digest's key space and still wants an owner's eye.
+Steps 2 and 3 are additive.
+
+## What the four new census counts decided
 
 `metric_model_prices`, `aggregates_with_module_version`,
 `aggregates_with_model`, `aggregates_priced_nonzero`.
