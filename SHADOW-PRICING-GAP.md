@@ -93,7 +93,82 @@ reach the historical price at all.
 | C. Reconcile only tier-1 usage, quarantine the rest explicitly | small | coverage — §11 closes over a subset, and that must be stated |
 | D. Add `Model` to `PriceKey` + `FactsFor`, then A or C | large | touches the sealed digest's key space |
 
-## What the four new census counts decide
+## ✅ MEASURED 2026-08-31 — the counts came back, and two of this file's claims were WRONG
+
+    metric_model_prices             26     events_without_account            50
+    aggregates_with_module_version   0     events_inside_a_rolled_period   6937
+    aggregates_with_model            6     periods_with_aggregates            2
+    aggregates_priced_nonzero       10
+
+**🔴 Correction 1 — the fallback is NOT needed, and INV-002 need not be
+weakened.** This file claimed facts carry a non-empty `module_version`, so a
+tier-3 catalog price keyed `{meter, module, ""}` would never match an exact
+lookup. **Wrong.** `aggregates_with_module_version` is **0** — no aggregate
+carries one. `FactsFor` therefore emits `PriceKey{meter, module, ""}` for every
+row, and a tier-3 catalog entry keyed the same way matches EXACTLY.
+
+So **option A is unnecessary**. `UnitPriceMicros` keeps single-path resolution,
+and INV-002 survives intact. What was framed as the hard decision does not
+arise.
+
+**🔴 Correction 2 — tier 2 is REQUIRED, not contingent.**
+`aggregates_with_model` is **6 of 12**. Half the priced usage resolved through
+`metric_model_prices`, which `intent.PriceKey` cannot express. **Option D is
+mandatory for that half**, not an option to be avoided if the count came back
+zero. It came back non-zero.
+
+Tier 1 is dead weight: it has never priced anything, because no aggregate
+carries a version. That is consistent with no module version ever having been
+published.
+
+**🔴 Correction 3 — and this one reverses Correction 1's conclusion.**
+
+Correction 1 said a tier-3 entry keyed `{meter, module, ""}` would match
+exactly, so no fallback was needed. The MATCHING claim is true. The
+CONSTRUCTION claim is false: `NewPriceBookRevision` rejects any key with an
+empty `ModuleVersion` —
+
+    ErrPriceKeyIncomplete = "intent: price book key is missing a
+                             meter, module or version"
+
+Verified by probe against the real type, not by reading:
+
+    version-blind key -> err = intent: price book key is missing a
+                               meter, module or version: mod@/m
+
+So the key that would match **cannot be put in a price book at all**. That
+validation is deliberate — the type's own doc says a book "with holes needs a
+fallback, and a fallback is a second pricing implementation, the thing INV-002
+exists to forbid" — and it requires a version because reproducible pricing is
+the whole claim.
+
+**The real shape of the gap:** production's usage is entirely version-blind
+(`aggregates_with_module_version` = 0, because no module version has ever
+published), and the intent price book requires a version on every key.
+**The intent engine cannot rate production usage as designed** — not for want
+of a query, but because the price book's completeness invariant is
+incompatible with version-blind usage.
+
+Closing §11 therefore needs BOTH:
+
+1. **Relax the version requirement** so version-blind usage can be priced at
+   all — this weakens "complete and effective-dated", the property the book
+   exists to provide; and
+2. **Add `Model` to `PriceKey`** and carry it in `FactsFor` — mandatory,
+   because 6 of 12 aggregates resolved through tier 2.
+
+Both touch the invariant, so this is an owner decision after all. My instinct
+to ask was right; my stated REASON for asking was wrong twice before landing
+here. The safe option remains:
+
+- **C** — rate only version-stamped usage and quarantine the rest explicitly.
+  Today that reconciles **nothing**, which is honest and closes §11 over an
+  empty subset rather than by weakening a guarantee.
+
+Nothing here is safe to decide by inference. This file has now been wrong
+three times, each time because a claim was reasoned rather than measured.
+
+## What the four new census counts decided
 
 `metric_model_prices`, `aggregates_with_module_version`,
 `aggregates_with_model`, `aggregates_priced_nonzero`.

@@ -198,3 +198,38 @@ SELECT
     count(DISTINCT period_id)                                  AS total,
     'billing_periods that were actually rolled up'             AS detail
 FROM ms_billing.usage_aggregates;
+
+-- 10. Is the rollup BEHIND, or are the unrolled periods simply still OPEN?
+--
+-- Added 2026-08-31 after §9 measured 6,937 of 38,326 events inside a
+-- rolled-up period (18%) with only 2 of 6 periods carrying aggregates, and
+-- only 50 events lacking an account — which kills the innocent "structurally
+-- unbillable" reading.
+--
+-- But 82% uncovered is only alarming if those periods should have been rolled
+-- up. A period rolls up when it CLOSES; an open period having no aggregates is
+-- correct, not a failure. ms_billing.billing_period_status is
+-- ('open','closing','invoiced'), so the question is exactly:
+--
+--   invoiced periods WITHOUT aggregates = the rollup genuinely failed
+--   open periods without aggregates     = normal, nothing is wrong
+--
+-- Asked as two counts rather than one grouped query so each stays a
+-- single-row aggregate, per this script's read contract.
+
+SELECT
+    'periods_open'                                             AS subject,
+    count(*)                                                   AS total,
+    'billing_periods still open — no rollup expected yet'      AS detail
+FROM ms_billing.billing_periods
+WHERE status = 'open';
+
+SELECT
+    'periods_invoiced_without_aggregates'                      AS subject,
+    count(*)                                                   AS total,
+    'CLOSED periods that were never rolled up — real failures' AS detail
+FROM ms_billing.billing_periods p
+WHERE p.status = 'invoiced'
+  AND NOT EXISTS (
+      SELECT 1 FROM ms_billing.usage_aggregates a WHERE a.period_id = p.id
+  );
