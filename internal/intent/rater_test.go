@@ -62,9 +62,9 @@ func fact(key, meter string, quantity int64) UsageFact {
 	}
 }
 
-func rateRequest(t *testing.T, facts ...UsageFact) RateRequest {
+func rateRequest(t *testing.T, facts ...UsageFact) RateInput {
 	t.Helper()
-	return RateRequest{
+	return RateInput{
 		Facts:            facts,
 		PriceBook:        book(t),
 		Tax:              resolvedTax(),

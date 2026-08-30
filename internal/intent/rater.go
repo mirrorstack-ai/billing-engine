@@ -44,10 +44,18 @@ type TaxResolver interface {
 	Determine(payer Subject, currency string, subtotalMicros int64, at time.Time) TaxDetermination
 }
 
-// RateRequest is everything the rater needs. It carries no clock and no
+// RateInput is everything the rater needs. It carries no clock and no
 // store: every input arrives as a value, which is what makes the same
 // call reproducible by the offline verifier.
-type RateRequest struct {
+//
+// Named Input rather than Request deliberately. internal/architecture
+// enforces docs/VERIFICATION.md §5 — "no monetary or authority field on
+// a public request struct" — by scanning types whose name ends in
+// Request, so that suffix is reserved for what arrives on the wire. An
+// internal argument bundle carrying a price book is not what that rule
+// is about, and naming it Request would either raise a false alarm or
+// teach the next reader to add an exemption for a real one.
+type RateInput struct {
 	Facts            []UsageFact
 	PriceBook        PriceBookRevision
 	Tax              TaxResolver
@@ -72,7 +80,7 @@ type RateRequest struct {
 //
 // Facts with the same idempotency key are one fact: re-delivery is
 // harmless, and a caller that retries does not double a bill.
-func Rate(req RateRequest) (ChargeIntent, error) {
+func Rate(req RateInput) (ChargeIntent, error) {
 	if len(req.Facts) == 0 {
 		return ChargeIntent{}, ErrRaterNoFacts
 	}

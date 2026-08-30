@@ -51,6 +51,18 @@ var authorityFieldNames = []string{
 
 // ScanRequestFields returns every field on a *Request type under the
 // given roots whose name denotes money or asserted authority.
+//
+// The Request suffix is the convention this relies on to find what
+// arrives on the wire, which makes the suffix load-bearing: internal
+// argument bundles must not use it. That is a real limitation — a wire
+// type named otherwise would go unseen — and it is the tradeoff for a
+// check that needs no route table to run.
+//
+// The Request suffix is the convention this relies on to find what
+// arrives on the wire, which makes the suffix load-bearing: internal
+// argument bundles must not use it. That is a real limitation — a wire
+// type named otherwise would go unseen — and it is the tradeoff for a
+// check that needs no route table to run.
 func ScanRequestFields(repoRoot string, roots ...string) ([]RequestField, error) {
 	var out []RequestField
 	fset := token.NewFileSet()
