@@ -93,10 +93,12 @@
 -- whoever merges second renumbers past the highest CLAIMED slot.
 --
 -- 054-055: sealed billing intents and occurrence-preserving keyed meters.
--- 056-058: the auto_topup authorization bounds, the credit-ledger 'proposed'
--- status, and the billing_ro read-only grant.
+-- 056-059: the auto_topup authorization bounds, the credit-ledger 'proposed'
+-- status, the billing_ro read-only grant, and 059 which re-applies that grant
+-- because 058 ran before the role existed and skipped (see 059's header).
 \i migrations/billing/054_intent_core.up.sql
 \i migrations/billing/055_keyed_meter_observations.up.sql
 \i migrations/billing/056_authorization_frequency_ceiling.up.sql
 \i migrations/billing/057_credit_ledger_proposed_status.up.sql
 \i migrations/billing/058_billing_ro_grants.up.sql
+\i migrations/billing/059_billing_ro_grants_retry.up.sql
