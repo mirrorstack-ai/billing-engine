@@ -149,6 +149,19 @@ func TestCreditCallbackReachesTheReconcilersAndStillCannotCollect(t *testing.T) 
 
 // A partner bus can deliver the same event more than once. Replay must
 // be idempotent, or a redelivery becomes a second settlement.
+//
+// 🔴 Read what this asserts carefully. The row count is 1 because
+// event_id is the PRIMARY KEY of webhook_events_processed
+// (003_webhook_events_processed.up.sql:15), so it would be 1 even if
+// the handler had run its side effects twice. What is actually shown is
+// that the idempotency RECORD is unique and that neither delivery
+// collected.
+//
+// Proving side-effects-once needs a side effect to observe, and an
+// ordinary invoice.paid has none — the recorder sees zero provider
+// calls on both passes. The stronger version of this test belongs with
+// the credit cases, where a reconciler runs, and it needs seeded ledger
+// state to reach the branch that would double-apply.
 func TestEventBridgeReplayIsIdempotent(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	recorder := stripetest.New()
@@ -172,6 +185,8 @@ func TestEventBridgeReplayIsIdempotent(t *testing.T) {
 		`SELECT count(*) FROM ms_billing.webhook_events_processed WHERE event_id = $1`,
 		"evt_replay_once").Scan(&processed))
 	require.Equal(t, 1, processed, "a redelivered event was recorded twice")
+	require.NotZero(t, processed, "the event was never recorded at all; both deliveries were dropped "+
+		"before reaching the idempotency marker, and this test would assert nothing")
 
 	recorder.RequireNoCollection(t, "a redelivered callback")
 }
