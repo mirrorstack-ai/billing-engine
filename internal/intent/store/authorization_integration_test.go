@@ -20,7 +20,7 @@ func standingAuth(t *testing.T) intent.BillingAuthorization {
 	auth, err := intent.Authorize(intent.AuthorizationGrant{
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
-		Currency: "USD", Kinds: []intent.ChargeKind{kindTopUp, "usage.cycle"},
+		Currency: "USD", Kinds: []intent.ChargeKind{kindTopUp, intent.KindModuleUsage},
 		PerChargeCeiling: 50_000, PeriodCeiling: 200_000,
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:     "email/v1",

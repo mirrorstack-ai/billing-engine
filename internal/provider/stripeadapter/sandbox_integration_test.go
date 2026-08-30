@@ -180,7 +180,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	const kind intent.ChargeKind = "usage.cycle"
+	const kind intent.ChargeKind = intent.KindModuleUsage
 
 	sealed, err := intent.Seal(intent.Draft{
 		Payer:    intent.Subject{Kind: "org", ID: payerID},

@@ -92,7 +92,7 @@ func run(ctx context.Context, src *shadow.Source, limit int) (shadow.Report, err
 			// These are shadow values. Nothing is executed against this
 			// intent — it exists to carry a total and a digest.
 			AuthorizationID:  "shadow",
-			Kind:             "usage.cycle",
+			Kind:             intent.KindModuleUsage,
 			TermsRevision:    "shadow",
 			NoticePolicy:     "shadow",
 			ExecuteNotBefore: p.Start,
