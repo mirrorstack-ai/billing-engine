@@ -1,0 +1,106 @@
+# The four placeholder revisions — what you are actually deciding
+
+Every intent this engine proposes today seals four policy identifiers.
+All four are placeholders (`internal/account/cycle/domain_charges.go:55-62`):
+
+```go
+proposedTermsRevision     = "unpublished/pending-decision-12"
+proposedPriceBookRevision = "unpublished/pending-decision-12"
+proposedNoticePolicy      = "unpublished/pending-decision-12"
+proposedTaxRuleRevision   = "not-applicable/pending-decision-12"
+```
+
+These are not cosmetic. They go **inside the canonical digest**, and the digest
+is what a customer's bundle attests to. A sealed intent says, in effect:
+*"this amount was derived under terms revision X, price book Y, notice policy Z,
+tax rules W."* Right now all four sentences are blank cheques.
+
+## What each one is waiting on
+
+| constant | §12 items that gate it | gates held shut |
+|---|---|---|
+| `proposedNoticePolicy` | **1** — what counts as delivered notice, which contacts, lead time, retry schedule | G1, G2 |
+| `proposedTermsRevision` | **3** change policy · **9** refund/dispute/chargeback/write-off · **13** credit expiry + legal characterization of stored value · **2** budget-stop semantics | G1, G3, G4 |
+| `proposedPriceBookRevision` | **12** which kinds exist + price/tier policy · **11** currency + TWD price books · **15** the infra-markup migration into a published base price | G1, G2, G4 |
+| `proposedTaxRuleRevision` | **4** merchant of record · **5** registrations · **6** classification/rounding · **7** location evidence · **8** rate source · **10** Taiwan/NewebPay invoicing duties | G3 |
+
+## Why my earlier recommendation was wrong
+
+I offered you "mint v1 frozen from today's behaviour". §12's closing paragraph
+forbids exactly that:
+
+> Until each of these is accepted as an immutable policy revision and an ADR,
+> they stay named decisions. **They must not be reconstructed from current
+> constants, code comments, or the shape of today's Stripe-shaped schema.**
+
+Minting `2026-08-30/v1` from what the code does today *is* reconstruction from
+current constants. It would produce a digest that looks settled and is not.
+Withdraw that option.
+
+## The one that is not a placeholder
+
+Three of the four say `unpublished/` — honest, if inert. The fourth says
+**`not-applicable/`**. That is not a deferral, it is a substantive claim: *tax
+does not apply to this charge.* For a Taiwan entity billing in TWD, §12 item 10
+says business-tax and e-invoice duties are exactly what has **not** been
+decided. So the one field that asserts something is the one with the least
+authority to assert it.
+
+If nothing else changes, this should change: `not-applicable/` → `unpublished/`.
+A refusal to guess is honest; a claim of non-applicability is not.
+
+## The real options
+
+**A. Fail-closed marker (recommended, pending verification).**
+Make the `unpublished/` prefix structurally uncollectable: a predicate clause
+that refuses any intent whose revisions are unpublished. Then the placeholder
+stops being a fiction and becomes a *control* — the engine can propose and
+store and reconcile all day, and physically cannot collect until you publish
+real revisions. This is what §12's G1 ("production execution fails closed until
+each item is settled") already asks for.
+Cost: one clause, one migration-free change. Does not need your policy answers.
+
+**B. Publish real revisions.**
+Requires settling §12 items 1, 3, 9, 11, 12, 13, 15 (and 4–8, 10 for tax) as
+accepted ADRs. That is finance + legal + product work, not engineering. It is
+the only path that lets money actually move.
+
+**C. Status quo.**
+Placeholders stay, nothing refuses them, and the day someone flips
+`INTENT_EXECUTOR_ENABLED` the engine collects under an invented revision.
+
+A and B are not alternatives — **A is the safe holding pattern that makes B
+unhurried.** C is the one to avoid.
+
+---
+
+## Verified 2026-08-30: the placeholder is a silent fiction, not a fail-closed marker
+
+I assumed something refused these. Nothing does. Measured, not reasoned:
+
+| what I expected to refuse it | what it actually does | evidence |
+|---|---|---|
+| `ClausePolicyPublished` — named `policy_published_effective_and_digest_matching` | `return s.PolicyDigestsMatch` — a caller-supplied bool. Never reads the intent. | `internal/intent/predicate/predicate.go:165-166`, field at `state.go:130` |
+| `ClauseTaxFinal` | reads `Tax().Resolved` + a caller bool. Never reads `RuleRevision`. | `predicate.go:161-163` |
+| any tax clause | **zero** clauses read `taxRuleRevision`. Its only non-test reads are the digest and the INSERT. | `chargeintent.go:321`, `store/store.go:83,148` |
+| `Seal` | non-blank check only. No format, prefix, or registry. | `chargeintent.go:210-215` |
+| `Authorize` | accepts ANY non-blank string | `authorization.go:160-168` |
+
+The consequence: an authorization minted with the *same* placeholder string
+satisfies every equality check in `Permits`. The four values are sealed into the
+canonical digest, so a customer's bundle would attest to
+`unpublished/pending-decision-12` — and nothing in the engine would object.
+
+An intent sealed today *is* refused, but only by `BuildIdentified`,
+`PolicyDigestsMatch`, `TimeReady`, `TaxIndependentlyReproducible` and a missing
+authorization row. **Every one of those flips to permit without anyone touching
+the placeholder strings.** They are unrelated guards that happen to be shut.
+
+### This makes option A necessary, not merely prudent
+
+Option A is no longer "add a nice safety clause". It is **filling in a clause
+that already exists and lies about what it checks**. `ClausePolicyPublished`
+should read the intent's four revisions and refuse any that is unpublished.
+That is the contract its own name states.
+
+Building five more legs before this lands would multiply the fiction by five.

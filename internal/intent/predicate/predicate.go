@@ -163,7 +163,24 @@ func satisfied(clause Clause, s SealedState) bool {
 			s.TaxIndependentlyReproducible
 
 	case ClausePolicyPublished:
-		return s.PolicyDigestsMatch
+		// The clause name states three things: published, effective,
+		// and digest-matching. PolicyDigestsMatch is the caller's
+		// answer to the last two — it is a reproduction result, and
+		// the executor is the only thing that can compute it.
+		//
+		// Published is different: it is readable from the intent
+		// itself, and until 2026-08-30 nothing read it. The four
+		// sealed revision ids went into the canonical digest
+		// unexamined, so a charge bundle could attest to
+		// "unpublished/pending-decision-12" and no clause objected.
+		// An authorization minted with the same placeholder satisfied
+		// every equality check in Permits, so the fiction was
+		// self-consistent rather than self-refuting.
+		//
+		// docs/DESIGN.md §12 gate G1 says production execution fails
+		// closed until each policy is settled in an accepted ADR.
+		// This is where that gate lives.
+		return s.PolicyDigestsMatch && len(intent.UnpublishedRevisions(s.Intent)) == 0
 
 	case ClauseTimeReadiness:
 		return s.TimeReady
