@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS ms_billing.charge_intents (
     payer_id            TEXT NOT NULL,
     currency            TEXT NOT NULL,
 
+    -- What this charge is for, from the closed catalog in DESIGN §6. It
+    -- is sealed into the intent rather than supplied at authorization
+    -- time, because it selects which rule of a standing authorization
+    -- applies: a caller that chose it could pick the permission its
+    -- charge happens to fit.
+    kind                TEXT NOT NULL,
+
     price_book_revision TEXT NOT NULL,
     terms_revision      TEXT NOT NULL,
     notice_policy       TEXT NOT NULL,
@@ -91,13 +98,13 @@ CREATE OR REPLACE FUNCTION ms_billing.charge_intents_reject_sealed_update()
 RETURNS TRIGGER AS $$
 BEGIN
     IF (NEW.digest, NEW.payer_kind, NEW.payer_id, NEW.currency,
-        NEW.price_book_revision, NEW.terms_revision, NEW.notice_policy,
+        NEW.kind, NEW.price_book_revision, NEW.terms_revision, NEW.notice_policy,
         NEW.tax_jurisdiction, NEW.tax_rule_revision, NEW.tax_amount_micros,
         NEW.subtotal_micros, NEW.total_micros, NEW.authorization_id,
         NEW.execute_not_before, NEW.execute_not_after, NEW.supersedes_digest)
        IS DISTINCT FROM
        (OLD.digest, OLD.payer_kind, OLD.payer_id, OLD.currency,
-        OLD.price_book_revision, OLD.terms_revision, OLD.notice_policy,
+        OLD.kind, OLD.price_book_revision, OLD.terms_revision, OLD.notice_policy,
         OLD.tax_jurisdiction, OLD.tax_rule_revision, OLD.tax_amount_micros,
         OLD.subtotal_micros, OLD.total_micros, OLD.authorization_id,
         OLD.execute_not_before, OLD.execute_not_after, OLD.supersedes_digest)

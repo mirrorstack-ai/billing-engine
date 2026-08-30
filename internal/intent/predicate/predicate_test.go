@@ -21,6 +21,7 @@ func sealedIntent(t *testing.T) intent.ChargeIntent {
 		Payer:             intent.Subject{Kind: "org", ID: "org-1"},
 		Currency:          "USD",
 		Lines:             []intent.Line{intent.NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 25)},
+		Kind:              kind,
 		PriceBookRevision: "pb-2026-08",
 		TermsRevision:     "terms-2026-01",
 		Tax: intent.TaxDetermination{
@@ -65,13 +66,12 @@ func permittedState(t *testing.T) SealedState {
 	t.Helper()
 	sealed := sealedIntent(t)
 	return SealedState{
-		Intent:            sealed,
-		State:             StateEligible,
-		Now:               evalNow,
-		BuildIdentified:   true,
-		Authorization:     standingAuth(t),
-		AuthorizationKind: kind,
-		Mode:              AuthorityStandingAuto,
+		Intent:          sealed,
+		State:           StateEligible,
+		Now:             evalNow,
+		BuildIdentified: true,
+		Authorization:   standingAuth(t),
+		Mode:            AuthorityStandingAuto,
 		Notice: NoticeReceipt{
 			DeliveredBytesDigest: sealed.Digest(),
 			Policy:               "email/v1",

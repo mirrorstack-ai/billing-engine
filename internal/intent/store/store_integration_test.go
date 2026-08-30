@@ -29,6 +29,7 @@ func sealedFixture(t *testing.T, quantity int64) intent.ChargeIntent {
 			intent.NewLine("quiz.render", "quiz-core", "1.4.0", quantity, 25),
 			intent.NewLine("quiz.grade", "quiz-core", "1.4.0", 10, 40),
 		},
+		Kind:              kindTopUp,
 		PriceBookRevision: "pb-2026-08",
 		TermsRevision:     "terms-2026-01",
 		Tax: intent.TaxDetermination{
@@ -222,6 +223,7 @@ func TestSupersedingIntentsBothLoad(t *testing.T) {
 		Payer:             corrected.Payer(),
 		Currency:          corrected.Currency(),
 		Lines:             corrected.Lines(),
+		Kind:              corrected.Kind(),
 		PriceBookRevision: corrected.PriceBookRevision(),
 		TermsRevision:     corrected.TermsRevision(),
 		Tax:               corrected.Tax(),

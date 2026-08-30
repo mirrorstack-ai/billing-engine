@@ -79,6 +79,16 @@ type Draft struct {
 	// resolved for this intent. Reproducibility depends on it: a total
 	// whose price source is unnamed cannot be recomputed later.
 	PriceBookRevision string
+	// Kind is what this charge is for, from the closed catalog in
+	// docs/DESIGN.md §6.
+	//
+	// It is sealed into the intent rather than passed to Permits,
+	// because it selects which rule of a standing authorization
+	// applies. A caller that chose it at authorization time could pick
+	// the permission its charge fits — which is INV-001's shape, one
+	// field further in: the engine must derive what is being charged
+	// for, not be told.
+	Kind ChargeKind
 	// TermsRevision is the customer terms this charge is made under.
 	// INV-003 seals "policy versions", and terms are one: a standing
 	// authorization accepted under one revision does not cover a charge
@@ -127,6 +137,7 @@ type ChargeIntent struct {
 	payer             Subject
 	currency          string
 	lines             []Line
+	kind              ChargeKind
 	priceBookRevision string
 	termsRevision     string
 	tax               TaxDetermination
@@ -152,6 +163,7 @@ var (
 	ErrCurrencyMissing    = errors.New("intent: no currency")
 	ErrPriceBookMissing   = errors.New("intent: no price book revision")
 	ErrTermsMissing       = errors.New("intent: no terms revision")
+	ErrKindMissing        = errors.New("intent: no charge kind")
 	ErrTaxUnresolved      = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
 	ErrTaxNegative        = errors.New("intent: tax is negative")
 	ErrAuthorizationUnset = errors.New("intent: no billing authorization referenced")
@@ -201,6 +213,9 @@ func Seal(draft Draft) (ChargeIntent, error) {
 	if strings.TrimSpace(draft.TermsRevision) == "" {
 		return ChargeIntent{}, ErrTermsMissing
 	}
+	if strings.TrimSpace(string(draft.Kind)) == "" {
+		return ChargeIntent{}, ErrKindMissing
+	}
 	if !draft.Tax.Resolved {
 		return ChargeIntent{}, ErrTaxUnresolved
 	}
@@ -231,6 +246,7 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		payer:             draft.Payer,
 		currency:          strings.ToUpper(strings.TrimSpace(draft.Currency)),
 		lines:             append([]Line(nil), draft.Lines...),
+		kind:              draft.Kind,
 		priceBookRevision: draft.PriceBookRevision,
 		termsRevision:     draft.TermsRevision,
 		tax:               draft.Tax,
@@ -298,6 +314,7 @@ func (c ChargeIntent) computeDigest() string {
 		e.int(line.AmountMicros())
 	}
 
+	e.string(string(c.kind))
 	e.string(c.priceBookRevision)
 	e.string(c.termsRevision)
 	e.string(c.tax.Jurisdiction)
@@ -336,6 +353,9 @@ func (c ChargeIntent) Lines() []Line { return append([]Line(nil), c.lines...) }
 
 // PriceBookRevision names the one effective price revision used.
 func (c ChargeIntent) PriceBookRevision() string { return c.priceBookRevision }
+
+// Kind is what this charge is for.
+func (c ChargeIntent) Kind() ChargeKind { return c.kind }
 
 // TermsRevision names the customer terms this charge is made under.
 func (c ChargeIntent) TermsRevision() string { return c.termsRevision }
@@ -415,6 +435,7 @@ type Stored struct {
 	Lines             []Line
 	PriceBookRevision string
 	TermsRevision     string
+	Kind              ChargeKind
 	Tax               TaxDetermination
 	AuthorizationID   string
 	NoticePolicy      string
@@ -458,6 +479,7 @@ func Rehydrate(stored Stored) (ChargeIntent, error) {
 		Payer:             stored.Payer,
 		Currency:          stored.Currency,
 		Lines:             stored.Lines,
+		Kind:              stored.Kind,
 		PriceBookRevision: stored.PriceBookRevision,
 		TermsRevision:     stored.TermsRevision,
 		Tax:               stored.Tax,

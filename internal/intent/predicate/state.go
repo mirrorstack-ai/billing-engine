@@ -116,9 +116,8 @@ type SealedState struct {
 	// identity reads `unknown` must refuse to execute."
 	BuildIdentified bool
 
-	Authorization     intent.BillingAuthorization
-	AuthorizationKind intent.ChargeKind
-	PriorSpendMicros  int64
+	Authorization    intent.BillingAuthorization
+	PriorSpendMicros int64
 
 	Mode       AuthorityMode
 	Acceptance AcceptanceReceipt

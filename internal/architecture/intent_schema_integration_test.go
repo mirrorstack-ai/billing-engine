@@ -145,11 +145,11 @@ func seedIntent(t *testing.T, pool *pgxpool.Pool, digest string) string {
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
 		`INSERT INTO ms_billing.charge_intents
-		   (digest, payer_kind, payer_id, currency, price_book_revision,
+		   (digest, payer_kind, payer_id, currency, kind, price_book_revision,
 		    terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
 		    tax_amount_micros, subtotal_micros, total_micros, authorization_id,
 		    execute_not_before, execute_not_after)
-		 VALUES ($1,'org','org-1','USD','pb-1','terms-1','email/v1','TW','tax-1',
+		 VALUES ($1,'org','org-1','USD','usage.cycle','pb-1','terms-1','email/v1','TW','tax-1',
 		         0, 1000, 1000, 'auth-1', $2, $3)`,
 		digest,
 		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),

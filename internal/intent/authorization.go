@@ -245,7 +245,6 @@ type Decision struct {
 // asks for.
 func (a BillingAuthorization) Permits(
 	intent ChargeIntent,
-	kind ChargeKind,
 	at time.Time,
 	priorSpendMicros int64,
 ) Decision {
@@ -301,7 +300,7 @@ func (a BillingAuthorization) Permits(
 			refusals = append(refusals, RefusalWrongIntent)
 		}
 	case ScopeStanding:
-		if !a.kinds[kind] {
+		if !a.kinds[intent.Kind()] {
 			refusals = append(refusals, RefusalKindNotPermitted)
 		}
 		if a.perChargeCeilingMicros > 0 && intent.TotalMicros() > a.perChargeCeilingMicros {

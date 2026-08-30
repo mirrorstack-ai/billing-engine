@@ -71,14 +71,14 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO ms_billing.charge_intents
-			  (digest, payer_kind, payer_id, currency, price_book_revision,
+			  (digest, payer_kind, payer_id, currency, kind, price_book_revision,
 			   terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
 			   tax_amount_micros, subtotal_micros, total_micros, authorization_id,
 			   execute_not_before, execute_not_after, supersedes_digest)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-			        NULLIF($16, ''))
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+			        NULLIF($17, ''))
 			ON CONFLICT (digest) DO NOTHING`,
-			sealed.Digest(), payer.Kind, payer.ID, sealed.Currency(),
+			sealed.Digest(), payer.Kind, payer.ID, sealed.Currency(), string(sealed.Kind()),
 			sealed.PriceBookRevision(), sealed.TermsRevision(), sealed.NoticePolicy(),
 			tax.Jurisdiction, tax.RuleRevision, tax.AmountMicros,
 			sealed.SubtotalMicros(), sealed.TotalMicros(), sealed.AuthorizationID(),
@@ -130,19 +130,20 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeIntent, error) {
 	var (
 		stored     intent.Stored
+		kind       string
 		supersedes *string
 	)
 	stored.Digest = digest
 
 	err := s.pool.QueryRow(ctx, `
-		SELECT payer_kind, payer_id, currency, price_book_revision, terms_revision,
+		SELECT payer_kind, payer_id, currency, kind, price_book_revision, terms_revision,
 		       notice_policy, tax_jurisdiction, tax_rule_revision, tax_amount_micros,
 		       subtotal_micros, total_micros, authorization_id,
 		       execute_not_before, execute_not_after, supersedes_digest
 		  FROM ms_billing.charge_intents
 		 WHERE digest = $1`, digest,
 	).Scan(
-		&stored.Payer.Kind, &stored.Payer.ID, &stored.Currency,
+		&stored.Payer.Kind, &stored.Payer.ID, &stored.Currency, &kind,
 		&stored.PriceBookRevision, &stored.TermsRevision, &stored.NoticePolicy,
 		&stored.Tax.Jurisdiction, &stored.Tax.RuleRevision, &stored.Tax.AmountMicros,
 		&stored.SubtotalMicros, &stored.TotalMicros, &stored.AuthorizationID,
@@ -154,6 +155,7 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 	if err != nil {
 		return intent.ChargeIntent{}, fmt.Errorf("load intent: %w", err)
 	}
+	stored.Kind = intent.ChargeKind(kind)
 	if supersedes != nil {
 		stored.Supersedes = *supersedes
 	}

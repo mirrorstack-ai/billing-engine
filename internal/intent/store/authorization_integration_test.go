@@ -55,8 +55,8 @@ func TestAuthorizationRoundTrips(t *testing.T) {
 	require.Equal(t, original.AcceptanceDigest(), loaded.AcceptanceDigest())
 	require.Equal(t, original.TermsRevision(), loaded.TermsRevision())
 
-	before := original.Permits(sealed, kindTopUp, now, 0)
-	after := loaded.Permits(sealed, kindTopUp, now, 0)
+	before := original.Permits(sealed, now, 0)
+	after := loaded.Permits(sealed, now, 0)
 	require.Equal(t, before.Permitted, after.Permitted)
 	require.Equal(t, before.Refusals, after.Refusals)
 }
