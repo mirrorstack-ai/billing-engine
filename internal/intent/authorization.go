@@ -67,6 +67,9 @@ type BillingAuthorization struct {
 	// direction.
 	perChargeCeilingMicros int64
 	periodCeilingMicros    int64
+	// frequencyCeiling bounds the COUNT of attempts, which no amount
+	// ceiling does.
+	frequencyCeiling int
 
 	// termsRevision and priceBookRevision pin what the customer agreed
 	// to. A price book moving under a standing authorization is a
@@ -98,6 +101,14 @@ type AuthorizationGrant struct {
 	Kinds            []ChargeKind
 	PerChargeCeiling int64
 	PeriodCeiling    int64
+	// FrequencyCeiling is the most attempts this authorization permits in
+	// its period. It is a COUNT, not an amount, and it is not implied by
+	// the two ceilings above: a trigger that fires a hundred times for one
+	// cent each is inside every amount bound and is still a runaway.
+	//
+	// docs/DESIGN.md §6 requires it by name for auto_topup — "per-attempt,
+	// frequency and period ceilings" — alongside the amount bounds.
+	FrequencyCeiling int
 	TermsRevision    string
 	PriceBook        string
 	NoticePolicy     string
@@ -115,6 +126,7 @@ var (
 	ErrAuthDigestMissing     = errors.New("intent: a one-time authorization must name the intent it permits")
 	ErrAuthKindsMissing      = errors.New("intent: a standing authorization must declare the charge kinds it permits")
 	ErrAuthCeilingMissing    = errors.New("intent: a standing authorization must declare a per-charge ceiling")
+	ErrAuthFrequencyMissing  = errors.New("intent: a standing authorization needs a frequency ceiling")
 	ErrAuthCeilingNegative   = errors.New("intent: a ceiling is negative")
 	ErrAuthTermsMissing      = errors.New("intent: authorization pins no terms revision")
 	ErrAuthPriceBookMissing  = errors.New("intent: authorization pins no price book revision")
@@ -156,6 +168,12 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 		if grant.PerChargeCeiling == 0 {
 			return BillingAuthorization{}, ErrAuthCeilingMissing
 		}
+		// A standing authorization with no attempt bound is a standing
+		// authorization to retry forever. The amount ceilings do not
+		// cover it: many small attempts stay inside both.
+		if grant.FrequencyCeiling <= 0 {
+			return BillingAuthorization{}, ErrAuthFrequencyMissing
+		}
 	}
 	if strings.TrimSpace(grant.TermsRevision) == "" {
 		return BillingAuthorization{}, ErrAuthTermsMissing
@@ -190,6 +208,7 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 		kinds:                  kinds,
 		perChargeCeilingMicros: grant.PerChargeCeiling,
 		periodCeilingMicros:    grant.PeriodCeiling,
+		frequencyCeiling:       grant.FrequencyCeiling,
 		termsRevision:          grant.TermsRevision,
 		priceBookRevision:      grant.PriceBook,
 		noticePolicy:           grant.NoticePolicy,
@@ -217,6 +236,7 @@ const (
 	RefusalKindNotPermitted       Refusal = "kind_not_permitted"
 	RefusalOverPerCharge          Refusal = "over_per_charge_ceiling"
 	RefusalOverPeriod             Refusal = "over_period_ceiling"
+	RefusalOverFrequency          Refusal = "over_frequency_ceiling"
 	RefusalTermsMoved             Refusal = "terms_revision_moved"
 	RefusalPriceBookMoved         Refusal = "price_book_moved"
 	RefusalNoticePolicyMoved      Refusal = "notice_policy_moved"
@@ -243,10 +263,27 @@ type Decision struct {
 // customer to be able to recheck a charge offline. This is the shape of
 // internal/account/eligibility, which is the discipline docs/DESIGN.md
 // asks for.
+// PriorUse is what this authorization has already been used for in the
+// current period.
+//
+// A struct rather than a bare int64 so that adding a bound is a COMPILE
+// ERROR at every call site rather than a silently-defaulted zero. The
+// frequency ceiling was added on 2026-08-30 and this is how every caller
+// was forced to say what it knew about attempts.
+type PriorUse struct {
+	// SpendMicros is what has already been charged in the period.
+	SpendMicros int64
+	// Attempts is how many times this authorization has already been
+	// acted on in the period — successful or not. A failed attempt still
+	// consumed one, which is the point: retrying forever is the runaway
+	// the frequency ceiling exists to stop.
+	Attempts int
+}
+
 func (a BillingAuthorization) Permits(
 	intent ChargeIntent,
 	at time.Time,
-	priorSpendMicros int64,
+	prior PriorUse,
 ) Decision {
 	var refusals []Refusal
 
@@ -306,8 +343,14 @@ func (a BillingAuthorization) Permits(
 		if a.perChargeCeilingMicros > 0 && intent.TotalMicros() > a.perChargeCeilingMicros {
 			refusals = append(refusals, RefusalOverPerCharge)
 		}
-		if a.periodCeilingMicros > 0 && priorSpendMicros+intent.TotalMicros() > a.periodCeilingMicros {
+		if a.periodCeilingMicros > 0 && prior.SpendMicros+intent.TotalMicros() > a.periodCeilingMicros {
 			refusals = append(refusals, RefusalOverPeriod)
+		}
+		// The count bound, which neither amount bound implies. This
+		// intent is the next attempt, so it is the prior count PLUS
+		// one that has to fit.
+		if a.frequencyCeiling > 0 && prior.Attempts+1 > a.frequencyCeiling {
+			refusals = append(refusals, RefusalOverFrequency)
 		}
 	}
 
@@ -381,6 +424,7 @@ func (a BillingAuthorization) Grant() AuthorizationGrant {
 		IntentDigest:     a.intentDigest,
 		Kinds:            kinds,
 		PerChargeCeiling: a.perChargeCeilingMicros,
+		FrequencyCeiling: a.frequencyCeiling,
 		PeriodCeiling:    a.periodCeilingMicros,
 		TermsRevision:    a.termsRevision,
 		PriceBook:        a.priceBookRevision,

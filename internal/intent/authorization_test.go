@@ -21,7 +21,7 @@ func standingGrant() AuthorizationGrant {
 		Subject:          Subject{Kind: "org", ID: "org-1"},
 		Currency:         "USD",
 		Kinds:            []ChargeKind{kindWalletTopUp},
-		PerChargeCeiling: 50_000,
+		PerChargeCeiling: 50_000, FrequencyCeiling: 100,
 		PeriodCeiling:    200_000,
 		TermsRevision:    "terms-2026-01",
 		PriceBook:        "pb-2026-08",
@@ -46,7 +46,7 @@ func TestStandingAuthorizationPermitsAnIntentInsideItsBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decision := auth.Permits(sealedFixture(t), now, 0)
+	decision := auth.Permits(sealedFixture(t), now, PriorUse{})
 	if !decision.Permitted {
 		t.Fatalf("refused an intent inside every bound: %v", decision.Refusals)
 	}
@@ -134,7 +134,7 @@ func TestEveryBoundRefuses(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			decision := auth.Permits(sealed, tc.at, tc.priorSpend)
+			decision := auth.Permits(sealed, tc.at, PriorUse{SpendMicros: tc.priorSpend})
 			if decision.Permitted {
 				t.Fatalf("permitted %s", tc.name)
 			}
@@ -163,7 +163,7 @@ func TestAuthorizationRefusesAnIntentThatNamesAnotherOne(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decision := auth.Permits(elsewhere, now, 0)
+	decision := auth.Permits(elsewhere, now, PriorUse{})
 	if decision.Permitted {
 		t.Fatal("an authorization permitted an intent that names a different one")
 	}
@@ -190,7 +190,7 @@ func TestRefusalsAreReportedTogether(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decision := auth.Permits(unpermittedKind, authTill.Add(time.Hour), 0)
+	decision := auth.Permits(unpermittedKind, authTill.Add(time.Hour), PriorUse{})
 
 	for _, want := range []Refusal{
 		RefusalWrongSubject, RefusalWrongCurrency, RefusalKindNotPermitted, RefusalExpired,
@@ -218,7 +218,7 @@ func TestOneTimeAuthorizationDoesNotCoverASupersedingCorrection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if decision := auth.Permits(original, now, 0); !decision.Permitted {
+	if decision := auth.Permits(original, now, PriorUse{}); !decision.Permitted {
 		t.Fatalf("refused the very intent it names: %v", decision.Refusals)
 	}
 
@@ -229,7 +229,7 @@ func TestOneTimeAuthorizationDoesNotCoverASupersedingCorrection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decision := auth.Permits(replacement, now, 0)
+	decision := auth.Permits(replacement, now, PriorUse{})
 	if decision.Permitted {
 		t.Fatal("a one-time authorization covered a document it never named")
 	}
@@ -247,13 +247,13 @@ func TestRevokedAuthorizationStopsPermitting(t *testing.T) {
 
 	revoked := auth.Revoke(now)
 
-	if decision := auth.Permits(sealed, now, 0); !decision.Permitted {
+	if decision := auth.Permits(sealed, now, PriorUse{}); !decision.Permitted {
 		t.Fatal("Revoke mutated the original authorization; a bundle already read would change under the reader")
 	}
-	if decision := revoked.Permits(sealed, now, 0); decision.Permitted {
+	if decision := revoked.Permits(sealed, now, PriorUse{}); decision.Permitted {
 		t.Fatal("a revoked authorization still permitted a charge")
 	}
-	if decision := revoked.Permits(sealed, now.Add(-time.Hour), 0); !decision.Permitted {
+	if decision := revoked.Permits(sealed, now.Add(-time.Hour), PriorUse{}); !decision.Permitted {
 		t.Fatal("revocation applied retroactively; a charge already permitted became unpermitted")
 	}
 }
@@ -304,7 +304,7 @@ func TestAuthorizeRefusesRatherThanDefaults(t *testing.T) {
 // a lookup missed, and "not found" must never read as "allowed".
 func TestZeroAuthorizationPermitsNothing(t *testing.T) {
 	var zero BillingAuthorization
-	decision := zero.Permits(sealedFixture(t), now, 0)
+	decision := zero.Permits(sealedFixture(t), now, PriorUse{})
 	if decision.Permitted {
 		t.Fatal("a zero BillingAuthorization permitted a charge")
 	}
@@ -319,7 +319,7 @@ func TestUnsealedIntentIsNeverPermitted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision := auth.Permits(ChargeIntent{}, now, 0); decision.Permitted {
+	if decision := auth.Permits(ChargeIntent{}, now, PriorUse{}); decision.Permitted {
 		t.Fatal("an unsealed intent was permitted")
 	}
 }
@@ -349,14 +349,14 @@ func TestRevokeWithAZeroInstantStillRevokes(t *testing.T) {
 
 	revoked := auth.Revoke(time.Time{})
 
-	if decision := revoked.Permits(sealed, now, 0); decision.Permitted {
+	if decision := revoked.Permits(sealed, now, PriorUse{}); decision.Permitted {
 		t.Fatal("Revoke with a zero instant silently did nothing")
 	}
-	if !hasRefusal(revoked.Permits(sealed, now, 0).Refusals, RefusalRevoked) {
+	if !hasRefusal(revoked.Permits(sealed, now, PriorUse{}).Refusals, RefusalRevoked) {
 		t.Error("the refusal does not name revocation")
 	}
 	// Even at the very start of its own effective window.
-	if decision := revoked.Permits(sealed, authFrom, 0); decision.Permitted {
+	if decision := revoked.Permits(sealed, authFrom, PriorUse{}); decision.Permitted {
 		t.Fatal("a zero-instant revocation left a window in which charges were still permitted")
 	}
 }
@@ -376,8 +376,8 @@ func TestAuthorizationRoundTripsThroughItsGrant(t *testing.T) {
 	}
 
 	sealed := sealedFixture(t)
-	before := original.Permits(sealed, now, 0)
-	after := restored.Permits(sealed, now, 0)
+	before := original.Permits(sealed, now, PriorUse{})
+	after := restored.Permits(sealed, now, PriorUse{})
 	if before.Permitted != after.Permitted {
 		t.Fatalf("round trip changed the verdict: %v -> %v", before, after)
 	}
@@ -391,13 +391,13 @@ func TestAuthorizationRoundTripsThroughItsGrant(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			return a.Permits(big, now, 0)
+			return a.Permits(big, now, PriorUse{})
 		},
 		"a kind it never permitted": func(a BillingAuthorization) Decision {
-			return a.Permits(sealed, now, 0)
+			return a.Permits(sealed, now, PriorUse{})
 		},
 		"after expiry": func(a BillingAuthorization) Decision {
-			return a.Permits(sealed, authTill.Add(time.Hour), 0)
+			return a.Permits(sealed, authTill.Add(time.Hour), PriorUse{})
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

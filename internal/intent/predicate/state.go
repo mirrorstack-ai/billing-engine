@@ -116,8 +116,13 @@ type SealedState struct {
 	// identity reads `unknown` must refuse to execute."
 	BuildIdentified bool
 
-	Authorization    intent.BillingAuthorization
-	PriorSpendMicros int64
+	Authorization intent.BillingAuthorization
+	// PriorUse is what the authorization has already been used for in the
+	// current period — amount AND attempt count. The count is not implied
+	// by the amount: many small attempts stay inside every amount bound
+	// and are still a runaway, which is what §6's frequency ceiling
+	// exists to stop.
+	PriorUse intent.PriorUse
 
 	Mode       AuthorityMode
 	Acceptance AcceptanceReceipt

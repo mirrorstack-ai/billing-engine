@@ -41,15 +41,17 @@ func (s *Store) SaveAuthorization(ctx context.Context, auth intent.BillingAuthor
 		INSERT INTO ms_billing.billing_authorizations
 		  (id, scope, subject_kind, subject_id, currency, intent_digest,
 		   charge_kinds, per_charge_ceiling_micros, period_ceiling_micros,
+		   frequency_ceiling,
 		   terms_revision, price_book_revision, notice_policy,
 		   effective_from, expires_at, acceptance_digest, revoked_at)
-		VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+		VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		ON CONFLICT (id) DO UPDATE
 		   SET revoked_at = COALESCE(
 		         ms_billing.billing_authorizations.revoked_at,
 		         EXCLUDED.revoked_at)`,
 		g.ID, string(g.Scope), g.Subject.Kind, g.Subject.ID, g.Currency,
 		g.IntentDigest, kinds, g.PerChargeCeiling, g.PeriodCeiling,
+		g.FrequencyCeiling,
 		g.TermsRevision, g.PriceBook, g.NoticePolicy,
 		g.EffectiveFrom, g.ExpiresAt, g.AcceptanceDigest, revokedAt,
 	)
@@ -78,6 +80,7 @@ func (s *Store) LoadAuthorization(ctx context.Context, id string) (intent.Billin
 	err := s.pool.QueryRow(ctx, `
 		SELECT scope, subject_kind, subject_id, currency, intent_digest,
 		       charge_kinds, per_charge_ceiling_micros, period_ceiling_micros,
+		       frequency_ceiling,
 		       terms_revision, price_book_revision, notice_policy,
 		       effective_from, expires_at, acceptance_digest, revoked_at
 		  FROM ms_billing.billing_authorizations
@@ -85,6 +88,7 @@ func (s *Store) LoadAuthorization(ctx context.Context, id string) (intent.Billin
 	).Scan(
 		&scope, &g.Subject.Kind, &g.Subject.ID, &g.Currency, &intentDigest,
 		&kinds, &g.PerChargeCeiling, &g.PeriodCeiling,
+		&g.FrequencyCeiling,
 		&g.TermsRevision, &g.PriceBook, &g.NoticePolicy,
 		&g.EffectiveFrom, &g.ExpiresAt, &g.AcceptanceDigest, &revokedAt,
 	)

@@ -102,7 +102,7 @@ func ready(t *testing.T, s *store.Store) intent.ChargeIntent {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindCycle},
-		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000,
+		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100,
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:     "email/v1",
 		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),

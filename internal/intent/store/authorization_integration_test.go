@@ -21,7 +21,7 @@ func standingAuth(t *testing.T) intent.BillingAuthorization {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindTopUp, intent.KindModuleUsage},
-		PerChargeCeiling: 50_000, PeriodCeiling: 200_000,
+		PerChargeCeiling: 50_000, PeriodCeiling: 200_000, FrequencyCeiling: 100,
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:     "email/v1",
 		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
@@ -55,8 +55,8 @@ func TestAuthorizationRoundTrips(t *testing.T) {
 	require.Equal(t, original.AcceptanceDigest(), loaded.AcceptanceDigest())
 	require.Equal(t, original.TermsRevision(), loaded.TermsRevision())
 
-	before := original.Permits(sealed, now, 0)
-	after := loaded.Permits(sealed, now, 0)
+	before := original.Permits(sealed, now, intent.PriorUse{})
+	after := loaded.Permits(sealed, now, intent.PriorUse{})
 	require.Equal(t, before.Permitted, after.Permitted)
 	require.Equal(t, before.Refusals, after.Refusals)
 }
@@ -75,7 +75,7 @@ func TestResavingCannotWidenAnAuthorization(t *testing.T) {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindTopUp},
-		PerChargeCeiling: 999_999_999, PeriodCeiling: 999_999_999,
+		PerChargeCeiling: 999_999_999, PeriodCeiling: 999_999_999, FrequencyCeiling: 100,
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:     "email/v1",
 		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),

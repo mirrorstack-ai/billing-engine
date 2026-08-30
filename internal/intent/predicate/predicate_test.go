@@ -45,7 +45,7 @@ func standingAuth(t *testing.T) intent.BillingAuthorization {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
-		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000,
+		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100,
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:     "email/v1",
 		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
@@ -162,7 +162,7 @@ func TestEveryClauseCanRefuseAlone(t *testing.T) {
 		ClauseAuthorityEvidence:     func(s *SealedState) { s.Mode = "" },
 		ClauseNoticeDelivered:       func(s *SealedState) { s.Notice.TerminalStatus = "queued" },
 		ClauseNoticeWaitElapsed:     func(s *SealedState) { s.Notice.EligibilityNotBefore = evalNow.Add(time.Hour) },
-		ClauseWithinCeilings:        func(s *SealedState) { s.PriorSpendMicros = 5_000_000 },
+		ClauseWithinCeilings:        func(s *SealedState) { s.PriorUse = intent.PriorUse{SpendMicros: 5_000_000} },
 		ClauseFundingPlanBalances:   func(s *SealedState) { s.Funding.ProviderRemainderMicros++ },
 		// Broken by the reproduction failing, not by an unsealed intent.
 		// An earlier version reused the unsealed-intent breaker, so this

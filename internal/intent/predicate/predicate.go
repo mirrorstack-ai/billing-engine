@@ -93,7 +93,7 @@ func satisfied(clause Clause, s SealedState) bool {
 			return false
 		}
 		return s.Authorization.
-			Permits(s.Intent, s.Now, s.PriorSpendMicros).
+			Permits(s.Intent, s.Now, s.PriorUse).
 			Permitted
 
 	case ClauseAuthorityEvidence:
@@ -127,7 +127,7 @@ func satisfied(clause Clause, s SealedState) bool {
 		if !s.Intent.Sealed() {
 			return false
 		}
-		decision := s.Authorization.Permits(s.Intent, s.Now, s.PriorSpendMicros)
+		decision := s.Authorization.Permits(s.Intent, s.Now, s.PriorUse)
 		for _, refusal := range decision.Refusals {
 			if refusal == intent.RefusalOverPerCharge || refusal == intent.RefusalOverPeriod {
 				return false

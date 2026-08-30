@@ -57,7 +57,7 @@ func placeholderState(t *testing.T) SealedState {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
-		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000,
+		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100,
 		TermsRevision: placeholderTerms, PriceBook: placeholderPriceBook,
 		NoticePolicy:     placeholderNotice,
 		EffectiveFrom:    windowStart,
