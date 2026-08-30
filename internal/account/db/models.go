@@ -681,6 +681,7 @@ type MsBillingMetricDefinition struct {
 	CreatedAt       time.Time            `json:"created_at"`
 	UpdatedAt       time.Time            `json:"updated_at"`
 	DisplayGroup    MsBillingMetricGroup `json:"display_group"`
+	AggregationKey  pgtype.Text          `json:"aggregation_key"`
 }
 
 type MsBillingMetricModelPrice struct {
@@ -785,21 +786,46 @@ type MsBillingUsageAggregate struct {
 	ModuleVersion     string              `json:"module_version"`
 	ActiveSeconds     pgtype.Numeric      `json:"active_seconds"`
 	PeriodDays        pgtype.Numeric      `json:"period_days"`
+	AggregationKey    pgtype.Text         `json:"aggregation_key"`
 }
 
 type MsBillingUsageEvent struct {
-	EventID       string              `json:"event_id"`
-	AccountID     pgtype.UUID         `json:"account_id"`
-	AppID         string              `json:"app_id"`
-	ModuleID      string              `json:"module_id"`
-	Metric        string              `json:"metric"`
-	Kind          MsBillingMetricKind `json:"kind"`
-	Value         pgtype.Numeric      `json:"value"`
-	RecordedAt    time.Time           `json:"recorded_at"`
-	IngestedAt    time.Time           `json:"ingested_at"`
-	Model         pgtype.Text         `json:"model"`
-	ModuleVersion pgtype.Text         `json:"module_version"`
-	RepointedFrom pgtype.Timestamptz  `json:"repointed_from"`
+	EventID            string              `json:"event_id"`
+	AccountID          pgtype.UUID         `json:"account_id"`
+	AppID              string              `json:"app_id"`
+	ModuleID           string              `json:"module_id"`
+	Metric             string              `json:"metric"`
+	Kind               MsBillingMetricKind `json:"kind"`
+	Value              pgtype.Numeric      `json:"value"`
+	RecordedAt         time.Time           `json:"recorded_at"`
+	IngestedAt         time.Time           `json:"ingested_at"`
+	Model              pgtype.Text         `json:"model"`
+	ModuleVersion      pgtype.Text         `json:"module_version"`
+	RepointedFrom      pgtype.Timestamptz  `json:"repointed_from"`
+	ObservationVersion int16               `json:"observation_version"`
+	Subject            pgtype.Text         `json:"subject"`
+	Metadata           []byte              `json:"metadata"`
+	OccurredAt         pgtype.Timestamptz  `json:"occurred_at"`
+	BillableAt         pgtype.Timestamptz  `json:"billable_at"`
+	AggregationKey     pgtype.Text         `json:"aggregation_key"`
+	PayloadFingerprint []byte              `json:"payload_fingerprint"`
+	OccurrencePolicy   string              `json:"occurrence_policy"`
+}
+
+type MsBillingUsageObservationRejection struct {
+	ID                 string             `json:"id"`
+	EventID            string             `json:"event_id"`
+	AccountID          pgtype.UUID        `json:"account_id"`
+	AppID              string             `json:"app_id"`
+	ModuleID           string             `json:"module_id"`
+	OwnerUserID        pgtype.UUID        `json:"owner_user_id"`
+	OwnerOrgID         pgtype.UUID        `json:"owner_org_id"`
+	Metric             string             `json:"metric"`
+	Subject            pgtype.Text        `json:"subject"`
+	OccurredAt         pgtype.Timestamptz `json:"occurred_at"`
+	RejectedAt         time.Time          `json:"rejected_at"`
+	Reason             string             `json:"reason"`
+	PayloadFingerprint []byte             `json:"payload_fingerprint"`
 }
 
 type MsBillingWebhookEventsProcessed struct {

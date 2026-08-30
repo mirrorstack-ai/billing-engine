@@ -459,6 +459,8 @@ func httpStatusForError(err error) int {
 		switch be.Code {
 		case billing.CodeInvalidInput:
 			return http.StatusBadRequest
+		case billing.CodeConflict:
+			return http.StatusConflict
 		case billing.CodePaymentRequired:
 			return http.StatusPaymentRequired
 		case billing.CodeNotFound:

@@ -18,6 +18,10 @@ type Code string
 
 const (
 	CodeInvalidInput Code = "INVALID_INPUT"
+	// CodeConflict reports that a caller reused an immutable idempotency key
+	// for a different canonical operation. Retrying the original payload is
+	// safe; changing a payload under the same key is not.
+	CodeConflict     Code = "CONFLICT"
 	CodeNotFound     Code = "NOT_FOUND"
 	CodeStripeError  Code = "STRIPE_ERROR"
 	CodeInternal     Code = "INTERNAL"
@@ -61,6 +65,12 @@ func (e *Error) Unwrap() error { return e.Wrapped }
 // every site that emits a given code).
 func InvalidInput(msg string) *Error {
 	return &Error{Code: CodeInvalidInput, Message: msg}
+}
+
+// Conflict reports an immutable-key collision or another state conflict the
+// caller must resolve rather than retry with the changed request.
+func Conflict(msg string) *Error {
+	return &Error{Code: CodeConflict, Message: msg}
 }
 
 // NotFound is returned when a requested resource (e.g. a payment method

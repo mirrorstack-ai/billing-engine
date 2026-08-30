@@ -92,9 +92,11 @@
 -- lexical, so gaps are tolerated). Two unmerged peer branches each claim it;
 -- whoever merges second renumbers past the highest CLAIMED slot.
 --
--- 055 is claimed by the period-boundary cutover on build/boundary and is not
--- on this branch.
+-- 054-055: sealed billing intents and occurrence-preserving keyed meters.
+-- 056-058: the auto_topup authorization bounds, the credit-ledger 'proposed'
+-- status, and the billing_ro read-only grant.
 \i migrations/billing/054_intent_core.up.sql
+\i migrations/billing/055_keyed_meter_observations.up.sql
 \i migrations/billing/056_authorization_frequency_ceiling.up.sql
 \i migrations/billing/057_credit_ledger_proposed_status.up.sql
 \i migrations/billing/058_billing_ro_grants.up.sql

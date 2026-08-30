@@ -111,8 +111,8 @@ func (s *pgxStore) GetBudget(ctx context.Context, scope Scope, scopeID uuid.UUID
 func (s *pgxStore) AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
 	n, err := s.q.AppPeriodSpendMicros(ctx, db.AppPeriodSpendMicrosParams{
 		AppID:        appID.String(),
-		RecordedAt:   periodStart,
-		RecordedAt_2: periodEnd,
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
 	})
 	if err != nil {
 		return 0, err

@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -175,6 +176,39 @@ func (q *Queries) ListPaymentMethods(ctx context.Context, accountID string) ([]L
 		return nil, err
 	}
 	return items, nil
+}
+
+const rewindowAccountV2UsageAtActivation = `-- name: RewindowAccountV2UsageAtActivation :execrows
+UPDATE ms_billing.usage_events event
+SET billable_at = GREATEST(event.occurred_at, $1::timestamptz),
+    occurrence_policy = CASE
+        WHEN event.occurred_at < $1::timestamptz
+        THEN 'first_funded'
+        ELSE event.occurrence_policy
+    END
+WHERE event.account_id = $2::uuid
+  AND event.observation_version = 2
+`
+
+type RewindowAccountV2UsageAtActivationParams struct {
+	FirstFundedStart time.Time `json:"first_funded_start"`
+	AccountID        string    `json:"account_id"`
+}
+
+// RewindowAccountV2UsageAtActivation folds pending v2 observations from an
+// unactivated account's provisional calendar window into its first funded
+// anchor window. Unactivated rollup intentionally excludes observation_version
+// 2, even when it closes the legacy calendar period, so these rows remain safe
+// to move after that rollup. The activation writer holds the account row UPDATE
+// lock, while ingest and rollup take FOR SHARE, so this sees every admission
+// that committed first and finishes before a later admission derives the new
+// anchor.
+func (q *Queries) RewindowAccountV2UsageAtActivation(ctx context.Context, arg RewindowAccountV2UsageAtActivationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rewindowAccountV2UsageAtActivation, arg.FirstFundedStart, arg.AccountID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const selectAccountByUser = `-- name: SelectAccountByUser :one
