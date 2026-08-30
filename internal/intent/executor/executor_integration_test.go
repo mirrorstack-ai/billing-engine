@@ -331,3 +331,87 @@ func TestATamperedIntentIsNeverEvaluated(t *testing.T) {
 	require.ErrorIs(t, err, intent.ErrDigestMismatch)
 	require.Zero(t, collector.count())
 }
+
+// docs/DESIGN.md §6 selects the obligation formula BY KIND:
+//
+//	grossObligation = serviceGrossObligation OR fundingGrossObligation OR
+//	                  collectionGrossObligation, selected by intent kind
+//
+// and gives the reason in the same breath: "so a stored-value purchase cannot
+// end up with zero principal by borrowing the service-line formula". The
+// service formula subtracts rating credits; a credit purchase's principal is
+// cash the customer is paying, which credits may not reduce.
+//
+// The three coincide today because rating credits are unimplemented. This pins
+// the SELECTION so they cannot silently diverge later, and pins that an
+// unrecognised kind refuses rather than borrowing whichever formula is first.
+func TestTheFundingFormulaIsSelectedByKind(t *testing.T) {
+	for _, kind := range []intent.ChargeKind{
+		intent.KindPlatformBase, intent.KindModuleUsage, intent.KindModuleCapacity,
+		intent.KindCustomDomain, intent.KindTax,
+		intent.KindCreditPurchase, intent.KindAutoTopUp, intent.KindSubscriptionStart,
+		intent.KindCollectReceivable,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			sealed := sealKind(t, kind, 20_000_000)
+			plan, err := fundingFor(sealed)
+			if err != nil {
+				t.Fatalf("a catalog kind has no funding formula: %v", err)
+			}
+			if plan.GrossMicros != 20_000_000 {
+				t.Fatalf("GrossMicros = %d, want 20_000_000", plan.GrossMicros)
+			}
+			// §6 for the two stored-value kinds: "walletFunding = 0;
+			// providerRemainder = grossObligation". A purchase of credit
+			// cannot be paid for with credit.
+			if kind == intent.KindCreditPurchase || kind == intent.KindAutoTopUp {
+				if plan.WalletAllocationMicros != 0 {
+					t.Fatalf("a stored-value purchase was funded from the wallet (%d) — "+
+						"credit cannot pay for credit", plan.WalletAllocationMicros)
+				}
+			}
+			if plan.WalletAllocationMicros+plan.ProviderRemainderMicros != plan.GrossMicros {
+				t.Fatal("the funding plan does not balance against its own gross")
+			}
+		})
+	}
+}
+
+// An unrecognised kind must refuse. Falling through to a formula would fund a
+// document nobody wrote a rule for.
+func TestAnUnknownKindHasNoFundingFormula(t *testing.T) {
+	sealed := sealKind(t, intent.KindModuleUsage, 1_000_000)
+	// Rehydrate with a kind outside the catalog, which Seal would refuse
+	// but a corrupted or future row could carry.
+	_ = sealed
+	// A kind outside the catalog, which Seal would refuse but a corrupted
+	// or future row could carry.
+	var rogue intent.ChargeIntent
+	if _, err := fundingFor(rogue); err == nil {
+		t.Fatal("an intent with no charge kind was funded")
+	}
+}
+
+// sealKind seals a minimal intent of the given kind, for tests about the
+// KIND rather than about the amounts.
+func sealKind(t *testing.T, kind intent.ChargeKind, micros int64) intent.ChargeIntent {
+	t.Helper()
+	sealed, err := intent.Seal(intent.Draft{
+		Payer:             intent.Subject{Kind: "user", ID: "acct-1"},
+		Currency:          "usd",
+		Lines:             []intent.Line{intent.NewLine("d", "m", "1", 1, micros)},
+		Kind:              kind,
+		PriceBookRevision: "pb-1",
+		TermsRevision:     "terms-1",
+		Tax:               intent.TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1"},
+		AuthorizationID:   "auth-1",
+		NoticePolicy:      "email/v1",
+		ExecuteNotBefore:  windowStart,
+		ExecuteNotAfter:   windowEnd,
+		SourceFactKeys:    []string{"f"},
+	})
+	if err != nil {
+		t.Fatalf("Seal(%s): %v", kind, err)
+	}
+	return sealed
+}

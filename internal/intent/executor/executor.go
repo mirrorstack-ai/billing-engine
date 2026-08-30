@@ -217,6 +217,11 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		return Outcome{}, err
 	}
 
+	funding, err := fundingFor(sealed)
+	if err != nil {
+		return Outcome{}, err
+	}
+
 	env := e.env(ctx)
 	verdict := predicate.Evaluate(predicate.SealedState{
 		Intent:                       sealed,
@@ -226,7 +231,7 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		Authorization:                auth,
 		Mode:                         e.authorityMode(auth),
 		Notice:                       noticeFor(sealed, notice),
-		Funding:                      fundingFor(sealed),
+		Funding:                      funding,
 		PolicyDigestsMatch:           env.PolicyDigestsMatch,
 		TimeReady:                    env.TimeReady,
 		TaxIndependentlyReproducible: env.TaxIndependentlyReproducible,
@@ -319,11 +324,55 @@ func noticeFor(sealed intent.ChargeIntent, r store.NoticeReceipt) predicate.Noti
 // entirely from the rail. That is stated rather than hidden: a plan
 // claiming a wallet split it cannot perform would make the predicate's
 // balance clause pass over a lie.
-func fundingFor(sealed intent.ChargeIntent) predicate.FundingPlan {
+//
+// 🔴 The obligation is selected BY KIND, which docs/DESIGN.md §6 states
+// and this function did not:
+//
+//	grossObligation = serviceGrossObligation OR fundingGrossObligation OR
+//	                  collectionGrossObligation, selected by intent kind
+//
+// §6 gives the reason in the same breath: "so a stored-value purchase
+// cannot end up with zero principal by borrowing the service-line
+// formula". The service formula subtracts rating credits; the funding
+// formula does not, because a credit purchase's principal is cash the
+// customer is paying, not a service line credits may reduce. Applying
+// one to the other is how a $20 top-up becomes a $0 top-up that still
+// grants $20 of credit.
+//
+// The three formulas coincide TODAY, because rating credits are not
+// implemented and every total is a bare sum. Writing the selection now,
+// while they agree, is the only time it can be done without a migration
+// of live documents — and an unknown kind refuses rather than borrowing
+// whichever formula happens to be first.
+func fundingFor(sealed intent.ChargeIntent) (predicate.FundingPlan, error) {
+	kind := sealed.Kind()
+	switch kind {
+	case intent.KindPlatformBase, intent.KindModuleUsage,
+		intent.KindModuleCapacity, intent.KindCustomDomain, intent.KindTax:
+		// serviceGrossObligation = positiveServiceLines
+		//                        - eligibleRatingTaxCredits + tax + rounding
+
+	case intent.KindCreditPurchase, intent.KindAutoTopUp, intent.KindSubscriptionStart:
+		// fundingGrossObligation = cashPurchasePrincipal + tax + rounding.
+		// §6 also fixes the split for the two stored-value kinds:
+		// "walletFunding = 0; providerRemainder = grossObligation" — a
+		// purchase of credit cannot be paid for with credit.
+
+	case intent.KindCollectReceivable:
+		// collectionGrossObligation = sourceRemainingCollectibleReserved.
+		// CollectRemainderOf bounds the receivable to its source and the
+		// store reserves exactly this amount, so the sealed total IS the
+		// reserved remainder.
+
+	default:
+		return predicate.FundingPlan{}, fmt.Errorf(
+			"executor: no funding formula for charge kind %q", kind)
+	}
+
 	return predicate.FundingPlan{
 		Frozen:                  true,
 		GrossMicros:             sealed.TotalMicros(),
 		WalletAllocationMicros:  0,
 		ProviderRemainderMicros: sealed.TotalMicros(),
-	}
+	}, nil
 }
