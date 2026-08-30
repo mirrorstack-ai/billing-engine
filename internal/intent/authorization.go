@@ -280,6 +280,12 @@ func (a BillingAuthorization) Permits(
 	if a.priceBookRevision != intent.PriceBookRevision() {
 		refusals = append(refusals, RefusalPriceBookMoved)
 	}
+	// Terms are a policy version like any other. An authorization
+	// accepted under one revision does not cover a charge made under
+	// another — that is a change to the agreement, not to the amount.
+	if a.termsRevision != intent.TermsRevision() {
+		refusals = append(refusals, RefusalTermsMoved)
+	}
 	if a.noticePolicy != intent.NoticePolicy() {
 		refusals = append(refusals, RefusalNoticePolicyMoved)
 	}

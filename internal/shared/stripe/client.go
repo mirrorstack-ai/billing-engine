@@ -93,9 +93,17 @@ func newBackends() *stripego.Backends {
 		MaxNetworkRetries: stripego.Int64(maxNetworkRetries),
 		HTTPClient:        newHTTPClient(),
 	}
+	// All four, not the two this code first set. stripe-go's Backends
+	// struct carries API, Connect, Uploads and MeterEvents, and a nil
+	// field is filled in from the SDK's defaults — which is where the
+	// nonzero retry count lives. Setting two left the other two
+	// retrying, so the configuration read as explicit while half of it
+	// was still inherited.
 	return &stripego.Backends{
-		API:     stripego.GetBackendWithConfig(stripego.APIBackend, config),
-		Uploads: stripego.GetBackendWithConfig(stripego.UploadsBackend, config),
+		API:         stripego.GetBackendWithConfig(stripego.APIBackend, config),
+		Connect:     stripego.GetBackendWithConfig(stripego.ConnectBackend, config),
+		Uploads:     stripego.GetBackendWithConfig(stripego.UploadsBackend, config),
+		MeterEvents: stripego.GetBackendWithConfig(stripego.MeterEventsBackend, config),
 	}
 }
 

@@ -660,11 +660,19 @@ type collectionAuthorityContextKey struct{}
 // nominal credit-status gate. A caller who forgets an opt-out charges a
 // card; a caller who forgets an opt-in does not.
 //
-// So the capability is granted by the coordinator's own event-driven
-// entrypoints — usage arriving, a settlement observed, a period
-// boundary reconciled — and never by a read. OutOfCredits deliberately
-// does not grant it, which is what makes asking whether an account is
-// out of credits incapable of charging one.
+// So the capability is granted at named entrypoints rather than
+// inherited: usage arriving, a settlement observed, a period boundary
+// reconciled.
+//
+// 🔴 OutOfCredits also grants it, and that is the gap
+// docs/SECURITY.md §2 records rather than the design working as
+// intended. It is the read behind the platform's service-block gate,
+// and refusing it a refill deadlocks the account it would protect —
+// see the comment at OutOfCredits itself. The target is that a read
+// grants nothing; the intent executor of docs/DESIGN.md §11 is what
+// gets there. internal/architecture counts the grants and separates
+// the events from this one, so the number is visible rather than
+// asserted here.
 //
 // Suppression is kept rather than replaced: the webhook transports
 // already pass it, and a deny that two independent mechanisms agree on

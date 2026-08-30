@@ -184,16 +184,30 @@ func TestHealthMakesNoProviderMutation(t *testing.T) {
 	recorder.RequireNoProviderMutation(t, "/__health")
 }
 
-// Capabilities is a statement about the build. It must answer without
-// reaching a provider, and without a database.
+// Capabilities is a statement about the build, so it must answer
+// through the real route without reaching a provider.
+//
+// An earlier version of this asserted on a recorder that was never
+// given to the dispatcher, which made it vacuous in the most literal
+// way: the double could not have observed a call if one had happened.
+// The recorder is now wired into the service the router actually uses.
 func TestCapabilitiesMakesNoProviderMutation(t *testing.T) {
+	pool := testutil.NewTestDB(t)
 	recorder := stripetest.New()
-	d := &dispatcher{}
 
-	_, err := d.dispatch(context.Background(), "Capabilities", nil)
+	d := &dispatcher{svc: billing.NewService(billing.NewStore(pool), recorder, "")}
+	t.Setenv("INTERNAL_SECRET", "internal-secret")
+	t.Setenv("METER_SECRET", "meter-secret")
 
-	require.NoError(t, err)
-	recorder.RequireNoProviderMutation(t, "Capabilities")
+	req := httptest.NewRequest(http.MethodPost, "/v1/billing.Capabilities", strings.NewReader(`{}`))
+	req.Header.Set("X-MS-Internal-Secret", "internal-secret")
+	rec := httptest.NewRecorder()
+	buildRouter(d).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), `"legacy_money_paths"`,
+		"the route answered without the field the intent-only claim rests on")
+	recorder.RequireNoProviderMutation(t, "/v1/billing.Capabilities")
 }
 
 func seedCapabilityAccount(t *testing.T, pool *pgxpool.Pool, ownerUserID uuid.UUID) uuid.UUID {

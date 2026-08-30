@@ -60,6 +60,7 @@ type RateInput struct {
 	PriceBook        PriceBookRevision
 	Tax              TaxResolver
 	AuthorizationID  string
+	TermsRevision    string
 	NoticePolicy     string
 	ExecuteNotBefore time.Time
 	ExecuteNotAfter  time.Time
@@ -205,6 +206,7 @@ func Rate(req RateInput) (ChargeIntent, error) {
 		Currency:          req.PriceBook.Currency(),
 		Lines:             lines,
 		PriceBookRevision: req.PriceBook.Revision(),
+		TermsRevision:     req.TermsRevision,
 		Tax:               tax,
 		AuthorizationID:   req.AuthorizationID,
 		NoticePolicy:      req.NoticePolicy,

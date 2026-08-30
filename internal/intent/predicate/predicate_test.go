@@ -22,6 +22,7 @@ func sealedIntent(t *testing.T) intent.ChargeIntent {
 		Currency:          "USD",
 		Lines:             []intent.Line{intent.NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 25)},
 		PriceBookRevision: "pb-2026-08",
+		TermsRevision:     "terms-2026-01",
 		Tax: intent.TaxDetermination{
 			Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-2026-05", AmountMicros: 1_250,
 		},
@@ -84,9 +85,10 @@ func permittedState(t *testing.T) SealedState {
 			WalletAllocationMicros:  0,
 			ProviderRemainderMicros: sealed.TotalMicros(),
 		},
-		PolicyDigestsMatch: true,
-		TimeReady:          true,
-		ClaimAvailable:     true,
+		TaxIndependentlyReproducible: true,
+		PolicyDigestsMatch:           true,
+		TimeReady:                    true,
+		ClaimAvailable:               true,
 		Unbuilt: UnbuiltEvidence{
 			ProofHeadCurrent: true, ProofsApplied: true, CommercialIdentity: true,
 			MerchantOfRecord: true, SourceAllocation: true, CreditLotsReserved: true,
@@ -162,11 +164,15 @@ func TestEveryClauseCanRefuseAlone(t *testing.T) {
 		ClauseNoticeWaitElapsed:     func(s *SealedState) { s.Notice.EligibilityNotBefore = evalNow.Add(time.Hour) },
 		ClauseWithinCeilings:        func(s *SealedState) { s.PriorSpendMicros = 5_000_000 },
 		ClauseFundingPlanBalances:   func(s *SealedState) { s.Funding.ProviderRemainderMicros++ },
-		ClauseTaxFinal:              func(s *SealedState) { s.Intent = intent.ChargeIntent{} },
-		ClausePolicyPublished:       func(s *SealedState) { s.PolicyDigestsMatch = false },
-		ClauseTimeReadiness:         func(s *SealedState) { s.TimeReady = false },
-		ClauseNoPriorSettlement:     func(s *SealedState) { s.PriorSettlementExists = true },
-		ClauseClaimAvailable:        func(s *SealedState) { s.ClaimAvailable = false },
+		// Broken by the reproduction failing, not by an unsealed intent.
+		// An earlier version reused the unsealed-intent breaker, so this
+		// clause was never shown to refuse for its own reason and could
+		// have been a no-op.
+		ClauseTaxFinal:          func(s *SealedState) { s.TaxIndependentlyReproducible = false },
+		ClausePolicyPublished:   func(s *SealedState) { s.PolicyDigestsMatch = false },
+		ClauseTimeReadiness:     func(s *SealedState) { s.TimeReady = false },
+		ClauseNoPriorSettlement: func(s *SealedState) { s.PriorSettlementExists = true },
+		ClauseClaimAvailable:    func(s *SealedState) { s.ClaimAvailable = false },
 
 		ClauseProofHeadCurrent:       func(s *SealedState) { s.Unbuilt.ProofHeadCurrent = false },
 		ClauseProofsApplied:          func(s *SealedState) { s.Unbuilt.ProofsApplied = false },
@@ -416,5 +422,35 @@ func TestRefusalsAreReportedTogether(t *testing.T) {
 func TestUnknownClauseRefuses(t *testing.T) {
 	if satisfied(Clause("a_clause_nobody_wrote"), permittedState(t)) {
 		t.Fatal("an unrecognised clause was satisfied")
+	}
+}
+
+// docs/DESIGN.md §4 keeps the two authority gates mutually exclusive.
+// A state claiming both is refused rather than treated as extra
+// assurance: the standing gate requires a delivered notice and its
+// wait, the customer-present one does not, so a state carrying both
+// would let a caller present an acceptance and take the branch that
+// skips the notice. That is the notice control removed by setting one
+// extra field.
+func TestStandingModeRefusesAFreshAcceptance(t *testing.T) {
+	sealed := sealedIntent(t)
+	state := permittedState(t) // standing mode, notice delivered
+
+	if verdict := Evaluate(state); !verdict.Permitted {
+		t.Fatalf("fixture is wrong, standing alone was refused: %v", verdict.Refused)
+	}
+
+	state.Acceptance = AcceptanceReceipt{
+		DisclosureDigest: sealed.Digest(), Payer: sealed.Payer(),
+		Audience: "web-account", Nonce: "n-1",
+		ExpiresAt: evalNow.Add(time.Hour), ReplayIdentity: "r-1",
+	}
+
+	verdict := Evaluate(state)
+	if verdict.Permitted {
+		t.Fatal("a state claiming both authority gates was permitted")
+	}
+	if !verdict.RefusedClause(ClauseAuthorityEvidence) {
+		t.Errorf("refusals = %v, want %v", verdict.Refused, ClauseAuthorityEvidence)
 	}
 }

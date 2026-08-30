@@ -130,6 +130,18 @@ type SealedState struct {
 	// published, effective, and digest-matching.
 	PolicyDigestsMatch bool
 
+	// TaxIndependentlyReproducible reports that the sealed tax figure
+	// was recomputed from the named rule revision and matched.
+	//
+	// docs/DESIGN.md §4 asks for "tax is independently reproducible
+	// final or explicitly not_applicable", which is a stronger claim
+	// than the sealed determination carrying a Resolved flag: Seal
+	// already refuses an unresolved one, so reading that flag back here
+	// would check something no reachable state can violate. What can be
+	// violated is the reproduction, and that is what a customer
+	// rechecking a charge offline is doing.
+	TaxIndependentlyReproducible bool
+
 	// TimeReady reports that the trusted clock's uncertainty interval
 	// lies wholly on the permitted side of every cutoff evaluated here.
 	// A clock that might be wrong in the direction that permits is not

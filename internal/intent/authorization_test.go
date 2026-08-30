@@ -99,6 +99,11 @@ func TestEveryBoundRefuses(t *testing.T) {
 			wantRefusal: RefusalNoticePolicyMoved,
 		},
 		{
+			name: "the terms moved under it", kind: kindWalletTopUp, at: now,
+			draft:       func(d *Draft) { d.TermsRevision = "terms-2026-02" },
+			wantRefusal: RefusalTermsMoved,
+		},
+		{
 			name: "before it takes effect", kind: kindWalletTopUp, at: authFrom.Add(-time.Hour),
 			wantRefusal: RefusalNotYetEffective,
 		},

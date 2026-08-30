@@ -20,6 +20,7 @@ func validDraft() Draft {
 			NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 25),
 		},
 		PriceBookRevision: "pb-2026-08",
+		TermsRevision:     "terms-2026-01",
 		Tax: TaxDetermination{
 			Resolved:     true,
 			Jurisdiction: "TW",
@@ -120,6 +121,7 @@ func TestEveryFieldChangesTheDigest(t *testing.T) {
 		"line quantity":       func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_001, 25) },
 		"line unit price":     func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 26) },
 		"price book":          func(d *Draft) { d.PriceBookRevision = "pb-2026-09" },
+		"terms revision":      func(d *Draft) { d.TermsRevision = "terms-2026-02" },
 		"tax jurisdiction":    func(d *Draft) { d.Tax.Jurisdiction = "JP" },
 		"tax rule revision":   func(d *Draft) { d.Tax.RuleRevision = "tax-2026-06" },
 		"tax amount":          func(d *Draft) { d.Tax.AmountMicros = 1_251 },
@@ -209,6 +211,7 @@ func TestSealRefusesRatherThanDefaults(t *testing.T) {
 		{"negative quantity", func(d *Draft) { d.Lines[0].Quantity = -1 }, ErrNegativeLine},
 		{"negative price", func(d *Draft) { d.Lines[0].UnitPriceMicros = -1 }, ErrNegativeLine},
 		{"no price book", func(d *Draft) { d.PriceBookRevision = "" }, ErrPriceBookMissing},
+		{"no terms revision", func(d *Draft) { d.TermsRevision = "" }, ErrTermsMissing},
 		{"undetermined tax", func(d *Draft) { d.Tax.Resolved = false }, ErrTaxUnresolved},
 		{"no authorization", func(d *Draft) { d.AuthorizationID = "" }, ErrAuthorizationUnset},
 		{"no notice policy", func(d *Draft) { d.NoticePolicy = "" }, ErrNoticePolicyUnset},

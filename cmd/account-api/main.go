@@ -663,6 +663,12 @@ func buildRouter(d *dispatcher) *chi.Mux {
 	internalSecret := os.Getenv("INTERNAL_SECRET")
 	r.Group(func(r chi.Router) {
 		r.Use(auth.InternalSecret(internalSecret))
+		// Capabilities reports the build and how many legacy money
+		// paths remain. It was reachable only through the Lambda
+		// dispatcher until now, which meant the local HTTP mode could
+		// not answer the question docs/VERIFICATION.md §2 makes the
+		// intent-only claim rest on.
+		r.Post("/v1/billing.Capabilities", makeHTTPHandler(d, "Capabilities"))
 		r.Post("/v1/billing.Ensure", makeHTTPHandler(d, "Ensure"))
 		r.Post("/v1/billing.PrepareAddPaymentMethod", makeHTTPHandler(d, "PrepareAddPaymentMethod"))
 		r.Post("/v1/billing.StartAddPaymentMethod", makeHTTPHandler(d, "StartAddPaymentMethod"))

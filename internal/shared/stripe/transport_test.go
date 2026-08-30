@@ -18,10 +18,20 @@ import (
 func TestBackendsMakeNoAutomaticRetries(t *testing.T) {
 	backends := newBackends()
 
+	// Every backend the struct has. A nil field is filled in from the
+	// SDK's defaults, so a backend left unset is a backend still
+	// retrying — this test existed while two of the four were.
 	for name, backend := range map[string]stripego.Backend{
-		"API":     backends.API,
-		"Uploads": backends.Uploads,
+		"API":         backends.API,
+		"Connect":     backends.Connect,
+		"Uploads":     backends.Uploads,
+		"MeterEvents": backends.MeterEvents,
 	} {
+		if backend == nil {
+			t.Errorf("%s backend is nil; stripe-go will fill it in with its own defaults, "+
+				"including the retry count this test exists to pin", name)
+			continue
+		}
 		impl, ok := backend.(*stripego.BackendImplementation)
 		if !ok {
 			t.Fatalf("%s backend is %T, not the implementation whose retry count can be read", name, backend)
@@ -33,17 +43,14 @@ func TestBackendsMakeNoAutomaticRetries(t *testing.T) {
 	}
 }
 
-// The default this overrides is nonzero, so the assertion above is
-// meaningful. If stripe-go ever ships zero as its default, this test
-// starts failing and whoever sees it can simplify with confidence
-// rather than guessing whether the override still does anything.
+// The default this overrides is nonzero, which is what makes the
+// assertion above worth making. Written as a failure rather than a skip
+// or a log: an earlier version did both, and a test that cannot fail
+// tells nobody anything, whatever its comment claims.
 func TestTheSDKDefaultIsStillNonZero(t *testing.T) {
 	if stripego.DefaultMaxNetworkRetries == 0 {
-		t.Skip("stripe-go now defaults to zero retries; the explicit override is redundant but harmless")
-	}
-	if stripego.DefaultMaxNetworkRetries != 2 {
-		t.Logf("stripe-go's default retry count is now %d, was 2 when the override was written",
-			stripego.DefaultMaxNetworkRetries)
+		t.Fatal("stripe-go now defaults to zero retries. The explicit override is no longer " +
+			"doing anything; either delete it or keep it deliberately, and update this test.")
 	}
 }
 

@@ -79,6 +79,12 @@ type Draft struct {
 	// resolved for this intent. Reproducibility depends on it: a total
 	// whose price source is unnamed cannot be recomputed later.
 	PriceBookRevision string
+	// TermsRevision is the customer terms this charge is made under.
+	// INV-003 seals "policy versions", and terms are one: a standing
+	// authorization accepted under one revision does not cover a charge
+	// made under another, and without this field on the intent there is
+	// nothing for the authorization to compare against.
+	TermsRevision string
 	// Tax is the frozen determination.
 	Tax TaxDetermination
 	// AuthorizationID references the BillingAuthorization that permits
@@ -122,6 +128,7 @@ type ChargeIntent struct {
 	currency          string
 	lines             []Line
 	priceBookRevision string
+	termsRevision     string
 	tax               TaxDetermination
 	authorizationID   string
 	noticePolicy      string
@@ -144,6 +151,7 @@ var (
 	ErrNoLines            = errors.New("intent: a charge intent with no lines proposes nothing")
 	ErrCurrencyMissing    = errors.New("intent: no currency")
 	ErrPriceBookMissing   = errors.New("intent: no price book revision")
+	ErrTermsMissing       = errors.New("intent: no terms revision")
 	ErrTaxUnresolved      = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
 	ErrTaxNegative        = errors.New("intent: tax is negative")
 	ErrAuthorizationUnset = errors.New("intent: no billing authorization referenced")
@@ -190,6 +198,9 @@ func Seal(draft Draft) (ChargeIntent, error) {
 	if strings.TrimSpace(draft.PriceBookRevision) == "" {
 		return ChargeIntent{}, ErrPriceBookMissing
 	}
+	if strings.TrimSpace(draft.TermsRevision) == "" {
+		return ChargeIntent{}, ErrTermsMissing
+	}
 	if !draft.Tax.Resolved {
 		return ChargeIntent{}, ErrTaxUnresolved
 	}
@@ -221,6 +232,7 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		currency:          strings.ToUpper(strings.TrimSpace(draft.Currency)),
 		lines:             append([]Line(nil), draft.Lines...),
 		priceBookRevision: draft.PriceBookRevision,
+		termsRevision:     draft.TermsRevision,
 		tax:               draft.Tax,
 		authorizationID:   draft.AuthorizationID,
 		noticePolicy:      draft.NoticePolicy,
@@ -287,6 +299,7 @@ func (c ChargeIntent) computeDigest() string {
 	}
 
 	e.string(c.priceBookRevision)
+	e.string(c.termsRevision)
 	e.string(c.tax.Jurisdiction)
 	e.string(c.tax.RuleRevision)
 	e.int(c.tax.AmountMicros)
@@ -323,6 +336,9 @@ func (c ChargeIntent) Lines() []Line { return append([]Line(nil), c.lines...) }
 
 // PriceBookRevision names the one effective price revision used.
 func (c ChargeIntent) PriceBookRevision() string { return c.priceBookRevision }
+
+// TermsRevision names the customer terms this charge is made under.
+func (c ChargeIntent) TermsRevision() string { return c.termsRevision }
 
 // Tax is the frozen determination.
 func (c ChargeIntent) Tax() TaxDetermination { return c.tax }

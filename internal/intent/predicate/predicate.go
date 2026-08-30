@@ -153,7 +153,14 @@ func satisfied(clause Clause, s SealedState) bool {
 		// INV-004: tax must be independently reproducible final or
 		// explicitly not applicable. An unresolved determination is
 		// neither, and must never be read as zero.
-		return s.Intent.Sealed() && s.Intent.Tax().Resolved
+		//
+		// Both halves are required. The sealed flag says a
+		// determination was made; the reproduction says it can be
+		// recomputed from the rule revision it names, which is what
+		// makes the figure checkable by someone who does not trust us.
+		return s.Intent.Sealed() &&
+			s.Intent.Tax().Resolved &&
+			s.TaxIndependentlyReproducible
 
 	case ClausePolicyPublished:
 		return s.PolicyDigestsMatch
@@ -240,6 +247,19 @@ func authorityEvidenceBinds(s SealedState) bool {
 	case AuthorityStandingAuto:
 		// The standing gate rests on the authorization's own recorded
 		// acceptance, not on a fresh one.
+		//
+		// A state carrying BOTH a standing mode and a fresh acceptance
+		// receipt is refused rather than treated as extra assurance.
+		// docs/DESIGN.md §4 keeps the two gates mutually exclusive, and
+		// the reason is that they have different consequences: the
+		// standing gate requires a delivered notice and its wait, the
+		// customer-present one does not. A state claiming both would
+		// let a caller present an acceptance and take the branch that
+		// skips the notice, which is the notice control removed by
+		// setting one extra field.
+		if s.Acceptance != (AcceptanceReceipt{}) {
+			return false
+		}
 		return s.Authorization.Scope() == intent.ScopeStanding &&
 			s.Authorization.AcceptanceDigest() != ""
 	}
