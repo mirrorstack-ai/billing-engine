@@ -119,6 +119,26 @@ type seed struct {
 	catalogPrice  int64
 	chargedMicros int64
 	skipCatalog   bool
+	// rawCost is the pre-markup base. Zero means "no markup".
+	rawCost int64
+}
+
+// rawCostMicros is the PRE-markup figure the real rollup writes beside
+// charged_micros (migrations/billing/009_usage_aggregates.up.sql:28:
+// charged_micros = round_half_up(raw_cost_micros * num / den)).
+//
+// A fixture that leaves it at its DEFAULT 0 is not a smaller fixture, it
+// is a different one: the shadow comparison is against the base, so a
+// zero base makes every delta equal the whole shadow figure. Tests that
+// omitted it were measuring the default, not the metric.
+//
+// Unless a case sets it explicitly, there is no markup and base ==
+// charged, which is what an ordinary non-infra metric looks like.
+func (s seed) rawCostMicros() int64 {
+	if s.rawCost != 0 {
+		return s.rawCost
+	}
+	return s.chargedMicros
 }
 
 func seedPricedPeriod(t *testing.T, pool *pgxpool.Pool, s seed) {
@@ -146,10 +166,10 @@ func seedPricedPeriod(t *testing.T, pool *pgxpool.Pool, s seed) {
 	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.usage_aggregates
 		   (period_id, account_id, app_id, module_id, metric, module_version,
-		    kind, billable_quantity, unit_price_micros, charged_micros)
-		 VALUES ($1,$2,$3,$4,$5,$6,'count',$7,$8,$9)`,
+		    kind, billable_quantity, unit_price_micros, raw_cost_micros, charged_micros)
+		 VALUES ($1,$2,$3,$4,$5,$6,'count',$7,$8,$9,$10)`,
 		periodID, accountID, appID, moduleID, usageMetric, s.version,
-		s.quantity, s.catalogPrice, s.chargedMicros)
+		s.quantity, s.catalogPrice, s.rawCostMicros(), s.chargedMicros)
 	require.NoError(t, err)
 
 	if !s.skipCatalog {
