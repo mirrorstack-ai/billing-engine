@@ -164,6 +164,7 @@ var (
 	ErrPriceBookMissing   = errors.New("intent: no price book revision")
 	ErrTermsMissing       = errors.New("intent: no terms revision")
 	ErrKindMissing        = errors.New("intent: no charge kind")
+	ErrKindNotInCatalog   = errors.New("intent: charge kind is not in the closed catalog of docs/DESIGN.md §6")
 	ErrTaxUnresolved      = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
 	ErrTaxNegative        = errors.New("intent: tax is negative")
 	ErrAuthorizationUnset = errors.New("intent: no billing authorization referenced")
@@ -215,6 +216,20 @@ func Seal(draft Draft) (ChargeIntent, error) {
 	}
 	if strings.TrimSpace(string(draft.Kind)) == "" {
 		return ChargeIntent{}, ErrKindMissing
+	}
+	// docs/DESIGN.md §6: "A positive customer charge kind that is not
+	// listed below must not be proposed, and must not be collected. No
+	// private caller, module, adapter, webhook, tax vendor or operator may
+	// introduce a kind from free text."
+	//
+	// Refused at Seal, not at the predicate, because unlike a policy
+	// revision there is no phase in which an invented kind is legitimate.
+	// A revision that is not yet published still names a real decision the
+	// shadow phase is allowed to propose under; a kind outside the catalog
+	// names nothing at all, and sealing it puts a word into the digest that
+	// no published rule defines.
+	if !KindInCatalog(draft.Kind) {
+		return ChargeIntent{}, fmt.Errorf("%w: %q", ErrKindNotInCatalog, draft.Kind)
 	}
 	if !draft.Tax.Resolved {
 		return ChargeIntent{}, ErrTaxUnresolved

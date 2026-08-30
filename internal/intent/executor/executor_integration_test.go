@@ -23,7 +23,7 @@ var (
 	evalNow     = time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
 )
 
-const kindCycle intent.ChargeKind = "usage.cycle"
+const kindCycle intent.ChargeKind = intent.KindModuleUsage
 
 // recordingCollector observes every dispatch, so "the executor did not
 // call the provider" is something the test can see rather than assume.

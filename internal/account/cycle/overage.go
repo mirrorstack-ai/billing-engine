@@ -823,7 +823,7 @@ func (s *Service) proposeModuleOverage(
 
 	sealed, err := s.proposer.Propose(ctx, proposer.Charge{
 		Payer:        intent.Subject{Kind: "user", ID: cand.AccountID.String()},
-		Kind:         "module.overage",
+		Kind:         intent.KindModuleCapacity,
 		Currency:     chargeCurrency,
 		AmountMicros: sealMicros,
 		Description:  "MirrorStack module overage (prorated)",

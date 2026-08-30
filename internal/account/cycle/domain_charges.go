@@ -392,7 +392,7 @@ func (s *Service) proposeDomainCharge(
 
 	sealed, err := s.proposer.Propose(ctx, proposer.Charge{
 		Payer:        intent.Subject{Kind: "user", ID: cand.AccountID.String()},
-		Kind:         "domain.custom",
+		Kind:         intent.KindCustomDomain,
 		Currency:     chargeCurrency,
 		AmountMicros: sealMicros,
 		Description:  fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname),

@@ -13,7 +13,7 @@ var (
 	evalNow     = time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
 )
 
-const kind intent.ChargeKind = "usage.cycle"
+const kind intent.ChargeKind = intent.KindModuleUsage
 
 func sealedIntent(t *testing.T) intent.ChargeIntent {
 	t.Helper()

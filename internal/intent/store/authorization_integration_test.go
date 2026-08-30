@@ -13,7 +13,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
-const kindTopUp intent.ChargeKind = "wallet.topup"
+const kindTopUp intent.ChargeKind = intent.KindAutoTopUp
 
 func standingAuth(t *testing.T) intent.BillingAuthorization {
 	t.Helper()

@@ -12,7 +12,7 @@ var (
 	now      = time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
 )
 
-const kindWalletTopUp ChargeKind = "wallet.topup"
+const kindWalletTopUp ChargeKind = KindAutoTopUp
 
 func standingGrant() AuthorizationGrant {
 	return AuthorizationGrant{
@@ -77,7 +77,7 @@ func TestEveryBoundRefuses(t *testing.T) {
 		},
 		{
 			name: "a charge kind it never permitted", at: now,
-			draft:       func(d *Draft) { d.Kind = "subscription.increase" },
+			draft:       func(d *Draft) { d.Kind = KindSubscriptionStart },
 			wantRefusal: RefusalKindNotPermitted,
 		},
 		{
@@ -185,7 +185,7 @@ func TestRefusalsAreReportedTogether(t *testing.T) {
 	}
 
 	d := validDraft()
-	d.Kind = "subscription.increase"
+	d.Kind = KindSubscriptionStart
 	unpermittedKind, err := Seal(d)
 	if err != nil {
 		t.Fatal(err)

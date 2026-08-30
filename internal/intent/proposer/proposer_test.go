@@ -30,7 +30,7 @@ var (
 func domainCharge() Charge {
 	return Charge{
 		Payer:        intent.Subject{Kind: "user", ID: "acct-1"},
-		Kind:         "domain.custom",
+		Kind:         intent.KindCustomDomain,
 		Currency:     "USD",
 		AmountMicros: 5_000_000,
 		Description:  "custom domain example.com",

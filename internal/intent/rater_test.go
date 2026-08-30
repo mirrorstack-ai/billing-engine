@@ -69,7 +69,7 @@ func rateRequest(t *testing.T, facts ...UsageFact) RateInput {
 		PriceBook:        book(t),
 		Tax:              resolvedTax(),
 		AuthorizationID:  "auth-1",
-		Kind:             "usage.cycle",
+		Kind:             KindModuleUsage,
 		TermsRevision:    "terms-2026-01",
 		NoticePolicy:     "email/v1",
 		ExecuteNotBefore: windowStart,
