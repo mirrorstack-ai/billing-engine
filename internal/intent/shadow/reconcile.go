@@ -43,6 +43,17 @@ type Difference struct {
 	// IntentDigest identifies the shadow document, so a reviewer can
 	// pull the exact lines that produced ShadowMicros.
 	IntentDigest string
+
+	// Quarantined marks a period the rater could not price at all.
+	//
+	// It must be carried explicitly rather than inferred from
+	// ShadowMicros == 0. A quarantined period has NO shadow figure, and
+	// zero is not "no figure" — it is a number that happens to agree
+	// with any legacy base that is also zero. INV-004 forbids exactly
+	// that inference, and it is reachable: raw_cost_micros DEFAULTs to 0
+	// (migration 009), so a row written without it would let a period
+	// the rater cannot handle be counted as a period it got right.
+	Quarantined bool
 }
 
 // DeltaMicros is shadow minus legacy. Positive means the new rater
@@ -58,7 +69,13 @@ func (d Difference) MarkupMicros() int64 { return d.LegacyMicros - d.LegacyBaseM
 // Agrees reports whether the two totals match exactly. Money is integer
 // micro-dollars, so there is no tolerance and none is offered: a
 // tolerance is a place for a real difference to hide.
-func (d Difference) Agrees() bool { return d.ShadowMicros == d.LegacyBaseMicros }
+func (d Difference) Agrees() bool {
+	if d.Quarantined {
+		// No figure was produced, so there is nothing that could agree.
+		return false
+	}
+	return d.ShadowMicros == d.LegacyBaseMicros
+}
 
 // Kind classifies a difference by what is known about its cause.
 type Kind string

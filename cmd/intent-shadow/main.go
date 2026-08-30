@@ -112,6 +112,7 @@ func run(ctx context.Context, src *shadow.Source, limit int) (shadow.Report, err
 			// periods the rater cannot handle from the very count that
 			// is supposed to reveal them.
 			d.ShadowMicros = 0
+			d.Quarantined = true
 			d.IntentDigest = "quarantined: " + rateErr.Error()
 		} else {
 			d.ShadowMicros = sealed.TotalMicros()

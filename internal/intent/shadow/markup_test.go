@@ -84,3 +84,40 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// A quarantined period has NO shadow figure. Zero is not "no figure" — it is a
+// number that happens to agree with any legacy base that is also zero, and
+// raw_cost_micros DEFAULTs to 0 (migration 009), so that case is reachable in
+// real data rather than hypothetical.
+//
+// INV-004 forbids reading an unknown as a zero. Counting a period the rater
+// could not price as a period it got right is the worst possible form of that
+// mistake: the tool would report readiness for a cutover on the strength of
+// the rows it failed to handle.
+func TestAQuarantinedPeriodNeverCountsAsAgreement(t *testing.T) {
+	d := Difference{
+		AccountID:        "acct-1",
+		PeriodID:         "period-1",
+		LegacyBaseMicros: 0, // raw_cost_micros never written
+		LegacyMicros:     25_000,
+		ShadowMicros:     0, // no figure, not "zero dollars"
+		Quarantined:      true,
+		IntentDigest:     "quarantined: no price for quiz.export",
+	}
+
+	if d.Agrees() {
+		t.Fatal("a period the rater could not price was counted as agreement")
+	}
+
+	report := Reconcile([]Difference{d})
+	if report.Agreed != 0 {
+		t.Fatalf("Agreed = %d, want 0", report.Agreed)
+	}
+	if report.Unexplained() != 1 {
+		t.Fatalf("Unexplained = %d, want 1 — a quarantine must surface, not vanish",
+			report.Unexplained())
+	}
+	if report.Ready() {
+		t.Fatal("a report containing a quarantined period declared itself ready for cutover")
+	}
+}
