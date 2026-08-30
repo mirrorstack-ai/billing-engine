@@ -1,0 +1,273 @@
+package predicate
+
+import (
+	"strings"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+)
+
+// Verdict is the predicate's answer.
+//
+// Refused clauses are returned together rather than short-circuiting.
+// An operator fixing one condition and being refused for the next is
+// how a single incident becomes an afternoon, and a customer asking why
+// a charge did not go through deserves the whole answer. Ordering
+// follows docs/DESIGN.md §4's conjunction so a refusal list reads down
+// the predicate.
+type Verdict struct {
+	Permitted bool
+	Refused   []Clause
+}
+
+// Refused reports whether a specific clause refused.
+func (v Verdict) RefusedClause(c Clause) bool {
+	for _, refused := range v.Refused {
+		if refused == c {
+			return true
+		}
+	}
+	return false
+}
+
+// Evaluate decides whether an intent may execute.
+//
+// It is the single copy of docs/DESIGN.md §4's predicate: one exported
+// total function, no I/O, no clock, no error return. A refusal mutates
+// no provider, because this function cannot reach one.
+//
+// Every clause is evaluated — none short-circuits — so the verdict
+// names every reason at once.
+func Evaluate(state SealedState) Verdict {
+	var refused []Clause
+
+	hasProviderRemainder := state.Funding.ProviderRemainderMicros > 0
+
+	for _, clause := range AllClauses {
+		if providerClauses[clause] && !hasProviderRemainder {
+			// docs/DESIGN.md §4: "providerRemainder == 0 OR (...)".
+			// A wallet-only intent moves no money at a rail, so rail
+			// evidence is not required of it.
+			continue
+		}
+		if !satisfied(clause, state) {
+			refused = append(refused, clause)
+		}
+	}
+
+	return Verdict{Permitted: len(refused) == 0, Refused: refused}
+}
+
+// satisfied answers one clause. Each has exactly one owner here, which
+// is the property the package exists to hold: there is one place to
+// read to find out what a clause means, and one place to change it.
+func satisfied(clause Clause, s SealedState) bool {
+	switch clause {
+	case ClauseIntentImmutable:
+		// An unsealed intent is a draft. INV-003 makes sealing the
+		// thing that fixes the document, so there is nothing to
+		// execute against before it.
+		return s.Intent.Sealed()
+
+	case ClauseIntentStateEligible:
+		return s.State == StateEligible
+
+	case ClauseBuildIdentified:
+		// docs/VERIFICATION.md §2: an executor whose build identity
+		// reads "unknown" must refuse to execute.
+		return s.BuildIdentified
+
+	case ClauseAuthorizationValid:
+		if !s.Intent.Sealed() {
+			return false
+		}
+		return s.Authorization.
+			Permits(s.Intent, s.AuthorizationKind, s.Now, s.PriorSpendMicros).
+			Permitted
+
+	case ClauseAuthorityEvidence:
+		return authorityEvidenceBinds(s)
+
+	case ClauseNoticeDelivered:
+		// Only the standing-automatic gate requires notice. INV-005
+		// applies to automatic collection; a customer watching the
+		// screen has just been shown the document.
+		if s.Mode != AuthorityStandingAuto {
+			return true
+		}
+		return noticeTerminallyDelivered(s)
+
+	case ClauseNoticeWaitElapsed:
+		if s.Mode != AuthorityStandingAuto {
+			return true
+		}
+		// The wait runs from delivery. A zero eligibilityNotBefore is
+		// not "no wait required", it is no receipt.
+		if s.Notice.EligibilityNotBefore.IsZero() {
+			return false
+		}
+		return !s.Now.Before(s.Notice.EligibilityNotBefore)
+
+	case ClauseWithinCeilings:
+		// The authorization owns the ceilings, and it has already been
+		// asked. This clause exists separately so that a refusal names
+		// the ceiling rather than the authorization: "over your limit"
+		// and "not authorized" are different things to be told.
+		if !s.Intent.Sealed() {
+			return false
+		}
+		decision := s.Authorization.Permits(s.Intent, s.AuthorizationKind, s.Now, s.PriorSpendMicros)
+		for _, refusal := range decision.Refusals {
+			if refusal == intent.RefusalOverPerCharge || refusal == intent.RefusalOverPeriod {
+				return false
+			}
+		}
+		return true
+
+	case ClauseFundingPlanBalances:
+		if !s.Funding.Frozen || !s.Intent.Sealed() {
+			return false
+		}
+		if s.Funding.WalletAllocationMicros < 0 || s.Funding.ProviderRemainderMicros < 0 {
+			return false
+		}
+		// The plan must account for the whole obligation and no more,
+		// and it must be the obligation this intent sealed.
+		if s.Funding.GrossMicros != s.Intent.TotalMicros() {
+			return false
+		}
+		return s.Funding.WalletAllocationMicros+s.Funding.ProviderRemainderMicros == s.Funding.GrossMicros
+
+	case ClauseTaxFinal:
+		// INV-004: tax must be independently reproducible final or
+		// explicitly not applicable. An unresolved determination is
+		// neither, and must never be read as zero.
+		return s.Intent.Sealed() && s.Intent.Tax().Resolved
+
+	case ClausePolicyPublished:
+		return s.PolicyDigestsMatch
+
+	case ClauseTimeReadiness:
+		return s.TimeReady
+
+	case ClauseNoPriorSettlement:
+		// INV-008: one intent settles at most once, across all
+		// providers.
+		return !s.PriorSettlementExists
+
+	case ClauseClaimAvailable:
+		return s.ClaimAvailable
+
+	// --- clauses whose records are unbuilt ---
+	case ClauseProofHeadCurrent:
+		return s.Unbuilt.ProofHeadCurrent
+	case ClauseProofsApplied:
+		return s.Unbuilt.ProofsApplied
+	case ClauseCommercialIdentity:
+		return s.Unbuilt.CommercialIdentity
+	case ClauseMerchantOfRecord:
+		return s.Unbuilt.MerchantOfRecord
+	case ClauseSourceAllocation:
+		return s.Unbuilt.SourceAllocation
+	case ClauseCreditLotsReserved:
+		return s.Unbuilt.CreditLotsReserved
+	case ClauseExposureReservation:
+		return s.Unbuilt.ExposureReservation
+	case ClauseFundingMatchesAccepted:
+		return s.Unbuilt.FundingMatchesAccepted
+	case ClauseRailSupportsPlan:
+		return s.Unbuilt.RailSupportsPlan
+	case ClauseProviderAutonomy:
+		return s.Unbuilt.ProviderAutonomy
+	case ClauseFirstStepMatchesPlan:
+		return s.Unbuilt.FirstStepMatchesPlan
+	case ClauseInstrumentBinding:
+		return s.Unbuilt.InstrumentBinding
+	case ClauseEnclaveReady:
+		return s.Unbuilt.EnclaveReady
+	case ClauseAttemptFrozen:
+		return s.Unbuilt.AttemptFrozen
+	}
+
+	// An unrecognised clause refuses. INV-004: "A validator that
+	// permits whatever it was not taught to refuse is the §1 shape,
+	// arriving one field at a time."
+	return false
+}
+
+// authorityEvidenceBinds checks the mode-appropriate evidence.
+//
+// docs/DESIGN.md §4 keeps the two gates mutually exclusive, so a state
+// naming neither — or claiming both by carrying a fresh acceptance
+// while in standing mode — is unclear rather than doubly authorized.
+func authorityEvidenceBinds(s SealedState) bool {
+	switch s.Mode {
+	case AuthorityCustomerPresent:
+		// "A bare accepted: true carrying no disclosure digest has no
+		// effect at all." The receipt must name this document, this
+		// payer, and be unexpired.
+		if s.Acceptance.DisclosureDigest == "" {
+			return false
+		}
+		if s.Acceptance.DisclosureDigest != s.Intent.Digest() {
+			return false
+		}
+		if s.Acceptance.Payer != s.Intent.Payer() {
+			return false
+		}
+		if strings.TrimSpace(s.Acceptance.Nonce) == "" ||
+			strings.TrimSpace(s.Acceptance.Audience) == "" ||
+			strings.TrimSpace(s.Acceptance.ReplayIdentity) == "" {
+			return false
+		}
+		if s.Acceptance.ExpiresAt.IsZero() || s.Now.After(s.Acceptance.ExpiresAt) {
+			return false
+		}
+		return s.Authorization.Scope() == intent.ScopeOneTime ||
+			s.Authorization.Scope() == intent.ScopeStanding
+
+	case AuthorityStandingAuto:
+		// The standing gate rests on the authorization's own recorded
+		// acceptance, not on a fresh one.
+		return s.Authorization.Scope() == intent.ScopeStanding &&
+			s.Authorization.AcceptanceDigest() != ""
+	}
+	return false
+}
+
+// noticeTerminallyDelivered is INV-005's "delivery, not sending".
+//
+// "Delivery evidence means the carrier reported your configured
+// destination in a terminal status the accepted policy defines as
+// destination-delivered. Queue acceptance is not enough: handing a
+// message to a queue proves only that we tried."
+func noticeTerminallyDelivered(s SealedState) bool {
+	if !s.Intent.Sealed() {
+		return false
+	}
+	// The bytes delivered must be the bytes collected against.
+	if s.Notice.DeliveredBytesDigest != s.Intent.Digest() {
+		return false
+	}
+	if s.Notice.Policy != s.Intent.NoticePolicy() {
+		return false
+	}
+	if !deliveredStatuses[s.Notice.TerminalStatus] {
+		return false
+	}
+	// A notice the customer cannot act on is a disclosure, not a
+	// control. docs/DESIGN.md §4 requires the revocation path to be
+	// fresh and checkpoint-consistent before an automatic charge.
+	return s.Notice.RevocationPathFresh
+}
+
+// deliveredStatuses is a closed allow-list of carrier states that count
+// as destination-delivered.
+//
+// An allow-list rather than a deny-list, for the reason INV-004 gives:
+// a status nobody anticipated must refuse, not pass. "queued", "sent"
+// and "accepted" are deliberately absent — they describe our side of
+// the handoff.
+var deliveredStatuses = map[string]bool{
+	"delivered": true,
+	"relayed":   true,
+}
