@@ -12,6 +12,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const closeBillingPeriodForRollup = `-- name: CloseBillingPeriodForRollup :exec
+UPDATE ms_billing.billing_periods
+SET status = CASE WHEN status = 'open' THEN 'closing' ELSE status END
+WHERE account_id = $1::uuid
+  AND period_start = $2::timestamptz
+  AND period_end = $3::timestamptz
+`
+
+type CloseBillingPeriodForRollupParams struct {
+	AccountID   string    `json:"account_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+}
+
+// CloseBillingPeriodForRollup transitions the period to its intake barrier.
+// The caller holds the same account-period advisory transaction lock as v2
+// observation insertion, so no accepted row can race the rollup snapshot.
+// A retry may re-enter an already-closing period; invoiced is also left intact.
+func (q *Queries) CloseBillingPeriodForRollup(ctx context.Context, arg CloseBillingPeriodForRollupParams) error {
+	_, err := q.db.Exec(ctx, closeBillingPeriodForRollup, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
+	return err
+}
+
 const lookupMetricPrice = `-- name: LookupMetricPrice :one
 SELECT unit_price_micros
 FROM ms_billing.metric_definitions
@@ -234,25 +257,128 @@ func (q *Queries) OpenPeriodForAccount(ctx context.Context, arg OpenPeriodForAcc
 	return i, err
 }
 
+const rollupKeyedPeakKind = `-- name: RollupKeyedPeakKind :many
+WITH eligible AS (
+    SELECT
+        app_id,
+        module_id,
+        metric,
+        subject,
+        COALESCE(model, '') AS model,
+        COALESCE(module_version, '') AS module_version,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1::uuid
+      AND COALESCE(billable_at, recorded_at) >= $2::timestamptz
+      AND COALESCE(billable_at, recorded_at) <  $3::timestamptz
+      AND ($4::boolean OR observation_version <> 2)
+      AND kind = 'peak'
+      AND aggregation_key = 'subject'
+),
+subject_peaks AS (
+    SELECT
+        app_id, module_id, metric, subject, model, module_version,
+        MAX(value)::numeric AS subject_peak
+    FROM eligible
+    GROUP BY app_id, module_id, metric, subject, model, module_version
+)
+SELECT
+    p.app_id,
+    p.module_id,
+    p.metric,
+    'peak'::ms_billing.metric_kind AS kind,
+    'subject'::text AS aggregation_key,
+    p.model,
+    p.module_version,
+    COALESCE(SUM(p.subject_peak), 0)::numeric AS billable_quantity
+FROM subject_peaks p
+GROUP BY p.app_id, p.module_id, p.metric, p.model, p.module_version
+`
+
+type RollupKeyedPeakKindParams struct {
+	AccountID   string    `json:"account_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	IncludeV2   bool      `json:"include_v2"`
+}
+
+type RollupKeyedPeakKindRow struct {
+	AppID            string              `json:"app_id"`
+	ModuleID         string              `json:"module_id"`
+	Metric           string              `json:"metric"`
+	Kind             MsBillingMetricKind `json:"kind"`
+	AggregationKey   string              `json:"aggregation_key"`
+	Model            string              `json:"model"`
+	ModuleVersion    string              `json:"module_version"`
+	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
+}
+
+// RollupKeyedPeakKind implements aggregation_key="subject": inside an
+// account's period, each authoritative subject contributes its own MAX(value),
+// and those subject maxima are summed. Subject identity is scoped to the meter
+// (app, module, metric), not diagnostic metadata, provider, or retry event id.
+//
+// Existing authoritative bill-line dimensions remain part of the scope:
+// account/app/module/metric/model/module_version/window. A model or version
+// change is a distinct pricing definition and therefore a distinct keyed line;
+// no arrival-order-dependent "latest wins" reassignment can move usage between
+// prices. Keyed peak is a cardinality-style quantity and receives no
+// level-window proration.
+func (q *Queries) RollupKeyedPeakKind(ctx context.Context, arg RollupKeyedPeakKindParams) ([]RollupKeyedPeakKindRow, error) {
+	rows, err := q.db.Query(ctx, rollupKeyedPeakKind,
+		arg.AccountID,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+		arg.IncludeV2,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RollupKeyedPeakKindRow{}
+	for rows.Next() {
+		var i RollupKeyedPeakKindRow
+		if err := rows.Scan(
+			&i.AppID,
+			&i.ModuleID,
+			&i.Metric,
+			&i.Kind,
+			&i.AggregationKey,
+			&i.Model,
+			&i.ModuleVersion,
+			&i.BillableQuantity,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const rollupPeakKind = `-- name: RollupPeakKind :many
 WITH raw_events AS (
     SELECT
         app_id, module_id, metric, kind,
         COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
-        value, recorded_at, event_id,
+        value, COALESCE(billable_at, recorded_at) AS observation_at, event_id,
         $2::timestamptz AS period_start
     FROM ms_billing.usage_events
     WHERE account_id = $1
-      AND recorded_at >= $2::timestamptz
-      AND recorded_at <  $3::timestamptz
+      AND COALESCE(billable_at, recorded_at) >= $2::timestamptz
+      AND COALESCE(billable_at, recorded_at) <  $3::timestamptz
+      AND ($4::boolean OR observation_version <> 2)
       AND kind = 'peak'
+      AND aggregation_key IS NULL
 ),
 windowed AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version, value, recorded_at, period_start,
-        LEAD(recorded_at, 1, $3::timestamptz)
-            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end,
+        app_id, module_id, metric, kind, model, module_version, value, observation_at, period_start,
+        LEAD(observation_at, 1, $3::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end,
         -- row_num identifies the EARLIEST-observed row of the WHOLE (app,
         -- module, metric, model) stream this period (rn=1 — the same
         -- ORDER BY as the LEAD above, so ties resolve to the identical row).
@@ -264,7 +390,7 @@ windowed AS (
         -- period boundary) would otherwise lose that gap from EVERY
         -- version's window on EVERY period, silently shrinking window_v/P
         -- below 1 even in the single-version, no-change common case.
-        ROW_NUMBER() OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS row_num
+        ROW_NUMBER() OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS row_num
     FROM raw_events
 )
 SELECT
@@ -272,12 +398,13 @@ SELECT
     module_id,
     metric,
     kind,
+    NULL::text AS aggregation_key,
     model,
     module_version,
     COALESCE(MAX(value), 0)::numeric AS billable_quantity,
     COALESCE(SUM(
-        EXTRACT(EPOCH FROM (segment_end - recorded_at))
-        + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (recorded_at - period_start)) ELSE 0 END
+        EXTRACT(EPOCH FROM (segment_end - observation_at))
+        + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (observation_at - period_start)) ELSE 0 END
     ), 0)::numeric AS active_seconds
 FROM windowed
 GROUP BY app_id, module_id, metric, kind, model, module_version
@@ -287,6 +414,7 @@ type RollupPeakKindParams struct {
 	AccountID   pgtype.UUID `json:"account_id"`
 	PeriodStart time.Time   `json:"period_start"`
 	PeriodEnd   time.Time   `json:"period_end"`
+	IncludeV2   bool        `json:"include_v2"`
 }
 
 type RollupPeakKindRow struct {
@@ -294,6 +422,7 @@ type RollupPeakKindRow struct {
 	ModuleID         string              `json:"module_id"`
 	Metric           string              `json:"metric"`
 	Kind             MsBillingMetricKind `json:"kind"`
+	AggregationKey   pgtype.Text         `json:"aggregation_key"`
 	Model            string              `json:"model"`
 	ModuleVersion    string              `json:"module_version"`
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
@@ -350,7 +479,12 @@ type RollupPeakKindRow struct {
 // is ALSO now a pricing key via metric_version_prices (migration 044),
 // version-first-resolved in Go (cycle.MetricPriceMicros).
 func (q *Queries) RollupPeakKind(ctx context.Context, arg RollupPeakKindParams) ([]RollupPeakKindRow, error) {
-	rows, err := q.db.Query(ctx, rollupPeakKind, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
+	rows, err := q.db.Query(ctx, rollupPeakKind,
+		arg.AccountID,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+		arg.IncludeV2,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +497,7 @@ func (q *Queries) RollupPeakKind(ctx context.Context, arg RollupPeakKindParams) 
 			&i.ModuleID,
 			&i.Metric,
 			&i.Kind,
+			&i.AggregationKey,
 			&i.Model,
 			&i.ModuleVersion,
 			&i.BillableQuantity,
@@ -384,21 +519,27 @@ SELECT
     module_id                      AS module_id,
     metric                         AS metric,
     kind                           AS kind,
+    NULL::text                     AS aggregation_key,
     COALESCE(model, '')            AS model,
     COALESCE(module_version, '')   AS module_version,
     COALESCE(SUM(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
-  AND recorded_at >= $2
-  AND recorded_at <  $3
+  AND COALESCE(billable_at, recorded_at) >= $2
+  AND COALESCE(billable_at, recorded_at) <  $3
+  -- Card-less calendar rollup freezes legacy usage for existing disclosure
+  -- behavior but leaves v2 pending until activation supplies its billable
+  -- anchor. include_v2 is true only for an activated, anchor-consistent window.
+  AND ($4::boolean OR observation_version <> 2)
   AND kind IN ('count', 'sum')
 GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '')
 `
 
 type RollupSumKindsParams struct {
-	AccountID    pgtype.UUID `json:"account_id"`
-	RecordedAt   time.Time   `json:"recorded_at"`
-	RecordedAt_2 time.Time   `json:"recorded_at_2"`
+	AccountID    pgtype.UUID        `json:"account_id"`
+	BillableAt   pgtype.Timestamptz `json:"billable_at"`
+	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+	IncludeV2    bool               `json:"include_v2"`
 }
 
 type RollupSumKindsRow struct {
@@ -406,6 +547,7 @@ type RollupSumKindsRow struct {
 	ModuleID         string              `json:"module_id"`
 	Metric           string              `json:"metric"`
 	Kind             MsBillingMetricKind `json:"kind"`
+	AggregationKey   pgtype.Text         `json:"aggregation_key"`
 	Model            string              `json:"model"`
 	ModuleVersion    string              `json:"module_version"`
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
@@ -423,7 +565,12 @@ type RollupSumKindsRow struct {
 // neither dimension (NULL model / NULL module_version) under a stable empty
 // string.
 func (q *Queries) RollupSumKinds(ctx context.Context, arg RollupSumKindsParams) ([]RollupSumKindsRow, error) {
-	rows, err := q.db.Query(ctx, rollupSumKinds, arg.AccountID, arg.RecordedAt, arg.RecordedAt_2)
+	rows, err := q.db.Query(ctx, rollupSumKinds,
+		arg.AccountID,
+		arg.BillableAt,
+		arg.BillableAt_2,
+		arg.IncludeV2,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -436,6 +583,7 @@ func (q *Queries) RollupSumKinds(ctx context.Context, arg RollupSumKindsParams) 
 			&i.ModuleID,
 			&i.Metric,
 			&i.Kind,
+			&i.AggregationKey,
 			&i.Model,
 			&i.ModuleVersion,
 			&i.BillableQuantity,
@@ -456,25 +604,26 @@ WITH raw_events AS (
         app_id, module_id, metric, kind,
         COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
-        value, recorded_at, event_id
+        value, COALESCE(billable_at, recorded_at) AS observation_at, event_id
     FROM ms_billing.usage_events
     WHERE account_id = $1
-      AND recorded_at >= $2
-      AND recorded_at <  $3
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+      AND ($4::boolean OR observation_version <> 2)
       AND kind = 'time_weighted'
 ),
 windowed AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version, value, recorded_at,
-        LEAD(recorded_at, 1, $3::timestamptz)
-            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end
+        app_id, module_id, metric, kind, model, module_version, value, observation_at,
+        LEAD(observation_at, 1, $3::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end
     FROM raw_events
 ),
 segments AS (
     SELECT
         app_id, module_id, metric, kind, model, module_version,
-        EXTRACT(EPOCH FROM (segment_end - recorded_at)) AS duration_seconds,
-        value * EXTRACT(EPOCH FROM (segment_end - recorded_at)) / 3600.0 AS segment_byte_hours
+        EXTRACT(EPOCH FROM (segment_end - observation_at)) AS duration_seconds,
+        value * EXTRACT(EPOCH FROM (segment_end - observation_at)) / 3600.0 AS segment_byte_hours
     FROM windowed
 )
 SELECT
@@ -482,6 +631,7 @@ SELECT
     module_id,
     metric,
     kind,
+    NULL::text AS aggregation_key,
     model,
     module_version,
     COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity,
@@ -491,9 +641,10 @@ GROUP BY app_id, module_id, metric, kind, model, module_version
 `
 
 type RollupTimeWeightedKindParams struct {
-	AccountID    pgtype.UUID `json:"account_id"`
-	RecordedAt   time.Time   `json:"recorded_at"`
-	RecordedAt_2 time.Time   `json:"recorded_at_2"`
+	AccountID    pgtype.UUID        `json:"account_id"`
+	BillableAt   pgtype.Timestamptz `json:"billable_at"`
+	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+	IncludeV2    bool               `json:"include_v2"`
 }
 
 type RollupTimeWeightedKindRow struct {
@@ -501,6 +652,7 @@ type RollupTimeWeightedKindRow struct {
 	ModuleID         string              `json:"module_id"`
 	Metric           string              `json:"metric"`
 	Kind             MsBillingMetricKind `json:"kind"`
+	AggregationKey   pgtype.Text         `json:"aggregation_key"`
 	Model            string              `json:"model"`
 	ModuleVersion    string              `json:"module_version"`
 	BillableQuantity pgtype.Numeric      `json:"billable_quantity"`
@@ -547,7 +699,12 @@ type RollupTimeWeightedKindRow struct {
 // is only one version's I_v to sum) — the load-bearing no-regression
 // invariant.
 func (q *Queries) RollupTimeWeightedKind(ctx context.Context, arg RollupTimeWeightedKindParams) ([]RollupTimeWeightedKindRow, error) {
-	rows, err := q.db.Query(ctx, rollupTimeWeightedKind, arg.AccountID, arg.RecordedAt, arg.RecordedAt_2)
+	rows, err := q.db.Query(ctx, rollupTimeWeightedKind,
+		arg.AccountID,
+		arg.BillableAt,
+		arg.BillableAt_2,
+		arg.IncludeV2,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -560,6 +717,7 @@ func (q *Queries) RollupTimeWeightedKind(ctx context.Context, arg RollupTimeWeig
 			&i.ModuleID,
 			&i.Metric,
 			&i.Kind,
+			&i.AggregationKey,
 			&i.Model,
 			&i.ModuleVersion,
 			&i.BillableQuantity,
@@ -626,15 +784,26 @@ func (q *Queries) UpsertDeveloperSettlement(ctx context.Context, arg UpsertDevel
 const upsertUsageAggregate = `-- name: UpsertUsageAggregate :exec
 INSERT INTO ms_billing.usage_aggregates (
     period_id, account_id, app_id, module_id, metric, model, module_version, kind,
+    aggregation_key,
     billable_quantity, unit_price_micros,
     customer_markup_num, customer_markup_den,
     raw_cost_micros, charged_micros, active_seconds, period_days, rolled_up_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now()
+    $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+    $5::text, $6::text, $7::text,
+    $8::ms_billing.metric_kind, $9::text,
+    $10::numeric, $11::bigint,
+    $12::integer, $13::integer,
+    $14::bigint, $15::bigint,
+    $16::numeric, $17::numeric, now()
 )
-ON CONFLICT (period_id, app_id, module_id, metric, model, module_version)
+ON CONFLICT (
+    period_id, app_id, module_id, metric, model, module_version,
+    COALESCE(aggregation_key, '')
+)
 DO UPDATE SET
     billable_quantity   = EXCLUDED.billable_quantity,
+    aggregation_key     = EXCLUDED.aggregation_key,
     unit_price_micros   = EXCLUDED.unit_price_micros,
     customer_markup_num = EXCLUDED.customer_markup_num,
     customer_markup_den = EXCLUDED.customer_markup_den,
@@ -654,6 +823,7 @@ type UpsertUsageAggregateParams struct {
 	Model             string              `json:"model"`
 	ModuleVersion     string              `json:"module_version"`
 	Kind              MsBillingMetricKind `json:"kind"`
+	AggregationKey    pgtype.Text         `json:"aggregation_key"`
 	BillableQuantity  pgtype.Numeric      `json:"billable_quantity"`
 	UnitPriceMicros   int64               `json:"unit_price_micros"`
 	CustomerMarkupNum int32               `json:"customer_markup_num"`
@@ -688,6 +858,7 @@ func (q *Queries) UpsertUsageAggregate(ctx context.Context, arg UpsertUsageAggre
 		arg.Model,
 		arg.ModuleVersion,
 		arg.Kind,
+		arg.AggregationKey,
 		arg.BillableQuantity,
 		arg.UnitPriceMicros,
 		arg.CustomerMarkupNum,

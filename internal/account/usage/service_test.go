@@ -3,6 +3,7 @@ package usage_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"sort"
@@ -31,6 +32,7 @@ type fakeStore struct {
 	appOwnerLookups        int
 	events                 map[string]usage.UsageEvent // event_id → event (idempotency)
 	anchorDays             map[uuid.UUID]int           // accountID → billing-period anchor day (0/absent → 1)
+	activations            map[uuid.UUID]time.Time
 	periodRows             []usage.MetricUsageRaw
 	historyRows            []usage.PeriodMetricUsageRaw
 	versionRows            []usage.VersionUsageRaw
@@ -121,6 +123,7 @@ type fakeStore struct {
 	errLookup             error
 	errAccount            error
 	errInsert             error
+	closedPeriod          bool
 	errPeriod             error
 	errVisibility         error
 	errUpsertDef          error
@@ -165,6 +168,7 @@ func newFakeStore() *fakeStore {
 		appOwnerOrgs:                map[uuid.UUID]uuid.UUID{},
 		events:                      map[string]usage.UsageEvent{},
 		anchorDays:                  map[uuid.UUID]int{},
+		activations:                 map[uuid.UUID]time.Time{},
 		periodWindows:               map[uuid.UUID]periodWindow{},
 		visibility:                  map[uuid.UUID]usage.Visibility{},
 		appMirrors:                  map[uuid.UUID]usage.AppMirrorInfo{},
@@ -453,6 +457,11 @@ func (f *fakeStore) AccountAnchorDay(_ context.Context, accountID uuid.UUID) (in
 	return 1, nil
 }
 
+func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (time.Time, bool, error) {
+	at, ok := f.activations[accountID]
+	return at, ok, nil
+}
+
 func defKey(moduleID uuid.UUID, metric string) string { return moduleID.String() + "/" + metric }
 
 func (f *fakeStore) LookupMetricDefinition(_ context.Context, moduleID uuid.UUID, metric string) (usage.MetricDefinition, bool, error) {
@@ -470,6 +479,7 @@ func (f *fakeStore) UpsertMetricDefinitions(_ context.Context, defs []usage.Metr
 	for _, def := range defs {
 		f.defs[defKey(def.ModuleID, def.Metric)] = usage.MetricDefinition{
 			Kind:            def.Kind,
+			AggregationKey:  def.AggregationKey,
 			Unit:            def.Unit,
 			UnitPriceMicros: def.UnitPriceMicros,
 			Priced:          def.Priced,
@@ -573,11 +583,66 @@ func (f *fakeStore) InsertUsageEvent(_ context.Context, ev usage.UsageEvent) (bo
 	if f.errInsert != nil {
 		return false, f.errInsert
 	}
-	if _, exists := f.events[ev.EventID]; exists {
-		return false, nil // ON CONFLICT DO NOTHING
+	if existing, exists := f.events[ev.EventID]; exists {
+		if !bytes.Equal(existing.PayloadFingerprint, ev.PayloadFingerprint) {
+			return false, usage.ErrUsageEventConflict
+		}
+		return false, nil
 	}
 	f.events[ev.EventID] = ev
 	return true, nil
+}
+
+func (f *fakeStore) CheckUsageEventID(_ context.Context, eventID string, fingerprint []byte) (bool, error) {
+	existing, exists := f.events[eventID]
+	if !exists {
+		return false, nil
+	}
+	if !bytes.Equal(existing.PayloadFingerprint, fingerprint) {
+		return false, usage.ErrUsageEventConflict
+	}
+	return true, nil
+}
+
+func (f *fakeStore) InsertUsageObservation(ctx context.Context, ev usage.UsageEvent, start, end time.Time, rejection usage.UsageRejectionReason) (bool, float64, error) {
+	if existing, ok := f.events[ev.EventID]; ok {
+		if !bytes.Equal(existing.PayloadFingerprint, ev.PayloadFingerprint) {
+			return false, 0, usage.ErrUsageEventConflict
+		}
+		return false, 0, nil
+	}
+	if rejection == usage.UsageRejectionOccurredFuture {
+		return false, 0, usage.ErrUsageOccurredFuture
+	}
+	if rejection == usage.UsageRejectionOccurredTooOld {
+		return false, 0, usage.ErrUsageOccurredTooOld
+	}
+	if rejection == usage.UsageRejectionPeriodClosed {
+		return false, 0, usage.ErrUsagePeriodClosed
+	}
+	if f.closedPeriod {
+		return false, 0, usage.ErrUsagePeriodClosed
+	}
+	previous := 0.0
+	if ev.AggregationKey == usage.AggregationKeySubject {
+		for _, prior := range f.events {
+			if prior.AccountID == ev.AccountID && prior.AppID == ev.AppID &&
+				prior.ModuleID == ev.ModuleID && prior.Metric == ev.Metric &&
+				prior.Model == ev.Model && prior.ModuleVersion == ev.ModuleVersion &&
+				prior.Subject == ev.Subject && !prior.OccurredAt.Before(start) && prior.OccurredAt.Before(end) &&
+				prior.Value > previous {
+				previous = prior.Value
+			}
+		}
+	}
+	recorded, err := f.InsertUsageEvent(ctx, ev)
+	if err != nil || !recorded {
+		return recorded, 0, err
+	}
+	if ev.AggregationKey == usage.AggregationKeySubject && previous >= ev.Value {
+		return true, 0, nil
+	}
+	return true, ev.Value - previous, nil
 }
 
 func (f *fakeStore) AccountByOwner(_ context.Context, owner usage.Owner) (uuid.UUID, bool, error) {
@@ -793,6 +858,196 @@ func TestRecordUsage_IdempotentRetry(t *testing.T) {
 	require.Len(t, store.events, 1)
 }
 
+func v2Record(now time.Time) usage.RecordUsageRequest {
+	req := validRecord()
+	req.Version = 2
+	req.RecordedAt = now
+	req.OccurredAt = now.Add(-time.Hour)
+	return req
+}
+
+func TestRecordUsage_V2PersistsCanonicalObservation(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	req := v2Record(now)
+	req.Subject = "user_123"
+	req.Metadata = json.RawMessage(`{"provider":"google","attempt":1.0}`)
+	declare(store, req, usage.KindCount)
+
+	resp, err := usage.NewService(store).WithNow(func() time.Time { return now }).RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	event := store.events[req.EventID]
+	require.Equal(t, 2, event.ObservationVersion)
+	require.Equal(t, req.OccurredAt, event.OccurredAt)
+	require.Equal(t, "user_123", event.Subject)
+	require.JSONEq(t, `{"attempt":1,"provider":"google"}`, string(event.Metadata))
+	require.Len(t, event.PayloadFingerprint, 32)
+}
+
+func TestRecordUsage_V2CanonicalRetryIgnoresMetadataKeyOrderAndNumberSpelling(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	req := v2Record(now)
+	req.Metadata = json.RawMessage(`{"b":2e0,"a":1}`)
+	declare(store, req, usage.KindCount)
+	svc := usage.NewService(store).WithNow(func() time.Time { return now })
+
+	first, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, first.Recorded)
+	req.Metadata = json.RawMessage(" { \"a\" : 1.0, \"b\" : 2 }")
+	second, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, second.Recorded)
+}
+
+func TestRecordUsage_EventIDCollisionReturnsConflict(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	req := v2Record(now)
+	req.Subject = "user-a"
+	declare(store, req, usage.KindCount)
+	svc := usage.NewService(store).WithNow(func() time.Time { return now })
+	require.NoError(t, func() error { _, err := svc.RecordUsage(context.Background(), req); return err }())
+
+	req.Subject = "user-b"
+	_, err := svc.RecordUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeConflict)
+	require.Equal(t, "user-a", store.events[req.EventID].Subject)
+}
+
+func TestRecordUsage_V2ContractValidation(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	base := v2Record(now)
+	cases := map[string]func(*usage.RecordUsageRequest){
+		"unknown version":        func(r *usage.RecordUsageRequest) { r.Version = 3 },
+		"missing occurrence":     func(r *usage.RecordUsageRequest) { r.OccurredAt = time.Time{} },
+		"legacy subject":         func(r *usage.RecordUsageRequest) { r.Version, r.Subject = 1, "user" },
+		"legacy metadata":        func(r *usage.RecordUsageRequest) { r.Version, r.Metadata = 1, json.RawMessage(`{}`) },
+		"oversize subject":       func(r *usage.RecordUsageRequest) { r.Subject = strings.Repeat("x", 257) },
+		"control subject":        func(r *usage.RecordUsageRequest) { r.Subject = "user\n1" },
+		"invalid utf8 subject":   func(r *usage.RecordUsageRequest) { r.Subject = string([]byte{0xff}) },
+		"metadata not object":    func(r *usage.RecordUsageRequest) { r.Metadata = json.RawMessage(`[]`) },
+		"metadata bad key":       func(r *usage.RecordUsageRequest) { r.Metadata = json.RawMessage(`{"bad key":1}`) },
+		"metadata too deep":      func(r *usage.RecordUsageRequest) { r.Metadata = json.RawMessage(`{"a":{"b":{"c":{"d":1}}}}`) },
+		"metadata trailing json": func(r *usage.RecordUsageRequest) { r.Metadata = json.RawMessage(`{} {}`) },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeStore()
+			req := base
+			mutate(&req)
+			declare(store, req, usage.KindCount)
+			_, err := usage.NewService(store).WithNow(func() time.Time { return now }).RecordUsage(context.Background(), req)
+			requireCode(t, err, billing.CodeInvalidInput)
+			require.Empty(t, store.events)
+		})
+	}
+}
+
+func TestRecordUsage_KeyedPeakRequiresV2Subject(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	store.defs[defKey(req.ModuleID, req.Metric)] = usage.MetricDefinition{
+		Kind: usage.KindPeak, AggregationKey: usage.AggregationKeySubject, Active: true,
+	}
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+	req.Version = 2
+	req.OccurredAt = req.RecordedAt
+	_, err = newService(store).RecordUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+func TestRecordUsage_V2OccurrencePolicyBoundariesAndClosedPeriod(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		occurredAt time.Time
+		closed     bool
+		wantCode   billing.Code
+		wantPolicy usage.OccurrencePolicy
+	}{
+		{name: "future tolerance inclusive", occurredAt: now.Add(5 * time.Minute), wantPolicy: usage.OccurrencePolicyOnTime},
+		{name: "future rejected", occurredAt: now.Add(5*time.Minute + time.Nanosecond), wantCode: billing.CodeInvalidInput},
+		{name: "past window inclusive", occurredAt: now.Add(-35 * 24 * time.Hour), wantPolicy: usage.OccurrencePolicyLateOpen},
+		{name: "past rejected", occurredAt: now.Add(-35*24*time.Hour - time.Nanosecond), wantCode: billing.CodeInvalidInput},
+		{name: "closing rejected", occurredAt: now.Add(-time.Hour), closed: true, wantCode: billing.CodeConflict},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			store.closedPeriod = tc.closed
+			req := v2Record(now)
+			req.OccurredAt = tc.occurredAt
+			declare(store, req, usage.KindCount)
+			resp, err := usage.NewService(store).WithNow(func() time.Time { return now }).RecordUsage(context.Background(), req)
+			if tc.wantCode != "" {
+				requireCode(t, err, tc.wantCode)
+				require.Empty(t, store.events)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			require.Equal(t, tc.wantPolicy, store.events[req.EventID].OccurrencePolicy)
+		})
+	}
+}
+
+func TestRecordUsage_PreActivationOccurrenceClampsToFirstFundedPeriod(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	req := v2Record(now)
+	req.OccurredAt = time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	declare(store, req, usage.KindCount)
+	accountID := uuid.New()
+	store.accounts[req.OwnerUserID] = accountID
+	store.anchorDays[accountID] = 15
+	store.activations[accountID] = time.Date(2026, 8, 15, 14, 0, 0, 0, time.UTC)
+
+	resp, err := usage.NewService(store).WithNow(func() time.Time { return now }).
+		RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	event := store.events[req.EventID]
+	require.Equal(t, req.OccurredAt, event.OccurredAt, "occurrence remains audit evidence")
+	require.Equal(t, time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC), event.BillableAt)
+	require.Equal(t, usage.OccurrencePolicyFirstFunded, event.OccurrencePolicy)
+}
+
+func TestRecordUsage_LogicallyClosedMissingPeriodIsRejected(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	req := v2Record(now)
+	req.OccurredAt = time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC) // within 35d, but two windows old
+	declare(store, req, usage.KindCount)
+	accountID := uuid.New()
+	store.accounts[req.OwnerUserID] = accountID
+	store.anchorDays[accountID] = 1
+
+	_, err := usage.NewService(store).WithNow(func() time.Time { return now }).
+		RecordUsage(context.Background(), req)
+	requireCode(t, err, billing.CodeConflict)
+	require.Empty(t, store.events)
+}
+
+func TestRecordUsage_IdenticalRetryRemainsIdempotentAfterPeriodCloses(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	req := v2Record(now)
+	declare(store, req, usage.KindCount)
+	svc := usage.NewService(store).WithNow(func() time.Time { return now })
+	first, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, first.Recorded)
+	store.closedPeriod = true
+	second, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, second.Recorded)
+}
+
 func TestRecordUsage_SnapshotsDeclaredKindFromCatalog(t *testing.T) {
 	store := newFakeStore()
 	req := validRecord()
@@ -831,6 +1086,28 @@ func TestRecordUsage_RejectsRetiredMetric(t *testing.T) {
 	_, err := newService(store).RecordUsage(context.Background(), req)
 	requireCode(t, err, billing.CodeInvalidInput)
 	require.Empty(t, store.events, "retired metric must not be recorded")
+}
+
+func TestRecordUsage_AcceptedRetryRemainsIdempotentAfterMetricRetires(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+	svc := newService(store)
+	first, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, first.Recorded)
+
+	def := store.defs[defKey(req.ModuleID, req.Metric)]
+	def.Active = false
+	store.defs[defKey(req.ModuleID, req.Metric)] = def
+	retry, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, retry.Recorded)
+
+	changed := req
+	changed.Value++
+	_, err = svc.RecordUsage(context.Background(), changed)
+	requireCode(t, err, billing.CodeConflict)
 }
 
 func TestRecordUsage_LazyAccountWhenNoBillingAccount(t *testing.T) {
@@ -1068,6 +1345,40 @@ func TestRecordUsage_CreditEvaluatorRunsOnceForFreshEventOnly(t *testing.T) {
 	require.Len(t, eval.events, 1)
 	require.Equal(t, accountID, eval.events[0].AccountID)
 	require.Equal(t, req.EventID, eval.events[0].EventID)
+}
+
+func TestRecordUsage_KeyedPeakCreditUsesOnlyPositiveSubjectMaxDelta(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	accountID := uuid.New()
+	req := v2Record(now)
+	req.Subject = "end-user-1"
+	req.Value = 1
+	store.accounts[req.OwnerUserID] = accountID
+	store.defs[defKey(req.ModuleID, req.Metric)] = usage.MetricDefinition{
+		Kind: usage.KindPeak, AggregationKey: usage.AggregationKeySubject,
+		UnitPriceMicros: 250, Priced: true, Active: true,
+	}
+	eval := &fakeCreditEvaluator{}
+	svc := usage.NewService(store).
+		WithNow(func() time.Time { return now }).
+		WithCreditEvaluator(eval)
+
+	_, err := svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	req.EventID = "evt-2"
+	req.Metadata = json.RawMessage(`{"provider":"github"}`)
+	_, err = svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	req.EventID = "evt-3"
+	req.Value = 3
+	_, err = svc.RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Len(t, eval.events, 3)
+	require.Equal(t, int64(250), eval.events[0].ApproximateChargeMicros)
+	require.Zero(t, eval.events[1].ApproximateChargeMicros, "provider duplicate cannot increase keyed MAX")
+	require.Equal(t, int64(500), eval.events[2].ApproximateChargeMicros, "only MAX increase from 1 to 3 is charged")
 }
 
 func TestRecordUsage_CreditEvaluatorErrorDoesNotFailIngest(t *testing.T) {
@@ -1590,6 +1901,32 @@ func TestSetMetricDefinitions_SyncsCatalog(t *testing.T) {
 
 	unpriced := store.defs[defKey(mod, "myapp.objects.bytes")]
 	require.False(t, unpriced.Priced, "unpriced metric stays unpriced")
+}
+
+func TestSetMetricDefinitions_SubjectAggregationIsPeakOnly(t *testing.T) {
+	store := newFakeStore()
+	mod := uuid.New()
+	_, err := newService(store).SetMetricDefinitions(context.Background(), usage.SetMetricDefinitionsRequest{
+		ModuleID: mod,
+		Metrics: []usage.MetricDef{{
+			Metric: "users.monthly_active", Kind: usage.KindPeak,
+			AggregationKey: usage.AggregationKeySubject, Active: true,
+		}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, usage.AggregationKeySubject, store.defs[defKey(mod, "users.monthly_active")].AggregationKey)
+
+	for name, metric := range map[string]usage.MetricDef{
+		"unknown key": {Metric: "users.bad", Kind: usage.KindPeak, AggregationKey: usage.AggregationKey("metadata.user"), Active: true},
+		"non peak":    {Metric: "users.bad", Kind: usage.KindCount, AggregationKey: usage.AggregationKeySubject, Active: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := newService(newFakeStore()).SetMetricDefinitions(context.Background(), usage.SetMetricDefinitionsRequest{
+				ModuleID: uuid.New(), Metrics: []usage.MetricDef{metric},
+			})
+			requireCode(t, err, billing.CodeInvalidInput)
+		})
+	}
 }
 
 func TestSetMetricDefinitions_RejectsReservedPrefix(t *testing.T) {

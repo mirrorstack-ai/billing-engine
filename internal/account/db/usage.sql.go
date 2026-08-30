@@ -14,12 +14,13 @@ import (
 
 const absorbAllInfraPriceOverrides = `-- name: AbsorbAllInfraPriceOverrides :execrows
 INSERT INTO ms_billing.metric_definitions (
-    module_id, metric, kind, unit, unit_price_micros, active
+    module_id, metric, kind, aggregation_key, unit, unit_price_micros, active
 )
 SELECT
     $1::uuid,
     sentinel.metric,
     sentinel.kind,
+    sentinel.aggregation_key,
     sentinel.unit,
     0,
     true
@@ -29,6 +30,7 @@ WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
 ON CONFLICT (module_id, metric)
 DO UPDATE SET
     unit_price_micros = 0,
+    aggregation_key   = EXCLUDED.aggregation_key,
     active            = true
 `
 
@@ -86,14 +88,38 @@ WITH rolled AS (
       AND bp.period_start = $3::timestamptz
     GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
 ),
+live_base AS (
+    SELECT
+        module_id, metric, kind, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        COALESCE(module_version, '') AS module_version,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1::uuid
+      AND app_id = $2::uuid
+      AND COALESCE(billable_at, recorded_at) >= $3::timestamptz
+      AND COALESCE(billable_at, recorded_at) <  $4::timestamptz
+),
+live_values AS (
+    SELECT module_id, metric, kind, model, module_version, value AS billable_value
+    FROM live_base
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, kind, model, module_version,
+        MAX(value)::numeric AS billable_value
+    FROM live_base
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, kind, model, module_version, subject
+),
 live AS (
     SELECT
         e.module_id                                        AS module_id,
         e.metric                                           AS metric,
         e.kind                                             AS kind,
-        COALESCE(e.model, '')                              AS model,
-        COALESCE(e.module_version, '')                     AS module_version,
-        COALESCE(SUM(e.value), 0)::numeric                 AS billable_quantity,
+        e.model                                             AS model,
+        e.module_version                                    AS module_version,
+        COALESCE(SUM(e.billable_value), 0)::numeric         AS billable_quantity,
         COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
         -- Custom metric → qty × price (identity 1×). Reserved infra.* / platform.*
         -- → qty × price × 12/10 (the SAME 1.2× the rollup freezes; mirrors
@@ -101,8 +127,8 @@ live AS (
         -- constant within each group.
         CASE
             WHEN e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%'
-                THEN COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
-            ELSE COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0)
+                THEN COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
+            ELSE COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0)
         END::numeric                                       AS charged_micros,
         -- The live (pre-rollup) estimate has no window-segmentation logic —
         -- that lives only in cmd/billing-cycle's rollup. Explicit NULL,
@@ -110,14 +136,10 @@ live AS (
         -- before a period rolls up, the active window is simply unknown.
         NULL::numeric                                      AS active_seconds,
         NULL::numeric                                      AS period_days
-    FROM ms_billing.usage_events e
+    FROM live_values e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
-    WHERE e.account_id  = $1::uuid
-      AND e.app_id      = $2::uuid
-      AND e.recorded_at >= $3::timestamptz
-      AND e.recorded_at <  $4::timestamptz
-    GROUP BY e.module_id, e.metric, e.kind, COALESCE(e.model, ''), COALESCE(e.module_version, '')
+    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version
 )
 SELECT
     module_id, metric, kind, model, module_version,
@@ -237,8 +259,8 @@ SELECT app_id FROM (
     FROM ms_billing.usage_events e
     WHERE e.account_id  = $1::uuid
       AND e.app_id     <> '00000000-0000-0000-0000-000000000000'::uuid
-      AND e.recorded_at >= $2::timestamptz
-      AND e.recorded_at <  $3::timestamptz
+      AND COALESCE(e.billable_at, e.recorded_at) >= $2::timestamptz
+      AND COALESCE(e.billable_at, e.recorded_at) <  $3::timestamptz
 ) apps_with_usage
 ORDER BY app_id
 `
@@ -314,8 +336,8 @@ live AS (
         ON md.module_id = e.module_id AND md.metric = e.metric
     WHERE e.account_id  = $1::uuid
       AND e.app_id      = $2::uuid
-      AND e.recorded_at >= $3::timestamptz
-      AND e.recorded_at <  $4::timestamptz
+      AND COALESCE(e.billable_at, e.recorded_at) >= $3::timestamptz
+      AND COALESCE(e.billable_at, e.recorded_at) <  $4::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
       AND e.module_id = '00000000-0000-0000-0000-000000000000'
     GROUP BY e.metric
@@ -464,8 +486,8 @@ live AS (
         ON md_ovr.module_id = e.module_id AND md_ovr.metric = e.metric
     WHERE e.account_id  = $1::uuid
       AND e.app_id      = $2::uuid
-      AND e.recorded_at >= $3::timestamptz
-      AND e.recorded_at <  $4::timestamptz
+      AND COALESCE(e.billable_at, e.recorded_at) >= $3::timestamptz
+      AND COALESCE(e.billable_at, e.recorded_at) <  $4::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
       AND e.module_id <> '00000000-0000-0000-0000-000000000000'
     GROUP BY e.module_id, COALESCE(e.module_version, ''), e.metric
@@ -632,17 +654,41 @@ WITH rolled AS (
       AND bp.period_start = $3::timestamptz
     GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
 ),
+live_base AS (
+    SELECT
+        module_id, metric, kind, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        COALESCE(module_version, '') AS module_version,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1::uuid
+      AND app_id = $2::uuid
+      AND COALESCE(billable_at, recorded_at) >= $3::timestamptz
+      AND COALESCE(billable_at, recorded_at) <  $4::timestamptz
+),
+live_values AS (
+    SELECT module_id, metric, kind, model, module_version, value AS billable_value
+    FROM live_base
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, kind, model, module_version,
+        MAX(value)::numeric AS billable_value
+    FROM live_base
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, kind, model, module_version, subject
+),
 live AS (
     SELECT
         e.module_id                                        AS module_id,
         e.metric                                           AS metric,
         e.kind                                             AS kind,
-        COALESCE(e.model, '')                              AS model,
-        COALESCE(e.module_version, '')                     AS module_version,
-        COALESCE(SUM(e.value), 0)::numeric                 AS billable_quantity,
+        e.model                                             AS model,
+        e.module_version                                    AS module_version,
+        COALESCE(SUM(e.billable_value), 0)::numeric         AS billable_quantity,
         COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
         COALESCE(
-            SUM(e.value * COALESCE(md.unit_price_micros, 0)),
+            SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)),
             0
         )::numeric                                         AS charged_micros,
         -- The live (pre-rollup) estimate has no window-segmentation logic —
@@ -651,14 +697,10 @@ live AS (
         -- before a period rolls up, the active window is simply unknown.
         NULL::numeric                                      AS active_seconds,
         NULL::numeric                                      AS period_days
-    FROM ms_billing.usage_events e
+    FROM live_values e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
-    WHERE e.account_id  = $1::uuid
-      AND e.app_id      = $2::uuid
-      AND e.recorded_at >= $3::timestamptz
-      AND e.recorded_at <  $4::timestamptz
-    GROUP BY e.module_id, e.metric, e.kind, COALESCE(e.model, ''), COALESCE(e.module_version, '')
+    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version
 )
 SELECT
     module_id, metric, kind, model, module_version,
@@ -799,14 +841,40 @@ func (q *Queries) BillingPeriodWindow(ctx context.Context, arg BillingPeriodWind
 }
 
 const currentPeriodUsageSummary = `-- name: CurrentPeriodUsageSummary :many
+WITH base_events AS (
+    SELECT
+        app_id, module_id, metric, kind, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        COALESCE(module_version, '') AS module_version,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+),
+billable_events AS (
+    -- Every legacy/non-keyed row keeps the exact coarse live behavior.
+    SELECT app_id, module_id, metric, kind, model, module_version, value AS billable_value
+    FROM base_events
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    -- Keyed peak is exact even before rollup: one MAX per authoritative
+    -- subject inside the existing app/model/version bill-line dimensions.
+    SELECT
+        app_id, module_id, metric, kind, model, module_version,
+        MAX(value)::numeric AS billable_value
+    FROM base_events
+    WHERE aggregation_key = 'subject'
+    GROUP BY app_id, module_id, metric, kind, model, module_version, subject
+)
 SELECT
     e.module_id                                         AS module_id,
     e.metric                                            AS metric,
     e.kind                                              AS kind,
-    COALESCE(SUM(e.value), 0)::numeric                  AS total_quantity,
+    COALESCE(SUM(e.billable_value), 0)::numeric         AS total_quantity,
     COALESCE(MAX(md.unit_price_micros), 0)::bigint      AS unit_price_micros,
     COALESCE(
-        SUM(e.value * COALESCE(md.unit_price_micros, 0)),
+        SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)),
         0
     )::numeric                                          AS raw_cost_micros,
     -- display_group is the §11 compaction taxonomy the frontend rolls up by.
@@ -821,22 +889,19 @@ SELECT
     -- module_visibility's PRIMARY KEY, so at most one row per group).
     COALESCE(MAX(mv.visibility), 'private')::ms_billing.margin_share_class
                                                         AS visibility
-FROM ms_billing.usage_events e
+FROM billable_events e
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric
 LEFT JOIN ms_billing.module_visibility mv
     ON mv.module_id = e.module_id
-WHERE e.account_id = $1
-  AND e.recorded_at >= $2
-  AND e.recorded_at <  $3
 GROUP BY e.module_id, e.metric, e.kind
 ORDER BY e.metric
 `
 
 type CurrentPeriodUsageSummaryParams struct {
-	AccountID    pgtype.UUID `json:"account_id"`
-	RecordedAt   time.Time   `json:"recorded_at"`
-	RecordedAt_2 time.Time   `json:"recorded_at_2"`
+	AccountID    pgtype.UUID        `json:"account_id"`
+	BillableAt   pgtype.Timestamptz `json:"billable_at"`
+	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
 }
 
 type CurrentPeriodUsageSummaryRow struct {
@@ -872,7 +937,7 @@ type CurrentPeriodUsageSummaryRow struct {
 // §7-B: never under-collect on a lagging publish) for a module with no
 // visibility row yet.
 func (q *Queries) CurrentPeriodUsageSummary(ctx context.Context, arg CurrentPeriodUsageSummaryParams) ([]CurrentPeriodUsageSummaryRow, error) {
-	rows, err := q.db.Query(ctx, currentPeriodUsageSummary, arg.AccountID, arg.RecordedAt, arg.RecordedAt_2)
+	rows, err := q.db.Query(ctx, currentPeriodUsageSummary, arg.AccountID, arg.BillableAt, arg.BillableAt_2)
 	if err != nil {
 		return nil, err
 	}
@@ -973,24 +1038,41 @@ func (q *Queries) DeleteInfraPriceOverridesNotInOrActive(ctx context.Context, ar
 
 const insertUsageEvent = `-- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
-    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at, model, module_version
+    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
+    model, module_version, observation_version, subject, metadata, occurred_at,
+    billable_at, aggregation_key, payload_fingerprint, occurrence_policy
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1::text, $2::uuid, $3::uuid,
+    $4::uuid, $5::text, $6::ms_billing.metric_kind,
+    $7::numeric, $8::timestamptz, $9::text,
+    $10::text, $11::smallint,
+    $12::text, $13::json,
+    $14::timestamptz, $15::timestamptz,
+    $16::text,
+    $17::bytea, $18::text
 )
 ON CONFLICT (event_id) DO NOTHING
 `
 
 type InsertUsageEventParams struct {
-	EventID       string              `json:"event_id"`
-	AccountID     pgtype.UUID         `json:"account_id"`
-	AppID         string              `json:"app_id"`
-	ModuleID      string              `json:"module_id"`
-	Metric        string              `json:"metric"`
-	Kind          MsBillingMetricKind `json:"kind"`
-	Value         pgtype.Numeric      `json:"value"`
-	RecordedAt    time.Time           `json:"recorded_at"`
-	Model         pgtype.Text         `json:"model"`
-	ModuleVersion pgtype.Text         `json:"module_version"`
+	EventID            string              `json:"event_id"`
+	AccountID          pgtype.UUID         `json:"account_id"`
+	AppID              string              `json:"app_id"`
+	ModuleID           string              `json:"module_id"`
+	Metric             string              `json:"metric"`
+	Kind               MsBillingMetricKind `json:"kind"`
+	Value              pgtype.Numeric      `json:"value"`
+	RecordedAt         time.Time           `json:"recorded_at"`
+	Model              pgtype.Text         `json:"model"`
+	ModuleVersion      pgtype.Text         `json:"module_version"`
+	ObservationVersion int16               `json:"observation_version"`
+	Subject            pgtype.Text         `json:"subject"`
+	Metadata           []byte              `json:"metadata"`
+	OccurredAt         pgtype.Timestamptz  `json:"occurred_at"`
+	BillableAt         time.Time           `json:"billable_at"`
+	AggregationKey     pgtype.Text         `json:"aggregation_key"`
+	PayloadFingerprint []byte              `json:"payload_fingerprint"`
+	OccurrencePolicy   string              `json:"occurrence_policy"`
 }
 
 // InsertUsageEvent writes one raw metered fact, idempotent on event_id.
@@ -1014,6 +1096,65 @@ func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventPara
 		arg.RecordedAt,
 		arg.Model,
 		arg.ModuleVersion,
+		arg.ObservationVersion,
+		arg.Subject,
+		arg.Metadata,
+		arg.OccurredAt,
+		arg.BillableAt,
+		arg.AggregationKey,
+		arg.PayloadFingerprint,
+		arg.OccurrencePolicy,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const insertUsageObservationRejection = `-- name: InsertUsageObservationRejection :execrows
+INSERT INTO ms_billing.usage_observation_rejections (
+    event_id, account_id, app_id, module_id, owner_user_id, owner_org_id,
+    metric, subject, occurred_at, reason, payload_fingerprint
+) VALUES (
+    $1::text, $2::uuid, $3::uuid,
+    $4::uuid, $5::uuid,
+    $6::uuid, $7::text, $8::text,
+    $9::timestamptz, $10::text,
+    $11::bytea
+)
+ON CONFLICT (event_id, reason, payload_fingerprint) DO NOTHING
+`
+
+type InsertUsageObservationRejectionParams struct {
+	EventID            string             `json:"event_id"`
+	AccountID          pgtype.UUID        `json:"account_id"`
+	AppID              string             `json:"app_id"`
+	ModuleID           string             `json:"module_id"`
+	OwnerUserID        pgtype.UUID        `json:"owner_user_id"`
+	OwnerOrgID         pgtype.UUID        `json:"owner_org_id"`
+	Metric             string             `json:"metric"`
+	Subject            pgtype.Text        `json:"subject"`
+	OccurredAt         pgtype.Timestamptz `json:"occurred_at"`
+	Reason             string             `json:"reason"`
+	PayloadFingerprint []byte             `json:"payload_fingerprint"`
+}
+
+// InsertUsageObservationRejection persists only bounded identifiers and the
+// canonical fingerprint. Diagnostic metadata is deliberately never stored on
+// a rejected row.
+func (q *Queries) InsertUsageObservationRejection(ctx context.Context, arg InsertUsageObservationRejectionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertUsageObservationRejection,
+		arg.EventID,
+		arg.AccountID,
+		arg.AppID,
+		arg.ModuleID,
+		arg.OwnerUserID,
+		arg.OwnerOrgID,
+		arg.Metric,
+		arg.Subject,
+		arg.OccurredAt,
+		arg.Reason,
+		arg.PayloadFingerprint,
 	)
 	if err != nil {
 		return 0, err
@@ -1084,8 +1225,26 @@ func (q *Queries) ListBillingPeriods(ctx context.Context, arg ListBillingPeriods
 	return items, nil
 }
 
+const lockUsageAccountActivation = `-- name: LockUsageAccountActivation :one
+SELECT activated_at
+FROM ms_billing.accounts
+WHERE id = $1::uuid
+FOR SHARE
+`
+
+// LockUsageAccountActivation serializes v2 period derivation with the
+// first-card activation transition. The caller compares this authoritative
+// row state with the precomputed anchor and retries if activation won first.
+// Rollup takes the same row lock before its period barrier.
+func (q *Queries) LockUsageAccountActivation(ctx context.Context, accountID string) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, lockUsageAccountActivation, accountID)
+	var activated_at pgtype.Timestamptz
+	err := row.Scan(&activated_at)
+	return activated_at, err
+}
+
 const lookupMetricDefinition = `-- name: LookupMetricDefinition :one
-SELECT kind, unit, unit_price_micros, active
+SELECT kind, aggregation_key, unit, unit_price_micros, active
 FROM ms_billing.metric_definitions
 WHERE module_id = $1 AND metric = $2
 `
@@ -1097,6 +1256,7 @@ type LookupMetricDefinitionParams struct {
 
 type LookupMetricDefinitionRow struct {
 	Kind            MsBillingMetricKind `json:"kind"`
+	AggregationKey  pgtype.Text         `json:"aggregation_key"`
 	Unit            string              `json:"unit"`
 	UnitPriceMicros pgtype.Int8         `json:"unit_price_micros"`
 	Active          bool                `json:"active"`
@@ -1111,6 +1271,7 @@ func (q *Queries) LookupMetricDefinition(ctx context.Context, arg LookupMetricDe
 	var i LookupMetricDefinitionRow
 	err := row.Scan(
 		&i.Kind,
+		&i.AggregationKey,
 		&i.Unit,
 		&i.UnitPriceMicros,
 		&i.Active,
@@ -1120,12 +1281,13 @@ func (q *Queries) LookupMetricDefinition(ctx context.Context, arg LookupMetricDe
 
 const upsertInfraPriceOverride = `-- name: UpsertInfraPriceOverride :execrows
 INSERT INTO ms_billing.metric_definitions (
-    module_id, metric, kind, unit, unit_price_micros, active
+    module_id, metric, kind, aggregation_key, unit, unit_price_micros, active
 )
 SELECT
     $1::uuid,
     sentinel.metric,
     sentinel.kind,
+    sentinel.aggregation_key,
     sentinel.unit,
     $2::bigint,
     true
@@ -1135,6 +1297,7 @@ WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
 ON CONFLICT (module_id, metric)
 DO UPDATE SET
     unit_price_micros = EXCLUDED.unit_price_micros,
+    aggregation_key   = EXCLUDED.aggregation_key,
     active            = true
 `
 
@@ -1177,13 +1340,16 @@ func (q *Queries) UpsertInfraPriceOverride(ctx context.Context, arg UpsertInfraP
 const upsertMetricDefinition = `-- name: UpsertMetricDefinition :exec
 
 INSERT INTO ms_billing.metric_definitions (
-    module_id, metric, kind, unit, unit_price_micros, active
+    module_id, metric, kind, aggregation_key, unit, unit_price_micros, active
 ) VALUES (
-    $1, $2, $3, $4, $5, $6
+    $1::uuid, $2::text, $3::ms_billing.metric_kind,
+    $4::text, $5::text,
+    $6::bigint, $7::boolean
 )
 ON CONFLICT (module_id, metric)
 DO UPDATE SET
     kind              = EXCLUDED.kind,
+    aggregation_key   = EXCLUDED.aggregation_key,
     unit              = EXCLUDED.unit,
     unit_price_micros = EXCLUDED.unit_price_micros,
     active            = EXCLUDED.active
@@ -1193,6 +1359,7 @@ type UpsertMetricDefinitionParams struct {
 	ModuleID        string              `json:"module_id"`
 	Metric          string              `json:"metric"`
 	Kind            MsBillingMetricKind `json:"kind"`
+	AggregationKey  pgtype.Text         `json:"aggregation_key"`
 	Unit            string              `json:"unit"`
 	UnitPriceMicros pgtype.Int8         `json:"unit_price_micros"`
 	Active          bool                `json:"active"`
@@ -1237,6 +1404,7 @@ func (q *Queries) UpsertMetricDefinition(ctx context.Context, arg UpsertMetricDe
 		arg.ModuleID,
 		arg.Metric,
 		arg.Kind,
+		arg.AggregationKey,
 		arg.Unit,
 		arg.UnitPriceMicros,
 		arg.Active,
@@ -1302,6 +1470,23 @@ type UpsertModuleVisibilityParams struct {
 func (q *Queries) UpsertModuleVisibility(ctx context.Context, arg UpsertModuleVisibilityParams) error {
 	_, err := q.db.Exec(ctx, upsertModuleVisibility, arg.ModuleID, arg.Visibility)
 	return err
+}
+
+const usageEventFingerprint = `-- name: UsageEventFingerprint :one
+SELECT payload_fingerprint
+FROM ms_billing.usage_events
+WHERE event_id = $1
+`
+
+// UsageEventFingerprint resolves an event-id retry after an INSERT conflict.
+// A NULL fingerprint identifies a pre-055 historical row: it remains a legacy
+// idempotent success because its original authoritative owner cannot be
+// reconstructed safely enough to compare a new canonical payload.
+func (q *Queries) UsageEventFingerprint(ctx context.Context, eventID string) ([]byte, error) {
+	row := q.db.QueryRow(ctx, usageEventFingerprint, eventID)
+	var payload_fingerprint []byte
+	err := row.Scan(&payload_fingerprint)
+	return payload_fingerprint, err
 }
 
 const usageHistoryForAccount = `-- name: UsageHistoryForAccount :many
@@ -1405,6 +1590,118 @@ func (q *Queries) UsageHistoryForAccount(ctx context.Context, arg UsageHistoryFo
 		return nil, err
 	}
 	return items, nil
+}
+
+const usagePeriodClosed = `-- name: UsagePeriodClosed :one
+SELECT (
+    EXISTS (
+        SELECT 1
+        FROM ms_billing.billing_periods p
+        WHERE p.account_id = $1::uuid
+          AND p.period_start = $2::timestamptz
+          AND p.period_end = $3::timestamptz
+          AND p.status IN ('closing', 'invoiced')
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM ms_billing.billing_runs r
+        WHERE r.account_id = $1::uuid
+          AND r.period_start = $2::timestamptz
+          AND r.period_end = $3::timestamptz
+    )
+    OR EXISTS (
+        -- Defense in depth for any pre-055/manual row whose status repair was
+        -- missed: a frozen aggregate is already an immutable rollup snapshot.
+        SELECT 1
+        FROM ms_billing.billing_periods p
+        JOIN ms_billing.usage_aggregates aggregate ON aggregate.period_id = p.id
+        WHERE p.account_id = $1::uuid
+          AND p.period_start = $2::timestamptz
+          AND p.period_end = $3::timestamptz
+    )
+)::boolean
+`
+
+type UsagePeriodClosedParams struct {
+	AccountID   string    `json:"account_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+}
+
+// UsagePeriodClosed is evaluated while the caller holds the account-period
+// advisory transaction lock shared with rollup. `closing` is terminal for
+// observation intake even if a later payment attempt is retried.
+func (q *Queries) UsagePeriodClosed(ctx context.Context, arg UsagePeriodClosedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, usagePeriodClosed, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const usageRejectionFingerprint = `-- name: UsageRejectionFingerprint :one
+SELECT payload_fingerprint
+FROM ms_billing.usage_observation_rejections
+WHERE event_id = $1
+ORDER BY rejected_at ASC
+LIMIT 1
+`
+
+// UsageRejectionFingerprint extends event-id collision detection across a
+// previous policy rejection. The identical payload may become admissible later
+// (for example once a future timestamp enters tolerance), but the id can never
+// be rebound to different semantics.
+func (q *Queries) UsageRejectionFingerprint(ctx context.Context, eventID string) ([]byte, error) {
+	row := q.db.QueryRow(ctx, usageRejectionFingerprint, eventID)
+	var payload_fingerprint []byte
+	err := row.Scan(&payload_fingerprint)
+	return payload_fingerprint, err
+}
+
+const usageSubjectPeak = `-- name: UsageSubjectPeak :one
+SELECT COALESCE(MAX(value), 0)::numeric
+FROM ms_billing.usage_events
+WHERE account_id = $1::uuid
+  AND app_id = $2::uuid
+  AND module_id = $3::uuid
+  AND metric = $4::text
+  AND COALESCE(model, '') = $5::text
+  AND COALESCE(module_version, '') = $6::text
+  AND subject = $7::text
+  AND aggregation_key = 'subject'
+  AND COALESCE(billable_at, recorded_at) >= $8::timestamptz
+  AND COALESCE(billable_at, recorded_at) <  $9::timestamptz
+`
+
+type UsageSubjectPeakParams struct {
+	AccountID     string    `json:"account_id"`
+	AppID         string    `json:"app_id"`
+	ModuleID      string    `json:"module_id"`
+	Metric        string    `json:"metric"`
+	Model         string    `json:"model"`
+	ModuleVersion string    `json:"module_version"`
+	Subject       string    `json:"subject"`
+	PeriodStart   time.Time `json:"period_start"`
+	PeriodEnd     time.Time `json:"period_end"`
+}
+
+// UsageSubjectPeak reads the current keyed maximum under the account-period
+// advisory lock. The ingest service uses only the positive increase as its
+// disposable-credit fast-path delta; rollup remains the authoritative bill.
+func (q *Queries) UsageSubjectPeak(ctx context.Context, arg UsageSubjectPeakParams) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, usageSubjectPeak,
+		arg.AccountID,
+		arg.AppID,
+		arg.ModuleID,
+		arg.Metric,
+		arg.Model,
+		arg.ModuleVersion,
+		arg.Subject,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+	)
+	var column_1 pgtype.Numeric
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const versionBreakdownForAccount = `-- name: VersionBreakdownForAccount :many

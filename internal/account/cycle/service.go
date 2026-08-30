@@ -459,7 +459,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		// never prorated. The PERSISTED billable_quantity (below) always stays
 		// the raw, unscaled representative level — proration is pricing-only.
 		pricedQuantity := raw.BillableQuantity
-		if raw.Kind == usage.KindPeak {
+		if raw.Kind == usage.KindPeak && raw.AggregationKey == "" {
 			pricedQuantity, err = prorateLevelQuantity(raw.BillableQuantity, raw.ActiveSeconds, periodSeconds)
 			if err != nil {
 				return nil, billing.Internal("compute window-prorated peak quantity failed", err)
@@ -487,6 +487,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			Model:            raw.Model,
 			ModuleVersion:    raw.ModuleVersion,
 			Kind:             raw.Kind,
+			AggregationKey:   raw.AggregationKey,
 			BillableQuantity: raw.BillableQuantity,
 			UnitPriceMicros:  priceMicros,
 			MarkupNum:        num,

@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"math"
 	"strings"
@@ -404,19 +405,28 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		moduleID = platformInfraModuleID
 	}
 
-	recorded, err := s.store.InsertUsageEvent(ctx, UsageEvent{
-		EventID:       req.EventID,
-		AccountID:     accountID,
-		AppID:         req.AppID,
-		ModuleID:      moduleID,
-		Metric:        req.Metric,
-		Kind:          kind,
-		Value:         req.Value,
-		RecordedAt:    recordedAt,
-		Model:         req.Model,         // empty for non-AI metrics → NULL usage_events.model
-		ModuleVersion: req.ModuleVersion, // empty → NULL usage_events.module_version
-	})
+	event := UsageEvent{
+		ObservationVersion: observationVersionLegacy,
+		EventID:            req.EventID,
+		AccountID:          accountID,
+		AppID:              req.AppID,
+		ModuleID:           moduleID,
+		Metric:             req.Metric,
+		Kind:               kind,
+		Value:              req.Value,
+		RecordedAt:         recordedAt,
+		OwnerUserID:        req.OwnerUserID,
+		OwnerOrgID:         req.OwnerOrgID,
+		Model:              req.Model,         // empty for non-AI metrics → NULL usage_events.model
+		ModuleVersion:      req.ModuleVersion, // empty → NULL usage_events.module_version
+		OccurrencePolicy:   OccurrencePolicyV1IngestTime,
+	}
+	event.PayloadFingerprint = observationFingerprint(event)
+	recorded, err := s.store.InsertUsageEvent(ctx, event)
 	if err != nil {
+		if errors.Is(err, ErrUsageEventConflict) {
+			return nil, billing.Conflict("event_id is already bound to a different canonical usage payload")
+		}
 		return nil, billing.Internal("insert infra usage event failed", err)
 	}
 

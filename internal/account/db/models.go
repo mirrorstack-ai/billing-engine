@@ -455,6 +455,26 @@ type MsBillingAppModuleOverageTimer struct {
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 }
 
+type MsBillingBillingAuthorization struct {
+	ID                     string             `json:"id"`
+	Scope                  string             `json:"scope"`
+	SubjectKind            string             `json:"subject_kind"`
+	SubjectID              string             `json:"subject_id"`
+	Currency               string             `json:"currency"`
+	IntentDigest           pgtype.Text        `json:"intent_digest"`
+	ChargeKinds            []string           `json:"charge_kinds"`
+	PerChargeCeilingMicros int64              `json:"per_charge_ceiling_micros"`
+	PeriodCeilingMicros    int64              `json:"period_ceiling_micros"`
+	TermsRevision          string             `json:"terms_revision"`
+	PriceBookRevision      string             `json:"price_book_revision"`
+	NoticePolicy           string             `json:"notice_policy"`
+	EffectiveFrom          time.Time          `json:"effective_from"`
+	ExpiresAt              time.Time          `json:"expires_at"`
+	AcceptanceDigest       string             `json:"acceptance_digest"`
+	RevokedAt              pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt              time.Time          `json:"created_at"`
+}
+
 type MsBillingBillingPeriod struct {
 	ID          string                       `json:"id"`
 	AccountID   string                       `json:"account_id"`
@@ -500,6 +520,46 @@ type MsBillingBudgetAlert struct {
 	SpendMicros int64     `json:"spend_micros"`
 	LimitMicros int64     `json:"limit_micros"`
 	FiredAt     time.Time `json:"fired_at"`
+}
+
+type MsBillingChargeIntent struct {
+	// Identity of the exact sealed document, over the canonical encoding in internal/intent/canonical.go. Also what a disclosure is bound to and what an acceptance receipt references.
+	Digest            string      `json:"digest"`
+	PayerKind         string      `json:"payer_kind"`
+	PayerID           string      `json:"payer_id"`
+	Currency          string      `json:"currency"`
+	Kind              string      `json:"kind"`
+	PriceBookRevision string      `json:"price_book_revision"`
+	TermsRevision     string      `json:"terms_revision"`
+	NoticePolicy      string      `json:"notice_policy"`
+	TaxJurisdiction   string      `json:"tax_jurisdiction"`
+	TaxRuleRevision   string      `json:"tax_rule_revision"`
+	TaxAmountMicros   int64       `json:"tax_amount_micros"`
+	SubtotalMicros    int64       `json:"subtotal_micros"`
+	TotalMicros       int64       `json:"total_micros"`
+	AuthorizationID   string      `json:"authorization_id"`
+	ExecuteNotBefore  time.Time   `json:"execute_not_before"`
+	ExecuteNotAfter   time.Time   `json:"execute_not_after"`
+	SupersedesDigest  pgtype.Text `json:"supersedes_digest"`
+	State             string      `json:"state"`
+	CreatedAt         time.Time   `json:"created_at"`
+	StateChangedAt    time.Time   `json:"state_changed_at"`
+}
+
+type MsBillingChargeIntentLine struct {
+	IntentDigest    string `json:"intent_digest"`
+	LineIndex       int32  `json:"line_index"`
+	Meter           string `json:"meter"`
+	Module          string `json:"module"`
+	ModuleVersion   string `json:"module_version"`
+	Quantity        int64  `json:"quantity"`
+	UnitPriceMicros int64  `json:"unit_price_micros"`
+	AmountMicros    int64  `json:"amount_micros"`
+}
+
+type MsBillingChargeIntentSourceFact struct {
+	IntentDigest   string `json:"intent_digest"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type MsBillingCreditAutoTopupConfig struct {
@@ -557,6 +617,15 @@ type MsBillingDeveloperSettlement struct {
 	CreatedAt           time.Time                 `json:"created_at"`
 }
 
+// INV-008 as a primary key: a second settlement of one intent is an integrity violation rather than a race the code must win.
+type MsBillingIntentSettlementClaim struct {
+	IntentDigest string             `json:"intent_digest"`
+	ClaimedBy    string             `json:"claimed_by"`
+	ClaimedAt    time.Time          `json:"claimed_at"`
+	Outcome      pgtype.Text        `json:"outcome"`
+	OutcomeAt    pgtype.Timestamptz `json:"outcome_at"`
+}
+
 type MsBillingInvoice struct {
 	ID              string             `json:"id"`
 	AccountID       string             `json:"account_id"`
@@ -595,6 +664,7 @@ type MsBillingMetricDefinition struct {
 	CreatedAt       time.Time            `json:"created_at"`
 	UpdatedAt       time.Time            `json:"updated_at"`
 	DisplayGroup    MsBillingMetricGroup `json:"display_group"`
+	AggregationKey  pgtype.Text          `json:"aggregation_key"`
 }
 
 type MsBillingMetricModelPrice struct {
@@ -619,6 +689,16 @@ type MsBillingModuleVisibility struct {
 	ModuleID   string                    `json:"module_id"`
 	Visibility MsBillingMarginShareClass `json:"visibility"`
 	UpdatedAt  time.Time                 `json:"updated_at"`
+}
+
+type MsBillingNoticeReceipt struct {
+	IntentDigest         string    `json:"intent_digest"`
+	DeliveredDigest      string    `json:"delivered_digest"`
+	Policy               string    `json:"policy"`
+	TerminalStatus       string    `json:"terminal_status"`
+	EligibilityNotBefore time.Time `json:"eligibility_not_before"`
+	RevocationPathFresh  bool      `json:"revocation_path_fresh"`
+	RecordedAt           time.Time `json:"recorded_at"`
 }
 
 type MsBillingOrgBillingDesignation struct {
@@ -687,21 +767,46 @@ type MsBillingUsageAggregate struct {
 	ModuleVersion     string              `json:"module_version"`
 	ActiveSeconds     pgtype.Numeric      `json:"active_seconds"`
 	PeriodDays        pgtype.Numeric      `json:"period_days"`
+	AggregationKey    pgtype.Text         `json:"aggregation_key"`
 }
 
 type MsBillingUsageEvent struct {
-	EventID       string              `json:"event_id"`
-	AccountID     pgtype.UUID         `json:"account_id"`
-	AppID         string              `json:"app_id"`
-	ModuleID      string              `json:"module_id"`
-	Metric        string              `json:"metric"`
-	Kind          MsBillingMetricKind `json:"kind"`
-	Value         pgtype.Numeric      `json:"value"`
-	RecordedAt    time.Time           `json:"recorded_at"`
-	IngestedAt    time.Time           `json:"ingested_at"`
-	Model         pgtype.Text         `json:"model"`
-	ModuleVersion pgtype.Text         `json:"module_version"`
-	RepointedFrom pgtype.Timestamptz  `json:"repointed_from"`
+	EventID            string              `json:"event_id"`
+	AccountID          pgtype.UUID         `json:"account_id"`
+	AppID              string              `json:"app_id"`
+	ModuleID           string              `json:"module_id"`
+	Metric             string              `json:"metric"`
+	Kind               MsBillingMetricKind `json:"kind"`
+	Value              pgtype.Numeric      `json:"value"`
+	RecordedAt         time.Time           `json:"recorded_at"`
+	IngestedAt         time.Time           `json:"ingested_at"`
+	Model              pgtype.Text         `json:"model"`
+	ModuleVersion      pgtype.Text         `json:"module_version"`
+	RepointedFrom      pgtype.Timestamptz  `json:"repointed_from"`
+	ObservationVersion int16               `json:"observation_version"`
+	Subject            pgtype.Text         `json:"subject"`
+	Metadata           []byte              `json:"metadata"`
+	OccurredAt         pgtype.Timestamptz  `json:"occurred_at"`
+	BillableAt         pgtype.Timestamptz  `json:"billable_at"`
+	AggregationKey     pgtype.Text         `json:"aggregation_key"`
+	PayloadFingerprint []byte              `json:"payload_fingerprint"`
+	OccurrencePolicy   string              `json:"occurrence_policy"`
+}
+
+type MsBillingUsageObservationRejection struct {
+	ID                 string             `json:"id"`
+	EventID            string             `json:"event_id"`
+	AccountID          pgtype.UUID        `json:"account_id"`
+	AppID              string             `json:"app_id"`
+	ModuleID           string             `json:"module_id"`
+	OwnerUserID        pgtype.UUID        `json:"owner_user_id"`
+	OwnerOrgID         pgtype.UUID        `json:"owner_org_id"`
+	Metric             string             `json:"metric"`
+	Subject            pgtype.Text        `json:"subject"`
+	OccurredAt         pgtype.Timestamptz `json:"occurred_at"`
+	RejectedAt         time.Time          `json:"rejected_at"`
+	Reason             string             `json:"reason"`
+	PayloadFingerprint []byte             `json:"payload_fingerprint"`
 }
 
 type MsBillingWebhookEventsProcessed struct {

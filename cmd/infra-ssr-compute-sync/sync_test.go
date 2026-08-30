@@ -95,6 +95,18 @@ func (f *fakeStore) InsertUsageEvent(_ context.Context, ev usage.UsageEvent) (bo
 	f.events[ev.EventID] = ev
 	return true, nil
 }
+
+func (f *fakeStore) CheckUsageEventID(context.Context, string, []byte) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeStore) InsertUsageObservation(ctx context.Context, ev usage.UsageEvent, _, _ time.Time, _ usage.UsageRejectionReason) (bool, float64, error) {
+	recorded, err := f.InsertUsageEvent(ctx, ev)
+	if !recorded || err != nil {
+		return recorded, 0, err
+	}
+	return true, ev.Value, nil
+}
 func (f *fakeStore) AccountByOwner(_ context.Context, _ usage.Owner) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil
 }
@@ -103,6 +115,9 @@ func (f *fakeStore) AppOwnerOrg(context.Context, uuid.UUID) (uuid.UUID, bool, er
 	return uuid.Nil, false, nil
 }
 func (f *fakeStore) AccountAnchorDay(_ context.Context, _ uuid.UUID) (int, error) { return 1, nil }
+func (f *fakeStore) AccountActivation(context.Context, uuid.UUID) (time.Time, bool, error) {
+	return time.Time{}, false, nil
+}
 func (f *fakeStore) LookupMetricDefinition(_ context.Context, _ uuid.UUID, _ string) (usage.MetricDefinition, bool, error) {
 	return usage.MetricDefinition{}, false, nil
 }

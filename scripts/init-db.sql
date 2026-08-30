@@ -87,3 +87,7 @@
 -- retirement.
 \i migrations/billing/051_heavy_tier_rates.up.sql
 \i migrations/billing/052_org_deletion_finalizations.up.sql
+
+-- 054–055: sealed billing intents and occurrence-preserving keyed meters.
+\i migrations/billing/054_intent_core.up.sql
+\i migrations/billing/055_keyed_meter_observations.up.sql
