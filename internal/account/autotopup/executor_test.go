@@ -2091,6 +2091,19 @@ func (s *memoryStore) AttachInvoice(_ context.Context, attempt Attempt, invoice 
 	return current, nil
 }
 
+// MarkProposed records the intent-path terminal marker. The fake mirrors the
+// real store's guard: only a pending attempt may be proposed, so a lost race
+// returns false rather than overwriting a terminal state.
+func (s *memoryStore) MarkProposed(_ context.Context, attempt Attempt, ref string) (bool, error) {
+	cur, ok := s.attempts[attempt.ID]
+	if !ok || cur.Status != "pending" {
+		return false, nil
+	}
+	cur.Status = "proposed"
+	s.attempts[attempt.ID] = cur
+	return true, nil
+}
+
 func (s *memoryStore) Fail(_ context.Context, attempt Attempt, failureCode, receiptURL string) (Attempt, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -530,11 +530,7 @@ func buildDispatcher() *dispatcher {
 		creditledger.NewStore(pool),
 		billingstripe.NewCreditPurchaseClient(stripeKey),
 	)
-	autoTopUpExecutor := autotopup.NewExecutor(
-		autotopup.NewStore(pool),
-		creditledger.NewStore(pool),
-		billingstripe.NewAutoTopUpClient(stripeKey),
-	)
+	autoTopUpExecutor := autotopup.NewStandardExecutor(pool, stripeKey)
 	recoveryCapability := creditrecovery.NewRuntimeCapability(
 		func(ctx context.Context) (bool, error) {
 			return config.CreditRecoverySchemaReady(ctx, pool)

@@ -180,7 +180,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	const kind intent.ChargeKind = "usage.cycle"
+	const kind intent.ChargeKind = intent.KindModuleUsage
 
 	sealed, err := intent.Seal(intent.Draft{
 		Payer:    intent.Subject{Kind: "org", ID: payerID},
@@ -207,7 +207,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 		ID: "auth-sandbox", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: payerID},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
-		PerChargeCeiling: 10_000_000, PeriodCeiling: 50_000_000,
+		PerChargeCeiling: 10_000_000, PeriodCeiling: 50_000_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:  "email/v1",
 		EffectiveFrom: now.Add(-24 * time.Hour), ExpiresAt: now.Add(24 * time.Hour),
@@ -219,6 +219,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
 		Policy: "email/v1", TerminalStatus: "delivered",
+		DeliveredAt:          now.Add(-26 * time.Hour),
 		EligibilityNotBefore: now.Add(-2 * time.Hour), RevocationPathFresh: true,
 	}))
 	require.NoError(t, s.AdvanceState(ctx, sealed.Digest(), "proposed", "eligible"))

@@ -88,6 +88,15 @@
 \i migrations/billing/051_heavy_tier_rates.up.sql
 \i migrations/billing/052_org_deletion_finalizations.up.sql
 
--- 054–055: sealed billing intents and occurrence-preserving keyed meters.
+-- 053 is a deliberate gap on main (migrations/billing/README.md: the runner is
+-- lexical, so gaps are tolerated). Two unmerged peer branches each claim it;
+-- whoever merges second renumbers past the highest CLAIMED slot.
+--
+-- 054-055: sealed billing intents and occurrence-preserving keyed meters.
+-- 056-058: the auto_topup authorization bounds, the credit-ledger 'proposed'
+-- status, and the billing_ro read-only grant.
 \i migrations/billing/054_intent_core.up.sql
 \i migrations/billing/055_keyed_meter_observations.up.sql
+\i migrations/billing/056_authorization_frequency_ceiling.up.sql
+\i migrations/billing/057_credit_ledger_proposed_status.up.sql
+\i migrations/billing/058_billing_ro_grants.up.sql
