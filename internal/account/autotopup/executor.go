@@ -13,6 +13,8 @@ import (
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -23,7 +25,31 @@ type Executor struct {
 	settler  Settler
 	stripe   StripeClient
 	observer SettlementObserver
+	proposer chargeProposer
 	nowFn    func() time.Time
+}
+
+// chargeProposer is the intent seam, declared locally so this package does not
+// depend on the intent packages when it is unwired.
+type chargeProposer interface {
+	Propose(ctx context.Context, c proposer.Charge) (intent.ChargeIntent, error)
+}
+
+// WithIntentProposer cuts this executor over to the intent path.
+//
+// Nil by default, which is byte-for-byte the legacy collecting behaviour.
+// NewStandardExecutor is what makes this ONE hang point rather than six —
+// SECURITY.md records four ordinary read and ingest paths reaching this
+// executor, so a seam installed in five of six binaries would leave a path
+// that still collects.
+//
+// 🔴 Arming it must be as deliberate as cmd/billing-cycle's flag, and for a
+// harder reason: a proposing auto-top-up collects nothing, so wallets never
+// refill and blocked accounts stay blocked. That is worse than the cycle legs'
+// revenue stop, which is why no binary wires this yet.
+func (e *Executor) WithIntentProposer(p chargeProposer) *Executor {
+	e.proposer = p
+	return e
 }
 
 // NewStandardExecutor builds the executor the way every binary that has one
@@ -392,6 +418,27 @@ func (e *Executor) resume(ctx context.Context, attempt Attempt, isNew bool) (Res
 		return resultFor(current, isNew), nil
 	}
 	attempt = current
+
+	// 🔴 The cutover point for this leg.
+	//
+	// BEFORE recoverOrCreateInvoice, because that call is what arms the
+	// provider: past it an invoice exists at Stripe, and the intent path
+	// holds no write port to finalize or void one, so sealing beside it
+	// would strand a live provider object for as long as the account
+	// exists. The boundary leg learned this expensively — its first
+	// cutover sealed a second obligation over an invoice another process
+	// had already collected.
+	//
+	// Still AFTER a durable claim: Trigger created this attempt pending
+	// before anything reached a provider, so the crash-recovery guard the
+	// legacy path relies on is intact.
+	//
+	// StripeInvoiceID is the direct refutation of "nothing has been
+	// collected for this attempt". If one exists, the rail that started
+	// the charge is the rail that finishes it.
+	if e.proposer != nil && attempt.StripeInvoiceID == "" {
+		return e.proposeAutoTopUp(ctx, attempt, isNew)
+	}
 
 	invoice, attempt, err := e.recoverOrCreateInvoice(ctx, attempt)
 	if err != nil {
@@ -1260,3 +1307,78 @@ func microsToCentsRoundHalfUp(micros int64) int64 {
 }
 
 var _ Settler = (*creditledger.Store)(nil)
+
+// proposeAutoTopUp seals the top-up as an intent and stops. It reaches no
+// provider.
+//
+// docs/DESIGN.md §6 gives this leg its own kind and funding rule —
+// "walletFunding = 0; providerRemainder = grossObligation", because a purchase
+// of credit cannot be paid for with credit.
+func (e *Executor) proposeAutoTopUp(ctx context.Context, attempt Attempt, isNew bool) (Result, error) {
+	at := e.nowFn().UTC()
+
+	// Seal what a collection would actually take, not the raw derived
+	// micros. Sealing the unrounded figure attests to an amount the
+	// customer was never charged — a repricing that shadow reconciliation
+	// cannot see, because it compares the new rater against history rather
+	// than the sealed intent against the leg it replaced.
+	sealMicros := microsToCentsRoundHalfUp(attempt.AmountMicros) * microsPerCent
+
+	sealed, err := e.proposer.Propose(ctx, proposer.Charge{
+		Payer:        intent.Subject{Kind: "user", ID: attempt.AccountID.String()},
+		Kind:         intent.KindAutoTopUp,
+		Currency:     "usd",
+		AmountMicros: sealMicros,
+		Description:  "MirrorStack credit auto top-up",
+		SourceRef:    "autotopup:" + attempt.ID.String(),
+
+		AuthorizationID:   "autotopup:" + attempt.AccountID.String(),
+		TermsRevision:     proposedTermsRevision,
+		PriceBookRevision: proposedPriceBookRevision,
+		NoticePolicy:      proposedNoticePolicy,
+		Tax: intent.TaxDetermination{
+			Resolved:     true,
+			Jurisdiction: "not-applicable",
+			RuleRevision: proposedTaxRuleRevision,
+		},
+		// The window must CONTAIN the seal instant or the document is dead
+		// on arrival — ClauseWithinExecutionWindow refuses it forever, the
+		// provider leg has already stopped, and the top-up evaporates. The
+		// boundary leg shipped exactly that bug by reusing a coverage
+		// period that had already closed.
+		ExecuteNotBefore: at,
+		ExecuteNotAfter:  at.AddDate(0, 1, 0),
+	})
+	if err != nil {
+		return resultFor(attempt, isNew), fmt.Errorf("propose auto top-up intent: %w", err)
+	}
+
+	// The reference is prefixed so nothing downstream reads a digest as a
+	// provider object id, and the migration-057 CHECK refuses a proposed
+	// row without one.
+	marked, err := e.store.MarkProposed(ctx, attempt, "intent:"+sealed.Digest())
+	if err != nil {
+		return resultFor(attempt, isNew), err
+	}
+	if !marked {
+		// Lost a race: the attempt is no longer pending. The intent is
+		// saved and inert — nothing executes it — which is the safe side
+		// of this failure.
+		return resultFor(attempt, isNew), nil
+	}
+
+	attempt.Status = "proposed"
+	return resultFor(attempt, isNew), nil
+}
+
+// Policy identifiers a proposed charge is sealed under.
+//
+// 🔴 Placeholders, and named so. DESIGN §12 leaves these undecided;
+// predicate.ClausePolicyPublished refuses to COLLECT under them, which is what
+// makes proposing under them safe.
+const (
+	proposedTermsRevision     = "unpublished/pending-decision-12"
+	proposedPriceBookRevision = "unpublished/pending-decision-12"
+	proposedNoticePolicy      = "unpublished/pending-decision-12"
+	proposedTaxRuleRevision   = "unpublished/pending-decision-12"
+)
