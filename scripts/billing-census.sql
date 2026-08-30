@@ -156,3 +156,45 @@ SELECT
     'usage_aggregates that actually carry a price'             AS detail
 FROM ms_billing.usage_aggregates
 WHERE unit_price_micros > 0;
+
+-- 9. ROLLUP COVERAGE: was that usage ever actually billable?
+--
+-- Added 2026-08-31 because the census returned 38,326 usage_events against
+-- only 12 usage_aggregates and 1 billing_run. Three readings fit, and they
+-- imply different things about whether the legacy collectors are doing the job
+-- the legacy-drop decision assumes they are doing:
+--
+--   (a) most events are structurally unbillable (no account) — normal;
+--   (b) most events fall outside any rolled-up period — the rollup is behind;
+--   (c) the rollup ran once and stopped — the collectors are already failing.
+--
+-- usage_events.account_id is NULLABLE by design ("NULL = lazy (no account
+-- yet)"), so (a) is a real possibility and must be measured before (b) or (c)
+-- is inferred from a raw count.
+
+SELECT
+    'events_without_account'                                   AS subject,
+    count(*)                                                   AS total,
+    'usage_events with NULL account_id — never billable'       AS detail
+FROM ms_billing.usage_events
+WHERE account_id IS NULL;
+
+SELECT
+    'events_inside_a_rolled_period'                            AS subject,
+    count(*)                                                   AS total,
+    'usage_events covered by a period that has aggregates'     AS detail
+FROM ms_billing.usage_events e
+WHERE EXISTS (
+    SELECT 1
+      FROM ms_billing.usage_aggregates a
+      JOIN ms_billing.billing_periods p ON p.id = a.period_id
+     WHERE p.account_id = e.account_id
+       AND e.recorded_at >= p.period_start
+       AND e.recorded_at <  p.period_end
+);
+
+SELECT
+    'periods_with_aggregates'                                  AS subject,
+    count(DISTINCT period_id)                                  AS total,
+    'billing_periods that were actually rolled up'             AS detail
+FROM ms_billing.usage_aggregates;
