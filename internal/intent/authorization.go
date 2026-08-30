@@ -3,6 +3,7 @@ package intent
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -352,3 +353,45 @@ func (a BillingAuthorization) AcceptanceDigest() string { return a.acceptanceDig
 
 // TermsRevision is what the customer agreed to.
 func (a BillingAuthorization) TermsRevision() string { return a.termsRevision }
+
+// Grant returns the authorization as the grant that would produce it.
+//
+// The persistable form of an authorization is the input that created
+// it, which means storage round-trips through Authorize and gets every
+// validation on the way back in. A separate projection type would be a
+// second description of the same thing, and the two would drift — the
+// looser one being whichever the database used.
+//
+// RevokedAt is deliberately not part of the grant: revocation happens
+// after the fact, so it is stored beside the grant and reapplied by the
+// caller.
+func (a BillingAuthorization) Grant() AuthorizationGrant {
+	kinds := make([]ChargeKind, 0, len(a.kinds))
+	for kind := range a.kinds {
+		kinds = append(kinds, kind)
+	}
+	// Sorted so that two authorizations with the same permissions
+	// produce identical rows, and a diff of stored state is readable.
+	sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
+
+	return AuthorizationGrant{
+		ID:               a.id,
+		Scope:            a.scope,
+		Subject:          a.subject,
+		Currency:         a.currency,
+		IntentDigest:     a.intentDigest,
+		Kinds:            kinds,
+		PerChargeCeiling: a.perChargeCeilingMicros,
+		PeriodCeiling:    a.periodCeilingMicros,
+		TermsRevision:    a.termsRevision,
+		PriceBook:        a.priceBookRevision,
+		NoticePolicy:     a.noticePolicy,
+		EffectiveFrom:    a.effectiveFrom,
+		ExpiresAt:        a.expiresAt,
+		AcceptanceDigest: a.acceptanceDigest,
+	}
+}
+
+// RevokedAt is the instant this authorization stopped permitting, or
+// the zero time if it has not been revoked.
+func (a BillingAuthorization) RevokedAt() time.Time { return a.revokedAt }

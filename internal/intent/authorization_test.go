@@ -353,3 +353,71 @@ func TestRevokeWithAZeroInstantStillRevokes(t *testing.T) {
 		t.Fatal("a zero-instant revocation left a window in which charges were still permitted")
 	}
 }
+
+// The persistable form of an authorization is the grant that made it,
+// so storage round-trips through Authorize and gets every validation on
+// the way back in.
+func TestAuthorizationRoundTripsThroughItsGrant(t *testing.T) {
+	original, err := Authorize(standingGrant())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := Authorize(original.Grant())
+	if err != nil {
+		t.Fatalf("an authorization's own grant was refused: %v", err)
+	}
+
+	sealed := sealedFixture(t)
+	before := original.Permits(sealed, kindWalletTopUp, now, 0)
+	after := restored.Permits(sealed, kindWalletTopUp, now, 0)
+	if before.Permitted != after.Permitted {
+		t.Fatalf("round trip changed the verdict: %v -> %v", before, after)
+	}
+
+	// Every bound must survive, not just the happy verdict.
+	for name, check := range map[string]func(BillingAuthorization) Decision{
+		"over the per-charge ceiling": func(a BillingAuthorization) Decision {
+			d := validDraft()
+			d.Lines = []Line{NewLine("quiz.render", "quiz-core", "1.4.0", 1_000_000, 25)}
+			big, err := Seal(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return a.Permits(big, kindWalletTopUp, now, 0)
+		},
+		"a kind it never permitted": func(a BillingAuthorization) Decision {
+			return a.Permits(sealed, "subscription.increase", now, 0)
+		},
+		"after expiry": func(a BillingAuthorization) Decision {
+			return a.Permits(sealed, kindWalletTopUp, authTill.Add(time.Hour), 0)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if check(original).Permitted != check(restored).Permitted {
+				t.Errorf("round trip changed the %s verdict", name)
+			}
+		})
+	}
+}
+
+// Revocation is stored beside the grant, not inside it, so a caller
+// reapplies it. This pins that the grant does not silently carry it.
+func TestGrantDoesNotCarryRevocation(t *testing.T) {
+	auth, err := Authorize(standingGrant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoked := auth.Revoke(now)
+
+	if revoked.RevokedAt().IsZero() {
+		t.Fatal("RevokedAt did not record the revocation")
+	}
+	restored, err := Authorize(revoked.Grant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RevokedAt().IsZero() {
+		t.Error("the grant carried a revocation; a caller reapplying it would double-count")
+	}
+}
