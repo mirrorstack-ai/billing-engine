@@ -72,6 +72,12 @@ type NoticeReceipt struct {
 	// TerminalStatus is the carrier's own terminal state. Only a
 	// destination-delivered status counts; "queued" and "sent" do not.
 	TerminalStatus string
+	// DeliveredAt is when the notice was actually delivered. It is what
+	// makes EligibilityNotBefore checkable: without it, the eligibility
+	// instant is a number the caller chose and nothing can say whether it
+	// respects the lead time the customer accepted.
+	DeliveredAt time.Time
+
 	// EligibilityNotBefore starts from DELIVERY, not from sealing.
 	EligibilityNotBefore time.Time
 	// RevocationPathFresh records that the customer's route to cancel
@@ -116,8 +122,13 @@ type SealedState struct {
 	// identity reads `unknown` must refuse to execute."
 	BuildIdentified bool
 
-	Authorization    intent.BillingAuthorization
-	PriorSpendMicros int64
+	Authorization intent.BillingAuthorization
+	// PriorUse is what the authorization has already been used for in the
+	// current period — amount AND attempt count. The count is not implied
+	// by the amount: many small attempts stay inside every amount bound
+	// and are still a runaway, which is what §6's frequency ceiling
+	// exists to stop.
+	PriorUse intent.PriorUse
 
 	Mode       AuthorityMode
 	Acceptance AcceptanceReceipt

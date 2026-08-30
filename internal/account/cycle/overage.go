@@ -35,6 +35,8 @@ package cycle
 import (
 	"context"
 	"fmt"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	"log/slog"
 	"time"
 
@@ -76,6 +78,9 @@ const (
 	// — resolved with no
 	// charge so it never re-sweeps forever.
 	ModuleOverageSkippedZeroCents ModuleOverageStatus = "zero_cents"
+	// ModuleOverageProposed: the leg has cut over to the intent path. A
+	// sealed intent records the charge; nothing has collected it.
+	ModuleOverageProposed ModuleOverageStatus = "proposed"
 	// ModuleOveragePeriodClosed: "over" but the account only activated AT OR AFTER
 	// this install's anchored period had already closed — charging now would be a
 	// retroactive catch-up (D1d), so it is resolved terminally WITH NO charge (the
@@ -154,6 +159,8 @@ type ModuleOverageResult struct {
 	ChargedCents int64
 	// StripeInvoiceID is set only when Status == ModuleOverageCharged.
 	StripeInvoiceID string
+	// IntentDigest is set when the leg proposed instead of charging.
+	IntentDigest string
 }
 
 // moduleOverageChargeShape resolves the deterministic charge for one timer
@@ -457,6 +464,18 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	custID := claim.StripeCustomerID
 	if custID == "" {
 		return nil, billing.Internal("module timer funding account has a usable PM but no Stripe customer id", nil)
+	}
+
+	// 🔴 The cutover point for this leg — the same shape as the domain
+	// leg, after the same durable arming claim.
+	//
+	// ArmModuleTimerStripeCharge is load-bearing here for a reason the
+	// comment above it spells out: a zero-row stamp means the timer is
+	// already settled, possibly by the wallet rail, and charging beside
+	// a wallet debit is a double charge. A cut-over leg keeps that
+	// guard because it proposes AFTER the claim, not instead of it.
+	if s.proposer != nil {
+		return s.proposeModuleOverage(ctx, cand, res, proratedMicros, coverageStart, coverageEnd, at)
 	}
 
 	// Charge via a per-timer draft→pinned-item→finalize flow with deterministic
@@ -781,4 +800,65 @@ func moduleOverageFinalizeIdemKey(timerID uuid.UUID) string {
 // column, mirroring appProrationWalletRef on the creation leg.
 func appModuleOverageWalletRef(timerID uuid.UUID) string {
 	return "wallet:mod-overage:" + timerID.String()
+}
+
+// proposeModuleOverage seals this leg's derived charge instead of
+// collecting it. See proposeDomainCharge for the shape and the reason
+// the policy revisions are placeholders.
+func (s *Service) proposeModuleOverage(
+	ctx context.Context,
+	cand ModuleOverageCandidate,
+	res *ModuleOverageResult,
+	proratedMicros int64,
+	coverageStart, coverageEnd time.Time,
+	at time.Time,
+) (*ModuleOverageResult, error) {
+	// Seal what a collection would actually take, not the raw derived
+	// micros — see collectableMicros. Sealing the unrounded figure would
+	// attest to an amount the customer was never charged.
+	sealMicros, err := collectableMicros(proratedMicros)
+	if err != nil {
+		return nil, billing.Internal("micros to collectable micros conversion failed", err)
+	}
+
+	sealed, err := s.proposer.Propose(ctx, proposer.Charge{
+		Payer:        intent.Subject{Kind: "user", ID: cand.AccountID.String()},
+		Kind:         intent.KindModuleCapacity,
+		Currency:     chargeCurrency,
+		AmountMicros: sealMicros,
+		Description:  "MirrorStack module overage (prorated)",
+		SourceRef:    moduleOverageChargeRef(cand.ID),
+
+		AuthorizationID:   "overage:" + cand.AccountID.String(),
+		TermsRevision:     proposedTermsRevision,
+		PriceBookRevision: proposedPriceBookRevision,
+		NoticePolicy:      proposedNoticePolicy,
+		Tax: intent.TaxDetermination{
+			Resolved:     true,
+			Jurisdiction: "not-applicable",
+			RuleRevision: proposedTaxRuleRevision,
+		},
+		ExecuteNotBefore: coverageStart,
+		ExecuteNotAfter:  coverageEnd,
+	})
+	if err != nil {
+		return nil, billing.Internal("propose module overage intent failed", err)
+	}
+
+	// The terminal stamp, so the timer stops re-sweeping — the same
+	// guard the legacy path takes after a successful finalize.
+	//
+	// The reference is prefixed "intent:" rather than written into the
+	// invoice column bare. A digest is not a Stripe invoice id, and a
+	// row where the two are indistinguishable is one where a later
+	// reconciler cannot tell which rail settled it.
+	if err := s.store.MarkModuleTimerCharged(
+		ctx, cand.ID, at.UTC(), "intent:"+sealed.Digest(), "",
+	); err != nil {
+		return nil, billing.Internal("mark module timer charged (proposed) failed", err)
+	}
+
+	res.Status = ModuleOverageProposed
+	res.IntentDigest = sealed.Digest()
+	return res, nil
 }

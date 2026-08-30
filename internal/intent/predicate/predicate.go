@@ -93,7 +93,7 @@ func satisfied(clause Clause, s SealedState) bool {
 			return false
 		}
 		return s.Authorization.
-			Permits(s.Intent, s.Now, s.PriorSpendMicros).
+			Permits(s.Intent, s.Now, s.PriorUse).
 			Permitted
 
 	case ClauseAuthorityEvidence:
@@ -117,6 +117,26 @@ func satisfied(clause Clause, s SealedState) bool {
 		if s.Notice.EligibilityNotBefore.IsZero() {
 			return false
 		}
+		// 🔴 EligibilityNotBefore is supplied by whoever built the
+		// state, so on its own it says only that SOMEBODY picked an
+		// instant. Until 2026-08-30 that was the whole clause: a caller
+		// could set it to the delivery moment and the wait elapsed
+		// immediately, while the customer was told as their card was
+		// charged.
+		//
+		// The authorization carries the lead time the customer
+		// accepted, so the receipt is now checked against it: eligibility
+		// may not start before delivery plus that wait. A missing
+		// delivery instant refuses, because a wait measured from nothing
+		// is not a wait.
+		if s.Notice.DeliveredAt.IsZero() {
+			return false
+		}
+		if lead := s.Authorization.NoticeLeadTime(); lead > 0 {
+			if s.Notice.EligibilityNotBefore.Before(s.Notice.DeliveredAt.Add(lead)) {
+				return false
+			}
+		}
 		return !s.Now.Before(s.Notice.EligibilityNotBefore)
 
 	case ClauseWithinCeilings:
@@ -127,7 +147,7 @@ func satisfied(clause Clause, s SealedState) bool {
 		if !s.Intent.Sealed() {
 			return false
 		}
-		decision := s.Authorization.Permits(s.Intent, s.Now, s.PriorSpendMicros)
+		decision := s.Authorization.Permits(s.Intent, s.Now, s.PriorUse)
 		for _, refusal := range decision.Refusals {
 			if refusal == intent.RefusalOverPerCharge || refusal == intent.RefusalOverPeriod {
 				return false
@@ -163,7 +183,24 @@ func satisfied(clause Clause, s SealedState) bool {
 			s.TaxIndependentlyReproducible
 
 	case ClausePolicyPublished:
-		return s.PolicyDigestsMatch
+		// The clause name states three things: published, effective,
+		// and digest-matching. PolicyDigestsMatch is the caller's
+		// answer to the last two — it is a reproduction result, and
+		// the executor is the only thing that can compute it.
+		//
+		// Published is different: it is readable from the intent
+		// itself, and until 2026-08-30 nothing read it. The four
+		// sealed revision ids went into the canonical digest
+		// unexamined, so a charge bundle could attest to
+		// "unpublished/pending-decision-12" and no clause objected.
+		// An authorization minted with the same placeholder satisfied
+		// every equality check in Permits, so the fiction was
+		// self-consistent rather than self-refuting.
+		//
+		// docs/DESIGN.md §12 gate G1 says production execution fails
+		// closed until each policy is settled in an accepted ADR.
+		// This is where that gate lives.
+		return s.PolicyDigestsMatch && len(intent.UnpublishedRevisions(s.Intent)) == 0
 
 	case ClauseTimeReadiness:
 		return s.TimeReady
@@ -200,7 +237,19 @@ func satisfied(clause Clause, s SealedState) bool {
 	case ClauseFirstStepMatchesPlan:
 		return s.Unbuilt.FirstStepMatchesPlan
 	case ClauseInstrumentBinding:
-		return s.Unbuilt.InstrumentBinding
+		// Two halves, and only one of them is the caller's to assert.
+		//
+		// Unbuilt.InstrumentBinding is the executor's claim that it
+		// VERIFIED the instrument against the rail — it needs the rail,
+		// so only the executor can answer it.
+		//
+		// The other half is readable here: an authorization that never
+		// named a provider and mandate has no binding to verify, so a
+		// caller claiming it verified one is claiming something about
+		// nothing. That is the same hollowness ClausePolicyPublished
+		// carried until 2026-08-30 — a clause named for a check, doing
+		// none.
+		return s.Unbuilt.InstrumentBinding && s.Authorization.InstrumentBound()
 	case ClauseEnclaveReady:
 		return s.Unbuilt.EnclaveReady
 	case ClauseAttemptFrozen:

@@ -75,11 +75,7 @@ func buildRouter() *webhook.Router {
 	verifier := billingstripe.NewVerifier(webhookSecret)
 	store := webhook.NewStore(pool)
 	charges := billingstripe.NewClient(stripeKey)
-	autoTopUpExecutor := autotopup.NewExecutor(
-		autotopup.NewStore(pool),
-		creditledger.NewStore(pool),
-		billingstripe.NewAutoTopUpClient(stripeKey),
-	)
+	autoTopUpExecutor := autotopup.NewStandardExecutor(pool, stripeKey)
 	manualPurchaseExecutor := creditpurchase.NewExecutor(
 		creditpurchase.NewStore(pool),
 		creditledger.NewStore(pool),

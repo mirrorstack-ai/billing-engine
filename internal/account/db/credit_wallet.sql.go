@@ -65,7 +65,7 @@ WITH target AS MATERIALIZED (
         attempt_stripe_customer_id = claim.stripe_customer_id
     FROM claim
     WHERE purchase.id = claim.id
-    RETURNING purchase.id, purchase.account_id, purchase.amount_micros, purchase.type, purchase.status, purchase.balance_after_micros, purchase.actor, purchase.idempotency_key, purchase.stripe_invoice_id, purchase.receipt_url, purchase.expires_at, purchase.period_id, purchase.source_credit_id, purchase.created_at, purchase.attempt_payment_method_id, purchase.attempt_stripe_payment_method_id, purchase.attempt_stripe_customer_id, purchase.attempt_expires_at, purchase.failure_code, purchase.charge_funding_account_id, purchase.charge_funding_generation, purchase.charge_funding_legacy_unresolved
+    RETURNING purchase.id, purchase.account_id, purchase.amount_micros, purchase.type, purchase.status, purchase.balance_after_micros, purchase.actor, purchase.idempotency_key, purchase.stripe_invoice_id, purchase.receipt_url, purchase.expires_at, purchase.period_id, purchase.source_credit_id, purchase.created_at, purchase.attempt_payment_method_id, purchase.attempt_stripe_payment_method_id, purchase.attempt_stripe_customer_id, purchase.attempt_expires_at, purchase.failure_code, purchase.charge_funding_account_id, purchase.charge_funding_generation, purchase.charge_funding_legacy_unresolved, purchase.proposed_reference
 )
 SELECT id,
        account_id,

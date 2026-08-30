@@ -5,10 +5,14 @@ import (
 	"testing"
 )
 
+// diff builds an UNMARKED-UP comparison: base == charged, so these
+// reconciliation tests keep asking exactly what they asked before the
+// markup split. Markup behaviour is tested separately, in
+// markup_test.go — mixing it in here would change what these tests mean.
 func diff(account, period string, legacy, shadow int64) Difference {
 	return Difference{
 		AccountID: account, PeriodID: period,
-		LegacyMicros: legacy, ShadowMicros: shadow,
+		LegacyMicros: legacy, LegacyBaseMicros: legacy, ShadowMicros: shadow,
 		IntentDigest: "digest-" + account + "-" + period,
 	}
 }

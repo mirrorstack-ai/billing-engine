@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/executor"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -108,6 +109,18 @@ func (a *Adapter) Collect(ctx context.Context, d executor.Debit) (executor.Colle
 	cents := centsFromMicros(d.AmountMicros)
 	ref := "intent:" + d.IntentDigest
 
+	// Stripe takes the currency lowercase, and every legacy call site in
+	// this repo sends the lowercase constant. Seal stores the canonical
+	// upper-case ISO 4217 code, which is right INSIDE the intent and wrong
+	// on the wire — so the normalization belongs here, at the provider
+	// boundary, and not in the document.
+	//
+	// Without it the intent rail sends "USD" where the legacy rail sends
+	// "usd": the same money described two ways to the same provider, which
+	// is the kind of difference that shows up as an unexplained
+	// reconciliation mismatch rather than an error.
+	currency := strings.ToLower(strings.TrimSpace(d.Currency))
+
 	invoice, err := a.client.CreateDraftInvoice(ctx, customerID, ref, "inv-"+d.IdempotencyKey)
 	if err != nil {
 		// Nothing has been finalized, so nothing has been collected.
@@ -116,7 +129,7 @@ func (a *Adapter) Collect(ctx context.Context, d executor.Debit) (executor.Colle
 	}
 
 	if _, err := a.client.CreateInvoiceItem(
-		ctx, customerID, invoice.ID, cents, d.Currency,
+		ctx, customerID, invoice.ID, cents, currency,
 		a.descriptionFor(d.IntentDigest), billingstripe.LinePeriod{},
 		"ii-"+d.IdempotencyKey,
 	); err != nil {

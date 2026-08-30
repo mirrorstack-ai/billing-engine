@@ -3,6 +3,8 @@ package cycle
 import (
 	"context"
 	"fmt"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	"log/slog"
 	"time"
 
@@ -22,8 +24,11 @@ const (
 	DomainChargeSkippedNoPM      DomainChargeStatus = "skipped_no_pm"
 	DomainChargeSkippedPrepaid   DomainChargeStatus = "skipped_prepaid"
 	DomainChargeSkippedZeroCents DomainChargeStatus = "zero_cents"
-	DomainChargePeriodClosed     DomainChargeStatus = "period_closed"
-	DomainChargeSkippedStale     DomainChargeStatus = "skipped_stale"
+	// DomainChargeProposed: the leg has cut over to the intent path.
+	// A sealed intent records the charge; nothing has collected it.
+	DomainChargeProposed     DomainChargeStatus = "proposed"
+	DomainChargePeriodClosed DomainChargeStatus = "period_closed"
+	DomainChargeSkippedStale DomainChargeStatus = "skipped_stale"
 )
 
 // DomainChargeResult reports what one ChargeDomain call did.
@@ -32,7 +37,28 @@ type DomainChargeResult struct {
 	Status          DomainChargeStatus
 	ChargedCents    int64
 	StripeInvoiceID string
+	// IntentDigest is set when the leg proposed instead of charging.
+	// It is the identity of the sealed document, so a domain row can be
+	// walked forward to the intent that replaced its charge.
+	IntentDigest string
 }
+
+// Policy identifiers a proposed charge is sealed under.
+//
+// 🔴 These are placeholders, and named so. DESIGN §12 leaves the terms,
+// price-book and notice policies for these charge kinds undecided, and
+// sealing under an invented revision would put a fiction inside the
+// digest — which a customer's charge bundle would then attest to.
+//
+// A cutover must not be ENABLED in production until they name real,
+// published revisions. The shadow reconciliation of §11 step 4 is what
+// happens first; this is the second thing that must be true.
+const (
+	proposedTermsRevision     = "unpublished/pending-decision-12"
+	proposedPriceBookRevision = "unpublished/pending-decision-12"
+	proposedNoticePolicy      = "unpublished/pending-decision-12"
+	proposedTaxRuleRevision   = "not-applicable/pending-decision-12"
+)
 
 // domainChargeShape prices only the domain's first, activation-containing
 // period. Domains have no grace, included pool, or straddle top-up: the
@@ -124,6 +150,21 @@ func (s *Service) ChargeDomain(ctx context.Context, cand DomainChargeCandidate, 
 	custID := claim.StripeCustomerID
 	if custID == "" {
 		return nil, billing.Internal("domain funding account has a usable PM but no Stripe customer id", nil)
+	}
+
+	// 🔴 The cutover point for this leg.
+	//
+	// Everything above is unchanged: the same staleness re-check, the
+	// same proration, the same durable arming claim. What changes is
+	// what happens with the derived amount — proposed as a sealed
+	// intent, or charged directly.
+	//
+	// The arming claim is taken FIRST either way, so a cut-over leg
+	// keeps the crash-recovery guard the legacy one has. Proposing
+	// without it would let a re-run derive the same charge against a
+	// row nothing had claimed.
+	if s.proposer != nil {
+		return s.proposeDomainCharge(ctx, cand, res, proratedMicros, coverageStart, coverageEnd, at)
 	}
 
 	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, domainChargeRef(cand.ID), domainInvoiceIdemKey(cand.ID))
@@ -317,4 +358,86 @@ func domainInvoiceIdemKey(domainID uuid.UUID) string {
 
 func domainFinalizeIdemKey(domainID uuid.UUID) string {
 	return "domain-fee-fin-" + domainID.String()
+}
+
+// proposeDomainCharge seals this leg's derived charge instead of
+// collecting it.
+//
+// The intent records the same figure the legacy path would have
+// charged, against the same domain row, inside the same coverage
+// window. What it does not do is move money — that waits for something
+// holding the write port, and for the predicate to permit it.
+//
+// The domain row is marked resolved on a successful proposal for the
+// same reason the legacy path marks it after a successful finalize:
+// the leg is done with it. A row left unresolved would be re-derived
+// on the next sweep and proposed again — harmlessly, since the digest
+// makes that the same document, but it would also never leave the
+// candidate set.
+func (s *Service) proposeDomainCharge(
+	ctx context.Context,
+	cand DomainChargeCandidate,
+	res *DomainChargeResult,
+	proratedMicros int64,
+	coverageStart, coverageEnd time.Time,
+	at time.Time,
+) (*DomainChargeResult, error) {
+	// Seal what a collection would actually take, not the raw derived
+	// micros — see collectableMicros. Sealing the unrounded figure would
+	// attest to an amount the customer was never charged.
+	sealMicros, err := collectableMicros(proratedMicros)
+	if err != nil {
+		return nil, billing.Internal("micros to collectable micros conversion failed", err)
+	}
+
+	sealed, err := s.proposer.Propose(ctx, proposer.Charge{
+		Payer:        intent.Subject{Kind: "user", ID: cand.AccountID.String()},
+		Kind:         intent.KindCustomDomain,
+		Currency:     chargeCurrency,
+		AmountMicros: sealMicros,
+		Description:  fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname),
+		SourceRef:    domainChargeRef(cand.ID),
+
+		AuthorizationID:   "domain:" + cand.AccountID.String(),
+		TermsRevision:     proposedTermsRevision,
+		PriceBookRevision: proposedPriceBookRevision,
+		NoticePolicy:      proposedNoticePolicy,
+		// 🔴 Zero tax, resolved. This leg has never applied tax, so
+		// claiming an unresolved determination would quarantine every
+		// domain charge, and claiming a computed one would invent a
+		// figure. Recording what is actually true — no tax was
+		// determined for this charge kind — is the honest option, and
+		// docs/DESIGN.md §12's tax decisions are what change it.
+		Tax: intent.TaxDetermination{
+			Resolved:     true,
+			Jurisdiction: "not-applicable",
+			RuleRevision: proposedTaxRuleRevision,
+		},
+		ExecuteNotBefore: coverageStart,
+		ExecuteNotAfter:  coverageEnd,
+	})
+	if err != nil {
+		return nil, billing.Internal("propose domain charge intent failed", err)
+	}
+
+	// MarkDomainCharged, not MarkDomainChargeResolved.
+	//
+	// Resolved is the terminal NO-CHARGE verdict — the marker the
+	// period-closed and zero-cent branches take. Using it here would
+	// record a sealed obligation as a forgiveness: the row would be
+	// indistinguishable from a domain nobody was ever going to bill, and
+	// the digest would exist only in the return value of a function that
+	// has already returned.
+	//
+	// The reference is written PREFIXED as "intent:<digest>", the same
+	// shape the module-overage leg uses (overage.go), so nothing
+	// downstream can read a digest as a provider invoice id. There is no
+	// invoice item, so that field stays empty.
+	if err := s.store.MarkDomainCharged(ctx, cand.ID, at.UTC(), "intent:"+sealed.Digest(), ""); err != nil {
+		return nil, billing.Internal("mark domain charge proposed failed", err)
+	}
+
+	res.Status = DomainChargeProposed
+	res.IntentDigest = sealed.Digest()
+	return res, nil
 }
