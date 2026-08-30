@@ -2,6 +2,7 @@ package cycle_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,4 +133,39 @@ func TestASealedDomainChargeIsAlwaysWholeCents(t *testing.T) {
 		"sealed %d micros is not a whole number of cents", sealed)
 	require.Equal(t, res.ChargedCents*10_000, sealed,
 		"the sealed amount and the leg's own reported cents disagree")
+}
+
+// A proposed domain charge must be walkable back to its intent, and must not
+// look like a forgiveness.
+//
+// The proposed path originally called MarkDomainChargeResolved — the terminal
+// NO-CHARGE verdict the period-closed and zero-cent branches take. That
+// recorded a sealed obligation as a domain nobody was ever going to bill, and
+// left the digest existing only in the return value of a function that had
+// already returned. The module-overage leg had it right; the domain leg did
+// not, and nothing compared them.
+func TestAProposedDomainChargeRecordsItsIntentAndIsNotAForgiveness(t *testing.T) {
+	recorder := stripetest.New()
+	store := newFakeStore()
+	p := &capturingProposer{}
+	cand := seedDomain(t, store)
+
+	svc := cycle.NewService(store, recorder).WithIntentProposer(p)
+	res, err := svc.ChargeDomain(context.Background(), cand, time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, cycle.DomainChargeProposed, res.Status)
+	require.NotEmpty(t, res.IntentDigest)
+
+	dom := store.domains[cand.ID]
+	require.False(t, dom.chargedAt.IsZero(),
+		"no charge instant was recorded, so the row reads as a no-charge forgiveness "+
+			"rather than a sealed obligation")
+
+	require.Equal(t, "intent:"+res.IntentDigest, dom.chargeInvoiceID,
+		"the domain row does not carry the intent reference, so the charge cannot be "+
+			"walked back to its document")
+	require.True(t, strings.HasPrefix(dom.chargeInvoiceID, "intent:"),
+		"an unprefixed digest can be read downstream as a provider invoice id")
+	require.Empty(t, dom.chargeInvoiceItemID,
+		"a proposed charge has no provider invoice item to name")
 }

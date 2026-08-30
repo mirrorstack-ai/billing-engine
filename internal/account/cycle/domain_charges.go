@@ -420,8 +420,21 @@ func (s *Service) proposeDomainCharge(
 		return nil, billing.Internal("propose domain charge intent failed", err)
 	}
 
-	if err := s.store.MarkDomainChargeResolved(ctx, cand.ID); err != nil {
-		return nil, billing.Internal("mark domain charge resolved (proposed) failed", err)
+	// MarkDomainCharged, not MarkDomainChargeResolved.
+	//
+	// Resolved is the terminal NO-CHARGE verdict — the marker the
+	// period-closed and zero-cent branches take. Using it here would
+	// record a sealed obligation as a forgiveness: the row would be
+	// indistinguishable from a domain nobody was ever going to bill, and
+	// the digest would exist only in the return value of a function that
+	// has already returned.
+	//
+	// The reference is written PREFIXED as "intent:<digest>", the same
+	// shape the module-overage leg uses (overage.go), so nothing
+	// downstream can read a digest as a provider invoice id. There is no
+	// invoice item, so that field stays empty.
+	if err := s.store.MarkDomainCharged(ctx, cand.ID, at.UTC(), "intent:"+sealed.Digest(), ""); err != nil {
+		return nil, billing.Internal("mark domain charge proposed failed", err)
 	}
 
 	res.Status = DomainChargeProposed
