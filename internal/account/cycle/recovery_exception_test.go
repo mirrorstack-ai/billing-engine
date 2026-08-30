@@ -98,22 +98,38 @@ func TestASealedDomainChargeIsAlwaysWholeCents(t *testing.T) {
 	recorder := stripetest.New()
 	store := newFakeStore()
 	p := &capturingProposer{}
+
+	// A MID-PERIOD activation, deliberately. The shared seedDomain fixture
+	// activates at the period start, so its proration is the whole $20.00 fee
+	// — already a round number of cents, which makes it blind to the exact
+	// defect this test exists for. Anchoring the account to the 1st and
+	// activating on the 13th prorates to 1_225_806 micros: 122.5806 cents.
 	cand := seedDomain(t, store)
+	acctActivated := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	activated := time.Date(2026, 8, 13, 5, 17, 0, 0, time.UTC)
+	cand.AccountActivatedAt = acctActivated
+	cand.ActivatedAt = activated
+	store.domains[cand.ID].domain.ActivatedAt = activated
 
 	svc := cycle.NewService(store, recorder).WithIntentProposer(p)
-	res, err := svc.ChargeDomain(context.Background(), cand, time.Now().UTC())
+	res, err := svc.ChargeDomain(context.Background(), cand, time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, cycle.DomainChargeProposed, res.Status)
 	require.Len(t, p.charges, 1)
 
 	sealed := p.charges[0].AmountMicros
 
+	// Non-vacuity guard: if the fixture ever stops producing a fractional
+	// derivation, this test silently stops testing rounding. Fail loudly
+	// instead — that is how the previous version of this test was hollow.
+	require.NotZero(t, res.ChargedCents, "fixture produced a zero charge")
+	require.NotEqual(t, int64(1_225_806), sealed,
+		"the raw derived micros were sealed — a collection cannot take 122.5806 cents")
+
 	// The invariant: a sealed figure a card cannot be charged is a figure the
 	// customer's bundle would attest to and never see on their statement.
 	require.Zero(t, sealed%10_000,
-		"sealed %d micros is not a whole number of cents, so no collection can take exactly it", sealed)
-
-	// And it must equal what the leg reports it charged, not merely be round.
+		"sealed %d micros is not a whole number of cents", sealed)
 	require.Equal(t, res.ChargedCents*10_000, sealed,
 		"the sealed amount and the leg's own reported cents disagree")
 }
