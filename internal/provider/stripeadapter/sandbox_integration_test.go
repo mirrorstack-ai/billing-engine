@@ -207,7 +207,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 		ID: "auth-sandbox", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: payerID},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
-		PerChargeCeiling: 10_000_000, PeriodCeiling: 50_000_000, FrequencyCeiling: 100, Provider: "stripe", MandateReference: "pm_test_1",
+		PerChargeCeiling: 10_000_000, PeriodCeiling: 50_000_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:  "email/v1",
 		EffectiveFrom: now.Add(-24 * time.Hour), ExpiresAt: now.Add(24 * time.Hour),

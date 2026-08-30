@@ -42,10 +42,10 @@ func (s *Store) SaveAuthorization(ctx context.Context, auth intent.BillingAuthor
 		  (id, scope, subject_kind, subject_id, currency, intent_digest,
 		   charge_kinds, per_charge_ceiling_micros, period_ceiling_micros,
 		   frequency_ceiling, trigger_below_micros, top_up_amount_micros,
-		   provider, mandate_reference,
+		   provider, mandate_reference, notice_lead_seconds,
 		   terms_revision, price_book_revision, notice_policy,
 		   effective_from, expires_at, acceptance_digest, revoked_at)
-		VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+		VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 		ON CONFLICT (id) DO UPDATE
 		   SET revoked_at = COALESCE(
 		         ms_billing.billing_authorizations.revoked_at,
@@ -53,7 +53,7 @@ func (s *Store) SaveAuthorization(ctx context.Context, auth intent.BillingAuthor
 		g.ID, string(g.Scope), g.Subject.Kind, g.Subject.ID, g.Currency,
 		g.IntentDigest, kinds, g.PerChargeCeiling, g.PeriodCeiling,
 		g.FrequencyCeiling, g.TriggerBelowMicros, g.TopUpAmountMicros,
-		g.Provider, g.MandateReference,
+		g.Provider, g.MandateReference, int64(g.NoticeLeadTime/time.Second),
 		g.TermsRevision, g.PriceBook, g.NoticePolicy,
 		g.EffectiveFrom, g.ExpiresAt, g.AcceptanceDigest, revokedAt,
 	)
@@ -72,18 +72,19 @@ func (s *Store) SaveAuthorization(ctx context.Context, auth intent.BillingAuthor
 // rules its own creation had to pass.
 func (s *Store) LoadAuthorization(ctx context.Context, id string) (intent.BillingAuthorization, error) {
 	var (
-		g            intent.AuthorizationGrant
-		scope        string
-		kinds        []string
-		intentDigest *string
-		revokedAt    *time.Time
+		noticeLeadSeconds int64
+		g                 intent.AuthorizationGrant
+		scope             string
+		kinds             []string
+		intentDigest      *string
+		revokedAt         *time.Time
 	)
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT scope, subject_kind, subject_id, currency, intent_digest,
 		       charge_kinds, per_charge_ceiling_micros, period_ceiling_micros,
 		       frequency_ceiling, trigger_below_micros, top_up_amount_micros,
-		       provider, mandate_reference,
+		       provider, mandate_reference, notice_lead_seconds,
 		       terms_revision, price_book_revision, notice_policy,
 		       effective_from, expires_at, acceptance_digest, revoked_at
 		  FROM ms_billing.billing_authorizations
@@ -92,7 +93,7 @@ func (s *Store) LoadAuthorization(ctx context.Context, id string) (intent.Billin
 		&scope, &g.Subject.Kind, &g.Subject.ID, &g.Currency, &intentDigest,
 		&kinds, &g.PerChargeCeiling, &g.PeriodCeiling,
 		&g.FrequencyCeiling, &g.TriggerBelowMicros, &g.TopUpAmountMicros,
-		&g.Provider, &g.MandateReference,
+		&g.Provider, &g.MandateReference, &noticeLeadSeconds,
 		&g.TermsRevision, &g.PriceBook, &g.NoticePolicy,
 		&g.EffectiveFrom, &g.ExpiresAt, &g.AcceptanceDigest, &revokedAt,
 	)
@@ -105,6 +106,7 @@ func (s *Store) LoadAuthorization(ctx context.Context, id string) (intent.Billin
 
 	g.ID = id
 	g.Scope = intent.AuthorizationScope(scope)
+	g.NoticeLeadTime = time.Duration(noticeLeadSeconds) * time.Second
 	if intentDigest != nil {
 		g.IntentDigest = *intentDigest
 	}
@@ -130,10 +132,12 @@ func (s *Store) LoadAuthorization(ctx context.Context, id string) (intent.Billin
 // DeliveredDigest equals the intent's own; this type carries it anyway
 // so a caller assembling predicate state reads it rather than assuming.
 type NoticeReceipt struct {
-	IntentDigest         string
-	DeliveredDigest      string
-	Policy               string
-	TerminalStatus       string
+	IntentDigest    string
+	DeliveredDigest string
+	Policy          string
+	TerminalStatus  string
+	// DeliveredAt is when the bytes arrived. The wait runs from here.
+	DeliveredAt          time.Time
 	EligibilityNotBefore time.Time
 	RevocationPathFresh  bool
 }
@@ -147,11 +151,12 @@ func (s *Store) RecordNotice(ctx context.Context, receipt NoticeReceipt) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO ms_billing.notice_receipts
 		  (intent_digest, delivered_digest, policy, terminal_status,
-		   eligibility_not_before, revocation_path_fresh)
-		VALUES ($1,$2,$3,$4,$5,$6)
+		   delivered_at, eligibility_not_before, revocation_path_fresh)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		ON CONFLICT (intent_digest) DO NOTHING`,
 		receipt.IntentDigest, receipt.DeliveredDigest, receipt.Policy,
-		receipt.TerminalStatus, receipt.EligibilityNotBefore, receipt.RevocationPathFresh,
+		receipt.TerminalStatus, receipt.DeliveredAt, receipt.EligibilityNotBefore,
+		receipt.RevocationPathFresh,
 	)
 	if err != nil {
 		return fmt.Errorf("record notice: %w", err)
@@ -165,16 +170,25 @@ func (s *Store) RecordNotice(ctx context.Context, receipt NoticeReceipt) error {
 // rather than an error, because "no notice yet" is an ordinary state
 // for an intent awaiting one — and the predicate refuses on it anyway.
 func (s *Store) LoadNotice(ctx context.Context, digest string) (NoticeReceipt, bool, error) {
-	var r NoticeReceipt
+	var (
+		r           NoticeReceipt
+		deliveredAt *time.Time
+	)
 	err := s.pool.QueryRow(ctx, `
 		SELECT intent_digest, delivered_digest, policy, terminal_status,
-		       eligibility_not_before, revocation_path_fresh
+		       delivered_at, eligibility_not_before, revocation_path_fresh
 		  FROM ms_billing.notice_receipts
 		 WHERE intent_digest = $1`, digest,
 	).Scan(&r.IntentDigest, &r.DeliveredDigest, &r.Policy, &r.TerminalStatus,
-		&r.EligibilityNotBefore, &r.RevocationPathFresh)
+		&deliveredAt, &r.EligibilityNotBefore, &r.RevocationPathFresh)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return NoticeReceipt{}, false, nil
+	}
+	// A NULL delivered_at is a pre-056 row: nothing recorded when its
+	// clock started, so it cannot satisfy a lead time and the zero value
+	// is the honest answer.
+	if deliveredAt != nil {
+		r.DeliveredAt = *deliveredAt
 	}
 	if err != nil {
 		return NoticeReceipt{}, false, fmt.Errorf("load notice: %w", err)

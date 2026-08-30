@@ -307,6 +307,7 @@ func noticeFor(sealed intent.ChargeIntent, r store.NoticeReceipt) predicate.Noti
 		DeliveredBytesDigest: r.DeliveredDigest,
 		Policy:               r.Policy,
 		TerminalStatus:       r.TerminalStatus,
+		DeliveredAt:          r.DeliveredAt,
 		EligibilityNotBefore: r.EligibilityNotBefore,
 		RevocationPathFresh:  r.RevocationPathFresh,
 	}

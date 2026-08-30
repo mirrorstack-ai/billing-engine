@@ -72,6 +72,12 @@ type NoticeReceipt struct {
 	// TerminalStatus is the carrier's own terminal state. Only a
 	// destination-delivered status counts; "queued" and "sent" do not.
 	TerminalStatus string
+	// DeliveredAt is when the notice was actually delivered. It is what
+	// makes EligibilityNotBefore checkable: without it, the eligibility
+	// instant is a number the caller chose and nothing can say whether it
+	// respects the lead time the customer accepted.
+	DeliveredAt time.Time
+
 	// EligibilityNotBefore starts from DELIVERY, not from sealing.
 	EligibilityNotBefore time.Time
 	// RevocationPathFresh records that the customer's route to cancel

@@ -21,7 +21,7 @@ func standingGrant() AuthorizationGrant {
 		Subject:          Subject{Kind: "org", ID: "org-1"},
 		Currency:         "USD",
 		Kinds:            []ChargeKind{kindWalletTopUp},
-		PerChargeCeiling: 50_000, FrequencyCeiling: 100,
+		PerChargeCeiling: 50_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour,
 		PeriodCeiling:    200_000,
 		TermsRevision:    "terms-2026-01",
 		PriceBook:        "pb-2026-08",

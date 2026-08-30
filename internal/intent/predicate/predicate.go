@@ -117,6 +117,26 @@ func satisfied(clause Clause, s SealedState) bool {
 		if s.Notice.EligibilityNotBefore.IsZero() {
 			return false
 		}
+		// 🔴 EligibilityNotBefore is supplied by whoever built the
+		// state, so on its own it says only that SOMEBODY picked an
+		// instant. Until 2026-08-30 that was the whole clause: a caller
+		// could set it to the delivery moment and the wait elapsed
+		// immediately, while the customer was told as their card was
+		// charged.
+		//
+		// The authorization carries the lead time the customer
+		// accepted, so the receipt is now checked against it: eligibility
+		// may not start before delivery plus that wait. A missing
+		// delivery instant refuses, because a wait measured from nothing
+		// is not a wait.
+		if s.Notice.DeliveredAt.IsZero() {
+			return false
+		}
+		if lead := s.Authorization.NoticeLeadTime(); lead > 0 {
+			if s.Notice.EligibilityNotBefore.Before(s.Notice.DeliveredAt.Add(lead)) {
+				return false
+			}
+		}
 		return !s.Now.Before(s.Notice.EligibilityNotBefore)
 
 	case ClauseWithinCeilings:

@@ -23,4 +23,8 @@ ALTER TABLE ms_billing.billing_authorizations
     DROP COLUMN IF EXISTS trigger_below_micros,
     DROP COLUMN IF EXISTS top_up_amount_micros,
     DROP COLUMN IF EXISTS provider,
-    DROP COLUMN IF EXISTS mandate_reference;
+    DROP COLUMN IF EXISTS mandate_reference,
+    DROP COLUMN IF EXISTS notice_lead_seconds;
+
+ALTER TABLE ms_billing.notice_receipts
+    DROP COLUMN IF EXISTS delivered_at;

@@ -102,7 +102,7 @@ func ready(t *testing.T, s *store.Store) intent.ChargeIntent {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindCycle},
-		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100, Provider: "stripe", MandateReference: "pm_test_1",
+		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:     "email/v1",
 		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
@@ -115,6 +115,7 @@ func ready(t *testing.T, s *store.Store) intent.ChargeIntent {
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
 		Policy: "email/v1", TerminalStatus: "delivered",
+		DeliveredAt:          evalNow.Add(-48 * time.Hour),
 		EligibilityNotBefore: evalNow.Add(-24 * time.Hour), RevocationPathFresh: true,
 	}))
 	require.NoError(t, s.AdvanceState(ctx, sealed.Digest(), "proposed", "eligible"))

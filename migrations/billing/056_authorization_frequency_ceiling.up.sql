@@ -62,6 +62,18 @@ ALTER TABLE ms_billing.billing_authorizations
     ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS mandate_reference TEXT NOT NULL DEFAULT '';
 
+-- §6's notice "lead time": how long after delivery the customer must be left
+-- before money moves. Stored in seconds because that is the unit the column
+-- can CHECK; the Go side carries a time.Duration.
+ALTER TABLE ms_billing.billing_authorizations
+    ADD COLUMN IF NOT EXISTS notice_lead_seconds BIGINT NOT NULL DEFAULT 0
+        CHECK (notice_lead_seconds >= 0);
+
+UPDATE ms_billing.billing_authorizations
+   SET notice_lead_seconds = 86400
+ WHERE scope = 'standing'
+   AND notice_lead_seconds = 0;
+
 ALTER TABLE ms_billing.billing_authorizations
     DROP CONSTRAINT IF EXISTS billing_authorizations_instrument_is_complete;
 
@@ -84,4 +96,21 @@ ALTER TABLE ms_billing.billing_authorizations
         CHECK (scope <> 'standing'
                OR (array_length(charge_kinds, 1) > 0
                    AND per_charge_ceiling_micros > 0
-                   AND frequency_ceiling > 0));
+                   AND frequency_ceiling > 0
+                   AND notice_lead_seconds > 0));
+
+-- The notice DELIVERY instant.
+--
+-- predicate.ClauseNoticeWaitElapsed measured the wait against
+-- eligibility_not_before alone — a timestamp whoever wrote the receipt chose.
+-- Checking it against the authorization's accepted lead time needs the instant
+-- the bytes actually arrived, and the table did not record it, so the executor
+-- could not supply it even in principle.
+ALTER TABLE ms_billing.notice_receipts
+    ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+
+COMMENT ON COLUMN ms_billing.notice_receipts.delivered_at IS
+    'When the notice bytes arrived. The wait runs from here, and the accepted '
+    'lead time is measured against it. NULL on rows written before migration '
+    '056, which therefore cannot satisfy the wait -- the right answer, since '
+    'nothing recorded when their clock started.';

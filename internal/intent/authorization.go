@@ -76,6 +76,7 @@ type BillingAuthorization struct {
 	topUpAmountMicros  int64
 	provider           string
 	mandateReference   string
+	noticeLeadTime     time.Duration
 
 	// termsRevision and priceBookRevision pin what the customer agreed
 	// to. A price book moving under a standing authorization is a
@@ -140,6 +141,17 @@ type AuthorizationGrant struct {
 	// without a mandate has not bound an instrument.
 	Provider         string
 	MandateReference string
+
+	// NoticeLeadTime is §6's "lead time": how long after notice is
+	// DELIVERED the customer must be left before money moves.
+	//
+	// Without it on the authorization, the wait is whatever the caller
+	// put in the receipt — predicate.ClauseNoticeWaitElapsed compares
+	// `now` against a caller-supplied EligibilityNotBefore and nothing
+	// checks that timestamp against anything the customer agreed to. A
+	// caller could set it to the delivery instant and the wait would
+	// elapse immediately.
+	NoticeLeadTime   time.Duration
 	TermsRevision    string
 	PriceBook        string
 	NoticePolicy     string
@@ -150,24 +162,25 @@ type AuthorizationGrant struct {
 
 // Errors from Authorize.
 var (
-	ErrAuthIDMissing            = errors.New("intent: authorization has no id")
-	ErrAuthScopeUnknown         = errors.New("intent: authorization scope is neither one-time nor standing")
-	ErrAuthSubjectUnknown       = errors.New("intent: authorization subject is not a kind the engine knows")
-	ErrAuthCurrencyMissing      = errors.New("intent: authorization names no currency")
-	ErrAuthDigestMissing        = errors.New("intent: a one-time authorization must name the intent it permits")
-	ErrAuthKindsMissing         = errors.New("intent: a standing authorization must declare the charge kinds it permits")
-	ErrAuthCeilingMissing       = errors.New("intent: a standing authorization must declare a per-charge ceiling")
-	ErrAuthFrequencyMissing     = errors.New("intent: a standing authorization needs a frequency ceiling")
-	ErrAuthTriggerIncomplete    = errors.New("intent: a balance trigger and an amount rule must be given together")
-	ErrAuthInstrumentIncomplete = errors.New("intent: a provider and a mandate reference must be given together")
-	ErrAuthRuleExceedsCeiling   = errors.New("intent: the amount rule is above the per-charge ceiling, so no attempt could ever satisfy it")
-	ErrAuthCeilingNegative      = errors.New("intent: a ceiling is negative")
-	ErrAuthTermsMissing         = errors.New("intent: authorization pins no terms revision")
-	ErrAuthPriceBookMissing     = errors.New("intent: authorization pins no price book revision")
-	ErrAuthNoticeMissing        = errors.New("intent: authorization names no notice policy")
-	ErrAuthWindowMissing        = errors.New("intent: authorization has no effective window")
-	ErrAuthWindowInverted       = errors.New("intent: authorization expires before it takes effect")
-	ErrAuthAcceptanceMissing    = errors.New("intent: authorization references no acceptance receipt")
+	ErrAuthIDMissing             = errors.New("intent: authorization has no id")
+	ErrAuthScopeUnknown          = errors.New("intent: authorization scope is neither one-time nor standing")
+	ErrAuthSubjectUnknown        = errors.New("intent: authorization subject is not a kind the engine knows")
+	ErrAuthCurrencyMissing       = errors.New("intent: authorization names no currency")
+	ErrAuthDigestMissing         = errors.New("intent: a one-time authorization must name the intent it permits")
+	ErrAuthKindsMissing          = errors.New("intent: a standing authorization must declare the charge kinds it permits")
+	ErrAuthCeilingMissing        = errors.New("intent: a standing authorization must declare a per-charge ceiling")
+	ErrAuthFrequencyMissing      = errors.New("intent: a standing authorization needs a frequency ceiling")
+	ErrAuthTriggerIncomplete     = errors.New("intent: a balance trigger and an amount rule must be given together")
+	ErrAuthInstrumentIncomplete  = errors.New("intent: a provider and a mandate reference must be given together")
+	ErrAuthNoticeLeadTimeMissing = errors.New("intent: a standing authorization needs a notice lead time")
+	ErrAuthRuleExceedsCeiling    = errors.New("intent: the amount rule is above the per-charge ceiling, so no attempt could ever satisfy it")
+	ErrAuthCeilingNegative       = errors.New("intent: a ceiling is negative")
+	ErrAuthTermsMissing          = errors.New("intent: authorization pins no terms revision")
+	ErrAuthPriceBookMissing      = errors.New("intent: authorization pins no price book revision")
+	ErrAuthNoticeMissing         = errors.New("intent: authorization names no notice policy")
+	ErrAuthWindowMissing         = errors.New("intent: authorization has no effective window")
+	ErrAuthWindowInverted        = errors.New("intent: authorization expires before it takes effect")
+	ErrAuthAcceptanceMissing     = errors.New("intent: authorization references no acceptance receipt")
 )
 
 // Authorize validates a grant and returns the immutable authorization.
@@ -231,6 +244,13 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 		if grant.FrequencyCeiling <= 0 {
 			return BillingAuthorization{}, ErrAuthFrequencyMissing
 		}
+		// A standing authorization that can collect automatically needs
+		// a lead time, or "notice was given" collapses to "a receipt
+		// exists" and the customer is told at the moment they are
+		// charged.
+		if grant.NoticeLeadTime <= 0 {
+			return BillingAuthorization{}, ErrAuthNoticeLeadTimeMissing
+		}
 	}
 	if strings.TrimSpace(grant.TermsRevision) == "" {
 		return BillingAuthorization{}, ErrAuthTermsMissing
@@ -270,6 +290,7 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 		topUpAmountMicros:      grant.TopUpAmountMicros,
 		provider:               strings.TrimSpace(grant.Provider),
 		mandateReference:       strings.TrimSpace(grant.MandateReference),
+		noticeLeadTime:         grant.NoticeLeadTime,
 		termsRevision:          grant.TermsRevision,
 		priceBookRevision:      grant.PriceBook,
 		noticePolicy:           grant.NoticePolicy,
@@ -512,6 +533,10 @@ func (a BillingAuthorization) InstrumentBound() bool {
 	return a.provider != "" && a.mandateReference != ""
 }
 
+// NoticeLeadTime is how long after delivery the customer must be left
+// before money moves.
+func (a BillingAuthorization) NoticeLeadTime() time.Duration { return a.noticeLeadTime }
+
 // Provider and MandateReference are the accepted rail and mandate.
 func (a BillingAuthorization) Provider() string         { return a.provider }
 func (a BillingAuthorization) MandateReference() string { return a.mandateReference }
@@ -538,6 +563,7 @@ func (a BillingAuthorization) Grant() AuthorizationGrant {
 		TopUpAmountMicros:  a.topUpAmountMicros,
 		Provider:           a.provider,
 		MandateReference:   a.mandateReference,
+		NoticeLeadTime:     a.noticeLeadTime,
 		PeriodCeiling:      a.periodCeilingMicros,
 		TermsRevision:      a.termsRevision,
 		PriceBook:          a.priceBookRevision,

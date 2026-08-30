@@ -2,6 +2,7 @@ package predicate
 
 import (
 	"testing"
+	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 )
@@ -57,7 +58,7 @@ func placeholderState(t *testing.T) SealedState {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
-		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100, Provider: "stripe", MandateReference: "pm_test_1",
+		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: placeholderTerms, PriceBook: placeholderPriceBook,
 		NoticePolicy:     placeholderNotice,
 		EffectiveFrom:    windowStart,
@@ -220,7 +221,7 @@ func TestInstrumentBindingNeedsAnAuthorizationThatNamedAnInstrument(t *testing.T
 			Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 			Currency: "USD", Kinds: []intent.ChargeKind{kind},
 			PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000,
-			FrequencyCeiling: 100,
+			FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour,
 			// Provider and MandateReference deliberately absent.
 			TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 			NoticePolicy:     "email/v1",
@@ -245,6 +246,50 @@ func TestInstrumentBindingNeedsAnAuthorizationThatNamedAnInstrument(t *testing.T
 		state.Unbuilt.InstrumentBinding = false
 		if Evaluate(state).Permitted {
 			t.Fatal("collection was permitted without a verified instrument binding")
+		}
+	})
+}
+
+// 🔴 The notice wait was whatever the caller said it was.
+//
+// ClauseNoticeWaitElapsed compared `now` against Notice.EligibilityNotBefore —
+// a timestamp supplied by whoever built the state. Nothing checked it against
+// anything the customer agreed to, so a caller could set eligibility to the
+// delivery instant and the wait elapsed immediately: the customer told as
+// their card was charged, and the clause reporting a satisfied notice period.
+//
+// The authorization carries the accepted lead time, so the receipt is now
+// checked against it.
+func TestTheNoticeWaitIsMeasuredAgainstTheAcceptedLeadTime(t *testing.T) {
+	// The authorization in permittedState accepts a 24h lead time.
+	t.Run("eligibility earlier than delivery plus the lead time", func(t *testing.T) {
+		state := permittedState(t)
+		state.Notice.DeliveredAt = evalNow.Add(-2 * time.Hour)
+		// A caller claiming the wait is already over, two hours after
+		// delivery, under a 24h accepted lead time.
+		state.Notice.EligibilityNotBefore = evalNow.Add(-time.Minute)
+
+		if Evaluate(state).Permitted {
+			t.Fatal("a two-hour wait satisfied a 24-hour accepted lead time — the customer " +
+				"would be told as their card was charged")
+		}
+	})
+
+	t.Run("no delivery instant at all", func(t *testing.T) {
+		state := permittedState(t)
+		state.Notice.DeliveredAt = time.Time{}
+		if Evaluate(state).Permitted {
+			t.Fatal("a wait measured from nothing was treated as elapsed")
+		}
+	})
+
+	t.Run("delivery plus the full lead time is enough", func(t *testing.T) {
+		state := permittedState(t)
+		state.Notice.DeliveredAt = evalNow.Add(-25 * time.Hour)
+		state.Notice.EligibilityNotBefore = evalNow.Add(-time.Hour)
+		if !Evaluate(state).Permitted {
+			t.Fatalf("a receipt honouring the full 24h lead time was refused: %v",
+				Evaluate(state).Refused)
 		}
 	})
 }
