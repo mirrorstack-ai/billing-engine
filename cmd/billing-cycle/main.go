@@ -396,13 +396,28 @@ const (
 // withIntentCutover attaches the proposer seam, or leaves the service on
 // the legacy collecting path.
 //
-// 🔴 Arming this STOPS THIS WORKER COLLECTING. A cut-over leg derives
-// the same amount, seals it as an intent, stores it and returns — and
-// cmd/intent-executor, which holds the only write port, refuses to start
-// while any legacy money path remains. Nothing downstream picks the
-// intent up yet. So the flag's effect today is a revenue stop, not a
-// migration, and it exists to make the seam REACHABLE rather than to be
-// switched on.
+// 🔴 Arming this STOPS THIS WORKER COLLECTING FOR NEW CHARGES. A
+// cut-over leg derives the same amount, seals it as an intent, stores it
+// and returns — and cmd/intent-executor, which holds the only write
+// port, refuses to start while any legacy money path remains. Nothing
+// downstream picks the intent up yet. So the flag's effect today is a
+// revenue stop, not a migration, and it exists to make the seam
+// REACHABLE rather than to be switched on.
+//
+// ⚠️ It is NOT "this worker collects nothing", and the difference is
+// load-bearing. Each leg takes its durable arming claim BEFORE the
+// proposer branch, and each leg's crash-recovery path runs BEFORE that
+// claim (domain_charges.go:100, overage.go:262). A row armed by a
+// legacy run that left a draft or finalized invoice at the provider is
+// therefore still completed after this flag is set.
+//
+// That is deliberate. Abandoning a finalized invoice would strand a
+// charge the customer can see and nobody can finish or prove. The
+// exception drains: once no row carries an unresolved charge-attempt
+// marker, the recovery path has nothing left to complete —
+// scripts/legacy-drop-preconditions.sql asks production exactly that
+// question, and it is one of the preconditions for deleting the
+// collectors.
 //
 // Until 2026-08-30 WithIntentProposer had no non-test caller at all: the
 // cutover branch in every leg was unreachable in production, and the two
@@ -420,8 +435,9 @@ func withIntentCutover(svc *cycle.Service, pool *pgxpool.Pool, flag string) *cyc
 	if !arm {
 		return svc
 	}
-	slog.Warn("INTENT CUTOVER ARMED — this worker will propose sealed intents and collect nothing",
-		"env", intentCutoverEnv)
+	slog.Warn("INTENT CUTOVER ARMED — cut-over legs will propose sealed intents instead of charging",
+		"env", intentCutoverEnv,
+		"exception", "in-flight legacy charges are still completed by each leg's crash-recovery path")
 	return svc.WithIntentProposer(proposer.New(intentstore.New(pool)))
 }
 

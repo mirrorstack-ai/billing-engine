@@ -104,3 +104,68 @@ should read the intent's four revisions and refuse any that is unpublished.
 That is the contract its own name states.
 
 Building five more legs before this lands would multiply the fiction by five.
+
+---
+
+## The three legs that cannot be built, and what unblocks each
+
+Verified 2026-08-30. These are blocked on decisions, not on effort. None of them
+is a matter of someone finding time.
+
+### Credit purchase and auto-top-up — blocked by §12 item 12
+
+Both are **stored-value funding**, not charges for consumption. §6's charge
+catalog is closed and names no funding kind, so neither can legally seal an
+`intent.Draft` today.
+
+The schema would not stop you: `ms_billing.charge_intents.kind` is a bare
+`TEXT NOT NULL` with no CHECK. Sealing `kind: "credit.purchase"` would compile,
+insert, and digest cleanly. That is exactly why it must not be done — inventing
+a kind is inventing the catalog, and §12 item 12 is the decision that says which
+kinds exist.
+
+**What unblocks them:** a decision on whether buying stored value is a charge
+kind in the §6 catalog, or a different document class the intent vocabulary does
+not cover. That is item 12 plus item 13 (the legal characterization of stored
+value), not an engineering task.
+
+Credit purchase carries a second, independent blocker: it is **not terminal**.
+The cycle legs propose and stop, and nothing downstream needs the money to have
+moved. Credit purchase's RPC response must carry a Stripe client secret that
+only exists *after* the finalize (`creditpurchase/executor.go:271`), so a
+proposing version returns a response the customer's browser cannot use. Cutting
+it over changes a synchronous customer-facing contract, which the two shipped
+legs never had to do.
+
+Auto-top-up carries its own: it is wired into **six binaries** by a duplicated
+inline closure, so the seam has six installation sites rather than one
+constructor.
+
+### Unpaid retry — blocked by INV-001 itself
+
+It re-pays an invoice that **already exists at Stripe**
+(`billing/unpaid.go:223`). `stripeadapter.Collect` always creates a new
+draft + line + finalize + pay, so the adapter cannot express it.
+
+Adding a `CollectExistingInvoice` method would be easy and wrong. The amount on
+a pre-existing invoice comes from the provider, not from our derivation — so an
+intent wrapping it would attest to a figure the engine did not derive. That is
+the exact inversion INV-001 exists to prevent, and the reason this design says
+the engine derives every financial field.
+
+**What unblocks it:** a decision on what an unpaid retry *is* in intent terms.
+The honest options look like: supersede the original intent and settle the
+successor (INV-003 already describes supersession), or classify retry as an
+execution concern of the original intent rather than a new charge. Both are
+design work in §5, not adapter work.
+
+### What this means for the count
+
+`legacy_money_paths` does not move for any of this. The constant's own comment
+is explicit: it "reaches zero when the last of them is deleted — not when an
+intent surface is added beside them." It stayed at **11** across both shipped
+cutovers. The count falls only on deletion, and deletion is gated on production
+state by `scripts/legacy-drop-preconditions.sql`.
+
+**So the critical path to "drop the legacy things" runs through production
+access, not through more legs.** That is what the read-only ops Lambda is for.
