@@ -87,3 +87,14 @@
 -- retirement.
 \i migrations/billing/051_heavy_tier_rates.up.sql
 \i migrations/billing/052_org_deletion_finalizations.up.sql
+
+-- 053 is a deliberate gap on main (migrations/billing/README.md: the runner is
+-- lexical, so gaps are tolerated). Two unmerged peer branches each claim it;
+-- whoever merges second renumbers past the highest CLAIMED slot.
+--
+-- 055 is claimed by the period-boundary cutover on build/boundary and is not
+-- on this branch.
+\i migrations/billing/054_intent_core.up.sql
+\i migrations/billing/056_authorization_frequency_ceiling.up.sql
+\i migrations/billing/057_credit_ledger_proposed_status.up.sql
+\i migrations/billing/058_billing_ro_grants.up.sql
