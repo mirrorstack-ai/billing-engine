@@ -482,3 +482,142 @@ func TestOverflowHelpers(t *testing.T) {
 		}
 	}
 }
+
+// storedFrom projects a sealed intent into the shape storage returns,
+// which is what a row read back looks like before anything has checked
+// it.
+func storedFrom(c ChargeIntent) Stored {
+	return Stored{
+		Digest:            c.Digest(),
+		Payer:             c.Payer(),
+		Currency:          c.Currency(),
+		Lines:             c.Lines(),
+		PriceBookRevision: c.PriceBookRevision(),
+		TermsRevision:     c.TermsRevision(),
+		Tax:               c.Tax(),
+		AuthorizationID:   c.AuthorizationID(),
+		NoticePolicy:      c.NoticePolicy(),
+		SourceFactKeys:    c.SourceFactKeys(),
+		Supersedes:        c.Supersedes(),
+		SubtotalMicros:    c.SubtotalMicros(),
+		TotalMicros:       c.TotalMicros(),
+	}
+}
+
+func TestRehydrateRoundTrips(t *testing.T) {
+	original, err := Seal(validDraft())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := storedFrom(original)
+	stored.ExecuteNotBefore, stored.ExecuteNotAfter = original.ExecutionWindow()
+
+	loaded, err := Rehydrate(stored)
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	if loaded.Digest() != original.Digest() {
+		t.Fatalf("digest changed on round trip: %s -> %s", original.Digest(), loaded.Digest())
+	}
+	if loaded.TotalMicros() != original.TotalMicros() {
+		t.Errorf("total changed on round trip")
+	}
+}
+
+// The digest checks the DATABASE, not a caller. A trigger protects one
+// table in one deployment; this protects the document wherever it has
+// been — a restored backup, a replicated row, a migration that rewrote
+// a column in passing, or a deliberate edit by whoever holds the
+// database credential.
+func TestRehydrateRefusesATamperedRow(t *testing.T) {
+	original, err := Seal(validDraft())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := storedFrom(original)
+	base.ExecuteNotBefore, base.ExecuteNotAfter = original.ExecutionWindow()
+
+	tampers := map[string]func(*Stored){
+		"the amount":           func(s *Stored) { s.Lines[0].Quantity = 1 },
+		"the unit price":       func(s *Stored) { s.Lines[0].UnitPriceMicros = 1 },
+		"the payer":            func(s *Stored) { s.Payer = Subject{Kind: "org", ID: "org-2"} },
+		"the currency":         func(s *Stored) { s.Currency = "TWD" },
+		"the price book":       func(s *Stored) { s.PriceBookRevision = "pb-2026-09" },
+		"the terms":            func(s *Stored) { s.TermsRevision = "terms-2026-02" },
+		"the tax amount":       func(s *Stored) { s.Tax.AmountMicros = 1 },
+		"the authorization":    func(s *Stored) { s.AuthorizationID = "auth-2" },
+		"the notice policy":    func(s *Stored) { s.NoticePolicy = "sms/v1" },
+		"the execution window": func(s *Stored) { s.ExecuteNotAfter = windowEnd.Add(time.Hour) },
+		"the source facts":     func(s *Stored) { s.SourceFactKeys = []string{"fact-2"} },
+		"the supersede link":   func(s *Stored) { s.Supersedes = "some-other-digest" },
+		"the digest itself":    func(s *Stored) { s.Digest = "not-the-digest" },
+		"the stored subtotal":  func(s *Stored) { s.SubtotalMicros++ },
+		"the stored total":     func(s *Stored) { s.TotalMicros++ },
+	}
+
+	for name, tamper := range tampers {
+		t.Run(name, func(t *testing.T) {
+			stored := base
+			stored.Lines = append([]Line(nil), base.Lines...)
+			stored.SourceFactKeys = append([]string(nil), base.SourceFactKeys...)
+			tamper(&stored)
+
+			loaded, err := Rehydrate(stored)
+			if !errors.Is(err, ErrDigestMismatch) {
+				t.Fatalf("Rehydrate accepted a row with %s edited: err = %v", name, err)
+			}
+			if loaded.Sealed() {
+				t.Error("a refused row still produced a sealed intent")
+			}
+		})
+	}
+}
+
+// A superseding correction must round-trip too, since the link is part
+// of what is attested.
+func TestRehydratePreservesTheSupersedeLink(t *testing.T) {
+	original, err := Seal(validDraft())
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrected := validDraft()
+	corrected.Lines = []Line{NewLine("quiz.render", "quiz-core", "1.4.0", 1_001, 25)}
+	replacement, err := original.Supersede(corrected)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stored := storedFrom(replacement)
+	stored.ExecuteNotBefore, stored.ExecuteNotAfter = replacement.ExecutionWindow()
+
+	loaded, err := Rehydrate(stored)
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	if loaded.Supersedes() != original.Digest() {
+		t.Errorf("supersede link lost: %q", loaded.Supersedes())
+	}
+	if loaded.Digest() != replacement.Digest() {
+		t.Error("a superseding intent did not round-trip to its own digest")
+	}
+}
+
+// A row that could never have been sealed must not load, and the reason
+// should say what was wrong rather than only that the hash differed.
+func TestRehydrateRefusesARowThatCouldNeverHaveBeenSealed(t *testing.T) {
+	original, err := Seal(validDraft())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := storedFrom(original)
+	stored.ExecuteNotBefore, stored.ExecuteNotAfter = original.ExecutionWindow()
+	stored.Tax.Resolved = false
+
+	_, err = Rehydrate(stored)
+	if !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("err = %v, want %v", err, ErrDigestMismatch)
+	}
+	if !errors.Is(err, ErrTaxUnresolved) {
+		t.Errorf("the error does not say the tax was unresolved: %v", err)
+	}
+}

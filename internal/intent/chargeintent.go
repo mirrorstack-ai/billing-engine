@@ -399,3 +399,103 @@ func addOK(a, b int64) (int64, bool) {
 	}
 	return sum, true
 }
+
+// Stored is a charge intent as it was read back from durable storage.
+//
+// It exists because a row is not a sealed intent. Seal validates and
+// derives; a SELECT does neither, so a value reconstructed from columns
+// has had none of the checks that made the original trustworthy — and
+// docs/DESIGN.md's whole argument rests on the sealed document being
+// the one the customer saw.
+type Stored struct {
+	Digest string
+
+	Payer             Subject
+	Currency          string
+	Lines             []Line
+	PriceBookRevision string
+	TermsRevision     string
+	Tax               TaxDetermination
+	AuthorizationID   string
+	NoticePolicy      string
+	ExecuteNotBefore  time.Time
+	ExecuteNotAfter   time.Time
+	SourceFactKeys    []string
+	Supersedes        string
+
+	SubtotalMicros int64
+	TotalMicros    int64
+}
+
+// ErrDigestMismatch is returned when a stored intent does not hash to
+// the digest stored beside it.
+var ErrDigestMismatch = errors.New("intent: stored intent does not match its digest")
+
+// Rehydrate reconstructs a sealed intent from storage, and refuses one
+// whose contents no longer produce its own digest.
+//
+// This is the control the digest was always for. Every field is fed
+// back through the same canonical encoding and the result compared with
+// the digest the row carries. A tampered amount, a swapped payer, an
+// edited price-book revision — any of them changes the hash, and the
+// intent does not load.
+//
+// So the check runs against the database rather than against a caller.
+// The trigger on ms_billing.charge_intents refuses an UPDATE, but a
+// trigger protects one table in one deployment; this protects the
+// document itself, wherever it has been. A restored backup, a replicated
+// row, a migration that rewrote a column in passing, and a deliberate
+// edit by someone holding the database credential all fail the same way.
+//
+// It also recomputes the totals rather than trusting the stored ones,
+// for the reason Seal does: a total nobody derived is an assertion.
+func Rehydrate(stored Stored) (ChargeIntent, error) {
+	if strings.TrimSpace(stored.Digest) == "" {
+		return ChargeIntent{}, fmt.Errorf("%w: no digest stored", ErrDigestMismatch)
+	}
+
+	rebuilt, err := Seal(Draft{
+		Payer:             stored.Payer,
+		Currency:          stored.Currency,
+		Lines:             stored.Lines,
+		PriceBookRevision: stored.PriceBookRevision,
+		TermsRevision:     stored.TermsRevision,
+		Tax:               stored.Tax,
+		AuthorizationID:   stored.AuthorizationID,
+		NoticePolicy:      stored.NoticePolicy,
+		ExecuteNotBefore:  stored.ExecuteNotBefore,
+		ExecuteNotAfter:   stored.ExecuteNotAfter,
+		SourceFactKeys:    stored.SourceFactKeys,
+	})
+	if err != nil {
+		// A row that cannot be sealed is a row that should never have
+		// been written. Surfacing the reason is more useful than a bare
+		// mismatch.
+		return ChargeIntent{}, fmt.Errorf("%w: %w", ErrDigestMismatch, err)
+	}
+
+	// The supersede link is part of what is attested, so it has to be in
+	// place before the digest is recomputed.
+	if stored.Supersedes != "" {
+		rebuilt.supersedes = stored.Supersedes
+		rebuilt.digest = rebuilt.computeDigest()
+	}
+
+	if rebuilt.digest != stored.Digest {
+		return ChargeIntent{}, fmt.Errorf("%w: stored %s, recomputed %s",
+			ErrDigestMismatch, stored.Digest, rebuilt.digest)
+	}
+
+	// The stored totals are compared, not adopted. A row whose total
+	// disagrees with its own lines is one where something wrote a number
+	// nobody derived — and because the totals are inside the digest, the
+	// check above has usually caught it already. Usually is not a
+	// guarantee worth resting a charge on.
+	if stored.SubtotalMicros != rebuilt.subtotalMicros || stored.TotalMicros != rebuilt.totalMicros {
+		return ChargeIntent{}, fmt.Errorf("%w: stored total %d/%d, derived %d/%d",
+			ErrDigestMismatch, stored.SubtotalMicros, stored.TotalMicros,
+			rebuilt.subtotalMicros, rebuilt.totalMicros)
+	}
+
+	return rebuilt, nil
+}
