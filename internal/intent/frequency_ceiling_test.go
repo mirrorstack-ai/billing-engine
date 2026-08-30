@@ -255,3 +255,51 @@ func TestAnAmountRuleAboveTheCeilingIsRefusedAtAuthorize(t *testing.T) {
 		t.Fatalf("an unsatisfiable authorization was minted: %v", err)
 	}
 }
+
+// 🔴 Never stack an attempt on an unknown outcome.
+//
+// §6 requires a standing authorization to bind its "pending-or-failed
+// treatment". An attempt submitted to a provider and never confirmed either
+// way MAY ALREADY HAVE TAKEN THE MONEY, so starting another is a coin flip on
+// double-charging. Refusing while anything is in flight is the only treatment
+// available before the outcome is known, and the only one that cannot be
+// wrong.
+//
+// This is why it is not merely the frequency ceiling in another guise: an
+// account can be far below every count and amount bound and still have one
+// unresolved attempt outstanding.
+func TestAnUnresolvedAttemptBlocksTheNextOne(t *testing.T) {
+	auth := freqAuth(t, 10)
+	sealed := freqIntent(t)
+	at := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	// Well inside every other bound — one attempt, tiny spend.
+	d := auth.Permits(sealed, at, PriorUse{SpendMicros: 1_000, Attempts: 1, Unresolved: 1})
+
+	if d.Permitted {
+		t.Fatal("a new attempt was permitted while a prior one's outcome was unknown — " +
+			"that is a coin flip on charging the customer twice")
+	}
+	if !hasRefusal(d.Refusals, RefusalAttemptUnresolved) {
+		t.Fatalf("refusals = %v, want %s", d.Refusals, RefusalAttemptUnresolved)
+	}
+	// It must not be the frequency or amount bounds doing the work, or this
+	// test would pass while the unresolved rule was absent.
+	if hasRefusal(d.Refusals, RefusalOverFrequency) || hasRefusal(d.Refusals, RefusalOverPeriod) {
+		t.Fatalf("another bound also refused (%v), so this proves nothing about "+
+			"unresolved attempts", d.Refusals)
+	}
+}
+
+// And a resolved history does not block: attempts that finished, however they
+// finished, are counted by the frequency ceiling and nothing more.
+func TestResolvedAttemptsDoNotBlock(t *testing.T) {
+	auth := freqAuth(t, 10)
+	sealed := freqIntent(t)
+	at := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	d := auth.Permits(sealed, at, PriorUse{SpendMicros: 1_000, Attempts: 4, Unresolved: 0})
+	if hasRefusal(d.Refusals, RefusalAttemptUnresolved) {
+		t.Fatalf("a fully resolved history was treated as in flight: %v", d.Refusals)
+	}
+}

@@ -280,12 +280,16 @@ const (
 	// top-up size the customer accepted. A charge inside the ceilings is
 	// not thereby the charge that was agreed.
 	RefusalAmountNotTheAcceptedRule Refusal = "amount_is_not_the_accepted_rule"
-	RefusalTermsMoved               Refusal = "terms_revision_moved"
-	RefusalPriceBookMoved           Refusal = "price_book_moved"
-	RefusalNoticePolicyMoved        Refusal = "notice_policy_moved"
-	RefusalNotYetEffective          Refusal = "not_yet_effective"
-	RefusalExpired                  Refusal = "expired"
-	RefusalRevoked                  Refusal = "revoked"
+	// RefusalAttemptUnresolved: a previous attempt under this
+	// authorization has an unknown outcome. It may already have taken the
+	// money.
+	RefusalAttemptUnresolved Refusal = "prior_attempt_unresolved"
+	RefusalTermsMoved        Refusal = "terms_revision_moved"
+	RefusalPriceBookMoved    Refusal = "price_book_moved"
+	RefusalNoticePolicyMoved Refusal = "notice_policy_moved"
+	RefusalNotYetEffective   Refusal = "not_yet_effective"
+	RefusalExpired           Refusal = "expired"
+	RefusalRevoked           Refusal = "revoked"
 )
 
 // Decision is the result of asking whether an authorization covers an
@@ -321,6 +325,20 @@ type PriorUse struct {
 	// consumed one, which is the point: retrying forever is the runaway
 	// the frequency ceiling exists to stop.
 	Attempts int
+
+	// Unresolved is how many of those attempts have an UNKNOWN outcome —
+	// submitted to a provider and never confirmed either way.
+	//
+	// This is not a policy knob. An attempt whose outcome is unknown may
+	// have taken the customer's money, so starting another is a coin
+	// flip on double-charging them. docs/DESIGN.md §6 requires a standing
+	// authorization to bind its "pending-or-failed treatment"; refusing
+	// while anything is in flight is the treatment that cannot be wrong,
+	// and the only one available before the outcome is known.
+	//
+	// A count, not a bool, so a caller that cannot answer says so by
+	// leaving it zero only when it has actually looked.
+	Unresolved int
 }
 
 func (a BillingAuthorization) Permits(
@@ -402,6 +420,10 @@ func (a BillingAuthorization) Permits(
 		// is a top-up of $19.
 		if a.topUpAmountMicros > 0 && intent.TotalMicros() != a.topUpAmountMicros {
 			refusals = append(refusals, RefusalAmountNotTheAcceptedRule)
+		}
+		// Never stack an attempt on an unknown outcome.
+		if prior.Unresolved > 0 {
+			refusals = append(refusals, RefusalAttemptUnresolved)
 		}
 	}
 
