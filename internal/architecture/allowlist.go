@@ -86,6 +86,20 @@ var allowedProviderMutations = map[string]string{
 	"internal/account/billing/unpaid.go (*Service).PayInvoice PayInvoice":                              "COLLECT: retrying an invoice the customer already owes",
 	"cmd/account-api/main.go (*dispatcher).dispatch PayInvoice":                                        "dispatcher delegating to the service method above",
 
+	// --- the intent path ---
+	//
+	// These are the REPLACEMENT for the legacy collectors, not another
+	// one of them. They are excluded from the legacy count below, and
+	// the exclusion rests on a property enforced elsewhere rather than
+	// on this comment: internal/provider/stripeadapter is reachable
+	// only through internal/intent/executor, which is
+	// predicate.Evaluate's single caller — asserted by
+	// TestExecutionPredicateHasAtMostOneCaller. If a second caller ever
+	// appears, that test fails and this exclusion stops being earned.
+	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect CreateDraftInvoice": "INTENT: the inert draft for one sealed intent",
+	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect CreateInvoiceItem":  "INTENT: one line carrying the sealed total; there is nowhere for a second",
+	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect FinalizeInvoice":    "INTENT COLLECT: the one money-moving step of the intent path, reachable only through the executor, which reaches it only on a permitting verdict",
+
 	// --- test support that is not a _test.go file ---
 	"internal/account/webhook/webhooktest/auto_topup_probe.go (*AutoTopUpChargeProbe).TriggerAutoTopUp PayInvoiceWithMethod": "a probe used by tests to detect whether a path reached the charge; it lives outside _test.go so other packages can use it",
 }

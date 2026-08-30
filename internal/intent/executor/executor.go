@@ -52,6 +52,15 @@ type Collector interface {
 // stop being the total a rail sees.
 type Debit struct {
 	IntentDigest string
+	// Payer is the subject sealed into the intent, NOT a provider
+	// customer id. An adapter resolves it to its own identity.
+	//
+	// The distinction matters: if this carried a provider customer id,
+	// whoever built the request could point a sealed intent at somebody
+	// else's card. The amount would still be the sealed one, and it
+	// would come out of the wrong account. Carrying the payer from the
+	// document keeps who-pays derived rather than told.
+	Payer        intent.Subject
 	AmountMicros int64
 	Currency     string
 	// IdempotencyKey is derived from the intent digest, so a retry of
@@ -219,6 +228,7 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 
 	result, collectErr := e.collector.Collect(ctx, Debit{
 		IntentDigest:   digest,
+		Payer:          sealed.Payer(),
 		AmountMicros:   sealed.TotalMicros(),
 		Currency:       sealed.Currency(),
 		IdempotencyKey: "intent-" + digest,

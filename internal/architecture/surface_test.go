@@ -90,11 +90,7 @@ func TestCollectionSurfaceIsSmallAndNamed(t *testing.T) {
 		if s.Effect != EffectCollect {
 			continue
 		}
-		// The adapter's own wrapped SDK calls are not independent money
-		// paths, and the webhook test probe exists to detect charges
-		// rather than to make them.
-		if s.File == "internal/shared/stripe/client.go" ||
-			strings.Contains(s.File, "/webhooktest/") {
+		if !countsAsLegacy(s) {
 			continue
 		}
 		collectors = append(collectors, s.File+" "+s.Func+" "+s.Method)
@@ -151,7 +147,7 @@ func TestReportedLegacyMoneyPathCountIsTrue(t *testing.T) {
 		if s.Effect != EffectCollect {
 			continue
 		}
-		if s.File == "internal/shared/stripe/client.go" || strings.Contains(s.File, "/webhooktest/") {
+		if !countsAsLegacy(s) {
 			continue
 		}
 		actual++
@@ -162,4 +158,37 @@ func TestReportedLegacyMoneyPathCountIsTrue(t *testing.T) {
 			"The reported number must be the true one — it is what the intent-only claim rests on.",
 			capabilities.LegacyMoneyPaths, actual)
 	}
+}
+
+// countsAsLegacy decides whether a money-moving call site counts
+// against capabilities.LegacyMoneyPaths.
+//
+// Three kinds do not, and each exclusion has to be earned rather than
+// asserted:
+//
+//   - internal/shared/stripe/client.go wraps the SDK. Its calls are not
+//     independent money paths; every collecting caller routes through
+//     them, and those callers are counted.
+//   - the webhook test probe exists to DETECT a charge, not make one.
+//   - internal/provider/stripeadapter is the intent path — the
+//     replacement for the legacy collectors rather than another of
+//     them. That exclusion rests on the adapter being reachable only
+//     through internal/intent/executor, which is predicate.Evaluate's
+//     single caller. TestExecutionPredicateHasAtMostOneCaller enforces
+//     that independently, so if a second route to the predicate
+//     appears, this exclusion stops being true and that test says so.
+//
+// The last one is the one to be suspicious of: an exclusion that grew a
+// new entry every time a money path was added would turn this count
+// into a number that only ever goes down because of bookkeeping.
+func countsAsLegacy(s Site) bool {
+	switch {
+	case s.File == "internal/shared/stripe/client.go":
+		return false
+	case strings.Contains(s.File, "/webhooktest/"):
+		return false
+	case strings.HasPrefix(s.File, "internal/provider/"):
+		return false
+	}
+	return true
 }
