@@ -169,3 +169,47 @@ state by `scripts/legacy-drop-preconditions.sql`.
 
 **So the critical path to "drop the legacy things" runs through production
 access, not through more legs.** That is what the read-only ops Lambda is for.
+
+---
+
+## A related gap the placeholder finding uncovered: `Seal` forces a tax claim
+
+`Seal` refuses an unresolved tax determination outright:
+
+```go
+if !draft.Tax.Resolved {
+    return ChargeIntent{}, ErrTaxUnresolved       // chargeintent.go:219
+}
+```
+
+So a proposer *cannot* seal an intent that says "tax has not been determined".
+The cycle legs therefore seal this (`domain_charges.go:403`):
+
+```go
+Tax: intent.TaxDetermination{
+    Resolved:     true,
+    Jurisdiction: "not-applicable",
+    RuleRevision: proposedTaxRuleRevision,
+}   // AmountMicros omitted, so zero
+```
+
+The code comment calls this "the honest option". It is the honest option
+*available*, but the digest ends up attesting that a determination **was made**
+and came to **zero** — for a Taiwan entity whose business-tax duties §12 item 10
+says are undecided.
+
+That is the shape INV-004 exists to forbid: an unknown input must quarantine,
+never default to zero. Here the type system forces the default, because
+`Resolved` is a two-state bool with no room for "not determined".
+
+**Not exploitable today** — as of `c5dc1fd` the predicate refuses to collect
+under an unpublished rule revision, so the zero never reaches a customer. But
+the sealed document still says something untrue, and superseding those intents
+later is more work than not creating them.
+
+**The fix is a design change, not a one-liner:** `TaxDetermination` needs a
+third state (determined / not-applicable / **not-determined**), which touches
+`Seal`, the canonical digest, the `charge_intents` schema and `ClauseTaxFinal`.
+Whether "not determined" may ever be sealed at all is itself a §12 question —
+it is the difference between an intent that cannot be collected and an intent
+that cannot be written down. **I have not changed this.** It needs your call.
