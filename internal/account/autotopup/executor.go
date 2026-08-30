@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
@@ -23,6 +24,29 @@ type Executor struct {
 	stripe   StripeClient
 	observer SettlementObserver
 	nowFn    func() time.Time
+}
+
+// NewStandardExecutor builds the executor the way every binary that has one
+// builds it: this package's store, the credit ledger as settler, and the
+// auto-top-up Stripe client.
+//
+// The same five lines were repeated in SIX binaries — account-api,
+// account-webhook, account-webhook-eventbridge, billing-cycle,
+// infra-egress-sync and infra-ssr-compute-sync. That is the shape of the
+// problem docs/DESIGN.md §6 leaves for this leg: unlike cycle.Service, which
+// has one constructor to hang a seam on, auto-top-up has six installation
+// sites, and a cutover would have to find all of them.
+//
+// Consolidating first means the intent seam gets ONE hang point rather than
+// six chances to miss one. SECURITY.md records that four ordinary read and
+// ingest paths can reach this executor, so a missed site is not a cosmetic
+// inconsistency — it is a path that still collects.
+func NewStandardExecutor(pool *pgxpool.Pool, stripeKey string) *Executor {
+	return NewExecutor(
+		NewStore(pool),
+		creditledger.NewStore(pool),
+		billingstripe.NewAutoTopUpClient(stripeKey),
+	)
 }
 
 func NewExecutor(store Store, settler Settler, stripe StripeClient) *Executor {

@@ -55,7 +55,6 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
-	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/legacyrestamp"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
@@ -349,11 +348,7 @@ func buildService() *cycle.Service {
 				rollout.ReadOnlySelectedAccess(controller),
 			))
 			coordinator := credit.NewCoordinator(counter, standingStore, projection, nil)
-			autoTopUpExecutor := autotopup.NewExecutor(
-				autotopup.NewStore(pool),
-				creditledger.NewStore(pool),
-				billingstripe.NewAutoTopUpClient(stripeKey),
-			).WithSettlementObserver(coordinator)
+			autoTopUpExecutor := autotopup.NewStandardExecutor(pool, stripeKey).WithSettlementObserver(coordinator)
 			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
 				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
 					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
