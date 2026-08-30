@@ -121,14 +121,52 @@ Tier 1 is dead weight: it has never priced anything, because no aggregate
 carries a version. That is consistent with no module version ever having been
 published.
 
-**Revised plan, and it is now mostly mechanical:**
+**🔴 Correction 3 — and this one reverses Correction 1's conclusion.**
 
-1. Add `Model` to `intent.PriceKey` and carry it in `FactsFor` (option D).
-2. Build the price book from tier 2 and tier 3, keyed exactly — no fallback.
-3. Keep tier 1 in the book for correctness; it contributes nothing today.
+Correction 1 said a tier-3 entry keyed `{meter, module, ""}` would match
+exactly, so no fallback was needed. The MATCHING claim is true. The
+CONSTRUCTION claim is false: `NewPriceBookRevision` rejects any key with an
+empty `ModuleVersion` —
 
-Step 1 touches the sealed digest's key space and still wants an owner's eye.
-Steps 2 and 3 are additive.
+    ErrPriceKeyIncomplete = "intent: price book key is missing a
+                             meter, module or version"
+
+Verified by probe against the real type, not by reading:
+
+    version-blind key -> err = intent: price book key is missing a
+                               meter, module or version: mod@/m
+
+So the key that would match **cannot be put in a price book at all**. That
+validation is deliberate — the type's own doc says a book "with holes needs a
+fallback, and a fallback is a second pricing implementation, the thing INV-002
+exists to forbid" — and it requires a version because reproducible pricing is
+the whole claim.
+
+**The real shape of the gap:** production's usage is entirely version-blind
+(`aggregates_with_module_version` = 0, because no module version has ever
+published), and the intent price book requires a version on every key.
+**The intent engine cannot rate production usage as designed** — not for want
+of a query, but because the price book's completeness invariant is
+incompatible with version-blind usage.
+
+Closing §11 therefore needs BOTH:
+
+1. **Relax the version requirement** so version-blind usage can be priced at
+   all — this weakens "complete and effective-dated", the property the book
+   exists to provide; and
+2. **Add `Model` to `PriceKey`** and carry it in `FactsFor` — mandatory,
+   because 6 of 12 aggregates resolved through tier 2.
+
+Both touch the invariant, so this is an owner decision after all. My instinct
+to ask was right; my stated REASON for asking was wrong twice before landing
+here. The safe option remains:
+
+- **C** — rate only version-stamped usage and quarantine the rest explicitly.
+  Today that reconciles **nothing**, which is honest and closes §11 over an
+  empty subset rather than by weakening a guarantee.
+
+Nothing here is safe to decide by inference. This file has now been wrong
+three times, each time because a claim was reasoned rather than measured.
 
 ## What the four new census counts decided
 
