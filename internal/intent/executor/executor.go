@@ -82,6 +82,24 @@ type CollectResult struct {
 	// and lets a second attempt charge a customer who was already
 	// charged. It retains the claim and records nothing.
 	Ambiguous bool
+
+	// InProgress means the rail accepted the request and has not
+	// finished. Collection is under way and its result will arrive
+	// through a callback.
+	//
+	// Distinct from Ambiguous, and the distinction was found by running
+	// this against a real provider: Stripe's finalize returns before it
+	// collects, so an invoice is routinely `open` at the moment the
+	// call comes back. Reporting that as ambiguous is true but useless
+	// — it is the ORDINARY path, and a system whose ordinary path is
+	// "we do not know" cannot tell the ordinary case from the incident.
+	//
+	// Both retain the claim. Only Ambiguous means nobody knows whether
+	// money moved; InProgress means the rail knows and will say.
+	// docs/DESIGN.md §4 gives it the provider_in_progress state, whose
+	// rule is "retain claim and reservations; a next step needs a fresh
+	// full gate".
+	InProgress bool
 }
 
 // Environment is the state the predicate needs that this package cannot
@@ -149,6 +167,11 @@ type Outcome struct {
 	// whether money moved. The claim is retained and no outcome is
 	// recorded, so nothing else will attempt this intent.
 	Unresolved bool
+
+	// InProgress is true when the rail accepted the charge and has not
+	// finished. The claim is retained and the intent moves to
+	// provider_in_progress; a callback carries the result.
+	InProgress bool
 }
 
 // Errors from Execute.
@@ -235,6 +258,14 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 	})
 
 	switch {
+	case result.InProgress && collectErr == nil:
+		// The rail has it and will report. The claim is retained, no
+		// outcome is recorded, and the intent says out loud that a
+		// charge is in flight — which is what a reconciler needs to
+		// find it later.
+		_ = e.store.AdvanceState(ctx, digest, state, "provider_in_progress")
+		return Outcome{Permitted: true, InProgress: true, Reference: result.Reference}, nil
+
 	case collectErr != nil || result.Ambiguous:
 		// The claim is retained and no outcome is recorded. Releasing
 		// it would let a second attempt charge a customer who may

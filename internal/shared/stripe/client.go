@@ -77,6 +77,12 @@ const stripeHTTPTimeout = 80 * time.Second
 
 // newRealClient builds an isolated Stripe API client whose transport
 // behaviour is stated rather than inherited.
+// NewIntentClient returns the narrow surface the intent executor's
+// provider adapter needs.
+func NewIntentClient(secretKey string) IntentClient {
+	return newRealClient(secretKey)
+}
+
 func newRealClient(secretKey string) *realClient {
 	sc := &stripeclient.API{}
 	sc.Init(secretKey, newBackends())

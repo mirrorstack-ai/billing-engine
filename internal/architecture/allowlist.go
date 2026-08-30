@@ -96,9 +96,10 @@ var allowedProviderMutations = map[string]string{
 	// predicate.Evaluate's single caller — asserted by
 	// TestExecutionPredicateHasAtMostOneCaller. If a second caller ever
 	// appears, that test fails and this exclusion stops being earned.
-	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect CreateDraftInvoice": "INTENT: the inert draft for one sealed intent",
-	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect CreateInvoiceItem":  "INTENT: one line carrying the sealed total; there is nowhere for a second",
-	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect FinalizeInvoice":    "INTENT COLLECT: the one money-moving step of the intent path, reachable only through the executor, which reaches it only on a permitting verdict",
+	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect CreateDraftInvoice":                "INTENT: the inert draft for one sealed intent",
+	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect CreateInvoiceItem":                 "INTENT: one line carrying the sealed total; there is nowhere for a second",
+	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect FinalizeInvoiceWithoutAutoAdvance": "INTENT: finalizes WITHOUT handing the invoice to automatic collection, so the pay below stays the single money-moving step with an answer this code receives",
+	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect PayInvoiceWithMethod":              "INTENT COLLECT: the one money-moving step of the intent path. Keyed and against a named instrument, unlike the legacy unkeyed Invoices.Pay, so a retry after an ambiguous answer cannot be a second charge. Reachable only through the executor, which reaches it only on a permitting verdict",
 
 	// --- test support that is not a _test.go file ---
 	"internal/account/webhook/webhooktest/auto_topup_probe.go (*AutoTopUpChargeProbe).TriggerAutoTopUp PayInvoiceWithMethod": "a probe used by tests to detect whether a path reached the charge; it lives outside _test.go so other packages can use it",

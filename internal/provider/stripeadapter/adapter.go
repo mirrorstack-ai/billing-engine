@@ -31,12 +31,35 @@ import (
 // would come out of the wrong account. Resolving it here from the
 // intent's own payer keeps who-pays derived rather than told.
 type CustomerResolver interface {
-	StripeCustomerFor(ctx context.Context, payerKind, payerID string) (string, error)
+	// ResolvePayer returns the provider customer and the payment
+	// method to charge.
+	//
+	// The instrument is resolved here for the same reason the customer
+	// is: which card gets charged must be derived from the payer, not
+	// supplied alongside the amount. It is returned rather than left to
+	// the provider's own default so the pay step can be keyed — see
+	// Collect.
+	ResolvePayer(ctx context.Context, payerKind, payerID string) (customerID, paymentMethodID string, err error)
+}
+
+// InvoiceRail is the slice of the provider client this adapter needs.
+//
+// Declared here rather than reusing billingstripe.Client, because that
+// interface also carries customer administration and provider reads —
+// and an adapter holding those could do things the port it implements
+// cannot express. Naming exactly four methods is what makes "this
+// package can create an invoice and pay it, and nothing else" a fact a
+// reader can check.
+type InvoiceRail interface {
+	CreateDraftInvoice(ctx context.Context, custID, ref, idemKey string) (billingstripe.Invoice, error)
+	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period billingstripe.LinePeriod, idemKey string) (billingstripe.InvoiceItem, error)
+	FinalizeInvoiceWithoutAutoAdvance(ctx context.Context, invoiceID, idemKey string) (billingstripe.Invoice, error)
+	PayInvoiceWithMethod(ctx context.Context, invoiceID, paymentMethodID, idemKey string) (billingstripe.Invoice, error)
 }
 
 // Adapter collects a sealed intent through Stripe.
 type Adapter struct {
-	client   billingstripe.Client
+	client   InvoiceRail
 	resolver CustomerResolver
 	// Resolved per collection rather than cached: a payer whose
 	// provider identity changed between sealing and collecting should
@@ -45,7 +68,7 @@ type Adapter struct {
 }
 
 // New returns an Adapter.
-func New(client billingstripe.Client, resolver CustomerResolver) *Adapter {
+func New(client InvoiceRail, resolver CustomerResolver) *Adapter {
 	return &Adapter{
 		client:   client,
 		resolver: resolver,
@@ -74,11 +97,11 @@ var ErrNoCustomer = errors.New("stripeadapter: payer has no Stripe customer")
 // boundary means the sealed total stays in the engine's own unit right
 // up to the wire.
 func (a *Adapter) Collect(ctx context.Context, d executor.Debit) (executor.CollectResult, error) {
-	customerID, err := a.resolver.StripeCustomerFor(ctx, d.Payer.Kind, d.Payer.ID)
+	customerID, paymentMethodID, err := a.resolver.ResolvePayer(ctx, d.Payer.Kind, d.Payer.ID)
 	if err != nil {
 		return executor.CollectResult{}, fmt.Errorf("%w: %w", ErrNoCustomer, err)
 	}
-	if customerID == "" {
+	if customerID == "" || paymentMethodID == "" {
 		return executor.CollectResult{}, ErrNoCustomer
 	}
 
@@ -100,19 +123,48 @@ func (a *Adapter) Collect(ctx context.Context, d executor.Debit) (executor.Colle
 		return executor.CollectResult{}, fmt.Errorf("create line: %w", err)
 	}
 
-	finalized, err := a.client.FinalizeInvoice(ctx, invoice.ID, "fin-"+d.IdempotencyKey)
+	// Finalize WITHOUT auto-advance, then pay explicitly.
+	//
+	// Handing the invoice to Stripe's automatic collection would make
+	// the money-moving step something that happens later, on Stripe's
+	// schedule, with no answer to return. Measured: an auto-advancing
+	// test-mode invoice sat `open` indefinitely.
+	//
+	// It is also the wrong shape for an intent. docs/DESIGN.md §4 wants
+	// one permit and one request, with the permit spent by the send —
+	// which requires a send this code makes and an answer it receives.
+	// The engine's existing auto-top-up path reached the same
+	// conclusion (internal/account/autotopup/executor.go).
+	finalized, err := a.client.FinalizeInvoiceWithoutAutoAdvance(
+		ctx, invoice.ID, "fin-"+d.IdempotencyKey)
 	if err != nil {
-		// 🔴 This is the ambiguous case, and it is reported as such
-		// rather than as a failure.
-		//
-		// Finalize is the step that moves money. An error here means
-		// the request may have arrived and charged the customer, or may
-		// not have. The executor retains its claim on an ambiguous
-		// result and records no outcome, so the one thing that must not
-		// happen — a second attempt — cannot.
-		return executor.CollectResult{Ambiguous: true},
-			fmt.Errorf("finalize (outcome unknown): %w", err)
+		// Unambiguous: a finalized-but-unpaid invoice has collected
+		// nothing, and one that failed to finalize collected less.
+		return executor.CollectResult{}, fmt.Errorf("finalize: %w", err)
 	}
+	_ = finalized
+
+	// Named the payment method, and KEYED.
+	//
+	// The unkeyed Invoices.Pay would work, and internal/architecture
+	// flagged it: it is the one collecting call in this tree with no
+	// deterministic key, so a retry after an ambiguous answer is a
+	// second charge the provider cannot deduplicate. An intent's whole
+	// point is that retrying it is safe, so the intent path uses the
+	// keyed form and carries the instrument to do so.
+	paid, err := a.client.PayInvoiceWithMethod(
+		ctx, invoice.ID, paymentMethodID, "pay-"+d.IdempotencyKey)
+	if err != nil {
+		// 🔴 The ambiguous case, reported as such rather than as a
+		// failure. Pay is the step that moves money, so an error here
+		// means the request may have arrived and charged the customer,
+		// or may not have. The executor retains its claim on ambiguity
+		// and records no outcome, so the one thing that must not
+		// happen — a second attempt — cannot.
+		return executor.CollectResult{Ambiguous: true, Reference: invoice.ID},
+			fmt.Errorf("pay (outcome unknown): %w", err)
+	}
+	finalized = paid
 
 	// Stripe's own status is the evidence. A finalized invoice that is
 	// not paid has not collected, whatever the call returned.
@@ -120,9 +172,16 @@ func (a *Adapter) Collect(ctx context.Context, d executor.Debit) (executor.Colle
 	case "paid":
 		return executor.CollectResult{Succeeded: true, Reference: finalized.ID}, nil
 	case "open", "draft":
-		// Finalized but not settled: Stripe is still trying, or will
-		// report through a callback. Not a failure and not a success.
-		return executor.CollectResult{Ambiguous: true, Reference: finalized.ID}, nil
+		// Finalized and not yet settled. Stripe's finalize returns
+		// BEFORE it collects, so this is the ordinary path rather than
+		// an anomaly — measured against the sandbox, an invoice is
+		// routinely `open` at the moment the call comes back.
+		//
+		// Reported as in-progress rather than ambiguous. Both retain
+		// the claim, and the difference is what anyone reading the
+		// state later can conclude: in-progress means the rail knows
+		// and will say, ambiguous means nobody does.
+		return executor.CollectResult{InProgress: true, Reference: finalized.ID}, nil
 	default:
 		// void, uncollectible, or a status this adapter has not been
 		// taught. An unrecognised status is NOT read as success.

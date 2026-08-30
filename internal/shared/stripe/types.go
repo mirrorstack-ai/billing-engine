@@ -364,6 +364,24 @@ type ChargeCardRef struct {
 // Client because the API surface is independent: webhooks use a
 // distinct STRIPE_WEBHOOK_SECRET, and signature verification doesn't
 // need (or use) the main Stripe secret key.
+// IntentClient is the surface the intent path needs, and nothing else.
+//
+// Four methods: make an inert draft, pin one line to it, finalize it
+// without handing it to automatic collection, and pay it with a named
+// instrument under a deterministic key.
+//
+// It is a separate interface rather than a reuse of Client because
+// Client also carries customer administration and provider reads. An
+// adapter holding those could do things the port it implements cannot
+// express, and "this package can create an invoice and pay it, and
+// nothing else" stops being checkable by reading the type.
+type IntentClient interface {
+	CreateDraftInvoice(ctx context.Context, custID, ref, idemKey string) (Invoice, error)
+	CreateInvoiceItem(ctx context.Context, custID, invoiceID string, amountCents int64, currency, desc string, period LinePeriod, idemKey string) (InvoiceItem, error)
+	FinalizeInvoiceWithoutAutoAdvance(ctx context.Context, invoiceID, idemKey string) (Invoice, error)
+	PayInvoiceWithMethod(ctx context.Context, invoiceID, paymentMethodID, idemKey string) (Invoice, error)
+}
+
 type Verifier interface {
 	// Verify parses + signature-verifies a webhook request body.
 	// signature is the raw value of the Stripe-Signature header.

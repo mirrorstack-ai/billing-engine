@@ -18,9 +18,12 @@ type fixedResolver struct {
 	sawID    string
 }
 
-func (r *fixedResolver) StripeCustomerFor(_ context.Context, kind, id string) (string, error) {
+func (r *fixedResolver) ResolvePayer(_ context.Context, kind, id string) (string, string, error) {
 	r.sawKind, r.sawID = kind, id
-	return r.customer, r.err
+	if r.customer == "" {
+		return "", "", r.err
+	}
+	return r.customer, "pm_test", r.err
 }
 
 func debit() executor.Debit {
@@ -39,7 +42,7 @@ func debit() executor.Debit {
 // card.
 func TestTheAdapterResolvesTheSealedPayer(t *testing.T) {
 	recorder := stripetest.New()
-	recorder.Stubs["FinalizeInvoice"] = billingstripe.Invoice{ID: "in_1", Status: "paid"}
+	recorder.Stubs["PayInvoiceWithMethod"] = billingstripe.Invoice{ID: "in_1", Status: "paid"}
 	resolver := &fixedResolver{customer: "cus_1"}
 
 	if _, err := New(recorder, resolver).Collect(context.Background(), debit()); err != nil {
@@ -57,7 +60,7 @@ func TestTheAdapterResolvesTheSealedPayer(t *testing.T) {
 func TestOneIntentBecomesOneKeyedInvoice(t *testing.T) {
 	recorder := stripetest.New()
 	recorder.Stubs["CreateDraftInvoice"] = billingstripe.Invoice{ID: "in_1"}
-	recorder.Stubs["FinalizeInvoice"] = billingstripe.Invoice{ID: "in_1", Status: "paid"}
+	recorder.Stubs["PayInvoiceWithMethod"] = billingstripe.Invoice{ID: "in_1", Status: "paid"}
 
 	result, err := New(recorder, &fixedResolver{customer: "cus_1"}).
 		Collect(context.Background(), debit())
@@ -69,8 +72,9 @@ func TestOneIntentBecomesOneKeyedInvoice(t *testing.T) {
 	}
 
 	calls := recorder.Calls()
-	if len(calls) != 3 {
-		t.Fatalf("made %d provider calls, want exactly 3: %v", len(calls), calls)
+	if len(calls) != 4 {
+		t.Fatalf("made %d provider calls, want exactly 4 "+
+			"(draft, line, finalize, pay): %v", len(calls), calls)
 	}
 	recorder.RequireCollected(t, 1)
 	recorder.RequireEveryMutationKeyed(t)
@@ -87,23 +91,23 @@ func TestOneIntentBecomesOneKeyedInvoice(t *testing.T) {
 	}
 }
 
-// 🔴 Finalize is the step that moves money, so an error there means the
+// 🔴 Pay is the step that moves money, so an error there means the
 // customer may or may not have been charged. It must be reported as
 // ambiguous — the executor retains its claim on that, and a second
 // attempt cannot happen.
-func TestAFinalizeErrorIsAmbiguousNotFailed(t *testing.T) {
+func TestAPayErrorIsAmbiguousNotFailed(t *testing.T) {
 	recorder := stripetest.New()
 	recorder.Stubs["CreateDraftInvoice"] = billingstripe.Invoice{ID: "in_1"}
-	recorder.Errs["FinalizeInvoice"] = errors.New("gateway timeout")
+	recorder.Errs["PayInvoiceWithMethod"] = errors.New("gateway timeout")
 
 	result, err := New(recorder, &fixedResolver{customer: "cus_1"}).
 		Collect(context.Background(), debit())
 
 	if err == nil {
-		t.Fatal("a finalize timeout returned no error")
+		t.Fatal("a pay timeout returned no error")
 	}
 	if !result.Ambiguous {
-		t.Fatal("a finalize timeout was resolved one way or the other; " +
+		t.Fatal("a pay timeout was resolved one way or the other; " +
 			"the customer may already have been charged")
 	}
 	if result.Succeeded {
@@ -111,9 +115,9 @@ func TestAFinalizeErrorIsAmbiguousNotFailed(t *testing.T) {
 	}
 }
 
-// An error BEFORE finalize is unambiguous: nothing was collected,
-// because a draft that never finalized is inert.
-func TestAnErrorBeforeFinalizeIsNotAmbiguous(t *testing.T) {
+// An error BEFORE the pay is unambiguous: nothing was collected,
+// because a finalized-but-unpaid invoice has taken no money.
+func TestAnErrorBeforeThePayIsNotAmbiguous(t *testing.T) {
 	recorder := stripetest.New()
 	recorder.Errs["CreateDraftInvoice"] = errors.New("bad request")
 
@@ -124,8 +128,8 @@ func TestAnErrorBeforeFinalizeIsNotAmbiguous(t *testing.T) {
 		t.Fatal("a failed draft returned no error")
 	}
 	if result.Ambiguous {
-		t.Fatal("a failure before finalize was reported as ambiguous; " +
-			"an inert draft cannot have charged anyone")
+		t.Fatal("a failure before the pay was reported as ambiguous; " +
+			"an unpaid invoice cannot have charged anyone")
 	}
 	recorder.RequireNoCollection(t, "a failed draft creation")
 }
@@ -134,14 +138,20 @@ func TestAnErrorBeforeFinalizeIsNotAmbiguous(t *testing.T) {
 // read as success.
 func TestProviderStatusDecidesTheOutcome(t *testing.T) {
 	cases := map[string]struct {
-		succeeded bool
-		ambiguous bool
+		succeeded  bool
+		ambiguous  bool
+		inProgress bool
 	}{
-		"paid":          {succeeded: true},
-		"open":          {ambiguous: true},
-		"draft":         {ambiguous: true},
+		"paid":  {succeeded: true},
+		"open":  {inProgress: true},
+		"draft": {inProgress: true},
+		// Terminal and not collected. Not ambiguous: the rail said no.
 		"void":          {},
 		"uncollectible": {},
+		// An unrecognised status is never read as success, and never as
+		// in-progress either — claiming the rail will report on
+		// something it has not acknowledged would leave the intent
+		// waiting forever.
 		"":              {},
 		"something_new": {},
 	}
@@ -150,7 +160,7 @@ func TestProviderStatusDecidesTheOutcome(t *testing.T) {
 		t.Run(status, func(t *testing.T) {
 			recorder := stripetest.New()
 			recorder.Stubs["CreateDraftInvoice"] = billingstripe.Invoice{ID: "in_1"}
-			recorder.Stubs["FinalizeInvoice"] = billingstripe.Invoice{ID: "in_1", Status: status}
+			recorder.Stubs["PayInvoiceWithMethod"] = billingstripe.Invoice{ID: "in_1", Status: status}
 
 			result, err := New(recorder, &fixedResolver{customer: "cus_1"}).
 				Collect(context.Background(), debit())
@@ -162,6 +172,9 @@ func TestProviderStatusDecidesTheOutcome(t *testing.T) {
 			}
 			if result.Ambiguous != want.ambiguous {
 				t.Errorf("status %q ambiguous = %v, want %v", status, result.Ambiguous, want.ambiguous)
+			}
+			if result.InProgress != want.inProgress {
+				t.Errorf("status %q inProgress = %v, want %v", status, result.InProgress, want.inProgress)
 			}
 		})
 	}
