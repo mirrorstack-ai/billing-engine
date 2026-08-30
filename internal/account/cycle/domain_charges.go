@@ -382,11 +382,19 @@ func (s *Service) proposeDomainCharge(
 	coverageStart, coverageEnd time.Time,
 	at time.Time,
 ) (*DomainChargeResult, error) {
+	// Seal what a collection would actually take, not the raw derived
+	// micros — see collectableMicros. Sealing the unrounded figure would
+	// attest to an amount the customer was never charged.
+	sealMicros, err := collectableMicros(proratedMicros)
+	if err != nil {
+		return nil, billing.Internal("micros to collectable micros conversion failed", err)
+	}
+
 	sealed, err := s.proposer.Propose(ctx, proposer.Charge{
 		Payer:        intent.Subject{Kind: "user", ID: cand.AccountID.String()},
 		Kind:         "domain.custom",
 		Currency:     chargeCurrency,
-		AmountMicros: proratedMicros,
+		AmountMicros: sealMicros,
 		Description:  fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname),
 		SourceRef:    domainChargeRef(cand.ID),
 

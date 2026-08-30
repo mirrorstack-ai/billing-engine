@@ -89,3 +89,31 @@ func TestRecoveryStillCompletesInFlightLegacyChargesWithAProposerArmed(t *testin
 			"a cut-over leg recovering a marker with no provider invoice")
 	})
 }
+
+// The helper test in seal_rounding_test.go proves collectableMicros is
+// correct. It proves nothing about whether the seal sites CALL it — which is
+// the mistake the reviewers found repeatedly in this migration. This asserts
+// the property end-to-end, through the real leg.
+func TestASealedDomainChargeIsAlwaysWholeCents(t *testing.T) {
+	recorder := stripetest.New()
+	store := newFakeStore()
+	p := &capturingProposer{}
+	cand := seedDomain(t, store)
+
+	svc := cycle.NewService(store, recorder).WithIntentProposer(p)
+	res, err := svc.ChargeDomain(context.Background(), cand, time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, cycle.DomainChargeProposed, res.Status)
+	require.Len(t, p.charges, 1)
+
+	sealed := p.charges[0].AmountMicros
+
+	// The invariant: a sealed figure a card cannot be charged is a figure the
+	// customer's bundle would attest to and never see on their statement.
+	require.Zero(t, sealed%10_000,
+		"sealed %d micros is not a whole number of cents, so no collection can take exactly it", sealed)
+
+	// And it must equal what the leg reports it charged, not merely be round.
+	require.Equal(t, res.ChargedCents*10_000, sealed,
+		"the sealed amount and the leg's own reported cents disagree")
+}

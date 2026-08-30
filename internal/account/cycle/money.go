@@ -150,6 +150,31 @@ func centsFromMicros(micros int64) (int64, error) {
 // 1e-6 USD). The micros → cents conversion factor at the Stripe boundary.
 const microsPerCent = 10_000
 
+// collectableMicros is the micro value a provider collection would actually
+// take: the derived micros rounded to whole cents, expressed back in micros.
+//
+// It is NOT the same number as the derived micros, and the difference is the
+// whole reason this exists. A legacy collection charges
+// centsFromMicros(derived) cents, so an intent sealed with the raw derived
+// micros attests to a figure the customer was never charged — off by up to
+// half a cent per charge, in whichever direction the rounding went.
+//
+// That is a repricing, and it is invisible to the shadow reconciliation of
+// docs/DESIGN.md §11: shadow compares the new rater against billing history,
+// not the sealed intent against the legacy leg it replaced.
+//
+// Rounding here also makes the executor's own micros→cents step idempotent —
+// it re-rounds a figure that is already whole cents — so the customer's
+// bundle, the sealed total and the card charge are one number rather than
+// three that usually agree.
+func collectableMicros(micros int64) (int64, error) {
+	cents, err := centsFromMicros(micros)
+	if err != nil {
+		return 0, err
+	}
+	return cents * microsPerCent, nil
+}
+
 // roundRatHalfUp rounds a big.Rat to the nearest integer, halves up (toward +∞
 // on a .5 tie). Identical rounding to usage.roundRatHalfUp — money rounds at one
 // deterministic point so the rollup and the live summary agree to the micro.
