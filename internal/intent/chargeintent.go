@@ -9,22 +9,27 @@ import (
 
 // Line is one priced row of a charge intent.
 //
-// AmountMicros is derived from Quantity and UnitPriceMicros, never
-// supplied: NewLine computes it. INV-001 says the private caller cannot
-// make money authoritative, and a struct that accepts a total alongside
-// its own factors is a struct where the two can disagree — at which
-// point something has to decide which one is real, and whatever it
-// decides, the number is no longer derived.
+// It holds only factors. There is no amount field, because a struct
+// carrying a total alongside the quantity and price that produce it is
+// a struct where the two can disagree — and then something has to
+// decide which is real, and whatever it decides, the number is no
+// longer derived.
+//
+// An earlier version did store the amount, computed by NewLine. The
+// factors are exported, so Line{Quantity: 5, UnitPriceMicros: 100} was
+// a valid struct literal with an amount of zero: a silent undercharge,
+// which is the failure nobody reports. Computing on access removes the
+// possibility rather than normalising it away afterwards.
 type Line struct {
 	Meter           string
 	Module          string
 	ModuleVersion   string
 	Quantity        int64
 	UnitPriceMicros int64
-	amountMicros    int64
 }
 
-// NewLine derives the line amount from its factors.
+// NewLine is a convenience for reading call sites; a struct literal is
+// equally correct.
 func NewLine(meter, module, moduleVersion string, quantity, unitPriceMicros int64) Line {
 	return Line{
 		Meter:           meter,
@@ -32,12 +37,11 @@ func NewLine(meter, module, moduleVersion string, quantity, unitPriceMicros int6
 		ModuleVersion:   moduleVersion,
 		Quantity:        quantity,
 		UnitPriceMicros: unitPriceMicros,
-		amountMicros:    quantity * unitPriceMicros,
 	}
 }
 
-// AmountMicros is the derived line total.
-func (l Line) AmountMicros() int64 { return l.amountMicros }
+// AmountMicros is the line total, derived on every read.
+func (l Line) AmountMicros() int64 { return l.Quantity * l.UnitPriceMicros }
 
 // TaxDetermination is the frozen tax decision for an intent.
 //
@@ -193,32 +197,10 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		return ChargeIntent{}, ErrNoSourceFacts
 	}
 
-	// Every line's amount is recomputed here rather than taken from
-	// the draft.
-	//
-	// NewLine derives it, but Line's factors are exported, so a caller
-	// can write Line{Quantity: 5, UnitPriceMicros: 100} as a struct
-	// literal and get an amount of zero. That failure is silent and it
-	// undercharges, which is the kind nobody reports. Deriving it here
-	// makes the constructor a convenience rather than a requirement:
-	// there is no way to hand this function an amount it will believe.
-	//
-	// It is the same rule INV-001 applies to the caller, applied inside
-	// the package. A total nobody derived is an assertion, and it does
-	// not become trustworthy by originating in Go rather than on a
-	// wire.
-	lines := make([]Line, len(draft.Lines))
-	for i, line := range draft.Lines {
-		lines[i] = NewLine(
-			line.Meter, line.Module, line.ModuleVersion,
-			line.Quantity, line.UnitPriceMicros,
-		)
-	}
-
 	intent := ChargeIntent{
 		payer:             draft.Payer,
 		currency:          strings.ToUpper(strings.TrimSpace(draft.Currency)),
-		lines:             lines,
+		lines:             append([]Line(nil), draft.Lines...),
 		priceBookRevision: draft.PriceBookRevision,
 		tax:               draft.Tax,
 		authorizationID:   draft.AuthorizationID,
