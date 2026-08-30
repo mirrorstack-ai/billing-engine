@@ -113,3 +113,46 @@ SELECT
     count(*)                                                   AS total,
     'standing authorizations (expected 0)'                     AS detail
 FROM ms_billing.billing_authorizations;
+
+-- 8. WHICH PRICING TIER actually priced production's usage.
+--
+-- Added 2026-08-31 after the census found 38,326 usage_events and 15 invoices
+-- against an EMPTY metric_version_prices. That combination is only possible if
+-- the charges resolved through a tier the shadow rater does not read.
+--
+-- cycle.Store.MetricPriceMicros (store.go:102-120) resolves in THREE tiers:
+--   1. version-first — metric_version_prices, when module_version != ''
+--   2. per-model     — metric_model_prices, when model != ''
+--   3. catalog       — the metric_definitions row
+--
+-- shadow.Source.PriceBookFor reads tier 1 ONLY. So these four counts decide
+-- whether that is a gap the reconciliation can be built past, or a structural
+-- one: intent.PriceKey is {Meter, Module, ModuleVersion} and has NO Model
+-- dimension, so tier 2 cannot be expressed in the intent price book at all.
+
+SELECT
+    'metric_model_prices'                                      AS subject,
+    count(*)                                                   AS total,
+    'tier-2 per-(metric,model) prices — SEEDED by 018'         AS detail
+FROM ms_billing.metric_model_prices;
+
+SELECT
+    'aggregates_with_module_version'                           AS subject,
+    count(*)                                                   AS total,
+    'usage_aggregates that tier 1 could price'                 AS detail
+FROM ms_billing.usage_aggregates
+WHERE module_version <> '';
+
+SELECT
+    'aggregates_with_model'                                    AS subject,
+    count(*)                                                   AS total,
+    'usage_aggregates needing tier 2 (no PriceKey dimension)'  AS detail
+FROM ms_billing.usage_aggregates
+WHERE model <> '';
+
+SELECT
+    'aggregates_priced_nonzero'                                AS subject,
+    count(*)                                                   AS total,
+    'usage_aggregates that actually carry a price'             AS detail
+FROM ms_billing.usage_aggregates
+WHERE unit_price_micros > 0;
