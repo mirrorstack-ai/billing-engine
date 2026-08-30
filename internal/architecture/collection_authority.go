@@ -87,10 +87,32 @@ func ScanCollectionAuthorityGrants(repoRoot string, roots ...string) ([]Site, er
 // Three are events: money is owed or a balance has changed, and a
 // refill is the point of the wallet. One is a read, and it is the gap
 // docs/SECURITY.md §2 records.
-var collectionAuthorityGrants = map[string]string{
-	"internal/account/credit/coordinator.go (*Coordinator).EvaluateCreditUsage authorizeCollection": "EVENT: usage arriving is how spend reaches the wallet; refusing a refill here blocks a credits customer rather than protecting one",
-	"internal/account/credit/coordinator.go (*Coordinator).ObserveAccount authorizeCollection":      "EVENT: a settlement observed against the wallet can leave a balance needing a refill",
-	"internal/account/credit/coordinator.go (*Coordinator).ReconcileBoundary authorizeCollection":   "EVENT: the scheduled period boundary, which is the run that charges",
+// GrantKind separates a grant an event legitimately holds from one a
+// read holds, which is the distinction docs/SECURITY.md §2 is about.
+//
+// A typed field rather than a prefix on the reason string: the count
+// below decides whether a gap-register row can close, and reading it
+// out of free text means a typo silently closes one.
+type GrantKind string
 
-	"internal/account/credit/coordinator.go (*Coordinator).OutOfCredits authorizeCollection": "GAP: the read behind the platform's service-block gate. Removing it deadlocks — a blocked account serves nothing, records no usage, and usage is what drives the other refill path. The remedy is the intent executor of docs/DESIGN.md §11.",
+const (
+	// GrantEvent: money is owed or a balance changed, and a refill is
+	// the point of the wallet.
+	GrantEvent GrantKind = "event"
+	// GrantReadGap: a read path that can charge. docs/SECURITY.md §2:
+	// "A status read is not capability-safe when it can move money."
+	GrantReadGap GrantKind = "read-gap"
+)
+
+type grant struct {
+	Kind GrantKind
+	Why  string
+}
+
+var collectionAuthorityGrants = map[string]grant{
+	"internal/account/credit/coordinator.go (*Coordinator).EvaluateCreditUsage authorizeCollection": {GrantEvent, "usage arriving is how spend reaches the wallet; refusing a refill here blocks a credits customer rather than protecting one"},
+	"internal/account/credit/coordinator.go (*Coordinator).ObserveAccount authorizeCollection":      {GrantEvent, "a settlement observed against the wallet can leave a balance needing a refill"},
+	"internal/account/credit/coordinator.go (*Coordinator).ReconcileBoundary authorizeCollection":   {GrantEvent, "the scheduled period boundary, which is the run that charges"},
+
+	"internal/account/credit/coordinator.go (*Coordinator).OutOfCredits authorizeCollection": {GrantReadGap, "the read behind the platform's service-block gate. Removing it deadlocks — a blocked account serves nothing, records no usage, and usage is what drives the other refill path. The remedy is the intent executor of docs/DESIGN.md §11."},
 }

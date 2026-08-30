@@ -8,10 +8,16 @@ import (
 	"testing"
 )
 
-// mutatingStatement matches SQL that changes something. Anchored to the
-// start of a statement so that the words appearing in prose do not.
-var mutatingStatement = regexp.MustCompile(
-	`(?i)^\s*(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|COPY)\b`)
+// mutatingVerb matches SQL that changes something, anywhere in a
+// statement rather than only at the start of a line.
+//
+// Line-anchoring was the first attempt and it was too weak: a write
+// indented under a CTE, or continuing a previous line, would pass. This
+// runs over statements with comments already stripped, so the words
+// appearing in the file's own prose — unavoidable in a file about
+// deletions — do not match.
+var mutatingVerb = regexp.MustCompile(
+	`(?i)\b(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|DROP\s+\w|ALTER\s+\w|TRUNCATE|CREATE\s+\w|GRANT\s+\w|REVOKE\s+\w|COPY\s+\w|SELECT\s+.*\bINTO\b)`)
 
 // TestLegacyDropPreconditionsAreReadOnly keeps the production
 // precondition script incapable of changing what it measures.
@@ -39,17 +45,37 @@ func TestLegacyDropPreconditionsAreReadOnly(t *testing.T) {
 
 	var offending []string
 	var selects int
+	var statement strings.Builder
+
 	for i, line := range strings.Split(string(body), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "--") || strings.HasPrefix(trimmed, `\`) {
 			continue
 		}
+		// Strip a trailing comment so prose after real SQL cannot hide
+		// a verb from the check or add a false one.
+		if idx := strings.Index(trimmed, "--"); idx >= 0 {
+			trimmed = strings.TrimSpace(trimmed[:idx])
+			if trimmed == "" {
+				continue
+			}
+		}
 		if strings.HasPrefix(strings.ToUpper(trimmed), "SELECT") {
 			selects++
 		}
-		if mutatingStatement.MatchString(line) {
-			offending = append(offending, itoa(i+1)+": "+trimmed)
+		statement.WriteString(" ")
+		statement.WriteString(trimmed)
+
+		if strings.HasSuffix(trimmed, ";") {
+			if mutatingVerb.MatchString(statement.String()) {
+				offending = append(offending, itoa(i+1)+": "+strings.TrimSpace(statement.String()))
+			}
+			statement.Reset()
 		}
+	}
+	// A trailing statement with no semicolon is still a statement.
+	if rest := strings.TrimSpace(statement.String()); rest != "" && mutatingVerb.MatchString(rest) {
+		offending = append(offending, "unterminated: "+rest)
 	}
 
 	if len(offending) > 0 {

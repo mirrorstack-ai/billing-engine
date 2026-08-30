@@ -66,8 +66,8 @@ func TestEveryCollectionAuthorityGrantIsNamed(t *testing.T) {
 // before that row can close.
 func TestReadPathsThatCanChargeOnlyShrink(t *testing.T) {
 	var gaps []string
-	for key, why := range collectionAuthorityGrants {
-		if strings.HasPrefix(why, "GAP:") {
+	for key, g := range collectionAuthorityGrants {
+		if g.Kind == GrantReadGap {
 			gaps = append(gaps, key)
 		}
 	}
