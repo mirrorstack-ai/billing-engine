@@ -112,6 +112,24 @@ func scanRequestTypes(fset *token.FileSet, file *ast.File, rel string) []Request
 			return true
 		}
 		for _, field := range st.Fields.List {
+			// An embedded field has no Names, so a loop over Names
+			// skips it entirely — and an embedded struct is a way to
+			// put an amount on the wire without naming one here. The
+			// embedded type's own name is what the caller sees in JSON
+			// and is what gets checked.
+			if len(field.Names) == 0 {
+				embedded := exprString(field.Type)
+				if denotesMoney(embedded) || denotesAuthority(embedded) {
+					out = append(out, RequestField{
+						File:   rel,
+						Type:   ts.Name.Name,
+						Field:  embedded,
+						GoType: "embedded " + embedded,
+						Line:   fset.Position(field.Pos()).Line,
+					})
+				}
+				continue
+			}
 			for _, name := range field.Names {
 				if !name.IsExported() {
 					continue
