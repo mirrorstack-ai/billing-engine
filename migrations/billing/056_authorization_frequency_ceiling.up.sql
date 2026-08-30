@@ -114,3 +114,45 @@ COMMENT ON COLUMN ms_billing.notice_receipts.delivered_at IS
     'lead time is measured against it. NULL on rows written before migration '
     '056, which therefore cannot satisfy the wait -- the right answer, since '
     'nothing recorded when their clock started.';
+
+-- The source-capacity reservation §6 requires for collect_receivable:
+-- "a linked intent for the remaining amount only, under a new FundingPlan and
+-- a source-capacity reservation".
+--
+-- Without it, two receivables can each claim the whole remainder of one intent
+-- and both collect. The intent's own digest PRIMARY KEY does not stop that:
+-- they are DIFFERENT documents, each individually valid, and INV-008's
+-- one-settlement-per-intent guard sees two intents rather than one obligation
+-- claimed twice.
+--
+-- reserved_micros is the running total claimed against a source. The CHECK is
+-- cross-column, so the database itself refuses an over-reservation — a guard in
+-- Go alone would be one racing process away from useless.
+ALTER TABLE ms_billing.charge_intents
+    ADD COLUMN IF NOT EXISTS reserved_micros BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE ms_billing.charge_intents
+    DROP CONSTRAINT IF EXISTS charge_intents_reservation_within_total;
+
+ALTER TABLE ms_billing.charge_intents
+    ADD CONSTRAINT charge_intents_reservation_within_total
+        CHECK (reserved_micros >= 0 AND reserved_micros <= total_micros);
+
+-- One row per receivable, so a retry of the same receivable reserves once.
+-- Without this the reservation is not idempotent and a replayed proposal eats
+-- the remainder twice.
+CREATE TABLE IF NOT EXISTS ms_billing.intent_receivable_links (
+    receivable_digest TEXT PRIMARY KEY
+        REFERENCES ms_billing.charge_intents(digest),
+    source_digest     TEXT NOT NULL
+        REFERENCES ms_billing.charge_intents(digest),
+    reserved_micros   BIGINT NOT NULL CHECK (reserved_micros > 0),
+    reserved_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- A receivable collecting itself is a loop, not a remainder.
+    CONSTRAINT intent_receivable_links_not_self
+        CHECK (receivable_digest <> source_digest)
+);
+
+CREATE INDEX IF NOT EXISTS intent_receivable_links_source
+    ON ms_billing.intent_receivable_links (source_digest);

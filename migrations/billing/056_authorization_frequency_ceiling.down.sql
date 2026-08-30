@@ -28,3 +28,11 @@ ALTER TABLE ms_billing.billing_authorizations
 
 ALTER TABLE ms_billing.notice_receipts
     DROP COLUMN IF EXISTS delivered_at;
+
+DROP TABLE IF EXISTS ms_billing.intent_receivable_links;
+
+ALTER TABLE ms_billing.charge_intents
+    DROP CONSTRAINT IF EXISTS charge_intents_reservation_within_total;
+
+ALTER TABLE ms_billing.charge_intents
+    DROP COLUMN IF EXISTS reserved_micros;
