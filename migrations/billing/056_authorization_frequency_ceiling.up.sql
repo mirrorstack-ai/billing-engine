@@ -54,6 +54,21 @@ COMMENT ON COLUMN ms_billing.billing_authorizations.top_up_amount_micros IS
 -- Both halves or neither: a trigger with no amount rule permits any size once
 -- the balance falls, and a rule with no trigger permits that size at any time.
 -- Either alone is a different arrangement from the one the customer accepted.
+-- §6's "provider and mandate": WHICH rail, and WHICH reusable mandate on it,
+-- the customer accepted. An off-session standing authorization naming neither
+-- authorises a charge against whatever instrument is on file later — which
+-- survives the customer replacing their card, and is not what was accepted.
+ALTER TABLE ms_billing.billing_authorizations
+    ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS mandate_reference TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE ms_billing.billing_authorizations
+    DROP CONSTRAINT IF EXISTS billing_authorizations_instrument_is_complete;
+
+ALTER TABLE ms_billing.billing_authorizations
+    ADD CONSTRAINT billing_authorizations_instrument_is_complete
+        CHECK ((provider = '') = (mandate_reference = ''));
+
 ALTER TABLE ms_billing.billing_authorizations
     DROP CONSTRAINT IF EXISTS billing_authorizations_trigger_is_complete;
 

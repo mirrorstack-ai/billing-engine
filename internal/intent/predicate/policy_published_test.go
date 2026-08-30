@@ -57,7 +57,7 @@ func placeholderState(t *testing.T) SealedState {
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
-		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100,
+		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: placeholderTerms, PriceBook: placeholderPriceBook,
 		NoticePolicy:     placeholderNotice,
 		EffectiveFrom:    windowStart,
@@ -202,4 +202,49 @@ func TestRevisionPublishedBoundaries(t *testing.T) {
 			t.Errorf("RevisionPublished(%q) = %v, want %v — %s", tc.revision, got, tc.published, tc.why)
 		}
 	}
+}
+
+// ClauseInstrumentBinding was `return s.Unbuilt.InstrumentBinding` — a
+// caller-supplied bool, the same hollowness ClausePolicyPublished carried.
+//
+// The executor's half is genuinely the executor's: verifying the instrument
+// needs the rail, which the predicate does not have. But the other half is
+// readable right here — an authorization that never named a provider and
+// mandate has NO binding to verify, so a caller claiming it verified one is
+// claiming something about nothing.
+func TestInstrumentBindingNeedsAnAuthorizationThatNamedAnInstrument(t *testing.T) {
+	t.Run("the executor claims it verified, but nothing was bound", func(t *testing.T) {
+		state := permittedState(t)
+		unbound, err := intent.Authorize(intent.AuthorizationGrant{
+			ID: "auth-1", Scope: intent.ScopeStanding,
+			Subject:  intent.Subject{Kind: "org", ID: "org-1"},
+			Currency: "USD", Kinds: []intent.ChargeKind{kind},
+			PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000,
+			FrequencyCeiling: 100,
+			// Provider and MandateReference deliberately absent.
+			TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
+			NoticePolicy:     "email/v1",
+			EffectiveFrom:    windowStart,
+			ExpiresAt:        windowEnd.AddDate(1, 0, 0),
+			AcceptanceDigest: "accept-1",
+		})
+		if err != nil {
+			t.Fatalf("Authorize: %v", err)
+		}
+		state.Authorization = unbound
+		state.Unbuilt.InstrumentBinding = true // the executor says it verified
+
+		if Evaluate(state).Permitted {
+			t.Fatal("an authorization that never named an instrument was permitted to collect " +
+				"on an executor's word that it verified one")
+		}
+	})
+
+	t.Run("bound, and the executor has not verified", func(t *testing.T) {
+		state := permittedState(t)
+		state.Unbuilt.InstrumentBinding = false
+		if Evaluate(state).Permitted {
+			t.Fatal("collection was permitted without a verified instrument binding")
+		}
+	})
 }

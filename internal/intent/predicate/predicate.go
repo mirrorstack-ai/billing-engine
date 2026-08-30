@@ -217,7 +217,19 @@ func satisfied(clause Clause, s SealedState) bool {
 	case ClauseFirstStepMatchesPlan:
 		return s.Unbuilt.FirstStepMatchesPlan
 	case ClauseInstrumentBinding:
-		return s.Unbuilt.InstrumentBinding
+		// Two halves, and only one of them is the caller's to assert.
+		//
+		// Unbuilt.InstrumentBinding is the executor's claim that it
+		// VERIFIED the instrument against the rail — it needs the rail,
+		// so only the executor can answer it.
+		//
+		// The other half is readable here: an authorization that never
+		// named a provider and mandate has no binding to verify, so a
+		// caller claiming it verified one is claiming something about
+		// nothing. That is the same hollowness ClausePolicyPublished
+		// carried until 2026-08-30 — a clause named for a check, doing
+		// none.
+		return s.Unbuilt.InstrumentBinding && s.Authorization.InstrumentBound()
 	case ClauseEnclaveReady:
 		return s.Unbuilt.EnclaveReady
 	case ClauseAttemptFrozen:

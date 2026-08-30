@@ -303,3 +303,57 @@ func TestResolvedAttemptsDoNotBlock(t *testing.T) {
 		t.Fatalf("a fully resolved history was treated as in flight: %v", d.Refusals)
 	}
 }
+
+// §6's "provider and mandate": WHICH rail, and WHICH reusable mandate on it.
+// An off-session standing authorization naming neither authorises a charge
+// against whatever instrument happens to be on file later — which survives the
+// customer replacing their card, and is not what anybody accepted.
+func TestTheProviderAndMandateMustBeGivenTogether(t *testing.T) {
+	base := func() AuthorizationGrant {
+		return AuthorizationGrant{
+			ID: "auth-inst", Scope: ScopeStanding,
+			Subject:  Subject{Kind: "user", ID: "acct-1"},
+			Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
+			PerChargeCeiling: 50_000_000, PeriodCeiling: 200_000_000,
+			FrequencyCeiling: 10,
+			TermsRevision:    "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
+			EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+			AcceptanceDigest: "accept-1",
+		}
+	}
+
+	railOnly := base()
+	railOnly.Provider = "stripe"
+	if _, err := Authorize(railOnly); !errors.Is(err, ErrAuthInstrumentIncomplete) {
+		t.Fatalf("a rail with no mandate was accepted: %v", err)
+	}
+
+	mandateOnly := base()
+	mandateOnly.MandateReference = "pm_1"
+	if _, err := Authorize(mandateOnly); !errors.Is(err, ErrAuthInstrumentIncomplete) {
+		t.Fatalf("a mandate with no rail was accepted: %v", err)
+	}
+
+	bound := base()
+	bound.Provider, bound.MandateReference = "stripe", "pm_1"
+	a, err := Authorize(bound)
+	if err != nil {
+		t.Fatalf("a fully bound instrument was refused: %v", err)
+	}
+	if !a.InstrumentBound() {
+		t.Fatal("InstrumentBound() is false for an authorization naming both")
+	}
+
+	unbound := base()
+	u, err := Authorize(unbound)
+	if err != nil {
+		t.Fatalf("an authorization with no instrument was refused: %v", err)
+	}
+	if u.InstrumentBound() {
+		t.Fatal("InstrumentBound() is true for an authorization naming neither")
+	}
+	if got := a.Grant().Provider; got != "stripe" {
+		t.Fatalf("Grant().Provider = %q, want stripe — the binding does not survive a round trip", got)
+	}
+}

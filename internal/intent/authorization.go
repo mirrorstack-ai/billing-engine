@@ -74,6 +74,8 @@ type BillingAuthorization struct {
 	// trigger and the accepted top-up size.
 	triggerBelowMicros int64
 	topUpAmountMicros  int64
+	provider           string
+	mandateReference   string
 
 	// termsRevision and priceBookRevision pin what the customer agreed
 	// to. A price book moving under a standing authorization is a
@@ -126,33 +128,46 @@ type AuthorizationGrant struct {
 	// balance-triggered authorization" and is legal for every other kind.
 	TriggerBelowMicros int64
 	TopUpAmountMicros  int64
-	TermsRevision      string
-	PriceBook          string
-	NoticePolicy       string
-	EffectiveFrom      time.Time
-	ExpiresAt          time.Time
-	AcceptanceDigest   string
+
+	// Provider and MandateReference are §6's "provider and mandate"
+	// binding: WHICH rail, and WHICH reusable mandate on it, the customer
+	// accepted. An off-session standing authorization that names neither
+	// authorises a charge against whatever instrument happens to be on
+	// file later — which is not what anyone accepted, and survives the
+	// customer replacing their card.
+	//
+	// Given together or not at all; an authorization that names a rail
+	// without a mandate has not bound an instrument.
+	Provider         string
+	MandateReference string
+	TermsRevision    string
+	PriceBook        string
+	NoticePolicy     string
+	EffectiveFrom    time.Time
+	ExpiresAt        time.Time
+	AcceptanceDigest string
 }
 
 // Errors from Authorize.
 var (
-	ErrAuthIDMissing          = errors.New("intent: authorization has no id")
-	ErrAuthScopeUnknown       = errors.New("intent: authorization scope is neither one-time nor standing")
-	ErrAuthSubjectUnknown     = errors.New("intent: authorization subject is not a kind the engine knows")
-	ErrAuthCurrencyMissing    = errors.New("intent: authorization names no currency")
-	ErrAuthDigestMissing      = errors.New("intent: a one-time authorization must name the intent it permits")
-	ErrAuthKindsMissing       = errors.New("intent: a standing authorization must declare the charge kinds it permits")
-	ErrAuthCeilingMissing     = errors.New("intent: a standing authorization must declare a per-charge ceiling")
-	ErrAuthFrequencyMissing   = errors.New("intent: a standing authorization needs a frequency ceiling")
-	ErrAuthTriggerIncomplete  = errors.New("intent: a balance trigger and an amount rule must be given together")
-	ErrAuthRuleExceedsCeiling = errors.New("intent: the amount rule is above the per-charge ceiling, so no attempt could ever satisfy it")
-	ErrAuthCeilingNegative    = errors.New("intent: a ceiling is negative")
-	ErrAuthTermsMissing       = errors.New("intent: authorization pins no terms revision")
-	ErrAuthPriceBookMissing   = errors.New("intent: authorization pins no price book revision")
-	ErrAuthNoticeMissing      = errors.New("intent: authorization names no notice policy")
-	ErrAuthWindowMissing      = errors.New("intent: authorization has no effective window")
-	ErrAuthWindowInverted     = errors.New("intent: authorization expires before it takes effect")
-	ErrAuthAcceptanceMissing  = errors.New("intent: authorization references no acceptance receipt")
+	ErrAuthIDMissing            = errors.New("intent: authorization has no id")
+	ErrAuthScopeUnknown         = errors.New("intent: authorization scope is neither one-time nor standing")
+	ErrAuthSubjectUnknown       = errors.New("intent: authorization subject is not a kind the engine knows")
+	ErrAuthCurrencyMissing      = errors.New("intent: authorization names no currency")
+	ErrAuthDigestMissing        = errors.New("intent: a one-time authorization must name the intent it permits")
+	ErrAuthKindsMissing         = errors.New("intent: a standing authorization must declare the charge kinds it permits")
+	ErrAuthCeilingMissing       = errors.New("intent: a standing authorization must declare a per-charge ceiling")
+	ErrAuthFrequencyMissing     = errors.New("intent: a standing authorization needs a frequency ceiling")
+	ErrAuthTriggerIncomplete    = errors.New("intent: a balance trigger and an amount rule must be given together")
+	ErrAuthInstrumentIncomplete = errors.New("intent: a provider and a mandate reference must be given together")
+	ErrAuthRuleExceedsCeiling   = errors.New("intent: the amount rule is above the per-charge ceiling, so no attempt could ever satisfy it")
+	ErrAuthCeilingNegative      = errors.New("intent: a ceiling is negative")
+	ErrAuthTermsMissing         = errors.New("intent: authorization pins no terms revision")
+	ErrAuthPriceBookMissing     = errors.New("intent: authorization pins no price book revision")
+	ErrAuthNoticeMissing        = errors.New("intent: authorization names no notice policy")
+	ErrAuthWindowMissing        = errors.New("intent: authorization has no effective window")
+	ErrAuthWindowInverted       = errors.New("intent: authorization expires before it takes effect")
+	ErrAuthAcceptanceMissing    = errors.New("intent: authorization references no acceptance receipt")
 )
 
 // Authorize validates a grant and returns the immutable authorization.
@@ -187,6 +202,11 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 	// describes, and neither is one a customer could have accepted.
 	if (grant.TriggerBelowMicros > 0) != (grant.TopUpAmountMicros > 0) {
 		return BillingAuthorization{}, ErrAuthTriggerIncomplete
+	}
+	// A rail without a mandate has not bound an instrument, and a mandate
+	// without a rail does not say where it is valid.
+	if (strings.TrimSpace(grant.Provider) == "") != (strings.TrimSpace(grant.MandateReference) == "") {
+		return BillingAuthorization{}, ErrAuthInstrumentIncomplete
 	}
 	// An amount rule above the per-charge ceiling can never be satisfied:
 	// every attempt would refuse for being over the ceiling, so the
@@ -248,6 +268,8 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 		frequencyCeiling:       grant.FrequencyCeiling,
 		triggerBelowMicros:     grant.TriggerBelowMicros,
 		topUpAmountMicros:      grant.TopUpAmountMicros,
+		provider:               strings.TrimSpace(grant.Provider),
+		mandateReference:       strings.TrimSpace(grant.MandateReference),
 		termsRevision:          grant.TermsRevision,
 		priceBookRevision:      grant.PriceBook,
 		noticePolicy:           grant.NoticePolicy,
@@ -480,6 +502,20 @@ func (a BillingAuthorization) TermsRevision() string { return a.termsRevision }
 // RevokedAt is deliberately not part of the grant: revocation happens
 // after the fact, so it is stored beside the grant and reapplied by the
 // caller.
+// InstrumentBound reports whether this authorization names the rail and
+// mandate it was accepted against.
+//
+// It is what predicate.ClauseInstrumentBinding needs in order to be more
+// than a caller-supplied boolean: an executor cannot have VERIFIED a
+// binding for an authorization that never named one.
+func (a BillingAuthorization) InstrumentBound() bool {
+	return a.provider != "" && a.mandateReference != ""
+}
+
+// Provider and MandateReference are the accepted rail and mandate.
+func (a BillingAuthorization) Provider() string         { return a.provider }
+func (a BillingAuthorization) MandateReference() string { return a.mandateReference }
+
 func (a BillingAuthorization) Grant() AuthorizationGrant {
 	kinds := make([]ChargeKind, 0, len(a.kinds))
 	for kind := range a.kinds {
@@ -500,6 +536,8 @@ func (a BillingAuthorization) Grant() AuthorizationGrant {
 		FrequencyCeiling:   a.frequencyCeiling,
 		TriggerBelowMicros: a.triggerBelowMicros,
 		TopUpAmountMicros:  a.topUpAmountMicros,
+		Provider:           a.provider,
+		MandateReference:   a.mandateReference,
 		PeriodCeiling:      a.periodCeilingMicros,
 		TermsRevision:      a.termsRevision,
 		PriceBook:          a.priceBookRevision,
