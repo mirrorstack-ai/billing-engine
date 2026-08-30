@@ -73,7 +73,32 @@ check and **BEFORE `recoverOrCreateInvoice`**, gated on
 This is the boundary leg's expensive lesson (it sealed a second obligation
 over an invoice another process had collected) applied without repeating it.
 
-**🔴 What makes this bigger than the cycle legs.** An auto-top-up attempt is a
+**✅ STEP 1 IS DONE — measured 2026-08-30, and the answer is good.**
+
+Every `credit_ledger` status comparison in the codebase is POSITIVE:
+`= 'settled'` (wallet balance, source allocation, draw recovery, app bill),
+`= 'pending'` and `= 'failed'` (auto-top-up resume and retry). There is **no**
+`<>`, `!=` or `NOT IN` on ledger status anywhere — SQL, Go, or the migration's
+partial indexes. The one `status <>` in the neighbourhood is
+`run.status <> 'invoiced'` on **billing_runs**, a different table.
+
+So adding `'proposed'` to `credit_ledger` is **additive and safe**: no existing
+reader can accidentally include it, because every reader names the statuses it
+wants.
+
+That is the OPPOSITE of the boundary leg, where `status <> 'invoiced'` meant a
+new value silently joined the "in flight" set and produced the org-deletion
+deadlock a reviewer caught. The difference is entirely down to positive vs
+negative filtering — see [[filters_that_were_noops_become_load_bearing]].
+
+Two consequences:
+- The resume/retry paths (`status = 'pending'` / `= 'failed'`) will SKIP a
+  proposed row, which is exactly right: a proposed attempt must not be resumed
+  by the legacy rail.
+- The wallet balance (`= 'settled'`) ignores it, which is also right: a
+  proposed top-up has granted no credit.
+
+**What remains genuinely bigger than the cycle legs.** An auto-top-up attempt is a
 `credit_ledger` row, and `autotopup/store.go` goes through **sqlc**
 (`db.Queries`). So a `proposed` status is a change to the SHARED credit
 ledger's status vocabulary, not to a leg-private table — every path that reads
