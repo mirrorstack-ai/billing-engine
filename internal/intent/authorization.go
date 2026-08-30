@@ -202,19 +202,26 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 type Refusal string
 
 const (
-	RefusalNotAuthorized     Refusal = "not_authorized"
-	RefusalWrongIntent       Refusal = "wrong_intent"
-	RefusalWrongSubject      Refusal = "wrong_subject"
-	RefusalWrongCurrency     Refusal = "wrong_currency"
-	RefusalKindNotPermitted  Refusal = "kind_not_permitted"
-	RefusalOverPerCharge     Refusal = "over_per_charge_ceiling"
-	RefusalOverPeriod        Refusal = "over_period_ceiling"
-	RefusalTermsMoved        Refusal = "terms_revision_moved"
-	RefusalPriceBookMoved    Refusal = "price_book_moved"
-	RefusalNoticePolicyMoved Refusal = "notice_policy_moved"
-	RefusalNotYetEffective   Refusal = "not_yet_effective"
-	RefusalExpired           Refusal = "expired"
-	RefusalRevoked           Refusal = "revoked"
+	RefusalNotAuthorized Refusal = "not_authorized"
+	// RefusalDifferentAuthorization: the intent names a different
+	// authorization than the one being asked. Without this, any valid
+	// standing authorization for the payer would permit an intent
+	// sealed against another one, and the AuthorizationID a customer
+	// can read on their charge bundle would not be the permission that
+	// was actually consulted.
+	RefusalDifferentAuthorization Refusal = "different_authorization"
+	RefusalWrongIntent            Refusal = "wrong_intent"
+	RefusalWrongSubject           Refusal = "wrong_subject"
+	RefusalWrongCurrency          Refusal = "wrong_currency"
+	RefusalKindNotPermitted       Refusal = "kind_not_permitted"
+	RefusalOverPerCharge          Refusal = "over_per_charge_ceiling"
+	RefusalOverPeriod             Refusal = "over_period_ceiling"
+	RefusalTermsMoved             Refusal = "terms_revision_moved"
+	RefusalPriceBookMoved         Refusal = "price_book_moved"
+	RefusalNoticePolicyMoved      Refusal = "notice_policy_moved"
+	RefusalNotYetEffective        Refusal = "not_yet_effective"
+	RefusalExpired                Refusal = "expired"
+	RefusalRevoked                Refusal = "revoked"
 )
 
 // Decision is the result of asking whether an authorization covers an
@@ -245,6 +252,12 @@ func (a BillingAuthorization) Permits(
 
 	if a.id == "" || !intent.Sealed() {
 		return Decision{Refusals: []Refusal{RefusalNotAuthorized}}
+	}
+	// The intent seals the authorization it was rated under. Asking a
+	// different one whether it permits the charge answers a question
+	// nobody asked.
+	if intent.AuthorizationID() != a.id {
+		refusals = append(refusals, RefusalDifferentAuthorization)
 	}
 	if !a.revokedAt.IsZero() && !at.Before(a.revokedAt) {
 		refusals = append(refusals, RefusalRevoked)
@@ -296,9 +309,27 @@ func (a BillingAuthorization) Permits(
 }
 
 // Revoke returns a copy that stops permitting at the given instant.
+//
 // It returns a new value rather than mutating, so an authorization
 // already captured in a charge bundle stays as it was read.
+//
+// A zero instant revokes unconditionally rather than doing nothing.
+// The internal "not revoked" state is a zero time, so passing one
+// through would produce an authorization that looked revoked to the
+// caller and permitted every charge — and of the two ways to be wrong
+// about a revocation, one refuses charges that should have gone
+// through and the other keeps charging a customer who asked you to
+// stop. This picks the first.
 func (a BillingAuthorization) Revoke(at time.Time) BillingAuthorization {
+	if at.IsZero() {
+		a.revokedAt = a.effectiveFrom
+		if a.revokedAt.IsZero() {
+			// Nothing to anchor to: use an instant before any plausible
+			// evaluation so Permits refuses from the start.
+			a.revokedAt = time.Unix(0, 0).UTC()
+		}
+		return a
+	}
 	a.revokedAt = at.UTC()
 	return a
 }

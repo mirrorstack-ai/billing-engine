@@ -139,6 +139,33 @@ func TestEveryBoundRefuses(t *testing.T) {
 	}
 }
 
+// An intent seals the authorization it was rated under. Without this
+// check any valid standing authorization for the payer would permit an
+// intent sealed against a different one, and the AuthorizationID a
+// customer reads on their charge bundle would not be the permission
+// that was actually consulted.
+func TestAuthorizationRefusesAnIntentThatNamesAnotherOne(t *testing.T) {
+	auth, err := Authorize(standingGrant())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := validDraft()
+	d.AuthorizationID = "auth-somebody-elses"
+	elsewhere, err := Seal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decision := auth.Permits(elsewhere, kindWalletTopUp, now, 0)
+	if decision.Permitted {
+		t.Fatal("an authorization permitted an intent that names a different one")
+	}
+	if !hasRefusal(decision.Refusals, RefusalDifferentAuthorization) {
+		t.Errorf("refusals = %v, want %v", decision.Refusals, RefusalDifferentAuthorization)
+	}
+}
+
 // A customer asking why a charge was refused deserves every reason,
 // not the first one found: fixing one and being refused again for the
 // next is how a support conversation becomes five.
@@ -292,4 +319,32 @@ func hasRefusal(refusals []Refusal, want Refusal) bool {
 		}
 	}
 	return false
+}
+
+// Of the two ways to be wrong about a revocation, one refuses charges
+// that should have gone through and the other keeps charging a customer
+// who asked you to stop. A zero instant must produce the first.
+//
+// The trap is that "not revoked" is itself represented by a zero time,
+// so passing one through would return an authorization that looked
+// revoked to its caller and permitted everything.
+func TestRevokeWithAZeroInstantStillRevokes(t *testing.T) {
+	auth, err := Authorize(standingGrant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := sealedFixture(t)
+
+	revoked := auth.Revoke(time.Time{})
+
+	if decision := revoked.Permits(sealed, kindWalletTopUp, now, 0); decision.Permitted {
+		t.Fatal("Revoke with a zero instant silently did nothing")
+	}
+	if !hasRefusal(revoked.Permits(sealed, kindWalletTopUp, now, 0).Refusals, RefusalRevoked) {
+		t.Error("the refusal does not name revocation")
+	}
+	// Even at the very start of its own effective window.
+	if decision := revoked.Permits(sealed, kindWalletTopUp, authFrom, 0); decision.Permitted {
+		t.Fatal("a zero-instant revocation left a window in which charges were still permitted")
+	}
 }

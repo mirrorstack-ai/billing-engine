@@ -152,20 +152,21 @@ func TestZeroStateRefusesEverything(t *testing.T) {
 // that these gates are real.
 func TestEveryClauseCanRefuseAlone(t *testing.T) {
 	breakers := map[Clause]func(*SealedState){
-		ClauseIntentImmutable:     func(s *SealedState) { s.Intent = intent.ChargeIntent{} },
-		ClauseIntentStateEligible: func(s *SealedState) { s.State = StateProposed },
-		ClauseBuildIdentified:     func(s *SealedState) { s.BuildIdentified = false },
-		ClauseAuthorizationValid:  func(s *SealedState) { s.Authorization = intent.BillingAuthorization{} },
-		ClauseAuthorityEvidence:   func(s *SealedState) { s.Mode = "" },
-		ClauseNoticeDelivered:     func(s *SealedState) { s.Notice.TerminalStatus = "queued" },
-		ClauseNoticeWaitElapsed:   func(s *SealedState) { s.Notice.EligibilityNotBefore = evalNow.Add(time.Hour) },
-		ClauseWithinCeilings:      func(s *SealedState) { s.PriorSpendMicros = 5_000_000 },
-		ClauseFundingPlanBalances: func(s *SealedState) { s.Funding.ProviderRemainderMicros++ },
-		ClauseTaxFinal:            func(s *SealedState) { s.Intent = intent.ChargeIntent{} },
-		ClausePolicyPublished:     func(s *SealedState) { s.PolicyDigestsMatch = false },
-		ClauseTimeReadiness:       func(s *SealedState) { s.TimeReady = false },
-		ClauseNoPriorSettlement:   func(s *SealedState) { s.PriorSettlementExists = true },
-		ClauseClaimAvailable:      func(s *SealedState) { s.ClaimAvailable = false },
+		ClauseIntentImmutable:       func(s *SealedState) { s.Intent = intent.ChargeIntent{} },
+		ClauseIntentStateEligible:   func(s *SealedState) { s.State = StateProposed },
+		ClauseWithinExecutionWindow: func(s *SealedState) { s.Now = windowEnd.Add(time.Hour) },
+		ClauseBuildIdentified:       func(s *SealedState) { s.BuildIdentified = false },
+		ClauseAuthorizationValid:    func(s *SealedState) { s.Authorization = intent.BillingAuthorization{} },
+		ClauseAuthorityEvidence:     func(s *SealedState) { s.Mode = "" },
+		ClauseNoticeDelivered:       func(s *SealedState) { s.Notice.TerminalStatus = "queued" },
+		ClauseNoticeWaitElapsed:     func(s *SealedState) { s.Notice.EligibilityNotBefore = evalNow.Add(time.Hour) },
+		ClauseWithinCeilings:        func(s *SealedState) { s.PriorSpendMicros = 5_000_000 },
+		ClauseFundingPlanBalances:   func(s *SealedState) { s.Funding.ProviderRemainderMicros++ },
+		ClauseTaxFinal:              func(s *SealedState) { s.Intent = intent.ChargeIntent{} },
+		ClausePolicyPublished:       func(s *SealedState) { s.PolicyDigestsMatch = false },
+		ClauseTimeReadiness:         func(s *SealedState) { s.TimeReady = false },
+		ClauseNoPriorSettlement:     func(s *SealedState) { s.PriorSettlementExists = true },
+		ClauseClaimAvailable:        func(s *SealedState) { s.ClaimAvailable = false },
 
 		ClauseProofHeadCurrent:       func(s *SealedState) { s.Unbuilt.ProofHeadCurrent = false },
 		ClauseProofsApplied:          func(s *SealedState) { s.Unbuilt.ProofsApplied = false },
@@ -201,6 +202,51 @@ func TestEveryClauseCanRefuseAlone(t *testing.T) {
 				t.Errorf("breaking %s refused for %v instead", clause, verdict.Refused)
 			}
 		})
+	}
+}
+
+// The window is sealed into the intent, so it is part of what the
+// customer was shown. Nothing else in the conjunction compares time to
+// the document, so without this clause an eligible intent could be
+// settled arbitrarily long after the customer stopped expecting it.
+func TestExecutionWindowBinds(t *testing.T) {
+	cases := map[string]struct {
+		now         time.Time
+		wantRefused bool
+	}{
+		"before the window opens": {windowStart.Add(-time.Second), true},
+		"exactly at the open":     {windowStart, false},
+		"inside":                  {evalNow, false},
+		"exactly at the close":    {windowEnd, false},
+		"after the window closes": {windowEnd.Add(time.Second), true},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			state := permittedState(t)
+			state.Now = tc.now
+			// Keep the notice wait satisfied so this clause is the only
+			// thing the time change can break.
+			state.Notice.EligibilityNotBefore = windowStart.Add(-24 * time.Hour)
+
+			verdict := Evaluate(state)
+			if got := verdict.RefusedClause(ClauseWithinExecutionWindow); got != tc.wantRefused {
+				t.Fatalf("at %v the window clause refused = %v, want %v (refusals: %v)",
+					tc.now, got, tc.wantRefused, verdict.Refused)
+			}
+		})
+	}
+}
+
+// A zero evaluation instant must refuse rather than compare as "before
+// everything". A caller that forgot to set Now is a caller whose
+// verdict means nothing.
+func TestZeroNowRefusesTheWindow(t *testing.T) {
+	state := permittedState(t)
+	state.Now = time.Time{}
+
+	if verdict := Evaluate(state); !verdict.RefusedClause(ClauseWithinExecutionWindow) {
+		t.Fatal("an unset evaluation instant satisfied the execution window")
 	}
 }
 

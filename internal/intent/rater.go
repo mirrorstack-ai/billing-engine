@@ -95,14 +95,28 @@ func Rate(req RateInput) (ChargeIntent, error) {
 	}
 
 	deduped := make(map[string]UsageFact, len(req.Facts))
-	var invalid, unpriced []string
+	var invalid, conflicting, unpriced []string
 
 	for _, fact := range req.Facts {
 		if err := fact.Validate(); err != nil {
 			invalid = append(invalid, fact.IdempotencyKey+": "+err.Error())
 			continue
 		}
-		if _, seen := deduped[fact.IdempotencyKey]; seen {
+		if seen, ok := deduped[fact.IdempotencyKey]; ok {
+			// An identical re-delivery is one fact, which is what the
+			// key is for. Two DIFFERENT facts under one key are not a
+			// duplicate — they are a contradiction about what happened,
+			// and keeping whichever arrived first silently picks a bill.
+			//
+			// INV-004 names this case directly: "Missing or CONFLICTING
+			// usage provenance ... must quarantine the intent." Which
+			// of the two is true is not something this function can
+			// know, and a rater that guesses is a rater whose total
+			// depends on network ordering.
+			if seen != fact {
+				conflicting = append(conflicting,
+					fact.IdempotencyKey+": two different facts share this key")
+			}
 			continue
 		}
 		deduped[fact.IdempotencyKey] = fact
@@ -110,6 +124,10 @@ func Rate(req RateInput) (ChargeIntent, error) {
 	if len(invalid) > 0 {
 		sort.Strings(invalid)
 		return ChargeIntent{}, Quarantine{Reason: "usage provenance", Facts: invalid}
+	}
+	if len(conflicting) > 0 {
+		sort.Strings(conflicting)
+		return ChargeIntent{}, Quarantine{Reason: "conflicting usage provenance", Facts: conflicting}
 	}
 
 	// Ordering by idempotency key makes the resulting lines — and so
@@ -142,6 +160,16 @@ func Rate(req RateInput) (ChargeIntent, error) {
 			Module:        fact.Module,
 			ModuleVersion: fact.ModuleVersion,
 		}
+		// A revision cannot price usage that happened before it took
+		// effect. Reproducibility is the whole claim of a versioned
+		// price book, and a book applied outside its own effective
+		// window prices history under rules that did not exist yet.
+		if fact.OccurredAt.Before(req.PriceBook.EffectiveFrom()) {
+			unpriced = append(unpriced, key+" (usage predates price book "+
+				req.PriceBook.Revision()+")")
+			continue
+		}
+
 		unitPrice, priced := req.PriceBook.UnitPriceMicros(priceKey)
 		if !priced {
 			// Not an error and not a zero. The engine has no rule for

@@ -71,6 +71,18 @@ func satisfied(clause Clause, s SealedState) bool {
 	case ClauseIntentStateEligible:
 		return s.State == StateEligible
 
+	case ClauseWithinExecutionWindow:
+		// The window is sealed into the intent, so it is part of what
+		// the customer was shown. Enforcing it here is what stops an
+		// eligible intent from being settled arbitrarily later —
+		// nothing else in the conjunction looks at time relative to
+		// the document.
+		if !s.Intent.Sealed() || s.Now.IsZero() {
+			return false
+		}
+		notBefore, notAfter := s.Intent.ExecutionWindow()
+		return !s.Now.Before(notBefore) && !s.Now.After(notAfter)
+
 	case ClauseBuildIdentified:
 		// docs/VERIFICATION.md §2: an executor whose build identity
 		// reads "unknown" must refuse to execute.

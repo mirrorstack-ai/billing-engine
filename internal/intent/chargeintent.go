@@ -145,6 +145,7 @@ var (
 	ErrCurrencyMissing    = errors.New("intent: no currency")
 	ErrPriceBookMissing   = errors.New("intent: no price book revision")
 	ErrTaxUnresolved      = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
+	ErrTaxNegative        = errors.New("intent: tax is negative")
 	ErrAuthorizationUnset = errors.New("intent: no billing authorization referenced")
 	ErrNoticePolicyUnset  = errors.New("intent: no notice policy")
 	ErrWindowUnset        = errors.New("intent: no execution window")
@@ -152,6 +153,7 @@ var (
 	ErrPayerUnknown       = errors.New("intent: payer is not a subject kind the engine knows")
 	ErrNoSourceFacts      = errors.New("intent: no source facts; a total with no reported usage behind it is an assertion")
 	ErrNegativeLine       = errors.New("intent: a line has a negative quantity or price")
+	ErrAmountOverflow     = errors.New("intent: the amount does not fit in int64")
 )
 
 // Seal validates a draft and returns the immutable intent.
@@ -174,12 +176,29 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		if line.Quantity < 0 || line.UnitPriceMicros < 0 {
 			return ChargeIntent{}, fmt.Errorf("%w: line %d", ErrNegativeLine, i)
 		}
+		// Quantity x price is the one multiplication in this package,
+		// and int64 wraps silently. A wrapped product does not fail
+		// loudly — it turns an enormous charge into a small or negative
+		// one, and every later check then agrees with it because the
+		// number really is small. Refusing is the only outcome that
+		// keeps the total meaning what it says.
+		if _, ok := mulOK(line.Quantity, line.UnitPriceMicros); !ok {
+			return ChargeIntent{}, fmt.Errorf("%w: line %d, %d x %d",
+				ErrAmountOverflow, i, line.Quantity, line.UnitPriceMicros)
+		}
 	}
 	if strings.TrimSpace(draft.PriceBookRevision) == "" {
 		return ChargeIntent{}, ErrPriceBookMissing
 	}
 	if !draft.Tax.Resolved {
 		return ChargeIntent{}, ErrTaxUnresolved
+	}
+	// Tax adds to a charge; it does not fund one. A negative amount
+	// would pull the total below the subtotal the customer was shown,
+	// and the lines are already refused for being negative — leaving
+	// this open would be the same hole with one more step.
+	if draft.Tax.AmountMicros < 0 {
+		return ChargeIntent{}, fmt.Errorf("%w: %d", ErrTaxNegative, draft.Tax.AmountMicros)
 	}
 	if strings.TrimSpace(draft.AuthorizationID) == "" {
 		return ChargeIntent{}, ErrAuthorizationUnset
@@ -213,10 +232,21 @@ func Seal(draft Draft) (ChargeIntent, error) {
 	// The total is computed here and nowhere else. INV-002: one
 	// derivation powers preview and settlement, so there is one place
 	// this arithmetic happens and every consumer reads its result.
+	//
+	// The sums are checked for the same reason the products are. Each
+	// line can fit and their total not.
 	for _, line := range intent.lines {
-		intent.subtotalMicros += line.AmountMicros()
+		sum, ok := addOK(intent.subtotalMicros, line.AmountMicros())
+		if !ok {
+			return ChargeIntent{}, fmt.Errorf("%w: subtotal", ErrAmountOverflow)
+		}
+		intent.subtotalMicros = sum
 	}
-	intent.totalMicros = intent.subtotalMicros + intent.tax.AmountMicros
+	total, ok := addOK(intent.subtotalMicros, intent.tax.AmountMicros)
+	if !ok {
+		return ChargeIntent{}, fmt.Errorf("%w: total with tax", ErrAmountOverflow)
+	}
+	intent.totalMicros = total
 	intent.digest = intent.computeDigest()
 	return intent, nil
 }
@@ -326,3 +356,30 @@ func (c ChargeIntent) Supersedes() string { return c.supersedes }
 // zero value. A zero ChargeIntent has no digest, and nothing may be
 // executed against it.
 func (c ChargeIntent) Sealed() bool { return c.digest != "" }
+
+// mulOK multiplies and reports whether the result is exact.
+//
+// Written with a division check rather than by widening, because there
+// is no wider integer type here and money must not pass through a
+// float: a float64 loses exactness above 2^53, which is well inside the
+// range a micro-dollar amount can reach.
+func mulOK(a, b int64) (int64, bool) {
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	product := a * b
+	if product/b != a {
+		return 0, false
+	}
+	return product, true
+}
+
+// addOK adds and reports whether the result is exact. Overflow shows up
+// as a sum that moved the wrong way relative to the addend.
+func addOK(a, b int64) (int64, bool) {
+	sum := a + b
+	if (b > 0 && sum < a) || (b < 0 && sum > a) {
+		return 0, false
+	}
+	return sum, true
+}

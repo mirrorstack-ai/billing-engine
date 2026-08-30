@@ -282,3 +282,92 @@ func TestPriceBookDistinguishesUnpricedFromZero(t *testing.T) {
 		t.Error("an absent key reported itself as priced")
 	}
 }
+
+// An identical re-delivery is one fact — that is what the key is for.
+// Two DIFFERENT facts under one key are a contradiction about what
+// happened, and keeping whichever arrived first silently picks a bill
+// based on network ordering.
+func TestConflictingFactsUnderOneKeyQuarantine(t *testing.T) {
+	first := fact("f1", "quiz.render", 100)
+	conflicting := fact("f1", "quiz.render", 5_000)
+
+	_, err := Rate(rateRequest(t, first, conflicting))
+
+	var quarantine Quarantine
+	if !errors.As(err, &quarantine) {
+		t.Fatalf("Rate error = %v, want a Quarantine", err)
+	}
+	if quarantine.Reason != "conflicting usage provenance" {
+		t.Errorf("quarantine reason = %q, want %q", quarantine.Reason, "conflicting usage provenance")
+	}
+}
+
+// The quarantine must not fire on a genuine re-delivery, or every
+// retrying caller becomes unbillable.
+func TestIdenticalRedeliveryIsStillOneFact(t *testing.T) {
+	f := fact("f1", "quiz.render", 100)
+
+	sealed, err := Rate(rateRequest(t, f, f, f))
+	if err != nil {
+		t.Fatalf("three identical deliveries must rate: %v", err)
+	}
+	if got, want := sealed.SubtotalMicros(), int64(100*25); got != want {
+		t.Errorf("subtotal = %d, want %d", got, want)
+	}
+}
+
+// A conflict is only a conflict if something actually differs — the
+// comparison must cover every field, not just the quantity.
+func TestConflictDetectionCoversEveryField(t *testing.T) {
+	base := fact("f1", "quiz.render", 100)
+
+	for name, mutate := range map[string]func(*UsageFact){
+		"quantity":       func(f *UsageFact) { f.Quantity = 101 },
+		"meter":          func(f *UsageFact) { f.Meter = "quiz.grade" },
+		"module version": func(f *UsageFact) { f.ModuleVersion = "1.5.0" },
+		"subject":        func(f *UsageFact) { f.Subject = Subject{Kind: "org", ID: "org-2"} },
+		"occurred at":    func(f *UsageFact) { f.OccurredAt = f.OccurredAt.Add(time.Hour) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			other := base
+			mutate(&other)
+
+			_, err := Rate(rateRequest(t, base, other))
+
+			var quarantine Quarantine
+			if !errors.As(err, &quarantine) {
+				t.Fatalf("a differing %s under one key did not quarantine: %v", name, err)
+			}
+		})
+	}
+}
+
+// A revision cannot price usage that happened before it took effect.
+// Reproducibility is the whole claim of a versioned price book, and a
+// book applied outside its own window prices history under rules that
+// did not exist yet.
+func TestUsageBeforeThePriceBookTookEffectQuarantines(t *testing.T) {
+	early := fact("f1", "quiz.render", 100)
+	early.OccurredAt = time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC) // book is effective 2026-08-01
+
+	_, err := Rate(rateRequest(t, early))
+
+	var quarantine Quarantine
+	if !errors.As(err, &quarantine) {
+		t.Fatalf("Rate error = %v, want a Quarantine", err)
+	}
+	if quarantine.Reason != "price policy" {
+		t.Errorf("quarantine reason = %q, want %q", quarantine.Reason, "price policy")
+	}
+}
+
+// Usage exactly at the effective instant is inside the window: a
+// revision that took effect at midnight prices midnight.
+func TestUsageAtTheEffectiveInstantIsPriced(t *testing.T) {
+	atBoundary := fact("f1", "quiz.render", 100)
+	atBoundary.OccurredAt = time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	if _, err := Rate(rateRequest(t, atBoundary)); err != nil {
+		t.Fatalf("usage at the effective instant must price: %v", err)
+	}
+}

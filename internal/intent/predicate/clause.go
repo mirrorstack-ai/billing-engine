@@ -36,18 +36,23 @@ const (
 
 	ClauseIntentImmutable     Clause = "intent_immutable"
 	ClauseIntentStateEligible Clause = "intent_state_eligible"
-	ClauseAuthorizationValid  Clause = "authorization_valid"
-	ClauseAuthorityEvidence   Clause = "authority_evidence"
-	ClauseNoticeDelivered     Clause = "notice_terminally_delivered"
-	ClauseNoticeWaitElapsed   Clause = "notice_wait_elapsed"
-	ClauseWithinCeilings      Clause = "within_gross_ceilings"
-	ClauseFundingPlanBalances Clause = "funding_plan_balances"
-	ClauseTaxFinal            Clause = "tax_final_or_not_applicable"
-	ClausePolicyPublished     Clause = "policy_published_effective_and_digest_matching"
-	ClauseTimeReadiness       Clause = "time_readiness"
-	ClauseNoPriorSettlement   Clause = "no_prior_settlement_or_attempt"
-	ClauseClaimAvailable      Clause = "settlement_claim_available"
-	ClauseBuildIdentified     Clause = "build_identified"
+	// ClauseWithinExecutionWindow: the sealed intent carries a window,
+	// and it has to bind. An intent executed outside it is one settled
+	// long after the customer stopped expecting it — which is the
+	// reason docs/DESIGN.md gives for the window existing at all.
+	ClauseWithinExecutionWindow Clause = "within_execution_window"
+	ClauseAuthorizationValid    Clause = "authorization_valid"
+	ClauseAuthorityEvidence     Clause = "authority_evidence"
+	ClauseNoticeDelivered       Clause = "notice_terminally_delivered"
+	ClauseNoticeWaitElapsed     Clause = "notice_wait_elapsed"
+	ClauseWithinCeilings        Clause = "within_gross_ceilings"
+	ClauseFundingPlanBalances   Clause = "funding_plan_balances"
+	ClauseTaxFinal              Clause = "tax_final_or_not_applicable"
+	ClausePolicyPublished       Clause = "policy_published_effective_and_digest_matching"
+	ClauseTimeReadiness         Clause = "time_readiness"
+	ClauseNoPriorSettlement     Clause = "no_prior_settlement_or_attempt"
+	ClauseClaimAvailable        Clause = "settlement_claim_available"
+	ClauseBuildIdentified       Clause = "build_identified"
 
 	// --- clauses whose supporting records are unbuilt ---
 	//
@@ -90,6 +95,7 @@ var providerClauses = map[Clause]bool{
 var AllClauses = []Clause{
 	ClauseIntentImmutable,
 	ClauseIntentStateEligible,
+	ClauseWithinExecutionWindow,
 	ClauseBuildIdentified,
 	ClauseProofHeadCurrent,
 	ClauseProofsApplied,

@@ -2,6 +2,7 @@ package intent
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -215,6 +216,7 @@ func TestSealRefusesRatherThanDefaults(t *testing.T) {
 		{"no window end", func(d *Draft) { d.ExecuteNotAfter = time.Time{} }, ErrWindowUnset},
 		{"inverted window", func(d *Draft) { d.ExecuteNotAfter = windowStart.Add(-time.Second) }, ErrWindowInverted},
 		{"no source facts", func(d *Draft) { d.SourceFactKeys = nil }, ErrNoSourceFacts},
+		{"negative tax", func(d *Draft) { d.Tax.AmountMicros = -1 }, ErrTaxNegative},
 	}
 
 	for _, tc := range cases {
@@ -393,5 +395,87 @@ func TestZeroIntentIsNotSealed(t *testing.T) {
 	}
 	if zero.Digest() != "" {
 		t.Fatal("a zero ChargeIntent has a digest")
+	}
+}
+
+// int64 wraps silently, and a wrapped product does not fail loudly — it
+// turns an enormous charge into a small or negative one, and every
+// later check then agrees with it because the number really is small.
+func TestSealRefusesAmountsThatDoNotFit(t *testing.T) {
+	const maxInt64 = math.MaxInt64
+
+	cases := map[string]func(*Draft){
+		"one line's product overflows": func(d *Draft) {
+			d.Lines = []Line{NewLine("m", "mod", "1.0.0", maxInt64, 2)}
+		},
+		"two lines that each fit overflow together": func(d *Draft) {
+			d.Lines = []Line{
+				NewLine("a", "mod", "1.0.0", maxInt64/2, 1),
+				NewLine("b", "mod", "1.0.0", maxInt64/2, 1),
+				NewLine("c", "mod", "1.0.0", 10, 1),
+			}
+		},
+		"the subtotal fits but tax pushes it over": func(d *Draft) {
+			d.Lines = []Line{NewLine("m", "mod", "1.0.0", maxInt64-10, 1)}
+			d.Tax.AmountMicros = 100
+		},
+	}
+
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := validDraft()
+			mutate(&d)
+
+			sealed, err := Seal(d)
+			if !errors.Is(err, ErrAmountOverflow) {
+				t.Fatalf("Seal error = %v, want %v", err, ErrAmountOverflow)
+			}
+			if sealed.Sealed() {
+				t.Error("an overflowing draft still produced a sealed intent")
+			}
+		})
+	}
+}
+
+// The arithmetic helpers are the thing a wrong overflow check would get
+// wrong, so they are exercised at their boundaries directly.
+func TestOverflowHelpers(t *testing.T) {
+	const maxInt64 = math.MaxInt64
+	const minInt64 = math.MinInt64
+
+	mulCases := []struct {
+		a, b int64
+		ok   bool
+	}{
+		{0, maxInt64, true},
+		{maxInt64, 0, true},
+		{1, maxInt64, true},
+		{2, maxInt64 / 2, true},
+		{2, maxInt64, false},
+		{maxInt64, 2, false},
+		{-1, maxInt64, true},
+		{-1, minInt64, false},
+	}
+	for _, tc := range mulCases {
+		if _, ok := mulOK(tc.a, tc.b); ok != tc.ok {
+			t.Errorf("mulOK(%d, %d) ok = %v, want %v", tc.a, tc.b, ok, tc.ok)
+		}
+	}
+
+	addCases := []struct {
+		a, b int64
+		ok   bool
+	}{
+		{0, 0, true},
+		{maxInt64 - 1, 1, true},
+		{maxInt64, 1, false},
+		{minInt64 + 1, -1, true},
+		{minInt64, -1, false},
+		{maxInt64, -1, true},
+	}
+	for _, tc := range addCases {
+		if _, ok := addOK(tc.a, tc.b); ok != tc.ok {
+			t.Errorf("addOK(%d, %d) ok = %v, want %v", tc.a, tc.b, ok, tc.ok)
+		}
 	}
 }
