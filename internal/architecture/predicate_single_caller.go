@@ -60,6 +60,14 @@ func ScanPredicateCallers(repoRoot string, roots ...string) ([]Site, error) {
 			if !imported {
 				return nil
 			}
+			// A dot-import brings Evaluate into scope unqualified, and
+			// a function VALUE — pred.Evaluate passed as an argument or
+			// stored in a var — reaches the predicate without ever
+			// appearing as a call here. Both were invisible to a scan
+			// that only matched pkg.Evaluate(...), which is the unsafe
+			// direction for a guard whose whole job is to notice a
+			// second route.
+			dotImported := local == "."
 			for _, decl := range file.Decls {
 				fn, ok := decl.(*ast.FuncDecl)
 				if !ok || fn.Body == nil {
@@ -67,16 +75,27 @@ func ScanPredicateCallers(repoRoot string, roots ...string) ([]Site, error) {
 				}
 				name := funcName(fn)
 				ast.Inspect(fn.Body, func(n ast.Node) bool {
-					call, ok := n.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					sel, ok := call.Fun.(*ast.SelectorExpr)
-					if !ok || sel.Sel.Name != predicateEntry {
-						return true
-					}
-					pkg, ok := sel.X.(*ast.Ident)
-					if !ok || pkg.Name != local {
+					var pos token.Pos
+					switch e := n.(type) {
+					case *ast.SelectorExpr:
+						// pkg.Evaluate, whether called or taken as a
+						// value.
+						if e.Sel.Name != predicateEntry {
+							return true
+						}
+						pkg, ok := e.X.(*ast.Ident)
+						if !ok || pkg.Name != local {
+							return true
+						}
+						pos = e.Sel.Pos()
+					case *ast.Ident:
+						// Bare Evaluate, only meaningful under a
+						// dot-import.
+						if !dotImported || e.Name != predicateEntry {
+							return true
+						}
+						pos = e.Pos()
+					default:
 						return true
 					}
 					sites = append(sites, Site{
@@ -84,7 +103,7 @@ func ScanPredicateCallers(repoRoot string, roots ...string) ([]Site, error) {
 						Func:   name,
 						Method: predicateEntry,
 						Effect: EffectCollect,
-						Line:   fset.Position(sel.Sel.Pos()).Line,
+						Line:   fset.Position(pos).Line,
 					})
 					return true
 				})
