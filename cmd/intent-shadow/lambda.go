@@ -18,8 +18,9 @@ const defaultPeriods = 100
 
 // Request is what an operator invokes this function with.
 type Request struct {
-	// Action is "shadow" (reconcile the rater against billing history) or
-	// "preconditions" (ask the seven legacy-drop questions).
+	// Action is "shadow" (reconcile the rater against billing history),
+	// "preconditions" (ask the seven legacy-drop questions), or "census"
+	// (how much billing history exists at all).
 	Action string `json:"action"`
 	// Periods bounds the shadow reconciliation. Ignored by preconditions.
 	Periods int `json:"periods"`
@@ -47,6 +48,8 @@ type Response struct {
 	// either way — but they still travel in the result, so there is one
 	// rule rather than two.
 	Preconditions []Precondition `json:"preconditions,omitempty"`
+	// Census carries table totals — aggregates only, same rule again.
+	Census []CensusRow `json:"census,omitempty"`
 }
 
 // handler runs one action inside one read-only transaction.
@@ -107,8 +110,19 @@ func runAction(ctx context.Context, tx pgx.Tx, req Request) (Response, error) {
 			}
 		}
 
+	case "census":
+		rows, err := runCensus(ctx, tx)
+		if err != nil {
+			return res, err
+		}
+		res.Census = rows
+		// A census cannot fail a gate — it reports what is there. OK means
+		// the questions were answerable, not that the answers are good.
+		res.OK = true
+
 	default:
-		return res, fmt.Errorf("unknown action %q (want \"shadow\" or \"preconditions\")", req.Action)
+		return res, fmt.Errorf(
+			"unknown action %q (want \"shadow\", \"preconditions\" or \"census\")", req.Action)
 	}
 	return res, nil
 }
@@ -139,6 +153,16 @@ func logSummary(log *slog.Logger, res Response) {
 			"ok", res.OK,
 			"questions", len(res.Preconditions),
 			"blocked", blocked)
+	case res.Census != nil:
+		// How many questions were answered, NOT what they answered. A table
+		// total is not a customer row, but "how many accounts exist" is a
+		// business figure and CloudWatch has a wider audience than the
+		// invoke permission — so the detail travels in the result only, and
+		// there stays one rule rather than a judgement call per subject.
+		log.Info("billing census complete",
+			"action", res.Action,
+			"ok", res.OK,
+			"subjects", len(res.Census))
 	default:
 		log.Info("intent-shadow run complete", "action", res.Action, "ok", res.OK)
 	}
