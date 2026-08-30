@@ -53,6 +53,48 @@ which has one constructor.
 
 ---
 
+### Cutover design, derived 2026-08-30 — start here
+
+**Seam placement, settled.** The branch goes in `resume`
+(`autotopup/executor.go:~386`) immediately after the `current.Status != "pending"`
+check and **BEFORE `recoverOrCreateInvoice`**, gated on
+`attempt.StripeInvoiceID == ""`.
+
+- `recoverOrCreateInvoice` is what arms the provider. Past it an invoice
+  exists at Stripe, and the intent path holds no write port to finalize or
+  void one — so proposing beside it strands a live provider object for as
+  long as the account exists.
+- The attempt row is already a durable claim (`Trigger` creates it pending
+  before anything reaches a provider), so proposing there still happens
+  AFTER a claim and keeps the crash-recovery guard.
+- `StripeInvoiceID != ""` is the direct refutation of "nothing has been
+  collected for this attempt". The rail that started the charge finishes it.
+
+This is the boundary leg's expensive lesson (it sealed a second obligation
+over an invoice another process had collected) applied without repeating it.
+
+**🔴 What makes this bigger than the cycle legs.** An auto-top-up attempt is a
+`credit_ledger` row, and `autotopup/store.go` goes through **sqlc**
+(`db.Queries`). So a `proposed` status is a change to the SHARED credit
+ledger's status vocabulary, not to a leg-private table — every path that reads
+`credit_ledger.status` is in the blast radius, and the change needs sqlc
+regeneration ([[sqlc_stub_is_a_claim_not_a_schema]]: an invented column
+type-checks and 42703s live).
+
+**Do not start this at the end of a session.** Order:
+1. Establish which paths read `credit_ledger.status` and what a new value does
+   to each. This is the real work.
+2. Migration adding the status, with the CHECK widened.
+3. sqlc query + regeneration for the terminal marker.
+4. The seam, using the placement above.
+5. `microsToCentsRoundHalfUp` already exists in the package — use it, do not
+   add a second rounding helper.
+
+**Also settled:** the arming flag must be deliberate, like
+`BILLING_CYCLE_INTENT_CUTOVER`. A proposing auto-top-up collects nothing, which
+for THIS leg means wallets never refill and blocked accounts stay blocked — a
+harder consequence than the cycle legs' revenue stop.
+
 ## `collect_receivable` — needs a LINK primitive, not supersede
 
 §6: "one-time authorization against the sealed receipt, or a standing
