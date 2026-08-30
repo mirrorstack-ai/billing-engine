@@ -151,6 +151,22 @@ type ChargeIntent struct {
 	totalMicros    int64
 	digest         string
 
+	// collects is the digest of an intent this one collects the REMAINDER
+	// of, empty unless this is a receivable.
+	//
+	// It is deliberately NOT supersedes, and the distinction is the whole
+	// point. Superseding REPLACES a document: the original is no longer
+	// owed. A receivable LINKS to one that is still owed and collects
+	// what is left of it — both stay live, with a stated arithmetic
+	// relation between them. docs/DESIGN.md §6 names the kind
+	// (collect_receivable) and its funding: "a linked intent for the
+	// remaining amount only, under a new FundingPlan and a
+	// source-capacity reservation".
+	//
+	// Building this on supersedes would mark the original replaced while
+	// the customer still owes it.
+	collects string
+
 	// supersedes is the digest of the intent this one replaces, empty
 	// for an original. A correction is a new intent pointing at the old
 	// one, which is what makes the history of a charge readable.
@@ -159,22 +175,26 @@ type ChargeIntent struct {
 
 // Errors from Seal.
 var (
-	ErrNoLines            = errors.New("intent: a charge intent with no lines proposes nothing")
-	ErrCurrencyMissing    = errors.New("intent: no currency")
-	ErrPriceBookMissing   = errors.New("intent: no price book revision")
-	ErrTermsMissing       = errors.New("intent: no terms revision")
-	ErrKindMissing        = errors.New("intent: no charge kind")
-	ErrKindNotInCatalog   = errors.New("intent: charge kind is not in the closed catalog of docs/DESIGN.md §6")
-	ErrTaxUnresolved      = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
-	ErrTaxNegative        = errors.New("intent: tax is negative")
-	ErrAuthorizationUnset = errors.New("intent: no billing authorization referenced")
-	ErrNoticePolicyUnset  = errors.New("intent: no notice policy")
-	ErrWindowUnset        = errors.New("intent: no execution window")
-	ErrWindowInverted     = errors.New("intent: execution window ends before it begins")
-	ErrPayerUnknown       = errors.New("intent: payer is not a subject kind the engine knows")
-	ErrNoSourceFacts      = errors.New("intent: no source facts; a total with no reported usage behind it is an assertion")
-	ErrNegativeLine       = errors.New("intent: a line has a negative quantity or price")
-	ErrAmountOverflow     = errors.New("intent: the amount does not fit in int64")
+	ErrNoLines                 = errors.New("intent: a charge intent with no lines proposes nothing")
+	ErrCurrencyMissing         = errors.New("intent: no currency")
+	ErrPriceBookMissing        = errors.New("intent: no price book revision")
+	ErrTermsMissing            = errors.New("intent: no terms revision")
+	ErrKindMissing             = errors.New("intent: no charge kind")
+	ErrNotSealed               = errors.New("intent: the source intent is not sealed")
+	ErrReceivableExceedsSource = errors.New("intent: a receivable cannot exceed the intent it collects")
+	ErrReceivablePayerMoved    = errors.New("intent: a receivable must name the same payer as the intent it collects")
+	ErrReceivableCurrencyMoved = errors.New("intent: a receivable must name the same currency as the intent it collects")
+	ErrKindNotInCatalog        = errors.New("intent: charge kind is not in the closed catalog of docs/DESIGN.md §6")
+	ErrTaxUnresolved           = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
+	ErrTaxNegative             = errors.New("intent: tax is negative")
+	ErrAuthorizationUnset      = errors.New("intent: no billing authorization referenced")
+	ErrNoticePolicyUnset       = errors.New("intent: no notice policy")
+	ErrWindowUnset             = errors.New("intent: no execution window")
+	ErrWindowInverted          = errors.New("intent: execution window ends before it begins")
+	ErrPayerUnknown            = errors.New("intent: payer is not a subject kind the engine knows")
+	ErrNoSourceFacts           = errors.New("intent: no source facts; a total with no reported usage behind it is an assertion")
+	ErrNegativeLine            = errors.New("intent: a line has a negative quantity or price")
+	ErrAmountOverflow          = errors.New("intent: the amount does not fit in int64")
 )
 
 // Seal validates a draft and returns the immutable intent.
@@ -294,6 +314,48 @@ func Seal(draft Draft) (ChargeIntent, error) {
 	return intent, nil
 }
 
+// CollectRemainderOf seals a receivable for what is still owed on this
+// intent.
+//
+// docs/DESIGN.md §6 lists `collect_receivable` as its own intent kind,
+// funded by "a linked intent for the remaining amount only, under a new
+// FundingPlan and a source-capacity reservation".
+//
+// The remainder is passed in rather than derived here, because only the
+// caller knows what has been collected so far — but it is BOUNDED here,
+// because a receivable for more than the original owed is not a
+// remainder, it is a new charge wearing a link.
+//
+// The result is a distinct document naming what it collects. Both stay
+// live: the original is still owed until its remainder reaches zero,
+// which is what distinguishes this from Supersede.
+func (c ChargeIntent) CollectRemainderOf(draft Draft) (ChargeIntent, error) {
+	if !c.Sealed() {
+		return ChargeIntent{}, ErrNotSealed
+	}
+	if draft.Kind != KindCollectReceivable {
+		return ChargeIntent{}, fmt.Errorf("%w: a receivable must be sealed as %q, not %q",
+			ErrKindNotInCatalog, KindCollectReceivable, draft.Kind)
+	}
+	receivable, err := Seal(draft)
+	if err != nil {
+		return ChargeIntent{}, err
+	}
+	if receivable.totalMicros > c.totalMicros {
+		return ChargeIntent{}, fmt.Errorf("%w: receivable of %d exceeds the %d it collects",
+			ErrReceivableExceedsSource, receivable.totalMicros, c.totalMicros)
+	}
+	if receivable.payer != c.payer {
+		return ChargeIntent{}, ErrReceivablePayerMoved
+	}
+	if receivable.currency != c.currency {
+		return ChargeIntent{}, ErrReceivableCurrencyMoved
+	}
+	receivable.collects = c.digest
+	receivable.digest = receivable.computeDigest()
+	return receivable, nil
+}
+
 // Supersede seals a replacement for this intent.
 //
 // INV-003: a one-unit change creates a new intent, supersedes the old
@@ -348,6 +410,7 @@ func (c ChargeIntent) computeDigest() string {
 	e.int(c.subtotalMicros)
 	e.int(c.totalMicros)
 	e.string(c.supersedes)
+	e.string(c.collects)
 	return e.digest()
 }
 
@@ -402,6 +465,10 @@ func (c ChargeIntent) TotalMicros() int64 { return c.totalMicros }
 
 // Supersedes is the digest of the intent this one replaces, or empty.
 func (c ChargeIntent) Supersedes() string { return c.supersedes }
+
+// Collects is the digest of the intent whose remainder this one collects,
+// empty unless this is a receivable.
+func (c ChargeIntent) Collects() string { return c.collects }
 
 // Sealed reports whether this is a real sealed intent rather than a
 // zero value. A zero ChargeIntent has no digest, and nothing may be
