@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	stripego "github.com/stripe/stripe-go/v85"
@@ -38,10 +39,82 @@ func NewAutoTopUpClient(secretKey string) AutoTopUpClient {
 	return newRealClient(secretKey)
 }
 
+// maxNetworkRetries is zero deliberately.
+//
+// docs/SECURITY.md §2 records the gap this closes: "The current Stripe
+// client initializes stripe-go's default backend without overriding its
+// nonzero automatic network-retry setting. One apparent SDK mutation
+// may submit multiple HTTP writes after an ambiguous transport
+// failure."
+//
+// stripe-go defaults to DefaultMaxNetworkRetries = 2 (stripe.go:50), so
+// a single call to a method in this file could put three write requests
+// on the wire while the caller sees one return value. Several of this
+// client's mutations take no idempotency key at all — PayInvoice,
+// DeleteDraftInvoice, DetachPaymentMethod, SetDefaultPaymentMethod,
+// CreateCustomer, CreateCheckoutSession — so for those the provider has
+// nothing to deduplicate on but its own resource semantics.
+//
+// The tradeoff is real and taken knowingly: reads lose the SDK's
+// retries too. That is the safer half of the trade. A read that fails
+// is retried by its caller or by the next scheduled run, whereas a
+// write retried inside the SDK is invisible to every control here — it
+// happens below the layer that counts provider mutations, so neither
+// the inventory in internal/architecture nor the recorder in stripetest
+// can see the second request.
+//
+// The target in docs/SECURITY.md is narrower: retries zero on the
+// WRITERS specifically. Splitting read and write backends is the
+// provider-port work of docs/DESIGN.md §9; until then one setting
+// covers both, and this is the direction that fails safe.
+const maxNetworkRetries int64 = 0
+
+// stripeHTTPTimeout matches stripe-go's own default (stripe.go:1768) so
+// that stating the transport explicitly does not silently change how
+// long a call waits.
+const stripeHTTPTimeout = 80 * time.Second
+
+// newRealClient builds an isolated Stripe API client whose transport
+// behaviour is stated rather than inherited.
 func newRealClient(secretKey string) *realClient {
 	sc := &stripeclient.API{}
-	sc.Init(secretKey, nil)
+	sc.Init(secretKey, newBackends())
 	return &realClient{sc: sc}
+}
+
+// newBackends configures every stripe-go backend explicitly.
+//
+// The point is that the values become a decision. Passing nil — which
+// is what this file did — takes whatever the SDK's defaults happen to
+// be, and one of those defaults is what docs/SECURITY.md §2 had to
+// write a gap row about.
+func newBackends() *stripego.Backends {
+	config := &stripego.BackendConfig{
+		MaxNetworkRetries: stripego.Int64(maxNetworkRetries),
+		HTTPClient:        newHTTPClient(),
+	}
+	return &stripego.Backends{
+		API:     stripego.GetBackendWithConfig(stripego.APIBackend, config),
+		Uploads: stripego.GetBackendWithConfig(stripego.UploadsBackend, config),
+	}
+}
+
+// newHTTPClient refuses redirects.
+//
+// docs/SECURITY.md §2's target for a provider writer is "retries to
+// zero, disable redirects, and fence/count the actual outbound request
+// before reporting ready". A followed redirect re-sends the request
+// body to a host the code never named, which for a write means a
+// mutation dispatched somewhere nobody reviewed. Stripe's API does not
+// redirect, so refusing one costs nothing and removes the case where it
+// starts to.
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: stripeHTTPTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 type realClient struct {
