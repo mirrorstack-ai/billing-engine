@@ -193,10 +193,32 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		return ChargeIntent{}, ErrNoSourceFacts
 	}
 
+	// Every line's amount is recomputed here rather than taken from
+	// the draft.
+	//
+	// NewLine derives it, but Line's factors are exported, so a caller
+	// can write Line{Quantity: 5, UnitPriceMicros: 100} as a struct
+	// literal and get an amount of zero. That failure is silent and it
+	// undercharges, which is the kind nobody reports. Deriving it here
+	// makes the constructor a convenience rather than a requirement:
+	// there is no way to hand this function an amount it will believe.
+	//
+	// It is the same rule INV-001 applies to the caller, applied inside
+	// the package. A total nobody derived is an assertion, and it does
+	// not become trustworthy by originating in Go rather than on a
+	// wire.
+	lines := make([]Line, len(draft.Lines))
+	for i, line := range draft.Lines {
+		lines[i] = NewLine(
+			line.Meter, line.Module, line.ModuleVersion,
+			line.Quantity, line.UnitPriceMicros,
+		)
+	}
+
 	intent := ChargeIntent{
 		payer:             draft.Payer,
 		currency:          strings.ToUpper(strings.TrimSpace(draft.Currency)),
-		lines:             append([]Line(nil), draft.Lines...),
+		lines:             lines,
 		priceBookRevision: draft.PriceBookRevision,
 		tax:               draft.Tax,
 		authorizationID:   draft.AuthorizationID,

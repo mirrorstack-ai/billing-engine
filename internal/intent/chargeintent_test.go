@@ -308,18 +308,81 @@ func TestSupersedeCreatesALinkedNewDocument(t *testing.T) {
 	if original.Supersedes() != "" {
 		t.Error("the original was modified by superseding it")
 	}
-	// The link is attested: a replacement of a different original is a
-	// different document even when everything else matches.
-	other, err := Seal(validDraft())
+	// The link is attested, so a replacement pointing at a DIFFERENT
+	// original is a different document even when everything else about
+	// it matches.
+	unrelated := validDraft()
+	unrelated.SourceFactKeys = []string{"fact-9"}
+	otherOriginal, err := Seal(unrelated)
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherReplacement, err := other.Supersede(corrected)
+	if otherOriginal.Digest() == original.Digest() {
+		t.Fatal("fixture is wrong: the two originals are the same document")
+	}
+
+	otherReplacement, err := otherOriginal.Supersede(corrected)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if otherReplacement.Digest() != replacement.Digest() {
-		t.Log("replacements of identical originals agree, as expected")
+	if otherReplacement.Digest() == replacement.Digest() {
+		t.Error("two replacements with identical content but different originals share a digest; " +
+			"the supersede link is not part of what is attested")
+	}
+}
+
+// Line's factors are exported, so a caller can build one as a struct
+// literal and skip NewLine. Seal must still derive the amount: the
+// alternative is a silent zero, which undercharges, and undercharging
+// is the failure nobody reports.
+func TestSealDerivesLineAmountsEvenWithoutNewLine(t *testing.T) {
+	d := validDraft()
+	d.Lines = []Line{{
+		Meter: "quiz.render", Module: "quiz-core", ModuleVersion: "1.4.0",
+		Quantity: 5, UnitPriceMicros: 100,
+	}}
+
+	sealed, err := Seal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := sealed.Lines()[0].AmountMicros(), int64(500); got != want {
+		t.Errorf("line amount = %d, want %d", got, want)
+	}
+	if got, want := sealed.SubtotalMicros(), int64(500); got != want {
+		t.Errorf("subtotal = %d, want %d", got, want)
+	}
+
+	// And a struct literal must seal to the same document NewLine
+	// produces, or two callers building the same charge disagree.
+	viaConstructor := validDraft()
+	viaConstructor.Lines = []Line{NewLine("quiz.render", "quiz-core", "1.4.0", 5, 100)}
+	expected, err := Seal(viaConstructor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed.Digest() != expected.Digest() {
+		t.Error("a struct literal and NewLine produced different documents for the same charge")
+	}
+}
+
+// A caller cannot smuggle an amount in past the factors, because there
+// is nowhere to put one: the field is unexported and Seal recomputes.
+func TestSealIgnoresAnyAmountTheCallerManagedToSet(t *testing.T) {
+	tampered := NewLine("quiz.render", "quiz-core", "1.4.0", 5, 100)
+	tampered.Quantity = 1 // change a factor after construction
+
+	d := validDraft()
+	d.Lines = []Line{tampered}
+
+	sealed, err := Seal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := sealed.SubtotalMicros(), int64(100); got != want {
+		t.Errorf("subtotal = %d, want %d — the amount must follow the factors, "+
+			"not the value captured when the line was built", got, want)
 	}
 }
 
