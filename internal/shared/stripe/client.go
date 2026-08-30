@@ -49,11 +49,12 @@ func NewAutoTopUpClient(secretKey string) AutoTopUpClient {
 //
 // stripe-go defaults to DefaultMaxNetworkRetries = 2 (stripe.go:50), so
 // a single call to a method in this file could put three write requests
-// on the wire while the caller sees one return value. Several of this
+// on the wire while the caller sees one return value. Seven of this
 // client's mutations take no idempotency key at all — PayInvoice,
 // DeleteDraftInvoice, DetachPaymentMethod, SetDefaultPaymentMethod,
-// CreateCustomer, CreateCheckoutSession — so for those the provider has
-// nothing to deduplicate on but its own resource semantics.
+// CreateCustomer, UpdateCustomerEmail, CreateCheckoutSession — so for
+// those the provider has nothing to deduplicate on but its own resource
+// semantics.
 //
 // The tradeoff is real and taken knowingly: reads lose the SDK's
 // retries too. That is the safer half of the trade. A read that fails

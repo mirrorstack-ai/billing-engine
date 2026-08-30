@@ -126,36 +126,52 @@ func ScanProviderMutations(repoRoot string, roots ...string) ([]Site, error) {
 func scanFile(fset *token.FileSet, file *ast.File, rel string) []Site {
 	var sites []Site
 
+	// The whole file is walked, not each function body in turn.
+	//
+	// Walking bodies misses a call outside one — a package-level
+	// var holding a func literal, or a composite literal built at init
+	// time. Those are unusual Go, which is exactly why nobody would
+	// look there, and a missed site is a money path nobody reviewed.
+	// Attributing such a call to "<package-level>" keeps it in the
+	// inventory rather than out of it.
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		effect, ok := providerEffects[sel.Sel.Name]
+		if !ok {
+			return true
+		}
+		sites = append(sites, Site{
+			File:   rel,
+			Func:   enclosingFunc(file, sel.Sel.Pos()),
+			Method: sel.Sel.Name,
+			Effect: effect,
+			Line:   fset.Position(sel.Sel.Pos()).Line,
+		})
+		return true
+	})
+	return sites
+}
+
+// enclosingFunc names the top-level function a position falls inside,
+// or "<package-level>" when it falls outside every one.
+func enclosingFunc(file *ast.File, pos token.Pos) string {
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
 			continue
 		}
-		name := funcName(fn)
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			effect, ok := providerEffects[sel.Sel.Name]
-			if !ok {
-				return true
-			}
-			sites = append(sites, Site{
-				File:   rel,
-				Func:   name,
-				Method: sel.Sel.Name,
-				Effect: effect,
-				Line:   fset.Position(sel.Sel.Pos()).Line,
-			})
-			return true
-		})
+		if pos >= fn.Pos() && pos <= fn.End() {
+			return funcName(fn)
+		}
 	}
-	return sites
+	return "<package-level>"
 }
 
 func funcName(fn *ast.FuncDecl) string {

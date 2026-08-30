@@ -16,8 +16,10 @@ package architecture
 //     inventory cannot drift into describing code that is gone.
 //
 // The `collect` entries are the ones that can take money from a stored
-// payment method. There are ten of them in service code, and
-// docs/SECURITY.md §2 says of them that there is no single capability
+// payment method. There are eleven, which is the number
+// capabilities.LegacyMoneyPaths reports and which the test in this
+// package pins against an AST scan of the tree. docs/SECURITY.md §2
+// says of them that there is no single capability
 // choke point proving every payment consumed the same authorization and
 // notice gates. Until the intent executor exists, this map is the only
 // enumeration of that surface, which is why the reasons below say what

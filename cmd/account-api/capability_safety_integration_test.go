@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/budget"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/stripe/stripetest"
@@ -56,11 +58,35 @@ func TestReadRoutesMakeNoProviderMutation(t *testing.T) {
 	// wallet off those routes answer CREDIT_WALLET_DISABLED without
 	// ever reaching it — the test would pass by not running the code
 	// it exists to check.
+	// The credit gate is installed, not merely enabled.
+	//
+	// WithCreditWallet(true) alone leaves s.creditGate nil, and
+	// GetServiceStatus skips the whole gate block when it is
+	// (internal/account/billing/service.go:465). So an earlier version
+	// of this test enabled the wallet and still never ran the code
+	// docs/SECURITY.md §2's row is about — the third time on this
+	// branch that a capability assertion was made over a path that
+	// never executed.
+	//
+	// gate counts its calls so the test can prove the path ran rather
+	// than assume it.
+	usageSvc := usage.NewService(usage.NewStore(pool))
+	standingStore := billing.NewStore(pool)
+	coordinator := credit.NewCoordinator(nil, standingStore, usageSvc, nil).
+		WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
+			func(context.Context, uuid.UUID, int64) (credit.AutoTopUpTriggerResult, error) {
+				t.Error("a read route reached the auto-top-up trigger")
+				return credit.AutoTopUpTriggerResult{}, nil
+			},
+		))
+	gate := &countingGate{inner: coordinator}
+
 	d := &dispatcher{
-		svc: billing.NewService(billing.NewStore(pool), recorder, "https://return.invalid").
+		svc: billing.NewService(standingStore, recorder, "https://return.invalid").
 			WithCreditWallet(true).
-			WithCreditAccess(func(uuid.UUID) bool { return true }),
-		usageSvc:  usage.NewService(usage.NewStore(pool)),
+			WithCreditAccess(func(uuid.UUID) bool { return true }).
+			WithCreditCoordinator(gate, nil),
+		usageSvc:  usageSvc,
 		budgetSvc: budget.NewService(budget.NewStore(pool)),
 		cycleSvc:  cycle.NewService(cycle.NewStore(pool), recorder),
 	}
@@ -122,6 +148,9 @@ func TestReadRoutesMakeNoProviderMutation(t *testing.T) {
 	// let a route quietly start refusing without anyone noticing that
 	// its green had stopped meaning anything.
 	const minAnswered = 10
+	require.NotZero(t, gate.calls(),
+		"no read route consulted the credit gate, so this suite proves nothing about "+
+			"the path docs/SECURITY.md §2 records")
 	require.GreaterOrEqualf(t, answered, minAnswered,
 		"only %d of %d read routes answered 200; the rest refused before reaching the code "+
 			"this test exists to check, so their green means nothing", answered, len(reads))
@@ -208,6 +237,28 @@ func TestCapabilitiesMakesNoProviderMutation(t *testing.T) {
 	require.Contains(t, rec.Body.String(), `"legacy_money_paths"`,
 		"the route answered without the field the intent-only claim rests on")
 	recorder.RequireNoProviderMutation(t, "/v1/billing.Capabilities")
+}
+
+// countingGate records that the credit gate was actually consulted.
+// Without it the suite could pass because no route reached the gate at
+// all, which is precisely how the earlier version passed.
+type countingGate struct {
+	inner credit.Gate
+	mu    sync.Mutex
+	n     int
+}
+
+func (g *countingGate) OutOfCredits(ctx context.Context, accountID uuid.UUID) (bool, error) {
+	g.mu.Lock()
+	g.n++
+	g.mu.Unlock()
+	return g.inner.OutOfCredits(ctx, accountID)
+}
+
+func (g *countingGate) calls() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.n
 }
 
 func seedCapabilityAccount(t *testing.T, pool *pgxpool.Pool, ownerUserID uuid.UUID) uuid.UUID {
