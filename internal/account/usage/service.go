@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -90,6 +91,10 @@ func (s *Service) WithCreditEvaluator(e credit.UsageEvaluator) *Service {
 // A deduped retry returns Recorded=false with a nil error — the fact is
 // already stored; callers must treat false as success.
 func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*RecordUsageResponse, error) {
+	return s.recordUsage(ctx, req, false)
+}
+
+func (s *Service) recordUsage(ctx context.Context, req RecordUsageRequest, timingRetried bool) (*RecordUsageResponse, error) {
 	if req.EventID == "" {
 		return nil, billing.InvalidInput("event_id required")
 	}
@@ -118,6 +123,29 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
 	}
 
+	version, err := normalizedObservationVersion(req.Version)
+	if err != nil {
+		return nil, billing.InvalidInput(err.Error())
+	}
+	var metadata []byte
+	switch version {
+	case observationVersionLegacy:
+		if req.Subject != "" || len(req.Metadata) != 0 || !req.OccurredAt.IsZero() {
+			return nil, billing.InvalidInput("subject, metadata, and occurred_at require observation contract v=2")
+		}
+	case observationVersionV2:
+		if req.OccurredAt.IsZero() {
+			return nil, billing.InvalidInput("occurred_at required for observation contract v=2")
+		}
+		if err := validateSubject(req.Subject); err != nil {
+			return nil, billing.InvalidInput(err.Error())
+		}
+		metadata, err = canonicalMetadata(req.Metadata)
+		if err != nil {
+			return nil, billing.InvalidInput(err.Error())
+		}
+	}
+
 	// Resolve the DECLARED kind from the manifest-fed catalog. Metering is
 	// declaration-first (design §1): a metric must be declared (ms.Meter →
 	// manifest → SetMetricDefinitions) before any event is accepted, so an
@@ -132,10 +160,45 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 	if !found {
 		return nil, billing.InvalidInput("metric not declared (declare it via ms.Meter so the platform can resolve its kind and price)")
 	}
+	kind := def.Kind
+	event := UsageEvent{
+		ObservationVersion: version,
+		EventID:            req.EventID,
+		AppID:              req.AppID,
+		ModuleID:           req.ModuleID,
+		Metric:             req.Metric,
+		Kind:               kind,
+		AggregationKey:     def.AggregationKey,
+		Value:              req.Value,
+		OccurredAt:         req.OccurredAt.UTC(),
+		Subject:            req.Subject,
+		Metadata:           metadata,
+		OwnerUserID:        req.OwnerUserID,
+		OwnerOrgID:         req.OwnerOrgID,
+		ModuleVersion:      req.ModuleVersion,
+	}
+	event.PayloadFingerprint = observationFingerprint(event)
+	accepted, err := s.store.CheckUsageEventID(ctx, req.EventID, event.PayloadFingerprint)
+	if err != nil {
+		if errors.Is(err, ErrUsageEventConflict) {
+			return nil, billing.Conflict("event_id is already bound to a different canonical usage payload")
+		}
+		return nil, billing.Internal("usage event id lookup failed", err)
+	}
+	if accepted {
+		return &RecordUsageResponse{Recorded: false}, nil
+	}
 	if !def.Active {
 		return nil, billing.InvalidInput("metric is retired and no longer accepts events")
 	}
-	kind := def.Kind
+	if def.AggregationKey == AggregationKeySubject {
+		if version != observationVersionV2 {
+			return nil, billing.InvalidInput("catalog aggregation_key subject requires observation contract v=2")
+		}
+		if req.Subject == "" {
+			return nil, billing.InvalidInput("subject required for a subject-keyed peak metric")
+		}
+	}
 
 	// Resolve the owner's billing account. Nil owner (or no account yet)
 	// records a lazy event with NULL account_id — retained and backfilled
@@ -162,24 +225,115 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 		}
 	}
 
-	recordedAt := req.RecordedAt
+	now := s.nowFn().UTC()
+	recordedAt := req.RecordedAt.UTC()
 	if recordedAt.IsZero() {
-		recordedAt = s.nowFn().UTC()
+		recordedAt = now
 	}
 
-	recorded, err := s.store.InsertUsageEvent(ctx, UsageEvent{
-		EventID:       req.EventID,
-		AccountID:     accountID,
-		AppID:         req.AppID,
-		ModuleID:      req.ModuleID,
-		Metric:        req.Metric,
-		Kind:          kind,
-		Value:         req.Value,
-		RecordedAt:    recordedAt,
-		ModuleVersion: req.ModuleVersion,
-	})
+	// v2 policy and every downstream read must agree on the account's anchored
+	// billing window. For v1, preserve the old best-effort fallback when this
+	// lookup is needed only by budget/credit hooks; for v2 a wrong anchor could
+	// admit a closed observation into the wrong period, so lookup failure is loud.
+	anchorDay := billingperiod.DefaultAnchorDay
+	firstFundedStart := time.Time{}
+	accountActivatedAt := time.Time{}
+	accountActivated := false
+	if accountID != uuid.Nil && (version == observationVersionV2 || s.budget != nil || s.credit != nil) {
+		if version == observationVersionV2 {
+			accountActivatedAt, accountActivated, err = s.store.AccountActivation(ctx, accountID)
+			if err != nil {
+				return nil, billing.Internal("account activation lookup failed", err)
+			}
+			if accountActivated {
+				anchorDay = billingperiod.AnchorDay(accountActivatedAt)
+				firstFundedStart, _ = billingperiod.AnchoredPeriodWindow(accountActivatedAt, anchorDay)
+			}
+		} else {
+			d, anchorErr := s.store.AccountAnchorDay(ctx, accountID)
+			if anchorErr != nil {
+				slog.Error("anchor day lookup failed (budget windowed on calendar month)",
+					"app_id", req.AppID, "account_id", accountID, "error", anchorErr)
+			} else {
+				anchorDay = d
+			}
+		}
+	}
+
+	eventTime := recordedAt
+	occurredAt := time.Time{}
+	policy := OccurrencePolicyV1IngestTime
+	policyRejection := UsageRejectionReason("")
+	if version == observationVersionV2 {
+		occurredAt = req.OccurredAt.UTC()
+		eventTime = occurredAt
+		policy = OccurrencePolicyOnTime
+		if occurredAt.After(now.Add(5 * time.Minute)) {
+			policyRejection = UsageRejectionOccurredFuture
+		} else if occurredAt.Before(now.Add(-35 * 24 * time.Hour)) {
+			policyRejection = UsageRejectionOccurredTooOld
+		}
+		if policyRejection == "" && !firstFundedStart.IsZero() && occurredAt.Before(firstFundedStart) {
+			// The cycle never closes a pre-activation window. Clamp into the
+			// first funded period while preserving occurred_at as audit evidence.
+			eventTime = firstFundedStart
+			policy = OccurrencePolicyFirstFunded
+		} else {
+			currentStart, _ := billingperiod.AnchoredPeriodWindow(now, anchorDay)
+			if policyRejection == "" && occurredAt.Before(currentStart) {
+				policy = OccurrencePolicyLateOpen
+			}
+		}
+	}
+	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(eventTime, anchorDay)
+	if version == observationVersionV2 && accountID != uuid.Nil && policyRejection == "" {
+		// The standard cycle can still close the current and immediately prior
+		// window. Anything older is logically closed even if an outage/missed
+		// empty sweep left no billing_period row to record that fact.
+		earliestClosableStart, _ := billingperiod.AnchoredJustClosed(now, anchorDay)
+		if periodStart.Before(earliestClosableStart) {
+			policyRejection = UsageRejectionPeriodClosed
+		}
+	}
+
+	event.AccountID = accountID
+	event.AccountActivatedAt = accountActivatedAt
+	event.AccountActivated = accountActivated
+	event.RecordedAt = recordedAt
+	event.OccurredAt = occurredAt
+	event.BillableAt = eventTime
+	event.OccurrencePolicy = policy
+
+	var recorded bool
+	billableDelta := req.Value
+	if version == observationVersionV2 {
+		recorded, billableDelta, err = s.store.InsertUsageObservation(
+			ctx, event, periodStart, periodEnd, policyRejection,
+		)
+	} else {
+		recorded, err = s.store.InsertUsageEvent(ctx, event)
+		if !recorded {
+			billableDelta = 0
+		}
+	}
 	if err != nil {
-		return nil, billing.Internal("insert usage event failed", err)
+		switch {
+		case errors.Is(err, ErrUsageAccountTimingChanged):
+			if timingRetried {
+				return nil, billing.Internal("account activation changed repeatedly during usage admission", err)
+			}
+			return s.recordUsage(ctx, req, true)
+		case errors.Is(err, ErrUsageEventConflict):
+			return nil, billing.Conflict("event_id is already bound to a different canonical usage payload")
+		case errors.Is(err, ErrUsageOccurredFuture):
+			return nil, billing.InvalidInput("occurred_at is more than 5 minutes in the future")
+		case errors.Is(err, ErrUsageOccurredTooOld):
+			return nil, billing.InvalidInput("occurred_at is older than the 35-day observation retry window")
+		case errors.Is(err, ErrUsagePeriodClosed):
+			return nil, billing.Conflict("the observation billing period is closing or invoiced")
+		default:
+			return nil, billing.Internal("insert usage event failed", err)
+		}
 	}
 
 	// Per-app budget evaluation (design §5 / §10). Fire ONLY on a fresh
@@ -192,16 +346,7 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 	// sees. A lazy event (accountID == Nil) has no payer account to anchor on,
 	// so it falls back to the calendar month (DefaultAnchorDay).
 	if recorded && (s.budget != nil || s.credit != nil) {
-		anchorDay := billingperiod.DefaultAnchorDay
-		if accountID != uuid.Nil {
-			if d, err := s.store.AccountAnchorDay(ctx, accountID); err != nil {
-				slog.Error("anchor day lookup failed (budget windowed on calendar month)",
-					"app_id", req.AppID, "account_id", accountID, "error", err)
-			} else {
-				anchorDay = d
-			}
-		}
-		start, end := billingperiod.AnchoredPeriodWindow(recordedAt.UTC(), anchorDay)
+		start, end := periodStart, periodEnd
 		if s.budget != nil {
 			if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, start, end); err != nil {
 				slog.Error("budget evaluation failed (usage still recorded)",
@@ -209,7 +354,7 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 			}
 		}
 		if s.credit != nil && accountID != uuid.Nil {
-			delta, err := approximateUsageChargeMicros(req.Metric, req.Value, def)
+			delta, err := approximateUsageChargeMicros(req.Metric, billableDelta, def)
 			if err != nil {
 				slog.Error("credit estimate pricing failed (usage still recorded)",
 					"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
@@ -232,9 +377,11 @@ func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*Rec
 
 // approximateUsageChargeMicros prices one newly accepted event for the
 // disposable fast-path counter. The authoritative wallet debit still uses the
-// rolled/boundary bill. Count/sum events are naturally additive; peak and
-// time-weighted events intentionally use the same conservative per-event
-// approximation and are overwritten by live bill math at reconciliation.
+// rolled/boundary bill. For subject-keyed peak the store supplies only the
+// positive increase over that subject's previous in-period MAX, preventing the
+// disposable estimate from double-counting provider duplicates. Other peak and
+// time-weighted events retain the established conservative approximation and
+// are overwritten by authoritative live/rollup math at reconciliation.
 func approximateUsageChargeMicros(metric string, value float64, def MetricDefinition) (int64, error) {
 	if !def.Priced || def.UnitPriceMicros == 0 || value == 0 {
 		return 0, nil
@@ -529,6 +676,12 @@ func (s *Service) SetMetricDefinitions(ctx context.Context, req SetMetricDefinit
 		if !isValidKind(m.Kind) {
 			return nil, billing.InvalidInput("invalid metric kind: " + string(m.Kind))
 		}
+		if m.AggregationKey != "" && m.AggregationKey != AggregationKeySubject {
+			return nil, billing.InvalidInput("invalid aggregation_key: " + string(m.AggregationKey))
+		}
+		if m.AggregationKey == AggregationKeySubject && m.Kind != KindPeak {
+			return nil, billing.InvalidInput("aggregation_key subject is only valid for peak metrics")
+		}
 		if m.Priced && m.UnitPriceMicros < 0 {
 			return nil, billing.InvalidInput("unit_price_micros must be non-negative")
 		}
@@ -536,6 +689,7 @@ func (s *Service) SetMetricDefinitions(ctx context.Context, req SetMetricDefinit
 			ModuleID:        req.ModuleID,
 			Metric:          m.Metric,
 			Kind:            m.Kind,
+			AggregationKey:  m.AggregationKey,
 			Unit:            m.Unit,
 			UnitPriceMicros: m.UnitPriceMicros,
 			Priced:          m.Priced,

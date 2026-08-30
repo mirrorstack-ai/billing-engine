@@ -253,6 +253,12 @@ func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
 
 	// Mark invoiced → terminal. Now it disappears + reclaim refuses.
 	require.NoError(t, store.MarkBillingRun(ctx, run2, cycle.RunStatusInvoiced, "in_test_x", 123))
+	var periodStatus string
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT status::text FROM ms_billing.billing_periods
+		WHERE account_id=$1 AND period_start=$2 AND period_end=$3`, acct, start, end).Scan(&periodStatus))
+	require.Equal(t, "invoiced", periodStatus,
+		"billing-run and billing-period terminal states commit together")
 	unbilled, err = store.AccountsWithUnbilledUsage(ctx, start, end)
 	require.NoError(t, err)
 	require.NotContains(t, unbilled, acct, "invoiced run excludes the account")

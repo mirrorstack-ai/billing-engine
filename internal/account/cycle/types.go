@@ -44,6 +44,9 @@ import (
 // vocabulary as the ingest path without re-declaring the four constants.
 type Kind = usage.Kind
 
+// AggregationKey aliases the catalog-owned usage aggregation identity.
+type AggregationKey = usage.AggregationKey
+
 // Visibility aliases usage.Visibility (the developer margin-share class).
 type Visibility = usage.Visibility
 
@@ -87,8 +90,9 @@ type MetricAggregate struct {
 	// Purely reporting — it never affects price — but it is part of the
 	// usage_aggregates idempotency key so two versions on one metric are
 	// distinct billable rows, exactly like two models are distinct under 018.
-	ModuleVersion string
-	Kind          Kind
+	ModuleVersion  string
+	Kind           Kind
+	AggregationKey AggregationKey
 
 	// BillableQuantity is the per-kind aggregate (count/sum → SUM, peak → MAX,
 	// time_weighted → integral). Carried as the exact NUMERIC string so the

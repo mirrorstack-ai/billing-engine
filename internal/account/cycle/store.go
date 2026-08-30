@@ -16,6 +16,8 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	"github.com/mirrorstack-ai/billing-engine/internal/meteringlock"
 )
 
 // ErrInactiveModelPrice is returned by MetricPriceMicros when a usage row's
@@ -952,6 +954,7 @@ type RawAggregate struct {
 	ModuleID         uuid.UUID
 	Metric           string
 	Kind             Kind
+	AggregationKey   AggregationKey
 	Model            string
 	ModuleVersion    string
 	BillableQuantity string
@@ -986,40 +989,74 @@ func (s *pgxStore) OpenPeriodForAccount(ctx context.Context, accountID uuid.UUID
 	return uuid.Parse(row.ID)
 }
 
-// RawAggregates issues the three per-kind rollup SELECTs sequentially, NOT in a
-// single snapshot transaction. This is safe because rollup is single-writer per
-// account per period: PR #6's billing_runs UNIQUE(account, period) + the batch
-// cycle job guarantee no concurrent rollup races a usage_events INSERT between
-// the first and third query. Re-evaluate if rollup ever becomes concurrent.
+// RawAggregates takes the shared account-period admission lock, transitions the
+// period to closing, and reads every kind in one transaction. A v2 insertion
+// that committed before the lock is visible; one waiting behind it observes the
+// closing state and is rejected with durable audit evidence after commit.
 func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]RawAggregate, error) {
 	acct := pgtype.UUID{Bytes: accountID, Valid: true}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.q.WithTx(tx)
+	// First-card activation rewinds unrolled observations while holding this
+	// account row exclusively. Taking the matching shared lock before the period
+	// barrier prevents rollup from freezing a pre-activation window while that
+	// rewindow is in flight.
+	activation, err := qtx.LockUsageAccountActivation(ctx, accountID.String())
+	if err != nil {
+		return nil, err
+	}
+	includeV2 := v2RollupWindowMatchesActivation(activation, periodStart, periodEnd)
+	if _, err := tx.Exec(ctx, meteringlock.AdvisorySQL, meteringlock.PeriodKey(accountID, periodStart)); err != nil {
+		return nil, err
+	}
+	if err := qtx.CloseBillingPeriodForRollup(ctx, db.CloseBillingPeriodForRollupParams{
+		AccountID: accountID.String(), PeriodStart: periodStart, PeriodEnd: periodEnd,
+	}); err != nil {
+		return nil, err
+	}
 
-	sumRows, err := s.q.RollupSumKinds(ctx, db.RollupSumKindsParams{
-		AccountID: acct, RecordedAt: periodStart, RecordedAt_2: periodEnd,
+	sumRows, err := qtx.RollupSumKinds(ctx, db.RollupSumKindsParams{
+		AccountID:    acct,
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+		IncludeV2:    includeV2,
 	})
 	if err != nil {
 		return nil, err
 	}
-	peakRows, err := s.q.RollupPeakKind(ctx, db.RollupPeakKindParams{
-		AccountID: acct, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	peakRows, err := qtx.RollupPeakKind(ctx, db.RollupPeakKindParams{
+		AccountID: acct, PeriodStart: periodStart, PeriodEnd: periodEnd, IncludeV2: includeV2,
 	})
 	if err != nil {
 		return nil, err
 	}
-	twRows, err := s.q.RollupTimeWeightedKind(ctx, db.RollupTimeWeightedKindParams{
-		AccountID: acct, RecordedAt: periodStart, RecordedAt_2: periodEnd,
+	keyedPeakRows, err := qtx.RollupKeyedPeakKind(ctx, db.RollupKeyedPeakKindParams{
+		AccountID: accountID.String(), PeriodStart: periodStart, PeriodEnd: periodEnd, IncludeV2: includeV2,
+	})
+	if err != nil {
+		return nil, err
+	}
+	twRows, err := qtx.RollupTimeWeightedKind(ctx, db.RollupTimeWeightedKindParams{
+		AccountID:    acct,
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+		IncludeV2:    includeV2,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	out := make([]RawAggregate, 0, len(sumRows)+len(peakRows)+len(twRows))
+	out := make([]RawAggregate, 0, len(sumRows)+len(peakRows)+len(keyedPeakRows)+len(twRows))
 	// appendRow's activeSeconds param is pgtype.Numeric{} (Valid=false) for the
 	// additive kinds (count/sum never carry a window); RawAggregate.ActiveSeconds
 	// renders "" in that case (NOT "0" — numericString's NULL rendering — because
 	// "no window data" and "a genuinely zero-length window" must stay
 	// distinguishable downstream in cycle/money.go's proration).
-	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, qty, activeSeconds pgtype.Numeric) error {
+	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, aggregationKey, model, moduleVersion string, qty, activeSeconds pgtype.Numeric) error {
 		app, err := uuid.Parse(appID)
 		if err != nil {
 			return err
@@ -1037,6 +1074,7 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 			ModuleID:         mod,
 			Metric:           metric,
 			Kind:             Kind(kind),
+			AggregationKey:   AggregationKey(aggregationKey),
 			Model:            model,         // "" for non-AI rows (COALESCE(model, ''))
 			ModuleVersion:    moduleVersion, // "" for version-less rows (COALESCE(module_version, ''))
 			BillableQuantity: numericString(qty),
@@ -1045,21 +1083,44 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 		return nil
 	}
 	for _, r := range sumRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, pgtype.Numeric{}); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.BillableQuantity, pgtype.Numeric{}); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range peakRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
+			return nil, err
+		}
+	}
+	for _, r := range keyedPeakRows {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey, r.Model, r.ModuleVersion, r.BillableQuantity, pgtype.Numeric{}); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range twRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
 			return nil, err
 		}
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// v2RollupWindowMatchesActivation admits v2 observations only after activation
+// and only into a window consistent with that immutable anchor. Card-less
+// calendar rollup continues to freeze legacy observations, but deliberately
+// leaves v2 rows pending so activation can rewindow them into the first funded
+// period. The window check also closes the work-list race where activation can
+// commit after the unactivated account list is read but before rollup begins.
+func v2RollupWindowMatchesActivation(activation pgtype.Timestamptz, periodStart, periodEnd time.Time) bool {
+	if !activation.Valid || !periodEnd.After(periodStart) {
+		return false
+	}
+	anchorDay := billingperiod.AnchorDay(activation.Time)
+	anchoredStart, anchoredEnd := billingperiod.AnchoredPeriodWindow(periodEnd.Add(-time.Nanosecond), anchorDay)
+	return periodEnd.UTC().Equal(anchoredEnd) && !periodStart.UTC().Before(anchoredStart)
 }
 
 func (s *pgxStore) MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model, moduleVersion string) (int64, bool, error) {
@@ -1182,6 +1243,7 @@ func (s *pgxStore) UpsertUsageAggregate(ctx context.Context, periodID, accountID
 		Model:             agg.Model,
 		ModuleVersion:     agg.ModuleVersion,
 		Kind:              db.MsBillingMetricKind(agg.Kind),
+		AggregationKey:    nullableAggregationKey(agg.AggregationKey),
 		BillableQuantity:  qty,
 		UnitPriceMicros:   agg.UnitPriceMicros,
 		CustomerMarkupNum: int32(agg.MarkupNum),
@@ -1747,17 +1809,45 @@ func (s *pgxStore) MarkBillingRun(ctx context.Context, runID uuid.UUID, status B
 	if err != nil {
 		return err
 	}
-	return s.q.MarkBillingRun(ctx, db.MarkBillingRunParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+	if err := qtx.MarkBillingRun(ctx, db.MarkBillingRunParams{
 		ID:              runID.String(),
 		Status:          string(status),
 		StripeInvoiceID: pgtype.Text{String: stripeInvoiceID, Valid: stripeInvoiceID != ""},
 		TotalAmount:     total,
-	})
+	}); err != nil {
+		return err
+	}
+	if status == RunStatusInvoiced {
+		if err := qtx.MarkBillingPeriodInvoicedByRun(ctx, runID.String()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *pgxStore) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, runID uuid.UUID) (bool, error) {
-	rows, err := s.q.MarkBillingRunInvoicedIfUnfrozen(ctx, runID.String())
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return false, err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+	rows, err := qtx.MarkBillingRunInvoicedIfUnfrozen(ctx, runID.String())
+	if err != nil {
+		return false, err
+	}
+	if rows > 0 {
+		if err := qtx.MarkBillingPeriodInvoicedByRun(ctx, runID.String()); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return rows > 0, nil
@@ -1860,8 +1950,8 @@ func (s *pgxStore) BillingRunFrozenCharge(ctx context.Context, runID uuid.UUID) 
 
 func (s *pgxStore) AccountsWithUsageEvents(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
 	rows, err := s.q.AccountsWithUsageEvents(ctx, db.AccountsWithUsageEventsParams{
-		RecordedAt:   periodStart,
-		RecordedAt_2: periodEnd,
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
 	})
 	if err != nil {
 		return nil, err
@@ -1871,8 +1961,8 @@ func (s *pgxStore) AccountsWithUsageEvents(ctx context.Context, periodStart, per
 
 func (s *pgxStore) UnactivatedAccountsWithUsage(ctx context.Context, periodStart, periodEnd time.Time) ([]uuid.UUID, error) {
 	rows, err := s.q.UnactivatedAccountsWithUsage(ctx, db.UnactivatedAccountsWithUsageParams{
-		RecordedAt:   periodStart,
-		RecordedAt_2: periodEnd,
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
 	})
 	if err != nil {
 		return nil, err
@@ -3699,12 +3789,34 @@ func (s *pgxStore) OrgsWithUnsweptUsage(ctx context.Context) ([]uuid.UUID, error
 }
 
 func (s *pgxStore) ActivateAccountIfUnset(ctx context.Context, accountID uuid.UUID, at time.Time) error {
-	// 0 rows = already activated — the anchor is immutable, a no-op by design.
-	_, err := s.q.ActivateAccountIfUnset(ctx, db.ActivateAccountIfUnsetParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	// The UPDATE holds the account row exclusively. v2 ingest and rollup both
+	// take FOR SHARE, making this transition atomic with the rewindow below:
+	// observations admitted before activation are visible here, while later
+	// admissions derive the immutable activated anchor.
+	rows, err := qtx.ActivateAccountIfUnset(ctx, db.ActivateAccountIfUnsetParams{
 		ID:          accountID.String(),
-		ActivatedAt: pgtype.Timestamptz{Time: at, Valid: true},
+		ActivatedAt: pgtype.Timestamptz{Time: at.UTC(), Valid: true},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if rows > 0 {
+		firstFundedStart, _ := billingperiod.AnchoredPeriodWindow(at, billingperiod.AnchorDay(at))
+		if _, err := qtx.RewindowAccountV2UsageAtActivation(ctx, db.RewindowAccountV2UsageAtActivationParams{
+			FirstFundedStart: firstFundedStart,
+			AccountID:        accountID.String(),
+		}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *pgxStore) OrgUnbilledBacklogMicros(ctx context.Context, orgID uuid.UUID) (int64, error) {
@@ -3724,11 +3836,57 @@ func (s *pgxStore) AttachOrgAppsToAccount(ctx context.Context, orgID, accountID 
 }
 
 func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error) {
-	return s.q.RepointOrgNullAccountEvents(ctx, db.RepointOrgNullAccountEventsParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+	// Keep the target anchor stable while choosing the destination window and
+	// repointing account-less observations. This follows the same account-row →
+	// period-lock order as ingest and rollup.
+	if _, err := qtx.LockUsageAccountActivation(ctx, accountID.String()); err != nil {
+		return 0, err
+	}
+
+	// Repoint is another admission writer. Share the period barrier with v2
+	// ingest; if rollup won and closed the caller's window, advance along the
+	// authoritative period rows until reaching an open/unmaterialized window.
+	targetStart := windowStart.UTC()
+	for advances := 0; ; advances++ {
+		if advances > 24 {
+			return 0, errors.New("repoint traversed more than 24 closed billing periods")
+		}
+		if _, err := tx.Exec(ctx, meteringlock.SharedAdvisorySQL, meteringlock.PeriodKey(accountID, targetStart)); err != nil {
+			return 0, err
+		}
+		nextStart, err := qtx.ClosedBillingPeriodEndAtStart(ctx, db.ClosedBillingPeriodEndAtStartParams{
+			AccountID: accountID.String(), PeriodStart: targetStart,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		if !nextStart.After(targetStart) {
+			return 0, fmt.Errorf("closed billing period at %s has non-advancing end %s", targetStart, nextStart)
+		}
+		targetStart = nextStart.UTC()
+	}
+
+	rows, err := qtx.RepointOrgNullAccountEvents(ctx, db.RepointOrgNullAccountEventsParams{
 		AccountID:   accountID.String(),
-		WindowStart: windowStart,
+		WindowStart: targetStart,
 		OrgID:       orgID.String(),
 	})
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return rows, nil
 }
 
 func (s *pgxStore) OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {
@@ -3779,6 +3937,13 @@ func pgUUIDOrNull(id uuid.UUID) pgtype.UUID {
 		return pgtype.UUID{} // Valid: false → NULL
 	}
 	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+func nullableAggregationKey(key AggregationKey) pgtype.Text {
+	if key == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: string(key), Valid: true}
 }
 
 // uuidFromPg decodes a nullable uuid column: NULL → uuid.Nil.

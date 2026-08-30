@@ -131,13 +131,15 @@ WHERE stripe_payment_method_id = $1 AND deleted_at IS NULL;
 -- already-frozen anchor, and a webhook retry is a no-op. Resolved by
 -- stripe_customer_id (the same key InsertPaymentMethod uses); a missing account is
 -- a no-op (0 rows) that the handler treats as drift, exactly like the mirror
--- insert. :execrows so the Go layer can log a first-time activation.
--- name: StampAccountActivated :execrows
+-- insert. RETURNING lets the Go layer atomically rewindow any v2 observations
+-- admitted before first activation, then log a first-time activation.
+-- name: StampAccountActivated :one
 UPDATE ms_billing.accounts
 SET activated_at = now()
 WHERE stripe_customer_id = $1
   AND activated_at IS NULL
-  AND ms_billing.account_org_billing_active_after_shared_lock(id);
+  AND ms_billing.account_org_billing_active_after_shared_lock(id)
+RETURNING id, activated_at;
 
 -- SoftDeletePaymentMethod marks a mirror row deleted by Stripe PM id.
 -- :execrows → >0 means found.
