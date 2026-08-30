@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // NewStore returns a Store backed by the given pgxpool. Used by
@@ -127,11 +128,41 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 // only when THIS call set the anchor; 0 rows (already activated, or no accounts
 // row for the customer) is a benign no-op the caller logs, never an error.
 func (s *pgxStore) StampAccountActivated(ctx context.Context, stripeCustomerID string) (bool, error) {
-	rows, err := s.q.StampAccountActivated(ctx, text(stripeCustomerID))
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
-	return rows > 0, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := s.q.WithTx(tx)
+
+	// The UPDATE holds the account row exclusively. v2 ingest and rollup take
+	// FOR SHARE on that row, so every observation belongs deterministically to
+	// either the pre-activation set rewound below or the activated-anchor set.
+	activated, err := qtx.StampAccountActivated(ctx, text(stripeCustomerID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !activated.ActivatedAt.Valid {
+		return false, errors.New("activated account returned a NULL activation instant")
+	}
+	activationTime := activated.ActivatedAt.Time.UTC()
+	firstFundedStart, _ := billingperiod.AnchoredPeriodWindow(
+		activationTime,
+		billingperiod.AnchorDay(activationTime),
+	)
+	if _, err := qtx.RewindowAccountV2UsageAtActivation(ctx, db.RewindowAccountV2UsageAtActivationParams{
+		FirstFundedStart: firstFundedStart,
+		AccountID:        activated.ID,
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SoftDeletePaymentMethod sets deleted_at=now() on the row matching

@@ -109,7 +109,12 @@ func TestMigration023_UpDownUp_RoundTrips(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.Aggregates, 2, "pre-down: two version-split rows exist")
 
-	// --- down: collapse the version-split rows back into one ---
+	// --- down: descendants first, then collapse the version-split rows ---
+	// Migration 055's aggregate identity includes module_version. A historical
+	// migration cannot know about a future dependent index, so a realistic
+	// rollback unwinds 055 before 023 rather than leaving a half-new schema.
+	_, err = pool.Exec(ctx, migrationSQL(t, "055_keyed_meter_observations.down.sql"))
+	require.NoError(t, err)
 	_, err = pool.Exec(ctx, migrationSQL(t, "023_usage_module_version.down.sql"))
 	require.NoError(t, err)
 
@@ -132,8 +137,10 @@ func TestMigration023_UpDownUp_RoundTrips(t *testing.T) {
 	require.EqualValues(t, 500_000, raw, "no money lost on down: 200_000 + 300_000")
 	require.EqualValues(t, 500_000, charged)
 
-	// --- up again: re-apply 023 cleanly (idempotent forward path) ---
+	// --- up again: re-apply 023 and then its 055 descendant cleanly ---
 	_, err = pool.Exec(ctx, migrationSQL(t, "023_usage_module_version.up.sql"))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, migrationSQL(t, "055_keyed_meter_observations.up.sql"))
 	require.NoError(t, err)
 
 	require.True(t, columnExists(t, pool, "usage_events", "module_version"))

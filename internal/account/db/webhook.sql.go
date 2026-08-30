@@ -535,13 +535,19 @@ func (q *Queries) SoftDeletePaymentMethod(ctx context.Context, stripePaymentMeth
 	return result.RowsAffected(), nil
 }
 
-const stampAccountActivated = `-- name: StampAccountActivated :execrows
+const stampAccountActivated = `-- name: StampAccountActivated :one
 UPDATE ms_billing.accounts
 SET activated_at = now()
 WHERE stripe_customer_id = $1
   AND activated_at IS NULL
   AND ms_billing.account_org_billing_active_after_shared_lock(id)
+RETURNING id, activated_at
 `
+
+type StampAccountActivatedRow struct {
+	ID          string             `json:"id"`
+	ActivatedAt pgtype.Timestamptz `json:"activated_at"`
+}
 
 // StampAccountActivated freezes the billing-period ANCHOR (migration 025): the
 // UTC instant the account bound its FIRST credit card. Called from
@@ -552,13 +558,13 @@ WHERE stripe_customer_id = $1
 // already-frozen anchor, and a webhook retry is a no-op. Resolved by
 // stripe_customer_id (the same key InsertPaymentMethod uses); a missing account is
 // a no-op (0 rows) that the handler treats as drift, exactly like the mirror
-// insert. :execrows so the Go layer can log a first-time activation.
-func (q *Queries) StampAccountActivated(ctx context.Context, stripeCustomerID pgtype.Text) (int64, error) {
-	result, err := q.db.Exec(ctx, stampAccountActivated, stripeCustomerID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+// insert. RETURNING lets the Go layer atomically rewindow any v2 observations
+// admitted before first activation, then log a first-time activation.
+func (q *Queries) StampAccountActivated(ctx context.Context, stripeCustomerID pgtype.Text) (StampAccountActivatedRow, error) {
+	row := q.db.QueryRow(ctx, stampAccountActivated, stripeCustomerID)
+	var i StampAccountActivatedRow
+	err := row.Scan(&i.ID, &i.ActivatedAt)
+	return i, err
 }
 
 const touchAccountByStripeCustomer = `-- name: TouchAccountByStripeCustomer :execrows

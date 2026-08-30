@@ -28,6 +28,7 @@
 package usage
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -69,6 +70,10 @@ const (
 // still recorded with a NULL account_id and backfilled on conversion —
 // design §8 "Lazy account").
 type RecordUsageRequest struct {
+	// Version selects the observation contract. Zero and one are the legacy
+	// ingest shape; two requires OccurredAt and admits Subject/Metadata.
+	Version int `json:"v,omitempty"`
+
 	// EventID is the SDK-minted idempotency key, stable across the call's
 	// HTTP retry. RecordUsage inserts ON CONFLICT(event_id) DO NOTHING.
 	EventID string `json:"event_id"`
@@ -84,6 +89,18 @@ type RecordUsageRequest struct {
 
 	Metric string  `json:"metric"`
 	Value  float64 `json:"value"`
+
+	// Subject is the platform-authorized, opaque end-user aggregation identity.
+	// It is diagnostic on an ordinary meter and required when the catalog
+	// declares aggregation_key="subject". Metadata is diagnostic only and is
+	// never consulted for billing identity or aggregation.
+	Subject  string          `json:"subject,omitempty"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+
+	// OccurredAt is the original v2 occurrence time. RecordedAt remains the
+	// platform receipt time. Billing windows use OccurredAt for v2 and preserve
+	// RecordedAt semantics for v1.
+	OccurredAt time.Time `json:"occurred_at,omitempty"`
 
 	// RecordedAt is dispatch's server-asserted event time (never the SDK
 	// recordedAtHint). Empty is tolerated and defaulted to now() so a
@@ -700,12 +717,16 @@ type SetModuleVisibilityResponse struct{}
 // is the developer's declared per-unit customer price; when Priced is false
 // the metric is metered-but-unpriced (stored as a NULL price).
 type MetricDef struct {
-	Metric          string `json:"metric"`
-	Kind            Kind   `json:"kind"`
-	Unit            string `json:"unit,omitempty"`
-	UnitPriceMicros int64  `json:"unit_price_micros,omitempty"`
-	Priced          bool   `json:"priced"`
-	Active          bool   `json:"active"`
+	Metric string `json:"metric"`
+	Kind   Kind   `json:"kind"`
+	// AggregationKey is catalog-owned. The only supported keyed mode is
+	// "subject" on a peak metric, producing SUM(MAX(value) per subject) in
+	// each billing period. Empty preserves the legacy kind semantics.
+	AggregationKey  AggregationKey `json:"aggregation_key,omitempty"`
+	Unit            string         `json:"unit,omitempty"`
+	UnitPriceMicros int64          `json:"unit_price_micros,omitempty"`
+	Priced          bool           `json:"priced"`
+	Active          bool           `json:"active"`
 }
 
 // SetMetricDefinitionsRequest is the payload of SetMetricDefinitions, a
