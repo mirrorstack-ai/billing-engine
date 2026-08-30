@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/capabilities"
 )
 
 // TestEveryProviderMutationIsInventoried is docs/DESIGN.md §11 step 2:
@@ -99,11 +101,15 @@ func TestCollectionSurfaceIsSmallAndNamed(t *testing.T) {
 	}
 	sort.Strings(collectors)
 
-	const wantCollectors = 11
+	// The expectation is the number the service reports about itself,
+	// so there is exactly one place to change when a money path is
+	// deleted — and changing it is what makes the deletion visible on
+	// the Capabilities surface.
+	wantCollectors := capabilities.LegacyMoneyPaths
 	if len(collectors) != wantCollectors {
-		t.Errorf("the surface that can take money has %d call sites, expected %d.\n"+
+		t.Errorf("the surface that can take money has %d call sites, but capabilities.LegacyMoneyPaths says %d.\n"+
 			"If this grew, a new way to charge a customer was added.\n"+
-			"If it shrank, a legacy money path was removed — update the count and say which:\n  %s",
+			"If it shrank, a legacy money path was removed — update the constant and say which:\n  %s",
 			len(collectors), wantCollectors, strings.Join(collectors, "\n  "))
 	}
 
@@ -119,4 +125,41 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// TestReportedLegacyMoneyPathCountIsTrue ties the number this service
+// reports about itself to the tree it was built from.
+//
+// docs/VERIFICATION.md §2 makes legacyMoneyPaths the field the
+// intent-only claim rests on, and docs/SECURITY.md §3 says a check the
+// private caller can satisfy with a statement about itself is not a
+// control. The same applies to a service reporting on its own
+// architecture: capabilities.LegacyMoneyPaths would be an assertion if
+// nothing checked it. This is the check.
+func TestReportedLegacyMoneyPathCountIsTrue(t *testing.T) {
+	root, err := RepoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites, err := ScanProviderMutations(root, "internal", "cmd")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	actual := 0
+	for _, s := range sites {
+		if s.Effect != EffectCollect {
+			continue
+		}
+		if s.File == "internal/shared/stripe/client.go" || strings.Contains(s.File, "/webhooktest/") {
+			continue
+		}
+		actual++
+	}
+
+	if capabilities.LegacyMoneyPaths != actual {
+		t.Fatalf("Capabilities reports legacyMoneyPaths=%d, but this tree has %d call sites that can take money.\n"+
+			"The reported number must be the true one — it is what the intent-only claim rests on.",
+			capabilities.LegacyMoneyPaths, actual)
+	}
 }

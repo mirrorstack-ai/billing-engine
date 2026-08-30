@@ -32,6 +32,14 @@ jobs:
       - name: Build Lambda zips
         run: |
           mkdir -p dist
+          # docs/VERIFICATION.md §2: a charge cannot be tied to a revision
+          # of this repository until the running service says which revision
+          # it is, and an executor whose build identity reads "unknown" must
+          # refuse to execute. Stamping is what makes that identity real —
+          # the values land on unexported vars in internal/shared/buildinfo
+          # and survive -s -w, which strips symbols after -X is applied.
+          BUILDINFO=github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo
+          STAMP="-X '$BUILDINFO.commit=$GITHUB_SHA' -X '$BUILDINFO.environment=production'"
           for pair in \
             account-api:billing-account-api \
             account-webhook:billing-webhook \
@@ -43,7 +51,9 @@ jobs:
             cmd="${pair%%:*}"
             artifact="${pair##*:}"
             echo "Building ./cmd/$cmd -> $artifact.zip"
-            GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc -ldflags="-s -w" -o bootstrap "./cmd/$cmd"
+            GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc \
+              -ldflags="-s -w $STAMP -X '$BUILDINFO.artifact=$artifact' -X '$BUILDINFO.role=$cmd'" \
+              -o bootstrap "./cmd/$cmd"
             zip -j "dist/$artifact.zip" bootstrap
             rm bootstrap
           done
