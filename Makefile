@@ -23,7 +23,7 @@ test:
 
 # Integration tests (require Docker — testcontainers-go boots Postgres as needed).
 test-integration:
-	go test -tags=integration -race -count=1 ./...
+	REQUIRE_DOCKER=1 go test -tags=integration -race -count=1 ./...
 
 # Lint
 lint:
