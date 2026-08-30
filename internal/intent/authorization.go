@@ -70,6 +70,10 @@ type BillingAuthorization struct {
 	// frequencyCeiling bounds the COUNT of attempts, which no amount
 	// ceiling does.
 	frequencyCeiling int
+	// triggerBelowMicros and topUpAmountMicros are the accepted balance
+	// trigger and the accepted top-up size.
+	triggerBelowMicros int64
+	topUpAmountMicros  int64
 
 	// termsRevision and priceBookRevision pin what the customer agreed
 	// to. A price book moving under a standing authorization is a
@@ -109,31 +113,46 @@ type AuthorizationGrant struct {
 	// docs/DESIGN.md §6 requires it by name for auto_topup — "per-attempt,
 	// frequency and period ceilings" — alongside the amount bounds.
 	FrequencyCeiling int
-	TermsRevision    string
-	PriceBook        string
-	NoticePolicy     string
-	EffectiveFrom    time.Time
-	ExpiresAt        time.Time
-	AcceptanceDigest string
+
+	// TriggerBelowMicros and TopUpAmountMicros are §6's "balance trigger"
+	// and "amount rule" for auto_topup: the arrangement is "when my
+	// balance falls below X, charge me exactly Y", and BOTH halves are
+	// part of what the customer accepted.
+	//
+	// Without them a standing authorization bounds how MUCH may be taken
+	// and says nothing about WHEN or IN WHAT SIZE — so any balance read
+	// could trigger any amount inside the ceilings, which is not the
+	// arrangement anybody agreed to. Zero on both means "not a
+	// balance-triggered authorization" and is legal for every other kind.
+	TriggerBelowMicros int64
+	TopUpAmountMicros  int64
+	TermsRevision      string
+	PriceBook          string
+	NoticePolicy       string
+	EffectiveFrom      time.Time
+	ExpiresAt          time.Time
+	AcceptanceDigest   string
 }
 
 // Errors from Authorize.
 var (
-	ErrAuthIDMissing         = errors.New("intent: authorization has no id")
-	ErrAuthScopeUnknown      = errors.New("intent: authorization scope is neither one-time nor standing")
-	ErrAuthSubjectUnknown    = errors.New("intent: authorization subject is not a kind the engine knows")
-	ErrAuthCurrencyMissing   = errors.New("intent: authorization names no currency")
-	ErrAuthDigestMissing     = errors.New("intent: a one-time authorization must name the intent it permits")
-	ErrAuthKindsMissing      = errors.New("intent: a standing authorization must declare the charge kinds it permits")
-	ErrAuthCeilingMissing    = errors.New("intent: a standing authorization must declare a per-charge ceiling")
-	ErrAuthFrequencyMissing  = errors.New("intent: a standing authorization needs a frequency ceiling")
-	ErrAuthCeilingNegative   = errors.New("intent: a ceiling is negative")
-	ErrAuthTermsMissing      = errors.New("intent: authorization pins no terms revision")
-	ErrAuthPriceBookMissing  = errors.New("intent: authorization pins no price book revision")
-	ErrAuthNoticeMissing     = errors.New("intent: authorization names no notice policy")
-	ErrAuthWindowMissing     = errors.New("intent: authorization has no effective window")
-	ErrAuthWindowInverted    = errors.New("intent: authorization expires before it takes effect")
-	ErrAuthAcceptanceMissing = errors.New("intent: authorization references no acceptance receipt")
+	ErrAuthIDMissing          = errors.New("intent: authorization has no id")
+	ErrAuthScopeUnknown       = errors.New("intent: authorization scope is neither one-time nor standing")
+	ErrAuthSubjectUnknown     = errors.New("intent: authorization subject is not a kind the engine knows")
+	ErrAuthCurrencyMissing    = errors.New("intent: authorization names no currency")
+	ErrAuthDigestMissing      = errors.New("intent: a one-time authorization must name the intent it permits")
+	ErrAuthKindsMissing       = errors.New("intent: a standing authorization must declare the charge kinds it permits")
+	ErrAuthCeilingMissing     = errors.New("intent: a standing authorization must declare a per-charge ceiling")
+	ErrAuthFrequencyMissing   = errors.New("intent: a standing authorization needs a frequency ceiling")
+	ErrAuthTriggerIncomplete  = errors.New("intent: a balance trigger and an amount rule must be given together")
+	ErrAuthRuleExceedsCeiling = errors.New("intent: the amount rule is above the per-charge ceiling, so no attempt could ever satisfy it")
+	ErrAuthCeilingNegative    = errors.New("intent: a ceiling is negative")
+	ErrAuthTermsMissing       = errors.New("intent: authorization pins no terms revision")
+	ErrAuthPriceBookMissing   = errors.New("intent: authorization pins no price book revision")
+	ErrAuthNoticeMissing      = errors.New("intent: authorization names no notice policy")
+	ErrAuthWindowMissing      = errors.New("intent: authorization has no effective window")
+	ErrAuthWindowInverted     = errors.New("intent: authorization expires before it takes effect")
+	ErrAuthAcceptanceMissing  = errors.New("intent: authorization references no acceptance receipt")
 )
 
 // Authorize validates a grant and returns the immutable authorization.
@@ -157,6 +176,24 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 	}
 	if grant.PerChargeCeiling < 0 || grant.PeriodCeiling < 0 {
 		return BillingAuthorization{}, ErrAuthCeilingNegative
+	}
+	if grant.TriggerBelowMicros < 0 || grant.TopUpAmountMicros < 0 {
+		return BillingAuthorization{}, ErrAuthCeilingNegative
+	}
+	// The two halves of a balance-triggered arrangement travel together.
+	// A trigger with no amount rule permits any size once the balance
+	// falls; an amount rule with no trigger permits that size at any
+	// time. Either alone is a different arrangement from the one §6
+	// describes, and neither is one a customer could have accepted.
+	if (grant.TriggerBelowMicros > 0) != (grant.TopUpAmountMicros > 0) {
+		return BillingAuthorization{}, ErrAuthTriggerIncomplete
+	}
+	// An amount rule above the per-charge ceiling can never be satisfied:
+	// every attempt would refuse for being over the ceiling, so the
+	// authorization is dead on arrival rather than restrictive.
+	if grant.TopUpAmountMicros > 0 && grant.PerChargeCeiling > 0 &&
+		grant.TopUpAmountMicros > grant.PerChargeCeiling {
+		return BillingAuthorization{}, ErrAuthRuleExceedsCeiling
 	}
 	if grant.Scope == ScopeOneTime && strings.TrimSpace(grant.IntentDigest) == "" {
 		return BillingAuthorization{}, ErrAuthDigestMissing
@@ -209,6 +246,8 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 		perChargeCeilingMicros: grant.PerChargeCeiling,
 		periodCeilingMicros:    grant.PeriodCeiling,
 		frequencyCeiling:       grant.FrequencyCeiling,
+		triggerBelowMicros:     grant.TriggerBelowMicros,
+		topUpAmountMicros:      grant.TopUpAmountMicros,
 		termsRevision:          grant.TermsRevision,
 		priceBookRevision:      grant.PriceBook,
 		noticePolicy:           grant.NoticePolicy,
@@ -237,12 +276,16 @@ const (
 	RefusalOverPerCharge          Refusal = "over_per_charge_ceiling"
 	RefusalOverPeriod             Refusal = "over_period_ceiling"
 	RefusalOverFrequency          Refusal = "over_frequency_ceiling"
-	RefusalTermsMoved             Refusal = "terms_revision_moved"
-	RefusalPriceBookMoved         Refusal = "price_book_moved"
-	RefusalNoticePolicyMoved      Refusal = "notice_policy_moved"
-	RefusalNotYetEffective        Refusal = "not_yet_effective"
-	RefusalExpired                Refusal = "expired"
-	RefusalRevoked                Refusal = "revoked"
+	// RefusalAmountNotTheAcceptedRule: the intent's total is not the
+	// top-up size the customer accepted. A charge inside the ceilings is
+	// not thereby the charge that was agreed.
+	RefusalAmountNotTheAcceptedRule Refusal = "amount_is_not_the_accepted_rule"
+	RefusalTermsMoved               Refusal = "terms_revision_moved"
+	RefusalPriceBookMoved           Refusal = "price_book_moved"
+	RefusalNoticePolicyMoved        Refusal = "notice_policy_moved"
+	RefusalNotYetEffective          Refusal = "not_yet_effective"
+	RefusalExpired                  Refusal = "expired"
+	RefusalRevoked                  Refusal = "revoked"
 )
 
 // Decision is the result of asking whether an authorization covers an
@@ -352,6 +395,14 @@ func (a BillingAuthorization) Permits(
 		if a.frequencyCeiling > 0 && prior.Attempts+1 > a.frequencyCeiling {
 			refusals = append(refusals, RefusalOverFrequency)
 		}
+		// The amount RULE, which the ceilings do not express. A ceiling
+		// says "no more than"; the rule says "exactly this". A top-up
+		// of $5 under an accepted rule of $20 is inside every bound and
+		// is still not the arrangement the customer agreed to — and so
+		// is a top-up of $19.
+		if a.topUpAmountMicros > 0 && intent.TotalMicros() != a.topUpAmountMicros {
+			refusals = append(refusals, RefusalAmountNotTheAcceptedRule)
+		}
 	}
 
 	return Decision{Permitted: len(refusals) == 0, Refusals: refusals}
@@ -417,21 +468,23 @@ func (a BillingAuthorization) Grant() AuthorizationGrant {
 	sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
 
 	return AuthorizationGrant{
-		ID:               a.id,
-		Scope:            a.scope,
-		Subject:          a.subject,
-		Currency:         a.currency,
-		IntentDigest:     a.intentDigest,
-		Kinds:            kinds,
-		PerChargeCeiling: a.perChargeCeilingMicros,
-		FrequencyCeiling: a.frequencyCeiling,
-		PeriodCeiling:    a.periodCeilingMicros,
-		TermsRevision:    a.termsRevision,
-		PriceBook:        a.priceBookRevision,
-		NoticePolicy:     a.noticePolicy,
-		EffectiveFrom:    a.effectiveFrom,
-		ExpiresAt:        a.expiresAt,
-		AcceptanceDigest: a.acceptanceDigest,
+		ID:                 a.id,
+		Scope:              a.scope,
+		Subject:            a.subject,
+		Currency:           a.currency,
+		IntentDigest:       a.intentDigest,
+		Kinds:              kinds,
+		PerChargeCeiling:   a.perChargeCeilingMicros,
+		FrequencyCeiling:   a.frequencyCeiling,
+		TriggerBelowMicros: a.triggerBelowMicros,
+		TopUpAmountMicros:  a.topUpAmountMicros,
+		PeriodCeiling:      a.periodCeilingMicros,
+		TermsRevision:      a.termsRevision,
+		PriceBook:          a.priceBookRevision,
+		NoticePolicy:       a.noticePolicy,
+		EffectiveFrom:      a.effectiveFrom,
+		ExpiresAt:          a.expiresAt,
+		AcceptanceDigest:   a.acceptanceDigest,
 	}
 }
 

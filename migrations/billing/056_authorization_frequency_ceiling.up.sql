@@ -35,6 +35,32 @@ UPDATE ms_billing.billing_authorizations
  WHERE scope = 'standing'
    AND frequency_ceiling = 0;
 
+-- The balance trigger and amount rule, §6's other two bounds for auto_topup.
+--
+-- These must persist or LoadAuthorization silently drops them: the row would
+-- reload with no amount rule, and an authorization with no rule permits any
+-- amount inside its ceilings. A bound that disappears on reload is worse than
+-- one that was never added.
+ALTER TABLE ms_billing.billing_authorizations
+    ADD COLUMN IF NOT EXISTS trigger_below_micros BIGINT NOT NULL DEFAULT 0
+        CHECK (trigger_below_micros >= 0),
+    ADD COLUMN IF NOT EXISTS top_up_amount_micros BIGINT NOT NULL DEFAULT 0
+        CHECK (top_up_amount_micros >= 0);
+
+COMMENT ON COLUMN ms_billing.billing_authorizations.top_up_amount_micros IS
+    'The accepted top-up size. A ceiling says "no more than"; this says '
+    '"exactly this". Zero means the authorization is not balance-triggered.';
+
+-- Both halves or neither: a trigger with no amount rule permits any size once
+-- the balance falls, and a rule with no trigger permits that size at any time.
+-- Either alone is a different arrangement from the one the customer accepted.
+ALTER TABLE ms_billing.billing_authorizations
+    DROP CONSTRAINT IF EXISTS billing_authorizations_trigger_is_complete;
+
+ALTER TABLE ms_billing.billing_authorizations
+    ADD CONSTRAINT billing_authorizations_trigger_is_complete
+        CHECK ((trigger_below_micros > 0) = (top_up_amount_micros > 0));
+
 ALTER TABLE ms_billing.billing_authorizations
     DROP CONSTRAINT IF EXISTS billing_authorizations_standing_is_bounded;
 

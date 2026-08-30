@@ -13,4 +13,9 @@ ALTER TABLE ms_billing.billing_authorizations
                    AND per_charge_ceiling_micros > 0));
 
 ALTER TABLE ms_billing.billing_authorizations
-    DROP COLUMN IF EXISTS frequency_ceiling;
+    DROP CONSTRAINT IF EXISTS billing_authorizations_trigger_is_complete;
+
+ALTER TABLE ms_billing.billing_authorizations
+    DROP COLUMN IF EXISTS frequency_ceiling,
+    DROP COLUMN IF EXISTS trigger_below_micros,
+    DROP COLUMN IF EXISTS top_up_amount_micros;

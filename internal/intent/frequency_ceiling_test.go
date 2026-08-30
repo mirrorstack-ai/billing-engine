@@ -140,3 +140,118 @@ func TestTheFrequencyCeilingSurvivesTheGrantRoundTrip(t *testing.T) {
 		t.Fatalf("Grant().FrequencyCeiling = %d, want 7", got)
 	}
 }
+
+// 🔴 The amount RULE, which no ceiling expresses.
+//
+// A ceiling says "no more than". §6's auto_topup arrangement says "when my
+// balance falls below X, charge me exactly Y" — and "exactly Y" is part of
+// what the customer accepted. A $5 top-up under an accepted rule of $20 sits
+// inside every bound and is still not the agreement; so does $19.
+func TestTheAmountRuleBindsWhereCeilingsDoNot(t *testing.T) {
+	auth, err := Authorize(AuthorizationGrant{
+		ID: "auth-rule", Scope: ScopeStanding,
+		Subject:  Subject{Kind: "user", ID: "acct-1"},
+		Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
+		PerChargeCeiling: 50_000_000, PeriodCeiling: 200_000_000,
+		FrequencyCeiling: 10,
+		// "below $10, top up by exactly $20"
+		TriggerBelowMicros: 10_000_000,
+		TopUpAmountMicros:  20_000_000,
+		TermsRevision:      "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
+		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+		AcceptanceDigest: "accept-1",
+	})
+	if err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+	at := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	seal := func(t *testing.T, micros int64) ChargeIntent {
+		t.Helper()
+		d := catalogDraft(KindAutoTopUp)
+		d.Lines = []Line{NewLine("top-up", "wallet", "1", 1, micros)}
+		s, err := Seal(d)
+		if err != nil {
+			t.Fatalf("Seal(%d): %v", micros, err)
+		}
+		return s
+	}
+
+	// Exactly the rule: permitted.
+	if d := auth.Permits(seal(t, 20_000_000), at, PriorUse{}); hasRefusal(d.Refusals, RefusalAmountNotTheAcceptedRule) {
+		t.Fatalf("the accepted amount was refused: %v", d.Refusals)
+	}
+
+	// Inside every ceiling, and not the rule.
+	for _, micros := range []int64{5_000_000, 19_000_000, 20_000_001, 49_000_000} {
+		d := auth.Permits(seal(t, micros), at, PriorUse{})
+		if !hasRefusal(d.Refusals, RefusalAmountNotTheAcceptedRule) {
+			t.Fatalf("%d micros was permitted under an accepted rule of 20_000_000; refusals = %v",
+				micros, d.Refusals)
+		}
+		if hasRefusal(d.Refusals, RefusalOverPerCharge) {
+			t.Fatalf("%d micros tripped the per-charge ceiling too, so this proves nothing "+
+				"about the amount rule", micros)
+		}
+	}
+}
+
+// The two halves of a balance-triggered arrangement travel together. A trigger
+// with no amount rule permits any size once the balance falls; an amount rule
+// with no trigger permits that size at any time. Either alone is a different
+// arrangement from the one the customer accepted.
+func TestTheTriggerAndTheAmountRuleMustBeGivenTogether(t *testing.T) {
+	base := func() AuthorizationGrant {
+		return AuthorizationGrant{
+			ID: "auth-pair", Scope: ScopeStanding,
+			Subject:  Subject{Kind: "user", ID: "acct-1"},
+			Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
+			PerChargeCeiling: 50_000_000, PeriodCeiling: 200_000_000,
+			FrequencyCeiling: 10,
+			TermsRevision:    "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
+			EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+			AcceptanceDigest: "accept-1",
+		}
+	}
+
+	triggerOnly := base()
+	triggerOnly.TriggerBelowMicros = 10_000_000
+	if _, err := Authorize(triggerOnly); !errors.Is(err, ErrAuthTriggerIncomplete) {
+		t.Fatalf("a trigger with no amount rule was accepted: %v", err)
+	}
+
+	ruleOnly := base()
+	ruleOnly.TopUpAmountMicros = 20_000_000
+	if _, err := Authorize(ruleOnly); !errors.Is(err, ErrAuthTriggerIncomplete) {
+		t.Fatalf("an amount rule with no trigger was accepted: %v", err)
+	}
+
+	neither := base()
+	if _, err := Authorize(neither); err != nil {
+		t.Fatalf("a standing authorization that is not balance-triggered was refused: %v", err)
+	}
+}
+
+// An amount rule above the per-charge ceiling can never be satisfied: every
+// attempt refuses for being over the ceiling. That is dead on arrival, not
+// restrictive, and Authorize should say so rather than mint it.
+func TestAnAmountRuleAboveTheCeilingIsRefusedAtAuthorize(t *testing.T) {
+	_, err := Authorize(AuthorizationGrant{
+		ID: "auth-dead", Scope: ScopeStanding,
+		Subject:  Subject{Kind: "user", ID: "acct-1"},
+		Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
+		PerChargeCeiling: 10_000_000, PeriodCeiling: 200_000_000,
+		FrequencyCeiling:   10,
+		TriggerBelowMicros: 5_000_000,
+		TopUpAmountMicros:  20_000_000, // above the per-charge ceiling
+		TermsRevision:      "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
+		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+		AcceptanceDigest: "accept-1",
+	})
+	if !errors.Is(err, ErrAuthRuleExceedsCeiling) {
+		t.Fatalf("an unsatisfiable authorization was minted: %v", err)
+	}
+}
