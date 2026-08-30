@@ -21,10 +21,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/shadow"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 )
@@ -34,9 +37,28 @@ func main() {
 	flag.Parse()
 
 	pool := config.MustPgxPool()
+
+	// Lambda transport: an operator invokes this against production, and the
+	// detail comes back as the function RESULT rather than the log. See
+	// lambda.go — stdout is CloudWatch, which is a wider audience than
+	// lambda:InvokeFunction.
+	if config.IsLambda() {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+		startLambda(pool, slog.Default())
+		return
+	}
 	defer pool.Close()
 
-	report, err := run(context.Background(), shadow.NewSource(pool), *periods)
+	// CLI: a person at a terminal, against a database they chose. stdout is
+	// their screen, not a log group, so nothing is redacted — withholding
+	// detail here would only make the tool harder to use without protecting
+	// anyone.
+	var report shadow.Report
+	err := withReadOnlyTx(context.Background(), pool, func(ctx context.Context, tx pgx.Tx) error {
+		var runErr error
+		report, runErr = run(ctx, shadow.NewSourceFrom(tx), *periods)
+		return runErr
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "shadow run failed:", err)
 		os.Exit(2)

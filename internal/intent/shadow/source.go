@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
@@ -18,11 +19,27 @@ import (
 // and move no money", and the way to be sure of that is for the code
 // to have no way to do either.
 type Source struct {
-	pool *pgxpool.Pool
+	q Querier
 }
 
 // NewSource returns a read-only reader over the legacy billing tables.
-func NewSource(pool *pgxpool.Pool) *Source { return &Source{pool: pool} }
+func NewSource(pool *pgxpool.Pool) *Source { return &Source{q: pool} }
+
+// Querier is the read surface this package needs: two methods, both reads.
+//
+// Both *pgxpool.Pool and pgx.Tx satisfy it, which is the point — the ops
+// function runs every query inside ONE read-only transaction, and a Source
+// bound to a pool would open its own connections outside that guard. Narrowing
+// to an interface with no Exec means this package cannot write even by
+// accident.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// NewSourceFrom builds a Source over any querier — in practice a read-only
+// transaction.
+func NewSourceFrom(q Querier) *Source { return &Source{q: q} }
 
 // Period is one closed billing period to reconcile.
 type Period struct {
@@ -58,7 +75,7 @@ type Period struct {
 // nothing charged has nothing to disagree about, and including them
 // would inflate the "compared" count with rows that can only agree.
 func (s *Source) ClosedPeriods(ctx context.Context, limit int) ([]Period, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.q.Query(ctx, `
 		SELECT p.id::text, p.account_id::text, p.period_start, p.period_end,
 		       COALESCE(SUM(ua.charged_micros), 0)::bigint,
 		       COALESCE(SUM(ua.raw_cost_micros), 0)::bigint
@@ -93,7 +110,7 @@ func (s *Source) ClosedPeriods(ctx context.Context, limit int) ([]Period, error)
 // carried over is the price — the whole point of shadow rating is to
 // derive that again from the catalog and see whether it matches.
 func (s *Source) FactsFor(ctx context.Context, p Period) ([]intent.UsageFact, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.q.Query(ctx, `
 		SELECT metric, module_id::text, module_version, billable_quantity
 		  FROM ms_billing.usage_aggregates
 		 WHERE period_id = $1
@@ -141,7 +158,7 @@ func (s *Source) FactsFor(ctx context.Context, p Period) ([]intent.UsageFact, er
 // whatever was charged and every period would agree, which is a
 // reconciliation that cannot fail and therefore says nothing.
 func (s *Source) PriceBookFor(ctx context.Context, effectiveFrom time.Time) (intent.PriceBookRevision, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.q.Query(ctx, `
 		SELECT metric, module_id::text, module_version, unit_price_micros
 		  FROM ms_billing.metric_version_prices`)
 	if err != nil {
