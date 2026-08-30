@@ -47,7 +47,8 @@ jobs:
             billing-cycle:billing-cycle \
             infra-egress-sync:billing-egress-sync \
             infra-ssr-compute-sync:billing-infra-ssr-compute-sync \
-            intent-executor:billing-intent-executor
+            intent-executor:billing-intent-executor \
+            intent-shadow:billing-intent-shadow
           do
             cmd="${pair%%:*}"
             artifact="${pair##*:}"

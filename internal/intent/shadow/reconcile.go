@@ -153,6 +153,15 @@ func (r Report) String() string {
 			" legacy=" + itoa64(d.LegacyMicros) +
 			" shadow=" + itoa64(d.ShadowMicros) +
 			" delta=" + itoa64(d.DeltaMicros()))
+		// The digest names the shadow document, so a reviewer can pull
+		// the exact lines that produced the figure — and when rating
+		// refused, it carries the reason instead. A period that
+		// contributed zero because it could not be rated looks
+		// identical to one that was simply cheaper, unless the report
+		// says which.
+		if d.IntentDigest != "" {
+			b.WriteString("\n      " + d.IntentDigest)
+		}
 		if f.Explanation != "" {
 			b.WriteString("\n      " + f.Explanation)
 		}
