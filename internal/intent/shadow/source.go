@@ -30,9 +30,25 @@ type Period struct {
 	AccountID string
 	Start     time.Time
 	End       time.Time
-	// LegacyMicros is what the legacy rollup recorded as charged for
-	// usage in this period.
+	// LegacyMicros is what the legacy rollup recorded as CHARGED for
+	// usage in this period — post-markup.
 	LegacyMicros int64
+
+	// LegacyBaseMicros is the same usage PRE-markup.
+	//
+	// The two are different numbers and comparing the wrong one makes
+	// this whole tool lie. migrations/billing/009_usage_aggregates.up.sql:28
+	// states the relationship the rollup writes:
+	//
+	//     charged_micros = round_half_up( raw_cost_micros * num / den )
+	//
+	// The intent rater derives quantity x unit_price, which is the
+	// PRE-markup figure. Comparing it against charged_micros makes every
+	// marked-up metric — every platform-infra line carries 12/10 —
+	// disagree systematically, for a reason that has nothing to do with
+	// the rater. That is not a discrepancy, it is an artefact, and it
+	// would swamp the signal this tool exists to produce.
+	LegacyBaseMicros int64
 }
 
 // ClosedPeriods returns periods whose usage has been rolled up,
@@ -44,7 +60,8 @@ type Period struct {
 func (s *Source) ClosedPeriods(ctx context.Context, limit int) ([]Period, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.id::text, p.account_id::text, p.period_start, p.period_end,
-		       COALESCE(SUM(ua.charged_micros), 0)::bigint
+		       COALESCE(SUM(ua.charged_micros), 0)::bigint,
+		       COALESCE(SUM(ua.raw_cost_micros), 0)::bigint
 		  FROM ms_billing.billing_periods p
 		  JOIN ms_billing.usage_aggregates ua ON ua.period_id = p.id
 		 WHERE p.period_end < now()
@@ -60,7 +77,7 @@ func (s *Source) ClosedPeriods(ctx context.Context, limit int) ([]Period, error)
 	var out []Period
 	for rows.Next() {
 		var p Period
-		if err := rows.Scan(&p.PeriodID, &p.AccountID, &p.Start, &p.End, &p.LegacyMicros); err != nil {
+		if err := rows.Scan(&p.PeriodID, &p.AccountID, &p.Start, &p.End, &p.LegacyMicros, &p.LegacyBaseMicros); err != nil {
 			return nil, fmt.Errorf("scan period: %w", err)
 		}
 		out = append(out, p)

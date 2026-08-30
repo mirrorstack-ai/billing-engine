@@ -30,10 +30,12 @@ type Difference struct {
 	AccountID string
 	PeriodID  string
 
-	// LegacyMicros is what the current code charged, read from the
-	// settled record rather than recomputed — the point is to compare
-	// against what actually happened.
+	// LegacyMicros is what the current code CHARGED, read from the
+	// settled record rather than recomputed — post-markup.
 	LegacyMicros int64
+	// LegacyBaseMicros is the same usage PRE-markup, and it is the
+	// figure the comparison actually uses. See Source.Period.
+	LegacyBaseMicros int64
 	// ShadowMicros is what the intent rater derived for the same
 	// inputs.
 	ShadowMicros int64
@@ -45,12 +47,18 @@ type Difference struct {
 
 // DeltaMicros is shadow minus legacy. Positive means the new rater
 // would have charged more.
-func (d Difference) DeltaMicros() int64 { return d.ShadowMicros - d.LegacyMicros }
+func (d Difference) DeltaMicros() int64 { return d.ShadowMicros - d.LegacyBaseMicros }
+
+// MarkupMicros is what the legacy rollup added on top of the base. It is
+// reported rather than compared, because a cutover that silently dropped
+// it would under-bill every platform-infra line by 1/6 and this tool
+// would call that agreement.
+func (d Difference) MarkupMicros() int64 { return d.LegacyMicros - d.LegacyBaseMicros }
 
 // Agrees reports whether the two totals match exactly. Money is integer
 // micro-dollars, so there is no tolerance and none is offered: a
 // tolerance is a place for a real difference to hide.
-func (d Difference) Agrees() bool { return d.ShadowMicros == d.LegacyMicros }
+func (d Difference) Agrees() bool { return d.ShadowMicros == d.LegacyBaseMicros }
 
 // Kind classifies a difference by what is known about its cause.
 type Kind string
@@ -150,7 +158,9 @@ func (r Report) String() string {
 	for _, f := range r.Findings {
 		d := f.Difference
 		b.WriteString("  [" + string(f.Kind) + "] " + d.AccountID + "/" + d.PeriodID +
-			" legacy=" + itoa64(d.LegacyMicros) +
+			" legacy_base=" + itoa64(d.LegacyBaseMicros) +
+			" legacy_charged=" + itoa64(d.LegacyMicros) +
+			" markup=" + itoa64(d.MarkupMicros()) +
 			" shadow=" + itoa64(d.ShadowMicros) +
 			" delta=" + itoa64(d.DeltaMicros()))
 		// The digest names the shadow document, so a reviewer can pull

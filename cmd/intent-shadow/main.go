@@ -101,9 +101,10 @@ func run(ctx context.Context, src *shadow.Source, limit int) (shadow.Report, err
 		})
 
 		d := shadow.Difference{
-			AccountID:    p.AccountID,
-			PeriodID:     p.PeriodID,
-			LegacyMicros: p.LegacyMicros,
+			AccountID:        p.AccountID,
+			PeriodID:         p.PeriodID,
+			LegacyMicros:     p.LegacyMicros,
+			LegacyBaseMicros: p.LegacyBaseMicros,
 		}
 		if rateErr != nil {
 			// A quarantined period is a difference of the whole
