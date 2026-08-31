@@ -39,6 +39,7 @@ import (
 )
 
 func main() {
+	ctx := context.Background()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 
 	if err := readiness(capabilities.Current(), os.Getenv("INTENT_EXECUTOR_ENABLED")); err != nil {
@@ -95,21 +96,51 @@ func main() {
 		slog.Error("executor will not construct", "reason", err.Error())
 		os.Exit(1)
 	}
-	_ = exec
-
-	// 🔴 There is no work loop yet, and that is deliberate rather than
-	// unfinished. Nothing produces intents in production — no caller
-	// seals one, and docs/DESIGN.md §11 puts shadow rating and
-	// reconciliation before any cutover. A poller here would be an
-	// arming path that has never been exercised against a real intent,
-	// which docs/SECURITY.md treats as its own kind of defect.
+	// The work loop.
 	//
-	// What this binary establishes today is the SHAPE: one deployment
-	// holds the write port, its readiness is refused rather than
-	// assumed, and everything below it is wired and tested.
-	slog.Info("intent executor started with no work source; nothing produces intents yet",
+	// It was deliberately absent until now, and the reason it was absent is
+	// worth keeping: "a poller here would be an arming path that has never
+	// been exercised against a real intent, which docs/SECURITY.md treats as
+	// its own kind of defect." That objection is answered by exercising it —
+	// internal/intent/executor drives RunOnce against a real Postgres and a
+	// real sealed intent, through a refusal, an in-flight result and a
+	// settlement.
+	//
+	// One bounded pass per invocation, not a daemon. This binary holds the
+	// only mutation-capable provider credential in the deployment, and
+	// docs/VERIFICATION.md §5's write-port isolation is the reason not to
+	// keep that open indefinitely.
+	//
+	// 🔴 On a deployment where every gate is false — which is every
+	// deployment today — this finds work and refuses all of it. That is the
+	// honest outcome, and the summary says so: an executor that found nothing
+	// and one that refused everything it found are different states, and only
+	// the second is telling the truth about a deployment whose supporting
+	// records do not exist yet.
+	result, err := executor.RunOnce(ctx, s, exec, executionBatchLimit, slog.Default())
+	if err != nil {
+		slog.Error("execution pass failed", "reason", err.Error())
+		os.Exit(1)
+	}
+
+	slog.Info("execution pass complete",
+		"considered", result.Considered,
+		"settled", result.Settled,
+		"in_progress", result.InProgress,
+		"unresolved", result.Unresolved,
+		"refused", result.Refused,
+		"errors", result.Errors,
+		"refused_clauses", result.RefusedClauses,
 		"build", buildinfo.Current())
 }
+
+// executionBatchLimit bounds one pass.
+//
+// Bounded because an unbounded pass on a backlog would hold the write port
+// open for as long as the backlog takes, and because a Lambda invocation that
+// cannot finish is one that gets killed mid-collection. What is not executed
+// this pass is not claimed, so the next invocation picks it up.
+const executionBatchLimit = 100
 
 // Readiness failures, distinguished so the operator sees which.
 var (
