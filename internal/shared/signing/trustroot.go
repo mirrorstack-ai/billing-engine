@@ -92,7 +92,7 @@ func (r TrustRoot) PublicKey(id, domain string) (ed25519.PublicKey, bool) {
 // it does not have.
 func (r TrustRoot) Len() int { return len(r.keys) }
 
-// PinnedKeys is the trust root that ships in this repository.
+// pinnedKeys is the trust root that ships in this repository.
 //
 // 🔴 It is EMPTY, and that is the honest state. No signing key has been
 // provisioned for any MirrorStack environment, so there is no public half to
@@ -100,28 +100,40 @@ func (r TrustRoot) Len() int { return len(r.keys) }
 // id, check a signature no one can produce, and a deployment could report
 // itself ready to verify evidence that cannot exist.
 //
-// Filling it is a deliberate act with a diff attached. Each entry names the
-// environment it belongs to, and the private half lives in SSM and never in
-// this repository.
+// It is UNEXPORTED. An exported package-level slice is not pinned — any
+// package in the tree could append to it at runtime and every later
+// Repository() call would return a root containing the added key, which is
+// precisely the "a verifier that learns its trust root from elsewhere has
+// checked nothing" failure this variable exists to prevent. Adding a key is a
+// deliberate edit to this file with a diff attached.
+//
+// Each entry names the environment it belongs to; the private half lives in
+// SSM and never in this repository.
 //
 // Until it has an entry:
 //   - Repository() returns a root of length zero;
 //   - every Verify fails with ErrUnknownKey;
-//   - no deployment can sign, because NewSigner has no key material to load;
+//   - no deployment can sign, because Load has no key material to read;
 //   - and the Capabilities surface reports evidence signing as unsupported,
-//     which is docs/VERIFICATION.md:70-72's "`unsupported` until its own
-//     suite passes".
-var PinnedKeys = []PinnedKey{}
+//     which is docs/VERIFICATION.md's "`unsupported` until its own suite
+//     passes".
+var pinnedKeys = []PinnedKey{}
 
 // Repository returns the trust root that ships in this tree.
 //
-// It panics on a malformed entry, because a build carrying an unusable
-// pinned key is a build that should not start: the alternative is a
-// deployment that runs with a silently smaller root than its source claims.
-func Repository() TrustRoot {
-	root, err := NewTrustRoot(PinnedKeys)
+// It returns an error rather than panicking. A panic here fires on the first
+// CALL, which may be deep inside a request, long after startup — so a build
+// carrying a malformed pinned key would look healthy until the first customer
+// tried to verify something. A caller at startup can refuse to start, which
+// is where that decision belongs.
+func Repository() (TrustRoot, error) {
+	root, err := NewTrustRoot(pinnedKeys)
 	if err != nil {
-		panic("signing: the trust root pinned in this repository is malformed: " + err.Error())
+		return TrustRoot{}, fmt.Errorf("the trust root pinned in this repository is malformed: %w", err)
 	}
-	return root
+	return root, nil
 }
+
+// PinnedKeyCount reports how many keys ship in this tree, for a readiness
+// surface that must not claim verification it cannot perform.
+func PinnedKeyCount() int { return len(pinnedKeys) }

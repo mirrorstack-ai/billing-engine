@@ -2,17 +2,25 @@
 // docs/VERIFICATION.md §2 requires, and refuses to produce one it cannot
 // make honestly.
 //
-// 🔴 Until this package existed the repository had NO signing primitive of
-// any kind: no ed25519, no HMAC, not even crypto/rand outside tests. Every
-// "signed" object in docs/DESIGN.md — the evidence record of INV-014, the
-// BillingDecisionProof of INV-012, the engine-issued disclosure §12 item 16
-// asks for — was unbuilt for the same reason.
+// 🔴 Until this package existed the repository could VERIFY a signature and
+// could not PRODUCE one.
+//
+// internal/shared/stripe/client.go:752 has verified inbound Stripe webhooks
+// with HMAC-SHA256 since long before this, in production, in both webhook
+// binaries. What did not exist was an outbound signer: nothing in the tree
+// could make a statement another party could check. Every "signed" object in
+// docs/DESIGN.md — the evidence record of INV-014, the BillingDecisionProof
+// of INV-012, the engine-issued disclosure §12 item 16 asks for — was unbuilt
+// for that reason.
+//
+// The distinction matters because the two need different cryptography, which
+// is the next paragraph.
 //
 // # Why asymmetric
 //
-// docs/VERIFICATION.md:81-83: "Pin the root, not the response. A verifier
-// that learns its trust root from the service it is checking has checked
-// nothing. That root must ship in this repository."
+// docs/VERIFICATION.md:81: "Pin the root, not the response. A verifier that
+// learns its trust root from the service it is checking has checked nothing.
+// That root must ship in this repository."
 //
 // A MAC cannot satisfy that. Verifying a MAC requires the signing secret, so
 // the only party who can check a MirrorStack statement is MirrorStack — which
@@ -23,7 +31,7 @@
 //
 // # Why a key names its domain
 //
-// docs/VERIFICATION.md:79-80: "A key valid for `billing-capabilities/v1`
+// docs/VERIFICATION.md:86-87: "A key valid for `billing-capabilities/v1`
 // therefore cannot sign `customer-acceptance/v1`." A key here CARRIES its
 // domain, and both Sign and Verify refuse a statement whose domain is not
 // the key's. So domain separation is a property of the key material rather
@@ -86,19 +94,34 @@ func knownDomain(d string) bool {
 }
 
 var (
-	ErrNoKey            = errors.New("signing: this deployment holds no signing key, so it cannot produce evidence")
-	ErrDomainMismatch   = errors.New("signing: the key is not valid for this signature domain")
-	ErrUnknownDomain    = errors.New("signing: unknown signature domain")
-	ErrIncomplete       = errors.New("signing: the statement omits something docs/VERIFICATION.md §2 requires it to name")
-	ErrWindowInverted   = errors.New("signing: a validity interval must not end before it starts")
-	ErrUnknownKey       = errors.New("signing: no pinned public key with this id")
-	ErrBadSignature     = errors.New("signing: the signature does not verify")
+	ErrNoKey          = errors.New("signing: this deployment holds no signing key, so it cannot produce evidence")
+	ErrDomainMismatch = errors.New("signing: the key is not valid for this signature domain")
+	ErrUnknownDomain  = errors.New("signing: unknown signature domain")
+	ErrIncomplete     = errors.New("signing: the statement omits something docs/VERIFICATION.md §2 requires it to name")
+	ErrWindowInverted = errors.New("signing: a validity interval must not end before it starts")
+	ErrUnknownKey     = errors.New("signing: no pinned public key with this id")
+	ErrBadSignature   = errors.New("signing: the signature does not verify")
+	// ErrExpired is separate from ErrBadSignature deliberately. A statement
+	// whose signature verified perfectly and whose validity window has passed
+	// is stale, not forged, and a caller classifying refusals — an alert, a
+	// retry decision, an operator reading a log — needs to tell those apart.
+	// Returning the forgery sentinel for an expired-but-authentic statement
+	// is the same class of defect as a clause named for a check it does not
+	// perform.
+	ErrExpired         = errors.New("signing: the statement is outside its validity interval")
+	ErrKeyInconsistent = errors.New("signing: the key material is not a consistent ed25519 key")
+	ErrKeyReused       = errors.New("signing: one key is configured for more than one signature domain")
+	// ErrNotAddressedToUs is an AUTHENTIC statement meant for someone else,
+	// some other environment, or from another issuer. Distinct from
+	// ErrBadSignature because the response is different: a forgery is an
+	// attack, a misaddressed statement is usually a misconfiguration.
+	ErrNotAddressedToUs = errors.New("signing: the statement is authentic but is not addressed to this verifier")
 	ErrAlgorithmUnknown = errors.New("signing: the statement names an algorithm this build does not implement")
 )
 
 // Statement is one signed statement.
 //
-// Every field of docs/VERIFICATION.md:78-79 is present and required:
+// Every field of docs/VERIFICATION.md:85-86 is present and required:
 // "algorithm, key id, issuer, audience, environment, schema, signature
 // domain, payload digest, validity interval and checkpoint."
 //
@@ -132,7 +155,7 @@ type Statement struct {
 
 	// Checkpoint is the position of this statement in the log that
 	// ordered it — for an evidence record, the outbox sequence
-	// (docs/VERIFICATION.md:131, "the outbox checkpoint"). Without it a
+	// ("the outbox checkpoint", docs/VERIFICATION.md's receipt table). Without it a
 	// verifier can check that a statement is authentic but not that it is
 	// the latest, so a withheld correction is undetectable.
 	Checkpoint string `json:"checkpoint"`
@@ -161,38 +184,64 @@ type Key struct {
 	private ed25519.PrivateKey
 }
 
-// NewKey builds a signing key from raw private key bytes.
+// SeedSize is the length of the key material this package accepts.
+const SeedSize = ed25519.SeedSize
+
+// NewKey builds a signing key from a 32-byte ed25519 SEED.
 //
-// The key id is DERIVED from the public half rather than supplied. A
-// supplied id is a second fact about the same key that can disagree with the
-// first: a rotated key kept under its old id verifies against a pinned key
-// it no longer matches, and the failure reads as a bad signature rather than
-// a bad deployment. Deriving it means an id and its material cannot come
-// apart, and rotating the key changes the id by construction — so a verifier
-// that has not been given the new public half fails with "unknown key",
-// which is the true reason.
+// 🔴 It takes a seed, not a private key, and that is a correctness decision
+// rather than an ergonomic one.
 //
-// It refuses an unknown domain and a wrong-sized key rather than accepting
-// them and failing later at a verifier: a deployment holding unusable key
-// material should not start.
+// An ed25519 "private key" in Go is 64 bytes: seed || public. The two halves
+// have to agree, and nothing in the format makes them. The first version of
+// this function accepted the 64-byte form and checked only its LENGTH, so
+// 64 bytes of raw randomness — precisely what `openssl rand -hex 64` gives
+// you, and the most natural thing an operator would paste into SSM — loaded
+// without complaint. The Key then reported an id derived from the wrong
+// trailing bytes, CanSign returned true, Sign returned no error, and every
+// signature it produced verified against nothing. The relying party saw
+// ErrBadSignature: a forgery signal, for a deployment that was simply
+// misconfigured.
 //
-// The error never contains the key material. This package is one of the few
+// A seed cannot be inconsistent with itself. Deriving the whole key from it
+// removes the failure rather than detecting it, and the belt-and-braces
+// self-check below removes the rest: the key signs a fixed vector and
+// verifies it before this function returns, so "this key can produce a
+// verifiable signature" is PROVEN at load rather than assumed.
+//
+// It also stops aliasing the caller's buffer. NewKeyFromSeed allocates, so a
+// caller that wipes its own material — the correct thing to do with a secret
+// — no longer silently zeroes the key this Key is holding.
+//
+// The error never contains the material. This package is one of the few
 // places in the tree that handles a secret, and an error string is the most
 // common way one escapes into a log.
-func NewKey(domain string, private []byte) (Key, error) {
+func NewKey(domain string, seed []byte) (Key, error) {
 	if !knownDomain(domain) {
 		return Key{}, fmt.Errorf("%w: %q", ErrUnknownDomain, domain)
 	}
-	if len(private) != ed25519.PrivateKeySize {
-		return Key{}, fmt.Errorf("%w: an ed25519 private key is %d bytes, got %d",
-			ErrIncomplete, ed25519.PrivateKeySize, len(private))
+	if len(seed) != SeedSize {
+		// The 64-byte case gets its own sentence, because it is the mistake
+		// this signature exists to prevent: `openssl rand -hex 64` and every
+		// "ed25519 private key" export produce it, and the old API accepted
+		// it and signed with material nothing could verify.
+		if len(seed) == ed25519.PrivateKeySize {
+			return Key{}, fmt.Errorf("%w: this is the %d-byte private-key form; pass the %d-byte SEED "+
+				"(openssl rand -hex %d)", ErrKeyInconsistent, ed25519.PrivateKeySize, SeedSize, SeedSize)
+		}
+		return Key{}, fmt.Errorf("%w: an ed25519 seed is %d bytes, got %d",
+			ErrKeyInconsistent, SeedSize, len(seed))
 	}
-	pk := ed25519.PrivateKey(private)
-	return Key{
-		id:      KeyID(pk.Public().(ed25519.PublicKey)),
-		domain:  domain,
-		private: pk,
-	}, nil
+	pk := ed25519.NewKeyFromSeed(seed)
+	pub := pk.Public().(ed25519.PublicKey)
+
+	// Prove it before returning it.
+	const probe = "mirrorstack.signing/self-check"
+	if !ed25519.Verify(pub, []byte(probe), ed25519.Sign(pk, []byte(probe))) {
+		return Key{}, ErrKeyInconsistent
+	}
+
+	return Key{id: KeyID(pub), domain: domain, private: pk}, nil
 }
 
 // KeyID is the identity of a public key: the first 128 bits of its SHA-256,
@@ -205,6 +254,22 @@ func KeyID(pub ed25519.PublicKey) string {
 	sum := sha256.Sum256(pub)
 	return hex.EncodeToString(sum[:16])
 }
+
+// String and GoString redact the key material.
+//
+// fmt prints unexported struct fields, so without these `fmt.Sprintf("%v", k)`
+// emits the complete private key as a decimal byte slice — into a log line, a
+// panic message, or a struct dumped during debugging. A secret that is one
+// %+v away from a log is a secret that will eventually be in one.
+func (k Key) String() string {
+	if k.private == nil {
+		return "signing.Key{unset}"
+	}
+	return "signing.Key{id:" + k.id + " domain:" + k.domain + " material:REDACTED}"
+}
+
+// GoString covers %#v, which does not route through String.
+func (k Key) GoString() string { return k.String() }
 
 // ID and Domain report what this key is for.
 func (k Key) ID() string     { return k.id }
@@ -299,7 +364,45 @@ func (s Statement) signedBytes() []byte {
 	return e.bytes()
 }
 
-// Verify checks a signed statement against a PINNED public key.
+// Expect is what a verifier requires a statement to say.
+//
+// 🔴 It exists because signing a field and CHECKING it are different things,
+// and the first version of Verify did only the first.
+//
+// Issuer, Audience and Environment were covered by the signature and required
+// to be non-empty — and compared to nothing. So a statement signed by a
+// pinned key with Environment "staging", Issuer "someone-else" and Audience
+// "not-you" verified in production. Every one of those fields exists to
+// answer a question ("who said this", "who may rely on it", "which
+// deployment"), and a field a verifier never reads answers nothing.
+//
+// Every field is required. A verifier that does not know what environment it
+// is in cannot state one, and cannot safely accept whatever arrives.
+type Expect struct {
+	Domain      string
+	Issuer      string
+	Audience    string
+	Environment string
+}
+
+func (e Expect) validate() error {
+	if !knownDomain(e.Domain) {
+		return fmt.Errorf("%w: %q", ErrUnknownDomain, e.Domain)
+	}
+	for _, f := range []struct{ name, value string }{
+		{"issuer", e.Issuer},
+		{"audience", e.Audience},
+		{"environment", e.Environment},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			return fmt.Errorf("%w: expected %s", ErrIncomplete, f.name)
+		}
+	}
+	return nil
+}
+
+// Verify checks a signed statement against a PINNED public key and against
+// what the caller expects it to say.
 //
 // The key comes from the caller's own trust root, never from the statement:
 // the KeyID selects among keys the verifier already holds, and an id it does
@@ -308,27 +411,27 @@ func (s Statement) signedBytes() []byte {
 //
 // `now` is supplied rather than read, so a verdict is a function of its
 // inputs and a refusal is reproducible.
-func Verify(root TrustRoot, signed Signed, domain string, now time.Time) error {
+func Verify(root TrustRoot, signed Signed, expect Expect, now time.Time) error {
+	if err := expect.validate(); err != nil {
+		return err
+	}
 	s := signed.Statement
 	if s.Algorithm != Algorithm {
 		return fmt.Errorf("%w: %q", ErrAlgorithmUnknown, s.Algorithm)
 	}
-	if !knownDomain(domain) {
-		return fmt.Errorf("%w: %q", ErrUnknownDomain, domain)
-	}
 	// The domain the CALLER expects, not the one the statement asserts. A
 	// verifier that read the domain off the statement would accept whatever
 	// domain the statement chose to be in.
-	if s.Domain != domain {
-		return fmt.Errorf("%w: expected %q, statement says %q", ErrDomainMismatch, domain, s.Domain)
+	if s.Domain != expect.Domain {
+		return fmt.Errorf("%w: expected %q, statement says %q", ErrDomainMismatch, expect.Domain, s.Domain)
 	}
 	if err := s.validate(); err != nil {
 		return err
 	}
 
-	pub, ok := root.PublicKey(s.KeyID, domain)
+	pub, ok := root.PublicKey(s.KeyID, expect.Domain)
 	if !ok {
-		return fmt.Errorf("%w: %q for %s", ErrUnknownKey, s.KeyID, domain)
+		return fmt.Errorf("%w: %q for %s", ErrUnknownKey, s.KeyID, expect.Domain)
 	}
 	sig, err := base64.StdEncoding.DecodeString(signed.Signature)
 	if err != nil {
@@ -337,9 +440,26 @@ func Verify(root TrustRoot, signed Signed, domain string, now time.Time) error {
 	if !ed25519.Verify(pub, s.signedBytes(), sig) {
 		return ErrBadSignature
 	}
+
+	// Everything below here is about an AUTHENTIC statement, so each failure
+	// gets its own sentinel: a caller must be able to tell "this is not ours"
+	// from "this is forged".
+	for _, m := range []struct {
+		field, want, got string
+	}{
+		{"issuer", expect.Issuer, s.Issuer},
+		{"audience", expect.Audience, s.Audience},
+		{"environment", expect.Environment, s.Environment},
+	} {
+		if m.want != m.got {
+			return fmt.Errorf("%w: expected %s %q, statement says %q",
+				ErrNotAddressedToUs, m.field, m.want, m.got)
+		}
+	}
+
 	if now.Before(s.NotBefore) || now.After(s.NotAfter) {
 		return fmt.Errorf("%w: %s is outside %s..%s",
-			ErrBadSignature, now.UTC(), s.NotBefore.UTC(), s.NotAfter.UTC())
+			ErrExpired, now.UTC(), s.NotBefore.UTC(), s.NotAfter.UTC())
 	}
 	return nil
 }

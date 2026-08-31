@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +25,7 @@ func testKey(t *testing.T, domain string, seed byte) Key {
 	for i := range s {
 		s[i] = seed
 	}
-	k, err := NewKey(domain, ed25519.NewKeyFromSeed(s))
+	k, err := NewKey(domain, s)
 	if err != nil {
 		t.Fatalf("NewKey: %v", err)
 	}
@@ -41,6 +43,17 @@ func rootFor(t *testing.T, keys ...Key) TrustRoot {
 		t.Fatalf("NewTrustRoot: %v", err)
 	}
 	return root
+}
+
+// expect is what every verifier in these tests requires, matching
+// validStatement. A test that wants to prove a MISMATCH varies one field.
+func expect(domain string) Expect {
+	return Expect{
+		Domain:      domain,
+		Issuer:      "billing-engine",
+		Audience:    "customer",
+		Environment: "prod",
+	}
 }
 
 func validStatement() Statement {
@@ -62,12 +75,12 @@ func TestASignedStatementVerifiesAgainstItsPinnedKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
-	if err := Verify(rootFor(t, k), signed, DomainCustomerAcceptance, at.Add(time.Hour)); err != nil {
+	if err := Verify(rootFor(t, k), signed, expect(DomainCustomerAcceptance), at.Add(time.Hour)); err != nil {
 		t.Fatalf("a statement this deployment just signed did not verify: %v", err)
 	}
 }
 
-// 🔴 docs/VERIFICATION.md:79-80: "A key valid for `billing-capabilities/v1`
+// 🔴 docs/VERIFICATION.md:86-87: "A key valid for `billing-capabilities/v1`
 // therefore cannot sign `customer-acceptance/v1`."
 //
 // Both halves are tested: the key refuses to sign outside its domain, AND a
@@ -101,7 +114,7 @@ func TestASignatureFromOneDomainDoesNotVerifyInAnother(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTrustRoot: %v", err)
 	}
-	if err := Verify(root, signed, DomainCustomerAcceptance, at.Add(time.Hour)); !errors.Is(err, ErrDomainMismatch) {
+	if err := Verify(root, signed, expect(DomainCustomerAcceptance), at.Add(time.Hour)); !errors.Is(err, ErrDomainMismatch) {
 		t.Fatalf("a capabilities signature verified as a customer acceptance: %v", err)
 	}
 }
@@ -117,7 +130,7 @@ func TestAKeyTheRootDoesNotHoldIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
-	if err := Verify(rootFor(t, other), signed, DomainCustomerAcceptance, at.Add(time.Hour)); !errors.Is(err, ErrUnknownKey) {
+	if err := Verify(rootFor(t, other), signed, expect(DomainCustomerAcceptance), at.Add(time.Hour)); !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("a statement signed by an unpinned key verified: %v", err)
 	}
 }
@@ -129,19 +142,7 @@ func TestEveryStatementFieldIsInsideTheSignature(t *testing.T) {
 	k := testKey(t, DomainCustomerAcceptance, 5)
 	root := rootFor(t, k)
 
-	edits := map[string]func(*Statement){
-		"Issuer":        func(s *Statement) { s.Issuer = "someone-else" },
-		"Audience":      func(s *Statement) { s.Audience = "another-party" },
-		"Environment":   func(s *Statement) { s.Environment = "staging" },
-		"Schema":        func(s *Statement) { s.Schema = "other/v1" },
-		"PayloadDigest": func(s *Statement) { s.PayloadDigest = "def456" },
-		"Checkpoint":    func(s *Statement) { s.Checkpoint = "outbox:2" },
-		"NotBefore":     func(s *Statement) { s.NotBefore = at.Add(-time.Hour) },
-		"NotAfter":      func(s *Statement) { s.NotAfter = at.Add(48 * time.Hour) },
-		"KeyID":         func(s *Statement) { s.KeyID = strings.Repeat("0", 32) },
-	}
-
-	for name, edit := range edits {
+	for name, edit := range statementEdits {
 		t.Run(name, func(t *testing.T) {
 			signed, err := k.Sign(validStatement())
 			if err != nil {
@@ -149,7 +150,7 @@ func TestEveryStatementFieldIsInsideTheSignature(t *testing.T) {
 			}
 			edit(&signed.Statement)
 
-			err = Verify(root, signed, DomainCustomerAcceptance, at.Add(time.Hour))
+			err = Verify(root, signed, expect(DomainCustomerAcceptance), at.Add(time.Hour))
 			if err == nil {
 				t.Fatalf("editing %s after signing left the statement verifying; "+
 					"the field is outside what the signature covers", name)
@@ -160,20 +161,104 @@ func TestEveryStatementFieldIsInsideTheSignature(t *testing.T) {
 
 // The encoding must be injective: two different statements must never
 // produce one signable string, or a signature over either attests to both.
-// A separator-joined encoding fails exactly here, and several of these
-// fields are free text a caller controls.
+//
+// 🔴 The first version of this test compared ("ab","c") against ("a","bc"),
+// and review showed it proves almost nothing: under a separator-joined
+// encoding those are "ab|c" and "a|bc", which already differ, so the test
+// passed with the very encoder its comment claimed to exclude. It detected a
+// bare-concatenation encoder and nothing else.
+//
+// What actually has to hold is that the code is PREFIX-FREE: reading a
+// decimal length, then a colon, then exactly that many bytes consumes each
+// field unambiguously, so a value that itself looks like a length prefix
+// cannot be reparsed as one. This searches for a collision over an alphabet
+// built from the encoding's own metacharacters, which is where a
+// separator-joined or naive encoder breaks.
 func TestTheEncodingCannotBeConfusedAcrossFieldBoundaries(t *testing.T) {
-	a := validStatement()
-	a.Issuer = "ab"
-	a.Audience = "c"
+	adversarial := []string{
+		"", "0", "1", ":", "|", "0:", ":0", "1:", "::", "10:", "9:x", "2:ab",
+		"ab", "a|b", "1:a", "11:", "|:", ":|",
+	}
 
-	b := validStatement()
-	b.Issuer = "a"
-	b.Audience = "bc"
+	seen := map[string][]string{}
+	for _, issuer := range adversarial {
+		for _, audience := range adversarial {
+			for _, schema := range adversarial {
+				st := validStatement()
+				st.Issuer, st.Audience, st.Schema = issuer, audience, schema
+				// signedBytes is taken directly: validate() would refuse the
+				// empty values, and it is the ENCODING under test here, not
+				// the completeness rule.
+				enc := string(st.signedBytes())
+				fields := []string{issuer, audience, schema}
+				if prev, dup := seen[enc]; dup {
+					t.Fatalf("two different statements encode identically:\n  %q\n  %q\n"+
+						"a signature over one would attest to the other", prev, fields)
+				}
+				seen[enc] = fields
+			}
+		}
+	}
+	if len(seen) != len(adversarial)*len(adversarial)*len(adversarial) {
+		t.Fatalf("expected %d distinct encodings, got %d",
+			len(adversarial)*len(adversarial)*len(adversarial), len(seen))
+	}
+}
 
-	if string(a.signedBytes()) == string(b.signedBytes()) {
-		t.Fatal("two different statements produced identical signable bytes; " +
-			"a signature over one would attest to the other")
+// 🔴 The floor under TestEveryStatementFieldIsInsideTheSignature.
+//
+// That test enumerates Statement's fields by hand, and a hand-written map
+// cannot notice what is not in it — the sibling PR in this same wave exists
+// because three canonical supersessions each added a sealed field with no
+// case and nothing failed. Review proved the same hole here: adding a field
+// to Statement and wiring it into neither signedBytes nor validate leaves the
+// whole suite green.
+//
+// So this reflects over Statement and requires every field to be named by
+// both the coverage map and the completeness map.
+func TestNoStatementFieldEscapesTheSignature(t *testing.T) {
+	// Fields set by Sign rather than by the caller, and therefore not in the
+	// omission table — Sign overwrites them, so they cannot be omitted.
+	setBySign := map[string]bool{"Algorithm": true, "KeyID": true, "Domain": true}
+
+	covered := map[string]bool{}
+	for name := range statementEdits {
+		covered[name] = true
+	}
+	required := map[string]bool{}
+	for name := range statementOmissions {
+		required[name] = true
+	}
+
+	st := reflect.TypeOf(Statement{})
+	if st.NumField() < 8 {
+		t.Fatalf("Statement has %d fields; the reflection target looks wrong", st.NumField())
+	}
+	for i := 0; i < st.NumField(); i++ {
+		f := st.Field(i)
+		if !covered[f.Name] {
+			t.Errorf("Statement.%s has no case in statementEdits proving it is inside the "+
+				"signature. A field the signature does not cover can be rewritten after "+
+				"signing and the statement still verifies.", f.Name)
+		}
+		if setBySign[f.Name] {
+			continue
+		}
+		if !required[f.Name] {
+			t.Errorf("Statement.%s has no case in statementOmissions proving it is REQUIRED. "+
+				"docs/VERIFICATION.md lists ten things a signed statement must name, and a "+
+				"field that may be blank is one a verifier cannot rely on.", f.Name)
+		}
+	}
+	for name := range covered {
+		if _, ok := st.FieldByName(name); !ok {
+			t.Errorf("statementEdits names %q, which is not a field of Statement", name)
+		}
+	}
+	for name := range required {
+		if _, ok := st.FieldByName(name); !ok {
+			t.Errorf("statementOmissions names %q, which is not a field of Statement", name)
+		}
 	}
 }
 
@@ -184,29 +269,19 @@ func TestAnExpiredStatementIsRefused(t *testing.T) {
 		t.Fatalf("Sign: %v", err)
 	}
 	for _, when := range []time.Time{at.Add(-time.Second), at.Add(validity + time.Second)} {
-		if err := Verify(rootFor(t, k), signed, DomainCustomerAcceptance, when); err == nil {
+		if err := Verify(rootFor(t, k), signed, expect(DomainCustomerAcceptance), when); err == nil {
 			t.Fatalf("a statement verified at %s, outside its validity interval", when)
 		}
 	}
 }
 
-// docs/VERIFICATION.md:78-79 lists ten things a signed statement must carry.
+// docs/VERIFICATION.md:85-86 lists ten things a signed statement must carry.
 // A statement omitting one is not a shorter statement — it is one a verifier
 // cannot fully check, so it is refused rather than signed.
 func TestAnIncompleteStatementIsNotSigned(t *testing.T) {
 	k := testKey(t, DomainCustomerAcceptance, 7)
 
-	omissions := map[string]func(*Statement){
-		"issuer":         func(s *Statement) { s.Issuer = "" },
-		"audience":       func(s *Statement) { s.Audience = "" },
-		"environment":    func(s *Statement) { s.Environment = "" },
-		"schema":         func(s *Statement) { s.Schema = "" },
-		"payload digest": func(s *Statement) { s.PayloadDigest = "" },
-		"checkpoint":     func(s *Statement) { s.Checkpoint = "" },
-		"not before":     func(s *Statement) { s.NotBefore = time.Time{} },
-		"not after":      func(s *Statement) { s.NotAfter = time.Time{} },
-	}
-	for name, omit := range omissions {
+	for name, omit := range statementOmissions {
 		t.Run(name, func(t *testing.T) {
 			s := validStatement()
 			omit(&s)
@@ -247,7 +322,7 @@ func TestADeploymentWithNoKeyCannotSign(t *testing.T) {
 func TestLoadReadsOnlyTheVariablesItIsGiven(t *testing.T) {
 	k := testKey(t, DomainBillingEvidence, 9)
 	env := map[string]string{
-		EnvBillingEvidenceKey: hex.EncodeToString(k.private),
+		EnvBillingEvidenceKey: hex.EncodeToString(k.private.Seed()),
 	}
 	s, err := Load(func(name string) string { return env[name] })
 	if err != nil {
@@ -269,8 +344,9 @@ func TestLoadReadsOnlyTheVariablesItIsGiven(t *testing.T) {
 // than whoever provisioned the key configured, and nothing would say so.
 func TestMalformedKeyMaterialRefusesToLoad(t *testing.T) {
 	for name, value := range map[string]string{
-		"not hex":   "zzzz",
-		"too short": hex.EncodeToString([]byte("short")),
+		"not hex":              "zzzz",
+		"too short":            hex.EncodeToString([]byte("short")),
+		"the 64-byte key form": strings.Repeat("ab", ed25519.PrivateKeySize),
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(func(n string) string {
@@ -300,7 +376,11 @@ func TestMalformedKeyMaterialRefusesToLoad(t *testing.T) {
 // claiming evidence readiness is claiming something untrue. When a key is
 // provisioned, this test is the place the change is declared.
 func TestTheRepositoryTrustRootIsEmptyUntilAKeyIsProvisioned(t *testing.T) {
-	if n := Repository().Len(); n != 0 {
+	root, err := Repository()
+	if err != nil {
+		t.Fatalf("the pinned trust root does not build: %v", err)
+	}
+	if n := root.Len(); n != 0 {
 		t.Fatalf("the pinned trust root has %d keys. If a key has been "+
 			"provisioned, update this test to say so and state which "+
 			"environment holds the private half — the count is what the "+
@@ -321,7 +401,7 @@ func TestAPinnedKeyMustCarryItsOwnDerivedID(t *testing.T) {
 }
 
 func TestAnUnknownDomainIsRefusedEverywhere(t *testing.T) {
-	if _, err := NewKey("made-up/v1", make([]byte, ed25519.PrivateKeySize)); !errors.Is(err, ErrUnknownDomain) {
+	if _, err := NewKey("made-up/v1", make([]byte, SeedSize)); !errors.Is(err, ErrUnknownDomain) {
 		t.Fatalf("NewKey accepted an unknown domain: %v", err)
 	}
 	if _, err := NewTrustRoot([]PinnedKey{{ID: "x", Domain: "made-up/v1"}}); !errors.Is(err, ErrUnknownDomain) {
@@ -342,7 +422,7 @@ func TestAnUnknownAlgorithmIsRefused(t *testing.T) {
 		t.Fatalf("Sign: %v", err)
 	}
 	signed.Statement.Algorithm = "rsa-pkcs1"
-	if err := Verify(rootFor(t, k), signed, DomainCustomerAcceptance, at.Add(time.Hour)); !errors.Is(err, ErrAlgorithmUnknown) {
+	if err := Verify(rootFor(t, k), signed, expect(DomainCustomerAcceptance), at.Add(time.Hour)); !errors.Is(err, ErrAlgorithmUnknown) {
 		t.Fatalf("a statement naming an unimplemented algorithm was checked anyway: %v", err)
 	}
 }
@@ -363,7 +443,7 @@ func TestAGarbledSignatureIsRefused(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			bad := signed
 			bad.Signature = sig
-			if err := Verify(root, bad, DomainCustomerAcceptance, at.Add(time.Hour)); !errors.Is(err, ErrBadSignature) {
+			if err := Verify(root, bad, expect(DomainCustomerAcceptance), at.Add(time.Hour)); !errors.Is(err, ErrBadSignature) {
 				t.Fatalf("a %s signature verified: %v", name, err)
 			}
 		})
@@ -400,7 +480,7 @@ func TestARewrittenDomainDoesNotSurviveTheSignature(t *testing.T) {
 		t.Fatalf("NewTrustRoot: %v", err)
 	}
 
-	if err := Verify(root, signed, DomainCustomerAcceptance, at.Add(time.Hour)); !errors.Is(err, ErrBadSignature) {
+	if err := Verify(root, signed, expect(DomainCustomerAcceptance), at.Add(time.Hour)); !errors.Is(err, ErrBadSignature) {
 		t.Fatalf("a capabilities signature was re-labelled a customer acceptance and verified: %v", err)
 	}
 }
@@ -423,7 +503,238 @@ func TestARewrittenKeyIDDoesNotSurviveTheSignature(t *testing.T) {
 	}}
 	signed.Statement.KeyID = "deadbeefdeadbeefdeadbeefdeadbeef"
 
-	if err := Verify(forged, signed, DomainBillingEvidence, at.Add(time.Hour)); !errors.Is(err, ErrBadSignature) {
+	if err := Verify(forged, signed, expect(DomainBillingEvidence), at.Add(time.Hour)); !errors.Is(err, ErrBadSignature) {
 		t.Fatalf("a statement whose key id was rewritten verified: %v", err)
 	}
+}
+
+// statementEdits perturbs each Statement field AFTER signing. Keys are the
+// Go field names, so TestNoStatementFieldEscapesTheSignature can compare them
+// against the type by reflection.
+var statementEdits = map[string]func(*Statement){
+	"Issuer":        func(s *Statement) { s.Issuer = "someone-else" },
+	"Audience":      func(s *Statement) { s.Audience = "another-party" },
+	"Environment":   func(s *Statement) { s.Environment = "staging" },
+	"Schema":        func(s *Statement) { s.Schema = "other/v1" },
+	"PayloadDigest": func(s *Statement) { s.PayloadDigest = "def456" },
+	"Checkpoint":    func(s *Statement) { s.Checkpoint = "outbox:2" },
+	"NotBefore":     func(s *Statement) { s.NotBefore = at.Add(-time.Hour) },
+	"NotAfter":      func(s *Statement) { s.NotAfter = at.Add(48 * time.Hour) },
+	"Algorithm":     func(s *Statement) { s.Algorithm = "rsa-pkcs1" },
+	"Domain":        func(s *Statement) { s.Domain = DomainBillingEvidence },
+	"KeyID":         func(s *Statement) { s.KeyID = strings.Repeat("0", 32) },
+}
+
+// statementOmissions blanks each caller-supplied field before signing. Every
+// one must be refused: docs/VERIFICATION.md names ten things a signed
+// statement must carry, and a field that may be blank is one a verifier
+// cannot rely on.
+var statementOmissions = map[string]func(*Statement){
+	"Issuer":        func(s *Statement) { s.Issuer = "" },
+	"Audience":      func(s *Statement) { s.Audience = "" },
+	"Environment":   func(s *Statement) { s.Environment = "" },
+	"Schema":        func(s *Statement) { s.Schema = "" },
+	"PayloadDigest": func(s *Statement) { s.PayloadDigest = "" },
+	"Checkpoint":    func(s *Statement) { s.Checkpoint = "" },
+	"NotBefore":     func(s *Statement) { s.NotBefore = time.Time{} },
+	"NotAfter":      func(s *Statement) { s.NotAfter = time.Time{} },
+}
+
+// 🔴 The 64-byte private-key form must be REFUSED, not accepted.
+//
+// This is the defect that made the first version of this package dangerous.
+// An ed25519 private key is seed||public and nothing in the format makes the
+// halves agree, so 64 bytes of raw randomness — `openssl rand -hex 64`, the
+// most natural thing to paste into SSM — loaded without complaint, reported
+// CanSign, signed, and produced signatures that verified against nothing. The
+// relying party saw a forgery signal for a deployment that was misconfigured.
+func TestThePrivateKeyFormIsRefusedInFavourOfTheSeed(t *testing.T) {
+	seed := make([]byte, SeedSize)
+	for i := range seed {
+		seed[i] = 9
+	}
+	full := ed25519.NewKeyFromSeed(seed)
+
+	if _, err := NewKey(DomainBillingEvidence, full); !errors.Is(err, ErrKeyInconsistent) {
+		t.Fatalf("the 64-byte private-key form was accepted: %v", err)
+	}
+
+	// And the specific poison: seed||seed, which the length check alone
+	// cannot tell from a real key.
+	spliced := append(append([]byte{}, seed...), seed...)
+	if _, err := NewKey(DomainBillingEvidence, spliced); !errors.Is(err, ErrKeyInconsistent) {
+		t.Fatalf("seed||seed was accepted as a key: %v", err)
+	}
+}
+
+// A Key built from a seed always signs something its own public half
+// verifies. NewKey proves it before returning, so this asserts the property
+// end to end rather than trusting the construction.
+func TestAKeyAlwaysProducesAVerifiableSignature(t *testing.T) {
+	k := testKey(t, DomainBillingEvidence, 21)
+	signed, err := k.Sign(validStatement())
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := Verify(rootFor(t, k), signed, expect(DomainBillingEvidence), at.Add(time.Hour)); err != nil {
+		t.Fatalf("a key derived from a seed produced a signature its own public half rejects: %v", err)
+	}
+}
+
+// 🔴 A statement signed for another environment, issuer or audience must not
+// verify here.
+//
+// All three are inside the signature and all three were compared to nothing,
+// so a staging signature verified in production. A field a verifier never
+// reads answers no question.
+func TestAStatementForSomeoneElseIsRefused(t *testing.T) {
+	k := testKey(t, DomainCustomerAcceptance, 22)
+	root := rootFor(t, k)
+
+	for name, vary := range map[string]func(*Statement){
+		"environment": func(s *Statement) { s.Environment = "staging" },
+		"issuer":      func(s *Statement) { s.Issuer = "some-other-service" },
+		"audience":    func(s *Statement) { s.Audience = "not-this-verifier" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := validStatement()
+			vary(&st)
+			signed, err := k.Sign(st)
+			if err != nil {
+				t.Fatalf("Sign: %v", err)
+			}
+			err = Verify(root, signed, expect(DomainCustomerAcceptance), at.Add(time.Hour))
+			if !errors.Is(err, ErrNotAddressedToUs) {
+				t.Fatalf("a statement whose %s is not ours verified: %v", name, err)
+			}
+			// It must NOT read as a forgery: the signature is perfect.
+			if errors.Is(err, ErrBadSignature) {
+				t.Fatalf("a misaddressed but authentic statement reported as a forgery: %v", err)
+			}
+		})
+	}
+}
+
+// A verifier that cannot state what it expects must not verify anything.
+func TestAVerifierMustStateWhatItExpects(t *testing.T) {
+	k := testKey(t, DomainCustomerAcceptance, 23)
+	signed, err := k.Sign(validStatement())
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	root := rootFor(t, k)
+
+	full := expect(DomainCustomerAcceptance)
+	for name, blank := range map[string]func(*Expect){
+		"issuer":      func(e *Expect) { e.Issuer = "" },
+		"audience":    func(e *Expect) { e.Audience = "" },
+		"environment": func(e *Expect) { e.Environment = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := full
+			blank(&e)
+			if err := Verify(root, signed, e, at.Add(time.Hour)); !errors.Is(err, ErrIncomplete) {
+				t.Fatalf("a verifier that stated no %s verified anyway: %v", name, err)
+			}
+		})
+	}
+}
+
+// 🔴 Expiry is not forgery.
+//
+// An authentic statement past its window used to return ErrBadSignature, so a
+// caller classifying refusals could not tell a stale evidence record from an
+// attack. Both are refusals; they are not the same event.
+func TestAnExpiredStatementIsNotReportedAsAForgery(t *testing.T) {
+	k := testKey(t, DomainCustomerAcceptance, 24)
+	signed, err := k.Sign(validStatement())
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	err = Verify(rootFor(t, k), signed, expect(DomainCustomerAcceptance), at.Add(validity+time.Hour))
+	if !errors.Is(err, ErrExpired) {
+		t.Fatalf("an expired statement did not report as expired: %v", err)
+	}
+	if errors.Is(err, ErrBadSignature) {
+		t.Fatalf("an expired but perfectly signed statement reported as a forgery: %v", err)
+	}
+}
+
+// 🔴 One key must not serve two domains.
+//
+// The package's separation claim is that a leaked capabilities key cannot
+// mint a customer acceptance. That holds for the TYPE — a Key refuses to sign
+// outside its domain — and did not hold for a DEPLOYMENT handed the same
+// material twice, which is the easy mistake when three variables are
+// provisioned by hand.
+func TestOneKeyCannotServeTwoDomains(t *testing.T) {
+	k := testKey(t, DomainBillingEvidence, 25)
+	material := hex.EncodeToString(k.private.Seed())
+
+	_, err := Load(func(name string) string {
+		switch name {
+		case EnvBillingEvidenceKey, EnvCapabilitiesKey:
+			return material
+		}
+		return ""
+	})
+	if !errors.Is(err, ErrKeyReused) {
+		t.Fatalf("the same key loaded for two domains: %v", err)
+	}
+}
+
+// 🔴 Neither a Key nor a Signer may print its material.
+//
+// fmt prints unexported struct fields, so without String/GoString a single
+// %v — in a log line, a panic message, a debugger dump — emits the complete
+// private key.
+func TestKeyMaterialNeverReachesAFormattedString(t *testing.T) {
+	k := testKey(t, DomainBillingEvidence, 26)
+	s, err := Load(func(name string) string {
+		if name == EnvBillingEvidenceKey {
+			return hex.EncodeToString(k.private.Seed())
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Every representation the material could take in a formatted string.
+	secrets := []string{
+		hex.EncodeToString(k.private),
+		hex.EncodeToString(k.private.Seed()),
+		fmt.Sprint([]byte(k.private)),
+		fmt.Sprint([]byte(k.private.Seed())),
+	}
+
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		for _, subject := range []any{k, s, &k, &s} {
+			out := fmt.Sprintf(verb, subject)
+			for _, secret := range secrets {
+				if strings.Contains(out, secret) {
+					t.Fatalf("%s of a %T leaked the key material", verb, subject)
+				}
+			}
+			if !strings.Contains(out, "REDACTED") && !strings.Contains(out, "no keys") {
+				t.Fatalf("%s of a %T does not go through the redacting formatter: %s", verb, subject, out)
+			}
+		}
+	}
+}
+
+// The pinned trust root must not be reachable for mutation from another
+// package. An exported slice is not pinned — anything in the tree could
+// append to it and every later Repository() would honour the addition, which
+// is the failure the pinning rule exists to prevent.
+func TestThePinnedRootIsNotAnExportedVariable(t *testing.T) {
+	if PinnedKeyCount() != 0 {
+		t.Fatalf("the pinned root holds %d keys; if one has been provisioned, say so here "+
+			"and in TestTheRepositoryTrustRootIsEmptyUntilAKeyIsProvisioned", PinnedKeyCount())
+	}
+	// The compile-time half of this test is that `signing.PinnedKeys` does
+	// not exist to be assigned from outside the package. It is unexported,
+	// so a mutation attempt from another package does not build — which is a
+	// stronger guarantee than any assertion here could make, and this is the
+	// note that says why there is no runtime check for it.
 }
