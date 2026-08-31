@@ -458,3 +458,81 @@ func TestStandingModeRefusesAFreshAcceptance(t *testing.T) {
 		t.Errorf("refusals = %v, want %v", verdict.Refused, ClauseAuthorityEvidence)
 	}
 }
+
+// 🔴 The sealed rail must be the accepted one.
+//
+// docs/DESIGN.md:1030-1037: the authorization "names permitted rails", the
+// engine chooses among THOSE, and "a private caller must not select a weaker
+// adapter to bypass notice, authentication, tax, ceilings or reconciliation".
+//
+// This test exists because mutation testing caught its absence: deleting the
+// rail comparison from ClauseRailSupportsPlan produced ZERO failures across
+// the whole predicate suite. A guard nothing exercises is the same defect as
+// a guard that checks nothing — the clause would have gone back to being a
+// bare s.Unbuilt bool and every test would still have passed.
+func TestARailOtherThanTheAcceptedOneIsRefused(t *testing.T) {
+	base := permittedState(t)
+
+	for _, tc := range []struct {
+		name string
+		rail string
+	}{
+		{"a different provider", "adyen"},
+		{"a near-miss on the accepted one", "stripe-connect"},
+		{"no rail sealed at all", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := base
+			state.Intent = resealWithRail(t, tc.rail)
+
+			verdict := Evaluate(state)
+			if verdict.Permitted {
+				t.Fatalf("an intent sealed on rail %q was permitted against an "+
+					"authorization accepting %q", tc.rail, state.Authorization.Provider())
+			}
+			var sawRail bool
+			for _, c := range verdict.Refused {
+				if c == ClauseRailSupportsPlan {
+					sawRail = true
+				}
+			}
+			if !sawRail {
+				t.Fatalf("rail %q was refused, but not by ClauseRailSupportsPlan: %v.\n"+
+					"Refusing for an unrelated reason would let this test pass while "+
+					"the rail check itself was gone.", tc.rail, verdict.Refused)
+			}
+		})
+	}
+}
+
+// resealWithRail rebuilds sealedIntent's draft on a different rail.
+//
+// The rail is in the digest, so it cannot be poked onto an existing sealed
+// intent — it has to be sealed that way from the start, which is the property
+// under test.
+func resealWithRail(t *testing.T, rail string) intent.ChargeIntent {
+	t.Helper()
+	sealed, err := intent.Seal(intent.Draft{
+		Payer:             intent.Subject{Kind: "org", ID: "org-1"},
+		Currency:          "USD",
+		Lines:             []intent.Line{intent.NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 25)},
+		Kind:              kind,
+		PriceBookRevision: "pb-2026-08",
+		TermsRevision:     "terms-2026-01",
+		Tax: intent.TaxDetermination{
+			Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-2026-05", AmountMicros: 1_250,
+			Verification: intent.TaxNotApplicable,
+		},
+		AuthorizationID:       "auth-1",
+		NoticePolicy:          "email/v1",
+		SelectedRail:          rail,
+		RoutingPolicyRevision: "routing-2026-08",
+		ExecuteNotBefore:      windowStart,
+		ExecuteNotAfter:       windowEnd,
+		SourceFactKeys:        []string{"fact-1"},
+	})
+	if err != nil {
+		t.Fatalf("Seal(rail=%q): %v", rail, err)
+	}
+	return sealed
+}
