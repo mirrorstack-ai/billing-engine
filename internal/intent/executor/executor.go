@@ -255,9 +255,21 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 	}
 
 	result, collectErr := e.collector.Collect(ctx, Debit{
-		IntentDigest:   digest,
-		Payer:          sealed.Payer(),
-		AmountMicros:   sealed.TotalMicros(),
+		IntentDigest: digest,
+		Payer:        sealed.Payer(),
+		// 🔴 The provider remainder, NEVER the gross obligation.
+		//
+		// docs/DESIGN.md:1284: "The integer handed to an adapter is the
+		// sealed providerRemainder — never grossObligation, and never
+		// wallet funding."
+		//
+		// These are EQUAL today only because fundingFor hardcodes a zero
+		// wallet allocation. The moment a wallet split exists, handing the
+		// total here charges the rail for the whole obligation while the
+		// wallet is drawn for its share as well — a 20,000,000 intent split
+		// 6,000,000/14,000,000 would collect 26,000,000. Reading the
+		// remainder is correct now and stays correct then.
+		AmountMicros:   funding.ProviderRemainderMicros,
 		Currency:       sealed.Currency(),
 		IdempotencyKey: "intent-" + digest,
 	})
