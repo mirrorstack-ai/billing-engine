@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence/evidencetest"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/executor"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/predicate"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/store"
@@ -49,13 +50,15 @@ func TestAnIntentCollectsThroughTheStripeSandbox(t *testing.T) {
 	s := store.New(pool)
 	sealed := seedIntentReadyToCollect(t, s, customerID)
 
-	exec := executor.New(
+	exec, execErr := executor.New(
 		s,
 		stripeadapter.New(client, payer),
+		evidencetest.Recorder(t),
 		"sandbox-e2e",
 		func() time.Time { return time.Now().UTC() },
 		func(context.Context) executor.Environment { return fullyEvidenced() },
 	)
+	require.NoError(t, execErr)
 
 	out, err := exec.Execute(ctx, sealed.Digest())
 	require.NoError(t, err)
@@ -131,12 +134,14 @@ func TestARefusedIntentNeverReachesTheSandbox(t *testing.T) {
 	env := fullyEvidenced()
 	env.BuildIdentified = false // docs/VERIFICATION.md §2
 
-	out, err := executor.New(
-		s, stripeadapter.New(client, payer), "sandbox-e2e",
+	exec2, execErr2 := executor.New(
+		s, stripeadapter.New(client, payer), evidencetest.Recorder(t), "sandbox-e2e",
 		func() time.Time { return time.Now().UTC() },
 		func(context.Context) executor.Environment { return env },
-	).Execute(ctx, sealed.Digest())
+	)
+	require.NoError(t, execErr2)
 
+	out, err := exec2.Execute(ctx, sealed.Digest())
 	require.NoError(t, err)
 	require.False(t, out.Permitted)
 	require.Contains(t, out.Refused, predicate.ClauseBuildIdentified)

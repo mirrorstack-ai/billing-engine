@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
 )
 
 // Store reads and writes sealed intent state.
@@ -60,6 +61,39 @@ var (
 // document arriving twice, and a retrying caller should not have to
 // tell the difference.
 func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) error {
+	return s.saveIntent(ctx, sealed, nil, evidence.Event{})
+}
+
+// SaveIntentWithEvidence stores a sealed intent AND its INV-014 record, in one
+// transaction.
+//
+// This is the path a proposer takes. Sealing an intent is the first of
+// docs/DESIGN.md:388's eight events, and it is the only one reachable in
+// production today — so it is the one that decides whether the outbox is a
+// table with writers or a table with a comment about writers.
+//
+// Committing them together is the point: an intent that exists without its
+// evidence record is a document the customer has no independent trace of, and
+// no later reconciler can distinguish "never recorded" from "recorded and
+// withheld".
+func (s *Store) SaveIntentWithEvidence(
+	ctx context.Context,
+	sealed intent.ChargeIntent,
+	rec *evidence.Recorder,
+	e evidence.Event,
+) error {
+	if rec == nil {
+		return ErrNoRecorder
+	}
+	return s.saveIntent(ctx, sealed, rec, e)
+}
+
+func (s *Store) saveIntent(
+	ctx context.Context,
+	sealed intent.ChargeIntent,
+	rec *evidence.Recorder,
+	e evidence.Event,
+) error {
 	if !sealed.Sealed() {
 		return errors.New("store: refusing to save an unsealed intent")
 	}
@@ -97,6 +131,15 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 			// Already stored. The digest covers every sealed field, so
 			// the existing row is this document — there is nothing to
 			// reconcile and nothing to overwrite.
+			//
+			// The evidence record is still attempted, and its own
+			// uniqueness constraint makes that idempotent too. A first
+			// attempt that stored the intent and then failed before its
+			// record would otherwise leave the intent permanently
+			// without one, since every retry would return here.
+			if rec != nil {
+				return appendEvidence(ctx, tx, rec, e)
+			}
 			return nil
 		}
 
@@ -121,6 +164,10 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 			); err != nil {
 				return fmt.Errorf("insert source fact %q: %w", key, err)
 			}
+		}
+
+		if rec != nil {
+			return appendEvidence(ctx, tx, rec, e)
 		}
 		return nil
 	})

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence/evidencetest"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 )
 
@@ -58,7 +61,11 @@ func TestArmingActuallyAttachesTheSeam(t *testing.T) {
 		t.Fatal("a freshly built service is already armed")
 	}
 
-	armed := svc.WithIntentProposer(proposer.New(nilSaver{}))
+	p, err := proposer.New(nilSaver{}, evidencetest.Recorder(t), func() time.Time { return evidencetest.At })
+	if err != nil {
+		t.Fatalf("proposer.New: %v", err)
+	}
+	armed := svc.WithIntentProposer(p)
 	if !armed.IntentProposerArmed() {
 		t.Fatal("WithIntentProposer did not attach the seam")
 	}
@@ -68,4 +75,8 @@ func TestArmingActuallyAttachesTheSeam(t *testing.T) {
 // not a save. Giving it a body would test the proposer instead.
 type nilSaver struct{}
 
-func (nilSaver) SaveIntent(_ context.Context, _ intent.ChargeIntent) error { panic("not reached") }
+func (nilSaver) SaveIntentWithEvidence(
+	_ context.Context, _ intent.ChargeIntent, _ *evidence.Recorder, _ evidence.Event,
+) error {
+	panic("not reached")
+}

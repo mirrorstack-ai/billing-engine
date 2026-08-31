@@ -7,14 +7,30 @@ import (
 	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence/evidencetest"
 )
 
 type recordingStore struct {
 	saved []intent.ChargeIntent
+	event evidence.Event
 	err   error
 }
 
-func (s *recordingStore) SaveIntent(_ context.Context, sealed intent.ChargeIntent) error {
+func (s *recordingStore) SaveIntentWithEvidence(
+	_ context.Context, sealed intent.ChargeIntent, rec *evidence.Recorder, e evidence.Event,
+) error {
+	// The proposer must hand down a recorder and a well-formed event. A store
+	// that ignored them would let the proposer's wiring rot unnoticed.
+	if rec == nil {
+		s.err = errors.New("proposer called the store with no recorder")
+		return s.err
+	}
+	s.event = e
+	return s.saveIntent(sealed)
+}
+
+func (s *recordingStore) saveIntent(sealed intent.ChargeIntent) error {
 	if s.err != nil {
 		return s.err
 	}
@@ -52,7 +68,7 @@ func domainCharge() Charge {
 func TestProposingSealsAndStores(t *testing.T) {
 	store := &recordingStore{}
 
-	sealed, err := New(store).Propose(context.Background(), domainCharge())
+	sealed, err := newProposer(t, store).Propose(context.Background(), domainCharge())
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
@@ -76,7 +92,7 @@ func TestProposingSealsAndStores(t *testing.T) {
 // reversible, and what lets cmd/billing-cycle lose its write port.
 func TestProposingCannotCollect(t *testing.T) {
 	store := &recordingStore{}
-	if _, err := New(store).Propose(context.Background(), domainCharge()); err != nil {
+	if _, err := newProposer(t, store).Propose(context.Background(), domainCharge()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -95,7 +111,7 @@ func TestProposingCannotCollect(t *testing.T) {
 // content.
 func TestReproposingTheSameChargeIsTheSameDocument(t *testing.T) {
 	store := &recordingStore{}
-	p := New(store)
+	p := newProposer(t, store)
 
 	first, err := p.Propose(context.Background(), domainCharge())
 	if err != nil {
@@ -115,7 +131,7 @@ func TestReproposingTheSameChargeIsTheSameDocument(t *testing.T) {
 // A different amount is a different document, or the digest would not
 // be an identity.
 func TestADifferentAmountIsADifferentDocument(t *testing.T) {
-	p := New(&recordingStore{})
+	p := newProposer(t, &recordingStore{})
 
 	first, err := p.Propose(context.Background(), domainCharge())
 	if err != nil {
@@ -142,7 +158,7 @@ func TestAZeroOrNegativeChargeIsRefused(t *testing.T) {
 			c := domainCharge()
 			c.AmountMicros = amount
 
-			sealed, err := New(&recordingStore{}).Propose(context.Background(), c)
+			sealed, err := newProposer(t, &recordingStore{}).Propose(context.Background(), c)
 			if !errors.Is(err, ErrNotProposable) {
 				t.Fatalf("err = %v, want %v", err, ErrNotProposable)
 			}
@@ -160,7 +176,7 @@ func TestAnUnsealableChargeIsRefusedAndNotStored(t *testing.T) {
 	c := domainCharge()
 	c.Tax.Resolved = false // an undetermined tax must not seal
 
-	_, err := New(store).Propose(context.Background(), c)
+	_, err := newProposer(t, store).Propose(context.Background(), c)
 	if !errors.Is(err, ErrNotProposable) {
 		t.Fatalf("err = %v, want %v", err, ErrNotProposable)
 	}
@@ -176,12 +192,54 @@ func TestAnUnsealableChargeIsRefusedAndNotStored(t *testing.T) {
 func TestAStoreFailureIsReported(t *testing.T) {
 	store := &recordingStore{err: errors.New("database is down")}
 
-	sealed, err := New(store).Propose(context.Background(), domainCharge())
+	sealed, err := newProposer(t, store).Propose(context.Background(), domainCharge())
 	if err == nil {
 		t.Fatal("a failed store returned no error")
 	}
 	if sealed.Sealed() {
 		t.Error("a charge that was never stored was returned as sealed; a leg would " +
 			"record a digest pointing at nothing")
+	}
+}
+
+// newProposer builds a Proposer with a real signing recorder, so a test
+// exercises the path a deployment takes rather than a stubbed one.
+func newProposer(t *testing.T, store Store) *Proposer {
+	t.Helper()
+	p, err := New(store, evidencetest.Recorder(t), func() time.Time { return evidencetest.At })
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p
+}
+
+// A proposer that cannot record what it seals must not be constructible.
+func TestAProposerWithNoRecorderIsRefused(t *testing.T) {
+	if _, err := New(&recordingStore{}, nil, func() time.Time { return evidencetest.At }); !errors.Is(err, ErrNoRecorder) {
+		t.Fatalf("a proposer with no evidence recorder was constructed: %v", err)
+	}
+}
+
+// The sealed-intent event must name the document it attests.
+func TestProposingRecordsASealedIntentEvent(t *testing.T) {
+	store := &recordingStore{}
+	sealed, err := newProposer(t, store).Propose(context.Background(), domainCharge())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.event.Kind != evidence.KindSealedIntent {
+		t.Errorf("event kind = %q, want %q", store.event.Kind, evidence.KindSealedIntent)
+	}
+	if store.event.IntentDigest != sealed.Digest() {
+		t.Errorf("the event names %q, the intent is %q", store.event.IntentDigest, sealed.Digest())
+	}
+	if store.event.Subject != sealed.Payer() {
+		t.Errorf("the event names a different payer than the intent")
+	}
+	if store.event.Detail != string(sealed.Kind()) {
+		t.Errorf("detail = %q, want the charge kind %q", store.event.Detail, sealed.Kind())
+	}
+	if store.event.OccurredAt.IsZero() {
+		t.Error("the event has no instant")
 	}
 }
