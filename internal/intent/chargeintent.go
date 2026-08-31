@@ -742,6 +742,12 @@ type Stored struct {
 	SourceFactKeys    []string
 	Supersedes        string
 
+	// Collects is the receivable link CollectRemainderOf sets. It is
+	// inside the digest, so a row that omits it rehydrates to a
+	// different document and does not load. It had no column and no
+	// field here until migration 063; see that migration's header.
+	Collects string
+
 	SubtotalMicros int64
 	TotalMicros    int64
 
@@ -808,12 +814,17 @@ func Rehydrate(stored Stored) (ChargeIntent, error) {
 		return ChargeIntent{}, fmt.Errorf("%w: %w", ErrDigestMismatch, err)
 	}
 
-	// The supersede link is part of what is attested, so it has to be in
+	// Both links are part of what is attested, so they have to be in
 	// place before the digest is recomputed.
-	if stored.Supersedes != "" {
-		rebuilt.supersedes = stored.Supersedes
-		rebuilt.digest = rebuilt.computeDigest()
-	}
+	//
+	// Assigned and recomputed unconditionally, rather than under an
+	// "is it set?" guard. The guard is how `collects` came to be
+	// digested and never restored: a link that is empty in the common
+	// case hides its own omission until the uncommon case arrives, and
+	// then the intent does not load at all.
+	rebuilt.supersedes = stored.Supersedes
+	rebuilt.collects = stored.Collects
+	rebuilt.digest = rebuilt.computeDigest()
 
 	if rebuilt.digest != stored.Digest {
 		return ChargeIntent{}, fmt.Errorf("%w: stored %s, recomputed %s",

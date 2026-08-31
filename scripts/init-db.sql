@@ -105,3 +105,4 @@
 \i migrations/billing/060_intent_tax_verification.up.sql
 \i migrations/billing/061_intent_funding_split.up.sql
 \i migrations/billing/062_intent_rail.up.sql
+\i migrations/billing/063_seal_every_sealed_column.up.sql

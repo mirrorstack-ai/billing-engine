@@ -3,6 +3,8 @@ package intent
 import (
 	"errors"
 	"math"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,47 +109,162 @@ func TestDigestDistinguishesLineGrouping(t *testing.T) {
 // Every sealed field must reach the digest. A field outside it is a
 // field that can differ between the document a customer read and the
 // one that settles.
+//
+// 🔴 The keys are Draft field paths, not prose, and TestNoDraftFieldEscapes
+// TheDigestMutations below turns that into a floor: a Draft field with no
+// case here fails the build.
+//
+// It is not decoration. Until 2026-08-31 this map had nineteen prose keys
+// and silently omitted FOUR sealed fields — Tax.Verification (canonical v2),
+// WalletAllocationMicros (v3), SelectedRail and RoutingPolicyRevision (v4).
+// Each was threaded through Draft, ChargeIntent, computeDigest, the store and
+// a migration, and each was added without a case proving it reached the
+// digest. Three supersessions, three omissions, and a green suite every time,
+// because a hand-written map cannot notice what is not in it.
 func TestEveryFieldChangesTheDigest(t *testing.T) {
-	base, err := Seal(validDraft())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mutations := map[string]func(*Draft){
-		"payer kind":          func(d *Draft) { d.Payer.Kind = "user" },
-		"payer id":            func(d *Draft) { d.Payer.ID = "org-2" },
-		"currency":            func(d *Draft) { d.Currency = "twd" },
-		"line meter":          func(d *Draft) { d.Lines[0].Meter = "other" },
-		"line module":         func(d *Draft) { d.Lines[0].Module = "other-core" },
-		"line module version": func(d *Draft) { d.Lines[0].ModuleVersion = "1.4.1" },
-		"line quantity":       func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_001, 25) },
-		"line unit price":     func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 26) },
-		"price book":          func(d *Draft) { d.PriceBookRevision = "pb-2026-09" },
-		"terms revision":      func(d *Draft) { d.TermsRevision = "terms-2026-02" },
-		"charge kind":         func(d *Draft) { d.Kind = KindSubscriptionStart },
-		"tax jurisdiction":    func(d *Draft) { d.Tax.Jurisdiction = "JP" },
-		"tax rule revision":   func(d *Draft) { d.Tax.RuleRevision = "tax-2026-06" },
-		"tax amount":          func(d *Draft) { d.Tax.AmountMicros = 1_251 },
-		"authorization":       func(d *Draft) { d.AuthorizationID = "auth-2" },
-		"notice policy":       func(d *Draft) { d.NoticePolicy = "sms/v1" },
-		"window start":        func(d *Draft) { d.ExecuteNotBefore = windowStart.Add(time.Second) },
-		"window end":          func(d *Draft) { d.ExecuteNotAfter = windowEnd.Add(time.Second) },
-		"source facts":        func(d *Draft) { d.SourceFactKeys = []string{"fact-2"} },
-	}
-
-	for name, mutate := range mutations {
+	for name, m := range digestMutations {
 		t.Run(name, func(t *testing.T) {
-			d := validDraft()
-			mutate(&d)
+			// A case may supply its own base when validDraft cannot
+			// express the field — see WalletAllocationMicros. Base and
+			// mutation always come from the same draft, so the pair
+			// still differs in exactly one field.
+			build := m.base
+			if build == nil {
+				build = validDraft
+			}
+			base, err := Seal(build())
+			if err != nil {
+				t.Fatalf("Seal base: %v", err)
+			}
+
+			d := build()
+			m.mutate(&d)
 			changed, err := Seal(d)
 			if err != nil {
 				t.Fatalf("Seal: %v", err)
 			}
 			if changed.Digest() == base.Digest() {
-				t.Errorf("changing the %s left the digest unchanged; the field is outside what is attested", name)
+				t.Errorf("changing %s left the digest unchanged; the field is outside what is attested", name)
 			}
 		})
 	}
+}
+
+// digestMutations is keyed by the Draft field path each case perturbs.
+//
+// The path matters: TestNoDraftFieldEscapesTheDigestMutations reads the
+// leading identifier of every key and requires the set to cover Draft's
+// exported fields exactly.
+type digestMutation struct {
+	// base overrides validDraft for a field the default draft cannot
+	// legally carry. Nil means validDraft.
+	base   func() Draft
+	mutate func(*Draft)
+}
+
+var digestMutations = map[string]digestMutation{
+	"Payer.Kind":               {mutate: func(d *Draft) { d.Payer.Kind = "user" }},
+	"Payer.ID":                 {mutate: func(d *Draft) { d.Payer.ID = "org-2" }},
+	"Currency":                 {mutate: func(d *Draft) { d.Currency = "twd" }},
+	"Lines[0].Meter":           {mutate: func(d *Draft) { d.Lines[0].Meter = "other" }},
+	"Lines[0].Module":          {mutate: func(d *Draft) { d.Lines[0].Module = "other-core" }},
+	"Lines[0].ModuleVersion":   {mutate: func(d *Draft) { d.Lines[0].ModuleVersion = "1.4.1" }},
+	"Lines[0].Quantity":        {mutate: func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_001, 25) }},
+	"Lines[0].UnitPriceMicros": {mutate: func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 26) }},
+	"PriceBookRevision":        {mutate: func(d *Draft) { d.PriceBookRevision = "pb-2026-09" }},
+	"TermsRevision":            {mutate: func(d *Draft) { d.TermsRevision = "terms-2026-02" }},
+	"Kind":                     {mutate: func(d *Draft) { d.Kind = KindSubscriptionStart }},
+	"Tax.Jurisdiction":         {mutate: func(d *Draft) { d.Tax.Jurisdiction = "JP" }},
+	"Tax.RuleRevision":         {mutate: func(d *Draft) { d.Tax.RuleRevision = "tax-2026-06" }},
+	"Tax.AmountMicros":         {mutate: func(d *Draft) { d.Tax.AmountMicros = 1_251 }},
+	// Canonical v2. Both remaining classes are legal for a resolved
+	// determination, so this changes HOW the figure was established without
+	// changing the figure — which is the whole reason the class is sealed.
+	"Tax.Verification": {mutate: func(d *Draft) { d.Tax.Verification = TaxProviderAttested }},
+	// Canonical v3. The gross is untouched; only the split moves, so a
+	// digest that missed this would let the funding change under an
+	// unchanged document.
+	"WalletAllocationMicros": {
+		// validDraft is an auto_topup, and §6:493-495 forbids the wallet
+		// funding its own refill — so Seal refuses any allocation on it.
+		// This case therefore rates a kind that MAY draw on credit, and
+		// compares against the same draft with a zero allocation, so the
+		// pair still differs in exactly one field.
+		base:   func() Draft { d := validDraft(); d.Kind = KindModuleUsage; return d },
+		mutate: func(d *Draft) { d.WalletAllocationMicros = 1 },
+	},
+	// Canonical v4.
+	"SelectedRail":          {mutate: func(d *Draft) { d.SelectedRail = "other-rail" }},
+	"RoutingPolicyRevision": {mutate: func(d *Draft) { d.RoutingPolicyRevision = "routing-2026-09" }},
+	"AuthorizationID":       {mutate: func(d *Draft) { d.AuthorizationID = "auth-2" }},
+	"NoticePolicy":          {mutate: func(d *Draft) { d.NoticePolicy = "sms/v1" }},
+	"ExecuteNotBefore":      {mutate: func(d *Draft) { d.ExecuteNotBefore = windowStart.Add(time.Second) }},
+	"ExecuteNotAfter":       {mutate: func(d *Draft) { d.ExecuteNotAfter = windowEnd.Add(time.Second) }},
+	"SourceFactKeys":        {mutate: func(d *Draft) { d.SourceFactKeys = []string{"fact-2"} }},
+}
+
+// TestNoDraftFieldEscapesTheDigestMutations is the floor under the map above.
+//
+// A hand-written mutation map proves what it contains and says nothing about
+// what it omits, so three canonical supersessions each added a sealed field
+// with no case and nothing failed. This reflects over Draft and requires a
+// case for every exported field.
+//
+// A field that genuinely must NOT reach the digest is added to
+// unsealedDraftFields with a reason — a deliberate line in a diff, rather
+// than an absence nobody can see.
+func TestNoDraftFieldEscapesTheDigestMutations(t *testing.T) {
+	// Fields Draft carries that are deliberately outside the digest.
+	// Empty today: every field of Draft is attested.
+	unsealedDraftFields := map[string]string{}
+
+	covered := map[string]bool{}
+	for path := range digestMutations {
+		covered[leadingField(path)] = true
+	}
+
+	dt := reflect.TypeOf(Draft{})
+	if dt.NumField() == 0 {
+		t.Fatal("Draft has no fields; the reflection target is wrong and this test proves nothing")
+	}
+	for i := 0; i < dt.NumField(); i++ {
+		f := dt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if reason, ok := unsealedDraftFields[f.Name]; ok {
+			if covered[f.Name] {
+				t.Errorf("Draft.%s is declared outside the digest (%q) but has a mutation case "+
+					"proving it changes the digest; one of the two is wrong", f.Name, reason)
+			}
+			continue
+		}
+		if !covered[f.Name] {
+			t.Errorf("Draft.%s is sealed into the document but no case in digestMutations "+
+				"proves it reaches the digest. Add one, or declare it in unsealedDraftFields "+
+				"with a reason. A field outside the digest can differ between the document a "+
+				"customer accepted and the one that settles.", f.Name)
+		}
+	}
+
+	// The floor needs its own floor: a covered set built from a map whose
+	// keys stopped matching Draft's field names would silently pass nothing.
+	for name := range covered {
+		if _, ok := dt.FieldByName(name); !ok {
+			t.Errorf("digestMutations has a case keyed %q, which is not a field of Draft. "+
+				"The key must be the field path it perturbs, or the coverage check above "+
+				"is comparing against names that no longer exist.", name)
+		}
+	}
+}
+
+// leadingField takes "Lines[0].Meter" to "Lines" and "Tax.RuleRevision" to
+// "Tax" — the Draft field a mutation case reaches into.
+func leadingField(path string) string {
+	if i := strings.IndexAny(path, ".["); i >= 0 {
+		return path[:i]
+	}
+	return path
 }
 
 // Sealing the same draft twice must produce the same digest, or the
