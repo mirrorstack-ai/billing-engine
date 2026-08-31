@@ -837,6 +837,10 @@ func (s *Service) proposeModuleOverage(
 			Resolved:     true,
 			Jurisdiction: "not-applicable",
 			RuleRevision: proposedTaxRuleRevision,
+			// Not "reproducible": nothing recomputed this. The engine
+			// determined no tax arises, which is a real determination
+			// and is exactly what this class names.
+			Verification: intent.TaxNotApplicable,
 		},
 		ExecuteNotBefore: coverageStart,
 		ExecuteNotAfter:  coverageEnd,
