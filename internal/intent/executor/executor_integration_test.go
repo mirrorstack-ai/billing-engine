@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence/evidencetest"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/predicate"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/store"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
@@ -125,10 +126,15 @@ func ready(t *testing.T, s *store.Store) intent.ChargeIntent {
 	return sealed
 }
 
-func newExecutor(s *store.Store, c Collector, env Environment) *Executor {
-	return New(s, c, "executor-test",
+func newExecutor(t *testing.T, s *store.Store, c Collector, env Environment) *Executor {
+	t.Helper()
+	e, err := New(s, c, evidencetest.Recorder(t), "executor-test",
 		func() time.Time { return evalNow },
 		func(context.Context) Environment { return env })
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return e
 }
 
 func TestAPermittedIntentIsCollectedOnce(t *testing.T) {
@@ -137,7 +143,7 @@ func TestAPermittedIntentIsCollectedOnce(t *testing.T) {
 	sealed := ready(t, s)
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "ref-1"}}
-	out, err := newExecutor(s, collector, fullyEvidencedEnv()).Execute(context.Background(), sealed.Digest())
+	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(context.Background(), sealed.Digest())
 
 	require.NoError(t, err)
 	require.True(t, out.Permitted, "refused: %v", out.Refused)
@@ -164,7 +170,7 @@ func TestARefusalTouchesNothing(t *testing.T) {
 	env.BuildIdentified = false // VERIFICATION §2
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
-	out, err := newExecutor(s, collector, env).Execute(ctx, sealed.Digest())
+	out, err := newExecutor(t, s, collector, env).Execute(ctx, sealed.Digest())
 
 	require.NoError(t, err)
 	require.False(t, out.Permitted)
@@ -188,7 +194,7 @@ func TestAnAmbiguousResultRetainsTheClaimAndRecordsNothing(t *testing.T) {
 	sealed := ready(t, s)
 
 	collector := &recordingCollector{result: CollectResult{Ambiguous: true}}
-	out, err := newExecutor(s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
+	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
 
 	require.NoError(t, err)
 	require.True(t, out.Unresolved)
@@ -204,7 +210,7 @@ func TestAnAmbiguousResultRetainsTheClaimAndRecordsNothing(t *testing.T) {
 
 	// And nothing else can now attempt it.
 	second := &recordingCollector{result: CollectResult{Succeeded: true}}
-	_, err = newExecutor(s, second, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
+	_, err = newExecutor(t, s, second, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
 	require.ErrorIs(t, err, ErrAlreadyClaimed)
 	require.Zero(t, second.count(), "a second attempt reached the provider after an ambiguous first")
 }
@@ -217,7 +223,7 @@ func TestATransportErrorIsTreatedAsAmbiguous(t *testing.T) {
 	sealed := ready(t, s)
 
 	collector := &recordingCollector{err: errors.New("connection reset")}
-	out, err := newExecutor(s, collector, fullyEvidencedEnv()).Execute(context.Background(), sealed.Digest())
+	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(context.Background(), sealed.Digest())
 
 	require.NoError(t, err)
 	require.True(t, out.Unresolved, "a transport error was resolved one way or the other")
@@ -245,7 +251,7 @@ func TestConcurrentExecutorsCollectExactlyOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			out, err := newExecutor(s, collector, fullyEvidencedEnv()).
+			out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).
 				Execute(context.Background(), sealed.Digest())
 			mu.Lock()
 			defer mu.Unlock()
@@ -292,7 +298,7 @@ func TestAMissingAuthorizationRefuses(t *testing.T) {
 	// No authorization saved.
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
-	out, err := newExecutor(s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
+	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
 
 	require.NoError(t, err)
 	require.False(t, out.Permitted)
@@ -307,7 +313,7 @@ func TestAnEmptyEnvironmentRefuses(t *testing.T) {
 	sealed := ready(t, s)
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
-	out, err := newExecutor(s, collector, Environment{}).Execute(context.Background(), sealed.Digest())
+	out, err := newExecutor(t, s, collector, Environment{}).Execute(context.Background(), sealed.Digest())
 
 	require.NoError(t, err)
 	require.False(t, out.Permitted)
@@ -329,7 +335,7 @@ func TestATamperedIntentIsNeverEvaluated(t *testing.T) {
 	require.NoError(t, err)
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
-	_, err = newExecutor(s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
+	_, err = newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
 
 	require.ErrorIs(t, err, intent.ErrDigestMismatch)
 	require.Zero(t, collector.count())

@@ -60,9 +60,12 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	intentstore "github.com/mirrorstack-ai/billing-engine/internal/intent/store"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/signing"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -430,10 +433,56 @@ func withIntentCutover(svc *cycle.Service, pool *pgxpool.Pool, flag string) *cyc
 	if !arm {
 		return svc
 	}
+	// 🔴 Arming the cutover now REQUIRES an evidence signing key.
+	//
+	// Sealing an intent is the first of docs/DESIGN.md:388's eight evidence
+	// events, and :398 makes an evidence record a durable side effect of the
+	// money moving rather than a report something chooses to render. A
+	// deployment that can seal charge documents but cannot record them
+	// produces documents the customer has no independent trace of, and no
+	// later reconciler can tell "never recorded" from "recorded and withheld".
+	//
+	// So this refuses to start rather than degrading. The alternative —
+	// proposing without evidence when the key is absent — is the silent-skip
+	// this design exists to remove, and it would be invisible: the legs would
+	// run, intents would appear, and the outbox would simply stay empty.
+	//
+	// The flag is unset in every environment today, so nothing changes until
+	// somebody deliberately arms it, which is exactly when they should be
+	// told a key is missing.
+	signer, err := signing.Load(os.Getenv)
+	if err != nil {
+		slog.Error("intent cutover is armed but the signing key material will not load; refusing to start",
+			"env", intentCutoverEnv, "error", err.Error())
+		os.Exit(1)
+	}
+	recorder, err := evidence.NewRecorder(signer, evidence.Options{
+		Issuer:      "billing-engine",
+		Audience:    "customer",
+		Environment: buildinfo.Current().Environment,
+		Now:         func() time.Time { return time.Now().UTC() },
+	})
+	if err != nil {
+		slog.Error("intent cutover is armed but this deployment cannot record evidence; refusing to start",
+			"env", intentCutoverEnv,
+			"needs", signing.EnvBillingEvidenceKey,
+			"why", "docs/DESIGN.md INV-014: an evidence record is a side effect of the money moving, not a report",
+			"error", err.Error())
+		os.Exit(1)
+	}
+
+	p, err := proposer.New(intentstore.New(pool), recorder, func() time.Time { return time.Now().UTC() })
+	if err != nil {
+		slog.Error("intent cutover is armed but the proposer will not construct; refusing to start",
+			"env", intentCutoverEnv, "error", err.Error())
+		os.Exit(1)
+	}
+
 	slog.Warn("INTENT CUTOVER ARMED — cut-over legs will propose sealed intents instead of charging",
 		"env", intentCutoverEnv,
+		"evidence_key", recorder != nil,
 		"exception", "in-flight legacy charges are still completed by each leg's crash-recovery path")
-	return svc.WithIntentProposer(proposer.New(intentstore.New(pool)))
+	return svc.WithIntentProposer(p)
 }
 
 // errUnrecognisedCutoverFlag refuses a flag that is neither unset nor the

@@ -19,9 +19,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/predicate"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/store"
 )
@@ -132,6 +135,7 @@ type Environment struct {
 type Executor struct {
 	store     *store.Store
 	collector Collector
+	recorder  *evidence.Recorder
 	identity  string
 	now       func() time.Time
 	env       func(context.Context) Environment
@@ -145,11 +149,51 @@ type Executor struct {
 func New(
 	s *store.Store,
 	collector Collector,
+	recorder *evidence.Recorder,
 	identity string,
 	now func() time.Time,
 	env func(context.Context) Environment,
-) *Executor {
-	return &Executor{store: s, collector: collector, identity: identity, now: now, env: env}
+) (*Executor, error) {
+	// A nil recorder is not "evidence off". Every branch of Execute produces
+	// one of docs/DESIGN.md:388's events — a refusal, a nonterminal attempt
+	// state, or a settlement — so an executor that cannot record is one that
+	// must not run. Refusing here means the deployment finds out at startup
+	// rather than the customer finding out by having no trace of a charge.
+	if recorder == nil {
+		return nil, ErrNoRecorder
+	}
+	if now == nil {
+		return nil, errors.New("executor: no clock")
+	}
+	return &Executor{
+		store: s, collector: collector, recorder: recorder,
+		identity: identity, now: now, env: env,
+	}, nil
+}
+
+// ErrNoRecorder refuses an executor that cannot record what it decides.
+var ErrNoRecorder = errors.New("executor: refusing to construct an executor with no evidence recorder")
+
+// refusalDetail renders a refusal's clause set as the record's detail.
+//
+// The clause names are a closed vocabulary (predicate.AllClauses), so this
+// carries no customer prose into a table whose read path is not yet gated —
+// and it is exactly what a customer asking "why was I not charged" needs,
+// which docs/VERIFICATION.md §4 has them rechecking offline.
+//
+// A refusal with no clauses is recorded as such rather than as an empty
+// string: the schema requires a non-empty detail, and "refused, reason
+// unstated" is itself the finding.
+func refusalDetail(refused []predicate.Clause) string {
+	if len(refused) == 0 {
+		return "refused_without_naming_a_clause"
+	}
+	names := make([]string, 0, len(refused))
+	for _, c := range refused {
+		names = append(names, string(c))
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 // Outcome is what Execute did.
@@ -242,7 +286,26 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 
 	if !verdict.Permitted {
 		// Nothing has been claimed and nothing dispatched. A refusal
-		// leaves the intent exactly as it was found.
+		// leaves the intent exactly as it was found — except for its
+		// evidence record, which is the one thing a refusal DOES
+		// produce. docs/DESIGN.md:388 lists a refusal among the eight
+		// events, and a customer told "no" is owed the same trace as
+		// one who was charged.
+		//
+		// It is its own transaction because a refusal mutates nothing
+		// else ("a refusal here mutates no provider"), and the write is
+		// reported rather than swallowed: an unrecorded refusal is a
+		// decision nobody can reproduce.
+		if err := e.store.AppendEvidence(ctx, e.recorder, evidence.Event{
+			Kind:         evidence.KindRefusal,
+			Subject:      sealed.Payer(),
+			IntentDigest: digest,
+			Detail:       refusalDetail(verdict.Refused),
+			OccurredAt:   e.now(),
+		}); err != nil {
+			return Outcome{Permitted: false, Refused: verdict.Refused},
+				fmt.Errorf("refused, and failed to record the refusal: %w", err)
+		}
 		return Outcome{Permitted: false, Refused: verdict.Refused}, nil
 	}
 
@@ -280,6 +343,16 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		// outcome is recorded, and the intent says out loud that a
 		// charge is in flight — which is what a reconciler needs to
 		// find it later.
+		if err := e.store.AppendEvidence(ctx, e.recorder, evidence.Event{
+			Kind:         evidence.KindNonterminalAttemptState,
+			Subject:      sealed.Payer(),
+			IntentDigest: digest,
+			Detail:       "provider_in_progress",
+			OccurredAt:   e.now(),
+		}); err != nil {
+			return Outcome{Permitted: true, InProgress: true, Reference: result.Reference},
+				fmt.Errorf("in flight at the rail, and failed to record it: %w", err)
+		}
 		_ = e.store.AdvanceState(ctx, digest, state, "provider_in_progress")
 		return Outcome{Permitted: true, InProgress: true, Reference: result.Reference}, nil
 
@@ -288,10 +361,30 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		// it would let a second attempt charge a customer who may
 		// already have been charged, and the whole reason this branch
 		// exists is that nobody knows which.
+		//
+		// The evidence record is exactly the trace that makes the
+		// ambiguity findable later, so it matters MORE here than on a
+		// clean settlement, not less.
+		if err := e.store.AppendEvidence(ctx, e.recorder, evidence.Event{
+			Kind:         evidence.KindNonterminalAttemptState,
+			Subject:      sealed.Payer(),
+			IntentDigest: digest,
+			Detail:       "unresolved",
+			OccurredAt:   e.now(),
+		}); err != nil {
+			return Outcome{Permitted: true, Unresolved: true},
+				fmt.Errorf("unresolved at the rail, and failed to record it: %w", err)
+		}
 		return Outcome{Permitted: true, Unresolved: true}, nil
 
 	case result.Succeeded:
-		if err := e.store.RecordOutcome(ctx, digest, "succeeded", e.now()); err != nil {
+		if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, digest, "succeeded", evidence.Event{
+			Kind:         evidence.KindSettlement,
+			Subject:      sealed.Payer(),
+			IntentDigest: digest,
+			Detail:       "succeeded",
+			OccurredAt:   e.now(),
+		}); err != nil {
 			// The money moved. Failing to write that down is bad, but
 			// it is not a reason to say it did not happen.
 			return Outcome{Permitted: true, Settled: true, Reference: result.Reference},
@@ -301,7 +394,13 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		return Outcome{Permitted: true, Settled: true, Reference: result.Reference}, nil
 
 	default:
-		if err := e.store.RecordOutcome(ctx, digest, "failed", e.now()); err != nil {
+		if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, digest, "failed", evidence.Event{
+			Kind:         evidence.KindSettlement,
+			Subject:      sealed.Payer(),
+			IntentDigest: digest,
+			Detail:       "failed",
+			OccurredAt:   e.now(),
+		}); err != nil {
 			return Outcome{Permitted: true}, fmt.Errorf("record failure: %w", err)
 		}
 		_ = e.store.AdvanceState(ctx, digest, state, "voided")
