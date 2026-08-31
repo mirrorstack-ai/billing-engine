@@ -28,11 +28,13 @@ func sealedIntent(t *testing.T) intent.ChargeIntent {
 			Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-2026-05", AmountMicros: 1_250,
 			Verification: intent.TaxNotApplicable,
 		},
-		AuthorizationID:  "auth-1",
-		NoticePolicy:     "email/v1",
-		ExecuteNotBefore: windowStart,
-		ExecuteNotAfter:  windowEnd,
-		SourceFactKeys:   []string{"fact-1"},
+		AuthorizationID:       "auth-1",
+		NoticePolicy:          "email/v1",
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
+		ExecuteNotBefore:      windowStart,
+		ExecuteNotAfter:       windowEnd,
+		SourceFactKeys:        []string{"fact-1"},
 	})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
