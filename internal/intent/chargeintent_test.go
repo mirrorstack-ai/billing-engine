@@ -3,6 +3,8 @@ package intent
 import (
 	"errors"
 	"math"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,6 +36,13 @@ func validDraft() Draft {
 		ExecuteNotBefore: windowStart,
 		ExecuteNotAfter:  windowEnd,
 		SourceFactKeys:   []string{"fact-1"},
+
+		// Stated, not left zero. A fixture whose fields are all zero cannot
+		// prove that anything carries them: an omission on the store side and
+		// an omission in the fixture cancel out, and the round trip passes.
+		// That is how `collects` stayed broken.
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
 	}
 }
 
@@ -107,47 +116,304 @@ func TestDigestDistinguishesLineGrouping(t *testing.T) {
 // Every sealed field must reach the digest. A field outside it is a
 // field that can differ between the document a customer read and the
 // one that settles.
+//
+// 🔴 The keys are Draft field paths, not prose, and TestNoDraftFieldEscapes
+// TheDigestMutations below turns that into a floor: a Draft field with no
+// case here fails the build.
+//
+// It is not decoration. Until 2026-08-31 this map had nineteen prose keys
+// and silently omitted FOUR sealed fields — Tax.Verification (canonical v2),
+// WalletAllocationMicros (v3), SelectedRail and RoutingPolicyRevision (v4).
+// Each was threaded through Draft, ChargeIntent, computeDigest, the store and
+// a migration, and each was added without a case proving it reached the
+// digest. Three supersessions, three omissions, and a green suite every time,
+// because a hand-written map cannot notice what is not in it.
 func TestEveryFieldChangesTheDigest(t *testing.T) {
-	base, err := Seal(validDraft())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mutations := map[string]func(*Draft){
-		"payer kind":          func(d *Draft) { d.Payer.Kind = "user" },
-		"payer id":            func(d *Draft) { d.Payer.ID = "org-2" },
-		"currency":            func(d *Draft) { d.Currency = "twd" },
-		"line meter":          func(d *Draft) { d.Lines[0].Meter = "other" },
-		"line module":         func(d *Draft) { d.Lines[0].Module = "other-core" },
-		"line module version": func(d *Draft) { d.Lines[0].ModuleVersion = "1.4.1" },
-		"line quantity":       func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_001, 25) },
-		"line unit price":     func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 26) },
-		"price book":          func(d *Draft) { d.PriceBookRevision = "pb-2026-09" },
-		"terms revision":      func(d *Draft) { d.TermsRevision = "terms-2026-02" },
-		"charge kind":         func(d *Draft) { d.Kind = KindSubscriptionStart },
-		"tax jurisdiction":    func(d *Draft) { d.Tax.Jurisdiction = "JP" },
-		"tax rule revision":   func(d *Draft) { d.Tax.RuleRevision = "tax-2026-06" },
-		"tax amount":          func(d *Draft) { d.Tax.AmountMicros = 1_251 },
-		"authorization":       func(d *Draft) { d.AuthorizationID = "auth-2" },
-		"notice policy":       func(d *Draft) { d.NoticePolicy = "sms/v1" },
-		"window start":        func(d *Draft) { d.ExecuteNotBefore = windowStart.Add(time.Second) },
-		"window end":          func(d *Draft) { d.ExecuteNotAfter = windowEnd.Add(time.Second) },
-		"source facts":        func(d *Draft) { d.SourceFactKeys = []string{"fact-2"} },
-	}
-
-	for name, mutate := range mutations {
+	for name, m := range digestMutations {
 		t.Run(name, func(t *testing.T) {
-			d := validDraft()
-			mutate(&d)
+			// A case may supply its own base when validDraft cannot
+			// express the field — see WalletAllocationMicros. Base and
+			// mutation always come from the same draft, so the pair
+			// still differs in exactly one field.
+			build := m.base
+			if build == nil {
+				build = validDraft
+			}
+			base, err := Seal(build())
+			if err != nil {
+				t.Fatalf("Seal base: %v", err)
+			}
+
+			d := build()
+			m.mutate(&d)
 			changed, err := Seal(d)
 			if err != nil {
 				t.Fatalf("Seal: %v", err)
 			}
 			if changed.Digest() == base.Digest() {
-				t.Errorf("changing the %s left the digest unchanged; the field is outside what is attested", name)
+				t.Errorf("changing %s left the digest unchanged; the field is outside what is attested", name)
 			}
 		})
 	}
+}
+
+// digestMutations is keyed by the Draft field path each case perturbs.
+//
+// The path matters: TestNoDraftFieldEscapesTheDigestMutations reads the
+// leading identifier of every key and requires the set to cover Draft's
+// exported fields exactly.
+type digestMutation struct {
+	// base overrides validDraft for a field the default draft cannot
+	// legally carry. Nil means validDraft.
+	base   func() Draft
+	mutate func(*Draft)
+}
+
+var digestMutations = map[string]digestMutation{
+	"Payer.Kind":               {mutate: func(d *Draft) { d.Payer.Kind = "user" }},
+	"Payer.ID":                 {mutate: func(d *Draft) { d.Payer.ID = "org-2" }},
+	"Currency":                 {mutate: func(d *Draft) { d.Currency = "twd" }},
+	"Lines[0].Meter":           {mutate: func(d *Draft) { d.Lines[0].Meter = "other" }},
+	"Lines[0].Module":          {mutate: func(d *Draft) { d.Lines[0].Module = "other-core" }},
+	"Lines[0].ModuleVersion":   {mutate: func(d *Draft) { d.Lines[0].ModuleVersion = "1.4.1" }},
+	"Lines[0].Quantity":        {mutate: func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_001, 25) }},
+	"Lines[0].UnitPriceMicros": {mutate: func(d *Draft) { d.Lines[0] = NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 26) }},
+	"PriceBookRevision":        {mutate: func(d *Draft) { d.PriceBookRevision = "pb-2026-09" }},
+	"TermsRevision":            {mutate: func(d *Draft) { d.TermsRevision = "terms-2026-02" }},
+	"Kind":                     {mutate: func(d *Draft) { d.Kind = KindSubscriptionStart }},
+	"Tax.Jurisdiction":         {mutate: func(d *Draft) { d.Tax.Jurisdiction = "JP" }},
+	"Tax.RuleRevision":         {mutate: func(d *Draft) { d.Tax.RuleRevision = "tax-2026-06" }},
+	"Tax.AmountMicros":         {mutate: func(d *Draft) { d.Tax.AmountMicros = 1_251 }},
+	// Canonical v2. Both remaining classes are legal for a resolved
+	// determination, so this changes HOW the figure was established without
+	// changing the figure — which is the whole reason the class is sealed.
+	"Tax.Verification": {mutate: func(d *Draft) { d.Tax.Verification = TaxProviderAttested }},
+	// Canonical v3. The gross is untouched; only the split moves, so a
+	// digest that missed this would let the funding change under an
+	// unchanged document.
+	"WalletAllocationMicros": {
+		// validDraft is an auto_topup, and §6:493-495 forbids the wallet
+		// funding its own refill — so Seal refuses any allocation on it.
+		// This case therefore rates a kind that MAY draw on credit, and
+		// compares against the same draft with a zero allocation, so the
+		// pair still differs in exactly one field.
+		base:   func() Draft { d := validDraft(); d.Kind = KindModuleUsage; return d },
+		mutate: func(d *Draft) { d.WalletAllocationMicros = 1 },
+	},
+	// Canonical v4.
+	"SelectedRail":          {mutate: func(d *Draft) { d.SelectedRail = "other-rail" }},
+	"RoutingPolicyRevision": {mutate: func(d *Draft) { d.RoutingPolicyRevision = "routing-2026-09" }},
+	"AuthorizationID":       {mutate: func(d *Draft) { d.AuthorizationID = "auth-2" }},
+	"NoticePolicy":          {mutate: func(d *Draft) { d.NoticePolicy = "sms/v1" }},
+	"ExecuteNotBefore":      {mutate: func(d *Draft) { d.ExecuteNotBefore = windowStart.Add(time.Second) }},
+	"ExecuteNotAfter":       {mutate: func(d *Draft) { d.ExecuteNotAfter = windowEnd.Add(time.Second) }},
+	"SourceFactKeys":        {mutate: func(d *Draft) { d.SourceFactKeys = []string{"fact-2"} }},
+}
+
+// linkMutations covers the two sealed fields a Draft cannot express.
+//
+// collects and supersedes are set by CollectRemainderOf and Supersede AFTER
+// Seal, so no entry in digestMutations can reach them. They are exactly the
+// class of field this commit exists to fix — `collects` was inside the digest
+// with no column, no Stored field and no Rehydrate restore — so the floor
+// below requires a case for them too.
+var linkMutations = map[string]func(t *testing.T) (bare, linked ChargeIntent){
+	"collects": func(t *testing.T) (ChargeIntent, ChargeIntent) {
+		t.Helper()
+		source, err := Seal(validDraft())
+		if err != nil {
+			t.Fatalf("Seal source: %v", err)
+		}
+		d := validDraft()
+		d.Kind = KindCollectReceivable
+		bare, err := Seal(d)
+		if err != nil {
+			t.Fatalf("Seal receivable: %v", err)
+		}
+		linked, err := source.CollectRemainderOf(d)
+		if err != nil {
+			t.Fatalf("CollectRemainderOf: %v", err)
+		}
+		return bare, linked
+	},
+	"supersedes": func(t *testing.T) (ChargeIntent, ChargeIntent) {
+		t.Helper()
+		original, err := Seal(validDraft())
+		if err != nil {
+			t.Fatalf("Seal original: %v", err)
+		}
+		bare, err := Seal(validDraft())
+		if err != nil {
+			t.Fatalf("Seal bare: %v", err)
+		}
+		linked, err := original.Supersede(validDraft())
+		if err != nil {
+			t.Fatalf("Supersede: %v", err)
+		}
+		return bare, linked
+	},
+}
+
+// Both links must move the digest, or a document does not attest what it
+// replaced or what it collects.
+func TestTheLinksChangeTheDigest(t *testing.T) {
+	for name, build := range linkMutations {
+		t.Run(name, func(t *testing.T) {
+			bare, linked := build(t)
+			if bare.Digest() == linked.Digest() {
+				t.Errorf("setting %s left the digest unchanged; the link is outside what is attested", name)
+			}
+		})
+	}
+}
+
+// derivedSealedFields are inside the digest but cannot have a mutation case,
+// because nothing can move them independently. Keys are normalisePath form.
+//
+// 🔴 Writing this down is the point. subtotalMicros and totalMicros are
+// functions of the lines and the tax; providerRemainderMicros is
+// `totalMicros - walletAllocationMicros` (chargeintent.go:472). So the
+// WalletAllocationMicros case in digestMutations CANNOT distinguish "the
+// allocation is in the digest" from "the remainder is in the digest": moving
+// one necessarily moves the other, and the case passes with either encoded.
+//
+// Review found that, not the suite — with `e.int(c.walletAllocationMicros)`
+// deleted from computeDigest the whole suite stays green, because the derived
+// remainder still moves. Two integers that always move together are one fact
+// encoded twice, and the redundancy is what makes the pair untestable. The
+// real fix is to stop encoding the derived one, which changes the canonical
+// encoding and therefore belongs to the next schema supersession rather than
+// to this commit. Until then this map is the record that the guard is weaker
+// than it looks.
+var derivedSealedFields = map[string]string{
+	"subtotalmicros":          "the sum of the lines",
+	"totalmicros":             "subtotal plus tax",
+	"providerremaindermicros": "totalMicros - walletAllocationMicros; moves with the allocation, so the pair cannot be separated",
+}
+
+// unsealedFields are ChargeIntent fields deliberately outside the digest.
+// Keys are normalisePath form.
+var unsealedFields = map[string]string{
+	"digest":       "it IS the digest",
+	"tax.resolved": "Seal refuses an unresolved determination, so it is constant true in every sealed intent and computeDigest does not encode it",
+}
+
+// TestNoSealedFieldEscapesTheDigestMutations is the floor under both maps.
+//
+// 🔴 It reflects over ChargeIntent, not Draft, and it walks NESTED fields.
+//
+// The first version of this test did neither, and review proved it vacuous
+// twice over. It reflected over Draft, so `collects` and `supersedes` — the
+// very fields whose omission this commit fixes — were invisible to it. And it
+// compared only the LEADING identifier of each key, so one case on any nested
+// struct marked the whole struct covered: deleting the `Tax.Verification`
+// case left it PASSING, and Tax.Verification is one of the four omissions the
+// test was written to catch.
+//
+// A guard for "a field was forgotten" that cannot see a forgotten field is
+// the exact defect this repository keeps finding. Comparing full leaf paths
+// against the type the digest is actually taken over is what fixes it.
+func TestNoSealedFieldEscapesTheDigestMutations(t *testing.T) {
+	covered := map[string]bool{}
+	for path := range digestMutations {
+		covered[normalisePath(path)] = true
+	}
+	for name := range linkMutations {
+		covered[normalisePath(name)] = true
+	}
+
+	leaves := sealedLeaves(reflect.TypeOf(ChargeIntent{}), "")
+	if len(leaves) < 20 {
+		t.Fatalf("the walk found only %d leaves in ChargeIntent; the reflection is wrong, "+
+			"and a floor that enumerates almost nothing proves almost nothing", len(leaves))
+	}
+
+	known := map[string]bool{}
+	for _, leaf := range leaves {
+		known[normalisePath(leaf)] = true
+	}
+
+	for _, leaf := range leaves {
+		key := normalisePath(leaf)
+		if reason, ok := unsealedFields[key]; ok {
+			if covered[key] {
+				t.Errorf("%s is declared outside the digest (%q) but has a case proving it "+
+					"changes the digest; one of the two is wrong", leaf, reason)
+			}
+			continue
+		}
+		if _, ok := derivedSealedFields[key]; ok {
+			continue
+		}
+		if !covered[key] {
+			t.Errorf("%s is inside the sealed document but no case proves it reaches the "+
+				"digest. Add one to digestMutations or linkMutations, or declare it in "+
+				"unsealedFields or derivedSealedFields with a reason. A field outside the "+
+				"digest can differ between the document a customer accepted and the one "+
+				"that settles.", leaf)
+		}
+	}
+
+	// The covered set needs its own floor: a key that stopped naming a real
+	// field would silently satisfy nothing.
+	for key := range covered {
+		if !known[key] {
+			t.Errorf("a mutation case is keyed %q, which is not a leaf of ChargeIntent. The "+
+				"key must be the field path it perturbs, or the coverage check above is "+
+				"comparing against names that no longer exist.", key)
+		}
+	}
+}
+
+// sealedLeaves walks a type and returns every leaf field path.
+//
+// It descends into structs and into the element type of a slice of structs,
+// because that is where the omissions were: Tax.Verification and the Line
+// fields are leaves a top-level walk never reaches.
+func sealedLeaves(t reflect.Type, prefix string) []string {
+	var out []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name := prefix + f.Name
+
+		ft := f.Type
+		if ft.Kind() == reflect.Slice {
+			// A slice of structs contributes its element's leaves; a slice
+			// of scalars is itself a leaf.
+			if ft.Elem().Kind() == reflect.Struct {
+				out = append(out, sealedLeaves(ft.Elem(), name+"[].")...)
+				continue
+			}
+			out = append(out, name)
+			continue
+		}
+		// time.Time is a struct but an opaque value here. Descending into it
+		// would enumerate wall, ext and loc, which no mutation case can name.
+		if ft.Kind() == reflect.Struct && ft != reflect.TypeOf(time.Time{}) {
+			out = append(out, sealedLeaves(ft, name+".")...)
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// normalisePath makes "Lines[0].Meter", "lines[].Meter" and "LINES.METER" the
+// same key, so a case and the field it names match however each was written.
+func normalisePath(path string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range path {
+		switch {
+		case r == '[':
+			depth++
+		case r == ']':
+			depth--
+		case depth == 0:
+			b.WriteRune(r)
+		}
+	}
+	return strings.ToLower(b.String())
 }
 
 // Sealing the same draft twice must produce the same digest, or the
@@ -505,8 +771,67 @@ func storedFrom(c ChargeIntent) Stored {
 		NoticePolicy:      c.NoticePolicy(),
 		SourceFactKeys:    c.SourceFactKeys(),
 		Supersedes:        c.Supersedes(),
+		Collects:          c.Collects(),
 		SubtotalMicros:    c.SubtotalMicros(),
 		TotalMicros:       c.TotalMicros(),
+
+		WalletAllocationMicros:  c.WalletAllocationMicros(),
+		ProviderRemainderMicros: c.ProviderRemainderMicros(),
+		SelectedRail:            c.SelectedRail(),
+		RoutingPolicyRevision:   c.RoutingPolicyRevision(),
+	}
+}
+
+// 🔴 storedFrom must mirror the WHOLE of intent.Stored.
+//
+// Until this test existed it mirrored fourteen of nineteen fields, and every
+// round-trip test in this file passed anyway — because validDraft left the
+// missing ones at their zero values too, so an omission in the fixture and an
+// omission in the helper cancelled out exactly.
+//
+// That is the same shape as the defect this commit fixes: `collects` was
+// inside the digest, absent from Stored, absent from Rehydrate, and absent
+// from every fixture, so nothing disagreed with anything. A round trip
+// between two incomplete halves proves only that they are incomplete in the
+// same way.
+//
+// The floor is: a sealed intent built from validDraft must produce a Stored
+// with no zero-valued field, unless the field is declared below.
+func TestStoredFromMirrorsEveryStoredField(t *testing.T) {
+	// Fields legitimately zero for a plain, non-linked intent.
+	alwaysZeroForThisFixture := map[string]string{
+		"Supersedes":             "validDraft is an original, not a replacement",
+		"Collects":               "validDraft is not a receivable",
+		"WalletAllocationMicros": "validDraft is an auto_topup, which §6:493-495 forbids funding from the wallet",
+	}
+
+	sealed, err := Seal(validDraft())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := storedFrom(sealed)
+	stored.ExecuteNotBefore, stored.ExecuteNotAfter = sealed.ExecutionWindow()
+
+	v := reflect.ValueOf(stored)
+	tp := v.Type()
+	if tp.NumField() < 15 {
+		t.Fatalf("Stored has %d fields; the reflection target looks wrong", tp.NumField())
+	}
+	for i := 0; i < tp.NumField(); i++ {
+		f := tp.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if _, ok := alwaysZeroForThisFixture[f.Name]; ok {
+			continue
+		}
+		if v.Field(i).IsZero() {
+			t.Errorf("storedFrom leaves Stored.%s at its zero value. Either the helper "+
+				"does not copy it — in which case every round-trip test in this file is "+
+				"passing on a field nobody carries — or validDraft does not state it, in "+
+				"which case the fixture cannot tell a carried field from a dropped one.",
+				f.Name)
+		}
 	}
 }
 
@@ -611,6 +936,40 @@ func TestRehydratePreservesTheSupersedeLink(t *testing.T) {
 
 // A row that could never have been sealed must not load, and the reason
 // should say what was wrong rather than only that the hash differed.
+// 🔴 A stored provider remainder that disagrees with the row it sits in must
+// not load, and the digest ALONE does not catch it.
+//
+// Rehydrate DERIVES the remainder from the total and the wallet allocation
+// (INV-002, one derivation), so rebuilt.providerRemainderMicros is correct
+// whatever the column says, and the recomputed digest matches. The stored
+// column is therefore checked against nothing unless something checks it
+// explicitly — which nothing did until this commit.
+//
+// The mutation that proves this test: replace the comparison in Rehydrate
+// with `if false` and only this test goes red.
+func TestRehydrateRefusesAStoredRemainderThatWasNotDerived(t *testing.T) {
+	original, err := Seal(validDraft())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := storedFrom(original)
+	stored.ExecuteNotBefore, stored.ExecuteNotAfter = original.ExecutionWindow()
+
+	if _, err := Rehydrate(stored); err != nil {
+		t.Fatalf("the untouched fixture does not load, so this test proves nothing: %v", err)
+	}
+
+	// One column rewritten, by a migration in passing or a restored backup.
+	// Every other field, and the digest, are exactly as sealed.
+	stored.ProviderRemainderMicros = original.ProviderRemainderMicros() + 1
+
+	if _, err := Rehydrate(stored); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("a row whose provider remainder was rewritten loaded anyway (%v). "+
+			"The adapter is handed that number, so a row nobody derived it from is a "+
+			"charge for an amount nobody computed.", err)
+	}
+}
+
 func TestRehydrateRefusesARowThatCouldNeverHaveBeenSealed(t *testing.T) {
 	original, err := Seal(validDraft())
 	if err != nil {
