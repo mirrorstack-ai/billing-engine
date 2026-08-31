@@ -27,13 +27,26 @@ import (
 	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
 )
 
 // Store is the durable half. Narrowed to one method so this package
 // cannot advance a state, take a claim, or record an outcome — all of
 // which belong to whoever executes.
+//
+// The one method writes the intent AND its INV-014 evidence record in a
+// single transaction. There is deliberately no method here that writes the
+// intent alone: sealing an intent is the first of docs/DESIGN.md:388's eight
+// evidence events, and a proposer able to seal without recording is a
+// proposer that can produce a charge document the customer has no independent
+// trace of.
 type Store interface {
-	SaveIntent(ctx context.Context, sealed intent.ChargeIntent) error
+	SaveIntentWithEvidence(
+		ctx context.Context,
+		sealed intent.ChargeIntent,
+		rec *evidence.Recorder,
+		e evidence.Event,
+	) error
 }
 
 // Charge is a leg's derived charge, ready to be sealed.
@@ -73,11 +86,33 @@ type Charge struct {
 
 // Proposer seals derived charges and stores them.
 type Proposer struct {
-	store Store
+	store    Store
+	recorder *evidence.Recorder
+	now      func() time.Time
 }
 
+// ErrNoRecorder refuses a Proposer that cannot record what it seals.
+//
+// A nil recorder is not "evidence off". docs/DESIGN.md:398 makes an evidence
+// record a durable side effect of the money moving, so a deployment that
+// cannot produce one must not seal charge documents at all — and the caller
+// that armed the cutover is the right place to discover that, at startup,
+// rather than a leg discovering it mid-run.
+var ErrNoRecorder = errors.New("proposer: refusing to construct a proposer with no evidence recorder")
+
 // New returns a Proposer over the given store.
-func New(store Store) *Proposer { return &Proposer{store: store} }
+//
+// now is injected for the same reason it is everywhere else in this package's
+// neighbours: a record that reads a clock cannot be replayed.
+func New(store Store, recorder *evidence.Recorder, now func() time.Time) (*Proposer, error) {
+	if recorder == nil {
+		return nil, ErrNoRecorder
+	}
+	if now == nil {
+		return nil, errors.New("proposer: no clock")
+	}
+	return &Proposer{store: store, recorder: recorder, now: now}, nil
+}
 
 // ErrNotProposable is returned when a charge cannot be sealed.
 var ErrNotProposable = errors.New("proposer: charge cannot be sealed")
@@ -130,7 +165,19 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		return intent.ChargeIntent{}, fmt.Errorf("%w: %w", ErrNotProposable, err)
 	}
 
-	if err := p.store.SaveIntent(ctx, sealed); err != nil {
+	// The intent and its evidence record commit together. docs/DESIGN.md:398
+	// makes evidence "a durable side effect of the money moving", so a seal
+	// this deployment cannot record is a seal it does not perform.
+	if err := p.store.SaveIntentWithEvidence(ctx, sealed, p.recorder, evidence.Event{
+		Kind:         evidence.KindSealedIntent,
+		Subject:      sealed.Payer(),
+		IntentDigest: sealed.Digest(),
+		// Closed vocabulary, never customer prose: the charge kind is one of
+		// docs/DESIGN.md §6's nine, and it is what a reader needs to know
+		// which rule of an authorization this document was sealed under.
+		Detail:     string(sealed.Kind()),
+		OccurredAt: p.now(),
+	}); err != nil {
 		return intent.ChargeIntent{}, fmt.Errorf("proposer: store sealed intent: %w", err)
 	}
 	return sealed, nil

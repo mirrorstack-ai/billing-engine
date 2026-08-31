@@ -27,12 +27,14 @@ import (
 	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/capabilities"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/executor"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/predicate"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/store"
 	"github.com/mirrorstack-ai/billing-engine/internal/provider/stripeadapter"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/signing"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -54,10 +56,42 @@ func main() {
 		payerResolver{pool: pool},
 	)
 
-	exec := executor.New(s, adapter, buildinfo.Current().Artifact,
+	// 🔴 The executor cannot start without an evidence signing key.
+	//
+	// Every branch of Execute produces one of docs/DESIGN.md:388's eight
+	// events, and :398 makes an evidence record a durable side effect of the
+	// money moving rather than a report something chooses to render. So a
+	// deployment that could execute but not record would settle charges the
+	// customer has no independent trace of — and it would look identical to
+	// one that is working, which is the failure this binary's readiness
+	// checks already exist to prevent.
+	signer, err := signing.Load(os.Getenv)
+	if err != nil {
+		slog.Error("signing key material will not load", "reason", err.Error())
+		os.Exit(1)
+	}
+	recorder, err := evidence.NewRecorder(signer, evidence.Options{
+		Issuer:      "billing-engine",
+		Audience:    "customer",
+		Environment: buildinfo.Current().Environment,
+		Now:         func() time.Time { return time.Now().UTC() },
+	})
+	if err != nil {
+		slog.Error("this deployment cannot record evidence, so it must not execute intents",
+			"needs", signing.EnvBillingEvidenceKey,
+			"why", "docs/DESIGN.md INV-014: an evidence record is a side effect of the money moving",
+			"reason", err.Error())
+		os.Exit(1)
+	}
+
+	exec, err := executor.New(s, adapter, recorder, buildinfo.Current().Artifact,
 		func() time.Time { return time.Now().UTC() },
 		environment,
 	)
+	if err != nil {
+		slog.Error("executor will not construct", "reason", err.Error())
+		os.Exit(1)
+	}
 	_ = exec
 
 	// 🔴 There is no work loop yet, and that is deliberate rather than
