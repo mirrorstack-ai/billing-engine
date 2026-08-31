@@ -2131,3 +2131,104 @@ decision, and should stop being described as pending.
 authorization ends the free window for items 1, 3, 13 and 16. Dropping legacy
 afterwards is mechanical by comparison — the preconditions are already clear and
 the collectors are already doing their job correctly.
+
+---
+
+## ✅ ANSWERED BY THE OWNER — 2026-08-31
+
+### Item 16 — consent authority: **C**
+
+Build the independence that needs no enrolled factor:
+
+1. the billing-owned transactional evidence outbox (DESIGN.md:395-397 — "worth
+   building first anyway");
+2. bind `AcceptanceDigest` to an **engine-issued, engine-signed** disclosure
+   digest instead of accepting any non-empty string
+   (`internal/intent/authorization.go:270-272`), and populate
+   `SealedState.Acceptance` in the executor from a stored engine-issued
+   challenge so the customer-present branch (`predicate.go:292-317`) is
+   reachable and actually checks something;
+3. publish the trust boundary in `Capabilities`.
+
+A relayed receipt stays relayed. What changes is that "reproducible in
+principle" becomes "reproducible in practice", and every piece is a strict
+prerequisite for B if it is ever funded.
+
+### Item 10 — Taiwan: **out of scope for this cutover**
+
+Owner: *"not in this scope, implement in future."* The NewebPay adapter, its
+independent conformance suite (§11 step 7) and any invoice-issuance subsystem
+leave the plan.
+
+⚠️ **One measurement is still owed before this is safe to call settled:**
+whether legacy collection *already* reaches Taiwan customers. If it does, this
+decision describes the target and not the present, and the exposure is a
+legacy-rail question the cutover does not touch.
+
+### Items 3 and 4 — answered, and they change the SHAPE of the model
+
+The owner's answers were not the single global choices §12's framing assumed.
+
+**Item 3 — change policy.** Not one answer:
+- **the platform runs option B** (two classes: terms and price book need
+  renewed acceptance; notice policy, tax rule and routing need delivered notice
+  but keep the authorization alive);
+- **a distributor may run A or B** for its own customers.
+
+**Item 4 — merchant of record and rail.** Also not one answer:
+- **the platform sells in USD only, through Stripe**;
+- **a distributor may select currency**;
+- **routing rule:** inside Stripe's supported area go direct to Stripe;
+  otherwise a local provider (NewebPay, TapPay, …) — *"but need to built to
+  support it"*.
+
+## 🔴 What those two answers imply: policy is PER-DISTRIBUTOR, and the model has no distributor
+
+This is the largest consequence of this decision round, and it is not in §12.
+
+**`distributor` exists in exactly one place in the billing engine:** as a value
+of `credit_ledger.actor`
+(`migrations/billing/048_credit_wallet.up.sql:47`, `CHECK (actor IN ('self',
+'distributor', 'system'))`). There is no distributor entity, no distributor
+identity on an account, and `BillingAuthorization` has no notion of one — it
+carries `Scope`, `Subject`, `Currency`, `Kinds`, ceilings, `Provider`,
+`MandateReference` and the four policy revisions, and nothing that says *whose
+policy* those revisions are.
+
+So both answers require a dimension that does not exist:
+
+| answer | needs |
+|---|---|
+| distributor may run change policy A or B | the class rule to be **resolvable per distributor**, and — per item 3 option B's own cost note — **sealed, not inferred**, so a canonical supersession |
+| distributor may select currency | `chargeCurrency` is a **constant** `"usd"` (`internal/account/cycle/types.go:195-198`) — one of the three traps this document already names |
+| routing: Stripe if supported, else local | `ClauseRailSupportsPlan` compares the sealed rail to `Authorization.Provider()` — a single accepted rail per authorization. A *routing rule* that picks among rails needs the published routing policy (§12 item 3's routing half) and a per-distributor permitted-rail set |
+| platform USD/Stripe, distributor otherwise | `ClauseMerchantOfRecord` must resolve the seller **from the distributor**, not from a global constant — which is item 4's binding set becoming genuinely plural after all |
+
+**Consequence for item 4's costing above:** the answer is closer to option **B**
+(plural entities, plural rails) than to option **A**, even though Taiwan is out
+of scope. Option A's cheapness came entirely from the binding set having one
+member. A distributor-selectable currency and a rail-routing rule make it
+plural on day one, and items 10 and 11 come back onto the critical path the
+moment a distributor selects a currency the platform does not sell in.
+
+Taiwan being out of scope defers the *implementation* of a local provider. It
+does not defer the *seam*, because the routing rule is what the owner asked
+for.
+
+### The next question this raises, which is the owner's
+
+**Is a distributor a billing principal, or a reseller?** The two readings have
+different answers to "whose customer is it" and therefore to merchant of
+record:
+
+- **A distributor is a channel.** MirrorStack remains merchant of record for
+  every sale; the distributor's currency and policy choices are presentation
+  and packaging over MirrorStack's own terms. Item 4 stays close to option A.
+- **A distributor is a reseller.** The distributor is merchant of record for
+  its customers, owns their tax liability, and MirrorStack sells to the
+  distributor rather than to the end customer. That is item 4 option **C**,
+  whose costed consequence above is that `TaxIndependentlyReproducible` may
+  become structurally unreachable for those sales.
+
+Nothing in the tree answers this, and it decides how much of §12 items 4, 5, 6,
+10 and 11 MirrorStack owns versus delegates.
