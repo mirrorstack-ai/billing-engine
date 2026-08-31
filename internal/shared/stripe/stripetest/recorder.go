@@ -70,6 +70,11 @@ type Call struct {
 	// the method takes none. A mutation with no key is worth failing on
 	// in its own right.
 	IdemKey string
+	// Description is the customer-facing line text, for the line-item
+	// calls. It is recorded because it is what the customer reads on their
+	// statement, and a rail that quietly substituted its own text for the
+	// one a document sealed would otherwise be unobservable here.
+	Description string
 }
 
 // Recorder implements the provider client interfaces and records every
@@ -119,6 +124,15 @@ func stub[T any](r *Recorder, method string) T {
 }
 
 // Calls returns every recorded call, in order.
+// setLastDescription attaches the description to the call just recorded.
+func (r *Recorder) setLastDescription(description string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n := len(r.calls); n > 0 {
+		r.calls[n-1].Description = description
+	}
+}
+
 func (r *Recorder) Calls() []Call {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -247,10 +261,11 @@ func (r *Recorder) CreateAutoTopUpInvoice(_ context.Context, customerID, payment
 	return r.invoiceStub("CreateAutoTopUpInvoice", "in_autotopup_recorder"), nil
 }
 
-func (r *Recorder) CreateInvoiceItem(_ context.Context, custID, invoiceID string, amountCents int64, _, _ string, _ billingstripe.LinePeriod, idemKey string) (billingstripe.InvoiceItem, error) {
+func (r *Recorder) CreateInvoiceItem(_ context.Context, custID, invoiceID string, amountCents int64, _, description string, _ billingstripe.LinePeriod, idemKey string) (billingstripe.InvoiceItem, error) {
 	if err := r.record("CreateInvoiceItem", EffectMutate, invoiceID, idemKey, amountCents); err != nil {
 		return billingstripe.InvoiceItem{}, err
 	}
+	r.setLastDescription(description)
 	_ = custID
 	return stub[billingstripe.InvoiceItem](r, "CreateInvoiceItem"), nil
 }

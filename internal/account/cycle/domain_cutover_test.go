@@ -29,7 +29,7 @@ func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (inten
 	return intent.Seal(intent.Draft{
 		Payer:                 intent.Subject{Kind: "user", ID: "owner-of-" + c.AccountID},
 		Currency:              c.Currency,
-		Lines:                 []intent.Line{intent.NewLine(c.Description, c.SourceRef, "1", 1, c.AmountMicros)},
+		Lines:                 chargeLines(c),
 		Kind:                  c.Kind,
 		PriceBookRevision:     c.PriceBookRevision,
 		TermsRevision:         c.TermsRevision,
@@ -38,7 +38,7 @@ func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (inten
 		NoticePolicy:          c.NoticePolicy,
 		ExecuteNotBefore:      c.ExecuteNotBefore,
 		ExecuteNotAfter:       c.ExecuteNotAfter,
-		SourceFactKeys:        []string{c.SourceRef},
+		SourceFactKeys:        chargeFacts(c),
 		SelectedRail:          "stripe",
 		RoutingPolicyRevision: "routing-2026-08",
 	})
@@ -100,9 +100,9 @@ func TestDomainLegProposesInsteadOfCharging(t *testing.T) {
 
 	require.Len(t, p.charges, 1)
 	require.Equal(t, intent.KindCustomDomain, p.charges[0].Kind)
-	require.Positive(t, p.charges[0].AmountMicros,
+	require.Positive(t, p.charges[0].TotalMicros(),
 		"the leg proposed a zero charge; the proration was lost in the cutover")
-	require.Contains(t, p.charges[0].Description, cand.Hostname)
+	require.Contains(t, p.charges[0].Lines[0].Description, cand.Hostname)
 }
 
 // With no proposer the leg behaves exactly as before, which is what
@@ -152,7 +152,25 @@ func TestTheCutoverDoesNotChangeTheAmount(t *testing.T) {
 	// The legacy path rounds to whole cents at the Stripe boundary; the
 	// proposed intent keeps micro-dollars. Comparing at cents compares
 	// the same decision.
-	proposedCents := (p.charges[0].AmountMicros + 5_000) / 10_000
+	proposedCents := (p.charges[0].TotalMicros() + 5_000) / 10_000
 	require.Equal(t, legacyRes.ChargedCents, proposedCents,
 		"the cutover changed what the customer is charged")
+}
+
+// chargeLines and chargeFacts mirror what the real proposer builds, so a
+// capturing fake cannot drift from the seam it stands in for.
+func chargeLines(c proposer.Charge) []intent.Line {
+	out := make([]intent.Line, 0, len(c.Lines))
+	for _, l := range c.Lines {
+		out = append(out, intent.NewLine(l.Description, l.SourceRef, "1", 1, l.AmountMicros))
+	}
+	return out
+}
+
+func chargeFacts(c proposer.Charge) []string {
+	out := make([]string, 0, len(c.Lines))
+	for _, l := range c.Lines {
+		out = append(out, l.SourceRef)
+	}
+	return out
 }
