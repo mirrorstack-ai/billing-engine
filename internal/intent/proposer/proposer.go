@@ -61,6 +61,11 @@ type Charge struct {
 	PriceBookRevision string
 	NoticePolicy      string
 	Tax               intent.TaxDetermination
+	// SelectedRail and RoutingPolicyRevision are sealed into the intent
+	// (docs/DESIGN.md:1281-1283), so a rail swap after disclosure breaks
+	// the digest rather than going unnoticed.
+	SelectedRail          string
+	RoutingPolicyRevision string
 
 	ExecuteNotBefore time.Time
 	ExecuteNotAfter  time.Time
@@ -114,9 +119,12 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		Tax:               c.Tax,
 		AuthorizationID:   c.AuthorizationID,
 		NoticePolicy:      c.NoticePolicy,
-		ExecuteNotBefore:  c.ExecuteNotBefore,
-		ExecuteNotAfter:   c.ExecuteNotAfter,
-		SourceFactKeys:    []string{c.SourceRef},
+
+		SelectedRail:          c.SelectedRail,
+		RoutingPolicyRevision: c.RoutingPolicyRevision,
+		ExecuteNotBefore:      c.ExecuteNotBefore,
+		ExecuteNotAfter:       c.ExecuteNotAfter,
+		SourceFactKeys:        []string{c.SourceRef},
 	})
 	if err != nil {
 		return intent.ChargeIntent{}, fmt.Errorf("%w: %w", ErrNotProposable, err)

@@ -16,18 +16,20 @@ type capturingProposer struct{ charges []proposer.Charge }
 func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (intent.ChargeIntent, error) {
 	p.charges = append(p.charges, c)
 	return intent.Seal(intent.Draft{
-		Payer:             c.Payer,
-		Currency:          c.Currency,
-		Lines:             []intent.Line{intent.NewLine(c.Description, c.SourceRef, "1", 1, c.AmountMicros)},
-		Kind:              c.Kind,
-		PriceBookRevision: c.PriceBookRevision,
-		TermsRevision:     c.TermsRevision,
-		Tax:               c.Tax,
-		AuthorizationID:   c.AuthorizationID,
-		NoticePolicy:      c.NoticePolicy,
-		ExecuteNotBefore:  c.ExecuteNotBefore,
-		ExecuteNotAfter:   c.ExecuteNotAfter,
-		SourceFactKeys:    []string{c.SourceRef},
+		Payer:                 c.Payer,
+		Currency:              c.Currency,
+		Lines:                 []intent.Line{intent.NewLine(c.Description, c.SourceRef, "1", 1, c.AmountMicros)},
+		Kind:                  c.Kind,
+		PriceBookRevision:     c.PriceBookRevision,
+		TermsRevision:         c.TermsRevision,
+		Tax:                   c.Tax,
+		AuthorizationID:       c.AuthorizationID,
+		NoticePolicy:          c.NoticePolicy,
+		ExecuteNotBefore:      c.ExecuteNotBefore,
+		ExecuteNotAfter:       c.ExecuteNotAfter,
+		SourceFactKeys:        []string{c.SourceRef},
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
 	})
 }
 

@@ -81,11 +81,13 @@ func sealedFixture(t *testing.T) intent.ChargeIntent {
 			Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-2026-05", AmountMicros: 1_250,
 			Verification: intent.TaxNotApplicable,
 		},
-		AuthorizationID:  "auth-1",
-		NoticePolicy:     "email/v1",
-		ExecuteNotBefore: windowStart,
-		ExecuteNotAfter:  windowEnd,
-		SourceFactKeys:   []string{"fact-1"},
+		AuthorizationID:       "auth-1",
+		NoticePolicy:          "email/v1",
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
+		ExecuteNotBefore:      windowStart,
+		ExecuteNotAfter:       windowEnd,
+		SourceFactKeys:        []string{"fact-1"},
 	})
 	require.NoError(t, err)
 	return sealed
@@ -424,18 +426,20 @@ func TestAnUnknownKindIsRefusedWhenRehydrated(t *testing.T) {
 func sealKind(t *testing.T, kind intent.ChargeKind, micros int64) intent.ChargeIntent {
 	t.Helper()
 	sealed, err := intent.Seal(intent.Draft{
-		Payer:             intent.Subject{Kind: "user", ID: "acct-1"},
-		Currency:          "usd",
-		Lines:             []intent.Line{intent.NewLine("d", "m", "1", 1, micros)},
-		Kind:              kind,
-		PriceBookRevision: "pb-1",
-		TermsRevision:     "terms-1",
-		Tax:               intent.TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1", Verification: intent.TaxNotApplicable},
-		AuthorizationID:   "auth-1",
-		NoticePolicy:      "email/v1",
-		ExecuteNotBefore:  windowStart,
-		ExecuteNotAfter:   windowEnd,
-		SourceFactKeys:    []string{"f"},
+		Payer:                 intent.Subject{Kind: "user", ID: "acct-1"},
+		Currency:              "usd",
+		Lines:                 []intent.Line{intent.NewLine("d", "m", "1", 1, micros)},
+		Kind:                  kind,
+		PriceBookRevision:     "pb-1",
+		TermsRevision:         "terms-1",
+		Tax:                   intent.TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1", Verification: intent.TaxNotApplicable},
+		AuthorizationID:       "auth-1",
+		NoticePolicy:          "email/v1",
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
+		ExecuteNotBefore:      windowStart,
+		ExecuteNotAfter:       windowEnd,
+		SourceFactKeys:        []string{"f"},
 	})
 	if err != nil {
 		t.Fatalf("Seal(%s): %v", kind, err)

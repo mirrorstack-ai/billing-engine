@@ -833,6 +833,13 @@ func (s *Service) proposeModuleOverage(
 		TermsRevision:     proposedTermsRevision,
 		PriceBookRevision: proposedPriceBookRevision,
 		NoticePolicy:      proposedNoticePolicy,
+		// The only rail this engine has an adapter for. The routing
+		// policy that is supposed to CHOOSE it does not exist yet, so
+		// the revision is a placeholder like the other four and
+		// ClausePolicyPublished refuses on it — which is the honest
+		// state, not a gap being hidden.
+		SelectedRail:          proposedRail,
+		RoutingPolicyRevision: proposedRoutingPolicy,
 		Tax: intent.TaxDetermination{
 			Resolved:     true,
 			Jurisdiction: "not-applicable",
