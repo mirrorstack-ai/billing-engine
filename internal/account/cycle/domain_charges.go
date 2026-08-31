@@ -396,12 +396,14 @@ func (s *Service) proposeDomainCharge(
 		// The proposer resolves this to the account OWNER. A leg that built
 		// an intent.Subject here is how the payer and the executor's
 		// resolver came to disagree; see proposer.Charge.AccountID.
-		AccountID:    cand.AccountID.String(),
-		Kind:         intent.KindCustomDomain,
-		Currency:     chargeCurrency,
-		AmountMicros: sealMicros,
-		Description:  fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname),
-		SourceRef:    domainChargeRef(cand.ID),
+		AccountID: cand.AccountID.String(),
+		Kind:      intent.KindCustomDomain,
+		Currency:  chargeCurrency,
+		Lines: proposer.SingleLine(
+			fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname),
+			domainChargeRef(cand.ID),
+			sealMicros,
+		),
 
 		AuthorizationID:   "domain:" + cand.AccountID.String(),
 		TermsRevision:     proposedTermsRevision,

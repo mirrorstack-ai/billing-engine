@@ -66,6 +66,16 @@ type Debit struct {
 	Payer        intent.Subject
 	AmountMicros int64
 	Currency     string
+	// Lines are the sealed lines, in order, so the adapter can put on the
+	// provider's invoice what the customer accepted.
+	//
+	// 🔴 They were not carried, and the adapter substituted "MirrorStack
+	// charge <short digest>" for every charge. A customer reading their
+	// statement on the intent rail would have seen an opaque string where
+	// the legacy rail named the domain, the module or the period — the same
+	// money, described worse, by the rail that is supposed to be the
+	// verifiable one.
+	Lines []intent.Line
 	// IdempotencyKey is derived from the intent digest, so a retry of
 	// the same intent is the same request at the provider.
 	IdempotencyKey string
@@ -334,6 +344,7 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		// remainder is correct now and stays correct then.
 		AmountMicros:   funding.ProviderRemainderMicros,
 		Currency:       sealed.Currency(),
+		Lines:          sealed.Lines(),
 		IdempotencyKey: "intent-" + digest,
 	})
 

@@ -18,7 +18,7 @@ func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (inten
 	return intent.Seal(intent.Draft{
 		Payer:                 intent.Subject{Kind: "user", ID: "owner-of-" + c.AccountID},
 		Currency:              c.Currency,
-		Lines:                 []intent.Line{intent.NewLine(c.Description, c.SourceRef, "1", 1, c.AmountMicros)},
+		Lines:                 chargeLines(c),
 		Kind:                  c.Kind,
 		PriceBookRevision:     c.PriceBookRevision,
 		TermsRevision:         c.TermsRevision,
@@ -27,7 +27,7 @@ func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (inten
 		NoticePolicy:          c.NoticePolicy,
 		ExecuteNotBefore:      c.ExecuteNotBefore,
 		ExecuteNotAfter:       c.ExecuteNotAfter,
-		SourceFactKeys:        []string{c.SourceRef},
+		SourceFactKeys:        chargeFacts(c),
 		SelectedRail:          "stripe",
 		RoutingPolicyRevision: "routing-2026-08",
 	})
@@ -74,11 +74,11 @@ func TestAutoTopUpProposesInsteadOfCharging(t *testing.T) {
 	}
 	// A figure a card cannot be charged is one the customer's bundle would
 	// attest to and never see on their statement.
-	if c.AmountMicros%microsPerCent != 0 {
-		t.Fatalf("sealed %d micros, which is not a whole number of cents", c.AmountMicros)
+	if c.TotalMicros()%microsPerCent != 0 {
+		t.Fatalf("sealed %d micros, which is not a whole number of cents", c.TotalMicros())
 	}
-	if c.AmountMicros != microsToCentsRoundHalfUp(attempt.AmountMicros)*microsPerCent {
-		t.Fatalf("sealed %d micros, not the amount a collection would take", c.AmountMicros)
+	if c.TotalMicros() != microsToCentsRoundHalfUp(attempt.AmountMicros)*microsPerCent {
+		t.Fatalf("sealed %d micros, not the amount a collection would take", c.TotalMicros())
 	}
 }
 
@@ -103,4 +103,22 @@ func TestAnAttemptWithAProviderInvoiceIsNotProposedOver(t *testing.T) {
 		t.Fatal("the leg sealed an intent for an attempt that already had an invoice at the " +
 			"provider — that is a second obligation for the same money")
 	}
+}
+
+// chargeLines and chargeFacts mirror what the real proposer builds, so a
+// capturing fake cannot drift from the seam it stands in for.
+func chargeLines(c proposer.Charge) []intent.Line {
+	out := make([]intent.Line, 0, len(c.Lines))
+	for _, l := range c.Lines {
+		out = append(out, intent.NewLine(l.Description, l.SourceRef, "1", 1, l.AmountMicros))
+	}
+	return out
+}
+
+func chargeFacts(c proposer.Charge) []string {
+	out := make([]string, 0, len(c.Lines))
+	for _, l := range c.Lines {
+		out = append(out, l.SourceRef)
+	}
+	return out
 }

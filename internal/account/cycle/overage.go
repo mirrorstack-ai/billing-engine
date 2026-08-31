@@ -825,12 +825,10 @@ func (s *Service) proposeModuleOverage(
 		// The proposer resolves this to the account OWNER. A leg that built
 		// an intent.Subject here is how the payer and the executor's
 		// resolver came to disagree; see proposer.Charge.AccountID.
-		AccountID:    cand.AccountID.String(),
-		Kind:         intent.KindModuleCapacity,
-		Currency:     chargeCurrency,
-		AmountMicros: sealMicros,
-		Description:  "MirrorStack module overage (prorated)",
-		SourceRef:    moduleOverageChargeRef(cand.ID),
+		AccountID: cand.AccountID.String(),
+		Kind:      intent.KindModuleCapacity,
+		Currency:  chargeCurrency,
+		Lines:     proposer.SingleLine("MirrorStack module overage (prorated)", moduleOverageChargeRef(cand.ID), sealMicros),
 
 		AuthorizationID:   "overage:" + cand.AccountID.String(),
 		TermsRevision:     proposedTermsRevision,

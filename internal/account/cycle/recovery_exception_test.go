@@ -118,7 +118,7 @@ func TestASealedDomainChargeIsAlwaysWholeCents(t *testing.T) {
 	require.Equal(t, cycle.DomainChargeProposed, res.Status)
 	require.Len(t, p.charges, 1)
 
-	sealed := p.charges[0].AmountMicros
+	sealed := p.charges[0].TotalMicros()
 
 	// Non-vacuity guard: if the fixture ever stops producing a fractional
 	// derivation, this test silently stops testing rounding. Fail loudly
