@@ -240,7 +240,7 @@ func (r *Recorder) Seal(e Event, checkpoint int64) (Record, error) {
 		return Record{}, fmt.Errorf("%w: checkpoint", ErrIncomplete)
 	}
 
-	digest := e.payloadDigest(checkpoint)
+	digest := e.payloadDigest()
 	at := r.now()
 	signed, err := r.key.Sign(signing.Statement{
 		Issuer:        r.issuer,
@@ -261,13 +261,27 @@ func (r *Recorder) Seal(e Event, checkpoint int64) (Record, error) {
 // payloadDigest is the identity of what the record attests.
 //
 // Length-prefixed, for the reason the intent digest is: two different events
-// must never produce one digest, and Detail is caller-supplied. The checkpoint
-// is inside it so a record cannot be lifted to another position in the log.
+// must never produce one digest, and Detail is caller-supplied.
+//
+// 🔴 The checkpoint is deliberately NOT in here, and the first version had it.
+//
+// Putting it in made the digest unique per ATTEMPT rather than per EVENT, so
+// the schema's UNIQUE (kind, intent_digest, payload_digest) — the whole
+// idempotency control — could never fire: a retry drew a new checkpoint,
+// produced a different digest, and appended a second record for one thing that
+// happened. Found by the retry test, which appended three records where it
+// asserted one.
+//
+// Nothing is lost by removing it. The checkpoint is envelope metadata, and the
+// SIGNATURE already covers it (signing.Statement.Checkpoint), so a record
+// still cannot be lifted to another position in the log — that guarantee lives
+// where it belongs, in the statement, rather than being conflated with the
+// identity of the event.
 //
 // It is a function of the event alone, so anyone holding the row can recompute
 // it — which is what makes the row's own columns sufficient evidence and a
 // stored payload unnecessary.
-func (e Event) payloadDigest(checkpoint int64) [32]byte {
+func (e Event) payloadDigest() [32]byte {
 	var b []byte
 	add := func(v string) {
 		b = strconv.AppendInt(b, int64(len(v)), 10)
@@ -275,7 +289,6 @@ func (e Event) payloadDigest(checkpoint int64) [32]byte {
 		b = append(b, v...)
 	}
 	add(Schema)
-	add(strconv.FormatInt(checkpoint, 10))
 	add(string(e.Kind))
 	add(e.Subject.Kind)
 	add(e.Subject.ID)
@@ -287,7 +300,7 @@ func (e Event) payloadDigest(checkpoint int64) [32]byte {
 
 // PayloadDigestOf recomputes a record's digest from its own fields, for a
 // verifier holding the row.
-func PayloadDigestOf(e Event, checkpoint int64) []byte {
-	d := e.payloadDigest(checkpoint)
+func PayloadDigestOf(e Event) []byte {
+	d := e.payloadDigest()
 	return d[:]
 }
