@@ -195,3 +195,70 @@ func differentValueFor(c intentColumn) string {
 func pgQuoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
+
+// 🔴 A sealed intent must not be DELETE-able either.
+//
+// Migration 054's trigger was BEFORE UPDATE, so for its whole life
+// `DELETE FROM ms_billing.charge_intents WHERE digest = '...'` succeeded — and
+// charge_intent_lines, charge_intent_source_facts and notice_receipts all
+// carry ON DELETE CASCADE (054:130, :150, :196). One statement removed the
+// sealed document, the lines it was made of, the facts it was derived from,
+// and the carrier-verified notice evidence INV-005 rests on.
+//
+// "Superseding is cheap; editing is unanswerable" applies at least as hard to
+// deletion: an edited row is at least still a row a reader can find and
+// disbelieve. A deleted one leaves the customer's charge with no document
+// behind it at all.
+func TestASealedIntentCannotBeDeleted(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	digest := seedIntent(t, pool, "sealed-no-delete")
+
+	_, err := pool.Exec(ctx,
+		`DELETE FROM ms_billing.charge_intents WHERE digest = $1`, digest)
+	require.Error(t, err, "a sealed intent was deleted outright")
+	require.Contains(t, err.Error(), "sealed",
+		"the refusal does not say why; an operator seeing it needs to be told to supersede or correct")
+
+	var still int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.charge_intents WHERE digest = $1`, digest).Scan(&still))
+	require.Equal(t, 1, still, "the row is gone, so the refusal did not hold")
+}
+
+// The cascade is the reason the test above matters, and this is what it would
+// have taken with it.
+func TestDeletingAnIntentWouldHaveTakenItsNoticeEvidence(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+
+	var cascading []string
+	rows, err := pool.Query(ctx, `
+		SELECT DISTINCT tc.table_name
+		  FROM information_schema.table_constraints tc
+		  JOIN information_schema.referential_constraints rc
+		    ON rc.constraint_name = tc.constraint_name
+		   AND rc.constraint_schema = tc.constraint_schema
+		  JOIN information_schema.constraint_column_usage ccu
+		    ON ccu.constraint_name = tc.constraint_name
+		   AND ccu.constraint_schema = tc.constraint_schema
+		 WHERE tc.constraint_type = 'FOREIGN KEY'
+		   AND tc.constraint_schema = 'ms_billing'
+		   AND ccu.table_name = 'charge_intents'
+		   AND rc.delete_rule = 'CASCADE'`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		cascading = append(cascading, name)
+	}
+	require.NoError(t, rows.Err())
+
+	// This is not a rule about which tables must cascade — it is the record
+	// of how much one DELETE used to be worth. If the set shrinks to nothing,
+	// the DELETE seal is less urgent; if it grows, more.
+	require.NotEmpty(t, cascading,
+		"nothing cascades from charge_intents, so this test no longer describes the tree")
+	t.Logf("a DELETE on charge_intents would cascade to: %v", cascading)
+}

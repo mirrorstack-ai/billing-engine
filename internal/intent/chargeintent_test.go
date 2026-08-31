@@ -936,6 +936,40 @@ func TestRehydratePreservesTheSupersedeLink(t *testing.T) {
 
 // A row that could never have been sealed must not load, and the reason
 // should say what was wrong rather than only that the hash differed.
+// 🔴 A stored provider remainder that disagrees with the row it sits in must
+// not load, and the digest ALONE does not catch it.
+//
+// Rehydrate DERIVES the remainder from the total and the wallet allocation
+// (INV-002, one derivation), so rebuilt.providerRemainderMicros is correct
+// whatever the column says, and the recomputed digest matches. The stored
+// column is therefore checked against nothing unless something checks it
+// explicitly — which nothing did until this commit.
+//
+// The mutation that proves this test: replace the comparison in Rehydrate
+// with `if false` and only this test goes red.
+func TestRehydrateRefusesAStoredRemainderThatWasNotDerived(t *testing.T) {
+	original, err := Seal(validDraft())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := storedFrom(original)
+	stored.ExecuteNotBefore, stored.ExecuteNotAfter = original.ExecutionWindow()
+
+	if _, err := Rehydrate(stored); err != nil {
+		t.Fatalf("the untouched fixture does not load, so this test proves nothing: %v", err)
+	}
+
+	// One column rewritten, by a migration in passing or a restored backup.
+	// Every other field, and the digest, are exactly as sealed.
+	stored.ProviderRemainderMicros = original.ProviderRemainderMicros() + 1
+
+	if _, err := Rehydrate(stored); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("a row whose provider remainder was rewritten loaded anyway (%v). "+
+			"The adapter is handed that number, so a row nobody derived it from is a "+
+			"charge for an amount nobody computed.", err)
+	}
+}
+
 func TestRehydrateRefusesARowThatCouldNeverHaveBeenSealed(t *testing.T) {
 	original, err := Seal(validDraft())
 	if err != nil {
