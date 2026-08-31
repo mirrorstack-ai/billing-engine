@@ -30,9 +30,14 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
 )
 
-// Store is the durable half. Narrowed to one method so this package
-// cannot advance a state, take a claim, or record an outcome — all of
-// which belong to whoever executes.
+// Store is the durable half. Narrowed so this package cannot advance a
+// state, take a claim, or record an outcome — all of which belong to whoever
+// executes.
+//
+// PayerForAccount is a READ, and it is here rather than on each leg because
+// the subject a charge seals must agree with what the executor later
+// resolves. Those two used to be written independently, in different
+// packages, and disagreed.
 //
 // The one method writes the intent AND its INV-014 evidence record in a
 // single transaction. There is deliberately no method here that writes the
@@ -41,6 +46,7 @@ import (
 // proposer that can produce a charge document the customer has no independent
 // trace of.
 type Store interface {
+	PayerForAccount(ctx context.Context, accountID string) (intent.Subject, error)
 	SaveIntentWithEvidence(
 		ctx context.Context,
 		sealed intent.ChargeIntent,
@@ -57,7 +63,18 @@ type Store interface {
 // decomposes into a catalog lookup would be a fiction the digest would
 // then attest to.
 type Charge struct {
-	Payer        intent.Subject
+	// AccountID is the ms_billing.accounts row the charge is against.
+	//
+	// 🔴 It is an ACCOUNT id, and the proposer resolves it to the account's
+	// OWNER before sealing. A leg does not construct an intent.Subject.
+	//
+	// It used to. All three cut-over legs sealed
+	// intent.Subject{Kind: "user", ID: <accounts.id>}, while the executor
+	// resolved a payer by owner_user_id — and accounts.id is never an
+	// owner_user_id, so every intent this tree could produce was
+	// uncollectable. Taking an account id here makes the correct subject the
+	// only one a leg can express.
+	AccountID    string
 	Kind         intent.ChargeKind
 	Currency     string
 	AmountMicros int64
@@ -138,8 +155,14 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		return intent.ChargeIntent{}, fmt.Errorf("%w: amount is %d", ErrNotProposable, c.AmountMicros)
 	}
 
+	// The payer is RESOLVED, never taken from the caller. See Charge.AccountID.
+	payer, err := p.store.PayerForAccount(ctx, c.AccountID)
+	if err != nil {
+		return intent.ChargeIntent{}, fmt.Errorf("%w: %w", ErrNotProposable, err)
+	}
+
 	sealed, err := intent.Seal(intent.Draft{
-		Payer:    c.Payer,
+		Payer:    payer,
 		Currency: c.Currency,
 		// One line, quantity one, the whole derived amount as its unit
 		// price. The line's amount must equal quantity x price, and

@@ -27,7 +27,7 @@ func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (inten
 	}
 	p.charges = append(p.charges, c)
 	return intent.Seal(intent.Draft{
-		Payer:                 c.Payer,
+		Payer:                 intent.Subject{Kind: "user", ID: "owner-of-" + c.AccountID},
 		Currency:              c.Currency,
 		Lines:                 []intent.Line{intent.NewLine(c.Description, c.SourceRef, "1", 1, c.AmountMicros)},
 		Kind:                  c.Kind,
