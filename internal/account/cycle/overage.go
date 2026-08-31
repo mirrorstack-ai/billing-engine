@@ -822,7 +822,10 @@ func (s *Service) proposeModuleOverage(
 	}
 
 	sealed, err := s.proposer.Propose(ctx, proposer.Charge{
-		Payer:        intent.Subject{Kind: "user", ID: cand.AccountID.String()},
+		// The proposer resolves this to the account OWNER. A leg that built
+		// an intent.Subject here is how the payer and the executor's
+		// resolver came to disagree; see proposer.Charge.AccountID.
+		AccountID:    cand.AccountID.String(),
 		Kind:         intent.KindModuleCapacity,
 		Currency:     chargeCurrency,
 		AmountMicros: sealMicros,

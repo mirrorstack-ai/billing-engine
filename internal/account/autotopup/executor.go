@@ -1325,7 +1325,10 @@ func (e *Executor) proposeAutoTopUp(ctx context.Context, attempt Attempt, isNew 
 	sealMicros := microsToCentsRoundHalfUp(attempt.AmountMicros) * microsPerCent
 
 	sealed, err := e.proposer.Propose(ctx, proposer.Charge{
-		Payer:        intent.Subject{Kind: "user", ID: attempt.AccountID.String()},
+		// The proposer resolves this to the account OWNER. A leg that built
+		// an intent.Subject here is how the payer and the executor's
+		// resolver came to disagree; see proposer.Charge.AccountID.
+		AccountID:    attempt.AccountID.String(),
 		Kind:         intent.KindAutoTopUp,
 		Currency:     "usd",
 		AmountMicros: sealMicros,

@@ -12,9 +12,23 @@ import (
 )
 
 type recordingStore struct {
-	saved []intent.ChargeIntent
-	event evidence.Event
-	err   error
+	saved       []intent.ChargeIntent
+	event       evidence.Event
+	resolvedFor string
+	payerErr    error
+	err         error
+}
+
+// PayerForAccount is the resolution the proposer performs. The fixture
+// returns an OWNER id that differs from the account id it was given, which is
+// the whole point: a test whose owner equalled its account id could not tell
+// a resolved subject from an unresolved one.
+func (s *recordingStore) PayerForAccount(_ context.Context, accountID string) (intent.Subject, error) {
+	if s.payerErr != nil {
+		return intent.Subject{}, s.payerErr
+	}
+	s.resolvedFor = accountID
+	return intent.Subject{Kind: "user", ID: "owner-of-" + accountID}, nil
 }
 
 func (s *recordingStore) SaveIntentWithEvidence(
@@ -45,7 +59,7 @@ var (
 
 func domainCharge() Charge {
 	return Charge{
-		Payer:        intent.Subject{Kind: "user", ID: "acct-1"},
+		AccountID:    "acct-1",
 		Kind:         intent.KindCustomDomain,
 		Currency:     "USD",
 		AmountMicros: 5_000_000,
@@ -241,5 +255,41 @@ func TestProposingRecordsASealedIntentEvent(t *testing.T) {
 	}
 	if store.event.OccurredAt.IsZero() {
 		t.Error("the event has no instant")
+	}
+}
+
+// 🔴 The proposer must SEAL THE OWNER, not the account id it was given.
+//
+// All three cut-over legs used to seal intent.Subject{Kind:"user", ID:
+// <accounts.id>} while the executor resolved a payer by owner_user_id. Those
+// are never equal, so every intent this tree could produce was uncollectable.
+// Resolving here is what makes the two halves agree; this is the test that
+// says so.
+func TestTheProposerSealsTheResolvedOwnerNotTheAccountID(t *testing.T) {
+	store := &recordingStore{}
+	sealed, err := newProposer(t, store).Propose(context.Background(), domainCharge())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.resolvedFor != "acct-1" {
+		t.Fatalf("the proposer resolved %q, the charge named account %q", store.resolvedFor, "acct-1")
+	}
+	if sealed.Payer().ID == "acct-1" {
+		t.Fatal("the intent sealed the ACCOUNT id as its payer. The executor resolves a " +
+			"payer by owner id, so this intent could never be collected.")
+	}
+	if got := (intent.Subject{Kind: "user", ID: "owner-of-acct-1"}); sealed.Payer() != got {
+		t.Fatalf("sealed payer = %v, want %v", sealed.Payer(), got)
+	}
+}
+
+// A charge against an account nothing owns must not seal.
+func TestAChargeAgainstAnUnresolvableAccountIsRefused(t *testing.T) {
+	store := &recordingStore{payerErr: errors.New("no such account")}
+	if _, err := newProposer(t, store).Propose(context.Background(), domainCharge()); !errors.Is(err, ErrNotProposable) {
+		t.Fatalf("sealed a charge whose payer could not be resolved: %v", err)
+	}
+	if len(store.saved) != 0 {
+		t.Fatal("an intent was stored for an account nothing owns")
 	}
 }
