@@ -103,3 +103,4 @@
 \i migrations/billing/058_billing_ro_grants.up.sql
 \i migrations/billing/059_billing_ro_grants_retry.up.sql
 \i migrations/billing/060_intent_tax_verification.up.sql
+\i migrations/billing/061_intent_funding_split.up.sql

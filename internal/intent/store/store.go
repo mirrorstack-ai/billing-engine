@@ -74,14 +74,17 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 			  (digest, payer_kind, payer_id, currency, kind, price_book_revision,
 			   terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
 			   tax_amount_micros, tax_verification, subtotal_micros, total_micros,
+			   wallet_allocation_micros, provider_remainder_micros,
 			   authorization_id, execute_not_before, execute_not_after, supersedes_digest)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-			        NULLIF($18, ''))
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+			        NULLIF($20, ''))
 			ON CONFLICT (digest) DO NOTHING`,
 			sealed.Digest(), payer.Kind, payer.ID, sealed.Currency(), string(sealed.Kind()),
 			sealed.PriceBookRevision(), sealed.TermsRevision(), sealed.NoticePolicy(),
 			tax.Jurisdiction, tax.RuleRevision, tax.AmountMicros, string(tax.Verification),
-			sealed.SubtotalMicros(), sealed.TotalMicros(), sealed.AuthorizationID(),
+			sealed.SubtotalMicros(), sealed.TotalMicros(),
+			sealed.WalletAllocationMicros(), sealed.ProviderRemainderMicros(),
+			sealed.AuthorizationID(),
 			notBefore, notAfter, sealed.Supersedes(),
 		)
 		if err != nil {
@@ -144,7 +147,8 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 	err := s.pool.QueryRow(ctx, `
 		SELECT payer_kind, payer_id, currency, kind, price_book_revision, terms_revision,
 		       notice_policy, tax_jurisdiction, tax_rule_revision, tax_amount_micros,
-		       tax_verification, subtotal_micros, total_micros, authorization_id,
+		       tax_verification, subtotal_micros, total_micros,
+		       wallet_allocation_micros, provider_remainder_micros, authorization_id,
 		       execute_not_before, execute_not_after, supersedes_digest
 		  FROM ms_billing.charge_intents
 		 WHERE digest = $1`, digest,
@@ -152,7 +156,8 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 		&stored.Payer.Kind, &stored.Payer.ID, &stored.Currency, &kind,
 		&stored.PriceBookRevision, &stored.TermsRevision, &stored.NoticePolicy,
 		&stored.Tax.Jurisdiction, &stored.Tax.RuleRevision, &stored.Tax.AmountMicros,
-		&taxVerification, &stored.SubtotalMicros, &stored.TotalMicros, &stored.AuthorizationID,
+		&taxVerification, &stored.SubtotalMicros, &stored.TotalMicros,
+		&stored.WalletAllocationMicros, &stored.ProviderRemainderMicros, &stored.AuthorizationID,
 		&stored.ExecuteNotBefore, &stored.ExecuteNotAfter, &supersedes,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
