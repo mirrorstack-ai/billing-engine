@@ -2232,3 +2232,66 @@ record:
 
 Nothing in the tree answers this, and it decides how much of §12 items 4, 5, 6,
 10 and 11 MirrorStack owns versus delegates.
+
+---
+
+## ✅ SECOND ANSWER ROUND — 2026-08-31
+
+### Distributor: **BOTH — configurable per distributor**
+
+Some distributors are channels (MirrorStack is merchant of record), some are
+resellers (the distributor is). It is a per-distributor setting.
+
+**Consequences, and they are the largest in this document:**
+
+1. **Merchant of record must be RESOLVED PER INTENT and sealed.** Not a global
+   constant, not a deployment value. `ClauseMerchantOfRecord` reads whatever
+   the intent says the seller was, so the seller becomes a sealed field —
+   another canonical supersession, and one that must land while
+   `charge_intents = 0`.
+2. **Two tax paths must exist.** MirrorStack's own reproducible determination,
+   and a distributor-supplied one. §7 will not accept a determination it cannot
+   reproduce: a distributor-attested result records as `provider_attested`
+   (which canonical **v2** now makes expressible — see `TaxVerificationClass`)
+   and leaves the state `unknown`, **which cannot execute**.
+3. 🔴 **So the reseller path cannot settle an intent under today's §7.** Either
+   §7 changes, or a reseller distributor must supply *independently
+   reproducible* evidence — which is §12 item 8's "whether an external
+   calculator can supply independently reproducible evidence, since authority
+   alone is insufficient". **Item 8 is therefore no longer optional or
+   deferrable: the reseller half of this answer depends on it.**
+
+### Item 10, corrected by the owner: the exposure is REAL, and it is the reverse of what I asked
+
+Owner: *"current taiwan user all pay to mirrorstack via stripe, so distributers
+from taiwan can not register their stripe to charge their customers, need use
+local payment (newebapp, tappay, etc...)"*
+
+This corrects the framing above. My question asked whether legacy *reaches*
+Taiwan customers. It does — and that is fine, because:
+
+- **MirrorStack → Taiwan customers works today, over Stripe.** MirrorStack is
+  the seller, Stripe is the rail, and no local provider is involved. That path
+  is not blocked and does not need NewebPay.
+- **What does not work is a Taiwan DISTRIBUTOR charging ITS customers.** A TW
+  distributor cannot register Stripe for that purpose, so it needs a local
+  provider (NewebPay, TapPay, …).
+
+**So the local-provider requirement belongs to the distributor rail, not to
+MirrorStack's own sales.** "Taiwan out of scope for this cutover" is therefore
+correct for the *distributor* rail and **wrong if read as "MirrorStack does not
+sell to Taiwan"** — it already does.
+
+**What this means for the plan:**
+
+| | |
+|---|---|
+| MirrorStack → TW customer, Stripe, USD | **works today**, in scope, no new rail |
+| TW distributor → its customers | needs a local provider; **deferred**, but the SEAM is required by the item 4 routing answer |
+| the tax question | does not defer with the rail — MirrorStack already sells into Taiwan, so items 5, 6, 7 and 10's tax half apply to sales happening **now** |
+
+🔴 **The tax exposure is not deferred by deferring NewebPay.** MirrorStack is
+already the seller for Taiwan customers over Stripe. Whatever registration,
+classification and invoicing duties that creates exist today on the legacy
+rail, independent of whether the intent engine ever cuts over. That is a
+legacy-rail exposure the cutover decision does not touch, and it is now named.
