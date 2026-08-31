@@ -380,16 +380,42 @@ func TestTheFundingFormulaIsSelectedByKind(t *testing.T) {
 
 // An unrecognised kind must refuse. Falling through to a formula would fund a
 // document nobody wrote a rule for.
-func TestAnUnknownKindHasNoFundingFormula(t *testing.T) {
+// An unknown charge kind is refused — now at SEAL rather than at funding.
+//
+// fundingFor used to carry the by-kind formula selection and error on an
+// unrecognised kind. That selection moved into intent.Seal, where the kind is
+// sealed, so an unknown kind refuses to become a document at all rather than
+// refusing to execute one. Strictly earlier and cheaper.
+//
+// The original concern still holds and is what this asserts: a corrupted or
+// future row carrying a kind outside the catalog must not settle. Rehydrate
+// re-seals every stored row, so that path is where the refusal now lands.
+func TestAnUnknownKindIsRefusedWhenRehydrated(t *testing.T) {
 	sealed := sealKind(t, intent.KindModuleUsage, 1_000_000)
-	// Rehydrate with a kind outside the catalog, which Seal would refuse
-	// but a corrupted or future row could carry.
-	_ = sealed
-	// A kind outside the catalog, which Seal would refuse but a corrupted
-	// or future row could carry.
-	var rogue intent.ChargeIntent
-	if _, err := fundingFor(rogue); err == nil {
-		t.Fatal("an intent with no charge kind was funded")
+
+	notBefore, notAfter := sealed.ExecutionWindow()
+	stored := intent.Stored{
+		Digest:                 sealed.Digest(),
+		Payer:                  sealed.Payer(),
+		Currency:               sealed.Currency(),
+		Lines:                  sealed.Lines(),
+		PriceBookRevision:      sealed.PriceBookRevision(),
+		TermsRevision:          sealed.TermsRevision(),
+		Kind:                   intent.ChargeKind("not_in_the_catalog"),
+		Tax:                    sealed.Tax(),
+		AuthorizationID:        sealed.AuthorizationID(),
+		NoticePolicy:           sealed.NoticePolicy(),
+		ExecuteNotBefore:       notBefore,
+		ExecuteNotAfter:        notAfter,
+		SourceFactKeys:         sealed.SourceFactKeys(),
+		SubtotalMicros:         sealed.SubtotalMicros(),
+		TotalMicros:            sealed.TotalMicros(),
+		WalletAllocationMicros: sealed.WalletAllocationMicros(),
+	}
+
+	if _, err := intent.Rehydrate(stored); err == nil {
+		t.Fatal("a stored row with a kind outside the catalog rehydrated; " +
+			"an unknown kind must never become an executable intent")
 	}
 }
 
