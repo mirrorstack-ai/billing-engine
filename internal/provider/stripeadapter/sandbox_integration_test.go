@@ -193,6 +193,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 		TermsRevision:     "terms-2026-01",
 		Tax: intent.TaxDetermination{
 			Resolved: true, Jurisdiction: "US-OR", RuleRevision: "tax-2026-05", AmountMicros: 0,
+			Verification: intent.TaxNotApplicable,
 		},
 		AuthorizationID:  "auth-sandbox",
 		NoticePolicy:     "email/v1",

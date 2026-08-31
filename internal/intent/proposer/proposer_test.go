@@ -42,6 +42,7 @@ func domainCharge() Charge {
 		NoticePolicy:      "email/v1",
 		Tax: intent.TaxDetermination{
 			Resolved: true, Jurisdiction: "US-OR", RuleRevision: "tax-2026-05",
+			Verification: intent.TaxNotApplicable,
 		},
 		ExecuteNotBefore: windowStart,
 		ExecuteNotAfter:  windowEnd,

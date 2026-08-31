@@ -164,5 +164,9 @@ func (zeroTax) Determine(intent.Subject, string, int64, time.Time) intent.TaxDet
 		Jurisdiction: "shadow",
 		RuleRevision: "shadow-zero",
 		AmountMicros: 0,
+		// The shadow rater computes no tax at all. Claiming
+		// reproducibility here would put a stronger provenance into a
+		// digest than the run can support.
+		Verification: intent.TaxNotApplicable,
 	}
 }
