@@ -36,11 +36,13 @@ func sealedFixture(t *testing.T, quantity int64) intent.ChargeIntent {
 			Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-2026-05", AmountMicros: 1_250,
 			Verification: intent.TaxNotApplicable,
 		},
-		AuthorizationID:  "auth-1",
-		NoticePolicy:     "email/v1",
-		ExecuteNotBefore: windowStart,
-		ExecuteNotAfter:  windowEnd,
-		SourceFactKeys:   []string{"fact-1", "fact-2"},
+		AuthorizationID:       "auth-1",
+		NoticePolicy:          "email/v1",
+		ExecuteNotBefore:      windowStart,
+		ExecuteNotAfter:       windowEnd,
+		SourceFactKeys:        []string{"fact-1", "fact-2"},
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
 	})
 	require.NoError(t, err)
 	return sealed
@@ -221,18 +223,20 @@ func TestSupersedingIntentsBothLoad(t *testing.T) {
 
 	corrected := sealedFixture(t, 1_001)
 	replacement, err := original.Supersede(intent.Draft{
-		Payer:             corrected.Payer(),
-		Currency:          corrected.Currency(),
-		Lines:             corrected.Lines(),
-		Kind:              corrected.Kind(),
-		PriceBookRevision: corrected.PriceBookRevision(),
-		TermsRevision:     corrected.TermsRevision(),
-		Tax:               corrected.Tax(),
-		AuthorizationID:   corrected.AuthorizationID(),
-		NoticePolicy:      corrected.NoticePolicy(),
-		ExecuteNotBefore:  windowStart,
-		ExecuteNotAfter:   windowEnd,
-		SourceFactKeys:    corrected.SourceFactKeys(),
+		Payer:                 corrected.Payer(),
+		Currency:              corrected.Currency(),
+		Lines:                 corrected.Lines(),
+		Kind:                  corrected.Kind(),
+		PriceBookRevision:     corrected.PriceBookRevision(),
+		TermsRevision:         corrected.TermsRevision(),
+		Tax:                   corrected.Tax(),
+		AuthorizationID:       corrected.AuthorizationID(),
+		NoticePolicy:          corrected.NoticePolicy(),
+		ExecuteNotBefore:      windowStart,
+		ExecuteNotAfter:       windowEnd,
+		SourceFactKeys:        corrected.SourceFactKeys(),
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
 	})
 	require.NoError(t, err)
 	require.NoError(t, s.SaveIntent(ctx, replacement))

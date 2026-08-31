@@ -196,6 +196,25 @@ type Draft struct {
 	// — and INV-002 says one derivation. Seal is the one place that
 	// arithmetic happens.
 	WalletAllocationMicros int64
+	// SelectedRail is the rail this intent will settle on, and
+	// RoutingPolicyRevision names the policy it was chosen under.
+	//
+	// 🔴 Both SEALED. docs/DESIGN.md:1281-1283: "Before an intent seals,
+	// the engine freezes the total, the FundingPlan, the rail, the
+	// merchant-account policy and the routing-policy digest. A later rail
+	// change requires a replacement intent, with a new digest and a new
+	// eligibility decision."
+	//
+	// :1030-1037 gives the reason: "A private caller must not select a
+	// weaker adapter to bypass notice, authentication, tax, ceilings or
+	// reconciliation." An UNSEALED rail is exactly that bypass — swap the
+	// adapter after disclosure and the digest still verifies.
+	//
+	// The merchant-account policy that sentence also names is NOT sealed
+	// here. Nothing defines or produces one yet, and a sealed field no
+	// producer writes is a fiction inside the digest.
+	SelectedRail          string
+	RoutingPolicyRevision string
 	// AuthorizationID references the BillingAuthorization that permits
 	// this debit (INV-006).
 	AuthorizationID string
@@ -254,7 +273,10 @@ type ChargeIntent struct {
 	// the integer handed to an adapter.
 	walletAllocationMicros  int64
 	providerRemainderMicros int64
-	digest                  string
+
+	selectedRail          string
+	routingPolicyRevision string
+	digest                string
 
 	// collects is the digest of an intent this one collects the REMAINDER
 	// of, empty unless this is a receivable.
@@ -403,11 +425,14 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		tax:               draft.Tax,
 
 		walletAllocationMicros: draft.WalletAllocationMicros,
-		authorizationID:        draft.AuthorizationID,
-		noticePolicy:           draft.NoticePolicy,
-		executeNotBefore:       draft.ExecuteNotBefore.UTC(),
-		executeNotAfter:        draft.ExecuteNotAfter.UTC(),
-		sourceFactKeys:         append([]string(nil), draft.SourceFactKeys...),
+
+		selectedRail:          strings.TrimSpace(draft.SelectedRail),
+		routingPolicyRevision: strings.TrimSpace(draft.RoutingPolicyRevision),
+		authorizationID:       draft.AuthorizationID,
+		noticePolicy:          draft.NoticePolicy,
+		executeNotBefore:      draft.ExecuteNotBefore.UTC(),
+		executeNotAfter:       draft.ExecuteNotAfter.UTC(),
+		sourceFactKeys:        append([]string(nil), draft.SourceFactKeys...),
 	}
 
 	// The total is computed here and nowhere else. INV-002: one
@@ -572,6 +597,8 @@ func (c ChargeIntent) computeDigest() string {
 	e.string(string(c.tax.Verification))
 	e.int(c.walletAllocationMicros)
 	e.int(c.providerRemainderMicros)
+	e.string(c.selectedRail)
+	e.string(c.routingPolicyRevision)
 	e.string(c.authorizationID)
 	e.string(c.noticePolicy)
 	e.time(c.executeNotBefore)
@@ -637,6 +664,13 @@ func (c ChargeIntent) SubtotalMicros() int64 { return c.subtotalMicros }
 
 // TotalMicros is what would be collected.
 func (c ChargeIntent) TotalMicros() int64 { return c.totalMicros }
+
+// SelectedRail is the rail this intent settles on. Sealed, so changing it
+// after disclosure requires a replacement intent (docs/DESIGN.md:1282).
+func (c ChargeIntent) SelectedRail() string { return c.selectedRail }
+
+// RoutingPolicyRevision names the policy the rail was chosen under.
+func (c ChargeIntent) RoutingPolicyRevision() string { return c.routingPolicyRevision }
 
 // WalletAllocationMicros is the credit applied to this charge.
 func (c ChargeIntent) WalletAllocationMicros() int64 { return c.walletAllocationMicros }
@@ -716,6 +750,9 @@ type Stored struct {
 	// though it had.
 	WalletAllocationMicros  int64
 	ProviderRemainderMicros int64
+
+	SelectedRail          string
+	RoutingPolicyRevision string
 }
 
 // ErrDigestMismatch is returned when a stored intent does not hash to
@@ -760,6 +797,9 @@ func Rehydrate(stored Stored) (ChargeIntent, error) {
 		SourceFactKeys:    stored.SourceFactKeys,
 
 		WalletAllocationMicros: stored.WalletAllocationMicros,
+
+		SelectedRail:          stored.SelectedRail,
+		RoutingPolicyRevision: stored.RoutingPolicyRevision,
 	})
 	if err != nil {
 		// A row that cannot be sealed is a row that should never have

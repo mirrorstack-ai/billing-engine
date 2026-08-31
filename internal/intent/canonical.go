@@ -13,8 +13,9 @@ import (
 // and the version is inside the bytes it names: changing the encoding
 // without changing the tag would let two different rules produce the
 // same digest.
-// v3 adds the sealed funding split (wallet allocation and provider
-// remainder). v2 added the tax determination's verification class. The tag moves with
+// v4 adds the sealed rail and routing-policy revision. v3 added the
+// funding split (wallet allocation and provider remainder); v2 added the
+// tax determination's verification class. The tag moves with
 // the layout by design: the doc above says changing the encoding without
 // changing the tag would let two different rules produce the same digest,
 // and a v1 intent that omitted the class must not collide with a v2 one
@@ -24,7 +25,7 @@ import (
 // (charge_intents = 0, measured 2026-08-31). After the first, this becomes
 // a migration of live sealed documents past the INV-003 reject-sealed-update
 // trigger.
-const canonicalSchema = "mirrorstack.charge-intent/v3"
+const canonicalSchema = "mirrorstack.charge-intent/v4"
 
 // canonicalEncoder builds the byte string a digest is taken over.
 //

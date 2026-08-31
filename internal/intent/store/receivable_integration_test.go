@@ -110,17 +110,19 @@ func sealSource(t *testing.T, micros int64) intent.ChargeIntent {
 
 func receivableFor(micros int64) intent.Draft {
 	return intent.Draft{
-		Payer:             intent.Subject{Kind: "user", ID: "acct-1"},
-		Currency:          "usd",
-		Lines:             []intent.Line{intent.NewLine("d", "m", "1", 1, micros)},
-		Kind:              intent.KindCollectReceivable,
-		PriceBookRevision: "pb-1",
-		TermsRevision:     "terms-1",
-		Tax:               intent.TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1", Verification: intent.TaxNotApplicable},
-		AuthorizationID:   "auth-1",
-		NoticePolicy:      "email/v1",
-		ExecuteNotBefore:  time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
-		ExecuteNotAfter:   time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
-		SourceFactKeys:    []string{"f"},
+		Payer:                 intent.Subject{Kind: "user", ID: "acct-1"},
+		Currency:              "usd",
+		Lines:                 []intent.Line{intent.NewLine("d", "m", "1", 1, micros)},
+		Kind:                  intent.KindCollectReceivable,
+		PriceBookRevision:     "pb-1",
+		TermsRevision:         "terms-1",
+		Tax:                   intent.TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1", Verification: intent.TaxNotApplicable},
+		AuthorizationID:       "auth-1",
+		NoticePolicy:          "email/v1",
+		ExecuteNotBefore:      time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+		ExecuteNotAfter:       time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		SourceFactKeys:        []string{"f"},
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
 	}
 }

@@ -195,11 +195,13 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 			Resolved: true, Jurisdiction: "US-OR", RuleRevision: "tax-2026-05", AmountMicros: 0,
 			Verification: intent.TaxNotApplicable,
 		},
-		AuthorizationID:  "auth-sandbox",
-		NoticePolicy:     "email/v1",
-		ExecuteNotBefore: now.Add(-time.Hour),
-		ExecuteNotAfter:  now.Add(time.Hour),
-		SourceFactKeys:   []string{"fact-sandbox-1"},
+		AuthorizationID:       "auth-sandbox",
+		NoticePolicy:          "email/v1",
+		ExecuteNotBefore:      now.Add(-time.Hour),
+		ExecuteNotAfter:       now.Add(time.Hour),
+		SourceFactKeys:        []string{"fact-sandbox-1"},
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
 	})
 	require.NoError(t, err)
 	require.NoError(t, s.SaveIntent(ctx, sealed))

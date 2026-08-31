@@ -16,6 +16,8 @@ const (
 	placeholderPriceBook = "unpublished/pending-decision-12"
 	placeholderNotice    = "unpublished/pending-decision-12"
 	placeholderTax       = "not-applicable/pending-decision-12"
+	placeholderRouting   = "routing-2026-08"
+	placeholderRouting2  = "unpublished/pending-decision-12"
 )
 
 // placeholderState builds the state that made this defect invisible: an
@@ -45,11 +47,13 @@ func placeholderState(t *testing.T) SealedState {
 			Resolved: true, Jurisdiction: "TW", RuleRevision: placeholderTax, AmountMicros: 1_250,
 			Verification: intent.TaxNotApplicable,
 		},
-		AuthorizationID:  "auth-1",
-		NoticePolicy:     placeholderNotice,
-		ExecuteNotBefore: windowStart,
-		ExecuteNotAfter:  windowEnd,
-		SourceFactKeys:   []string{"fact-1"},
+		AuthorizationID:       "auth-1",
+		NoticePolicy:          placeholderNotice,
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: placeholderRouting,
+		ExecuteNotBefore:      windowStart,
+		ExecuteNotAfter:       windowEnd,
+		SourceFactKeys:        []string{"fact-1"},
 	})
 	if err != nil {
 		t.Fatalf("Seal under placeholders: %v", err)
@@ -140,6 +144,7 @@ func TestEachSealedRevisionCanRefuseAlone(t *testing.T) {
 		{"price book", func(d *intent.Draft) { d.PriceBookRevision = placeholderPriceBook }},
 		{"notice policy", func(d *intent.Draft) { d.NoticePolicy = placeholderNotice }},
 		{"tax rule", func(d *intent.Draft) { d.Tax.RuleRevision = placeholderTax }},
+		{"routing policy", func(d *intent.Draft) { d.RoutingPolicyRevision = placeholderRouting2 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			draft := intent.Draft{
@@ -153,11 +158,13 @@ func TestEachSealedRevisionCanRefuseAlone(t *testing.T) {
 					Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-2026-05", AmountMicros: 1_250,
 					Verification: intent.TaxNotApplicable,
 				},
-				AuthorizationID:  "auth-1",
-				NoticePolicy:     "email/v1",
-				ExecuteNotBefore: windowStart,
-				ExecuteNotAfter:  windowEnd,
-				SourceFactKeys:   []string{"fact-1"},
+				AuthorizationID:       "auth-1",
+				NoticePolicy:          "email/v1",
+				SelectedRail:          "stripe",
+				RoutingPolicyRevision: "routing-2026-08",
+				ExecuteNotBefore:      windowStart,
+				ExecuteNotAfter:       windowEnd,
+				SourceFactKeys:        []string{"fact-1"},
 			}
 			tc.apply(&draft)
 
