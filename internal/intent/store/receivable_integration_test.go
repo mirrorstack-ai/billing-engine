@@ -126,3 +126,85 @@ func receivableFor(micros int64) intent.Draft {
 		RoutingPolicyRevision: "routing-2026-08",
 	}
 }
+
+// 🔴 A receivable must survive a round trip through the database.
+//
+// `collects` is inside ChargeIntent.computeDigest (chargeintent.go:615) and
+// had NO column, no field on intent.Stored and no restore in Rehydrate until
+// migration 063. So every receivable this file writes was unloadable: read it
+// back and the digest recomputes over an empty link, Rehydrate refuses it, and
+// the document is gone for good.
+//
+// It went unnoticed because this file calls SaveIntent eight times and
+// LoadIntent zero times, and no non-test caller of CollectRemainderOf exists
+// yet. A defect that only fires on the first real receivable is still a
+// defect; it just fires later, in production, on a charge someone is owed.
+//
+// This is the test that would have caught it, and the one that keeps the next
+// sealed link from being added the same way.
+func TestAReceivableRoundTripsThroughTheStore(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	source := sealSource(t, 20_000_000)
+	require.NoError(t, s.SaveIntent(ctx, source))
+
+	receivable, err := source.CollectRemainderOf(receivableFor(7_500_000))
+	require.NoError(t, err)
+	require.Equal(t, source.Digest(), receivable.Collects(),
+		"the receivable does not name what it collects; the fixture is wrong")
+	require.NoError(t, s.SaveIntent(ctx, receivable))
+
+	loaded, err := s.LoadIntent(ctx, receivable.Digest())
+	require.NoError(t, err,
+		"the receivable does not load back. Its digest is taken over the link "+
+			"it collects, so a link the database drops makes the document "+
+			"unreproducible and Rehydrate refuses it permanently.")
+
+	require.Equal(t, receivable.Digest(), loaded.Digest())
+	require.Equal(t, source.Digest(), loaded.Collects(),
+		"the link came back empty, so the loaded document is not the one that was sealed")
+}
+
+// The other direction: a link the database has FORGOTTEN must not load.
+//
+// Without this, a Rehydrate that quietly ignored collects would pass the test
+// above — the round trip would work because both sides omitted the field
+// identically. Editing the stored link away has to break the digest, or
+// nothing about the link is actually attested.
+func TestAReceivableWhoseLinkWasErasedDoesNotLoad(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	source := sealSource(t, 20_000_000)
+	require.NoError(t, s.SaveIntent(ctx, source))
+	receivable, err := source.CollectRemainderOf(receivableFor(7_500_000))
+	require.NoError(t, err)
+	require.NoError(t, s.SaveIntent(ctx, receivable))
+
+	// The seal trigger refuses this, which is itself the point: reaching the
+	// Rehydrate check at all takes a session that has disabled the control.
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.charge_intents SET collects_digest = NULL WHERE digest = $1`,
+		receivable.Digest())
+	require.Error(t, err, "the sealed link was editable in place")
+	require.Contains(t, err.Error(), "sealed")
+
+	// So do it the way a restored backup or a stray migration would: with the
+	// trigger out of the way. Rehydrate is the control that still has to hold.
+	_, err = pool.Exec(ctx, `ALTER TABLE ms_billing.charge_intents DISABLE TRIGGER charge_intents_sealed`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.charge_intents SET collects_digest = NULL WHERE digest = $1`,
+		receivable.Digest())
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `ALTER TABLE ms_billing.charge_intents ENABLE TRIGGER charge_intents_sealed`)
+	require.NoError(t, err)
+
+	_, err = s.LoadIntent(ctx, receivable.Digest())
+	require.ErrorIs(t, err, intent.ErrDigestMismatch,
+		"a receivable whose link was erased loaded anyway, so the link is not "+
+			"really inside what the digest attests")
+}

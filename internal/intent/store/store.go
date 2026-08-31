@@ -76,9 +76,10 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 			   tax_amount_micros, tax_verification, subtotal_micros, total_micros,
 			   wallet_allocation_micros, provider_remainder_micros,
 			   selected_rail, routing_policy_revision,
-			   authorization_id, execute_not_before, execute_not_after, supersedes_digest)
+			   authorization_id, execute_not_before, execute_not_after,
+			   supersedes_digest, collects_digest)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
-			        NULLIF($22, ''))
+			        NULLIF($22, ''), NULLIF($23, ''))
 			ON CONFLICT (digest) DO NOTHING`,
 			sealed.Digest(), payer.Kind, payer.ID, sealed.Currency(), string(sealed.Kind()),
 			sealed.PriceBookRevision(), sealed.TermsRevision(), sealed.NoticePolicy(),
@@ -87,7 +88,7 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 			sealed.WalletAllocationMicros(), sealed.ProviderRemainderMicros(),
 			sealed.SelectedRail(), sealed.RoutingPolicyRevision(),
 			sealed.AuthorizationID(),
-			notBefore, notAfter, sealed.Supersedes(),
+			notBefore, notAfter, sealed.Supersedes(), sealed.Collects(),
 		)
 		if err != nil {
 			return fmt.Errorf("insert intent: %w", err)
@@ -137,6 +138,7 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 		stored     intent.Stored
 		kind       string
 		supersedes *string
+		collects   *string
 	)
 	stored.Digest = digest
 
@@ -152,7 +154,8 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 		       tax_verification, subtotal_micros, total_micros,
 		       wallet_allocation_micros, provider_remainder_micros,
 		       selected_rail, routing_policy_revision, authorization_id,
-		       execute_not_before, execute_not_after, supersedes_digest
+		       execute_not_before, execute_not_after, supersedes_digest,
+		       collects_digest
 		  FROM ms_billing.charge_intents
 		 WHERE digest = $1`, digest,
 	).Scan(
@@ -162,7 +165,7 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 		&taxVerification, &stored.SubtotalMicros, &stored.TotalMicros,
 		&stored.WalletAllocationMicros, &stored.ProviderRemainderMicros,
 		&stored.SelectedRail, &stored.RoutingPolicyRevision, &stored.AuthorizationID,
-		&stored.ExecuteNotBefore, &stored.ExecuteNotAfter, &supersedes,
+		&stored.ExecuteNotBefore, &stored.ExecuteNotAfter, &supersedes, &collects,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return intent.ChargeIntent{}, fmt.Errorf("%w: %s", ErrNotFound, digest)
@@ -173,6 +176,12 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 	stored.Kind = intent.ChargeKind(kind)
 	if supersedes != nil {
 		stored.Supersedes = *supersedes
+	}
+	// collects is inside the digest, so a receivable that loses this link
+	// rehydrates as a different document and refuses to load. It had no
+	// column at all until migration 063.
+	if collects != nil {
+		stored.Collects = *collects
 	}
 	// A stored row always carries a determination; the column is NOT
 	// NULL. Resolved is set here rather than stored, because storing it
@@ -281,8 +290,14 @@ func (s *Store) RecordOutcome(ctx context.Context, digest, outcome string, at ti
 //
 // The expected current state is part of the WHERE clause, so a
 // transition made against stale knowledge fails instead of silently
-// overwriting a state something else set. The trigger on the table
-// permits these columns to change; everything sealed stays frozen.
+// overwriting a state something else set.
+//
+// The trigger on the table permits state and state_changed_at to change
+// and freezes every other column, including ones added after it was
+// written. That last part became true only in migration 063: 054's
+// version compared a hardcoded 17-column tuple, so the five sealed
+// columns migrations 060-062 added were editable in place while this
+// comment claimed otherwise.
 func (s *Store) AdvanceState(ctx context.Context, digest, from, to string) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE ms_billing.charge_intents
