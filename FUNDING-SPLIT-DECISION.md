@@ -1,5 +1,77 @@
 # The funding split belongs in the SEALED document
 
+## ✅ SETTLED BY THE OWNER, 2026-08-31 — the credit-note model
+
+**Wallet draws become NEGATIVE LINE ITEMS on a Stripe invoice.** Not a parallel
+rail. The customer sees one invoice:
+
+    usage            20.00
+    credit applied   -6.00
+    due              14.00
+
+This is Stripe's native model (customer credit balance / credit notes), and it
+settles more than it looks like it does:
+
+**1. `providerRemainder` is the amount DUE AFTER CREDIT.** Which makes the fix
+in billing-engine #146 exactly right, and for a stronger reason than the one it
+was merged under: the adapter must be handed 14.00, not 20.00, because 14.00 is
+what the invoice is for. `walletAllocation` is the credit line, not a draw on a
+second rail.
+
+**2. Every cashflow lands on Stripe**, which is the owner's stated requirement:
+"we should record any cashflow on stripe".
+
+**3. There is no "wallet rail" to scope.** The open question "is a wallet rail
+in scope for the first cutover" partly dissolves — there is no second rail to
+build. What remains is *credit lot reservation*: `Unbuilt.CreditLotsReserved`
+and `Unbuilt.SourceAllocation` still matter, because a credit applied to an
+invoice must be reserved against a real lot before it is applied. Those are
+about the LEDGER, not about a rail.
+
+**4. The split is disclosed after all — as a line item.** The owner selected
+"sealed but not disclosed" and then described showing the credit with a
+negative amount. Those reconcile: it is not disclosed as a *wallet/card split*
+concept, it is shown as `-6.00 credit applied` on the invoice. So
+`ClauseFundingMatchesAccepted` does get something real to compare, eventually:
+the credit applied versus the credit accepted.
+
+## 🔴 THE GAP THIS EXPOSES
+
+**A wallet draw produces no Stripe record today.**
+`internal/account/cycle/overage.go:561-586` calls
+`store.DrawModuleOverageFromWallet` — a pure ledger write — and reaches no
+provider. Under the settled model there should be a Stripe invoice carrying a
+negative credit line, and there is none.
+
+The status is `ModuleOverageWalletCharged` ("wallet_charged"), distinct from
+`ModuleOverageCharged`, and `overage.go:99-102` documents that the result's
+`StripeInvoiceID` carries a *synthetic* ref (`wallet:mod-overage:<uuid>`,
+`overage.go:801-803`) which arms the per-timer guard. So this is a documented
+deliberate reuse, NOT a hidden trap — an earlier draft of this file called it
+"actively misleading", which overstated it. A reader can distinguish the two
+statuses.
+
+What is genuinely wrong is narrower and now decided: under the credit-note
+model that draw should be **an invoice with a credit line**, so the cashflow is
+recorded where the owner requires it. Today it exists only in
+`ms_billing.credit_ledger`.
+
+## What this changes about the plan below
+
+The corrected design in the rest of this file still stands — seal the split
+into the document — but the two numbers mean something more specific than
+"wallet vs card":
+
+    wallet_allocation_micros  = the credit applied to the invoice
+    provider_remainder_micros = the invoice total actually due
+
+Sealing them is still the fix for `ClauseFundingPlanBalances`'s vacuity, and
+the canonical window is still the constraint. The owner has chosen to HOLD that
+change until the remaining decisions are made.
+
+---
+
+
 Adversarial check, 2026-08-31: **4 of 4 lenses refuted** the recommendation to make
 funding an execution-time port. This file is the corrected answer.
 
