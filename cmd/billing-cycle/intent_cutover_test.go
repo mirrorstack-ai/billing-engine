@@ -75,6 +75,10 @@ func TestArmingActuallyAttachesTheSeam(t *testing.T) {
 // not a save. Giving it a body would test the proposer instead.
 type nilSaver struct{}
 
+func (nilSaver) PayerForAccount(_ context.Context, _ string) (intent.Subject, error) {
+	panic("not reached")
+}
+
 func (nilSaver) SaveIntentWithEvidence(
 	_ context.Context, _ intent.ChargeIntent, _ *evidence.Recorder, _ evidence.Event,
 ) error {

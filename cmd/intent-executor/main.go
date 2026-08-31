@@ -51,9 +51,12 @@ func main() {
 	defer pool.Close()
 
 	s := store.New(pool)
+	// The resolver is the store's, so the subject a proposer seals and the
+	// subject an executor resolves are written in one place. They were not,
+	// and they disagreed — see internal/intent/store/payer.go.
 	adapter := stripeadapter.New(
 		billingstripe.NewIntentClient(config.MustEnv("STRIPE_SECRET_KEY")),
-		payerResolver{pool: pool},
+		s,
 	)
 
 	// 🔴 The executor cannot start without an evidence signing key.
