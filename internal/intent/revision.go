@@ -63,6 +63,14 @@ func UnpublishedRevisions(c ChargeIntent) []string {
 		{"price_book_revision", c.PriceBookRevision()},
 		{"notice_policy", c.NoticePolicy()},
 		{"tax_rule_revision", c.Tax().RuleRevision},
+		// 🔴 Added in the SAME change that seals the routing policy.
+		//
+		// This list is what ClausePolicyPublished checks. A revision
+		// sealed into the digest but absent here passes the published
+		// check unexamined — the exact hollowness fixed in this predicate
+		// on 2026-08-30. Any future sealed revision belongs here the
+		// moment it is sealed, not in a follow-up.
+		{"routing_policy", c.RoutingPolicyRevision()},
 	} {
 		if !RevisionPublished(named.revision) {
 			unpublished = append(unpublished, named.name)

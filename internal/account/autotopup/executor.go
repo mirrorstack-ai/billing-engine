@@ -1336,6 +1336,13 @@ func (e *Executor) proposeAutoTopUp(ctx context.Context, attempt Attempt, isNew 
 		TermsRevision:     proposedTermsRevision,
 		PriceBookRevision: proposedPriceBookRevision,
 		NoticePolicy:      proposedNoticePolicy,
+		// The only rail this engine has an adapter for. The routing
+		// policy that is supposed to CHOOSE it does not exist yet, so
+		// the revision is a placeholder like the other four and
+		// ClausePolicyPublished refuses on it — which is the honest
+		// state, not a gap being hidden.
+		SelectedRail:          proposedRail,
+		RoutingPolicyRevision: proposedRoutingPolicy,
 		Tax: intent.TaxDetermination{
 			Resolved:     true,
 			Jurisdiction: "not-applicable",
@@ -1385,4 +1392,6 @@ const (
 	proposedPriceBookRevision = "unpublished/pending-decision-12"
 	proposedNoticePolicy      = "unpublished/pending-decision-12"
 	proposedTaxRuleRevision   = "unpublished/pending-decision-12"
+	proposedRail              = "stripe"
+	proposedRoutingPolicy     = "unpublished/pending-decision-12"
 )

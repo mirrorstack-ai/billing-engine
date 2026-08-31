@@ -75,15 +75,17 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 			   terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
 			   tax_amount_micros, tax_verification, subtotal_micros, total_micros,
 			   wallet_allocation_micros, provider_remainder_micros,
+			   selected_rail, routing_policy_revision,
 			   authorization_id, execute_not_before, execute_not_after, supersedes_digest)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-			        NULLIF($20, ''))
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
+			        NULLIF($22, ''))
 			ON CONFLICT (digest) DO NOTHING`,
 			sealed.Digest(), payer.Kind, payer.ID, sealed.Currency(), string(sealed.Kind()),
 			sealed.PriceBookRevision(), sealed.TermsRevision(), sealed.NoticePolicy(),
 			tax.Jurisdiction, tax.RuleRevision, tax.AmountMicros, string(tax.Verification),
 			sealed.SubtotalMicros(), sealed.TotalMicros(),
 			sealed.WalletAllocationMicros(), sealed.ProviderRemainderMicros(),
+			sealed.SelectedRail(), sealed.RoutingPolicyRevision(),
 			sealed.AuthorizationID(),
 			notBefore, notAfter, sealed.Supersedes(),
 		)
@@ -148,7 +150,8 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 		SELECT payer_kind, payer_id, currency, kind, price_book_revision, terms_revision,
 		       notice_policy, tax_jurisdiction, tax_rule_revision, tax_amount_micros,
 		       tax_verification, subtotal_micros, total_micros,
-		       wallet_allocation_micros, provider_remainder_micros, authorization_id,
+		       wallet_allocation_micros, provider_remainder_micros,
+		       selected_rail, routing_policy_revision, authorization_id,
 		       execute_not_before, execute_not_after, supersedes_digest
 		  FROM ms_billing.charge_intents
 		 WHERE digest = $1`, digest,
@@ -157,7 +160,8 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 		&stored.PriceBookRevision, &stored.TermsRevision, &stored.NoticePolicy,
 		&stored.Tax.Jurisdiction, &stored.Tax.RuleRevision, &stored.Tax.AmountMicros,
 		&taxVerification, &stored.SubtotalMicros, &stored.TotalMicros,
-		&stored.WalletAllocationMicros, &stored.ProviderRemainderMicros, &stored.AuthorizationID,
+		&stored.WalletAllocationMicros, &stored.ProviderRemainderMicros,
+		&stored.SelectedRail, &stored.RoutingPolicyRevision, &stored.AuthorizationID,
 		&stored.ExecuteNotBefore, &stored.ExecuteNotAfter, &supersedes,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {

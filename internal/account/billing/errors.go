@@ -21,10 +21,10 @@ const (
 	// CodeConflict reports that a caller reused an immutable idempotency key
 	// for a different canonical operation. Retrying the original payload is
 	// safe; changing a payload under the same key is not.
-	CodeConflict     Code = "CONFLICT"
-	CodeNotFound     Code = "NOT_FOUND"
-	CodeStripeError  Code = "STRIPE_ERROR"
-	CodeInternal     Code = "INTERNAL"
+	CodeConflict    Code = "CONFLICT"
+	CodeNotFound    Code = "NOT_FOUND"
+	CodeStripeError Code = "STRIPE_ERROR"
+	CodeInternal    Code = "INTERNAL"
 	// CodeUnavailable is returned by the credit RPCs while the fail-closed
 	// wallet flag or migration-048 capability probe is off.
 	CodeUnavailable Code = "CREDIT_WALLET_DISABLED"

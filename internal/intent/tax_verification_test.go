@@ -97,7 +97,8 @@ func TestCanonicalSchemaTagNamesTheCurrentLayout(t *testing.T) {
 	// Bump this deliberately with every encoding change, and only with one.
 	//   v2 — the tax determination's verification class
 	//   v3 — the sealed funding split (wallet allocation, provider remainder)
-	const current = "mirrorstack.charge-intent/v3"
+	//   v4 — the sealed rail and routing-policy revision
+	const current = "mirrorstack.charge-intent/v4"
 	if canonicalSchema != current {
 		t.Fatalf("canonicalSchema = %q; want %q.\n"+
 			"The encoder's own doc says changing the layout without changing the "+

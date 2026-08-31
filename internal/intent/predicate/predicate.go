@@ -231,6 +231,26 @@ func satisfied(clause Clause, s SealedState) bool {
 	case ClauseFundingMatchesAccepted:
 		return s.Unbuilt.FundingMatchesAccepted
 	case ClauseRailSupportsPlan:
+		// 🔴 A SECOND, independently-readable half — the pattern that
+		// rescued ClauseNoticeElapsed and ClauseInstrumentBinding. A bare
+		// s.Unbuilt bool is supplied by the same composition root that
+		// wants the answer; the sealed rail is not.
+		//
+		// docs/DESIGN.md:1030-1037: the authorization "names permitted
+		// rails", the engine chooses among THOSE, and "a private caller
+		// must not select a weaker adapter to bypass notice,
+		// authentication, tax, ceilings or reconciliation". So an intent
+		// whose sealed rail is not the accepted one is refused here,
+		// whatever the evidence flag says.
+		//
+		// An intent with no sealed rail is refused too: an unstated rail
+		// cannot be shown to be the accepted one, and defaulting it to
+		// "the authorization's" would be the caller's choice wearing the
+		// engine's name.
+		if s.Intent.SelectedRail() == "" ||
+			s.Intent.SelectedRail() != s.Authorization.Provider() {
+			return false
+		}
 		return s.Unbuilt.RailSupportsPlan
 	case ClauseProviderAutonomy:
 		return s.Unbuilt.ProviderAutonomy
