@@ -345,34 +345,26 @@ func noticeFor(sealed intent.ChargeIntent, r store.NoticeReceipt) predicate.Noti
 // of live documents — and an unknown kind refuses rather than borrowing
 // whichever formula happens to be first.
 func fundingFor(sealed intent.ChargeIntent) (predicate.FundingPlan, error) {
-	kind := sealed.Kind()
-	switch kind {
-	case intent.KindPlatformBase, intent.KindModuleUsage,
-		intent.KindModuleCapacity, intent.KindCustomDomain, intent.KindTax:
-		// serviceGrossObligation = positiveServiceLines
-		//                        - eligibleRatingTaxCredits + tax + rounding
-
-	case intent.KindCreditPurchase, intent.KindAutoTopUp, intent.KindSubscriptionStart:
-		// fundingGrossObligation = cashPurchasePrincipal + tax + rounding.
-		// §6 also fixes the split for the two stored-value kinds:
-		// "walletFunding = 0; providerRemainder = grossObligation" — a
-		// purchase of credit cannot be paid for with credit.
-
-	case intent.KindCollectReceivable:
-		// collectionGrossObligation = sourceRemainingCollectibleReserved.
-		// CollectRemainderOf bounds the receivable to its source and the
-		// store reserves exactly this amount, so the sealed total IS the
-		// reserved remainder.
-
-	default:
-		return predicate.FundingPlan{}, fmt.Errorf(
-			"executor: no funding formula for charge kind %q", kind)
-	}
-
+	// A PROJECTION of the sealed document, not a derivation.
+	//
+	// 🔴 This function used to synthesise the plan from the intent's
+	// total, which made predicate.ClauseFundingPlanBalances unable to
+	// fail: it verified a value this call had computed three lines
+	// earlier. Every check in that clause was true by construction.
+	//
+	// The split is now sealed (docs/DESIGN.md:205-206, :470, :1281 — the
+	// engine freezes it BEFORE disclosure), so these two integers reach
+	// the predicate through a durable write and a digest. The clause can
+	// now disagree with them: a row whose provider remainder no longer
+	// sums to its total refuses, where before x + 0 == x for every int64.
+	//
+	// The by-kind funding-formula selection moved to Seal, where the kind
+	// is sealed — an unknown kind now refuses to SEAL rather than
+	// refusing to execute, which is strictly earlier and cheaper.
 	return predicate.FundingPlan{
 		Frozen:                  true,
 		GrossMicros:             sealed.TotalMicros(),
-		WalletAllocationMicros:  0,
-		ProviderRemainderMicros: sealed.TotalMicros(),
+		WalletAllocationMicros:  sealed.WalletAllocationMicros(),
+		ProviderRemainderMicros: sealed.ProviderRemainderMicros(),
 	}, nil
 }

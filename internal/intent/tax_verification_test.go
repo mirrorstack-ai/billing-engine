@@ -94,8 +94,14 @@ func TestTheVerificationClassChangesTheDigest(t *testing.T) {
 // verification class changed the layout, so a v1 intent that omitted it
 // must not be able to collide with a v2 one that states it.
 func TestCanonicalSchemaTagNamesTheCurrentLayout(t *testing.T) {
-	if canonicalSchema != "mirrorstack.charge-intent/v2" {
-		t.Fatalf("canonicalSchema = %q; the tax verification class is in the encoding, "+
-			"so the tag must name v2", canonicalSchema)
+	// Bump this deliberately with every encoding change, and only with one.
+	//   v2 — the tax determination's verification class
+	//   v3 — the sealed funding split (wallet allocation, provider remainder)
+	const current = "mirrorstack.charge-intent/v3"
+	if canonicalSchema != current {
+		t.Fatalf("canonicalSchema = %q; want %q.\n"+
+			"The encoder's own doc says changing the layout without changing the "+
+			"tag would let two different rules produce the same digest \u2014 so the tag "+
+			"moves with every field added to computeDigest.", canonicalSchema, current)
 	}
 }
