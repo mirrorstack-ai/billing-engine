@@ -10,7 +10,16 @@
 -- digest, and Rehydrate refuses it forever.
 
 ALTER TABLE ms_billing.charge_intents
+    DROP CONSTRAINT IF EXISTS charge_intents_collects_digest_fkey;
+
+ALTER TABLE ms_billing.charge_intents
     DROP COLUMN IF EXISTS collects_digest;
+
+-- 054's trigger was BEFORE UPDATE only, so this restores the DELETE hole too.
+DROP TRIGGER IF EXISTS charge_intents_sealed ON ms_billing.charge_intents;
+CREATE TRIGGER charge_intents_sealed
+    BEFORE UPDATE ON ms_billing.charge_intents
+    FOR EACH ROW EXECUTE FUNCTION ms_billing.charge_intents_reject_sealed_update();
 
 CREATE OR REPLACE FUNCTION ms_billing.charge_intents_reject_sealed_update()
 RETURNS TRIGGER AS $$

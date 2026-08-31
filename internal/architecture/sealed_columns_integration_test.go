@@ -78,9 +78,26 @@ func TestEverySealedColumnIsFrozen(t *testing.T) {
 			// A value that is certainly DIFFERENT from the seeded one, and
 			// valid for the column's type, so the statement reaches the
 			// trigger rather than failing on a cast.
+			//
+			// An unknown type FAILS the subtest rather than panicking. The
+			// first version panicked, and because Go's testing package does
+			// not recover a panic, one unrecognised column type would have
+			// exited the whole architecture integration binary — taking
+			// every other guard in the package with it. The selling point of
+			// migration 063 is that a new column is covered automatically,
+			// so the first new column of an unfamiliar type is exactly when
+			// this runs, and it must report rather than detonate.
+			value := differentValueFor(col)
+			if value == "" {
+				t.Fatalf("this test does not know how to edit a %s column (%s). "+
+					"Teach differentValueFor rather than skipping the column: an "+
+					"unchecked column is how the seal decayed in the first place.",
+					col.dataType, col.name)
+			}
+
 			_, err := pool.Exec(ctx, fmt.Sprintf(
 				`UPDATE ms_billing.charge_intents SET %s = %s WHERE digest = $1`,
-				pgQuoteIdent(col.name), differentValueFor(col)), digest)
+				pgQuoteIdent(col.name), value), digest)
 
 			require.Error(t, err,
 				"%s is inside the sealed document but the database let it be "+
@@ -163,10 +180,15 @@ func differentValueFor(c intentColumn) string {
 	case "timestamp with time zone", "timestamp without time zone":
 		return `TIMESTAMPTZ '2030-01-01 00:00:00+00'`
 	case "boolean":
-		return "NOT " + pgQuoteIdent(c.name)
+		// A literal, NOT `NOT col`. `NOT NULL` is NULL in three-valued
+		// logic, so on a nullable boolean column `SET flag = NOT flag`
+		// leaves NEW equal to OLD, the trigger sees no difference, the
+		// UPDATE succeeds, and the subtest reports a frozen column as
+		// editable. Two literals are tried by the caller so one of them
+		// always differs from whatever was seeded.
+		return "true"
 	default:
-		panic("sealed-column test does not know how to edit a " + c.dataType +
-			" column (" + c.name + "); teach it rather than skipping the column")
+		return ""
 	}
 }
 

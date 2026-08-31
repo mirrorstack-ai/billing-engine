@@ -842,5 +842,24 @@ func Rehydrate(stored Stored) (ChargeIntent, error) {
 			rebuilt.subtotalMicros, rebuilt.totalMicros)
 	}
 
+	// The provider remainder is compared for the same reason, and until now
+	// it was not compared at all.
+	//
+	// Stored's comment says the funding split is "read back and re-sealed
+	// rather than defaulted". That was true of WalletAllocationMicros, which
+	// Rehydrate passes into Seal — and false of ProviderRemainderMicros,
+	// which Draft has no field for because Seal DERIVES it (INV-002, one
+	// derivation). So the column was written by SaveIntent, read by
+	// LoadIntent, and then checked against nothing.
+	//
+	// The digest covers it, so a row whose remainder disagreed with its own
+	// total and allocation would usually already have failed above. Usually
+	// is not a guarantee worth resting a charge on — the same sentence the
+	// totals check is here for.
+	if stored.ProviderRemainderMicros != rebuilt.providerRemainderMicros {
+		return ChargeIntent{}, fmt.Errorf("%w: stored provider remainder %d, derived %d",
+			ErrDigestMismatch, stored.ProviderRemainderMicros, rebuilt.providerRemainderMicros)
+	}
+
 	return rebuilt, nil
 }
