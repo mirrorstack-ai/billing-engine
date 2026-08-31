@@ -3,6 +3,7 @@ package stripeadapter
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
@@ -83,8 +84,11 @@ func TestOneIntentBecomesOneKeyedInvoice(t *testing.T) {
 		if c.IdemKey == "" {
 			continue
 		}
-		if want := "intent-abcdef0123456789"; len(c.IdemKey) < len(want) ||
-			c.IdemKey[len(c.IdemKey)-len(want):] != want {
+		// Every key CONTAINS the intent-derived key. Line items add a
+		// per-line index suffix, because one intent now becomes one
+		// invoice item per sealed line — a fixed key across several items
+		// would make the second item a retry of the first at the provider.
+		if want := "intent-abcdef0123456789"; !strings.Contains(c.IdemKey, want) {
 			t.Errorf("%s keyed %q, which is not derived from the intent digest",
 				c.Method, c.IdemKey)
 		}
@@ -219,6 +223,70 @@ func TestCentsRoundHalfUp(t *testing.T) {
 	for micros, want := range cases {
 		if got := centsFromMicros(micros); got != want {
 			t.Errorf("centsFromMicros(%d) = %d, want %d", micros, got, want)
+		}
+	}
+}
+
+// 🔴 Each sealed line must reach the provider as its OWN item, with its OWN
+// idempotency key.
+//
+// One intent becomes one invoice item per sealed line. A fixed key across
+// several items makes the second a retry of the first at the provider:
+// Stripe returns the first item again, the invoice carries one line instead
+// of several, and the customer is charged LESS than the sealed total —
+// silently, because every call succeeded.
+//
+// This observes the calls the adapter actually made. An earlier version of
+// this test constructed the expected keys itself and passed with every item
+// sharing one key, which proved nothing.
+func TestEverySealedLineBecomesItsOwnKeyedItem(t *testing.T) {
+	recorder := stripetest.New()
+	recorder.Stubs["CreateDraftInvoice"] = billingstripe.Invoice{ID: "in_1"}
+	recorder.Stubs["PayInvoiceWithMethod"] = billingstripe.Invoice{ID: "in_1", Status: "paid"}
+
+	d := debit()
+	d.AmountMicros = 27_000_000
+	d.Lines = []intent.Line{
+		intent.NewLine("usage arrears", "run:1", "1", 1, 5_000_000),
+		intent.NewLine("MirrorStack base fee", "run:1", "1", 1, 20_000_000),
+		intent.NewLine("custom domain", "run:1", "1", 1, 2_000_000),
+	}
+
+	if _, err := New(recorder, &fixedResolver{customer: "cus_1"}).
+		Collect(context.Background(), d); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	var (
+		keys         = map[string]int{}
+		descriptions []string
+		total        int64
+		items        int
+	)
+	for _, c := range recorder.Calls() {
+		if c.Method != "CreateInvoiceItem" {
+			continue
+		}
+		items++
+		keys[c.IdemKey]++
+		descriptions = append(descriptions, c.Description)
+		total += c.AmountCents
+	}
+
+	if items != len(d.Lines) {
+		t.Fatalf("created %d invoice items for %d sealed lines", items, len(d.Lines))
+	}
+	if len(keys) != items {
+		t.Fatalf("%d items share %d idempotency keys: %v. The provider would treat the "+
+			"repeats as retries and the invoice would carry fewer lines than the "+
+			"document sealed.", items, len(keys), keys)
+	}
+	if want := int64(2700); total != want {
+		t.Fatalf("the items sum to %d cents, the sealed remainder is %d", total, want)
+	}
+	for i, want := range []string{"usage arrears", "MirrorStack base fee", "custom domain"} {
+		if descriptions[i] != want {
+			t.Errorf("item %d described as %q, the sealed line says %q", i, descriptions[i], want)
 		}
 	}
 }

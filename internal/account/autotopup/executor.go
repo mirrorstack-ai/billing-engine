@@ -1328,12 +1328,14 @@ func (e *Executor) proposeAutoTopUp(ctx context.Context, attempt Attempt, isNew 
 		// The proposer resolves this to the account OWNER. A leg that built
 		// an intent.Subject here is how the payer and the executor's
 		// resolver came to disagree; see proposer.Charge.AccountID.
-		AccountID:    attempt.AccountID.String(),
-		Kind:         intent.KindAutoTopUp,
-		Currency:     "usd",
-		AmountMicros: sealMicros,
-		Description:  "MirrorStack credit auto top-up",
-		SourceRef:    "autotopup:" + attempt.ID.String(),
+		AccountID: attempt.AccountID.String(),
+		Kind:      intent.KindAutoTopUp,
+		Currency:  "usd",
+		Lines: proposer.SingleLine(
+			"MirrorStack credit auto top-up",
+			"autotopup:"+attempt.ID.String(),
+			sealMicros,
+		),
 
 		AuthorizationID:   "autotopup:" + attempt.AccountID.String(),
 		TermsRevision:     proposedTermsRevision,

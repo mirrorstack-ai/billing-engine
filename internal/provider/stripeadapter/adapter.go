@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/executor"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
@@ -128,12 +129,27 @@ func (a *Adapter) Collect(ctx context.Context, d executor.Debit) (executor.Colle
 		return executor.CollectResult{}, fmt.Errorf("create draft: %w", err)
 	}
 
-	if _, err := a.client.CreateInvoiceItem(
-		ctx, customerID, invoice.ID, cents, currency,
-		a.descriptionFor(d.IntentDigest), billingstripe.LinePeriod{},
-		"ii-"+d.IdempotencyKey,
-	); err != nil {
-		return executor.CollectResult{}, fmt.Errorf("create line: %w", err)
+	// One invoice item per SEALED line, so the customer's statement says
+	// what the document they accepted says.
+	//
+	// 🔴 This used to be a single item carrying the whole amount under
+	// "MirrorStack charge <short digest>". The description the leg wrote is
+	// inside the intent — it is the line's Meter — and discarding it made
+	// the verifiable rail's invoice strictly less informative than the
+	// legacy one it replaces.
+	//
+	// The amounts still sum to `cents` and not to the lines' own rounding:
+	// see splitCents. The provider is handed the sealed provider remainder
+	// once, apportioned, never the gross and never a per-line rounding.
+	items := splitCents(cents, d.Lines)
+	for i, item := range items {
+		if _, err := a.client.CreateInvoiceItem(
+			ctx, customerID, invoice.ID, item.cents, currency,
+			item.description, billingstripe.LinePeriod{},
+			fmt.Sprintf("ii-%s-%d", d.IdempotencyKey, i),
+		); err != nil {
+			return executor.CollectResult{}, fmt.Errorf("create line %d: %w", i, err)
+		}
 	}
 
 	// Finalize WITHOUT auto-advance, then pay explicitly.
@@ -221,4 +237,87 @@ func shortDigest(digest string) string {
 		return digest
 	}
 	return digest[:12]
+}
+
+// invoiceItem is one line as it will appear at the provider.
+type invoiceItem struct {
+	cents       int64
+	description string
+}
+
+// splitCents apportions the collected total across the sealed lines.
+//
+// 🔴 The TOTAL is authoritative, not the lines.
+//
+// The engine rounds micros to cents ONCE, on the provider remainder, exactly
+// as the legacy boundary collector rounds once on its net
+// (internal/account/cycle/charge.go:595). Rounding each line independently and
+// summing would give a different integer — measured elsewhere in this repo at
+// one cent on a two-component proration — so the lines are apportioned
+// largest-remainder within the total the intent sealed. The invoice therefore
+// adds up to the sealed charge by construction, whatever the lines are.
+//
+// A charge with no lines, or one whose lines sum to nothing, collapses to a
+// single item for the whole amount rather than producing an invoice with no
+// items, which Stripe would refuse to finalize.
+func splitCents(total int64, lines []intent.Line) []invoiceItem {
+	var gross int64
+	for _, l := range lines {
+		gross += l.AmountMicros()
+	}
+	if len(lines) == 0 || gross <= 0 || total <= 0 {
+		return []invoiceItem{{cents: total, description: fallbackDescription(lines)}}
+	}
+
+	items := make([]invoiceItem, len(lines))
+	remainders := make([]int64, len(lines))
+	var assigned int64
+	for i, l := range lines {
+		// Integer floor of the line's share, and the remainder kept so the
+		// leftover cents go to the lines that lost the most to truncation.
+		num := l.AmountMicros() * total
+		items[i] = invoiceItem{cents: num / gross, description: lineDescription(l)}
+		remainders[i] = num % gross
+		assigned += items[i].cents
+	}
+
+	// Largest-remainder: hand out the leftover one cent at a time, highest
+	// remainder first, ties to the earlier line so the result is
+	// deterministic and a retry produces the same invoice.
+	for leftover := total - assigned; leftover > 0; leftover-- {
+		best := -1
+		for i := range items {
+			if remainders[i] > 0 && (best == -1 || remainders[i] > remainders[best]) {
+				best = i
+			}
+		}
+		if best == -1 {
+			// Every remainder is zero, which can only happen if the division
+			// was exact. Give the rest to the first line rather than
+			// silently dropping cents.
+			items[0].cents += leftover
+			break
+		}
+		items[best].cents++
+		remainders[best] = 0
+	}
+	return items
+}
+
+// lineDescription is what the customer reads for one sealed line.
+//
+// The proposer puts the leg's description in Meter and its source reference
+// in Module (proposer.Propose), so Meter is the customer-facing half.
+func lineDescription(l intent.Line) string {
+	if d := strings.TrimSpace(l.Meter); d != "" {
+		return d
+	}
+	return "MirrorStack charge"
+}
+
+func fallbackDescription(lines []intent.Line) string {
+	if len(lines) == 1 {
+		return lineDescription(lines[0])
+	}
+	return "MirrorStack charge"
 }

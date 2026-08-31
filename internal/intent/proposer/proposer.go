@@ -62,6 +62,37 @@ type Store interface {
 // module-overage block is one derived figure, and pretending it
 // decomposes into a catalog lookup would be a fiction the digest would
 // then attest to.
+// ChargeLine is one line of a charge, in the customer's terms.
+//
+// 🔴 A Charge carries LINES, not a single amount, and that is what lets a leg
+// propose ONE intent where the legacy path issues ONE invoice.
+//
+// internal/provider/stripeadapter collects per intent: draft, item, finalize,
+// pay, keyed on that intent's digest, rounding micros to cents once for that
+// intent alone. So a leg that split its charge into several intents would
+// issue several invoices and take several card payments where the legacy leg
+// took one — a different customer statement, and several roundings instead of
+// the single round-on-the-net the boundary collector performs
+// (cycle/charge.go:595). One intent with several lines reproduces both.
+type ChargeLine struct {
+	// Description is what the customer reads.
+	Description string
+	// SourceRef ties this line back to the row it was derived from — a
+	// domain id, a timer id, a run id — so a reader can walk from a charge
+	// to the thing that caused it. It becomes a source-fact key.
+	SourceRef string
+	// AmountMicros is what this line contributes. The proposer refuses a
+	// non-positive line for the same reason it refuses a non-positive
+	// charge: a zero line is not a line and a negative one is not a charge.
+	AmountMicros int64
+}
+
+// Charge is a leg's derived charge, ready to be sealed.
+//
+// There is deliberately no way to pass a quantity and a price separately: a
+// prorated domain fee or a module-overage block is one derived figure, and
+// pretending it decomposes into a catalog lookup would be a fiction the
+// digest would then attest to.
 type Charge struct {
 	// AccountID is the ms_billing.accounts row the charge is against.
 	//
@@ -74,17 +105,20 @@ type Charge struct {
 	// owner_user_id, so every intent this tree could produce was
 	// uncollectable. Taking an account id here makes the correct subject the
 	// only one a leg can express.
-	AccountID    string
-	Kind         intent.ChargeKind
-	Currency     string
-	AmountMicros int64
-	// Description names what is being charged for, in the customer's
-	// terms. It becomes the intent's single line.
-	Description string
-	// SourceRef ties the intent back to the row the leg derived it
-	// from — a domain id, a timer id, a run id — so a reader can walk
-	// from a charge to the thing that caused it.
-	SourceRef string
+	AccountID string
+
+	Kind     intent.ChargeKind
+	Currency string
+
+	// Lines are what the charge is made of, in order. At least one.
+	Lines []ChargeLine
+
+	// WalletAllocationMicros is the stored-value credit applied to this
+	// charge. The provider is handed the REMAINDER, which Seal derives —
+	// so a leg that draws on a wallet must state the draw here rather than
+	// subtracting it from its lines, or the sealed document will say the
+	// customer was charged for less than they owed.
+	WalletAllocationMicros int64
 
 	AuthorizationID   string
 	TermsRevision     string
@@ -99,6 +133,20 @@ type Charge struct {
 
 	ExecuteNotBefore time.Time
 	ExecuteNotAfter  time.Time
+}
+
+// SingleLine is the convenience for a leg whose charge is one derived figure.
+func SingleLine(description, sourceRef string, amountMicros int64) []ChargeLine {
+	return []ChargeLine{{Description: description, SourceRef: sourceRef, AmountMicros: amountMicros}}
+}
+
+// TotalMicros is the gross the lines add up to.
+func (c Charge) TotalMicros() int64 {
+	var total int64
+	for _, l := range c.Lines {
+		total += l.AmountMicros
+	}
+	return total
 }
 
 // Proposer seals derived charges and stores them.
@@ -148,11 +196,19 @@ var ErrNotProposable = errors.New("proposer: charge cannot be sealed")
 // legacy legs get from deterministic Stripe idempotency keys, obtained
 // here from the identity of the content instead.
 func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, error) {
-	if c.AmountMicros <= 0 {
-		// A zero charge is not a document worth sealing, and a
-		// negative one is not a charge. Legs already skip these; this
-		// refuses rather than relying on them to.
-		return intent.ChargeIntent{}, fmt.Errorf("%w: amount is %d", ErrNotProposable, c.AmountMicros)
+	if len(c.Lines) == 0 {
+		return intent.ChargeIntent{}, fmt.Errorf("%w: no lines", ErrNotProposable)
+	}
+	for i, l := range c.Lines {
+		if l.AmountMicros <= 0 {
+			// A zero line is not a line and a negative one is not a charge.
+			// Legs already skip these; this refuses rather than relying on
+			// them to.
+			return intent.ChargeIntent{}, fmt.Errorf("%w: line %d is %d", ErrNotProposable, i, l.AmountMicros)
+		}
+	}
+	if c.TotalMicros() <= 0 {
+		return intent.ChargeIntent{}, fmt.Errorf("%w: total is %d", ErrNotProposable, c.TotalMicros())
 	}
 
 	// The payer is RESOLVED, never taken from the caller. See Charge.AccountID.
@@ -161,16 +217,21 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		return intent.ChargeIntent{}, fmt.Errorf("%w: %w", ErrNotProposable, err)
 	}
 
+	lines := make([]intent.Line, 0, len(c.Lines))
+	facts := make([]string, 0, len(c.Lines))
+	for _, l := range c.Lines {
+		// Quantity one, the whole derived amount as the unit price. The
+		// line's amount must equal quantity x price, and this is the only
+		// decomposition of a single derived figure that satisfies it without
+		// inventing factors.
+		lines = append(lines, intent.NewLine(l.Description, l.SourceRef, "1", 1, l.AmountMicros))
+		facts = append(facts, l.SourceRef)
+	}
+
 	sealed, err := intent.Seal(intent.Draft{
-		Payer:    payer,
-		Currency: c.Currency,
-		// One line, quantity one, the whole derived amount as its unit
-		// price. The line's amount must equal quantity x price, and
-		// this is the only decomposition of a single derived figure
-		// that satisfies it without inventing factors.
-		Lines: []intent.Line{
-			intent.NewLine(c.Description, c.SourceRef, "1", 1, c.AmountMicros),
-		},
+		Payer:             payer,
+		Currency:          c.Currency,
+		Lines:             lines,
 		Kind:              c.Kind,
 		PriceBookRevision: c.PriceBookRevision,
 		TermsRevision:     c.TermsRevision,
@@ -178,11 +239,13 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		AuthorizationID:   c.AuthorizationID,
 		NoticePolicy:      c.NoticePolicy,
 
+		WalletAllocationMicros: c.WalletAllocationMicros,
+
 		SelectedRail:          c.SelectedRail,
 		RoutingPolicyRevision: c.RoutingPolicyRevision,
 		ExecuteNotBefore:      c.ExecuteNotBefore,
 		ExecuteNotAfter:       c.ExecuteNotAfter,
-		SourceFactKeys:        []string{c.SourceRef},
+		SourceFactKeys:        facts,
 	})
 	if err != nil {
 		return intent.ChargeIntent{}, fmt.Errorf("%w: %w", ErrNotProposable, err)

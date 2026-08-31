@@ -59,12 +59,14 @@ var (
 
 func domainCharge() Charge {
 	return Charge{
-		AccountID:    "acct-1",
-		Kind:         intent.KindCustomDomain,
-		Currency:     "USD",
-		AmountMicros: 5_000_000,
-		Description:  "custom domain example.com",
-		SourceRef:    "domain:11111111-1111-1111-1111-111111111111",
+		AccountID: "acct-1",
+		Kind:      intent.KindCustomDomain,
+		Currency:  "USD",
+		Lines: SingleLine(
+			"custom domain example.com",
+			"domain:11111111-1111-1111-1111-111111111111",
+			5_000_000,
+		),
 
 		AuthorizationID:   "auth-1",
 		TermsRevision:     "terms-2026-01",
@@ -152,7 +154,7 @@ func TestADifferentAmountIsADifferentDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := domainCharge()
-	other.AmountMicros++
+	other.Lines[0].AmountMicros++
 	second, err := p.Propose(context.Background(), other)
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +172,7 @@ func TestAZeroOrNegativeChargeIsRefused(t *testing.T) {
 	for name, amount := range map[string]int64{"zero": 0, "negative": -1} {
 		t.Run(name, func(t *testing.T) {
 			c := domainCharge()
-			c.AmountMicros = amount
+			c.Lines = SingleLine("d", "ref", amount)
 
 			sealed, err := newProposer(t, &recordingStore{}).Propose(context.Background(), c)
 			if !errors.Is(err, ErrNotProposable) {
@@ -291,5 +293,100 @@ func TestAChargeAgainstAnUnresolvableAccountIsRefused(t *testing.T) {
 	}
 	if len(store.saved) != 0 {
 		t.Fatal("an intent was stored for an account nothing owns")
+	}
+}
+
+// A zero or negative LINE must be refused, not just a zero total.
+//
+// A charge whose lines cancel out to something positive would seal a document
+// with a line the customer is charged nothing for — or, worse, a negative one
+// that reads as a refund inside a debit. Legs already skip these; the proposer
+// refuses rather than relying on them to.
+func TestANonPositiveLineIsRefused(t *testing.T) {
+	for name, lines := range map[string][]ChargeLine{
+		"a zero line": {
+			{Description: "a", SourceRef: "ref-a", AmountMicros: 5_000_000},
+			{Description: "b", SourceRef: "ref-b", AmountMicros: 0},
+		},
+		"a negative line": {
+			{Description: "a", SourceRef: "ref-a", AmountMicros: 5_000_000},
+			{Description: "b", SourceRef: "ref-b", AmountMicros: -1_000_000},
+		},
+		"only a zero line": {
+			{Description: "a", SourceRef: "ref-a", AmountMicros: 0},
+		},
+		"no lines at all": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := &recordingStore{}
+			c := domainCharge()
+			c.Lines = lines
+			if _, err := newProposer(t, store).Propose(context.Background(), c); !errors.Is(err, ErrNotProposable) {
+				t.Fatalf("sealed a charge with %s: %v", name, err)
+			}
+			if len(store.saved) != 0 {
+				t.Fatalf("an intent was stored for a charge with %s", name)
+			}
+		})
+	}
+}
+
+// Every line reaches the sealed document, in order, and each contributes a
+// source-fact key. A leg's second line silently dropped would charge the
+// customer for it while the document said otherwise.
+func TestEveryChargeLineReachesTheSealedIntent(t *testing.T) {
+	store := &recordingStore{}
+	c := domainCharge()
+	c.Lines = []ChargeLine{
+		{Description: "usage arrears", SourceRef: "run:1#arrears", AmountMicros: 5_000},
+		{Description: "MirrorStack base fee", SourceRef: "run:1#base", AmountMicros: 20_000_000},
+		{Description: "custom domain", SourceRef: "run:1#domains", AmountMicros: 2_000_000},
+	}
+
+	sealed, err := newProposer(t, store).Propose(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := sealed.Lines()
+	if len(lines) != len(c.Lines) {
+		t.Fatalf("sealed %d lines for a charge of %d", len(lines), len(c.Lines))
+	}
+	for i, want := range c.Lines {
+		if lines[i].Meter != want.Description {
+			t.Errorf("line %d described as %q, want %q", i, lines[i].Meter, want.Description)
+		}
+		if lines[i].AmountMicros() != want.AmountMicros {
+			t.Errorf("line %d is %d micros, want %d", i, lines[i].AmountMicros(), want.AmountMicros)
+		}
+	}
+	if got, want := sealed.SubtotalMicros(), c.TotalMicros(); got != want {
+		t.Errorf("the sealed subtotal is %d, the lines add to %d", got, want)
+	}
+	if got := len(sealed.SourceFactKeys()); got != len(c.Lines) {
+		t.Errorf("%d source facts for %d lines; a line with no fact cannot be traced back "+
+			"to the row it came from", got, len(c.Lines))
+	}
+}
+
+// The wallet allocation must reach the seal, or the provider is handed the
+// gross and the customer pays twice for the part credit already covered.
+func TestTheWalletAllocationReachesTheSealedFundingSplit(t *testing.T) {
+	store := &recordingStore{}
+	c := domainCharge()
+	c.Kind = intent.KindModuleUsage
+	c.Lines = SingleLine("module usage", "run:1", 20_000_000)
+	c.WalletAllocationMicros = 6_000_000
+
+	sealed, err := newProposer(t, store).Propose(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sealed.WalletAllocationMicros(); got != 6_000_000 {
+		t.Fatalf("sealed wallet allocation = %d, want 6000000", got)
+	}
+	if got, want := sealed.ProviderRemainderMicros(), sealed.TotalMicros()-6_000_000; got != want {
+		t.Fatalf("provider remainder = %d, want %d. The adapter is handed this number, so a "+
+			"charge that ignored the draw would collect for credit already spent.", got, want)
 	}
 }
