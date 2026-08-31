@@ -168,6 +168,34 @@ type Draft struct {
 	TermsRevision string
 	// Tax is the frozen determination.
 	Tax TaxDetermination
+	// WalletAllocationMicros is the credit applied to this charge, and
+	// ProviderRemainderMicros is what is then due at the rail.
+	//
+	// 🔴 SEALED, not decided at execution. docs/DESIGN.md:205-206 puts
+	// the split in INV-001's "what it may never send" list: "Which part
+	// comes from wallet and which from a card is a FundingPlan the
+	// engine freezes BEFORE you are shown anything." :470 and :1281 say
+	// the same, and predicate/state.go already records why — "the plan
+	// is frozen before disclosure, so the split the customer saw is the
+	// split that settles."
+	//
+	// The owner settled the model on 2026-08-31: a wallet draw is a
+	// NEGATIVE LINE ITEM on a Stripe invoice, not a parallel rail. So
+	// WalletAllocationMicros is the credit line and
+	// ProviderRemainderMicros is the invoice total actually due —
+	// which is the integer handed to an adapter (docs/DESIGN.md:1284,
+	// "never grossObligation, and never wallet funding").
+	//
+	// Until a credit allocator exists every intent seals (0, total).
+	// That is a real derived split that happens to be trivial, not a
+	// synthesized tautology: the operands reach the predicate through a
+	// durable write, so ClauseFundingPlanBalances can disagree with
+	// them.
+	// 🔴 Only the CREDIT is stated. The remainder is DERIVED by Seal,
+	// because deriving it here would mean the caller computing the total
+	// — and INV-002 says one derivation. Seal is the one place that
+	// arithmetic happens.
+	WalletAllocationMicros int64
 	// AuthorizationID references the BillingAuthorization that permits
 	// this debit (INV-006).
 	AuthorizationID string
@@ -220,7 +248,13 @@ type ChargeIntent struct {
 
 	subtotalMicros int64
 	totalMicros    int64
-	digest         string
+
+	// The sealed funding split. walletAllocationMicros is the credit
+	// applied; providerRemainderMicros is what is due at the rail and is
+	// the integer handed to an adapter.
+	walletAllocationMicros  int64
+	providerRemainderMicros int64
+	digest                  string
 
 	// collects is the digest of an intent this one collects the REMAINDER
 	// of, empty unless this is a receivable.
@@ -258,6 +292,10 @@ var (
 	ErrKindNotInCatalog        = errors.New("intent: charge kind is not in the closed catalog of docs/DESIGN.md §6")
 	ErrTaxUnresolved           = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
 	ErrTaxVerificationUnstated = errors.New("intent: tax determination does not say how it was established; an unstated class must not seal as the strongest one")
+	ErrFundingNegative         = errors.New("intent: funding split has a negative component")
+	ErrFundingDoesNotBalance   = errors.New("intent: funding split does not equal the total; the plan must account for the whole obligation and no more")
+	ErrCreditExceedsTotal      = errors.New("intent: credit applied exceeds the total; a charge cannot be credited past zero")
+	ErrWalletCannotFundItself  = errors.New("intent: this charge kind cannot be funded from the wallet; a purchase of credit paid for with credit refills a balance out of itself")
 	ErrTaxNegative             = errors.New("intent: tax is negative")
 	ErrAuthorizationUnset      = errors.New("intent: no billing authorization referenced")
 	ErrNoticePolicyUnset       = errors.New("intent: no notice policy")
@@ -363,11 +401,13 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		priceBookRevision: draft.PriceBookRevision,
 		termsRevision:     draft.TermsRevision,
 		tax:               draft.Tax,
-		authorizationID:   draft.AuthorizationID,
-		noticePolicy:      draft.NoticePolicy,
-		executeNotBefore:  draft.ExecuteNotBefore.UTC(),
-		executeNotAfter:   draft.ExecuteNotAfter.UTC(),
-		sourceFactKeys:    append([]string(nil), draft.SourceFactKeys...),
+
+		walletAllocationMicros: draft.WalletAllocationMicros,
+		authorizationID:        draft.AuthorizationID,
+		noticePolicy:           draft.NoticePolicy,
+		executeNotBefore:       draft.ExecuteNotBefore.UTC(),
+		executeNotAfter:        draft.ExecuteNotAfter.UTC(),
+		sourceFactKeys:         append([]string(nil), draft.SourceFactKeys...),
 	}
 
 	// The total is computed here and nowhere else. INV-002: one
@@ -388,8 +428,62 @@ func Seal(draft Draft) (ChargeIntent, error) {
 		return ChargeIntent{}, fmt.Errorf("%w: total with tax", ErrAmountOverflow)
 	}
 	intent.totalMicros = total
+
+	// The funding split must account for the whole obligation and no
+	// more. Checked HERE, after the total is derived, because the total
+	// is what it has to balance against — and refusing at seal is
+	// strictly earlier and cheaper than refusing at execution.
+	if intent.walletAllocationMicros < 0 {
+		return ChargeIntent{}, fmt.Errorf("%w: wallet %d",
+			ErrFundingNegative, intent.walletAllocationMicros)
+	}
+	if intent.walletAllocationMicros > intent.totalMicros {
+		return ChargeIntent{}, fmt.Errorf("%w: credit %d exceeds total %d",
+			ErrCreditExceedsTotal, intent.walletAllocationMicros, intent.totalMicros)
+	}
+	// The remainder is DERIVED, here and nowhere else — the same rule as
+	// the total two statements above. A caller that supplied it would be
+	// a second derivation, and the two could disagree.
+	intent.providerRemainderMicros = intent.totalMicros - intent.walletAllocationMicros
+
+	// docs/DESIGN.md §6 fixes the split for the two stored-value kinds:
+	// "walletFunding = 0; providerRemainder = grossObligation". A
+	// purchase of credit cannot be paid for with credit — allowing it
+	// would let a balance refill itself out of the balance it is
+	// refilling. The rule lived only as a comment in the executor's
+	// fundingFor until now; it belongs where the kind is sealed.
+	if walletFundingForbidden(intent.kind) && intent.walletAllocationMicros != 0 {
+		return ChargeIntent{}, fmt.Errorf("%w: %s allocated %d from the wallet",
+			ErrWalletCannotFundItself, intent.kind, intent.walletAllocationMicros)
+	}
+
 	intent.digest = intent.computeDigest()
 	return intent, nil
+}
+
+// walletFundingForbidden reports the kinds that must not draw on the
+// wallet, per docs/DESIGN.md:493-495: "Funding eligibility is closed by
+// intent kind: credit_purchase and auto_topup create stored value, so
+// walletFunding = 0 and providerRemainder = grossObligation."
+//
+// TWO kinds, not three. subscription_start shares fundingGrossObligation
+// with them in the executor's by-kind selection, but §6's funding table
+// (:1228) funds it as "first-period platform_base plus only the kinds the
+// offer names" — it does not create stored value, so nothing stops it
+// being paid from a balance. Grouping by formula and grouping by
+// stored-value are different partitions and it is easy to conflate them.
+//
+// A list rather than a default branch, for catalog.go's reason: a kind
+// added to the catalog but not considered here gets the permissive
+// answer, so the permissive answer must be the one that requires an
+// explicit decision to reach.
+func walletFundingForbidden(kind ChargeKind) bool {
+	switch kind {
+	case KindCreditPurchase, KindAutoTopUp:
+		return true
+	default:
+		return false
+	}
 }
 
 // CollectRemainderOf seals a receivable for what is still owed on this
@@ -476,6 +570,8 @@ func (c ChargeIntent) computeDigest() string {
 	e.string(c.tax.RuleRevision)
 	e.int(c.tax.AmountMicros)
 	e.string(string(c.tax.Verification))
+	e.int(c.walletAllocationMicros)
+	e.int(c.providerRemainderMicros)
 	e.string(c.authorizationID)
 	e.string(c.noticePolicy)
 	e.time(c.executeNotBefore)
@@ -542,6 +638,13 @@ func (c ChargeIntent) SubtotalMicros() int64 { return c.subtotalMicros }
 // TotalMicros is what would be collected.
 func (c ChargeIntent) TotalMicros() int64 { return c.totalMicros }
 
+// WalletAllocationMicros is the credit applied to this charge.
+func (c ChargeIntent) WalletAllocationMicros() int64 { return c.walletAllocationMicros }
+
+// ProviderRemainderMicros is what is due at the rail after credit, and
+// is the integer an adapter is handed (docs/DESIGN.md:1284).
+func (c ChargeIntent) ProviderRemainderMicros() int64 { return c.providerRemainderMicros }
+
 // Supersedes is the digest of the intent this one replaces, or empty.
 func (c ChargeIntent) Supersedes() string { return c.supersedes }
 
@@ -607,6 +710,12 @@ type Stored struct {
 
 	SubtotalMicros int64
 	TotalMicros    int64
+
+	// The sealed funding split, read back and re-sealed rather than
+	// defaulted. A row that never stated one must not rehydrate as
+	// though it had.
+	WalletAllocationMicros  int64
+	ProviderRemainderMicros int64
 }
 
 // ErrDigestMismatch is returned when a stored intent does not hash to
@@ -649,6 +758,8 @@ func Rehydrate(stored Stored) (ChargeIntent, error) {
 		ExecuteNotBefore:  stored.ExecuteNotBefore,
 		ExecuteNotAfter:   stored.ExecuteNotAfter,
 		SourceFactKeys:    stored.SourceFactKeys,
+
+		WalletAllocationMicros: stored.WalletAllocationMicros,
 	})
 	if err != nil {
 		// A row that cannot be sealed is a row that should never have
