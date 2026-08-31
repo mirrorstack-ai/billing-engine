@@ -4,6 +4,7 @@ package architecture
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -147,16 +148,69 @@ func seedIntent(t *testing.T, pool *pgxpool.Pool, digest string) string {
 		`INSERT INTO ms_billing.charge_intents
 		   (digest, payer_kind, payer_id, currency, kind, price_book_revision,
 		    terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
-		    tax_amount_micros, subtotal_micros, total_micros, authorization_id,
-		    execute_not_before, execute_not_after)
+		    tax_amount_micros, tax_verification, subtotal_micros, total_micros,
+		    authorization_id, execute_not_before, execute_not_after)
 		 VALUES ($1,'org','org-1','USD','usage.cycle','pb-1','terms-1','email/v1','TW','tax-1',
-		         0, 1000, 1000, 'auth-1', $2, $3)`,
+		         0, 'not_applicable', 1000, 1000, 'auth-1', $2, $3)`,
 		digest,
 		time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
 	)
 	require.NoError(t, err, "seeding a valid intent failed; the fixture is wrong, not the schema")
 	return digest
+}
+
+// 🔴 The database must refuse an unknown tax verification class too.
+//
+// The Go side refuses it at Seal, but the store is not the only writer a
+// production database can ever have. Migration 060's CHECK is what holds if
+// a row is inserted by hand, by a future query, or by a service that skips
+// the sealing path — and the empty string is excluded deliberately, because
+// it is the Go zero value that Seal already rejects.
+//
+// A stored class the engine would not have produced is a document whose
+// digest cannot be reproduced, which is the whole failure the field exists
+// to prevent.
+func TestStoredTaxVerificationClassIsConstrained(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+
+	for _, bad := range []string{"", "reproducible", "INDEPENDENTLY_REPRODUCIBLE", "guessed"} {
+		_, err := pool.Exec(context.Background(),
+			`INSERT INTO ms_billing.charge_intents
+			   (digest, payer_kind, payer_id, currency, kind, price_book_revision,
+			    terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
+			    tax_amount_micros, tax_verification, subtotal_micros, total_micros,
+			    authorization_id, execute_not_before, execute_not_after)
+			 VALUES ($1,'org','org-1','USD','usage.cycle','pb-1','terms-1','email/v1','TW','tax-1',
+			         0, $2, 1000, 1000, 'auth-1', $3, $4)`,
+			"digest-bad-"+bad,
+			bad,
+			time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		)
+		require.Error(t, err,
+			"the schema accepted tax_verification %q; a class the engine cannot "+
+				"produce must not be storable", bad)
+	}
+
+	// And every class the Go side CAN seal must be storable, or the two
+	// vocabularies have drifted apart in the other direction.
+	for i, good := range []string{"independently_reproducible", "provider_attested", "not_applicable"} {
+		_, err := pool.Exec(context.Background(),
+			`INSERT INTO ms_billing.charge_intents
+			   (digest, payer_kind, payer_id, currency, kind, price_book_revision,
+			    terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
+			    tax_amount_micros, tax_verification, subtotal_micros, total_micros,
+			    authorization_id, execute_not_before, execute_not_after)
+			 VALUES ($1,'org','org-1','USD','usage.cycle','pb-1','terms-1','email/v1','TW','tax-1',
+			         0, $2, 1000, 1000, 'auth-1', $3, $4)`,
+			fmt.Sprintf("digest-good-%d", i),
+			good,
+			time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		)
+		require.NoError(t, err, "the schema refused sealable class %q", good)
+	}
 }
 
 // The migration must actually be applied by the harness, or every test above

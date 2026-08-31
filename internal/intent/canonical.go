@@ -13,7 +13,17 @@ import (
 // and the version is inside the bytes it names: changing the encoding
 // without changing the tag would let two different rules produce the
 // same digest.
-const canonicalSchema = "mirrorstack.charge-intent/v1"
+// v2 adds the tax determination's verification class. The tag moves with
+// the layout by design: the doc above says changing the encoding without
+// changing the tag would let two different rules produce the same digest,
+// and a v1 intent that omitted the class must not collide with a v2 one
+// that states it.
+//
+// Safe to change exactly now — production holds ZERO sealed intents
+// (charge_intents = 0, measured 2026-08-31). After the first, this becomes
+// a migration of live sealed documents past the INV-003 reject-sealed-update
+// trigger.
+const canonicalSchema = "mirrorstack.charge-intent/v2"
 
 // canonicalEncoder builds the byte string a digest is taken over.
 //

@@ -27,6 +27,7 @@ func validDraft() Draft {
 			Jurisdiction: "TW",
 			RuleRevision: "tax-2026-05",
 			AmountMicros: 1_250,
+			Verification: TaxNotApplicable,
 		},
 		AuthorizationID:  "auth-1",
 		NoticePolicy:     "email/v1",
@@ -252,6 +253,7 @@ func TestResolvedZeroTaxSeals(t *testing.T) {
 		Jurisdiction: "TW",
 		RuleRevision: "tax-2026-05",
 		AmountMicros: 0,
+		Verification: TaxNotApplicable,
 	}
 
 	sealed, err := Seal(d)

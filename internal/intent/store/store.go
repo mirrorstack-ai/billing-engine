@@ -73,14 +73,14 @@ func (s *Store) SaveIntent(ctx context.Context, sealed intent.ChargeIntent) erro
 			INSERT INTO ms_billing.charge_intents
 			  (digest, payer_kind, payer_id, currency, kind, price_book_revision,
 			   terms_revision, notice_policy, tax_jurisdiction, tax_rule_revision,
-			   tax_amount_micros, subtotal_micros, total_micros, authorization_id,
-			   execute_not_before, execute_not_after, supersedes_digest)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-			        NULLIF($17, ''))
+			   tax_amount_micros, tax_verification, subtotal_micros, total_micros,
+			   authorization_id, execute_not_before, execute_not_after, supersedes_digest)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+			        NULLIF($18, ''))
 			ON CONFLICT (digest) DO NOTHING`,
 			sealed.Digest(), payer.Kind, payer.ID, sealed.Currency(), string(sealed.Kind()),
 			sealed.PriceBookRevision(), sealed.TermsRevision(), sealed.NoticePolicy(),
-			tax.Jurisdiction, tax.RuleRevision, tax.AmountMicros,
+			tax.Jurisdiction, tax.RuleRevision, tax.AmountMicros, string(tax.Verification),
 			sealed.SubtotalMicros(), sealed.TotalMicros(), sealed.AuthorizationID(),
 			notBefore, notAfter, sealed.Supersedes(),
 		)
@@ -135,10 +135,16 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 	)
 	stored.Digest = digest
 
+	// Read back as a plain string and convert, so an unknown value from the
+	// database becomes an unsealable class rather than being trusted. The
+	// column has a CHECK, but the Go side is the authority on the vocabulary
+	// and re-Seal is what actually enforces it.
+	var taxVerification string
+
 	err := s.pool.QueryRow(ctx, `
 		SELECT payer_kind, payer_id, currency, kind, price_book_revision, terms_revision,
 		       notice_policy, tax_jurisdiction, tax_rule_revision, tax_amount_micros,
-		       subtotal_micros, total_micros, authorization_id,
+		       tax_verification, subtotal_micros, total_micros, authorization_id,
 		       execute_not_before, execute_not_after, supersedes_digest
 		  FROM ms_billing.charge_intents
 		 WHERE digest = $1`, digest,
@@ -146,7 +152,7 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 		&stored.Payer.Kind, &stored.Payer.ID, &stored.Currency, &kind,
 		&stored.PriceBookRevision, &stored.TermsRevision, &stored.NoticePolicy,
 		&stored.Tax.Jurisdiction, &stored.Tax.RuleRevision, &stored.Tax.AmountMicros,
-		&stored.SubtotalMicros, &stored.TotalMicros, &stored.AuthorizationID,
+		&taxVerification, &stored.SubtotalMicros, &stored.TotalMicros, &stored.AuthorizationID,
 		&stored.ExecuteNotBefore, &stored.ExecuteNotAfter, &supersedes,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -163,6 +169,11 @@ func (s *Store) LoadIntent(ctx context.Context, digest string) (intent.ChargeInt
 	// NULL. Resolved is set here rather than stored, because storing it
 	// would allow a row asserting "unresolved but priced".
 	stored.Tax.Resolved = true
+	// The class is stored, NOT defaulted. Defaulting it here would let a row
+	// that never stated one reload as though it had — the substitution the
+	// column exists to prevent. A value the Go side does not recognise fails
+	// the re-Seal below, which is the correct direction to fail in.
+	stored.Tax.Verification = intent.TaxVerificationClass(taxVerification)
 
 	rows, err := s.pool.Query(ctx, `
 		SELECT meter, module, module_version, quantity, unit_price_micros

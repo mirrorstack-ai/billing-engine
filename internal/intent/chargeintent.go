@@ -61,6 +61,77 @@ type TaxDetermination struct {
 	// AmountMicros may legitimately be zero — a justified zero-tax
 	// result is a determination, and Resolved is what says so.
 	AmountMicros int64
+	// Verification says HOW the figure was established.
+	//
+	// 🔴 Without it, a determination the engine recomputed and one a
+	// vendor asserted are BYTE-IDENTICAL once sealed. The predicate has
+	// a clause for TaxIndependentlyReproducible, but nothing in the
+	// sealed document says which class the figure belongs to, so the
+	// clause has no way to tell a reproduced figure from an attested
+	// one — and a customer verifying a digest offline cannot either.
+	// The only thing preventing substitution today is that no vendor
+	// resolver has been written.
+	//
+	// The zero value is TaxUnverified and Seal REFUSES it, so a caller
+	// that does not say cannot seal. That is the INV-004 shape applied
+	// to provenance rather than to amount: an unstated class must not
+	// silently read as the strongest one.
+	Verification TaxVerificationClass
+}
+
+// TaxVerificationClass names how a sealed tax figure was established.
+//
+// Closed, and the zero value refuses. docs/VERIFICATION.md distinguishes
+// evidence levels, and this is that distinction inside the digest: a
+// verifier reproducing the bytes learns which claim it is checking.
+type TaxVerificationClass string
+
+const (
+	// TaxUnverified is the zero value and cannot be sealed.
+	TaxUnverified TaxVerificationClass = ""
+	// TaxIndependentlyReproducible means the engine recomputed the
+	// figure from the named rule revision and matched it. This is the
+	// only class that can satisfy the predicate's reproducibility clause.
+	// Nothing in this tree produces it yet — no resolver exists — and
+	// that is the honest state.
+	TaxIndependentlyReproducible TaxVerificationClass = "independently_reproducible"
+	// TaxProviderAttested means a vendor asserted the figure and the
+	// engine did not reproduce it. Sealable — an attested figure is a
+	// real determination — but the predicate must not treat it as
+	// reproduced.
+	TaxProviderAttested TaxVerificationClass = "provider_attested"
+	// TaxNotApplicable means the engine determined no tax arises, and
+	// the amount is zero for that reason rather than because nothing was
+	// computed.
+	//
+	// This is what every proposer in this tree actually does today:
+	// Jurisdiction "not-applicable", amount zero, under a rule revision
+	// that is not published. It gets its own class precisely so those
+	// proposals do NOT have to claim reproducibility they have not
+	// earned — INV-004 says an undetermined input must not read as zero,
+	// and the mirror of that is that a justified zero must not read as a
+	// reproduction.
+	TaxNotApplicable TaxVerificationClass = "not_applicable"
+)
+
+// SealableTaxVerificationClasses is the closed set Seal accepts.
+//
+// A list rather than a default branch: a class added to the type but not
+// to this list fails to seal, which is the direction an unknown value
+// must fail in. The catalog in catalog.go is the same shape for the same
+// reason.
+func SealableTaxVerificationClasses() []TaxVerificationClass {
+	return []TaxVerificationClass{TaxIndependentlyReproducible, TaxProviderAttested, TaxNotApplicable}
+}
+
+// TaxVerificationSealable reports whether Seal accepts this class.
+func TaxVerificationSealable(c TaxVerificationClass) bool {
+	for _, ok := range SealableTaxVerificationClasses() {
+		if c == ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Draft is a proposed charge before it is sealed.
@@ -186,6 +257,7 @@ var (
 	ErrReceivableCurrencyMoved = errors.New("intent: a receivable must name the same currency as the intent it collects")
 	ErrKindNotInCatalog        = errors.New("intent: charge kind is not in the closed catalog of docs/DESIGN.md §6")
 	ErrTaxUnresolved           = errors.New("intent: tax is undetermined; a charge must not be sealed over a guess")
+	ErrTaxVerificationUnstated = errors.New("intent: tax determination does not say how it was established; an unstated class must not seal as the strongest one")
 	ErrTaxNegative             = errors.New("intent: tax is negative")
 	ErrAuthorizationUnset      = errors.New("intent: no billing authorization referenced")
 	ErrNoticePolicyUnset       = errors.New("intent: no notice policy")
@@ -253,6 +325,12 @@ func Seal(draft Draft) (ChargeIntent, error) {
 	}
 	if !draft.Tax.Resolved {
 		return ChargeIntent{}, ErrTaxUnresolved
+	}
+	// A resolved determination must also say HOW it was established.
+	// Refusing the zero value is what stops "nobody said" from sealing
+	// as the strongest class by omission.
+	if !TaxVerificationSealable(draft.Tax.Verification) {
+		return ChargeIntent{}, fmt.Errorf("%w: %q", ErrTaxVerificationUnstated, draft.Tax.Verification)
 	}
 	// Tax adds to a charge; it does not fund one. A negative amount
 	// would pull the total below the subtotal the customer was shown,
@@ -397,6 +475,7 @@ func (c ChargeIntent) computeDigest() string {
 	e.string(c.tax.Jurisdiction)
 	e.string(c.tax.RuleRevision)
 	e.int(c.tax.AmountMicros)
+	e.string(string(c.tax.Verification))
 	e.string(c.authorizationID)
 	e.string(c.noticePolicy)
 	e.time(c.executeNotBefore)

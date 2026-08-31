@@ -14,7 +14,7 @@ func catalogDraft(kind ChargeKind) Draft {
 		Kind:              kind,
 		PriceBookRevision: "pb-1",
 		TermsRevision:     "terms-1",
-		Tax:               TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1"},
+		Tax:               TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1", Verification: TaxNotApplicable},
 		AuthorizationID:   "auth-1",
 		NoticePolicy:      "email/v1",
 		ExecuteNotBefore:  time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),

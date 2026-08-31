@@ -26,6 +26,7 @@ func sealedIntent(t *testing.T) intent.ChargeIntent {
 		TermsRevision:     "terms-2026-01",
 		Tax: intent.TaxDetermination{
 			Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-2026-05", AmountMicros: 1_250,
+			Verification: intent.TaxNotApplicable,
 		},
 		AuthorizationID:  "auth-1",
 		NoticePolicy:     "email/v1",

@@ -28,6 +28,7 @@ func (f *fixedTax) Determine(_ Subject, _ string, subtotal int64, _ time.Time) T
 		Jurisdiction: "TW",
 		RuleRevision: "tax-2026-05",
 		AmountMicros: subtotal * f.rateBps / 10_000,
+		Verification: TaxNotApplicable,
 	}
 }
 
