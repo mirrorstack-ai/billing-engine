@@ -169,9 +169,9 @@ func TestAnOutcomeIsRecordedOnce(t *testing.T) {
 	require.NoError(t, s.ClaimSettlement(ctx, sealed.Digest(), "executor"))
 
 	now := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
-	require.NoError(t, s.RecordOutcome(ctx, sealed.Digest(), "succeeded", now))
+	require.NoError(t, s.RecordOutcome(ctx, sealed.Digest(), "succeeded", "in_test_ref", now))
 
-	err := s.RecordOutcome(ctx, sealed.Digest(), "failed", now)
+	err := s.RecordOutcome(ctx, sealed.Digest(), "failed", "", now)
 	require.ErrorIs(t, err, ErrStateChanged, "an outcome was overwritten")
 
 	var outcome string

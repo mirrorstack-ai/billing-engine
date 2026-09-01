@@ -74,7 +74,7 @@ func TestOneRefusedMemberRefusesTheWholeGroup(t *testing.T) {
 	_, err := pool.Exec(ctx, `DELETE FROM ms_billing.notice_receipts WHERE intent_digest = $1`, b.Digest())
 	require.NoError(t, err)
 
-	collector := &groupCollector{result: CollectResult{Succeeded: true}}
+	collector := &groupCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	outs, err := newExecutor(t, s, &recordingCollector{}, fullyEvidencedEnv()).
 		ExecuteGroup(ctx, collector, []string{a.Digest(), b.Digest()})
 	require.NoError(t, err)

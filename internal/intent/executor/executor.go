@@ -437,7 +437,7 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		return Outcome{Permitted: true, Unresolved: true}, nil
 
 	case result.Succeeded:
-		if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, digest, "succeeded", evidence.Event{
+		if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, digest, "succeeded", result.Reference, evidence.Event{
 			Kind:         evidence.KindSettlement,
 			Subject:      sealed.Payer(),
 			IntentDigest: digest,
@@ -453,7 +453,7 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		return Outcome{Permitted: true, Settled: true, Reference: result.Reference}, nil
 
 	default:
-		if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, digest, "failed", evidence.Event{
+		if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, digest, "failed", result.Reference, evidence.Event{
 			Kind:         evidence.KindSettlement,
 			Subject:      sealed.Payer(),
 			IntentDigest: digest,

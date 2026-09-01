@@ -394,11 +394,32 @@ func (s *Store) ClaimSettlement(ctx context.Context, digest, claimedBy string) e
 // Only a claim with no outcome may be given one. A second call is
 // refused rather than overwriting, because an intent that settled and
 // then "settled differently" is a record nobody can reason about.
-func (s *Store) RecordOutcome(ctx context.Context, digest, outcome string, at time.Time) error {
+// RecordOutcome records how a claim ended without an evidence record.
+//
+// 🔴 It takes the provider reference for the same reason
+// RecordOutcomeWithEvidence does: a settled claim must name the object the
+// money moved through, or nothing can walk from that object back to the sealed
+// document — which is what §6's collect_receivable needs to link a receivable
+// to its source.
+//
+// It has no non-test caller, and the parameter was added anyway. A second
+// writer that can produce a row the first one refuses is how the two drift,
+// and migration 069's CHECK would then fail at the database with no message
+// naming which writer did it.
+func (s *Store) RecordOutcome(
+	ctx context.Context,
+	digest, outcome, providerReference string,
+	at time.Time,
+) error {
+	if outcome == "succeeded" && providerReference == "" {
+		return fmt.Errorf(
+			"store: refusing to record intent %s as succeeded with no provider reference", digest)
+	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE ms_billing.intent_settlement_claims
-		   SET outcome = $2, outcome_at = $3
-		 WHERE intent_digest = $1 AND outcome IS NULL`, digest, outcome, at)
+		   SET outcome = $2, outcome_at = $3,
+		       provider_reference = NULLIF($4, '')
+		 WHERE intent_digest = $1 AND outcome IS NULL`, digest, outcome, at, providerReference)
 	if err != nil {
 		return fmt.Errorf("record outcome: %w", err)
 	}
