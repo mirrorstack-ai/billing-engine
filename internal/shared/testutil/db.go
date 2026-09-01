@@ -95,6 +95,35 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return err
 	}
+	// 🔴 MINT billing_ro BEFORE MIGRATING, because production does.
+	//
+	// The role is a privilege bundle for the read-only ops path. In production
+	// it is minted by db-bootstrap from mirrorstack-infra's config.DbServices,
+	// which runs before the migrations. Nothing in THIS repository creates it —
+	// there is no CREATE ROLE in any migration.
+	//
+	// Until 2026-09-01 the test harness did not create it either, and the
+	// consequence was not a missing test: migrations 058 (the read-only grants)
+	// and 064 (the REVOKE that keeps the INV-014 evidence outbox away from that
+	// role) are both wrapped in "IF EXISTS (SELECT 1 FROM pg_roles ...)". With
+	// no role, every run took the ELSE branch. So the grant set and the revoke
+	// had never been executed ANYWHERE — not in production, where they were
+	// recorded as applied, and not here, where a test could have noticed.
+	//
+	// NOLOGIN and no password: it is a bundle to be granted to a login
+	// identity, not an identity itself, and a test database must not contain
+	// something that can connect.
+	if _, err := pool.Exec(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'billing_ro') THEN
+				CREATE ROLE billing_ro NOLOGIN;
+			END IF;
+		END
+		$$;`); err != nil {
+		return errors.New("create the billing_ro role before migrating: " + err.Error())
+	}
+
 	dir := filepath.Join(root, "migrations", "billing")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
