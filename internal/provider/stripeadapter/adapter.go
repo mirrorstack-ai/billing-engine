@@ -66,21 +66,22 @@ type Adapter struct {
 	// Resolved per collection rather than cached: a payer whose
 	// provider identity changed between sealing and collecting should
 	// fail to resolve rather than charge the old one.
-	descriptionFor func(intentDigest string) string
 }
 
 // New returns an Adapter.
 func New(client InvoiceRail, resolver CustomerResolver) *Adapter {
-	return &Adapter{
-		client:   client,
-		resolver: resolver,
-		descriptionFor: func(digest string) string {
-			// The line description names the intent, so an invoice in
-			// the provider's own dashboard can be traced back to the
-			// document a customer approved.
-			return "MirrorStack charge " + shortDigest(digest)
-		},
-	}
+	// 🔴 There is deliberately no description function here any more.
+	//
+	// This adapter used to substitute "MirrorStack charge <short digest>" for
+	// every line, discarding what the intent sealed — so the verifiable rail's
+	// invoice was strictly LESS informative than the legacy one it replaces.
+	// The description a leg wrote is inside the document (the line's Meter),
+	// and lineDescription reads it from there.
+	//
+	// The field is gone rather than left unused, because an unused seam is an
+	// invitation: the next reader wiring it back would silently restore the
+	// defect, and nothing would fail.
+	return &Adapter{client: client, resolver: resolver}
 }
 
 // ErrNoCustomer is returned when a payer has no provider identity.
@@ -230,13 +231,6 @@ func centsFromMicros(micros int64) int64 {
 		return -((-micros + 5_000) / 10_000)
 	}
 	return (micros + 5_000) / 10_000
-}
-
-func shortDigest(digest string) string {
-	if len(digest) <= 12 {
-		return digest
-	}
-	return digest[:12]
 }
 
 // invoiceItem is one line as it will appear at the provider.
