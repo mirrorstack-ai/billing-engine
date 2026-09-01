@@ -672,6 +672,33 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		linePeriod.End = newPeriodEnd
 	}
 
+	// 🔴 THE CUTOVER BRANCH. Everything above ran: the amounts are derived, the
+	// wallet is drawn, the funding is armed and the request is FROZEN. Only the
+	// Stripe call is replaced.
+	//
+	// The branch sits here, after the freeze and after the recovery read, for
+	// the same reason the other two legs put theirs after their own arming
+	// claim (domain_charges.go:140, overage.go:452): a run that a previous
+	// attempt already committed to a Stripe request must be FINISHED on Stripe,
+	// not re-derived as an intent. Abandoning a finalized invoice would strand a
+	// charge the customer can see and nobody can prove. `recovered` is exactly
+	// that case, so it takes the legacy path even when the cutover is armed —
+	// the exception drains as those runs complete, and
+	// scripts/legacy-drop-preconditions.sql asks production when it has.
+	if s.proposer != nil && recovered == nil {
+		return s.proposeBoundary(ctx, runID, accountID, summary, boundaryComponents{
+			// summary.ArrearsMicros is the ORIGINAL arrears. remainingArrears
+			// cannot be used to recover it: it is clamped at zero, so a wallet
+			// draw larger than the arrears loses the difference and the split
+			// would understate the closed period.
+			ArrearsMicros:        summary.ArrearsMicros,
+			AdvanceBaseMicros:    summary.AdvanceBaseMicros,
+			AdvanceOverageMicros: summary.AdvanceOverageMicros,
+			AdvanceDomainsMicros: summary.AdvanceDomainsMicros,
+			WalletDrawnMicros:    summary.WalletDrawnMicros,
+		}, periodStart, periodEnd, newPeriodEnd)
+	}
+
 	// Charge — or, on a frozen reclaim, RECONCILE against Stripe first (H5): the
 	// frozen marker means a prior attempt reached its Stripe section, and past
 	// the ~24h idempotency-key window a bare "replay" would mint brand-new

@@ -191,6 +191,19 @@ const (
 	// arrears netted below it). The usage is RETAINED. Distinct from
 	// RunStatusSkippedPrepaid so the skip reason is unambiguous in the audit trail.
 	RunStatusSkippedCeiling BillingRunStatus = "skipped_ceiling"
+
+	// RunStatusProposed: the intent cutover was armed, so this run's charge
+	// was SEALED AS INTENTS and nothing was collected.
+	//
+	// Terminal for this worker and distinct from every other outcome on
+	// purpose. It is not 'invoiced' — no invoice exists and no money moved —
+	// and it is not 'failed'. Recording it as either would corrupt the
+	// measurement the legacy drop depends on:
+	// scripts/legacy-drop-preconditions.sql asks whether any boundary run is
+	// still in flight, and a proposed run reading as 'pending' would block the
+	// drop forever while one reading as 'invoiced' would claim money was
+	// collected that never was.
+	RunStatusProposed BillingRunStatus = "proposed"
 )
 
 // chargeCurrency is the Stripe charge currency. Fixed to usd for v1 (matching
@@ -258,6 +271,13 @@ type ChargeSummary struct {
 	// StripeInvoiceID is the created Stripe invoice id, empty when no charge
 	// happened (zero arrears or skipped_no_pm).
 	StripeInvoiceID string
+	// ProposedDigests are the intents this run's charge was sealed as, when
+	// the intent cutover was armed. Empty on the legacy path.
+	//
+	// The link from a legacy run to the intents that replaced its charge is
+	// what makes the cutover auditable in both directions — from the row to
+	// the documents, and from a document back to the row that caused it.
+	ProposedDigests []string
 }
 
 // CreditBillingMode is the universal-wallet billing mode stored in

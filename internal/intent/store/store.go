@@ -98,11 +98,38 @@ func (s *Store) saveIntent(
 		return errors.New("store: refusing to save an unsealed intent")
 	}
 
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		return insertIntentTx(ctx, tx, sealed, rec, e)
+	})
+}
+
+// insertIntentTx is the whole of one intent's persistence, on a caller's
+// transaction: the row, its lines, its source facts and its evidence record.
+//
+// Split out of saveIntent so that a GROUP of intents and the grouping itself
+// can commit together. A group written in a second transaction is a group that
+// a crash can lose, and a lost grouping is not a missing convenience — the
+// executor's PendingExecutionGrouped returns ungrouped intents as groups of
+// ONE, so two boundary halves that lost their grouping are collected as two
+// separate invoices, with two roundings. That is precisely the divergence the
+// two-intent boundary exists to avoid, and it would appear as a few cents, not
+// as an error.
+func insertIntentTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	sealed intent.ChargeIntent,
+	rec *evidence.Recorder,
+	e evidence.Event,
+) error {
+	if !sealed.Sealed() {
+		return errors.New("store: refusing to save an unsealed intent")
+	}
+
 	notBefore, notAfter := sealed.ExecutionWindow()
 	tax := sealed.Tax()
 	payer := sealed.Payer()
 
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	{
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO ms_billing.charge_intents
 			  (digest, payer_kind, payer_id, currency, kind, price_book_revision,
@@ -168,6 +195,54 @@ func (s *Store) saveIntent(
 
 		if rec != nil {
 			return appendEvidence(ctx, tx, rec, e)
+		}
+		return nil
+	}
+}
+
+// SaveIntentGroupWithEvidence stores several intents AND the grouping that
+// makes them one collection, in a single transaction.
+//
+// This is what a boundary proposes through. The period boundary seals two
+// intents — the closed period's usage arrears and the next period's
+// subscription — and they must reach the executor as a group or not at all:
+// PendingExecutionGrouped treats an ungrouped intent as a group of one, so a
+// half-written boundary is collected as two invoices with two roundings, which
+// is a silent few cents of divergence from what the legacy path took.
+//
+// The whole set commits or none of it does. Nothing partial is a state the
+// executor can see.
+func (s *Store) SaveIntentGroupWithEvidence(
+	ctx context.Context,
+	groupID string,
+	sealed []intent.ChargeIntent,
+	rec *evidence.Recorder,
+	events []evidence.Event,
+) error {
+	if rec == nil {
+		return ErrNoRecorder
+	}
+	if groupID == "" {
+		return errors.New("store: refusing to group intents under an empty id")
+	}
+	if len(sealed) != len(events) {
+		return fmt.Errorf("store: %d intents but %d evidence events", len(sealed), len(events))
+	}
+	if len(sealed) == 0 {
+		return nil
+	}
+
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		for i, in := range sealed {
+			if err := insertIntentTx(ctx, tx, in, rec, events[i]); err != nil {
+				return fmt.Errorf("group member %d (%s): %w", i, in.Digest(), err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO ms_billing.intent_groups (intent_digest, group_id)
+				VALUES ($1, $2)
+				ON CONFLICT (intent_digest) DO NOTHING`, in.Digest(), groupID); err != nil {
+				return fmt.Errorf("group intent %s: %w", in.Digest(), err)
+			}
 		}
 		return nil
 	})

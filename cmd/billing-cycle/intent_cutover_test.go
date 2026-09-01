@@ -84,3 +84,9 @@ func (nilSaver) SaveIntentWithEvidence(
 ) error {
 	panic("not reached")
 }
+
+func (nilSaver) SaveIntentGroupWithEvidence(
+	context.Context, string, []intent.ChargeIntent, *evidence.Recorder, []evidence.Event,
+) error {
+	return nil
+}

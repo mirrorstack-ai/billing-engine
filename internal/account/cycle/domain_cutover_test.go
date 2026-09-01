@@ -18,7 +18,30 @@ import (
 // be observed without a database.
 type capturingProposer struct {
 	charges []proposer.Charge
-	err     error
+	// groups records each ProposeGroup call as one slice, so a test can tell
+	// "two charges in ONE group" from "two separate proposals" — which is the
+	// distinction the boundary's single rounding depends on.
+	groups [][]proposer.Charge
+	err    error
+}
+
+// ProposeGroup seals a set that must settle together. It records the SET, not
+// just the charges, because a boundary that proposed its two halves separately
+// would look identical in p.charges and be collected as two invoices.
+func (p *capturingProposer) ProposeGroup(ctx context.Context, charges []proposer.Charge) ([]intent.ChargeIntent, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	var sealed []intent.ChargeIntent
+	for _, c := range charges {
+		in, err := p.Propose(ctx, c)
+		if err != nil {
+			return nil, err
+		}
+		sealed = append(sealed, in)
+	}
+	p.groups = append(p.groups, charges)
+	return sealed, nil
 }
 
 func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (intent.ChargeIntent, error) {
