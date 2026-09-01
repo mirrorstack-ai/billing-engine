@@ -180,7 +180,7 @@ func TestARefusalTouchesNothing(t *testing.T) {
 	env := fullyEvidencedEnv()
 	env.BuildIdentified = false // VERIFICATION §2
 
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	out, err := newExecutor(t, s, collector, env).Execute(ctx, sealed.Digest())
 
 	require.NoError(t, err)
@@ -231,7 +231,7 @@ func TestAnAmbiguousResultRetainsTheClaimAndRecordsNothing(t *testing.T) {
 	// was finally populated and RefusalAttemptUnresolved became reachable.
 	// ErrAlreadyClaimed itself stays covered by
 	// TestConcurrentExecutorsCollectExactlyOnce and the store's own suite.
-	second := &recordingCollector{result: CollectResult{Succeeded: true}}
+	second := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	out2, err := newExecutor(t, s, second, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
 	require.NoError(t, err)
 	require.False(t, out2.Permitted, "a second attempt was permitted while the first is unresolved")
@@ -330,7 +330,7 @@ func TestAMissingAuthorizationRefuses(t *testing.T) {
 	require.NoError(t, s.AdvanceState(ctx, sealed.Digest(), "proposed", "eligible"))
 	// No authorization saved.
 
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
 
 	require.NoError(t, err)
@@ -345,7 +345,7 @@ func TestAnEmptyEnvironmentRefuses(t *testing.T) {
 	s := store.New(pool)
 	sealed := ready(t, s)
 
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	out, err := newExecutor(t, s, collector, Environment{}).Execute(context.Background(), sealed.Digest())
 
 	require.NoError(t, err)
@@ -367,7 +367,7 @@ func TestATamperedIntentIsNeverEvaluated(t *testing.T) {
 		  WHERE intent_digest = $1 AND line_index = 0`, sealed.Digest())
 	require.NoError(t, err)
 
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	_, err = newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
 
 	require.ErrorIs(t, err, intent.ErrDigestMismatch)
@@ -539,7 +539,7 @@ func TestAnAuthorizationWithNoIssuedAcceptanceIsRefused(t *testing.T) {
 	other := freshAuthorizationWithoutAcceptance(t, s)
 	orphan := sealAgainst(t, s, other)
 
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, orphan.Digest())
 	require.NoError(t, err)
 
