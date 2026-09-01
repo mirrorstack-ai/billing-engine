@@ -73,7 +73,18 @@ var allowedProviderMutations = map[string]string{
 	"internal/account/autotopup/executor.go (*Executor).deleteDraftAndFail DeleteDraftInvoice":           "discarding a draft that was never finalized",
 	"internal/account/autotopup/executor.go (*Executor).ReconcileWebhookFailure VoidInvoice":             "closing out a top-up the provider reported as failed",
 
-	// --- the ten service call sites that can take money ---
+	// --- the eleven service call sites that can take money ---
+	//
+	// ELEVEN, not ten. The header said ten over eleven entries for as long as
+	// the list has existed. The eleventh is the dispatcher row at the end of
+	// this block, which LEGACY-DROP-PLAN.md explains is a miscount the scanner
+	// makes by matching a method NAME without its receiver — and which must
+	// NOT be corrected until the other ten are deleted, because lowering the
+	// count by editing the scanner is what LegacyMoneyPaths's own comment
+	// forbids.
+	//
+	// A header that disagrees with the list it heads is a small thing sitting
+	// on top of the one constant the intent-only claim rests on.
 	"internal/account/cycle/charge.go (*Service).charge FinalizeInvoice":                               "COLLECT: the period-boundary invoice — the closed period's usage arrears plus the new period's advance base, overage and domains, in one charge",
 	"internal/account/cycle/charge.go (*Service).boundaryInvoice FinalizeInvoice":                      "COLLECT: resume of the same boundary invoice after a crash, replaying the original finalization key",
 	"internal/account/cycle/overage.go (*Service).ChargeModuleOverage FinalizeInvoice":                 "COLLECT: a module installed beyond the included allowance, after its grace",
