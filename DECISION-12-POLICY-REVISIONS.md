@@ -127,10 +127,18 @@ is a matter of someone finding time.
 >
 > So the catalog is not the blocker for either leg, and no kind needs
 > inventing. Auto-top-up is routed. What actually blocks CREDIT PURCHASE is
-> the disclosure binding — see the next correction — and the schema paragraph
-> below is also stale: `charge_intents.kind` has been CHECKed against the
-> closed set since the catalog landed, so sealing an invented kind no longer
-> compiles *or* stores.
+> the disclosure binding — see the next correction.
+>
+> 🔴 **This correction was itself wrong, and is corrected here (2026-09-01).**
+> It claimed `charge_intents.kind` "has been CHECKed against the closed set
+> since the catalog landed". It has not, and the paragraph it called stale is
+> the accurate one: `migrations/billing/054_intent_core.up.sql:38` declares
+> `kind TEXT NOT NULL` with no CHECK — contrast `payer_kind` four lines above
+> it, which *is* CHECKed. `internal/architecture/intent_schema_integration_test.go:155`
+> inserts a non-catalog kind and asserts `NoError`, which is the schema saying
+> so directly. The catalog is enforced in Go only: sealing an invented kind no
+> longer compiles and is refused at `Seal`, but the database would still store
+> one if anything got past those.
 
 Both are **stored-value funding**, not charges for consumption. §6's charge
 catalog is closed and names no funding kind, so neither can legally seal an

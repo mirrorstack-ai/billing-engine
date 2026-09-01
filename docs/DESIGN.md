@@ -1130,10 +1130,8 @@ under a published rule you accepted.
 
 | kind | what it pays for | who fixes the quantity | who fixes the rate | when it lands |
 |---|---|---|---|---|
-| `platform_base` | published platform access for one app or account period | eligible app and account-period facts | an immutable platform price-book revision | the cycle; prorated only by a published rule |
+| `platform_base` | published platform access for one app or account period, including installed-module capacity above the included tier and the published custom-domain feature | eligible app and account-period facts | an immutable platform price-book revision | the cycle; prorated only by a published rule |
 | `module_usage` | one installed module's declared metered usage | immutable usage facts, aggregated by the rule its manifest declares | the immutable module-version manifest plus the effective price revision | the cycle |
-| `module_capacity` | installed-module capacity above the included tier, if product policy keeps it | versioned installation and timer facts | an immutable platform price-book revision | the cycle; never an immediate sweep |
-| `custom_domain` | the published domain feature, if product policy keeps it | immutable domain activation and active-window facts | an immutable platform price-book revision | the cycle; activation proration by a published rule |
 | `tax` | tax on the listed taxable lines | the frozen taxable basis plus your tax evidence | an immutable tax-policy revision and a versioned determination | before notice, before the seal |
 | infrastructure / `infra_total_micros` | **shipped today; not in the target vocabulary** — infrastructure as its own customer line, at cost × 1.2 | `infra.*` and `platform.*` usage rows | `ms_billing.metric_definitions` and `metric_model_prices` | a current-cycle read; the disclosure below |
 
@@ -1722,7 +1720,13 @@ so recurring account fees ride on top of it.
 🔴 **What is missing is the split.** You are charged one number covering a period
 that ended and a period that has not started, and nothing today shows which part
 is which. The fix is presentation and receipt structure, not a change to when
-money is collected. Every current defect is enumerated once, in
+money is collected. The owner's answer is one collection with both halves shown,
+not two collections.
+
+Module overage and custom domains fold into the base price under §12 item 12, so
+in the target vocabulary the forward half is a single `platform_base`. Until that
+price-book revision ships, the boundary invoice still derives and carries them as
+separate components — the fold has closed the kind set, not the price. Every current defect is enumerated once, in
 [`SECURITY.md` § Known current gaps](../SECURITY.md#known-current-gaps).
 
 ---
@@ -1945,10 +1949,24 @@ is left **TBD** here rather than invented.
 11. **Currency.** Supported currencies, TWD price books, and whether any FX is
     offered as a customer line. Blocks G1, G2 and G4: §8 forbids implicit
     cross-currency entries.
-12. **Which kinds exist, and their timing.** Whether `module_capacity` and
-    `custom_domain` stay separately chargeable; the base, module and domain
-    price and tier policy; and proration, grace, cycle consolidation and late
-    usage. Blocks G1 and G2: §6 is not a closed vocabulary until this settles.
+12. **Which kinds exist, and their timing.** The base, module and domain price
+    and tier policy; and proration, grace, cycle consolidation and late usage.
+
+    The **kind set is settled**: `module_capacity` and `custom_domain` fold
+    into `platform_base`, which recovers both, so neither is separately
+    chargeable and neither keeps a kind of its own. §6's table above no longer
+    lists them and the Go catalog no longer defines them. Do not re-decide the
+    direction.
+
+    What remains is the price, and none of it is decided here: the base price
+    that absorbs capacity and domains (together with item 15's infrastructure
+    markup), the included tier and the rate above it, proration, grace, cycle
+    consolidation and late usage. Those are a price-book revision, and both
+    shipped legs still seal `unpublished/pending-decision-12` until it is
+    published.
+
+    Blocks G1 and G2: the catalog half of G2 moves with this answer; G2 stays
+    shut on items 1, 6, 9, 11 and 13.
 13. **Credit, wallet and developer settlement.** Credit expiry, refundability,
     exposure, allocation order and the legal characterization of stored value;
     plus developer take rate, reserve, refund and payout timing. Blocks G2 and

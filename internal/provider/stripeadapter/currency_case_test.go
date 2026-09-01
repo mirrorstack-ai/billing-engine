@@ -18,7 +18,7 @@ func TestSealNormalizesUpAndTheWireNeedsItDown(t *testing.T) {
 		Payer:                 intent.Subject{Kind: "user", ID: "acct-1"},
 		Currency:              "usd", // what every legacy call site uses
 		Lines:                 []intent.Line{intent.NewLine("d", "m", "1", 1, 10_000)},
-		Kind:                  intent.KindCustomDomain,
+		Kind:                  intent.KindPlatformBase,
 		PriceBookRevision:     "pb-1",
 		TermsRevision:         "terms-1",
 		Tax:                   intent.TaxDetermination{Resolved: true, Jurisdiction: "TW", RuleRevision: "tax-1", Verification: intent.TaxNotApplicable},

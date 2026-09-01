@@ -116,9 +116,11 @@ var allowedProviderMutations = map[string]string{
 	// Same four steps, same exclusion, and the exclusion rests on the same
 	// property: stripeadapter is reachable only through the executor.
 	//
-	// It exists because the period-boundary invoice is four §6 charge kinds
-	// and an intent carries one — see BOUNDARY-KIND-DECISION.md, which is an
-	// OPEN decision. Nothing calls CollectGroup yet.
+	// It exists because the period-boundary invoice spans more than one §6
+	// charge kind — module_usage arrears plus the forward platform_base, two
+	// since §12 item 12 folded capacity and domains into the base price — and
+	// an intent carries one. See BOUNDARY-KIND-DECISION.md. Nothing calls
+	// CollectGroup yet.
 	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup CreateDraftInvoice":                "INTENT: the inert draft for a group of sealed intents",
 	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup CreateInvoiceItem":                 "INTENT: one line per sealed line across the group, apportioned from ONE rounding over the summed remainders",
 	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup FinalizeInvoiceWithoutAutoAdvance": "INTENT: finalizes WITHOUT automatic collection, so the pay below stays the single money-moving step with an answer this code receives",
