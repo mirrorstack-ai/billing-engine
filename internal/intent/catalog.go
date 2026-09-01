@@ -21,15 +21,16 @@ const (
 
 	// KindPlatformBase is published platform access for one app or account
 	// period.
+	//
+	// §12 item 12 folded installed-module capacity above the included tier
+	// and the published custom-domain feature INTO this kind: the base
+	// price recovers both, so neither is separately chargeable and neither
+	// has a kind of its own. §6's pre-fold table listed them conditionally,
+	// "if product policy keeps it" — product policy did not. Do not re-add
+	// module_capacity or custom_domain.
 	KindPlatformBase ChargeKind = "platform_base"
 	// KindModuleUsage is one installed module's declared metered usage.
 	KindModuleUsage ChargeKind = "module_usage"
-	// KindModuleCapacity is installed-module capacity above the included
-	// tier. This is what the module-overage timer leg charges for.
-	KindModuleCapacity ChargeKind = "module_capacity"
-	// KindCustomDomain is the published domain feature. This is what the
-	// custom-domain leg charges for.
-	KindCustomDomain ChargeKind = "custom_domain"
 	// KindTax is tax on the listed taxable lines.
 	KindTax ChargeKind = "tax"
 
@@ -58,8 +59,6 @@ const (
 var catalog = map[ChargeKind]struct{}{
 	KindPlatformBase:      {},
 	KindModuleUsage:       {},
-	KindModuleCapacity:    {},
-	KindCustomDomain:      {},
 	KindTax:               {},
 	KindSubscriptionStart: {},
 	KindCreditPurchase:    {},

@@ -187,7 +187,7 @@ func TestMigration068RepairsASkipped058(t *testing.T) {
 // Skipping is what 058 did, and the cost was a migration recorded as applied
 // that granted nothing and can never re-run. A migration that cannot do its job
 // must stop the deploy so the ordering against role creation is explicit.
-func TestMigration068RefusesWhenTheRoleIsMissing(t *testing.T) {
+func TestMigration068CreatesTheRoleWhenItIsMissing(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	ctx := context.Background()
 
@@ -205,11 +205,28 @@ func TestMigration068RefusesWhenTheRoleIsMissing(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = pool.Exec(ctx, string(body))
-	require.Error(t, err,
-		"068 succeeded with no billing_ro role. It must RAISE: skipping is what 058 did, and "+
-			"a skipped migration is recorded as applied and never runs again.")
-	require.Contains(t, err.Error(), "billing_ro",
-		"the failure does not name the missing role, so an operator cannot act on it")
+	require.NoError(t, err,
+		"068 failed with no billing_ro role. Raising halts a multi-repo deploy on an ordering "+
+			"nothing enforces — db-bootstrap is invoked by a Makefile target, not by any "+
+			"workflow, which is exactly how 058 came to skip.")
+
+	// It created the role and granted through it. Neither skipping (058's bug)
+	// nor halting: the migration owns its own precondition.
+	var exists bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'billing_ro')`).Scan(&exists))
+	require.True(t, exists, "068 neither created the role nor failed; it did nothing")
+
+	var readable bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT has_table_privilege('billing_ro', 'ms_billing.invoices', 'SELECT')`).Scan(&readable))
+	require.True(t, readable, "068 created the role and did not grant through it")
+
+	// And still not the evidence outbox.
+	var evidence bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT has_table_privilege('billing_ro', 'ms_billing.evidence_records', 'SELECT')`).Scan(&evidence))
+	require.False(t, evidence, "creating the role re-exposed the INV-014 evidence outbox")
 }
 
 func repoRootForTest() (string, error) { return RepoRoot() }

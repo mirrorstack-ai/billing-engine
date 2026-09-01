@@ -68,7 +68,7 @@ The owner's 2026-08-31 decision to build all 17 gates as designed means the
 | 9 | Adverse outcomes and value return | Whether money ever goes back to the card, or only to a balance | G2, G3, G4 | Yes |
 | 10 | Invoicing duties, Taiwan, NewebPay | Whether Taiwan is a market this engine may collect in at all | G1, G3 | Yes |
 | 11 | Currency | Whether the engine's money is ever denominated in more than one currency | G1, G2, G4 | **No** |
-| 12 | Which kinds exist, and their timing | Whether the bill carries four priced service lines or fewer, and when each lands | G1, G2 | Yes |
+| 12 | Which kinds exist, and their timing | Whether the bill carries four priced service lines or fewer, and when each lands | G1, G2 | Yes (kind set **settled**; price open) |
 | 13 | Credit, wallet, developer settlement | Whether a credit balance is the customer's money or an entitlement we may expire | G2, G4 | Yes |
 | 14 | Ledger and evidence policy | Which accounts exist, when money becomes revenue, and what evidence may leave | G1, G3, G4 | Yes |
 | 15 | Responsibility transfer | When the payer changes, who owes for service already consumed | G1 | Yes (infra half **settled**) |
@@ -1407,7 +1407,8 @@ Buildable under any of these, without the answer: the Tier 0 canonical-v2 work
 refusals.
 
 ### Recommendation
-**OWNER-ONLY.**
+**OWNER-ONLY** for the price. ✅ **The kind set was answered 2026-09-01 — see the third
+answer round below.** `module_capacity` and `custom_domain` fold into `platform_base`.
 
 ### Cost to defer
 **Nothing stops.** Legacy still collects, and `BILLING_CYCLE_INTENT_CUTOVER`'s only armed value
@@ -2295,3 +2296,70 @@ already the seller for Taiwan customers over Stripe. Whatever registration,
 classification and invoicing duties that creates exist today on the legacy
 rail, independent of whether the intent engine ever cuts over. That is a
 legacy-rail exposure the cutover decision does not touch, and it is now named.
+
+---
+
+## ✅ THIRD ANSWER ROUND — 2026-09-01
+
+### Item 12 — the kind set, settled. The price, still open.
+
+**The owner's answer: fold both into base.** `module_capacity` (installed-module
+capacity above the included tier) and `custom_domain` (the published domain
+feature) are recovered by the base price. Neither is separately chargeable and
+neither keeps a charge kind of its own.
+
+§6 had already written both conditionally — "if product policy keeps it"
+(`docs/DESIGN.md:1135-1136`). Product policy did not keep them. The Go catalog
+listed them unconditionally, so until this answer the shipped enum was two
+entries wider than the accepted vocabulary.
+
+**Shipped with the answer.** The catalog is seven kinds; both legs re-point to
+`KindPlatformBase`; `TestSealRefusesAKindOutsideTheCatalog` now refuses
+`module_capacity` and `custom_domain` by name, so re-adding either constant
+fails rather than passing silently.
+
+**What the fold did NOT need, each verified rather than assumed:**
+
+- **No migration.** `charge_intents.kind` is `TEXT NOT NULL` with no CHECK
+  (`054_intent_core.up.sql:38`) — contrast `payer_kind` on `:29`.
+  `internal/architecture/intent_schema_integration_test.go:155` inserts a
+  non-catalog kind and asserts `NoError`.
+- **No canonical schema tag bump.** The tag versions the layout
+  (`canonical.go:11-15`); `kind` is one length-prefixed string at a fixed
+  position, and narrowing its legal values moves no bytes. All three recorded
+  bumps were field additions.
+- **No published policy revision.** The catalog is not one of the five names
+  `UnpublishedRevisions` checks (`revision.go:56-79`), so the narrowing flips no
+  clause.
+- **No stored row at risk.** `Rehydrate` re-Seals every stored row
+  (`store.go:284`), so a row of a deleted kind would be permanently unloadable
+  and INV-003 forbids repairing it in place — but `charge_intents` is empty, the
+  cutover flag is set nowhere, and the shadow rail only ever seals
+  `module_usage` (`cmd/intent-shadow/main.go:117`).
+
+**What remains open** is the price: the base price that absorbs capacity and
+domains together with item 15's infrastructure markup, the included tier and the
+rate above it, proration, grace, cycle consolidation and late usage. That is a
+price-book revision, and both legs still seal
+`unpublished/pending-decision-12` until it is published.
+
+### Boundary collection shape — settled
+
+**One collection, both halves shown.** Not two collections. With the fold the
+boundary is exactly two kinds — `module_usage` for the closed period's arrears,
+`platform_base` for the next period — and the three fee components are exact
+whole-cent multiples, so folding them introduces no rounding. Only `arrears` and
+the wallet draw are sub-cent-fractional and they sit in the same intent, so a
+group that rounds once over the summed remainders takes exactly the cents the
+legacy path takes. See `BOUNDARY-KIND-DECISION.md`.
+
+⚠️ The fold is a **vocabulary** change. It does not by itself produce "two
+intents, one collection, one rounding": `charge.go` has no proposer seam and
+nothing calls `ExecuteGroup`. That is a later wave.
+
+### A correction to the record
+
+`DECISION-12-POLICY-REVISIONS.md` carried a correction that was itself wrong —
+it claimed `charge_intents.kind` "has been CHECKed against the closed set since
+the catalog landed", and called the accurate paragraph below it stale. It is the
+other way round. Corrected in place.
