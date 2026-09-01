@@ -114,6 +114,24 @@ is a matter of someone finding time.
 
 ### Credit purchase and auto-top-up — blocked by §12 item 12
 
+> 🔴 **CORRECTION, 2026-08-31.** The paragraph below said "§6's charge catalog
+> is closed and names no funding kind, so neither can legally seal an
+> `intent.Draft` today." **That is false, and it was false when written.**
+>
+> `internal/intent/catalog.go:36-54` carries a section headed *"funding and
+> collection: not service lines, per §6"* and names four kinds:
+> `KindSubscriptionStart`, `KindCreditPurchase`, `KindAutoTopUp` and
+> `KindCollectReceivable`. The auto-top-up leg **already seals**
+> `KindAutoTopUp` in production code
+> (`internal/account/autotopup/executor.go:1329`).
+>
+> So the catalog is not the blocker for either leg, and no kind needs
+> inventing. Auto-top-up is routed. What actually blocks CREDIT PURCHASE is
+> the disclosure binding — see the next correction — and the schema paragraph
+> below is also stale: `charge_intents.kind` has been CHECKed against the
+> closed set since the catalog landed, so sealing an invented kind no longer
+> compiles *or* stores.
+
 Both are **stored-value funding**, not charges for consumption. §6's charge
 catalog is closed and names no funding kind, so neither can legally seal an
 `intent.Draft` today.
@@ -213,3 +231,47 @@ third state (determined / not-applicable / **not-determined**), which touches
 Whether "not determined" may ever be sealed at all is itself a §12 question —
 it is the difference between an intent that cannot be collected and an intent
 that cannot be written down. **I have not changed this.** It needs your call.
+
+
+---
+
+## 🔴 What actually blocks credit purchase, and a live divergence found looking
+
+Recorded 2026-08-31, verified in code.
+
+### The disclosure it needs has no producer and no consumer
+
+§6 requires a credit purchase to rest on "your acceptance of engine-signed
+disclosure bytes naming currency, amount, credit received, restrictions,
+expiry, refund terms, rail and intent digest". `internal/intent/disclosure.go`
+implements exactly that type — and **nothing outside its own unit test
+references it**. `ChargeIntent` carries no disclosure digest field, so an
+intent cannot even name the document it was accepted under.
+
+That is §12 item 16 option C, piece 2 — bind acceptance to an engine-issued,
+engine-signed disclosure — which is unbuilt. Credit purchase is blocked on
+that piece and on nothing else in the catalog.
+
+### The amount charged and the credit granted already differ
+
+`internal/account/creditledger/settlement.go:184` requires the customer to have
+paid `microsToCentsRoundHalfUp(row.AmountMicros)` — the **rounded cents**.
+Fourteen lines later, `:198` credits `balance + row.AmountMicros` — the **raw
+micros**.
+
+Nothing requires `amount_micros` to be a whole-cent multiple:
+`internal/account/billing/credit.go` range-checks only 5,000,000 to
+5,000,000,000, and migration `048`'s CHECKs are a non-zero test and a sign
+test. So a purchase of 5,004,999 micros charges $5.00 and credits 5,004,999 —
+the customer receives 4,999 micros they did not pay for, per purchase.
+
+It is sub-cent and it is in the customer's favour, so it is not urgent. It
+matters here because **a cutover cannot seal both numbers**: `proposer.Charge`
+expresses one amount, and `intent.Disclosure` is explicit that the amount paid
+and the credit received "are NOT the same number — a promotion, a bonus tier
+or a fee makes them differ, and collapsing them would hide exactly the term a
+customer most needs to see."
+
+So routing this leg requires the intent to carry the credit granted as well as
+the amount charged. That is another canonical field, and it is free only while
+`charge_intents = 0`.
