@@ -306,8 +306,42 @@ func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurc
 		return nil, NotFound("credit purchase not found")
 	}
 
-	if purchase.Status != "settled" &&
-		(purchase.Status != "failed" || purchase.StripeInvoiceID != "") {
+	// 🔴 A POSITIVE list, not a negative composite.
+	//
+	// Migration 057 widened this table's status vocabulary with 'proposed',
+	// and its header argues the change is safe because "every credit_ledger
+	// status comparison in the codebase is POSITIVE ... There is no <>, != or
+	// NOT IN on ledger status anywhere". That measurement was not true: this
+	// line was one of the counterexamples, and a 'proposed' purchase fell
+	// through it into reconciliation — which then reached the executor's
+	// unsupported-status error.
+	//
+	// Written positively so the next value added to the vocabulary is a
+	// compile-visible decision rather than a silent membership.
+	//
+	// 057's header is left as it stands: it is an APPLIED migration and this
+	// org's tooling hashes migration file content, so its bytes are not worth
+	// changing for a comment. Three negative comparisons existed when it was
+	// written — this one, creditpurchase/executor.go's unsupported-status
+	// guard, and creditledger/settlement.go:178. The third is left alone: it
+	// is keyed on a Stripe invoice id and a proposed purchase has no invoice,
+	// so nothing can reach it, and it fails closed if anything ever does.
+	//
+	// The lesson is not that 057's argument was wrong — it is right, and it is
+	// why the first two had to be fixed before this leg could route. The
+	// lesson is that its grep searched SQL and did not search Go.
+	needsReconcile := false
+	switch purchase.Status {
+	case "pending", "refunded":
+		needsReconcile = true
+	case "failed":
+		// A failure with no invoice never reached Stripe; there is nothing to
+		// reconcile against.
+		needsReconcile = purchase.StripeInvoiceID != ""
+	case "settled", "proposed":
+		// Terminal. 'proposed' means the intent rail owns this attempt.
+	}
+	if needsReconcile {
 		start, reconcileErr := s.resumeCreditPurchase(ctx, purchase)
 		if reconcileErr != nil {
 			return nil, reconcileErr

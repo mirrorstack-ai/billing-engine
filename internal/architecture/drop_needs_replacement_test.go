@@ -40,14 +40,10 @@ import (
 // of a TODO: the next person to attempt the drop must be told, by a failing
 // test, that deleting these two removes the only collector their charge kinds
 // have.
+// 🔴 ONE ENTRY, DOWN FROM TWO. creditpurchase was routed 2026-09-01 after the
+// owner accepted a changed browser contract — the decision this list existed to
+// surface. The remaining entry is not a decision anyone can take today.
 var unroutedLegs = map[string]string{
-	"internal/account/creditpurchase/executor.go": "credit_purchase changes a SYNCHRONOUS customer-facing contract. " +
-		"creditPurchaseStartResponse (internal/account/billing/credit.go:624-637) returns " +
-		"invoice.ClientSecret to the browser, and that secret only exists after the finalize. " +
-		"A proposing version returns a response the browser cannot use, so cutting it over is a " +
-		"product decision, not an engineering one. Deleting this collector today leaves credit " +
-		"purchases with no way to be paid.",
-
 	"internal/account/billing/unpaid.go": "collect_receivable is STRUCTURALLY impossible today. A receivable is " +
 		"CollectRemainderOf(source) and links to a SOURCE INTENT; every unpaid invoice in the " +
 		"system predates the intent rail, so there is nothing to link to. It also re-pays a " +

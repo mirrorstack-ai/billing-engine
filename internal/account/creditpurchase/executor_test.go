@@ -14,8 +14,9 @@ import (
 )
 
 type fakeStore struct {
-	attempt   Attempt
-	failCalls int
+	proposedRefs []string
+	attempt      Attempt
+	failCalls    int
 }
 
 func (s *fakeStore) Get(
@@ -75,6 +76,24 @@ func (s *fakeStore) Fail(
 	s.attempt.Status = "failed"
 	s.attempt.ReceiptURL = receiptURL
 	return s.attempt, true, nil
+}
+
+// MarkProposed records the intent reference the way the real store does.
+//
+// Pending-only, matching the SQL predicate. A row already moved is a lost race,
+// not a fault — a fake that ignored this would make the executor's race
+// handling untestable.
+func (s *fakeStore) MarkProposed(_ context.Context, _ Attempt, ref string) (bool, error) {
+	if ref == "" {
+		return false, errors.New("fake store: a proposed attempt needs its intent reference")
+	}
+	if s.attempt.Status != "pending" {
+		return false, nil
+	}
+	s.attempt.Status = "proposed"
+	s.attempt.ProposedReference = ref
+	s.proposedRefs = append(s.proposedRefs, ref)
+	return true, nil
 }
 
 type fakeSettler struct {
