@@ -59,22 +59,60 @@ money?* Measured 2026-09-01, that is the real state:
 
 | # | path | drained? | proposes an intent? | can the rail collect it? |
 |---|---|---|---|---|
-| 1 | `cycle/charge.go` boundary | ✅ | ❌ | ❌ blocked — the invoice is FOUR §6 kinds and an intent carries one (`BOUNDARY-KIND-DECISION.md`) |
+| 1 | `cycle/charge.go` boundary | ✅ | ✅ **routed 2026-09-01** | ❌ every executor gate is false |
 | 2 | `cycle/overage.go` | ✅ | ✅ | ❌ every executor gate is false |
 | 3 | `cycle/domain_charges.go` | ✅ | ✅ | ❌ every executor gate is false |
-| 4 | `cycle/proration.go` | ✅ | ❌ | ❌ blocked — two §6 kinds, same decision as row 1 |
-| 5 | `creditpurchase/` | ✅ | ❌ | ❌ needs the disclosure binding, and the intent cannot yet carry the credit granted alongside the amount charged |
+| 4 | `cycle/proration.go` | ✅ | ✅ **routed 2026-09-01** | ❌ every executor gate is false |
+| 5 | `creditpurchase/` | ✅ | ❌ **owner decision** — it changes a SYNCHRONOUS customer contract | ❌ |
 | 6 | `autotopup/` | ✅ | ✅ | ❌ every executor gate is false |
-| 7 | `billing/unpaid.go` | ✅ | ❌ | ❌ **not a charge** — `InvoicePayParams{}` sends no amount; it re-settles an obligation the provider already holds, and the adapter has no operation that pays an existing invoice |
+| 7 | `billing/unpaid.go` | ✅ | ❌ **structurally impossible** | ❌ **not a charge** — `InvoicePayParams{}` sends no amount; it re-settles an obligation the provider already holds, and the adapter has no operation that pays an existing invoice |
 
 **Not one row is deletable today**, and only the middle column would have said
 so before this note existed.
 
+### Updated 2026-09-01: rows 1 and 4 are routed, and their blocker is answered
+
+Rows 1 and 4 said "blocked — FOUR §6 kinds" and "blocked — two §6 kinds". §12
+item 12 answered it: `module_capacity` and `custom_domain` fold into
+`platform_base`.
+
+- The **boundary** became TWO kinds — `module_usage` for the closed period's
+  arrears, `platform_base` for the next period — and two is what dissolved the
+  rounding objection. The three fee components are exact whole-cent multiples,
+  so folding them introduces no rounding, and the only sub-cent-fractional
+  terms (arrears and the wallet draw) now sit in the SAME intent. A group that
+  rounds once over the summed remainders takes exactly the cents the legacy
+  path takes.
+- **Combined proration** became ONE kind, so it needs no group at all.
+
+Both now propose. Every collecting leg does.
+
+🔴 **The middle column is now the load-bearing one, and rows 5 and 7 are the
+whole of step 3's remaining risk.** They are the only paths that will never be
+routed by writing more code:
+
+- **Row 5** returns `invoice.ClientSecret` synchronously to the browser
+  (`billing/credit.go:624-637`), and that secret exists only after the
+  finalize. A proposing version returns a response the browser cannot use.
+  Cutting it over changes a customer-facing contract, which is a product
+  decision.
+- **Row 7** links to a SOURCE INTENT that cannot exist until another leg is
+  routed AND enabled and leaves an unpaid intent behind.
+
+Deleting either collector does not strand a charge mid-flight. It makes that
+charge kind **uncollectable from then on**, silently. The precondition script
+cannot see this — it measures durable state, and every row here is already
+clear. `internal/architecture/drop_needs_replacement_test.go` asserts it from
+the code instead, and fails if `LegacyMoneyPaths` is ever set to 0 while either
+row is unrouted.
+
 ### What has to become true, in order
 
-1. **The boundary/proration kind decision** (`BOUNDARY-KIND-DECISION.md`).
-   Rows 1 and 4 cannot even PROPOSE until it is made, and they are the two
-   largest charges in the system.
+1. ~~**The boundary/proration kind decision**~~ ✅ **ANSWERED 2026-09-01** —
+   §12 item 12, fold into base. Rows 1 and 4 propose. What replaces it as the
+   first blocker is **row 5's synchronous-contract decision**, because the drop
+   is all-or-nothing (the executor refuses to start until the count is zero) and
+   row 5 cannot reach zero without it.
 2. **A standing authorization per account.** `billing_authorizations` measured
    0 on 2026-08-31, and INV-006 requires one per charge. Its shape is §12 item
    1, which is unanswered. An acceptance can no longer be a string a caller

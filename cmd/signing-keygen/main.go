@@ -92,9 +92,11 @@ To provision it:
      checked nothing. The id is DERIVED from the material, so NewTrustRoot
      refuses a key pinned under any other id.
 
-  3. Update TestTheRepositoryTrustRootIsEmptyUntilAKeyIsProvisioned, which
-     currently asserts the root is empty. It is the place that change is
-     declared.
+  3. Update TestTheRepositoryTrustRootPinsTheProvisionedKey and
+     TestThePinnedRootIsNotAnExportedVariable, which assert the EXACT number
+     of pinned keys. They are the place that change is declared, and the
+     count is what the Capabilities surface reports as evidence-signing
+     readiness — so a key arriving unnoticed is exactly what they prevent.
 
 Nothing was written. This command has no side effects.
 `, *domain, key.ID(), key.Public(), env, key.ID(), *domain, key.Public())

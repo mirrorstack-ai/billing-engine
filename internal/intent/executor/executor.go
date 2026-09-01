@@ -300,6 +300,15 @@ func (e *Executor) evaluate(ctx context.Context, digest string) (evaluated, erro
 		return evaluated{}, err
 	}
 
+	// What this authorization has already been used for, without which the
+	// period and frequency ceilings bound nothing — see store.PriorUseFor.
+	// The window is the grant's own effective start: the conservative
+	// reading, until §12 item 1 says what "the period" is.
+	prior, err := e.store.PriorUseFor(ctx, auth.ID(), auth.Grant().EffectiveFrom)
+	if err != nil {
+		return evaluated{}, err
+	}
+
 	env := e.env(ctx)
 	return evaluated{
 		sealed:  sealed,
@@ -313,6 +322,7 @@ func (e *Executor) evaluate(ctx context.Context, digest string) (evaluated, erro
 			Authorization:                auth,
 			Mode:                         e.authorityMode(auth),
 			StandingAcceptance:           acceptance,
+			PriorUse:                     prior,
 			Notice:                       noticeFor(sealed, notice),
 			Funding:                      funding,
 			PolicyDigestsMatch:           env.PolicyDigestsMatch,

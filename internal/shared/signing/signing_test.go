@@ -375,16 +375,39 @@ func TestMalformedKeyMaterialRefusesToLoad(t *testing.T) {
 // While it is empty: nothing verifies, no deployment signs, and any surface
 // claiming evidence readiness is claiming something untrue. When a key is
 // provisioned, this test is the place the change is declared.
-func TestTheRepositoryTrustRootIsEmptyUntilAKeyIsProvisioned(t *testing.T) {
+func TestTheRepositoryTrustRootPinsTheProvisionedKey(t *testing.T) {
 	root, err := Repository()
 	if err != nil {
 		t.Fatalf("the pinned trust root does not build: %v", err)
 	}
-	if n := root.Len(); n != 0 {
-		t.Fatalf("the pinned trust root has %d keys. If a key has been "+
-			"provisioned, update this test to say so and state which "+
-			"environment holds the private half — the count is what the "+
-			"Capabilities surface reports as evidence-signing readiness.", n)
+	if n := root.Len(); n != 1 {
+		t.Fatalf("the pinned trust root has %d keys, want the 1 provisioned for "+
+			"billing evidence. The count is what the Capabilities surface reports "+
+			"as evidence-signing readiness, so it must not drift silently.", n)
+	}
+
+	// The key must be for the domain it claims. A key pinned under the wrong
+	// domain verifies documents it was never meant to — the "one key for two
+	// domains" failure the Load path refuses at the other end.
+	if _, ok := root.PublicKey("7cd37ff8ba25c9d79445918a5eab5d17", DomainBillingEvidence); !ok {
+		t.Fatal("the provisioned billing-evidence key is not in the root under its own domain")
+	}
+	if _, ok := root.PublicKey("7cd37ff8ba25c9d79445918a5eab5d17", DomainCustomerAcceptance); ok {
+		t.Fatal("the billing-evidence key resolves under the customer-acceptance domain too; " +
+			"one key must not verify two domains")
+	}
+
+	// 🔴 Pinning the PUBLIC half is not provisioning the PRIVATE one. Load
+	// reads seed material from the environment and finds none here, so this
+	// build can verify a signature and cannot produce one. Asserting it keeps
+	// the two readinesses from being conflated by a later edit.
+	signer, err := Load(func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load with no environment must not error: %v", err)
+	}
+	if signer.CanSign(DomainBillingEvidence) {
+		t.Fatal("a signer materialised with no seed in the environment; pinning a public " +
+			"key must not confer the ability to sign")
 	}
 }
 
@@ -728,9 +751,14 @@ func TestKeyMaterialNeverReachesAFormattedString(t *testing.T) {
 // append to it and every later Repository() would honour the addition, which
 // is the failure the pinning rule exists to prevent.
 func TestThePinnedRootIsNotAnExportedVariable(t *testing.T) {
-	if PinnedKeyCount() != 0 {
-		t.Fatalf("the pinned root holds %d keys; if one has been provisioned, say so here "+
-			"and in TestTheRepositoryTrustRootIsEmptyUntilAKeyIsProvisioned", PinnedKeyCount())
+	// One key, for the billing-evidence domain, provisioned 2026-09-01. The
+	// count is what the Capabilities surface reports as evidence-signing
+	// readiness, so it is asserted exactly rather than as "at least one" — a
+	// key arriving unnoticed is the thing a pinned root exists to prevent.
+	if PinnedKeyCount() != 1 {
+		t.Fatalf("the pinned root holds %d keys, want 1. Adding or removing one is a "+
+			"deliberate edit to trustroot.go with a diff attached; say so here and in "+
+			"TestTheRepositoryTrustRootPinsTheProvisionedKey", PinnedKeyCount())
 	}
 	// The compile-time half of this test is that `signing.PinnedKeys` does
 	// not exist to be assigned from outside the package. It is unexported,
