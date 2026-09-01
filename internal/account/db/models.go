@@ -455,6 +455,22 @@ type MsBillingAppModuleOverageTimer struct {
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 }
 
+type MsBillingAuthorizationAcceptance struct {
+	ID               string             `json:"id"`
+	AuthorizationID  string             `json:"authorization_id"`
+	DisclosureDigest string             `json:"disclosure_digest"`
+	PayerKind        string             `json:"payer_kind"`
+	PayerID          string             `json:"payer_id"`
+	Nonce            string             `json:"nonce"`
+	Audience         string             `json:"audience"`
+	ReplayIdentity   string             `json:"replay_identity"`
+	IssuedAt         time.Time          `json:"issued_at"`
+	ExpiresAt        time.Time          `json:"expires_at"`
+	AcceptedAt       pgtype.Timestamptz `json:"accepted_at"`
+	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+	RecordedAt       time.Time          `json:"recorded_at"`
+}
+
 type MsBillingBillingAuthorization struct {
 	ID                     string             `json:"id"`
 	Scope                  string             `json:"scope"`
@@ -493,10 +509,11 @@ type MsBillingBillingPeriod struct {
 }
 
 type MsBillingBillingRun struct {
-	ID                            string         `json:"id"`
-	AccountID                     string         `json:"account_id"`
-	PeriodStart                   time.Time      `json:"period_start"`
-	PeriodEnd                     time.Time      `json:"period_end"`
+	ID          string    `json:"id"`
+	AccountID   string    `json:"account_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	// Terminal outcome of one boundary run. 'proposed' means the intent cutover was armed: the amounts were sealed as intents and no money moved, which is neither invoiced nor failed.
 	Status                        string         `json:"status"`
 	StripeInvoiceID               pgtype.Text    `json:"stripe_invoice_id"`
 	TotalAmount                   pgtype.Numeric `json:"total_amount"`
@@ -532,27 +549,33 @@ type MsBillingBudgetAlert struct {
 
 type MsBillingChargeIntent struct {
 	// Identity of the exact sealed document, over the canonical encoding in internal/intent/canonical.go. Also what a disclosure is bound to and what an acceptance receipt references.
-	Digest            string      `json:"digest"`
-	PayerKind         string      `json:"payer_kind"`
-	PayerID           string      `json:"payer_id"`
-	Currency          string      `json:"currency"`
-	Kind              string      `json:"kind"`
-	PriceBookRevision string      `json:"price_book_revision"`
-	TermsRevision     string      `json:"terms_revision"`
-	NoticePolicy      string      `json:"notice_policy"`
-	TaxJurisdiction   string      `json:"tax_jurisdiction"`
-	TaxRuleRevision   string      `json:"tax_rule_revision"`
-	TaxAmountMicros   int64       `json:"tax_amount_micros"`
-	SubtotalMicros    int64       `json:"subtotal_micros"`
-	TotalMicros       int64       `json:"total_micros"`
-	AuthorizationID   string      `json:"authorization_id"`
-	ExecuteNotBefore  time.Time   `json:"execute_not_before"`
-	ExecuteNotAfter   time.Time   `json:"execute_not_after"`
-	SupersedesDigest  pgtype.Text `json:"supersedes_digest"`
-	State             string      `json:"state"`
-	CreatedAt         time.Time   `json:"created_at"`
-	StateChangedAt    time.Time   `json:"state_changed_at"`
-	ReservedMicros    int64       `json:"reserved_micros"`
+	Digest                  string      `json:"digest"`
+	PayerKind               string      `json:"payer_kind"`
+	PayerID                 string      `json:"payer_id"`
+	Currency                string      `json:"currency"`
+	Kind                    string      `json:"kind"`
+	PriceBookRevision       string      `json:"price_book_revision"`
+	TermsRevision           string      `json:"terms_revision"`
+	NoticePolicy            string      `json:"notice_policy"`
+	TaxJurisdiction         string      `json:"tax_jurisdiction"`
+	TaxRuleRevision         string      `json:"tax_rule_revision"`
+	TaxAmountMicros         int64       `json:"tax_amount_micros"`
+	SubtotalMicros          int64       `json:"subtotal_micros"`
+	TotalMicros             int64       `json:"total_micros"`
+	AuthorizationID         string      `json:"authorization_id"`
+	ExecuteNotBefore        time.Time   `json:"execute_not_before"`
+	ExecuteNotAfter         time.Time   `json:"execute_not_after"`
+	SupersedesDigest        pgtype.Text `json:"supersedes_digest"`
+	State                   string      `json:"state"`
+	CreatedAt               time.Time   `json:"created_at"`
+	StateChangedAt          time.Time   `json:"state_changed_at"`
+	ReservedMicros          int64       `json:"reserved_micros"`
+	TaxVerification         string      `json:"tax_verification"`
+	WalletAllocationMicros  int64       `json:"wallet_allocation_micros"`
+	ProviderRemainderMicros int64       `json:"provider_remainder_micros"`
+	SelectedRail            string      `json:"selected_rail"`
+	RoutingPolicyRevision   string      `json:"routing_policy_revision"`
+	CollectsDigest          pgtype.Text `json:"collects_digest"`
 }
 
 type MsBillingChargeIntentLine struct {
@@ -625,6 +648,28 @@ type MsBillingDeveloperSettlement struct {
 	DeveloperOwedMicros int64                     `json:"developer_owed_micros"`
 	Status              string                    `json:"status"`
 	CreatedAt           time.Time                 `json:"created_at"`
+}
+
+type MsBillingEvidenceRecord struct {
+	Checkpoint      int64       `json:"checkpoint"`
+	Kind            string      `json:"kind"`
+	SubjectKind     string      `json:"subject_kind"`
+	SubjectID       string      `json:"subject_id"`
+	IntentDigest    pgtype.Text `json:"intent_digest"`
+	Detail          string      `json:"detail"`
+	OccurredAt      time.Time   `json:"occurred_at"`
+	PayloadDigest   []byte      `json:"payload_digest"`
+	Signature       string      `json:"signature"`
+	KeyID           string      `json:"key_id"`
+	SignedNotBefore time.Time   `json:"signed_not_before"`
+	SignedNotAfter  time.Time   `json:"signed_not_after"`
+	RecordedAt      time.Time   `json:"recorded_at"`
+}
+
+type MsBillingIntentGroup struct {
+	IntentDigest string    `json:"intent_digest"`
+	GroupID      string    `json:"group_id"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type MsBillingIntentReceivableLink struct {

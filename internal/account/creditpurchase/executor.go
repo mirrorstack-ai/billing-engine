@@ -4,17 +4,47 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	stripego "github.com/stripe/stripe-go/v85"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 type Executor struct {
-	store   Store
-	settler Settler
-	stripe  StripeClient
+	store    Store
+	settler  Settler
+	stripe   StripeClient
+	proposer chargeProposer
+	nowFn    func() time.Time
+}
+
+// now is the executor's clock, injectable so a test does not depend on the
+// wall clock for an execution window it asserts on.
+func (e *Executor) now() time.Time {
+	if e.nowFn != nil {
+		return e.nowFn().UTC()
+	}
+	return time.Now().UTC()
+}
+
+// WithNow replaces the clock. Test-only in practice; production takes the
+// default.
+func (e *Executor) WithNow(fn func() time.Time) *Executor {
+	e.nowFn = fn
+	return e
+}
+
+// chargeProposer is the narrow seam this leg proposes through.
+//
+// Declared here rather than imported so this package does not depend on the
+// intent packages when no proposer is installed — the same shape the cycle
+// legs use (cycle/service.go:197-205).
+type chargeProposer interface {
+	Propose(ctx context.Context, c proposer.Charge) (intent.ChargeIntent, error)
 }
 
 func NewExecutor(store Store, settler Settler, stripe StripeClient) *Executor {
@@ -23,6 +53,30 @@ func NewExecutor(store Store, settler Settler, stripe StripeClient) *Executor {
 	}
 	return &Executor{store: store, settler: settler, stripe: stripe}
 }
+
+// WithIntentProposer cuts this leg over to the intent path.
+//
+// 🔴 ARMING THIS CHANGES A CUSTOMER-FACING CONTRACT, which is why it is the
+// last leg to be routed and why it took an owner decision rather than an
+// engineering one.
+//
+// The other five legs run in background workers: a proposal replaces a charge
+// nobody was waiting on. This one is synchronous. StartCreditPurchase returns
+// a Stripe client_secret that exists only after the invoice is finalized
+// (billing/credit.go:624-637), and a proposing version has no invoice and
+// therefore no secret. The browser must poll the purchase instead.
+//
+// So an armed deployment must have a browser that can handle the async shape.
+// Arming it against the old front end leaves a customer on a page waiting for
+// a secret that will never arrive.
+func (e *Executor) WithIntentProposer(p chargeProposer) *Executor {
+	e.proposer = p
+	return e
+}
+
+// IntentProposerArmed reports whether the seam is attached, so a deployment
+// test can prove the wiring rather than a comment asserting it.
+func (e *Executor) IntentProposerArmed() bool { return e.proposer != nil }
 
 // Resume drives a fresh or already-authorized foreground purchase. The durable
 // attempt is the sole payer authority; caller-supplied customer state is never
@@ -41,6 +95,17 @@ func (e *Executor) Resume(ctx context.Context, supplied Attempt) (Result, error)
 	if attempt.Status == "settled" {
 		return Result{Attempt: attempt}, nil
 	}
+	// Terminal for the legacy rail. The intent rail has taken this attempt and
+	// holds a sealed obligation for it; resuming here would raise a second
+	// invoice beside that document and collect twice.
+	//
+	// A soft return rather than an error, matching the auto-top-up leg
+	// (autotopup/executor.go:417-418). An error here would 500 two reachable
+	// callers — FinishCreditPurchase, and the idempotent StartCreditPurchase
+	// replay — for a state that is correct.
+	if attempt.Status == "proposed" {
+		return Result{Attempt: attempt}, nil
+	}
 	if attempt.Status != "pending" && attempt.Status != "failed" {
 		return Result{}, fmt.Errorf(
 			"manual credit purchase %s has unsupported status %q",
@@ -50,6 +115,22 @@ func (e *Executor) Resume(ctx context.Context, supplied Attempt) (Result, error)
 	}
 	if attempt.StripeInvoiceID == "" && attempt.Status == "failed" {
 		return Result{Attempt: attempt}, nil
+	}
+
+	// 🔴 THE CUTOVER BRANCH, before any Stripe object is created.
+	//
+	// Unlike the cycle legs there is no durable arming claim to sit after:
+	// this leg's claim IS the pending ledger row, taken when the purchase was
+	// inserted, and MarkProposed moves that same row under a pending-only
+	// predicate. So the branch belongs here — after the recovery guard above,
+	// which is what keeps an attempt that already reached Stripe on the legacy
+	// path.
+	//
+	// A purchase carrying a StripeInvoiceID has an invoice at the provider and
+	// must be FINISHED there. Abandoning it would strand a charge the customer
+	// can see and nobody can prove.
+	if e.proposer != nil && attempt.StripeInvoiceID == "" {
+		return e.proposePurchase(ctx, attempt)
 	}
 
 	invoice, attempt, err := e.recoverOrCreateInvoice(ctx, attempt)
@@ -878,4 +959,81 @@ func validateUnpaidInvoiceResource(
 
 func microsToCentsRoundHalfUp(micros int64) int64 {
 	return (micros + microsPerCent/2) / microsPerCent
+}
+
+// proposePurchase seals this purchase as an intent instead of collecting it.
+//
+// 🔴 IT MOVES NO MONEY, and unlike every other leg the customer is WAITING.
+// The caller's response carries no client secret because no invoice exists, so
+// the browser has to poll the purchase until something settles it.
+//
+// The order is: seal first, then mark. A mark written before the seal would
+// claim an intent that does not exist, and the paired CHECK on
+// proposed_reference means such a row could not even be written — it would
+// fail in the database rather than in code that can explain it.
+func (e *Executor) proposePurchase(ctx context.Context, attempt Attempt) (Result, error) {
+	sealed, err := e.proposer.Propose(ctx, proposer.Charge{
+		// The proposer resolves this to the account's FUNDER's owner. A leg
+		// that built an intent.Subject here is how the payer and the
+		// executor's resolver came to disagree.
+		AccountID: attempt.AccountID.String(),
+		Kind:      intent.KindCreditPurchase,
+		Currency:  purchaseCurrency,
+		Lines: proposer.SingleLine(
+			"MirrorStack credit purchase",
+			"credit-purchase:"+attempt.ID.String(),
+			attempt.AmountMicros,
+		),
+
+		// 🔴 walletFunding = 0. §6 is explicit that buying credit is not a
+		// service you consumed, and a purchase funded from the wallet it is
+		// topping up is circular: it would spend the balance to increase it,
+		// and the taxable basis would move with a funding choice. The whole
+		// obligation is the provider's to collect.
+		WalletAllocationMicros: 0,
+
+		AuthorizationID:   "credit-purchase:" + attempt.ID.String(),
+		TermsRevision:     proposedTermsRevision,
+		PriceBookRevision: proposedPriceBookRevision,
+		NoticePolicy:      proposedNoticePolicy,
+		SelectedRail:      proposedRail,
+
+		RoutingPolicyRevision: proposedRoutingPolicy,
+		// Zero tax, resolved — the same honest state the other legs record.
+		// This leg has never applied tax; claiming an unresolved determination
+		// would quarantine every purchase and claiming a computed one would
+		// invent a figure.
+		Tax: intent.TaxDetermination{
+			Resolved:     true,
+			Jurisdiction: "not-applicable",
+			RuleRevision: proposedTaxRuleRevision,
+			Verification: intent.TaxNotApplicable,
+		},
+		// The window a collection may happen in. A customer-present purchase
+		// is expected to collect promptly, but the window is deliberately
+		// generous: an intent that expires before anything can execute it is
+		// dead on arrival, which is the defect two earlier legs shipped with.
+		ExecuteNotBefore: e.now(),
+		ExecuteNotAfter:  e.now().AddDate(0, 0, 7),
+	})
+	if err != nil {
+		return Result{Attempt: attempt}, fmt.Errorf("propose credit purchase intent: %w", err)
+	}
+
+	// Prefixed per migration 057, "so nothing downstream can read a digest as
+	// a provider object id".
+	moved, err := e.store.MarkProposed(ctx, attempt, "intent:"+sealed.Digest())
+	if err != nil {
+		return Result{Attempt: attempt}, fmt.Errorf("mark credit purchase proposed: %w", err)
+	}
+	if !moved {
+		// Another worker moved the row first. The intent is sealed and stored
+		// either way — Propose is idempotent on the digest — so this is a lost
+		// race rather than a fault, and the caller re-reads the winner.
+		return Result{Attempt: attempt}, nil
+	}
+
+	attempt.Status = "proposed"
+	attempt.ProposedReference = "intent:" + sealed.Digest()
+	return Result{Attempt: attempt}, nil
 }
