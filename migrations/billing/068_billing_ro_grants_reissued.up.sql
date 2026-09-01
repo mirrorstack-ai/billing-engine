@@ -16,7 +16,7 @@
 --     ELSE
 --         RAISE NOTICE '... skipping GRANT to billing_ro (role does not exist)';
 --
--- and nothing creates billing_ro: there is no CREATE ROLE in any migration in
+-- and nothing created billing_ro: there was no CREATE ROLE in any migration in
 -- this repository, and roles are minted by db-bootstrap from config.DbServices,
 -- which lives in mirrorstack-infra. So in production 058 took the ELSE branch,
 -- raised a NOTICE, exited 0, and was recorded as APPLIED.
@@ -53,9 +53,30 @@
 -- intended behaviour, not an inconvenience to be gated away.
 DO $$
 BEGIN
+    -- 🔴 CREATE IT IF ABSENT, rather than raising or skipping.
+    --
+    -- Both alternatives were wrong. SKIPPING is what 058 did: gated on the
+    -- role existing, it took the ELSE branch, raised a NOTICE, exited 0, and
+    -- was recorded as APPLIED having granted nothing — and a migration is
+    -- applied once, so it can never repair itself. RAISING fixes that but
+    -- moves the cost: this file runs inside a multi-repo deploy, and a
+    -- migration that halts it strands every other repo's rollout on an
+    -- ordering nothing enforces. db-bootstrap is invoked by a Makefile target,
+    -- not by any workflow, so "infra runs first" is a convention rather than a
+    -- guarantee — which is precisely how 058 came to skip.
+    --
+    -- So 068 does not depend on that ordering at all. The role is a privilege
+    -- bundle; creating it is idempotent, and infra's ensureReadOnlyRole is
+    -- equally idempotent when it runs afterwards. LOGIN with no password
+    -- matches what db-bootstrap creates and cannot authenticate on its own:
+    -- connecting requires the rds_iam grant, which stays infra's to give.
+    --
+    -- The division "infra owns identities, migrations own privileges" is still
+    -- right about ownership. It is not a reason to leave a deploy hostage to an
+    -- unordered step.
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'billing_ro') THEN
-        RAISE EXCEPTION
-            'migration 068: the role billing_ro does not exist. It is minted by db-bootstrap from mirrorstack-infra''s config.DbServices, which must run FIRST. Refusing to skip: migration 058 skipped this same work, was recorded as applied, and can never re-run — which is why this migration exists.';
+        RAISE NOTICE 'migration 068: creating role billing_ro (db-bootstrap has not run here yet); it grants rds_iam separately and idempotently';
+        CREATE ROLE billing_ro LOGIN;
     END IF;
 
     -- 058's body, verbatim. Idempotent, so re-issuing is safe where 058 did
