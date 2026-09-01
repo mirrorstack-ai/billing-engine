@@ -202,6 +202,15 @@ func (s *Service) WithNow(now func() time.Time) *Service {
 // a database.
 type chargeProposer interface {
 	Propose(ctx context.Context, c proposer.Charge) (intent.ChargeIntent, error)
+	// ProposeGroup seals several charges that must settle on ONE invoice.
+	//
+	// The period boundary needs it and the other legs do not: a boundary is
+	// two charge kinds — the closed period's usage arrears and the next
+	// period's subscription — and an intent carries one kind, because the
+	// kind selects which rule of a standing authorization applies. Proposing
+	// them separately would let the executor collect them as two invoices
+	// with two roundings, which is not what the legacy path takes.
+	ProposeGroup(ctx context.Context, charges []proposer.Charge) ([]intent.ChargeIntent, error)
 }
 
 // WithIntentProposer cuts this service's charge legs over to the intent

@@ -220,10 +220,32 @@ func TestAnAmbiguousResultRetainsTheClaimAndRecordsNothing(t *testing.T) {
 	require.Nil(t, outcome, "an outcome was recorded that nobody established")
 
 	// And nothing else can now attempt it.
+	//
+	// It is refused BEFORE the claim: the unresolved attempt is prior use, so
+	// the predicate says no (prior_attempt_unresolved) and nothing reaches the
+	// provider. Two independent things would each have stopped it — that
+	// refusal and the settlement claim — and this asserts the STRONGER one
+	// plus the property that actually matters, that no second request was
+	// sent. Asserting ErrAlreadyClaimed here would be asserting the weaker of
+	// them, and it stopped being what happens on 2026-09-01, when PriorUse
+	// was finally populated and RefusalAttemptUnresolved became reachable.
+	// ErrAlreadyClaimed itself stays covered by
+	// TestConcurrentExecutorsCollectExactlyOnce and the store's own suite.
 	second := &recordingCollector{result: CollectResult{Succeeded: true}}
-	_, err = newExecutor(t, s, second, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
-	require.ErrorIs(t, err, ErrAlreadyClaimed)
+	out2, err := newExecutor(t, s, second, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
+	require.NoError(t, err)
+	require.False(t, out2.Permitted, "a second attempt was permitted while the first is unresolved")
+	require.False(t, out2.Settled, "an intent whose first attempt is unresolved settled again")
 	require.Zero(t, second.count(), "a second attempt reached the provider after an ambiguous first")
+
+	// The reason, not just the refusal: the clause has several, and this must
+	// be the one that knows an attempt may already have taken the money.
+	auth, err := s.LoadAuthorization(ctx, sealed.AuthorizationID())
+	require.NoError(t, err)
+	prior, err := s.PriorUseFor(ctx, auth.ID(), auth.Grant().EffectiveFrom)
+	require.NoError(t, err)
+	require.Equal(t, 1, prior.Unresolved, "the in-flight claim was not seen as unresolved prior use")
+	require.Contains(t, auth.Permits(sealed, evalNow, prior).Refusals, intent.RefusalAttemptUnresolved)
 }
 
 // A transport error is ambiguous for the same reason: the request may
