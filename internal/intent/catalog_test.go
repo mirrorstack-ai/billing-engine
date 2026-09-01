@@ -41,6 +41,12 @@ func TestSealRefusesAKindOutsideTheCatalog(t *testing.T) {
 		"subscription.increase",
 		"platform_base_v2", // near-miss on a real one
 		"PLATFORM_BASE",    // case is not a spelling
+		// Folded into platform_base by §12 item 12. They were in the
+		// catalog until 2026-09-01, so without these two rows the
+		// narrowing is asserted by nothing and re-adding either constant
+		// passes silently.
+		"module_capacity",
+		"custom_domain",
 	} {
 		t.Run(string(invented), func(t *testing.T) {
 			_, err := Seal(catalogDraft(invented))
@@ -56,8 +62,8 @@ func TestSealRefusesAKindOutsideTheCatalog(t *testing.T) {
 // test above while making the catalog unusable.
 func TestEveryCatalogKindSeals(t *testing.T) {
 	kinds := CatalogKinds()
-	if len(kinds) != 9 {
-		t.Fatalf("catalog has %d kinds, want the 9 §6 lists", len(kinds))
+	if len(kinds) != 7 {
+		t.Fatalf("catalog has %d kinds, want the 7 §6 lists after the item 12 fold", len(kinds))
 	}
 	for _, k := range kinds {
 		if _, err := Seal(catalogDraft(k)); err != nil {
@@ -67,22 +73,25 @@ func TestEveryCatalogKindSeals(t *testing.T) {
 }
 
 // The two shipped legs must use the names §6 gives them, not near-misses.
+//
+// Both legs proposed a kind of their own until §12 item 12 folded capacity and
+// domains into the base price. The premise outlives the fold — a leg seals a
+// name §6 lists, never one invented at the call site — so this is retargeted
+// rather than deleted, and it is now also the pin that both legs land on the
+// SAME kind.
 func TestTheShippedLegsUseTheCatalogNames(t *testing.T) {
 	for _, tc := range []struct {
 		leg  string
 		kind ChargeKind
 	}{
-		{"custom domain", KindCustomDomain},
-		{"module overage", KindModuleCapacity},
+		{"custom domain", KindPlatformBase},
+		{"module overage", KindPlatformBase},
 	} {
 		if !KindInCatalog(tc.kind) {
 			t.Fatalf("the %s leg's kind %q is not in the catalog", tc.leg, tc.kind)
 		}
 	}
-	if KindCustomDomain != "custom_domain" {
-		t.Fatalf("KindCustomDomain = %q, but §6 names it custom_domain", KindCustomDomain)
-	}
-	if KindModuleCapacity != "module_capacity" {
-		t.Fatalf("KindModuleCapacity = %q, but §6 names it module_capacity", KindModuleCapacity)
+	if KindPlatformBase != "platform_base" {
+		t.Fatalf("KindPlatformBase = %q, but §6 names it platform_base", KindPlatformBase)
 	}
 }

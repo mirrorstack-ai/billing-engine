@@ -26,9 +26,15 @@ import (
 //
 // # The problem it solves
 //
-// The period-boundary invoice is FOUR of §6's charge kinds (module_usage,
-// platform_base, module_capacity, custom_domain) and combined proration is
-// two. A ChargeIntent carries ONE Kind, and migration 054's header says why
+// The period-boundary invoice is TWO of §6's charge kinds — module_usage for
+// the closed period's arrears and platform_base for the next period's
+// subscription — since §12 item 12 folded module_capacity and custom_domain
+// into the base price. It was four before that fold, and the reason a group is
+// needed did not change with the count: a boundary still spans more than one
+// kind, because arrears and the forward subscription are different kinds no
+// matter how the forward half is composed.
+//
+// A ChargeIntent carries ONE Kind, and migration 054's header says why
 // that matters: "it selects which rule of a standing authorization applies: a
 // caller that chose it could pick the permission its charge happens to fit."
 // So one intent for the whole invoice weakens the authorization control.
