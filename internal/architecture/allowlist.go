@@ -112,6 +112,18 @@ var allowedProviderMutations = map[string]string{
 	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect FinalizeInvoiceWithoutAutoAdvance": "INTENT: finalizes WITHOUT handing the invoice to automatic collection, so the pay below stays the single money-moving step with an answer this code receives",
 	"internal/provider/stripeadapter/adapter.go (*Adapter).Collect PayInvoiceWithMethod":              "INTENT COLLECT: the one money-moving step of the intent path. Keyed and against a named instrument, unlike the legacy unkeyed Invoices.Pay, so a retry after an ambiguous answer cannot be a second charge. Reachable only through the executor, which reaches it only on a permitting verdict",
 
+	// The GROUP path, which settles several sealed intents onto one invoice.
+	// Same four steps, same exclusion, and the exclusion rests on the same
+	// property: stripeadapter is reachable only through the executor.
+	//
+	// It exists because the period-boundary invoice is four §6 charge kinds
+	// and an intent carries one — see BOUNDARY-KIND-DECISION.md, which is an
+	// OPEN decision. Nothing calls CollectGroup yet.
+	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup CreateDraftInvoice":                "INTENT: the inert draft for a group of sealed intents",
+	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup CreateInvoiceItem":                 "INTENT: one line per sealed line across the group, apportioned from ONE rounding over the summed remainders",
+	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup FinalizeInvoiceWithoutAutoAdvance": "INTENT: finalizes WITHOUT automatic collection, so the pay below stays the single money-moving step with an answer this code receives",
+	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup PayInvoiceWithMethod":              "INTENT COLLECT: the one money-moving step for a group. Keyed on the sorted SET of the group's digests, so the same intents in any order are one charge and a retry is the same request",
+
 	// --- test support that is not a _test.go file ---
 	"internal/account/webhook/webhooktest/auto_topup_probe.go (*AutoTopUpChargeProbe).TriggerAutoTopUp PayInvoiceWithMethod": "a probe used by tests to detect whether a path reached the charge; it lives outside _test.go so other packages can use it",
 }
