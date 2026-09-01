@@ -222,10 +222,20 @@ type fakeStore struct {
 	// errPersistAfterStripe fails ChargeProrationLocked's persist phase (Phase 3)
 	// AFTER the charge callback's Stripe calls already succeeded — modeling a
 	// combined-invoice charge whose guard/timer marks fail to commit (deadlock /
-	// transient tx error) even though Stripe already moved the money.
+	// transient tx error) even though Stripe already moved the money. Since the
+	// cutover the only callback that still returns a charge to persist is the
+	// ADOPTION of a crashed legacy attempt's finalized invoice; a proposing
+	// attempt's equivalent failure is errMarkProposed.
 	errPersistAfterStripe error
-	errFreezeCharge       error // FreezeBillingRunCharge
-	errFrozenCharge       error // BillingRunFrozenCharge
+	// errMarkProposed fails MarkCombinedProrationProposed — the terminal stamp a
+	// SEALED combined proration takes where the deleted invoice took its persist
+	// phase. It is the post-cutover shape of the same failure: the charge
+	// artifact EXISTS (the intent is sealed) and the write that resolves the
+	// attempt + arms the guard does not commit. That is the window in which Leg 1
+	// could bill the same co-created over-modules a second time.
+	errMarkProposed error
+	errFreezeCharge error // FreezeBillingRunCharge
+	errFrozenCharge error // BillingRunFrozenCharge
 
 	errLiveTimerCount          error // LiveModuleTimerCountForApp
 	errInsertTimers            error // InsertModuleOverageTimers
@@ -760,6 +770,9 @@ func (f *fakeStore) UpsertInvoice(_ context.Context, inv cycle.InvoiceMirror) er
 func (f *fakeStore) MarkCombinedProrationProposed(
 	_ context.Context, appID uuid.UUID, at time.Time, ref string,
 ) error {
+	if f.errMarkProposed != nil {
+		return f.errMarkProposed
+	}
 	if ref == "" {
 		return errors.New("fake store: a proposed proration needs its intent reference")
 	}

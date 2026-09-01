@@ -21,13 +21,26 @@ package cycle
 //         install always gets the latest installed_at, so an existing row's rank
 //         can only improve over→included, never included→over) makes this a
 //         PERMANENT verdict — the row is never re-evaluated.
-//       * over → charge ModuleOverageFeeMicros ($1, the amortized per-module
+//       * over → price ModuleOverageFeeMicros ($1, the amortized per-module
 //         stub rate — one-time legs never price in blocks) prorated from the install's
 //         UTC day to the install period's end (install-anchored — the correction
 //         vs. the prior account-wide attempt, which anchored to grace-elapse),
-//         via a per-timer Stripe invoice with deterministic idem keys derived
-//         from the timer id, then stamp grace_charged_at / grace_resolved and the
-//         GENUINE Stripe ids.
+//         SEAL it as a charge intent, and stamp grace_charged_at /
+//         grace_resolved with the intent digest.
+//
+// 🔴 This leg no longer collects. The per-timer draft → pinned item →
+// finalize invoice it used to mint is DELETED: the derived amount is sealed
+// into an intent and something else decides whether to collect it. Two paths
+// out of this file can still reach the provider, and neither is a fresh
+// charge:
+//
+//   - recoverModuleOverageCharge, which finishes an invoice a LEGACY run
+//     already left at the provider. Abandoning one would strand a charge the
+//     customer can see and nobody can finish or prove, so it stays until no
+//     row carries an unresolved charge_attempted_at marker.
+//   - proration.go's combined creation invoice, which pins a co-created
+//     timer's overage line itself. That is the creation leg's collector, not
+//     this one's, and this file only DEFERS to it.
 //
 // The boundary per-module overage precharge for ongoing modules (scenario 6) and
 // the combined creation-invoice overage line (scenario 3) are Stage B follow-ups.
@@ -474,68 +487,15 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 	// already settled, possibly by the wallet rail, and charging beside
 	// a wallet debit is a double charge. A cut-over leg keeps that
 	// guard because it proposes AFTER the claim, not instead of it.
-	if s.proposer != nil {
-		return s.proposeModuleOverage(ctx, cand, res, proratedMicros, coverageStart, coverageEnd, at)
-	}
-
-	// Charge via a per-timer draft→pinned-item→finalize flow with deterministic
-	// idem keys derived from the timer id (the stable charge identity — each
-	// install charges at most once, the grace_resolved guard), so a crash-retry
-	// reuses the SAME Stripe objects. The item is PINNED to this timer's own
-	// draft (C2 — a floating pending item could be swept onto another leg's
-	// invoice); only the finalize step moves money.
-	desc := fmt.Sprintf("MirrorStack module overage (prorated) — %s", appLineLabel(app.Name, cand.AppID))
-	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, moduleOverageChargeRef(cand.ID), moduleOverageInvoiceIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("module overage draft invoice failed", err)
-	}
-	linePeriod := billingstripe.LinePeriod{Start: coverageStart, End: coverageEnd}
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, linePeriod, moduleOverageItemIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("module overage invoice item failed", err)
-	}
-	inv, err := s.stripe.FinalizeInvoice(ctx, draft.ID, moduleOverageFinalizeIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("module overage invoice finalize failed", err)
-	}
-
-	// Resolve the large-charge disclosure threshold AT CHARGE TIME, immediately
-	// after Stripe confirms (scenario 5 / migration 034) — the SAME resolution
-	// point every off-session charge site uses.
-	acct, err := s.store.AccountCollection(ctx, cand.AccountID)
-	if err != nil {
-		return nil, billing.Internal("account collection lookup failed", err)
-	}
-
-	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:               cand.AccountID,
-		ChargeFundingAccountID:  claim.FundingAccountID,
-		ChargeFundingGeneration: claim.FundingGeneration,
-		StripeInvoiceID:         inv.ID,
-		Status:                  inv.Status,
-		AmountDueCents:          inv.AmountDue,
-		AmountPaidCents:         inv.AmountPaid,
-		Currency:                chargeCurrency,
-		// The coverage window the shape priced — [install day, coverage end) in
-		// the normal case; narrowed to the straddled period alone under the D1d
-		// straddle rule — so the mirrored window and the charged amount agree by
-		// construction.
-		PeriodStart:        coverageStart,
-		PeriodEnd:          coverageEnd,
-		IsLargeAutoCollect: flagLargeAutoCollect(proratedMicros, acct),
-	}); err != nil {
-		return nil, billing.Internal("invoice mirror upsert failed", err)
-	}
-
-	// Stamp the terminal "over and charged" verdict with the GENUINE Stripe ids
-	// (item.ID — never the idempotency-key string).
-	if err := s.store.MarkModuleTimerCharged(ctx, cand.ID, at.UTC(), inv.ID, item.ID); err != nil {
-		return nil, billing.Internal("mark module timer charged failed", err)
-	}
-
-	res.Status = ModuleOverageCharged
-	res.StripeInvoiceID = inv.ID
-	return res, nil
+	//
+	// There is no longer a branch here. The legacy
+	// draft -> pinned item -> finalize collector that used to follow is
+	// DELETED, so sealing the intent is the only thing this leg can do
+	// with the amount it derived; nothing below this line can move
+	// money. The single remaining path in this file that may still
+	// reach the provider is recoverModuleOverageCharge above, and it
+	// only ever finishes a charge a LEGACY run already put there.
+	return s.proposeModuleOverage(ctx, cand, res, proratedMicros, coverageStart, coverageEnd, at)
 }
 
 // chargeModuleOverageFromWallet is ChargeModuleOverage's credit-mode leg
@@ -646,12 +606,6 @@ func (s *Service) SweepModuleOverage(ctx context.Context, at time.Time) (*SweepM
 	return res, nil
 }
 
-// moduleOverageItemIdemKey / moduleOverageInvoiceIdemKey build the deterministic
-// per-timer Stripe Idempotency-Keys for the Leg 1 overage charge. The timer id is
-// the stable charge identity (each install charges at most once — the
-// grace_resolved guard), so a re-attempt (a retried sweep after a crash between
-// the Stripe call and the mark) reuses the SAME Stripe objects and can never
-// double-charge even before the row is marked resolved.
 // recoverModuleOverageCharge is the H5/H9 recovery path for a candidate whose
 // charge_attempted_at marker is set: look the timer's invoice up on Stripe by
 // its ms_charge_ref anchor and finish whatever the crashed attempt left —
@@ -781,12 +735,18 @@ func (s *Service) recoverModuleOverageCharge(ctx context.Context, cand ModuleOve
 // one timer's Leg-1 invoice — what FindInvoiceByRef recovers by.
 func moduleOverageChargeRef(timerID uuid.UUID) string { return "timer:" + timerID.String() }
 
+// moduleOverageItemIdemKey / moduleOverageFinalizeIdemKey build the
+// deterministic per-timer Stripe Idempotency-Keys. The fresh charge that used
+// to mint them is gone; what remains that needs them is
+// recoverModuleOverageCharge completing a draft a LEGACY run left at the
+// provider, and proration.go's combined creation invoice, which pins this
+// timer's overage line under the SAME item key so the two paths can never
+// double-charge one install.
+//
+// There is deliberately no invoice-creation key any more: nothing in this leg
+// creates an invoice, and recovery only ever finds one.
 func moduleOverageItemIdemKey(timerID uuid.UUID) string {
 	return "mod-overage-ii-" + timerID.String()
-}
-
-func moduleOverageInvoiceIdemKey(timerID uuid.UUID) string {
-	return "mod-overage-inv-" + timerID.String()
 }
 
 func moduleOverageFinalizeIdemKey(timerID uuid.UUID) string {
@@ -813,6 +773,15 @@ func (s *Service) proposeModuleOverage(
 	coverageStart, coverageEnd time.Time,
 	at time.Time,
 ) (*ModuleOverageResult, error) {
+	// Fail closed rather than panic. There is no collector behind this
+	// call any more, so a service built without a proposer cannot charge
+	// this timer by any route — say so, and let the sweep count it and
+	// retry, instead of dereferencing nil in a billing worker.
+	if s.proposer == nil {
+		return nil, billing.Internal(
+			"module overage: no intent proposer installed and no legacy collector remains", nil)
+	}
+
 	// Seal what a collection would actually take, not the raw derived
 	// micros — see collectableMicros. Sealing the unrounded figure would
 	// attest to an amount the customer was never charged.

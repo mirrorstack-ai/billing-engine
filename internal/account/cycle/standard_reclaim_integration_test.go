@@ -130,12 +130,14 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		require.Equal(t, firstID, reclaimedID, "reclaim must preserve Stripe idempotency identity")
 
 		sc := newFakeStripe()
-		resp, err := cycle.NewService(store, sc).
-			WithCreditWallet(false).
-			RunBillingCycle(ctx, accountID, start, end, 0)
+		svc, p := boundarySvcProposing(store, sc)
+		resp, err := svc.WithCreditWallet(false).RunBillingCycle(ctx, accountID, start, end, 0)
 		require.NoError(t, err)
 		require.True(t, resp.FirstRun, "a reclaimed pending row is an active attempt")
 		require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+		require.Zero(t, resp.ChargedCents)
+		require.Empty(t, p.groups,
+			"a genuinely fresh zero boundary must seal no intent — a $0 document is still a document")
 		require.Empty(t, sc.findByRefCalls)
 		require.Empty(t, sc.invoiceCalls)
 		require.Empty(t, sc.itemCalls)
@@ -148,6 +150,26 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		require.Zero(t, got.totalCents)
 	})
 
+	// 🔴 DRIFT — THE RECLAIM REFUSES INSTEAD OF RE-DERIVING.
+	//
+	// This subtest deliberately builds a run whose durable commitment and live
+	// state DISAGREE: a crashed attempt froze 137 cents, while live state (no
+	// usage, no live apps, no domains) derives 0. That gap is the subject. The
+	// deleted collector closed it by REUSING the frozen cents verbatim
+	// (charge.go:398-402) and sending 137 to Stripe under the run's stable idem
+	// keys.
+	//
+	// The intent rail cannot do that, and boundary_charges.go's splitBoundary
+	// says why: a single frozen cents figure cannot be split back into arrears
+	// plus the three advance components, so sealing 137 would put a document in
+	// front of the customer whose lines nobody derived. It COMPARES instead and
+	// refuses, naming both numbers — and the run is left reclaimable with its
+	// commitment intact rather than terminally marked against a charge that
+	// never happened.
+	//
+	// Both figures the collecting assertion pinned are still pinned: 137 as the
+	// durable amount that must not be silently dropped, 0 as the live total
+	// that must not be silently substituted for it.
 	t.Run("reclaimed frozen greater than zero", func(t *testing.T) {
 		store := cycle.NewStore(pool)
 		accountID := seedAccount(t, pool)
@@ -170,32 +192,44 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		require.NoError(t, store.MarkBillingRun(ctx, runID, cycle.RunStatusFailed, "in_stale", 999))
 
 		sc := newFakeStripe()
-		sc.invoiceAmountDue = frozenCents
-		resp, err := cycle.NewService(store, sc).
-			WithCreditWallet(false).
-			RunBillingCycle(ctx, accountID, start, end, 0)
-		require.NoError(t, err)
-		require.True(t, resp.FirstRun)
-		require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
-		require.EqualValues(t, frozenCents, resp.ChargedCents)
-		require.Len(t, sc.findByRefCalls, 1)
-		require.Len(t, sc.invoiceCalls, 1)
-		require.Len(t, sc.itemCalls, 1)
-		require.Len(t, sc.finalizeCalls, 1)
-		require.Equal(t, "run:"+runID.String(), sc.findByRefCalls[0])
-		require.Equal(t, "inv-"+runID.String(), sc.invoiceCalls[0].idemKey)
-		require.Equal(t, "ii-"+runID.String(), sc.itemCalls[0].idemKey)
-		require.Equal(t, "fin-"+runID.String(), sc.finalizeCalls[0].idemKey)
-		require.EqualValues(t, frozenCents, sc.itemCalls[0].amountCfg,
-			"the reclaim must reuse the durable amount, not the live zero total")
+		svc, p := boundarySvcProposing(store, sc)
+		resp, err := svc.WithCreditWallet(false).RunBillingCycle(ctx, accountID, start, end, 0)
 
+		// The refusal names BOTH numbers: what this run committed to, and what
+		// live state now derives.
+		require.Error(t, err)
+		require.ErrorContains(t, err, "this run froze 137 cents but live state now derives 0",
+			"a drifted reclaim must name the durable amount and the live one")
+		require.Nil(t, resp)
+
+		// 🔴 Nothing was sealed. Sealing EITHER number would be the failure the
+		// refusal exists to prevent: 137 is a total nobody derived lines for,
+		// and 0 silently forgives the amount the crashed attempt committed to.
+		require.Empty(t, p.groups, "a drifted reclaim sealed an amount nobody derived")
+		require.Empty(t, p.charges)
+
+		// 🔴 And nothing reached the provider — the drop's central claim.
+		require.Empty(t, sc.invoiceCalls)
+		require.Empty(t, sc.itemCalls)
+		require.Empty(t, sc.finalizeCalls)
+
+		// The crash-recovery READ survives the collector's deletion: it is what
+		// decides whether money may already have moved, and it still runs under
+		// this run's own charge ref.
+		require.Len(t, sc.findByRefCalls, 1)
+		require.Equal(t, "run:"+runID.String(), sc.findByRefCalls[0])
+
+		// The run is left RECLAIMABLE with its commitment intact — 'pending'
+		// from the reclaim's own reset, no invoice, and the frozen 137 still on
+		// the row for whoever resolves the disagreement.
 		got := readStandardRun(t, pool, runID)
-		require.Equal(t, "invoiced", got.status)
-		require.NotNil(t, got.stripeInvoice)
-		require.Equal(t, sc.invoiceID, *got.stripeInvoice)
-		require.EqualValues(t, frozenCents, got.totalCents)
+		require.Equal(t, "pending", got.status,
+			"a refused reclaim must stay reclaimable, never terminal")
+		require.Nil(t, got.stripeInvoice)
+		require.Zero(t, got.totalCents)
 		require.NotNil(t, got.frozenCents)
-		require.EqualValues(t, frozenCents, *got.frozenCents)
+		require.EqualValues(t, frozenCents, *got.frozenCents,
+			"the durable commitment must survive the refusal")
 		require.NotNil(t, got.frozenWithBase)
 		require.True(t, *got.frozenWithBase)
 	})
@@ -215,13 +249,14 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		require.NoError(t, store.MarkBillingRun(ctx, runID, cycle.RunStatusFailed, "", 0))
 
 		sc := newFakeStripe()
-		resp, err := cycle.NewService(store, sc).
-			WithCreditWallet(false).
-			RunBillingCycle(ctx, accountID, start, end, 0)
+		svc, p := boundarySvcProposing(store, sc)
+		resp, err := svc.WithCreditWallet(false).RunBillingCycle(ctx, accountID, start, end, 0)
 		require.NoError(t, err)
 		require.True(t, resp.FirstRun)
 		require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
 		require.Zero(t, resp.ChargedCents)
+		require.Empty(t, p.groups,
+			"a durable zero is already settled — it must seal no intent either")
 		require.Empty(t, sc.findByRefCalls,
 			"a durable zero is already settled and must not search Stripe")
 		require.Empty(t, sc.invoiceCalls)

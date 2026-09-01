@@ -11,6 +11,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // capturingProposer records what the leg sealed without needing a database.
@@ -65,10 +66,8 @@ func cutoverExecutor(t *testing.T, a Attempt, p chargeProposer) (*Executor, *fak
 	store := &fakeStore{attempt: a}
 	sc := &fakeStripe{}
 	e := NewExecutor(store, &fakeSettler{}, sc).
-		WithNow(func() time.Time { return time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC) })
-	if p != nil {
-		e = e.WithIntentProposer(p)
-	}
+		WithNow(func() time.Time { return time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC) }).
+		WithIntentProposer(p)
 	return e, store, sc
 }
 
@@ -134,10 +133,10 @@ func TestTheProposedReferenceIsPrefixed(t *testing.T) {
 		"the durable marker and the returned attempt disagree about which intent this is")
 }
 
-// An attempt that already reached Stripe must be FINISHED there, even when the
-// cutover is armed. Abandoning a finalized invoice strands a charge the
-// customer can see and nobody can prove.
-func TestAPurchaseThatAlreadyReachedStripeStaysOnTheLegacyPath(t *testing.T) {
+// An attempt that already reached Stripe must be FINISHED there, never
+// proposed. Abandoning a finalized invoice strands a charge the customer can
+// see and nobody can prove.
+func TestAPurchaseThatAlreadyReachedStripeIsNeverProposed(t *testing.T) {
 	a := pendingPurchase()
 	a.StripeInvoiceID = "in_already_there"
 	p := &capturingProposer{}
@@ -150,19 +149,52 @@ func TestAPurchaseThatAlreadyReachedStripeStaysOnTheLegacyPath(t *testing.T) {
 			"the recovery guard is what keeps that charge provable")
 }
 
-// Without a proposer the leg still collects, or every test above would pass
-// against a leg that had simply stopped working.
-func TestWithoutAProposerTheCreditPurchaseStillCharges(t *testing.T) {
+// The inverse of the test this replaces, which asserted that an unarmed leg
+// still collected. That path is deleted, so the assertion is now that an
+// unarmed leg REFUSES — loudly, without touching Stripe and without moving the
+// row — rather than silently doing nothing, which is the failure the old test
+// was written to catch.
+func TestWithoutAProposerAFreshPurchaseIsRefusedNotCharged(t *testing.T) {
 	a := pendingPurchase()
-	e, _, sc := cutoverExecutor(t, a, nil)
+	store := &fakeStore{attempt: a}
+	sc := &fakeStripe{}
+	e := NewExecutor(store, &fakeSettler{}, sc)
 
-	res, err := e.Resume(context.Background(), a)
+	_, err := e.Resume(context.Background(), a)
+
+	require.Error(t, err, "an unarmed leg reported success without proposing or charging")
+	require.Zero(t, sc.getCalls, "a fresh purchase reached Stripe at all")
+	require.Zero(t, sc.createInvoiceCalls, "the legacy collector is still reachable")
+	require.Equal(t, "pending", store.attempt.Status,
+		"the row moved without either a sealed intent or a charge")
+}
+
+// 🔴 The charge that ALREADY REACHED THE PROVIDER must still finish.
+//
+// This is what the in-flight guard is for: the money moved, and this is the
+// only path that can prove it into the wallet. An armed leg must settle it
+// rather than seal a second obligation beside it.
+func TestAnInFlightPaidPurchaseStillSettlesWhileArmed(t *testing.T) {
+	attempt := testAttempt("pending")
+	invoice := exactInvoice(attempt, "paid")
+	store := &fakeStore{attempt: attempt}
+	settler := &fakeSettler{store: store}
+	sc := &fakeStripe{
+		invoice:  invoice,
+		items:    []billingstripe.InvoiceItem{exactItem(attempt)},
+		payments: []billingstripe.InvoicePaymentProof{exactPayment(attempt, invoice)},
+	}
+	p := &capturingProposer{}
+	e := NewExecutor(store, settler, sc).WithIntentProposer(p)
+
+	result, err := e.Resume(context.Background(), attempt)
+
 	require.NoError(t, err)
-
-	require.NotEqual(t, "proposed", res.Attempt.Status)
-	require.Positive(t, sc.createInvoiceCalls,
-		"the legacy path created no invoice; the cutover tests above would not notice a "+
-			"broken leg")
+	require.True(t, result.Settlement.Transitioned,
+		"a paid in-flight charge was not settled; the customer paid and the wallet did not move")
+	require.Equal(t, 1, settler.calls)
+	require.Empty(t, p.charges,
+		"a charge already collected at the provider was also sealed as an intent")
 }
 
 // A failed proposal must not fall back to charging. The customer is waiting,

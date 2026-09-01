@@ -71,7 +71,7 @@ func TestProviderSDKDebtOnlyShrinks(t *testing.T) {
 	}
 	sort.Strings(debt)
 
-	const wantDebt = 4
+	const wantDebt = 3
 	if len(debt) > wantDebt {
 		t.Errorf("provider SDK reach spread to %d files outside the adapter, was %d:\n  %s",
 			len(debt), wantDebt, strings.Join(debt, "\n  "))

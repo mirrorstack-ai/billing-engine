@@ -34,7 +34,22 @@ import "github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
 //
 // Do not edit this without deleting a money path. The architecture test
 // will fail, which is the point.
-const LegacyMoneyPaths = 11
+// 🔴 THREE, down from eleven. The legacy collectors were deleted 2026-09-01.
+//
+// What remains is not a collector. Two are CRASH-RECOVERY paths that finish a
+// charge a legacy run already put in front of the provider — abandoning one
+// would strand an invoice the customer can already see and nobody can prove —
+// and the third is a scan false positive on billing's own Service.PayInvoice.
+//
+// They drain rather than being deleted: nothing stamps a provider marker any
+// more, so once no row carries an unresolved charge-attempt marker the
+// recovery paths find nothing and only ever fall through to the proposal.
+// scripts/legacy-drop-preconditions.sql is what measures when that is true.
+//
+// Until it reaches ZERO, cmd/intent-executor still refuses to start — which is
+// correct: the recovery paths and the executor must not both be able to settle
+// the same obligation.
+const LegacyMoneyPaths = 3
 
 // Report is what Capabilities returns.
 type Report struct {

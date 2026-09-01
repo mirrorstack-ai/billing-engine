@@ -28,7 +28,9 @@ type Attempt struct {
 	FundingGeneration uuid.UUID
 	StripeCustomerID  string
 	// ProposedReference is the intent this purchase was sealed as, prefixed
-	// "intent:<digest>" per migration 057. Empty on the legacy path.
+	// "intent:<digest>" per migration 057. Empty until the seal, and empty
+	// forever on a pre-cutover row that was collected before this leg stopped
+	// charging.
 	ProposedReference string
 }
 
@@ -97,6 +99,21 @@ type Settler interface {
 	) (creditledger.Settlement, error)
 }
 
+// StripeClient is the surface this leg keeps after the cutover.
+//
+// 🔴 It deliberately no longer embeds billingstripe.CreditPurchaseClient.
+// That interface carries CreateCreditPurchaseInvoice, CreateInvoiceItem and
+// FinalizeInvoice — the three calls this leg used to collect with — and
+// embedding it would leave the executor holding a write port it must never use
+// again. Narrowing it here is what makes the deletion structural instead of
+// merely a code path nobody happens to reach.
 type StripeClient interface {
-	billingstripe.CreditPurchaseClient
+	GetInvoice(ctx context.Context, stripeInvoiceID string) (billingstripe.Invoice, error)
+	ListInvoiceItems(ctx context.Context, invoiceID string) ([]billingstripe.InvoiceItem, error)
+	ListInvoicePayments(ctx context.Context, invoiceID string) ([]billingstripe.InvoicePaymentProof, error)
+	// VoidInvoice is the one mutation left, and it moves no money: it closes
+	// an in-flight invoice the provider gave up collecting so the ledger row
+	// can reach a terminal state. Reachable only for an attempt already
+	// attached to that invoice.
+	VoidInvoice(ctx context.Context, invoiceID, idemKey string) (billingstripe.Invoice, error)
 }

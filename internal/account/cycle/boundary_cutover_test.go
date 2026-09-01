@@ -21,6 +21,13 @@ import (
 // REACHED STRIPE — a cut-over leg holds no write port, and that is what makes
 // "cmd/billing-cycle cannot charge anyone" a fact about the code rather than a
 // claim about its call graph.
+//
+// TestWithoutAProposerTheBoundaryStillCharges used to sit below, pinning that
+// an unarmed service still collected — the canary that these tests were not
+// passing against a leg which had simply stopped working. The collector it
+// watched is deleted, so there is no unarmed behaviour left for it to describe.
+// Its job passes to TestTheProposedBoundaryCarriesTheLegacyAmounts: a leg that
+// stopped working cannot still seal the amounts the legacy path computed.
 func TestBoundaryLegProposesInsteadOfCharging(t *testing.T) {
 	store := newFakeStore()
 	store.chargedTotal = 1_000_000
@@ -83,27 +90,6 @@ func TestTheProposedBoundaryCarriesTheLegacyAmounts(t *testing.T) {
 	}
 	require.Equal(t, resp.ArrearsMicros+resp.AdvanceBaseMicros, total,
 		"the sealed intents do not add up to the boundary the legacy path computed")
-}
-
-// Without a proposer the boundary still collects. Without this, every test
-// above would pass against a leg that had simply stopped working.
-func TestWithoutAProposerTheBoundaryStillCharges(t *testing.T) {
-	store := newFakeStore()
-	store.chargedTotal = 1_000_000
-	store.hasPM = true
-	store.stripeCustomer = "cus_boundary_3"
-	seedApp(store, chargeAccount, 0, false)
-	sc := newFakeStripe()
-
-	resp, err := cycle.NewService(store, sc).
-		RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
-	require.NoError(t, err)
-
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
-	require.NotEqual(t, cycle.RunStatusProposed, resp.Status)
-	require.NotEmpty(t, sc.itemCalls,
-		"the legacy path collected nothing; the cutover tests above would not notice a broken leg")
-	require.Positive(t, resp.ChargedCents)
 }
 
 // A proposal that fails leaves the run PENDING, never 'failed'.

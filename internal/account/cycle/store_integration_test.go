@@ -13,8 +13,24 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
+
+// boundarySvcProposing is chargeSvcProposing (charge_test.go) for the
+// integration suite: the same rule — a boundary service can only be built WITH
+// an intent proposer — applied over the REAL store. chargeSvcProposing itself
+// takes *fakeStore, so it cannot be reused here.
+//
+// It exists for the same reason it does there. The boundary's
+// draft→item→finalize collector is deleted, so a service built without a
+// proposer cannot finish a boundary at all: it reaches ProposeGroup on a nil
+// interface and panics. A fixture that omitted one would not be exercising a
+// leaner leg, it would be exercising a deployment that cannot bill.
+func boundarySvcProposing(store cycle.Store, sc billingstripe.Client) (*cycle.Service, *capturingProposer) {
+	p := &capturingProposer{}
+	return cycle.NewService(store, sc).WithIntentProposer(p), p
+}
 
 // These exercise the generated sqlc queries against a real Postgres (gated by
 // the `integration` build tag; run via `make test-integration`, skipped when

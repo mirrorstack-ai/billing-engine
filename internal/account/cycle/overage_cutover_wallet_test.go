@@ -14,10 +14,12 @@ import (
 // 🔴 "The module-overage leg is cut over" is FALSE for a credits-mode account,
 // and this pins that rather than leaving it as a comment nobody reads.
 //
-// The credit-wallet block (overage.go:408) runs BEFORE the cutover branch
-// (overage.go:477) and returns. So an operator who arms
+// The credit-wallet block (overage.go:421) runs BEFORE the proposal
+// (overage.go:498) and returns. So an operator who arms
 // BILLING_CYCLE_INTENT_CUTOVER still sees credits-mode customers' prepaid
-// value consumed for overage, with no intent sealed for it at all.
+// value consumed for overage, with no intent sealed for it at all. Deleting the
+// legacy collector did not change this: the wallet block was always upstream of
+// the branch, and the branch is now the only thing downstream of it.
 //
 // It is the right behaviour TODAY, and it is not a small caveat:
 //
@@ -64,6 +66,9 @@ func TestCreditsModeOverageBypassesTheCutoverEntirely(t *testing.T) {
 		"a credits-mode overage sealed an intent — if the executor has grown a "+
 			"wallet rail, update this test and the cutover claim together")
 
-	// The provider is untouched either way, which is why the gap is easy to miss.
+	// The provider is untouched either way, which is why the gap is easy to miss —
+	// and since the cutover NOTHING in this leg can finalize, so this assertion no
+	// longer distinguishes the wallet path from the provider one. The p.charges
+	// check above is what carries the test.
 	require.Empty(t, sc.finalizeCalls)
 }

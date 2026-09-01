@@ -85,7 +85,17 @@ func (s *Service) ChargeDomain(ctx context.Context, cand DomainChargeCandidate, 
 		return nil, billing.InvalidInput("charge instant required")
 	}
 	if s.stripe == nil {
+		// Still required: recoverDomainCharge below finishes a charge a
+		// LEGACY run already put in front of the provider. Nothing else
+		// in this leg touches Stripe any more.
 		return nil, billing.Internal("ChargeDomain requires a Stripe client", nil)
+	}
+	// The proposer is no longer optional. This leg has no second branch to
+	// fall back to, so a service built without one cannot charge for a
+	// domain at all — and must say so rather than silently skip the row or
+	// nil-panic at the seal.
+	if s.proposer == nil {
+		return nil, billing.Internal("ChargeDomain requires an intent proposer: the legacy collect path is deleted", nil)
 	}
 	res := &DomainChargeResult{DomainID: cand.ID}
 
@@ -149,67 +159,28 @@ func (s *Service) ChargeDomain(ctx context.Context, cand DomainChargeCandidate, 
 		res.Status = DomainChargeSkippedStale
 		return res, nil
 	}
-	custID := claim.StripeCustomerID
-	if custID == "" {
+	// The claim says this funding account has a usable payment method, and a
+	// usable payment method implies a Stripe customer. If the two disagree
+	// the row is inconsistent, and sealing an intent against it would
+	// produce a document the executor can never route. Fail closed instead.
+	if claim.StripeCustomerID == "" {
 		return nil, billing.Internal("domain funding account has a usable PM but no Stripe customer id", nil)
 	}
 
-	// 🔴 The cutover point for this leg.
+	// 🔴 This leg is CUT OVER. There is no second branch.
 	//
 	// Everything above is unchanged: the same staleness re-check, the
-	// same proration, the same durable arming claim. What changes is
-	// what happens with the derived amount — proposed as a sealed
-	// intent, or charged directly.
+	// same proration, the same durable arming claim. What used to follow
+	// — draft invoice, line item, finalize, mirror — is deleted, so
+	// ChargeDomain now holds no provider write port on its own path and
+	// the sealed intent is the only record of the charge.
 	//
-	// The arming claim is taken FIRST either way, so a cut-over leg
-	// keeps the crash-recovery guard the legacy one has. Proposing
-	// without it would let a re-run derive the same charge against a
-	// row nothing had claimed.
-	if s.proposer != nil {
-		return s.proposeDomainCharge(ctx, cand, res, proratedMicros, coverageStart, coverageEnd, at)
-	}
-
-	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, domainChargeRef(cand.ID), domainInvoiceIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("domain draft invoice failed", err)
-	}
-	desc := fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname)
-	linePeriod := billingstripe.LinePeriod{Start: coverageStart, End: coverageEnd}
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, linePeriod, domainItemIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("domain invoice item failed", err)
-	}
-	inv, err := s.stripe.FinalizeInvoice(ctx, draft.ID, domainFinalizeIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("domain invoice finalize failed", err)
-	}
-
-	acct, err := s.store.AccountCollection(ctx, cand.AccountID)
-	if err != nil {
-		return nil, billing.Internal("account collection lookup failed", err)
-	}
-	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:               cand.AccountID,
-		ChargeFundingAccountID:  claim.FundingAccountID,
-		ChargeFundingGeneration: claim.FundingGeneration,
-		StripeInvoiceID:         inv.ID,
-		Status:                  inv.Status,
-		AmountDueCents:          inv.AmountDue,
-		AmountPaidCents:         inv.AmountPaid,
-		Currency:                chargeCurrency,
-		PeriodStart:             coverageStart,
-		PeriodEnd:               coverageEnd,
-		IsLargeAutoCollect:      flagLargeAutoCollect(proratedMicros, acct),
-	}); err != nil {
-		return nil, billing.Internal("invoice mirror upsert failed", err)
-	}
-	if err := s.store.MarkDomainCharged(ctx, cand.ID, at.UTC(), inv.ID, item.ID); err != nil {
-		return nil, billing.Internal("mark domain charged failed", err)
-	}
-
-	res.Status = DomainChargeCharged
-	res.StripeInvoiceID = inv.ID
-	return res, nil
+	// The arming claim is still taken FIRST, and that ordering is now
+	// load-bearing rather than merely symmetric: it is what stamps the
+	// charge-attempt marker recoverDomainCharge reads, and proposing
+	// without it would let a re-run derive the same charge against a row
+	// nothing had claimed.
+	return s.proposeDomainCharge(ctx, cand, res, proratedMicros, coverageStart, coverageEnd, at)
 }
 
 // SweepDomainChargesResult tallies one custom-domain activation-charge batch.
@@ -258,6 +229,23 @@ func (s *Service) SweepDomainCharges(ctx context.Context, at time.Time) (*SweepD
 // recoverDomainCharge reconciles a candidate whose charge-attempt marker was
 // stamped before a prior process died. A found finalized invoice is mirrored
 // and marked; a found draft is completed with the deterministic line and keys.
+//
+// 🔴 This is the ONLY path in this leg that still reaches the provider, and it
+// is kept deliberately. It runs only when a LEGACY run already put a draft or
+// a finalized invoice under domainChargeRef — a charge that has already
+// reached Stripe. Deleting it would not prevent that charge; it would abandon
+// it: a finalized invoice the customer can see on their statement, that nobody
+// can finish, void, or prove. Proposing over the top would be worse still,
+// counting the same domain once on the card and once in the intent ledger.
+//
+// The exception DRAINS. Nothing stamps a marker with a provider object any
+// more, so once no row carries an unresolved charge-attempt marker with an
+// invoice behind it, FindInvoiceByRef finds nothing and this function only
+// ever falls through to the proposal. That is one of the questions
+// scripts/legacy-drop-preconditions.sql asks production, and it is what makes
+// removing this function a later, measurable step rather than a guess.
+// Pinned end-to-end by recovery_exception_test.go's
+// TestRecoveryStillCompletesInFlightLegacyChargesWithAProposerArmed.
 func (s *Service) recoverDomainCharge(ctx context.Context, cand DomainChargeCandidate, at time.Time, res *DomainChargeResult) (bool, error) {
 	if cand.ChargeFundingAccountID == uuid.Nil || cand.ChargeFundingGeneration == uuid.Nil {
 		return false, billing.Internal("domain recovery marker has no pinned funding authorization", nil)
@@ -352,10 +340,6 @@ func domainChargeRef(domainID uuid.UUID) string { return "domain:" + domainID.St
 
 func domainItemIdemKey(domainID uuid.UUID) string {
 	return "domain-fee-ii-" + domainID.String()
-}
-
-func domainInvoiceIdemKey(domainID uuid.UUID) string {
-	return "domain-fee-inv-" + domainID.String()
 }
 
 func domainFinalizeIdemKey(domainID uuid.UUID) string {

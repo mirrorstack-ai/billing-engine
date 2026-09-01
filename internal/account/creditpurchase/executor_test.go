@@ -306,26 +306,6 @@ func exactPayment(attempt Attempt, invoice billingstripe.Invoice) billingstripe.
 	}
 }
 
-func TestResumeCreatesAndRereadsExactlyOneDraftLineBeforeFinalize(t *testing.T) {
-	attempt := testAttempt("pending")
-	attempt.StripeInvoiceID = ""
-	store := &fakeStore{attempt: attempt}
-	stripe := &fakeStripe{}
-	settler := &fakeSettler{store: store}
-	executor := NewExecutor(store, settler, stripe)
-
-	result, err := executor.Resume(context.Background(), attempt)
-
-	require.NoError(t, err)
-	require.Equal(t, "open", result.Invoice.Status)
-	require.Equal(t, 1, stripe.createInvoiceCalls)
-	require.Equal(t, 1, stripe.createItemCalls)
-	require.Equal(t, 1, stripe.finalizeCalls)
-	require.GreaterOrEqual(t, stripe.getCalls, 2)
-	require.GreaterOrEqual(t, stripe.listItemCalls, 3)
-	require.Zero(t, settler.calls)
-}
-
 func TestReconcileWebhookPaidRejectsEveryUnprovedMoneyShape(t *testing.T) {
 	baseAttempt := testAttempt("pending")
 	baseInvoice := exactInvoice(baseAttempt, "paid")
