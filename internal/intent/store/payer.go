@@ -71,10 +71,30 @@ var ErrNoUsableCard = errors.New("store: payer has no usable default card")
 //     CHECKed to ('user', 'org', 'app') — account is not one of them, which is
 //     the schema saying the same thing.
 //
-// The designation is read at PROPOSE time and then frozen by the seal. That is
-// the intent rail's equivalent of the legacy arm's generation pin
-// (StripeChargeClaim, cycle/store.go:53-56): a later re-designation cannot move
-// the payer of an intent already sealed, because INV-003 forbids editing one.
+// The legacy rail makes the same hop and names it: "the FUNDING HOP
+// (org-billing D1): an org account whose designation names a sponsor gates on —
+// and charges — the SPONSOR's default PM + Stripe customer; every other account
+// funds itself" (cycle/service.go:135-140). This is that hop, on the intent
+// rail.
+//
+// 🔴 WHERE THE TWO RAILS INTENTIONALLY DIVERGE, AND THE QUESTION IT LEAVES OPEN.
+//
+// Legacy resolves the funder at CHARGE time, "so a designation switch re-routes
+// only future charges ... and a sponsor revoke degrades to the ordinary
+// transient no_pm skip" (cycle/service.go:137-140). The intent rail cannot do
+// that: it resolves at PROPOSE time and the seal freezes it. That is the
+// rail's equivalent of the legacy arm's generation pin (StripeChargeClaim,
+// cycle/store.go:53-56) and it is required, not incidental — the payer appears
+// in the document the customer is shown and authorizes, so a payer that could
+// change after sealing would charge a party who never appeared in it.
+//
+// The consequence is that a sponsorship revoked BETWEEN propose and execute
+// leaves an intent still naming the ex-sponsor. If they removed their card the
+// executor refuses (ErrNoUsableCard) and it fails closed; if they did not, the
+// sealed intent would still charge them. Under INV-003 the correction is
+// supersession — the designation change must supersede the open intent — and
+// nothing does that today. It is not reachable yet, because no deployment
+// executes intents, and it must be settled before any leg goes live.
 //
 // The LEFT JOIN plus COALESCE reproduces the trigger's own default — an account
 // funds itself. A missing authorization row means the trigger did not fire,
