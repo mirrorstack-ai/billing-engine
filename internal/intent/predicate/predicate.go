@@ -329,8 +329,46 @@ func authorityEvidenceBinds(s SealedState) bool {
 		if s.Acceptance != (AcceptanceReceipt{}) {
 			return false
 		}
-		return s.Authorization.Scope() == intent.ScopeStanding &&
-			s.Authorization.AcceptanceDigest() != ""
+		if s.Authorization.Scope() != intent.ScopeStanding {
+			return false
+		}
+
+		// 🔴 The acceptance must be one the ENGINE ISSUED and the customer
+		// ANSWERED, and it must still stand.
+		//
+		// Until this wave the whole standing gate was
+		// `Authorization.AcceptanceDigest() != ""` — any non-empty string, so
+		// one character authorised recurring, automatic collection. §12 item
+		// 16 names that as the consent-authority problem.
+		//
+		// intent.Authorize now refuses a grant whose acceptance digest is not
+		// the digest of the document its own terms constitute, and
+		// store.LoadAuthorization re-runs Authorize on every read. That is a
+		// CONSTRUCTOR guarantee, so re-checking it here would verify nothing
+		// — the same defect as a clause named for a check it does not
+		// perform.
+		//
+		// So this checks what a constructor cannot: that the document was
+		// issued, answered, is unexpired and unrevoked. Each is a row that
+		// changes after the authorization was built.
+		a := s.StandingAcceptance
+		if !a.Issued || !a.Accepted || a.Revoked {
+			return false
+		}
+		// The stored challenge must be for THIS document. Without this the
+		// engine would accept an answer to some other set of terms.
+		if a.DisclosureDigest == "" ||
+			a.DisclosureDigest != s.Authorization.AcceptanceDigest() {
+			return false
+		}
+		// And for this payer. An acceptance by someone else is not consent.
+		if a.Payer != s.Intent.Payer() {
+			return false
+		}
+		if a.ExpiresAt.IsZero() || s.Now.After(a.ExpiresAt) {
+			return false
+		}
+		return true
 	}
 	return false
 }
