@@ -45,11 +45,43 @@ var ErrNoUsableCard = errors.New("store: payer has no usable default card")
 
 // PayerForAccount is the subject a charge against this account must seal.
 //
-// It returns the account's OWNER, not the account id. The owner is who
-// accepted the authorization and who the charge is against; the account is
-// the internal artifact that happens to hold their card. The vocabulary
-// agrees: charge_intents.payer_kind is CHECKed to ('user', 'org', 'app') —
-// account is not one of them, which is the schema saying the same thing.
+// It returns the owner of the account that FUNDS this one, not the account id
+// and not necessarily this account's own owner.
+//
+// Two hops, and both are load-bearing:
+//
+//  1. account -> FUNDER. An org may designate a sponsor: another account that
+//     pays its invoices (migration 041:29,42).
+//     ms_billing.account_funding_authorizations carries that designation per
+//     account, maintained by trigger on both the account and the designation,
+//     and defaulting to the account itself (migration 052:92-160). The legacy
+//     rail has always charged the Stripe customer of the FUNDING account
+//     (cycle/domain_charges.go:265, armed via db/queries/domains.sql:80-86).
+//     Until 2026-09-01 the intent rail did not make this hop at all — nothing
+//     under internal/intent/ referenced the table — so a sponsored org sealed
+//     ITSELF as payer. A sponsor-funded org account owns no cards ("the org
+//     account owns no cards, the sponsor's ...", cycle/apps.go:300-301), so
+//     ResolvePayer found no default card and EVERY intent against a sponsored
+//     org was permanently uncollectable. It failed closed, which is why no
+//     wrong party was ever charged, and why nothing reported it either.
+//
+//  2. funder -> OWNER. The owner is who accepted the authorization and who the
+//     charge is against; the account is the internal artifact that happens to
+//     hold their card. The vocabulary agrees: charge_intents.payer_kind is
+//     CHECKed to ('user', 'org', 'app') — account is not one of them, which is
+//     the schema saying the same thing.
+//
+// The designation is read at PROPOSE time and then frozen by the seal. That is
+// the intent rail's equivalent of the legacy arm's generation pin
+// (StripeChargeClaim, cycle/store.go:53-56): a later re-designation cannot move
+// the payer of an intent already sealed, because INV-003 forbids editing one.
+//
+// The LEFT JOIN plus COALESCE reproduces the trigger's own default — an account
+// funds itself. A missing authorization row means the trigger did not fire,
+// which is an anomaly; resolving it to self-funding is both what the schema
+// says the value would have been and the conservative direction, where the
+// charge stays with the account's own owner rather than moving to a party the
+// database never named.
 func (s *Store) PayerForAccount(ctx context.Context, accountID string) (intent.Subject, error) {
 	var (
 		ownerKind string
@@ -57,9 +89,13 @@ func (s *Store) PayerForAccount(ctx context.Context, accountID string) (intent.S
 		ownerOrg  *string
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT owner_kind, owner_user_id::text, owner_org_id::text
-		  FROM ms_billing.accounts
-		 WHERE id = $1`, accountID).Scan(&ownerKind, &ownerUser, &ownerOrg)
+		SELECT funder.owner_kind, funder.owner_user_id::text, funder.owner_org_id::text
+		  FROM ms_billing.accounts a
+		  LEFT JOIN ms_billing.account_funding_authorizations auth
+		         ON auth.account_id = a.id
+		  JOIN ms_billing.accounts funder
+		    ON funder.id = COALESCE(auth.funding_account_id, a.id)
+		 WHERE a.id = $1`, accountID).Scan(&ownerKind, &ownerUser, &ownerOrg)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return intent.Subject{}, fmt.Errorf("%w: %s", ErrNoSuchAccount, accountID)
 	}
@@ -77,7 +113,7 @@ func (s *Store) PayerForAccount(ctx context.Context, accountID string) (intent.S
 		return intent.Subject{Kind: "org", ID: *ownerOrg}, nil
 	}
 	return intent.Subject{}, fmt.Errorf(
-		"%w: account %s is owner_kind %q with no matching owner column",
+		"%w: the account funding %s is owner_kind %q with no matching owner column",
 		ErrNoSuchAccount, accountID, ownerKind)
 }
 
