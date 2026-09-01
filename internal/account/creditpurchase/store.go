@@ -272,3 +272,32 @@ func decodeAttempt(
 		StripeCustomerID:  stripeCustomerID,
 	}, nil
 }
+
+// MarkProposed records that this purchase was sealed as an intent.
+//
+// The reference is required and prefixed by the caller, per migration 057:
+// "written prefixed as 'intent:<digest>' so nothing downstream can read a
+// digest as a provider object id". The paired CHECK refuses a proposed row
+// without one, so an empty reference would fail in the database — this refuses
+// earlier, where the message can name the leg.
+func (s *pgxStore) MarkProposed(
+	ctx context.Context,
+	attempt Attempt,
+	intentReference string,
+) (bool, error) {
+	if intentReference == "" {
+		return false, errors.New("creditpurchase: a proposed attempt needs its intent reference")
+	}
+	_, err := s.q.MarkCreditPurchaseProposed(ctx, db.MarkCreditPurchaseProposedParams{
+		PurchaseID:        attempt.ID.String(),
+		AccountID:         attempt.AccountID.String(),
+		ProposedReference: intentReference,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("mark credit purchase proposed: %w", err)
+	}
+	return true, nil
+}
