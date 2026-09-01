@@ -10,6 +10,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
 
 // seedSettledApp wires an app CREATED at createdAt whose creation-proration leg
@@ -453,10 +454,27 @@ func TestListNewCreationCharges_Ordering(t *testing.T) {
 	store.accounts[owner] = uuid.New()
 	now := time.Now().UTC()
 
+	// 🔴 Seed INSIDE the period the service will resolve, not relative to
+	// `now`.
+	//
+	// SettledNewCreationCharges keeps only invoices whose instant is in
+	// [periodStart, periodEnd), and the service resolves that window with
+	// billingperiod.AnchoredPeriodWindow over the real clock. Offsetting
+	// backwards from `now` therefore lands the two settled invoices in the
+	// PREVIOUS period whenever the test runs within two hours of a period
+	// boundary — and both are then dropped, leaving only the pending row.
+	//
+	// It failed exactly that way in CI at 2026-09-01 00:11 UTC: three
+	// expected, one returned. It had never failed locally, because the
+	// developer clock is UTC+8 and 00:11 UTC is mid-morning there. A fixture
+	// anchored on the wall clock is a test that passes on the luck of the
+	// calendar AND the timezone.
+	periodStart, _ := billingperiod.AnchoredPeriodWindow(now, 1)
+
 	older := uuid.New()
-	seedSettledApp(store, older, now, "in_old", "INV-OLD", "paid", 20_000_000, now.Add(-2*time.Hour))
+	seedSettledApp(store, older, now, "in_old", "INV-OLD", "paid", 20_000_000, periodStart.Add(time.Hour))
 	newer := uuid.New()
-	seedSettledApp(store, newer, now, "in_new", "INV-NEW", "paid", 20_000_000, now.Add(-1*time.Hour))
+	seedSettledApp(store, newer, now, "in_new", "INV-NEW", "paid", 20_000_000, periodStart.Add(2*time.Hour))
 
 	pending := uuid.New()
 	store.appMirrors[pending] = usage.AppMirrorInfo{CreatedAt: now}
