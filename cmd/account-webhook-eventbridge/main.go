@@ -15,9 +15,11 @@
 // webhook.ConstructEvent already parses, so json.Unmarshal(evt.Detail, &event)
 // produces an identical stripego.Event.
 //
-// See docs-temp/stripe-eventbridge-migration/plan.md for the full migration
-// plan (dual-run now; HTTPS path + STRIPE_WEBHOOK_SECRET removed only in a
-// later, separate cleanup PR once EventBridge has burned in).
+// See docs-temp/stripe-eventbridge-migration/plan.md for the migration plan.
+// The cleanup it deferred is DONE: this is now the ONLY path Stripe events
+// reach. cmd/account-webhook survives as an empty HTTP ingress reserved for
+// payment providers that cannot publish to an AWS partner event bus (NewebPay
+// in Taiwan is the first) — see that binary's package doc.
 //
 // Spec: mirrorstack-docs/api/billing/account-webhook.md.
 package main
@@ -56,12 +58,18 @@ func main() {
 
 // buildRouter reads env vars and wires the pgxpool + verifier + store +
 // router. Mirrors cmd/account-webhook's buildRouter() exactly.
-// STRIPE_WEBHOOK_SECRET is OPTIONAL here by construction: ProcessTrusted
-// never calls the verifier (EventBridge partner events arrive pre-trusted),
-// but Router's constructor requires a non-nil one — an empty secret wires
-// stripe.NewVerifier's fail-closed reject-all verifier, which this binary
-// never reaches. The HTTPS binary stays deployed for dual-run; removing it
-// entirely remains the later cleanup (per the migration plan).
+// 🔴 THE VERIFIER HERE IS A CONSTRUCTOR ARGUMENT, NOT A CONTROL. ProcessTrusted
+// never calls it — EventBridge partner events arrive pre-trusted, because only
+// Stripe's AWS account may PutEvents to that bus and only this Lambda's Rule may
+// consume it — but Router's constructor requires a non-nil one. It is wired from
+// the empty string, which is stripe.NewVerifier's fail-closed reject-all
+// verifier, so if a future refactor ever routed traffic through Process instead
+// the result would be refusal, not acceptance.
+//
+// STRIPE_WEBHOOK_SECRET is no longer set on either webhook function: the dual-run
+// is over, cmd/account-webhook has dropped its Stripe path, and the env var and
+// the Secrets Manager key are gone. os.Getenv (never MustEnv) is what keeps that
+// removal a no-op here.
 func buildRouter() *webhook.Router {
 	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
 	// The fraud handlers (charge.dispute.created / radar.early_fraud_warning.created)
