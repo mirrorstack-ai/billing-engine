@@ -247,15 +247,31 @@ var (
 //  4. Claim, which is a primary key and therefore exclusive.
 //  5. Dispatch once.
 //  6. Record the outcome only if the rail established one.
-func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) {
+//
+// evaluated is everything Execute learned about an intent before deciding.
+//
+// Factored out so ExecuteGroup evaluates a member EXACTLY as Execute
+// evaluates a lone intent. A second copy of this sequence would be a second
+// set of gates, and the two would drift — which is the failure this whole
+// package is built to avoid, applied to itself.
+type evaluated struct {
+	sealed  intent.ChargeIntent
+	state   string
+	funding predicate.FundingPlan
+	verdict predicate.Verdict
+}
+
+// evaluate assembles the sealed state and runs the predicate. It claims
+// nothing and touches no provider.
+func (e *Executor) evaluate(ctx context.Context, digest string) (evaluated, error) {
 	sealed, err := e.store.LoadIntent(ctx, digest)
 	if err != nil {
-		return Outcome{}, err
+		return evaluated{}, err
 	}
 
 	auth, err := e.store.LoadAuthorization(ctx, sealed.AuthorizationID())
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return Outcome{}, err
+		return evaluated{}, err
 	}
 	// A missing authorization is not an error here: it is a refusal.
 	// The predicate's zero BillingAuthorization permits nothing, and
@@ -263,17 +279,17 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 
 	state, err := e.store.State(ctx, digest)
 	if err != nil {
-		return Outcome{}, err
+		return evaluated{}, err
 	}
 
 	notice, _, err := e.store.LoadNotice(ctx, digest)
 	if err != nil {
-		return Outcome{}, err
+		return evaluated{}, err
 	}
 
 	funding, err := fundingFor(sealed)
 	if err != nil {
-		return Outcome{}, err
+		return evaluated{}, err
 	}
 
 	// The engine-issued acceptance the standing gate rests on. A missing row
@@ -281,27 +297,40 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 	// the record" and "the record refuses" must reach the same answer.
 	acceptance, err := e.store.LoadStandingAcceptance(ctx, auth.ID(), auth.AcceptanceDigest())
 	if err != nil {
-		return Outcome{}, err
+		return evaluated{}, err
 	}
 
 	env := e.env(ctx)
-	verdict := predicate.Evaluate(predicate.SealedState{
-		Intent:                       sealed,
-		State:                        predicate.IntentState(state),
-		Now:                          e.now(),
-		BuildIdentified:              env.BuildIdentified,
-		Authorization:                auth,
-		Mode:                         e.authorityMode(auth),
-		StandingAcceptance:           acceptance,
-		Notice:                       noticeFor(sealed, notice),
-		Funding:                      funding,
-		PolicyDigestsMatch:           env.PolicyDigestsMatch,
-		TimeReady:                    env.TimeReady,
-		TaxIndependentlyReproducible: env.TaxIndependentlyReproducible,
-		PriorSettlementExists:        false,
-		ClaimAvailable:               true,
-		Unbuilt:                      env.Unbuilt,
-	})
+	return evaluated{
+		sealed:  sealed,
+		state:   state,
+		funding: funding,
+		verdict: predicate.Evaluate(predicate.SealedState{
+			Intent:                       sealed,
+			State:                        predicate.IntentState(state),
+			Now:                          e.now(),
+			BuildIdentified:              env.BuildIdentified,
+			Authorization:                auth,
+			Mode:                         e.authorityMode(auth),
+			StandingAcceptance:           acceptance,
+			Notice:                       noticeFor(sealed, notice),
+			Funding:                      funding,
+			PolicyDigestsMatch:           env.PolicyDigestsMatch,
+			TimeReady:                    env.TimeReady,
+			TaxIndependentlyReproducible: env.TaxIndependentlyReproducible,
+			PriorSettlementExists:        false,
+			ClaimAvailable:               true,
+			Unbuilt:                      env.Unbuilt,
+		}),
+	}, nil
+}
+
+func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) {
+	ev, err := e.evaluate(ctx, digest)
+	if err != nil {
+		return Outcome{}, err
+	}
+	sealed, state, funding, verdict := ev.sealed, ev.state, ev.funding, ev.verdict
 
 	if !verdict.Permitted {
 		// Nothing has been claimed and nothing dispatched. A refusal
