@@ -1,6 +1,15 @@
-# One invoice, four charge kinds — the decision that blocks two legs
+# One invoice, two charge kinds — the decision that blocked two legs
 
-**Status: open. Owner's call. Nothing else I can build resolves it.**
+**Status: the kind count is ANSWERED (§12 item 12, 2026-09-01). The collection
+shape is ANSWERED: one collection, both halves shown. What remains open is the
+price-book revision that publishes the folded base price.**
+
+🔴 **This document was written when the boundary was four kinds.** §12 item 12
+folded `module_capacity` and `custom_domain` into `platform_base`, so the
+boundary is now **two**: `module_usage` for the closed period's arrears and
+`platform_base` for the next period. The four-kind analysis below is kept
+because the rounding argument is what the answer rests on, but read every
+"four" as historical.
 
 Found 2026-08-31 while routing `internal/account/cycle/charge.go`. I wrote a
 draft that sealed the boundary charge under a `KindUsageCycle` that does not
@@ -27,28 +36,34 @@ intents means several invoices and several card charges, because
 
 ### `cycle/charge.go` — the period boundary
 
-| component | §6 kind |
+| component | §6 kind (after the item 12 fold) |
 |---|---|
 | usage arrears (closed period) | `module_usage` |
 | advance base fee | `platform_base` |
-| advance module overage | `module_capacity` |
-| advance custom domains | `custom_domain` |
+| advance module overage | `platform_base` — folded |
+| advance custom domains | `platform_base` — folded |
 
 Rounds **once, on the net**, at `charge.go:595`:
 `centsFromMicros(arrears + base + overage + domains − walletDraw)`.
 
-🔴 So splitting it into four intents rounds four times, and the totals do not
-agree. Only `arrears` and the wallet draw are sub-cent-fractional (the three
-fee components are exact whole-cent multiples), so the divergence is small —
-but it is real, and "a cutover must seal exactly what a collection takes" is
-the rule this repository has already been bitten by.
+🔴 Splitting it into **four** intents would round four times and the totals
+would not agree. That was the whole problem, and the fold dissolves most of it.
+
+✅ **With two intents it reproduces the legacy net exactly.** The three fee
+components are exact whole-cent multiples, so folding them into one
+`platform_base` introduces no rounding at all. Only `arrears` and the wallet
+draw are sub-cent-fractional, and they sit in the *same* remaining intent — so
+a group that rounds once over the summed remainders takes the same cents the
+legacy path takes. "A cutover must seal exactly what a collection takes" is the
+rule this repository has already been bitten by, and two kinds is the shape
+that satisfies it.
 
 ### `cycle/proration.go` — combined proration
 
-| component | §6 kind |
+| component | §6 kind (after the item 12 fold) |
 |---|---|
 | app base fee (prorated) | `platform_base` |
-| module overage (prorated), × timers | `module_capacity` |
+| module overage (prorated), × timers | `platform_base` — folded |
 
 Rounds **per component**, then sums (`proration.go:751-753`,
 `combinedProrationTotalCents`), and already writes **separate Stripe invoice
