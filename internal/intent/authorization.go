@@ -181,6 +181,10 @@ var (
 	ErrAuthWindowMissing         = errors.New("intent: authorization has no effective window")
 	ErrAuthWindowInverted        = errors.New("intent: authorization expires before it takes effect")
 	ErrAuthAcceptanceMissing     = errors.New("intent: authorization references no acceptance receipt")
+	// ErrAuthAcceptanceMismatch is an acceptance that names a DIFFERENT
+	// document than the terms being minted — a caller showing a customer one
+	// set of ceilings and minting another.
+	ErrAuthAcceptanceMismatch = errors.New("intent: the acceptance names a different document than these terms")
 )
 
 // Authorize validates a grant and returns the immutable authorization.
@@ -189,6 +193,26 @@ var (
 // must declare its kinds and a per-charge ceiling. Neither is
 // defaulted: an authorization with no ceiling is not an unlimited one,
 // it is a refused grant.
+// AuthorizeAccepted is Authorize for a caller that IS the party which showed
+// the customer their terms.
+//
+// It computes the disclosure digest from the grant instead of requiring one,
+// which is correct only when the same code both rendered the document and is
+// minting the authorization. In production nothing satisfies that: the terms
+// are shown by api-platform and relayed back, so the digest must ARRIVE and
+// be compared — which is what Authorize does and what makes the comparison a
+// control rather than a tautology.
+//
+// 🔴 It is therefore for tests and local development only, and
+// internal/architecture fails the build if a non-test file calls it. Without
+// that pin this function is a hole straight through the check it exists
+// beside: any caller could mint an authorization for any terms and have the
+// engine agree with itself about them.
+func AuthorizeAccepted(grant AuthorizationGrant) (BillingAuthorization, error) {
+	grant.AcceptanceDigest = DisclosureDigestFor(grant)
+	return Authorize(grant)
+}
+
 func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 	if strings.TrimSpace(grant.ID) == "" {
 		return BillingAuthorization{}, ErrAuthIDMissing
@@ -269,6 +293,31 @@ func Authorize(grant AuthorizationGrant) (BillingAuthorization, error) {
 	}
 	if strings.TrimSpace(grant.AcceptanceDigest) == "" {
 		return BillingAuthorization{}, ErrAuthAcceptanceMissing
+	}
+
+	// 🔴 The acceptance must name THESE terms.
+	//
+	// Until now this field was any non-empty string, and docs/DESIGN.md §4's
+	// standing gate rests entirely on it: predicate.authorityEvidenceBinds
+	// returns true when the scope is standing and the digest is non-empty. So
+	// a single character satisfied the only evidence a recurring, automatic
+	// charge requires.
+	//
+	// The digest is now the identity of the document these terms constitute
+	// (AuthorizationDisclosure), computed here from the grant itself. A caller
+	// that shows a customer one set of ceilings and mints another gets a
+	// mismatch and no authorization — which is the check §4 asks for ("a bare
+	// accepted: true carrying no disclosure digest has no effect at all"),
+	// applied to the standing document rather than only to a fresh receipt.
+	//
+	// It does NOT prove the customer accepted. Nothing here can: INV-006 says
+	// "the engine cannot tell a relayed acceptance from an invented one", and
+	// api-platform relays. What it removes is the ability to claim acceptance
+	// of terms that were never the terms.
+	if want := DisclosureDigestFor(grant); grant.AcceptanceDigest != want {
+		return BillingAuthorization{}, fmt.Errorf(
+			"%w: the acceptance names %s, these terms are %s",
+			ErrAuthAcceptanceMismatch, grant.AcceptanceDigest, want)
 	}
 
 	kinds := make(map[ChargeKind]bool, len(grant.Kinds))

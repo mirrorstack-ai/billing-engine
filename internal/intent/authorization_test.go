@@ -22,13 +22,12 @@ func standingGrant() AuthorizationGrant {
 		Currency:         "USD",
 		Kinds:            []ChargeKind{kindWalletTopUp},
 		PerChargeCeiling: 50_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour,
-		PeriodCeiling:    200_000,
-		TermsRevision:    "terms-2026-01",
-		PriceBook:        "pb-2026-08",
-		NoticePolicy:     "email/v1",
-		EffectiveFrom:    authFrom,
-		ExpiresAt:        authTill,
-		AcceptanceDigest: "accept-1",
+		PeriodCeiling: 200_000,
+		TermsRevision: "terms-2026-01",
+		PriceBook:     "pb-2026-08",
+		NoticePolicy:  "email/v1",
+		EffectiveFrom: authFrom,
+		ExpiresAt:     authTill,
 	}
 }
 
@@ -42,7 +41,7 @@ func sealedFixture(t *testing.T) ChargeIntent {
 }
 
 func TestStandingAuthorizationPermitsAnIntentInsideItsBounds(t *testing.T) {
-	auth, err := Authorize(standingGrant())
+	auth, err := AuthorizeAccepted(standingGrant())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +119,7 @@ func TestEveryBoundRefuses(t *testing.T) {
 			if tc.grant != nil {
 				tc.grant(&g)
 			}
-			auth, err := Authorize(g)
+			auth, err := AuthorizeAccepted(g)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -151,7 +150,7 @@ func TestEveryBoundRefuses(t *testing.T) {
 // customer reads on their charge bundle would not be the permission
 // that was actually consulted.
 func TestAuthorizationRefusesAnIntentThatNamesAnotherOne(t *testing.T) {
-	auth, err := Authorize(standingGrant())
+	auth, err := AuthorizeAccepted(standingGrant())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +178,7 @@ func TestRefusalsAreReportedTogether(t *testing.T) {
 	g := standingGrant()
 	g.Subject = Subject{Kind: "org", ID: "org-2"}
 	g.Currency = "TWD"
-	auth, err := Authorize(g)
+	auth, err := AuthorizeAccepted(g)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +212,7 @@ func TestOneTimeAuthorizationDoesNotCoverASupersedingCorrection(t *testing.T) {
 	g.IntentDigest = original.Digest()
 	g.Kinds = nil
 	g.PerChargeCeiling = 0
-	auth, err := Authorize(g)
+	auth, err := AuthorizeAccepted(g)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +238,7 @@ func TestOneTimeAuthorizationDoesNotCoverASupersedingCorrection(t *testing.T) {
 }
 
 func TestRevokedAuthorizationStopsPermitting(t *testing.T) {
-	auth, err := Authorize(standingGrant())
+	auth, err := AuthorizeAccepted(standingGrant())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +286,13 @@ func TestAuthorizeRefusesRatherThanDefaults(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// The acceptance is filled in FIRST, then the term is broken —
+			// which is the real sequence: a customer accepted a document and
+			// something later tried to mint different terms under it. Using
+			// AuthorizeAccepted here would recompute the digest over the
+			// broken grant and make every case agree with itself.
 			g := standingGrant()
+			g.AcceptanceDigest = DisclosureDigestFor(g)
 			tc.mutate(&g)
 			auth, err := Authorize(g)
 			if !errors.Is(err, tc.wantErr) {
@@ -315,7 +320,7 @@ func TestZeroAuthorizationPermitsNothing(t *testing.T) {
 
 // An unsealed intent is not a document anyone approved.
 func TestUnsealedIntentIsNeverPermitted(t *testing.T) {
-	auth, err := Authorize(standingGrant())
+	auth, err := AuthorizeAccepted(standingGrant())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +346,7 @@ func hasRefusal(refusals []Refusal, want Refusal) bool {
 // so passing one through would return an authorization that looked
 // revoked to its caller and permitted everything.
 func TestRevokeWithAZeroInstantStillRevokes(t *testing.T) {
-	auth, err := Authorize(standingGrant())
+	auth, err := AuthorizeAccepted(standingGrant())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,12 +370,12 @@ func TestRevokeWithAZeroInstantStillRevokes(t *testing.T) {
 // so storage round-trips through Authorize and gets every validation on
 // the way back in.
 func TestAuthorizationRoundTripsThroughItsGrant(t *testing.T) {
-	original, err := Authorize(standingGrant())
+	original, err := AuthorizeAccepted(standingGrant())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	restored, err := Authorize(original.Grant())
+	restored, err := AuthorizeAccepted(original.Grant())
 	if err != nil {
 		t.Fatalf("an authorization's own grant was refused: %v", err)
 	}
@@ -411,7 +416,7 @@ func TestAuthorizationRoundTripsThroughItsGrant(t *testing.T) {
 // Revocation is stored beside the grant, not inside it, so a caller
 // reapplies it. This pins that the grant does not silently carry it.
 func TestGrantDoesNotCarryRevocation(t *testing.T) {
-	auth, err := Authorize(standingGrant())
+	auth, err := AuthorizeAccepted(standingGrant())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +425,7 @@ func TestGrantDoesNotCarryRevocation(t *testing.T) {
 	if revoked.RevokedAt().IsZero() {
 		t.Fatal("RevokedAt did not record the revocation")
 	}
-	restored, err := Authorize(revoked.Grant())
+	restored, err := AuthorizeAccepted(revoked.Grant())
 	if err != nil {
 		t.Fatal(err)
 	}

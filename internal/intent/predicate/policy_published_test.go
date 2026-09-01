@@ -59,16 +59,15 @@ func placeholderState(t *testing.T) SealedState {
 		t.Fatalf("Seal under placeholders: %v", err)
 	}
 
-	auth, err := intent.Authorize(intent.AuthorizationGrant{
+	auth, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
 		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: placeholderTerms, PriceBook: placeholderPriceBook,
-		NoticePolicy:     placeholderNotice,
-		EffectiveFrom:    windowStart,
-		ExpiresAt:        windowEnd.AddDate(1, 0, 0),
-		AcceptanceDigest: "accept-1",
+		NoticePolicy:  placeholderNotice,
+		EffectiveFrom: windowStart,
+		ExpiresAt:     windowEnd.AddDate(1, 0, 0),
 	})
 	if err != nil {
 		t.Fatalf("Authorize under placeholders: %v", err)
@@ -225,7 +224,7 @@ func TestRevisionPublishedBoundaries(t *testing.T) {
 func TestInstrumentBindingNeedsAnAuthorizationThatNamedAnInstrument(t *testing.T) {
 	t.Run("the executor claims it verified, but nothing was bound", func(t *testing.T) {
 		state := permittedState(t)
-		unbound, err := intent.Authorize(intent.AuthorizationGrant{
+		unbound, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
 			ID: "auth-1", Scope: intent.ScopeStanding,
 			Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 			Currency: "USD", Kinds: []intent.ChargeKind{kind},
@@ -233,10 +232,9 @@ func TestInstrumentBindingNeedsAnAuthorizationThatNamedAnInstrument(t *testing.T
 			FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour,
 			// Provider and MandateReference deliberately absent.
 			TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
-			NoticePolicy:     "email/v1",
-			EffectiveFrom:    windowStart,
-			ExpiresAt:        windowEnd.AddDate(1, 0, 0),
-			AcceptanceDigest: "accept-1",
+			NoticePolicy:  "email/v1",
+			EffectiveFrom: windowStart,
+			ExpiresAt:     windowEnd.AddDate(1, 0, 0),
 		})
 		if err != nil {
 			t.Fatalf("Authorize: %v", err)
