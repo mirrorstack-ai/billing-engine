@@ -158,6 +158,45 @@ func TestRevokingSponsorshipReturnsThePayerToTheOrg(t *testing.T) {
 		"a revoked sponsor is still the sealed payer — the designation was not followed")
 }
 
+// An account with no funding authorization row resolves to its own owner.
+//
+// The trigger makes this unreachable in practice — every account gets a row on
+// insert, defaulting to itself (052:92-124) — so without this test the LEFT
+// JOIN's fallback is an unexercised branch, which is how a clause comes to be
+// named for a check it does not perform. Deleting the row directly is the only
+// way to reach it.
+//
+// Self-funding is also the safe answer rather than merely the convenient one.
+// A missing row cannot silently move money to a party the database never
+// named: it leaves the charge with the account's own owner, and if that
+// account was in fact sponsored and holds no card, ResolvePayer refuses.
+func TestAnAccountWithNoFundingAuthorizationFundsItself(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	accountID, ownerID, customerID, pmID := seedPayableAccount(t, pool, "user")
+
+	tag, err := pool.Exec(ctx,
+		`DELETE FROM ms_billing.account_funding_authorizations WHERE account_id = $1`,
+		accountID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, tag.RowsAffected(),
+		"there was no authorization row to delete, so this test would exercise the "+
+			"ordinary path and prove nothing about the fallback")
+
+	payer, err := s.PayerForAccount(ctx, accountID)
+	require.NoError(t, err,
+		"an account whose authorization row is missing resolved to no payer at all")
+	require.Equal(t, "user", payer.Kind)
+	require.Equal(t, ownerID, payer.ID)
+
+	gotCustomer, gotPM, err := s.ResolvePayer(ctx, payer.Kind, payer.ID)
+	require.NoError(t, err)
+	require.Equal(t, customerID, gotCustomer)
+	require.Equal(t, pmID, gotPM)
+}
+
 // The old shape must NOT resolve, or the test above would pass for the wrong
 // reason on a database where account id and owner id happened to coincide.
 func TestTheOldAccountIDPayerShapeDoesNotResolve(t *testing.T) {
