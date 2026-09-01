@@ -108,3 +108,4 @@
 \i migrations/billing/063_seal_every_sealed_column.up.sql
 \i migrations/billing/064_evidence_outbox.up.sql
 \i migrations/billing/065_authorization_acceptances.up.sql
+\i migrations/billing/066_intent_groups.up.sql
