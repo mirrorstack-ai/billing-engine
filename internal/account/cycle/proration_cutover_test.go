@@ -37,7 +37,15 @@ func TestProrationLegProposesInsteadOfCharging(t *testing.T) {
 
 	require.Empty(t, sc.itemCalls, "a cut-over proration created a Stripe invoice item")
 	require.Empty(t, sc.finalizeCalls, "a cut-over proration finalized a Stripe invoice")
-	require.Empty(t, res.ProrationInvoiceID, "a proposed proration reported a Stripe invoice id")
+	// 🔴 The terminal stamp. Without it AppsPendingProration re-selects this
+	// app forever — a new intent per sweep for one charge — and on a disarm the
+	// legacy branch mints a real Stripe invoice for a period already sealed.
+	require.Len(t, store.proposedProrations, 1,
+		"the proposed proration wrote no terminal stamp, so the app is re-swept forever")
+	require.Equal(t, "intent:"+res.IntentDigest, store.proposedProrations[0],
+		"the stamp does not name the intent that replaced this charge")
+	require.Equal(t, "intent:"+res.IntentDigest, store.apps[appID].ProrationInvoiceID,
+		"the app row still selects as pending proration")
 
 	// ONE intent, not two. Before §12 item 12 the prorated base fee and the
 	// prorated module overage were platform_base and module_capacity — two
