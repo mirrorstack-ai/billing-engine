@@ -154,10 +154,10 @@ func TestEveryDisclosureFieldChangesTheDigest(t *testing.T) {
 // re-acceptance campaign would be triggered by nothing at all.
 func TestKindOrderDoesNotChangeTheDocument(t *testing.T) {
 	a := standingGrant()
-	a.Kinds = []ChargeKind{KindModuleUsage, KindAutoTopUp, KindCustomDomain}
+	a.Kinds = []ChargeKind{KindModuleUsage, KindAutoTopUp, KindPlatformBase}
 
 	b := standingGrant()
-	b.Kinds = []ChargeKind{KindCustomDomain, KindModuleUsage, KindAutoTopUp}
+	b.Kinds = []ChargeKind{KindPlatformBase, KindModuleUsage, KindAutoTopUp}
 
 	if DisclosureDigestFor(a) != DisclosureDigestFor(b) {
 		t.Fatal("the same permitted kinds in a different order produced two documents")
