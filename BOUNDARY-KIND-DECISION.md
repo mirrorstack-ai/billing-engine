@@ -87,10 +87,8 @@ single rounding — the mechanism already merged in #154 for lines.
 - ❌ A real executor/adapter change: a group identity, group refusal
   semantics, and partial-failure handling (all claimed, all unresolved — the
   same shape as today's single-intent ambiguity, multiplied).
-- ❓ The group identity needs deciding. The components already share a source
-  reference (`run:<id>#arrears`, `run:<id>#base`, …), so it could be derived —
-  but deriving a group from a string prefix is fragile, and sealing a group id
-  is another canonical supersession.
+- ✅ The group identity is **resolved** — see below. It needs neither a
+  canonical supersession nor a fragile string convention.
 
 ### C — add a recurring-bill kind to §6
 
@@ -123,9 +121,67 @@ single rounding — the mechanism already merged in #154 for lines.
 
 ## What I need
 
-**Pick A, B, C or D.** If B, I also need a steer on group identity: derive it
-from the shared source reference, or seal it (another canonical supersession,
-which is free while `charge_intents = 0` and expensive afterwards).
+**Pick A, B, C or D.** That is the whole of it — the group-identity
+sub-question below is answered and needs nothing from you.
+
+---
+
+# The group identity, resolved
+
+I asked for a steer on this and then talked myself out of needing one. Writing
+down why, so the answer is checkable rather than assumed.
+
+## The question
+
+Under B, several intents settle onto one invoice. Something durable has to say
+which intents belong together, because the executor discovers work from the
+store rather than from the leg that proposed it. Two options were on the table
+and both looked bad:
+
+- **derive it from the shared source reference** (`run:<id>#arrears`,
+  `run:<id>#base`, …) — fragile, because a grouping inferred from a string
+  convention breaks the first time somebody changes the convention, silently
+  and in the direction of splitting one charge into several;
+- **seal a group id into the intent** — a canonical supersession, free only
+  while `charge_intents = 0` and expensive forever after.
+
+## The answer: neither, because grouping is not part of the document
+
+A `ChargeIntent` is what the customer owes and under what terms. **Which other
+charges happen to share its invoice is not one of those things.** Two
+customers owed identical amounts under identical terms hold identical
+documents whether their charges were invoiced together or separately — and if
+that were false, the digest would be attesting to something the customer never
+agreed to.
+
+So grouping is an **execution concern**, and it belongs where the other
+execution concerns already live: beside `intent_settlement_claims`, not inside
+the seal.
+
+That is a side table — `intent_digest` to `group_id` — written when a leg
+proposes. Concretely it means:
+
+- **no canonical supersession**, so the change is not on the
+  `charge_intents = 0` clock and can be revised later at ordinary cost;
+- **no string convention** to break, because the grouping is stated rather
+  than inferred;
+- **the seal is unaffected**, so an intent's digest is identical whether it is
+  invoiced alone or with three others — which is the property that makes the
+  decision reversible;
+- and a group that is never executed strands nothing: the rows are inert, and
+  `PendingExecution` already refuses to hand out a claimed or terminal intent.
+
+## What is left to build under B
+
+The adapter half is merged (#160): `CollectGroup` settles a set of intents onto
+one invoice, apportioned from one rounding, keyed on the sorted set of digests.
+
+What follows once B is confirmed is the side table, the store read that
+assembles a group, and the executor path that claims every intent in a group
+before collecting and records every outcome after — all-or-nothing, with an
+ambiguous pay leaving every claim in the group retained.
+
+None of that needs a further decision from you.
 
 
 ---
