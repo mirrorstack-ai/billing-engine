@@ -40,17 +40,18 @@ import (
 // of a TODO: the next person to attempt the drop must be told, by a failing
 // test, that deleting these two removes the only collector their charge kinds
 // have.
-// 🔴 ONE ENTRY, DOWN FROM TWO. creditpurchase was routed 2026-09-01 after the
-// owner accepted a changed browser contract — the decision this list existed to
-// surface. The remaining entry is not a decision anyone can take today.
-var unroutedLegs = map[string]string{
-	"internal/account/billing/unpaid.go": "collect_receivable is STRUCTURALLY impossible today. A receivable is " +
-		"CollectRemainderOf(source) and links to a SOURCE INTENT; every unpaid invoice in the " +
-		"system predates the intent rail, so there is nothing to link to. It also re-pays a " +
-		"provider-created invoice, so the amount would come from the provider rather than our " +
-		"derivation — the inversion INV-001 exists to prevent. It needs another leg cut over AND " +
-		"ENABLED, leaving an unpaid intent, before it can exist at all.",
-}
+// 🔴 EMPTY. Every collecting leg proposes.
+//
+// It held two entries this morning. creditpurchase came off when the owner
+// accepted a changed browser contract; billing/unpaid.go came off when a
+// settlement started recording WHICH provider object it moved through
+// (migration 069) — without that, a receivable had no source intent to link to
+// and the leg was not routable by any amount of effort.
+//
+// An empty list is not the end of the guard's job. It now asserts that nothing
+// is ADDED without a replacement, and the test below still refuses a
+// LegacyMoneyPaths of 0 while anything is listed.
+var unroutedLegs = map[string]string{}
 
 func TestEveryCollectingLegCanBeReplacedOrIsNamed(t *testing.T) {
 	root, err := RepoRoot()
