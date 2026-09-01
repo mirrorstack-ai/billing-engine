@@ -344,11 +344,37 @@ type NewebPayPurchaseInit struct {
 // StartCreditPurchaseResponse is rail-discriminated. PurchaseID is the
 // durable pending-ledger handle used by FinishCreditPurchase.
 type StartCreditPurchaseResponse struct {
-	PurchaseID string                `json:"purchase_id"`
-	Rail       string                `json:"rail"`
-	Stripe     *StripePurchaseInit   `json:"stripe,omitempty"`
-	NewebPay   *NewebPayPurchaseInit `json:"newebpay,omitempty"`
+	PurchaseID string `json:"purchase_id"`
+	Rail       string `json:"rail"`
+
+	// Status tells the browser what to do next, so it does not have to infer
+	// it from which optional block is present.
+	//
+	//   "ready"    — a rail block follows; complete the payment with it.
+	//   "proposed" — the intent rail owns this purchase. NO rail block, no
+	//                client secret, nothing to redirect to. Poll the purchase
+	//                until it settles.
+	//
+	// 🔴 It is a NEW field with an old default. Existing clients ignore it and
+	// keep reading `stripe`, which is exactly right for a purchase that has
+	// one. A proposed purchase has no Stripe block at all, and a client that
+	// only looks for `stripe` finds nothing and stops — which is the correct
+	// behaviour for a browser that does not yet know how to poll, rather than
+	// a broken redirect to an empty URL.
+	Status string `json:"status"`
+
+	Stripe   *StripePurchaseInit   `json:"stripe,omitempty"`
+	NewebPay *NewebPayPurchaseInit `json:"newebpay,omitempty"`
 }
+
+// Purchase start statuses.
+const (
+	// PurchaseStartReady: a rail block follows and the payment can be
+	// completed now.
+	PurchaseStartReady = "ready"
+	// PurchaseStartProposed: sealed as an intent, nothing to pay against yet.
+	PurchaseStartProposed = "proposed"
+)
 
 type FinishCreditPurchaseRequest struct {
 	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`

@@ -656,6 +656,25 @@ func validateCreditOwner(userID, orgID uuid.UUID) error {
 }
 
 func creditPurchaseStartResponse(purchase CreditPurchaseRow, invoice billingstripe.Invoice) *StartCreditPurchaseResponse {
+	// 🔴 A PROPOSED PURCHASE HAS NO RAIL BLOCK, and saying so is the point.
+	//
+	// The intent rail sealed this purchase and created no Stripe object, so
+	// there is no client secret and nothing to redirect to. Returning
+	// Stripe{ClientSecret: "", HostedInvoiceURL: ""} would be a lie in the
+	// shape of an answer: the field says "here is how to pay" and carries
+	// nothing that can pay.
+	//
+	// Omitting it makes a client that does not understand `status` fail SAFE —
+	// it finds no hosted URL, takes its existing no-checkout branch, and
+	// refreshes. A browser that does understand it polls.
+	if purchase.Status == "proposed" {
+		return &StartCreditPurchaseResponse{
+			PurchaseID: purchase.ID.String(),
+			Rail:       "stripe",
+			Status:     PurchaseStartProposed,
+		}
+	}
+
 	hostedURL := invoice.HostedInvoiceURL
 	if hostedURL == "" {
 		hostedURL = purchase.ReceiptURL
@@ -663,6 +682,7 @@ func creditPurchaseStartResponse(purchase CreditPurchaseRow, invoice billingstri
 	return &StartCreditPurchaseResponse{
 		PurchaseID: purchase.ID.String(),
 		Rail:       "stripe",
+		Status:     PurchaseStartReady,
 		Stripe: &StripePurchaseInit{
 			ClientSecret:     invoice.ClientSecret,
 			HostedInvoiceURL: hostedURL,
