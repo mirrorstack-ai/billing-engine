@@ -34,12 +34,70 @@ direct-to-Aurora Lambda:
 
 Copying this shape is the whole infra change. It is not novel work.
 
-## The one real decision
+## ✅ THE DECISION IS MADE, AND BOTH HALVES ARE BUILT — updated 2026-09-01
+
+**Option ROLE was chosen, and it was already implemented on both sides.** What
+follows below is kept because the reasoning still explains WHY, but the "one
+real decision" framing is spent. Read this section first.
+
+**The role exists.** It is not driven by `config.DbServices` — that would have
+been the wrong mechanism, because every entry there mints a
+`{username,password}` secret and an RDS Proxy auth registration
+(`constructs/db_bootstrap.go:70-79`), while `billing_ro` uses `DB_AUTH=rds-iam`
+with no password and connects DIRECT to Aurora, bypassing the proxy
+(`constructs/intent_shadow_ops.go:98`). A `DbServices` entry would have created
+a password secret nothing reads and a proxy registration for a connection that
+does not use the proxy.
+
+Instead `assets/db-bootstrap/main.go` has a separate password-less path with
+`billing_ro` hardcoded — `ensureReadOnlyRole` runs `CREATE ROLE billing_ro WITH
+LOGIN` (no password) then `GRANT rds_iam TO billing_ro`. Its own comment states
+the division this document arrived at independently: *"infra owns identities,
+migrations own privileges"*, and it names 058 as the grant owner. It landed in
+infra #225 and is present in the deployed pin.
+
+**The privileges did NOT exist, and that is the actual defect.** Migration 058
+grants the read set and 064 revokes the evidence outbox, but both are gated on
+`IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'billing_ro')`, and the role
+was created AFTER they were applied. So both took their ELSE branches, raised a
+NOTICE, exited 0, and were recorded as APPLIED having done nothing. A migration
+is applied once, so creating the role later does not fix it.
+
+🔴 **The failure this produces is worse than a missing role.** `billing_ro`
+exists and `rds_iam` is granted, so the ops Lambda CONNECTS successfully and
+then fails on every SELECT with permission denied. A working credential with an
+empty grant set is a considerably more confusing thing to debug than an identity
+that does not exist.
+
+**Migration 068 repairs it** — re-issuing 058's grants AND 064's revoke, in that
+order, and raising rather than skipping if the role is absent. The order is
+load-bearing: `GRANT SELECT ON ALL TABLES` covers `evidence_records` because it
+already exists, so re-issuing the grants alone would have exposed the INV-014
+evidence outbox. Fixing one half without the other would have been worse than
+leaving both broken.
+
+**Both defences are now in place, not one.** This document framed ROLE and
+TRANSACTION-ONLY as alternatives. The shipped design has both: a genuinely
+read-only identity, AND `withReadOnlyTx` (`cmd/intent-shadow/readonly.go`),
+which asks the server `current_setting('transaction_read_only')` and aborts on
+anything but `on` — *"a flag we set and never verify is a belief, not a
+guarantee"*. The transaction guard's weakness was always that it is a habit
+rather than a wall; backed by a role that holds no write privilege at all, it
+stops being the only thing standing between a diagnostic and the ledger.
+
+---
+
+## The one real decision (historical — see above)
 
 **No read-only database role exists.** `billing_svc` holds
 SELECT/INSERT/UPDATE/DELETE on every table in `ms_billing`, plus
 `ALTER DEFAULT PRIVILEGES`. No migration in either repo runs `CREATE ROLE` —
 roles are minted by the db-bootstrap Lambda from `config.DbServices`.
+
+> ⚠️ Both sentences above were true when written and the first is now wrong: the
+> role is created by db-bootstrap's own `ensureReadOnlyRole`, not from
+> `config.DbServices`. The second remains true — no migration creates a role,
+> which is exactly why 058 could skip.
 
 ### Option ROLE — a genuinely read-only identity
 

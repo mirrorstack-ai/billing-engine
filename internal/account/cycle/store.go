@@ -420,6 +420,15 @@ type Store interface {
 	// cents) → nothing is persisted. The returned invoice id is the armed (or
 	// pre-armed) guard's.
 	ChargeProrationLocked(ctx context.Context, appID uuid.UUID, charge func(locked AppMirror) (*ProrationCharge, error)) (ProrationOutcome, string, error)
+	// MarkCombinedProrationProposed is the terminal stamp for a proposed
+	// attempt, so the app stops being re-swept.
+	//
+	// 🔴 Its absence is not a missing convenience. AppsPendingProration selects
+	// on proration_invoice_id AND proration_skipped_at both being NULL, so an
+	// attempt that seals an intent and stamps nothing is re-derived on every
+	// sweep — a new intent per sweep for one charge. The domain and overage
+	// legs each stamp; this is the same act.
+	MarkCombinedProrationProposed(ctx context.Context, appID uuid.UUID, at time.Time, intentReference string) error
 
 	// DrawCreationProrationFromWallet settles ONE app's creation proration through
 	// the universal credit wallet (migration 048, billing-engine #99) ATOMICALLY:
@@ -3973,4 +3982,39 @@ func parseUUIDs(ids []string) ([]uuid.UUID, error) {
 // numeric is exact (no scale).
 func centsNumeric(cents int64) (pgtype.Numeric, error) {
 	return numericFromString(strconv.FormatInt(cents, 10))
+}
+
+// MarkCombinedProrationProposed resolves the attempt against its intent rather
+// than an invoice.
+//
+// The reference is prefixed "intent:" for the reason the sibling legs give: a
+// digest is not a Stripe invoice id, and a row where the two are
+// indistinguishable is one where a later reconciler cannot tell which rail
+// settled it.
+//
+// It resolves the HEADER only. persistProrationCharge also mirrors invoice
+// children and timer charges, and there are none here — no invoice exists, and
+// stamping timers as charged would claim money moved.
+func (s *pgxStore) MarkCombinedProrationProposed(
+	ctx context.Context,
+	appID uuid.UUID,
+	at time.Time,
+	intentReference string,
+) error {
+	if intentReference == "" {
+		return errors.New("cycle: a proposed proration needs its intent reference")
+	}
+	resolved, err := s.q.ResolveCombinedProrationAttempt(ctx, db.ResolveCombinedProrationAttemptParams{
+		ResolvedAt:        at.UTC(),
+		ResolvedInvoiceID: pgtype.Text{String: intentReference, Valid: true},
+		AppID:             appID.String(),
+	})
+	if err != nil {
+		return fmt.Errorf("resolve combined proration attempt as proposed: %w", err)
+	}
+	if resolved != 1 {
+		return fmt.Errorf(
+			"combined proration attempt %s could not resolve to intent %s", appID, intentReference)
+	}
+	return nil
 }

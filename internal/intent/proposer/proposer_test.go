@@ -3,6 +3,7 @@ package proposer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 )
 
 type recordingStore struct {
+	groups      []string
 	saved       []intent.ChargeIntent
 	event       evidence.Event
 	resolvedFor string
@@ -42,6 +44,29 @@ func (s *recordingStore) SaveIntentWithEvidence(
 	}
 	s.event = e
 	return s.saveIntent(sealed)
+}
+
+// SaveIntentGroupWithEvidence records a grouped save the way the real store
+// does it: every member and its grouping, or none of them. The fake keeps the
+// group id so a test can assert that one boundary produced ONE group.
+func (s *recordingStore) SaveIntentGroupWithEvidence(
+	ctx context.Context,
+	groupID string,
+	sealed []intent.ChargeIntent,
+	rec *evidence.Recorder,
+	events []evidence.Event,
+) error {
+	if len(sealed) != len(events) {
+		return fmt.Errorf("fake store: %d intents but %d events", len(sealed), len(events))
+	}
+	for i, in := range sealed {
+		if err := s.SaveIntentWithEvidence(ctx, in, rec, events[i]); err != nil {
+			return err
+		}
+		s.groups = append(s.groups, groupID)
+		_ = i
+	}
+	return nil
 }
 
 func (s *recordingStore) saveIntent(sealed intent.ChargeIntent) error {
