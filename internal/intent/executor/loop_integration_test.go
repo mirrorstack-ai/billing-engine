@@ -265,20 +265,24 @@ func readyN(t *testing.T, s *store.Store, n int) intent.ChargeIntent {
 
 	// The same authorization ready() builds. Saving it again is a no-op on
 	// its terms; the period ceiling is raised so a batch fits inside it.
-	auth, err := intent.Authorize(intent.AuthorizationGrant{
+	auth, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
 		ID: "auth-1", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindCycle},
 		PerChargeCeiling: 1_000_000, PeriodCeiling: 500_000_000, FrequencyCeiling: 100,
 		NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
-		NoticePolicy:     "email/v1",
-		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-		AcceptanceDigest: "accept-1",
+		NoticePolicy:  "email/v1",
+		EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
 	require.NoError(t, s.SaveAuthorization(ctx, auth))
+
+	// The engine-issued acceptance the standing gate rests on. readyN builds
+	// its own authorization, so it needs its own challenge — the sibling
+	// helper in executor_integration_test.go issues one for ready()'s.
+	issueAndAccept(t, s, auth, intent.Subject{Kind: "org", ID: "org-1"})
 
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),

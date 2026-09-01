@@ -8,16 +8,15 @@ import (
 
 func freqAuth(t *testing.T, frequency int) BillingAuthorization {
 	t.Helper()
-	a, err := Authorize(AuthorizationGrant{
+	a, err := AuthorizeAccepted(AuthorizationGrant{
 		ID: "auth-freq", Scope: ScopeStanding,
 		Subject:  Subject{Kind: "user", ID: "acct-1"},
 		Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
 		PerChargeCeiling: 50_000_000, PeriodCeiling: 200_000_000,
 		FrequencyCeiling: frequency, NoticeLeadTime: 24 * time.Hour,
 		TermsRevision: "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
-		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-		AcceptanceDigest: "accept-1",
+		EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("Authorize: %v", err)
@@ -97,16 +96,15 @@ func TestTheFrequencyBoundaryCountsTheAttemptBeingAuthorised(t *testing.T) {
 // zero as "unlimited".
 func TestAStandingAuthorizationNeedsAFrequencyCeiling(t *testing.T) {
 	for _, frequency := range []int{0, -1} {
-		_, err := Authorize(AuthorizationGrant{
+		_, err := AuthorizeAccepted(AuthorizationGrant{
 			ID: "auth-x", Scope: ScopeStanding,
 			Subject:  Subject{Kind: "user", ID: "acct-1"},
 			Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
 			PerChargeCeiling: 50_000_000, PeriodCeiling: 200_000_000,
 			FrequencyCeiling: frequency, NoticeLeadTime: 24 * time.Hour,
 			TermsRevision: "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
-			EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-			ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-			AcceptanceDigest: "accept-1",
+			EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 		})
 		if !errors.Is(err, ErrAuthFrequencyMissing) {
 			t.Fatalf("FrequencyCeiling %d: got %v, want ErrAuthFrequencyMissing", frequency, err)
@@ -117,14 +115,13 @@ func TestAStandingAuthorizationNeedsAFrequencyCeiling(t *testing.T) {
 // A one-time authorization covers exactly one document by construction, so it
 // needs no attempt bound and must not be forced to invent one.
 func TestAOneTimeAuthorizationNeedsNoFrequencyCeiling(t *testing.T) {
-	_, err := Authorize(AuthorizationGrant{
+	_, err := AuthorizeAccepted(AuthorizationGrant{
 		ID: "auth-once", Scope: ScopeOneTime,
 		Subject:  Subject{Kind: "user", ID: "acct-1"},
 		Currency: "usd", IntentDigest: "digest-1",
 		TermsRevision: "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
-		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-		AcceptanceDigest: "accept-1",
+		EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("a one-time authorization was refused for lacking a frequency ceiling: %v", err)
@@ -148,7 +145,7 @@ func TestTheFrequencyCeilingSurvivesTheGrantRoundTrip(t *testing.T) {
 // what the customer accepted. A $5 top-up under an accepted rule of $20 sits
 // inside every bound and is still not the agreement; so does $19.
 func TestTheAmountRuleBindsWhereCeilingsDoNot(t *testing.T) {
-	auth, err := Authorize(AuthorizationGrant{
+	auth, err := AuthorizeAccepted(AuthorizationGrant{
 		ID: "auth-rule", Scope: ScopeStanding,
 		Subject:  Subject{Kind: "user", ID: "acct-1"},
 		Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
@@ -158,9 +155,8 @@ func TestTheAmountRuleBindsWhereCeilingsDoNot(t *testing.T) {
 		TriggerBelowMicros: 10_000_000,
 		TopUpAmountMicros:  20_000_000,
 		TermsRevision:      "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
-		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-		AcceptanceDigest: "accept-1",
+		EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("Authorize: %v", err)
@@ -210,26 +206,25 @@ func TestTheTriggerAndTheAmountRuleMustBeGivenTogether(t *testing.T) {
 			PerChargeCeiling: 50_000_000, PeriodCeiling: 200_000_000,
 			FrequencyCeiling: 10, NoticeLeadTime: 24 * time.Hour,
 			TermsRevision: "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
-			EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-			ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-			AcceptanceDigest: "accept-1",
+			EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 		}
 	}
 
 	triggerOnly := base()
 	triggerOnly.TriggerBelowMicros = 10_000_000
-	if _, err := Authorize(triggerOnly); !errors.Is(err, ErrAuthTriggerIncomplete) {
+	if _, err := AuthorizeAccepted(triggerOnly); !errors.Is(err, ErrAuthTriggerIncomplete) {
 		t.Fatalf("a trigger with no amount rule was accepted: %v", err)
 	}
 
 	ruleOnly := base()
 	ruleOnly.TopUpAmountMicros = 20_000_000
-	if _, err := Authorize(ruleOnly); !errors.Is(err, ErrAuthTriggerIncomplete) {
+	if _, err := AuthorizeAccepted(ruleOnly); !errors.Is(err, ErrAuthTriggerIncomplete) {
 		t.Fatalf("an amount rule with no trigger was accepted: %v", err)
 	}
 
 	neither := base()
-	if _, err := Authorize(neither); err != nil {
+	if _, err := AuthorizeAccepted(neither); err != nil {
 		t.Fatalf("a standing authorization that is not balance-triggered was refused: %v", err)
 	}
 }
@@ -238,7 +233,7 @@ func TestTheTriggerAndTheAmountRuleMustBeGivenTogether(t *testing.T) {
 // attempt refuses for being over the ceiling. That is dead on arrival, not
 // restrictive, and Authorize should say so rather than mint it.
 func TestAnAmountRuleAboveTheCeilingIsRefusedAtAuthorize(t *testing.T) {
-	_, err := Authorize(AuthorizationGrant{
+	_, err := AuthorizeAccepted(AuthorizationGrant{
 		ID: "auth-dead", Scope: ScopeStanding,
 		Subject:  Subject{Kind: "user", ID: "acct-1"},
 		Currency: "usd", Kinds: []ChargeKind{KindAutoTopUp},
@@ -247,9 +242,8 @@ func TestAnAmountRuleAboveTheCeilingIsRefusedAtAuthorize(t *testing.T) {
 		TriggerBelowMicros: 5_000_000,
 		TopUpAmountMicros:  20_000_000, // above the per-charge ceiling
 		TermsRevision:      "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
-		EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-		AcceptanceDigest: "accept-1",
+		EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 	})
 	if !errors.Is(err, ErrAuthRuleExceedsCeiling) {
 		t.Fatalf("an unsatisfiable authorization was minted: %v", err)
@@ -317,27 +311,26 @@ func TestTheProviderAndMandateMustBeGivenTogether(t *testing.T) {
 			PerChargeCeiling: 50_000_000, PeriodCeiling: 200_000_000,
 			FrequencyCeiling: 10, NoticeLeadTime: 24 * time.Hour,
 			TermsRevision: "terms-1", PriceBook: "pb-1", NoticePolicy: "email/v1",
-			EffectiveFrom:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-			ExpiresAt:        time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
-			AcceptanceDigest: "accept-1",
+			EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
 		}
 	}
 
 	railOnly := base()
 	railOnly.Provider = "stripe"
-	if _, err := Authorize(railOnly); !errors.Is(err, ErrAuthInstrumentIncomplete) {
+	if _, err := AuthorizeAccepted(railOnly); !errors.Is(err, ErrAuthInstrumentIncomplete) {
 		t.Fatalf("a rail with no mandate was accepted: %v", err)
 	}
 
 	mandateOnly := base()
 	mandateOnly.MandateReference = "pm_1"
-	if _, err := Authorize(mandateOnly); !errors.Is(err, ErrAuthInstrumentIncomplete) {
+	if _, err := AuthorizeAccepted(mandateOnly); !errors.Is(err, ErrAuthInstrumentIncomplete) {
 		t.Fatalf("a mandate with no rail was accepted: %v", err)
 	}
 
 	bound := base()
 	bound.Provider, bound.MandateReference = "stripe", "pm_1"
-	a, err := Authorize(bound)
+	a, err := AuthorizeAccepted(bound)
 	if err != nil {
 		t.Fatalf("a fully bound instrument was refused: %v", err)
 	}
@@ -346,7 +339,7 @@ func TestTheProviderAndMandateMustBeGivenTogether(t *testing.T) {
 	}
 
 	unbound := base()
-	u, err := Authorize(unbound)
+	u, err := AuthorizeAccepted(unbound)
 	if err != nil {
 		t.Fatalf("an authorization with no instrument was refused: %v", err)
 	}

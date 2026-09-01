@@ -211,7 +211,7 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 	require.NoError(t, err)
 	require.NoError(t, s.SaveIntent(ctx, sealed))
 
-	auth, err := intent.Authorize(intent.AuthorizationGrant{
+	auth, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
 		ID: "auth-sandbox", Scope: intent.ScopeStanding,
 		Subject:  intent.Subject{Kind: "org", ID: payerID},
 		Currency: "USD", Kinds: []intent.ChargeKind{kind},
@@ -219,7 +219,6 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
 		NoticePolicy:  "email/v1",
 		EffectiveFrom: now.Add(-24 * time.Hour), ExpiresAt: now.Add(24 * time.Hour),
-		AcceptanceDigest: "accept-sandbox",
 	})
 	require.NoError(t, err)
 	require.NoError(t, s.SaveAuthorization(ctx, auth))
