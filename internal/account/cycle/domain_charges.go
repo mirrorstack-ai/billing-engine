@@ -397,7 +397,7 @@ func (s *Service) proposeDomainCharge(
 		// an intent.Subject here is how the payer and the executor's
 		// resolver came to disagree; see proposer.Charge.AccountID.
 		AccountID: cand.AccountID.String(),
-		Kind:      intent.KindCustomDomain,
+		Kind:      intent.KindPlatformBase,
 		Currency:  chargeCurrency,
 		Lines: proposer.SingleLine(
 			fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname),

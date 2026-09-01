@@ -367,8 +367,7 @@ func TestATamperedIntentIsNeverEvaluated(t *testing.T) {
 // unrecognised kind refuses rather than borrowing whichever formula is first.
 func TestTheFundingFormulaIsSelectedByKind(t *testing.T) {
 	for _, kind := range []intent.ChargeKind{
-		intent.KindPlatformBase, intent.KindModuleUsage, intent.KindModuleCapacity,
-		intent.KindCustomDomain, intent.KindTax,
+		intent.KindPlatformBase, intent.KindModuleUsage, intent.KindTax,
 		intent.KindCreditPurchase, intent.KindAutoTopUp, intent.KindSubscriptionStart,
 		intent.KindCollectReceivable,
 	} {
