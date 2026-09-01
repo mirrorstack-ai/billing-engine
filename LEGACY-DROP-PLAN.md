@@ -42,6 +42,66 @@ hides a real money path in a billing system. Once rows 1–7 are deleted the
 count will read 1, the residue will be unambiguous, and correcting it then is
 safe because there is nothing left for it to conceal.
 
+## 🔴 DRAINAGE IS NOT THE ONLY GATE — added 2026-09-01
+
+The table above asks one question per path: *is there in-flight state a
+deletion would strand?* That is necessary and it is **not sufficient**.
+
+A precondition can be zero — nothing in flight, nothing to strand — while the
+intent rail still cannot collect the charge the collector was making. Deleting
+it then does not migrate collection. It **stops** collection, silently, for
+that charge kind. Every precondition in the table is clear today, and the
+intent rail has never settled anything, so the table is currently at its most
+misleading.
+
+So each path needs a **second** gate: *can the replacement actually take this
+money?* Measured 2026-09-01, that is the real state:
+
+| # | path | drained? | proposes an intent? | can the rail collect it? |
+|---|---|---|---|---|
+| 1 | `cycle/charge.go` boundary | ✅ | ❌ | ❌ blocked — the invoice is FOUR §6 kinds and an intent carries one (`BOUNDARY-KIND-DECISION.md`) |
+| 2 | `cycle/overage.go` | ✅ | ✅ | ❌ every executor gate is false |
+| 3 | `cycle/domain_charges.go` | ✅ | ✅ | ❌ every executor gate is false |
+| 4 | `cycle/proration.go` | ✅ | ❌ | ❌ blocked — two §6 kinds, same decision as row 1 |
+| 5 | `creditpurchase/` | ✅ | ❌ | ❌ needs the disclosure binding, and the intent cannot yet carry the credit granted alongside the amount charged |
+| 6 | `autotopup/` | ✅ | ✅ | ❌ every executor gate is false |
+| 7 | `billing/unpaid.go` | ✅ | ❌ | ❌ **not a charge** — `InvoicePayParams{}` sends no amount; it re-settles an obligation the provider already holds, and the adapter has no operation that pays an existing invoice |
+
+**Not one row is deletable today**, and only the middle column would have said
+so before this note existed.
+
+### What has to become true, in order
+
+1. **The boundary/proration kind decision** (`BOUNDARY-KIND-DECISION.md`).
+   Rows 1 and 4 cannot even PROPOSE until it is made, and they are the two
+   largest charges in the system.
+2. **A standing authorization per account.** `billing_authorizations` measured
+   0 on 2026-08-31, and INV-006 requires one per charge. Its shape is §12 item
+   1, which is unanswered. An acceptance can no longer be a string a caller
+   invented (migration 065), so minting is a real act with a real document.
+3. **An evidence signing key.** INV-014 makes an evidence record a side effect
+   of the money moving, and both `cmd/billing-cycle` (when armed) and
+   `cmd/intent-executor` now refuse to start without one.
+4. **The executor gates.** All seventeen are hardcoded false
+   (`cmd/intent-executor/main.go`), and most need a published policy revision
+   rather than code. `EXECUTOR-GATE-PLAN.md` scores the remainder LARGE 26 /
+   MEDIUM 4 / SMALL 2.
+5. **Then arm one leg, watch it settle, and only then delete its collector** —
+   one at a time, re-running the precondition for that row in the same window
+   as the deletion.
+
+### Row 7 is not on that path at all
+
+Unpaid retry is not a charge to route. It re-attempts settlement of an
+obligation Stripe already holds; there is no integer to seal, and
+`stripeadapter.Collect` would raise a SECOND invoice beside the unpaid one.
+§6's `KindCollectReceivable` is the right model and needs a sealed SOURCE
+intent, which the 15 production invoices — all from legacy legs — do not have.
+
+It therefore becomes reachable only **after** the other legs are routed and
+the rail itself starts raising invoices that can fail. It should not be
+counted among the paths waiting on drainage.
+
 ## Order of operations
 
 1. Run the preconditions (needs the ops Lambda, or a read-only DSN).
