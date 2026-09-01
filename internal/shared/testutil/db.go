@@ -110,14 +110,23 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// had never been executed ANYWHERE — not in production, where they were
 	// recorded as applied, and not here, where a test could have noticed.
 	//
-	// NOLOGIN and no password: it is a bundle to be granted to a login
-	// identity, not an identity itself, and a test database must not contain
-	// something that can connect.
+	// WITH LOGIN and no password, because that is what production creates:
+	// infra's db-bootstrap runs CREATE ROLE billing_ro WITH LOGIN then
+	// GRANT rds_iam TO billing_ro, so the role IS the identity the ops Lambda
+	// connects as rather than a bundle granted to one.
+	//
+	// The first version of this helper used NOLOGIN, on the reasoning that a
+	// test database should hold nothing that can connect. That was a harness
+	// diverging from production to feel safer, which is the shape of defect
+	// this whole file is a response to — and the grants diagnostic caught it
+	// immediately by asking whether the role can log in. A password-less role
+	// in an ephemeral container cannot authenticate anyway: there is no
+	// rds_iam here to grant, and no password to use.
 	if _, err := pool.Exec(ctx, `
 		DO $$
 		BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'billing_ro') THEN
-				CREATE ROLE billing_ro NOLOGIN;
+				CREATE ROLE billing_ro LOGIN;
 			END IF;
 		END
 		$$;`); err != nil {
