@@ -1,0 +1,207 @@
+package creditpurchase
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
+)
+
+// capturingProposer records what the leg sealed without needing a database.
+type capturingProposer struct {
+	charges []proposer.Charge
+	err     error
+}
+
+func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (intent.ChargeIntent, error) {
+	if p.err != nil {
+		return intent.ChargeIntent{}, p.err
+	}
+	p.charges = append(p.charges, c)
+	lines := make([]intent.Line, 0, len(c.Lines))
+	facts := make([]string, 0, len(c.Lines))
+	for _, l := range c.Lines {
+		lines = append(lines, intent.NewLine(l.Description, l.SourceRef, "1", 1, l.AmountMicros))
+		facts = append(facts, l.SourceRef)
+	}
+	return intent.Seal(intent.Draft{
+		Payer:                 intent.Subject{Kind: "user", ID: "owner-of-" + c.AccountID},
+		Currency:              c.Currency,
+		Lines:                 lines,
+		Kind:                  c.Kind,
+		PriceBookRevision:     c.PriceBookRevision,
+		TermsRevision:         c.TermsRevision,
+		Tax:                   c.Tax,
+		AuthorizationID:       c.AuthorizationID,
+		NoticePolicy:          c.NoticePolicy,
+		SelectedRail:          c.SelectedRail,
+		RoutingPolicyRevision: c.RoutingPolicyRevision,
+		ExecuteNotBefore:      c.ExecuteNotBefore,
+		ExecuteNotAfter:       c.ExecuteNotAfter,
+		SourceFactKeys:        facts,
+	})
+}
+
+func pendingPurchase() Attempt {
+	return Attempt{
+		ID:                uuid.New(),
+		AccountID:         uuid.New(),
+		AmountMicros:      25_000_000,
+		Status:            "pending",
+		FundingAccountID:  uuid.New(),
+		FundingGeneration: uuid.New(),
+		StripeCustomerID:  "cus_credit_1",
+	}
+}
+
+func cutoverExecutor(t *testing.T, a Attempt, p chargeProposer) (*Executor, *fakeStore, *fakeStripe) {
+	t.Helper()
+	store := &fakeStore{attempt: a}
+	sc := &fakeStripe{}
+	e := NewExecutor(store, &fakeSettler{}, sc).
+		WithNow(func() time.Time { return time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC) })
+	if p != nil {
+		e = e.WithIntentProposer(p)
+	}
+	return e, store, sc
+}
+
+// 🔴 THE LAST LEG, AND THE ONLY ONE WHERE THE CUSTOMER IS WAITING.
+//
+// The assertion that matters is the same as every other leg's: NOTHING REACHED
+// STRIPE. A cut-over leg holds no write port.
+func TestTheCreditPurchaseLegProposesInsteadOfCharging(t *testing.T) {
+	a := pendingPurchase()
+	p := &capturingProposer{}
+	e, _, sc := cutoverExecutor(t, a, p)
+
+	res, err := e.Resume(context.Background(), a)
+	require.NoError(t, err)
+
+	require.Equal(t, "proposed", res.Attempt.Status, "the leg did not take the cutover branch")
+	require.NotEmpty(t, res.Attempt.ProposedReference,
+		"a proposed purchase carries no reference, so the row cannot be walked to its intent")
+	require.Empty(t, res.Attempt.StripeInvoiceID, "a proposed purchase reported a Stripe invoice")
+
+	require.Zero(t, sc.createInvoiceCalls, "a cut-over credit purchase created a Stripe invoice")
+	require.Zero(t, sc.finalizeCalls, "a cut-over credit purchase finalized a Stripe invoice")
+
+	require.Len(t, p.charges, 1)
+	c := p.charges[0]
+	require.Equal(t, intent.KindCreditPurchase, c.Kind)
+	require.EqualValues(t, a.AmountMicros, c.TotalMicros(),
+		"the amount changed in the cutover")
+}
+
+// 🔴 §6: buying credit is not a service you consumed. walletFunding = 0.
+//
+// A purchase funded from the wallet it is topping up is circular — it would
+// spend the balance to increase it — and the funding choice would move the
+// taxable basis. The whole obligation is the provider's to collect.
+func TestACreditPurchaseIsNeverFundedFromTheWallet(t *testing.T) {
+	a := pendingPurchase()
+	p := &capturingProposer{}
+	e, _, _ := cutoverExecutor(t, a, p)
+
+	_, err := e.Resume(context.Background(), a)
+	require.NoError(t, err)
+
+	require.Zero(t, p.charges[0].WalletAllocationMicros,
+		"the credit purchase allocated wallet credit to itself; §6 requires "+
+			"walletFunding = 0 and providerRemainder = grossObligation")
+}
+
+// The reference is prefixed so nothing downstream can read a digest as a
+// provider object id — migration 057's own reason for the column.
+func TestTheProposedReferenceIsPrefixed(t *testing.T) {
+	a := pendingPurchase()
+	e, store, _ := cutoverExecutor(t, a, &capturingProposer{})
+
+	res, err := e.Resume(context.Background(), a)
+	require.NoError(t, err)
+
+	require.Regexp(t, `^intent:[0-9a-f]{64}$`, res.Attempt.ProposedReference,
+		"the reference is not a prefixed digest, so a reader could mistake it for a "+
+			"Stripe object id")
+	require.Len(t, store.proposedRefs, 1)
+	require.Equal(t, res.Attempt.ProposedReference, store.proposedRefs[0],
+		"the durable marker and the returned attempt disagree about which intent this is")
+}
+
+// An attempt that already reached Stripe must be FINISHED there, even when the
+// cutover is armed. Abandoning a finalized invoice strands a charge the
+// customer can see and nobody can prove.
+func TestAPurchaseThatAlreadyReachedStripeStaysOnTheLegacyPath(t *testing.T) {
+	a := pendingPurchase()
+	a.StripeInvoiceID = "in_already_there"
+	p := &capturingProposer{}
+	e, _, _ := cutoverExecutor(t, a, p)
+
+	_, _ = e.Resume(context.Background(), a)
+
+	require.Empty(t, p.charges,
+		"a purchase with an invoice at the provider was proposed instead of finished; "+
+			"the recovery guard is what keeps that charge provable")
+}
+
+// Without a proposer the leg still collects, or every test above would pass
+// against a leg that had simply stopped working.
+func TestWithoutAProposerTheCreditPurchaseStillCharges(t *testing.T) {
+	a := pendingPurchase()
+	e, _, sc := cutoverExecutor(t, a, nil)
+
+	res, err := e.Resume(context.Background(), a)
+	require.NoError(t, err)
+
+	require.NotEqual(t, "proposed", res.Attempt.Status)
+	require.Positive(t, sc.createInvoiceCalls,
+		"the legacy path created no invoice; the cutover tests above would not notice a "+
+			"broken leg")
+}
+
+// A failed proposal must not fall back to charging. The customer is waiting,
+// so the temptation to "just collect it" is real, and taking it would mean a
+// charge with no sealed document behind it.
+func TestAFailedProposalDoesNotFallBackToCharging(t *testing.T) {
+	a := pendingPurchase()
+	p := &capturingProposer{err: errors.New("proposal refused")}
+	e, store, sc := cutoverExecutor(t, a, p)
+
+	_, err := e.Resume(context.Background(), a)
+	require.Error(t, err, "a failed proposal was reported as success")
+
+	require.Zero(t, sc.createInvoiceCalls, "a failed proposal fell back to charging the customer")
+	require.Equal(t, "pending", store.attempt.Status,
+		"the row moved despite the proposal failing; it must stay pending and retryable")
+	require.Empty(t, store.proposedRefs)
+}
+
+// A lost race is not a fault. Another worker moving the row first leaves the
+// intent sealed either way — Propose is idempotent on the digest.
+func TestALostRaceIsNotAnError(t *testing.T) {
+	a := pendingPurchase()
+	p := &capturingProposer{}
+	store := &fakeStore{attempt: a}
+	store.attempt.Status = "settled" // the winner already moved it
+	e := NewExecutor(store, &fakeSettler{}, &fakeStripe{}).WithIntentProposer(p)
+
+	_, err := e.Resume(context.Background(), Attempt{
+		ID: a.ID, AccountID: a.AccountID, AmountMicros: a.AmountMicros,
+		Status: "pending", FundingAccountID: a.FundingAccountID,
+		FundingGeneration: a.FundingGeneration, StripeCustomerID: a.StripeCustomerID,
+	})
+	require.NoError(t, err, "a lost race was reported as a fault")
+}
+
+// Proposing without arming is impossible, and armed is observable.
+func TestTheSeamIsObservable(t *testing.T) {
+	require.False(t, NewExecutor(&fakeStore{}, &fakeSettler{}, &fakeStripe{}).IntentProposerArmed())
+	require.True(t, NewExecutor(&fakeStore{}, &fakeSettler{}, &fakeStripe{}).
+		WithIntentProposer(&capturingProposer{}).IntentProposerArmed())
+}

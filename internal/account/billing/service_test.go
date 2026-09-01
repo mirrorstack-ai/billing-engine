@@ -193,6 +193,16 @@ func (s *fakeCreditPurchaseStore) Fail(
 	return fakeCreditPurchaseAttempt(failed), failed.Transitioned, nil
 }
 
+// MarkProposed is unused here — the billing service never arms the proposer —
+// but the interface requires it. It refuses rather than no-oping so a test
+// that unexpectedly reaches it fails loudly instead of silently taking the
+// intent path and asserting nothing.
+func (s *fakeCreditPurchaseStore) MarkProposed(
+	context.Context, creditpurchase.Attempt, string,
+) (bool, error) {
+	return false, errors.New("fakeCreditPurchaseStore: MarkProposed is not wired in these tests")
+}
+
 type fakeCreditPurchaseSettler struct {
 	store *fakeStore
 }
