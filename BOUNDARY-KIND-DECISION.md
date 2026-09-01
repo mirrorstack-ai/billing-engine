@@ -126,3 +126,64 @@ single rounding — the mechanism already merged in #154 for lines.
 **Pick A, B, C or D.** If B, I also need a steer on group identity: derive it
 from the shared source reference, or seal it (another canonical supersession,
 which is free while `charge_intents = 0` and expensive afterwards).
+
+
+---
+
+# A second leg that cannot route, for a different reason
+
+`internal/account/billing/unpaid.go` — the unpaid-invoice retry — was listed
+as one of the four remaining legs. It is not blocked on a decision. It is
+blocked on **not being a charge**.
+
+## It hands the provider no integer
+
+`internal/shared/stripe/client.go:599` is:
+
+```go
+params := &stripego.InvoicePayParams{}
+```
+
+No amount, no payment method, no idempotency key — deliberately, and the
+comment says why: Stripe replays a saved response on an identical key for
+~24h, *declines included*, so a deterministic key would replay the original
+decline after the customer fixed their card, which is the exact retry this RPC
+exists for.
+
+So a retry is **not a new charge**. It re-attempts settlement of an obligation
+the provider already holds, and the amount lives at Stripe. There is no
+integer to seal, and sealing one would either duplicate Stripe's figure or
+drift from it.
+
+## Routing it through the adapter would create a SECOND obligation
+
+`stripeadapter.Collect` creates a draft, adds items, finalizes and pays — a
+**new** invoice. It has no operation that pays an existing one. So a
+receivable intent collected the ordinary way would leave the original invoice
+open *and* raise a second one for the same money.
+
+## §6 already names the right model, and it does not fit legacy invoices
+
+`KindCollectReceivable` is exactly this case: "retries an amount already owed,
+under a one-time authorization against the sealed receipt or a standing one
+after notice." And `ChargeIntent.CollectRemainderOf` implements it.
+
+But `CollectRemainderOf` requires a **sealed source intent** — it refuses on
+`!c.Sealed()` and binds `collects` to that intent's digest. The 15 invoices in
+production came from the legacy legs and have no source intent, so there is
+nothing for a receivable to collect the remainder *of*.
+
+## The conclusion
+
+🔴 **Unpaid retry is not a leg to route. It is a leg that becomes reachable
+only after the others are routed** — once the intent rail itself raises
+invoices, a failed one has a sealed source document and a receivable can name
+it. Until then there is nothing to seal against.
+
+It also needs an adapter operation that **pays an existing provider invoice**
+rather than creating one, which does not exist today and is not the same seam
+as `Collect`.
+
+No decision is needed on this one. It should simply stop being counted among
+the legs that can be cut over now, and `REMAINING-LEGS-PLAN.md`'s tally should
+say three, not four.
