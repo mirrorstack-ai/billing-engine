@@ -125,10 +125,23 @@ func requireCentsMatchMicros(which string, cents, micros int64) error {
 // durable arming claim, never instead of it: the claim is what stops a second
 // worker charging beside this one, and a leg that skipped it to propose would
 // have removed a guard rather than replaced a charge.
+//
+// 🔴 IT IS NO LONGER OPTIONAL. The legacy collector this used to stand beside
+// is deleted, so an unset proposer is not "the old behaviour" — it is a
+// service that cannot bill this charge kind at all. Say so, loudly, at the
+// point of use: the alternative is a nil dereference inside a money path, and
+// the one after that is a charge that silently never happens.
 func (s *Service) proposeCombinedProration(
 	ctx context.Context,
 	attempt CombinedProrationAttempt,
 ) (intent.ChargeIntent, error) {
+	if s.proposer == nil {
+		return intent.ChargeIntent{}, billing.Internal(
+			"combined creation-proration has no intent proposer installed, and its direct "+
+				"charge path no longer exists; this deployment cannot bill an app's creation period",
+			nil,
+		)
+	}
 	charge, err := prorationCharge(attempt, proposer.Charge{
 		// Resolved to the account's funder's owner by the proposer, never
 		// built here — see proposer.Charge.AccountID.

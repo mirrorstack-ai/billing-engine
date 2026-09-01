@@ -26,13 +26,13 @@ type Service struct {
 	// roots install it from the API controller before any public credit RPC can
 	// name a wallet object. A nil selector preserves the component-test
 	// behavior of WithCreditWallet(true).
-	creditAccess      func(uuid.UUID) bool
-	creditGate        credit.Gate
-	observer          credit.SettlementObserver
-	creditPurchases   creditrecovery.ManualPurchaseExecutor
+	creditAccess    func(uuid.UUID) bool
+	creditGate      credit.Gate
+	observer        credit.SettlementObserver
+	creditPurchases creditrecovery.ManualPurchaseExecutor
 	// proposer is the intent seam for the unpaid-retry leg. Nil leaves it
 	// on the legacy path.
-	proposer receivableProposer
+	proposer          receivableProposer
 	creditRecovery    *creditrecovery.RuntimeCapability
 	autoTopUpRecovery AutoTopUpRecovery
 }

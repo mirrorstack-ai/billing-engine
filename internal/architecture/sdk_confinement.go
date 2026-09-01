@@ -90,6 +90,5 @@ var providerSDKImporters = map[string]string{
 	// adapter, which is exactly the reach VERIFICATION §5 wants closed.
 	"internal/account/autotopup/executor.go":      "DEBT: uses provider error types directly to classify a failed charge; belongs behind the adapter",
 	"internal/account/creditpurchase/executor.go": "DEBT: same, for the purchase path",
-	"internal/account/billing/unpaid.go":          "DEBT: same, for the pay-unpaid path",
 	"cmd/pm-default-backfill/main.go":             "DEBT: a one-off backfill binary talking to the SDK directly",
 }

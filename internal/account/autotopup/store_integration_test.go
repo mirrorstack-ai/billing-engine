@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
-	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
@@ -333,9 +332,17 @@ func TestStoreFail_ConcurrentWebhookTransitionsOnceAndAddsZeroCredit(t *testing.
 	require.Equal(t, autotopup.AcquireNew, kind)
 	require.Equal(t, int64(7_000_000), attempt.BalanceAfterMicros)
 
-	attempt, err = store.AttachInvoice(ctx, attempt, billingstripe.Invoice{
-		ID: "in_webhook_concurrent", HostedInvoiceURL: "https://stripe.test/in_webhook_concurrent",
-	})
+	// The executor no longer has a port that writes this column — the
+	// collector that did was deleted — so the pre-cutover row this test needs
+	// is staged directly.
+	_, err = pool.Exec(ctx, `
+		UPDATE ms_billing.credit_ledger
+		SET stripe_invoice_id = $2, receipt_url = $3
+		WHERE id = $1`,
+		attempt.ID, "in_webhook_concurrent", "https://stripe.test/in_webhook_concurrent",
+	)
+	require.NoError(t, err)
+	attempt, err = store.Get(ctx, accountID, attempt.ID)
 	require.NoError(t, err)
 	found, ok, err := store.FindByStripeInvoice(ctx, "in_webhook_concurrent")
 	require.NoError(t, err)

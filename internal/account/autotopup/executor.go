@@ -29,27 +29,55 @@ type Executor struct {
 	nowFn    func() time.Time
 }
 
-// chargeProposer is the intent seam, declared locally so this package does not
-// depend on the intent packages when it is unwired.
+// chargeProposer is the intent seam, declared locally so this package owns the
+// shape it seals through rather than inheriting it.
 type chargeProposer interface {
 	Propose(ctx context.Context, c proposer.Charge) (intent.ChargeIntent, error)
 }
 
-// WithIntentProposer cuts this executor over to the intent path.
+// WithIntentProposer installs the proposer this executor seals through.
 //
-// Nil by default, which is byte-for-byte the legacy collecting behaviour.
+// It is no longer a cutover switch. The legacy collector is deleted, so an
+// executor without a real proposer has no other path — it refuses (see
+// unarmedProposer) rather than falling back to charging a card, because there
+// is nothing left to fall back to.
+//
 // NewStandardExecutor is what makes this ONE hang point rather than six —
 // SECURITY.md records four ordinary read and ingest paths reaching this
-// executor, so a seam installed in five of six binaries would leave a path
-// that still collects.
+// executor, so a proposer installed in five of six binaries would leave a
+// path that seals nothing and silently stops refilling wallets.
 //
-// 🔴 Arming it must be as deliberate as cmd/billing-cycle's flag, and for a
-// harder reason: a proposing auto-top-up collects nothing, so wallets never
-// refill and blocked accounts stay blocked. That is worse than the cycle legs'
-// revenue stop, which is why no binary wires this yet.
+// 🔴 Installing it is still as deliberate as cmd/billing-cycle's flag, and
+// for a harder reason: a proposing auto-top-up collects nothing, so wallets
+// never refill and blocked accounts stay blocked until the intent executor
+// runs. That is worse than the cycle legs' revenue stop.
 func (e *Executor) WithIntentProposer(p chargeProposer) *Executor {
+	if p == nil {
+		panic("autotopup.Executor.WithIntentProposer: proposer must not be nil")
+	}
 	e.proposer = p
 	return e
+}
+
+// ErrProposerUnarmed is what this leg does instead of collecting when no
+// proposer has been installed.
+//
+// It is not a degraded mode and it is not "evidence off". The collector this
+// executor used to fall back to no longer exists, so a deployment that has
+// not installed a proposer cannot fund a wallet by any route. Saying so at the
+// first trigger is the only honest option: the alternatives are a nil panic in
+// a webhook handler, or a silent no-op that looks exactly like an account that
+// did not need topping up.
+var ErrProposerUnarmed = errors.New(
+	"autotopup: no intent proposer installed and the legacy collector is deleted",
+)
+
+// unarmedProposer is the proposer every executor starts with, so the leg has
+// exactly one path and no nil check standing between it and a provider.
+type unarmedProposer struct{}
+
+func (unarmedProposer) Propose(context.Context, proposer.Charge) (intent.ChargeIntent, error) {
+	return intent.ChargeIntent{}, ErrProposerUnarmed
 }
 
 // NewStandardExecutor builds the executor the way every binary that has one
@@ -65,8 +93,13 @@ func (e *Executor) WithIntentProposer(p chargeProposer) *Executor {
 //
 // Consolidating first means the intent seam gets ONE hang point rather than
 // six chances to miss one. SECURITY.md records that four ordinary read and
-// ingest paths can reach this executor, so a missed site is not a cosmetic
-// inconsistency — it is a path that still collects.
+// ingest paths can reach this executor.
+//
+// 🔴 This constructor installs NO proposer, and since the legacy collector
+// was deleted that is a leg which refuses every trigger (ErrProposerUnarmed)
+// rather than one that quietly charges a card. Wiring a real proposer is the
+// deployment's job; cmd/billing-cycle's withIntentCutover is the pattern,
+// including its refusal to start without evidence signing material.
 func NewStandardExecutor(pool *pgxpool.Pool, stripeKey string) *Executor {
 	return NewExecutor(
 		NewStore(pool),
@@ -80,7 +113,8 @@ func NewExecutor(store Store, settler Settler, stripe StripeClient) *Executor {
 		panic("autotopup.NewExecutor: store, settler, and stripe must not be nil")
 	}
 	return &Executor{
-		store: store, settler: settler, stripe: stripe, nowFn: time.Now,
+		store: store, settler: settler, stripe: stripe,
+		proposer: unarmedProposer{}, nowFn: time.Now,
 	}
 }
 
@@ -419,316 +453,80 @@ func (e *Executor) resume(ctx context.Context, attempt Attempt, isNew bool) (Res
 	}
 	attempt = current
 
-	// 🔴 The cutover point for this leg.
+	// 🔴 THE LEGACY COLLECTOR IS GONE. This leg proposes, and the
+	// proposal is not conditional on anything — there is no second branch
+	// to fall through to, and no arming flag that turns collecting back on.
 	//
-	// BEFORE recoverOrCreateInvoice, because that call is what arms the
-	// provider: past it an invoice exists at Stripe, and the intent path
-	// holds no write port to finalize or void one, so sealing beside it
-	// would strand a live provider object for as long as the account
-	// exists. The boundary leg learned this expensively — its first
-	// cutover sealed a second obligation over an invoice another process
-	// had already collected.
-	//
-	// Still AFTER a durable claim: Trigger created this attempt pending
-	// before anything reached a provider, so the crash-recovery guard the
-	// legacy path relies on is intact.
+	// Still AFTER the durable claim: Acquire created this attempt pending
+	// before anything could reach a provider, so the crash-recovery read
+	// below is looking at a row that already exists.
 	//
 	// StripeInvoiceID is the direct refutation of "nothing has been
-	// collected for this attempt". If one exists, the rail that started
-	// the charge is the rail that finishes it.
-	if e.proposer != nil && attempt.StripeInvoiceID == "" {
+	// collected for this attempt", and it is the ONE thing here that may
+	// still touch Stripe. A row carrying one was armed by a pre-cutover run
+	// that left a draft or a finalized invoice at the provider. Proposing
+	// over it would seal a SECOND obligation for the same money — the bug
+	// the boundary leg shipped. Resolving it is not collecting; see
+	// resolveLegacyInvoice.
+	if attempt.StripeInvoiceID == "" {
 		return e.proposeAutoTopUp(ctx, attempt, isNew)
 	}
+	return e.resolveLegacyInvoice(ctx, attempt, "legacy_collector_removed", isNew)
+}
 
-	invoice, attempt, err := e.recoverOrCreateInvoice(ctx, attempt)
+// resolveLegacyInvoice finishes an attempt that a pre-cutover run already
+// left at the provider. It is all that remains of the legacy rail, and every
+// branch of it either records money Stripe ALREADY took or destroys an
+// obligation that was never collected:
+//
+//   - paid → settle, because the customer was charged and the wallet must
+//     show it;
+//   - draft → delete, because an unfinalized draft has taken nothing;
+//   - open or uncollectible → void, because an open invoice is one the
+//     customer can still pay through its hosted URL. Abandoning it would
+//     leave a live charge against a ledger row that is already terminal —
+//     money arriving with nothing to credit it to, which is exactly the
+//     charge nobody can prove.
+//
+// It never creates, finalizes, or pays. A top-up not collected here is
+// re-proposed by the next Trigger through the intent rail.
+func (e *Executor) resolveLegacyInvoice(
+	ctx context.Context,
+	attempt Attempt,
+	failureCode string,
+	isNew bool,
+) (Result, error) {
+	invoice, err := e.stripe.GetInvoice(ctx, attempt.StripeInvoiceID)
 	if err != nil {
+		return resultFor(attempt, isNew), fmt.Errorf("retrieve auto-top-up invoice: %w", err)
+	}
+	if err := validateInvoiceOwnership(attempt, invoice); err != nil {
 		return resultFor(attempt, isNew), err
 	}
 	if handled, result, err := e.handleTerminalInvoice(ctx, attempt, invoice, isNew); handled {
 		return result, err
 	}
-
-	if invoice.Status == "" || invoice.Status == "draft" {
-		invoice, err = e.finalizeDraft(ctx, attempt, invoice)
-		if err != nil {
-			return resultFor(attempt, isNew), err
-		}
-		if handled, result, err := e.handleTerminalInvoice(ctx, attempt, invoice, isNew); handled {
-			return result, err
-		}
-	}
-
-	if invoice.Status != "open" {
-		return resultFor(attempt, isNew), fmt.Errorf(
-			"auto-top-up invoice %s is not payable in status %q",
-			invoice.ID,
-			invoice.Status,
-		)
-	}
-	if invariantErr := e.validatePayableInvoice(ctx, attempt, invoice); invariantErr != nil {
-		// An open invoice with no money collected is safe to close. Void it
-		// before releasing the durable pending guard, exactly like a proven
-		// card decline. A partially paid or unreadable resource stays pending.
-		if invoice.AmountPaid == 0 &&
-			invoice.ID == attempt.StripeInvoiceID &&
-			invoice.CustomerID == attempt.StripeCustomerID {
-			result, closeErr := e.voidAndFail(
-				ctx,
-				attempt,
-				invoice,
-				"invoice_invariant_mismatch",
-				isNew,
-			)
-			if closeErr != nil {
-				return result, fmt.Errorf(
-					"auto-top-up invoice invariant failed: %v; safe close failed: %w",
-					invariantErr,
-					closeErr,
-				)
-			}
-			return result, nil
-		}
-		return resultFor(attempt, isNew), fmt.Errorf(
-			"auto-top-up invoice invariant failed with nonzero amount_paid; leaving pending: %w",
-			invariantErr,
-		)
-	}
-
-	paid, payErr := e.stripe.PayInvoiceWithMethod(
-		ctx,
-		invoice.ID,
-		attempt.StripePaymentMethodID,
-		"credit-auto-topup-pay:"+attempt.ID.String(),
-	)
-	if payErr != nil {
-		return e.resolvePayError(ctx, attempt, invoice, payErr, isNew)
-	}
-	if handled, result, err := e.handleTerminalInvoice(ctx, attempt, paid, isNew); handled {
-		return result, err
-	}
-	return resultFor(attempt, isNew), nil
+	return e.voidAndFail(ctx, attempt, invoice, failureCode, isNew)
 }
 
-// reconcileExpired establishes terminal Stripe truth before releasing the
-// partial unique pending guard. A recovered draft is permanently deleted and
-// independently verified missing; a finalized invoice is voided or settled
-// from exact payment truth. Both paths establish a resource-level barrier
-// against a concurrent stale worker paying after the ledger is failed.
+// reconcileExpired establishes terminal truth before releasing the partial
+// unique pending guard.
+//
+// An attempt with no attached invoice has no provider truth to establish. The
+// intent path reaches nothing before MarkProposed, and the deleted legacy path
+// only ever added the priced line AFTER AttachInvoice — so a run that crashed
+// between creating the invoice and attaching it left at most an EMPTY draft,
+// with auto_advance disabled and no amount. That cannot collect, so the guard
+// is released from durable truth alone, with no provider call at all.
+//
+// An attempt that does carry an invoice is resolved exactly like a foreground
+// in-flight row: settled if Stripe already took the money, closed if it did
+// not. Both establish a resource-level barrier against a stale worker.
 func (e *Executor) reconcileExpired(ctx context.Context, attempt Attempt) (Result, error) {
-	invoice, attempt, err := e.recoverOrCreateInvoice(ctx, attempt)
-	if err != nil {
-		return resultFor(attempt, false), err
+	if attempt.StripeInvoiceID == "" {
+		return e.failWithoutStripeResource(ctx, attempt, "attempt_expired", false)
 	}
-	if handled, result, err := e.handleTerminalInvoice(ctx, attempt, invoice, false); handled {
-		return result, err
-	}
-	return e.voidAndFail(ctx, attempt, invoice, "attempt_expired", false)
-}
-
-func (e *Executor) recoverOrCreateInvoice(
-	ctx context.Context,
-	attempt Attempt,
-) (billingstripe.Invoice, Attempt, error) {
-	var (
-		invoice billingstripe.Invoice
-		err     error
-	)
-	ref := "credit-auto-topup:" + attempt.ID.String()
-	if attempt.StripeInvoiceID != "" {
-		invoice, err = e.stripe.GetInvoice(ctx, attempt.StripeInvoiceID)
-		if err != nil {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf("retrieve auto-top-up invoice: %w", err)
-		}
-	} else {
-		var found bool
-		invoice, found, err = e.stripe.FindInvoiceByRef(ctx, attempt.StripeCustomerID, ref)
-		if err != nil {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf("recover auto-top-up invoice: %w", err)
-		}
-		if !found {
-			invoice, err = e.stripe.CreateAutoTopUpInvoice(
-				ctx,
-				attempt.StripeCustomerID,
-				attempt.StripePaymentMethodID,
-				attempt.AccountID.String(),
-				attempt.ID.String(),
-				"credit-auto-topup-invoice:"+attempt.ID.String(),
-			)
-			if err != nil {
-				return billingstripe.Invoice{}, attempt, fmt.Errorf("create auto-top-up invoice: %w", err)
-			}
-		}
-		if err := validateInvoiceOwnership(attempt, invoice); err != nil {
-			return billingstripe.Invoice{}, attempt, err
-		}
-		attempt, err = e.store.AttachInvoice(ctx, attempt, invoice)
-		if err != nil {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf("attach auto-top-up invoice: %w", err)
-		}
-	}
-	if err := validateInvoiceOwnership(attempt, invoice); err != nil {
-		return billingstripe.Invoice{}, attempt, err
-	}
-	return invoice, attempt, nil
-}
-
-// finalizeDraft always pins the exact credit line before opening an invoice.
-// This helper is shared by the ordinary charge path and expired-attempt
-// reconciliation: a process may crash immediately after the durable attempt
-// insert, leaving no Stripe resource/line to recover. Finalizing that empty
-// draft could otherwise produce a paid $0 invoice and strand the pending
-// guard. Both calls are deterministically idempotent.
-func (e *Executor) finalizeDraft(
-	ctx context.Context,
-	attempt Attempt,
-	invoice billingstripe.Invoice,
-) (billingstripe.Invoice, error) {
-	verifiedDraft, err := e.ensureDraftLine(ctx, attempt, invoice)
-	if err != nil {
-		return invoice, err
-	}
-	finalized, err := e.stripe.FinalizeInvoiceWithoutAutoAdvance(
-		ctx,
-		verifiedDraft.ID,
-		"credit-auto-topup-finalize:"+attempt.ID.String(),
-	)
-	if err != nil {
-		return invoice, fmt.Errorf("finalize auto-top-up invoice: %w", err)
-	}
-	if finalized.ID == "" {
-		return invoice, fmt.Errorf("Stripe finalized an invoice without id")
-	}
-	if finalized.ID != verifiedDraft.ID {
-		return invoice, fmt.Errorf(
-			"Stripe finalized invoice %q instead of attached invoice %q",
-			finalized.ID,
-			verifiedDraft.ID,
-		)
-	}
-	// Never pay based only on the finalize response. Re-read the resource so
-	// post-finalization amount/currency/customer truth is independently
-	// established before the explicit pay call.
-	latest, err := e.stripe.GetInvoice(ctx, finalized.ID)
-	if err != nil {
-		return finalized, fmt.Errorf("retrieve finalized auto-top-up invoice: %w", err)
-	}
-	return latest, nil
-}
-
-// ensureDraftLine establishes Stripe resource truth before relying on an
-// idempotency key. Stripe may prune keys after roughly 24 hours, while a
-// durable attempt can be recovered later. An already-priced draft is reused
-// only when its total and currency exactly match this frozen attempt; a
-// mismatched or duplicate full line fails closed before finalize/pay.
-func (e *Executor) ensureDraftLine(
-	ctx context.Context,
-	attempt Attempt,
-	invoice billingstripe.Invoice,
-) (billingstripe.Invoice, error) {
-	expectedCents := microsToCentsRoundHalfUp(attempt.AmountMicros)
-	items, err := e.stripe.ListInvoiceItems(ctx, invoice.ID)
-	if err != nil {
-		return invoice, fmt.Errorf("list auto-top-up draft items: %w", err)
-	}
-	if len(items) == 0 {
-		if invoice.AmountDue != 0 || invoice.AmountPaid != 0 {
-			return invoice, fmt.Errorf(
-				"empty auto-top-up draft %s has amount_due=%d amount_paid=%d",
-				invoice.ID,
-				invoice.AmountDue,
-				invoice.AmountPaid,
-			)
-		}
-		if _, err := e.stripe.CreateInvoiceItem(
-			ctx,
-			attempt.StripeCustomerID,
-			invoice.ID,
-			expectedCents,
-			"usd",
-			"MirrorStack automatic credit top-up",
-			billingstripe.LinePeriod{},
-			"credit-auto-topup-item:"+attempt.ID.String(),
-		); err != nil {
-			return invoice, fmt.Errorf("create auto-top-up invoice item: %w", err)
-		}
-		// Re-read after the write; this proves a newly-created (or idempotently
-		// replayed) item became exactly one attached line.
-		invoice, err = e.stripe.GetInvoice(ctx, invoice.ID)
-		if err != nil {
-			return invoice, fmt.Errorf("retrieve auto-top-up draft after item: %w", err)
-		}
-		items, err = e.stripe.ListInvoiceItems(ctx, invoice.ID)
-		if err != nil {
-			return invoice, fmt.Errorf("re-list auto-top-up draft items: %w", err)
-		}
-	}
-	if err := validateInvoiceResource(attempt, invoice, items, "draft"); err != nil {
-		return invoice, err
-	}
-	return invoice, nil
-}
-
-func (e *Executor) validatePayableInvoice(
-	ctx context.Context,
-	attempt Attempt,
-	invoice billingstripe.Invoice,
-) error {
-	items, err := e.stripe.ListInvoiceItems(ctx, invoice.ID)
-	if err != nil {
-		return fmt.Errorf("list finalized auto-top-up invoice items: %w", err)
-	}
-	return validateInvoiceResource(attempt, invoice, items, "open")
-}
-
-func validateInvoiceResource(
-	attempt Attempt,
-	invoice billingstripe.Invoice,
-	items []billingstripe.InvoiceItem,
-	requiredStatus string,
-) error {
-	expectedCents := microsToCentsRoundHalfUp(attempt.AmountMicros)
-	if err := validateInvoiceIdentityAndLine(attempt, invoice, items); err != nil {
-		return err
-	}
-	if invoice.Status != requiredStatus {
-		return fmt.Errorf(
-			"auto-top-up invoice %s status is %q; expected %q",
-			invoice.ID,
-			invoice.Status,
-			requiredStatus,
-		)
-	}
-	if invoice.CollectionMethod != string(stripego.InvoiceCollectionMethodChargeAutomatically) {
-		return fmt.Errorf(
-			"auto-top-up invoice %s collection_method is %q; expected charge_automatically",
-			invoice.ID,
-			invoice.CollectionMethod,
-		)
-	}
-	if invoice.AutoAdvance {
-		return fmt.Errorf(
-			"auto-top-up invoice %s has auto_advance enabled; expected disabled",
-			invoice.ID,
-		)
-	}
-	if invoice.DefaultPaymentMethodID != attempt.StripePaymentMethodID {
-		return fmt.Errorf(
-			"auto-top-up invoice %s default payment method is %q; expected frozen method %q",
-			invoice.ID,
-			invoice.DefaultPaymentMethodID,
-			attempt.StripePaymentMethodID,
-		)
-	}
-	if invoice.AmountDue != expectedCents || invoice.AmountPaid != 0 {
-		return fmt.Errorf(
-			"auto-top-up invoice %s has amount_due=%d amount_paid=%d; expected %d/0",
-			invoice.ID,
-			invoice.AmountDue,
-			invoice.AmountPaid,
-			expectedCents,
-		)
-	}
-	return nil
+	return e.resolveLegacyInvoice(ctx, attempt, "attempt_expired", false)
 }
 
 func validatePaidInvoiceResource(
@@ -922,44 +720,6 @@ func validateInvoiceOwnership(attempt Attempt, invoice billingstripe.Invoice) er
 		)
 	}
 	return nil
-}
-
-func (e *Executor) resolvePayError(
-	ctx context.Context,
-	attempt Attempt,
-	invoice billingstripe.Invoice,
-	payErr error,
-	isNew bool,
-) (Result, error) {
-	latest, readErr := e.stripe.GetInvoice(ctx, invoice.ID)
-	if readErr == nil {
-		if handled, result, err := e.handleTerminalInvoice(ctx, attempt, latest, isNew); handled {
-			return result, err
-		}
-	}
-
-	failureCode, deterministic := deterministicPaymentFailure(payErr)
-	if !deterministic {
-		if readErr != nil {
-			return resultFor(attempt, isNew), fmt.Errorf(
-				"pay auto-top-up invoice: %w (re-read also failed: %v)",
-				payErr,
-				readErr,
-			)
-		}
-		// Network/API ambiguity remains pending and recoverable.
-		return resultFor(attempt, isNew), fmt.Errorf("pay auto-top-up invoice: %w", payErr)
-	}
-	if readErr != nil {
-		// Never fail the ledger from an error alone. We must prove paid or close
-		// the unpaid Stripe resource first.
-		return resultFor(attempt, isNew), fmt.Errorf(
-			"deterministic payment failure %q could not be reconciled: %w",
-			failureCode,
-			readErr,
-		)
-	}
-	return e.voidAndFail(ctx, attempt, latest, failureCode, isNew)
 }
 
 func (e *Executor) voidAndFail(
@@ -1269,27 +1029,6 @@ func (e *Executor) observe(ctx context.Context, accountID uuid.UUID) {
 		slog.WarnContext(ctx, "auto-top-up settlement observer failed; durable truth committed",
 			"account_id", accountID, "error", err)
 	}
-}
-
-func deterministicPaymentFailure(err error) (string, bool) {
-	var stripeErr *stripego.Error
-	if !errors.As(err, &stripeErr) {
-		return "", false
-	}
-	if stripeErr.Code == stripego.ErrorCodeInvoicePaymentIntentRequiresAction {
-		return "authentication_required", true
-	}
-	if stripeErr.Type != stripego.ErrorTypeCard && stripeErr.DeclineCode == "" {
-		return "", false
-	}
-	code := string(stripeErr.DeclineCode)
-	if code == "" {
-		code = string(stripeErr.Code)
-	}
-	if code == "" {
-		code = "card_declined"
-	}
-	return strings.ToLower(code), true
 }
 
 func resultFor(attempt Attempt, isNew bool) Result {

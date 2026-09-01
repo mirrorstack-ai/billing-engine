@@ -70,9 +70,21 @@ func TestEveryCollectingLegCanBeReplacedOrIsNamed(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", rel, err)
 		}
-		// A leg proposes when it branches on an installed proposer. Every
-		// cut-over leg does this the same way, after its own arming claim.
-		if strings.Contains(string(src), ".proposer != nil") {
+		// 🔴 A leg proposes when it CALLS a proposer — not when it branches on
+		// one.
+		//
+		// This looked for ".proposer != nil" while the cutover was optional,
+		// and every leg had that branch. The legacy drop made the proposal
+		// UNCONDITIONAL, so the branch is gone and the grep started reporting
+		// six fully-routed legs as unrouted. A detector keyed on the shape of a
+		// transitional state fails exactly when that state ends — which is the
+		// moment it most needs to be right.
+		//
+		// It now looks for the call. A leg that seals through the proposer has
+		// a replacement; one that does not, does not.
+		if strings.Contains(string(src), ".proposer.Propose") ||
+			strings.Contains(string(src), ".proposer.ProposeGroup") ||
+			strings.Contains(string(src), ".proposer.SourceIntentFor") {
 			if reason, named := unroutedLegs[rel]; named {
 				t.Errorf("%s now has a proposer branch but is still listed as unrouted.\n"+
 					"Remove its entry — a stale exemption hides the next leg that genuinely "+

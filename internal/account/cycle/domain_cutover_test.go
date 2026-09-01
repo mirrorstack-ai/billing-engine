@@ -128,57 +128,35 @@ func TestDomainLegProposesInsteadOfCharging(t *testing.T) {
 	require.Contains(t, p.charges[0].Lines[0].Description, cand.Hostname)
 }
 
-// With no proposer the leg behaves exactly as before, which is what
-// makes the cutover reversible and lets it be enabled per deployment.
-func TestWithoutAProposerTheLegStillCharges(t *testing.T) {
+// The legacy collect path is deleted, so a service built without a proposer
+// has no way to charge for a domain. It must say so rather than nil-panic at
+// the seal or silently leave the row unresolved forever.
+//
+// This replaces TestWithoutAProposerTheLegStillCharges, which asserted the
+// legacy draft/item/finalize sequence still collected. That sequence no longer
+// exists, so the old test was pinning a path rather than a behaviour.
+func TestWithoutAProposerTheLegRefusesRatherThanCharging(t *testing.T) {
 	recorder := stripetest.New()
 	store := newFakeStore()
 	cand := seedDomain(t, store)
 
-	res, err := cycle.NewService(store, recorder).ChargeDomain(context.Background(), cand, time.Now().UTC())
-	require.NoError(t, err)
+	_, err := cycle.NewService(store, recorder).ChargeDomain(context.Background(), cand, time.Now().UTC())
+	require.Error(t, err,
+		"a service with no proposer accepted a domain charge; the leg has no collector left to run")
 
-	require.NotEqual(t, cycle.DomainChargeProposed, res.Status,
-		"the legacy path took the cutover branch with no proposer installed")
-	require.NotEmpty(t, recorder.CallsWithEffect(stripetest.EffectCollect),
-		"the legacy path collected nothing; this test would not notice a broken cutover")
+	recorder.RequireNoProviderMutation(t, "a domain leg with no proposer installed")
 }
 
-// The derived amount must be identical either way. A cutover that
-// changed the figure would be a repricing wearing a migration's name,
-// and shadow reconciliation would never catch it — it compares the new
-// rater against history, not the legacy leg against itself.
-func TestTheCutoverDoesNotChangeTheAmount(t *testing.T) {
-	now := time.Now().UTC()
-
-	legacyStore := newFakeStore()
-	legacyCand := seedDomain(t, legacyStore)
-	legacyRes, err := cycle.NewService(legacyStore, stripetest.New()).
-		ChargeDomain(context.Background(), legacyCand, now)
-	require.NoError(t, err)
-	require.Positive(t, legacyRes.ChargedCents,
-		"the legacy fixture charged nothing, so this comparison would pass vacuously")
-
-	p := &capturingProposer{}
-	proposedStore := newFakeStore()
-	proposedCand := seedDomain(t, proposedStore)
-	// Same activation instants, so the two runs price the same shape.
-	proposedCand.ActivatedAt = legacyCand.ActivatedAt
-	proposedCand.AccountActivatedAt = legacyCand.AccountActivatedAt
-
-	_, err = cycle.NewService(proposedStore, stripetest.New()).
-		WithIntentProposer(p).
-		ChargeDomain(context.Background(), proposedCand, now)
-	require.NoError(t, err)
-	require.Len(t, p.charges, 1)
-
-	// The legacy path rounds to whole cents at the Stripe boundary; the
-	// proposed intent keeps micro-dollars. Comparing at cents compares
-	// the same decision.
-	proposedCents := (p.charges[0].TotalMicros() + 5_000) / 10_000
-	require.Equal(t, legacyRes.ChargedCents, proposedCents,
-		"the cutover changed what the customer is charged")
-}
+// TestTheCutoverDoesNotChangeTheAmount was deleted with the legacy collect
+// path: its reference figure was the amount the legacy leg handed Stripe, and
+// there is no longer a legacy leg to run for comparison.
+//
+// What it protected survives elsewhere and is stronger:
+// recovery_exception_test.go's TestASealedDomainChargeIsAlwaysWholeCents ties
+// the sealed micros to the leg's own derived ChargedCents on a deliberately
+// FRACTIONAL fixture (122.5806 cents), which the round-number fixture here
+// could never have caught. The derivation itself — domainChargeShape,
+// centsFromMicros, collectableMicros — is untouched by the cutover.
 
 // chargeLines and chargeFacts mirror what the real proposer builds, so a
 // capturing fake cannot drift from the seam it stands in for.

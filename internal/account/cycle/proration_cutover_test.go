@@ -57,21 +57,13 @@ func TestProrationLegProposesInsteadOfCharging(t *testing.T) {
 		"the leg proposed a zero charge; the proration was lost in the cutover")
 }
 
-// Without a proposer the leg still collects, or the test above would pass
-// against a leg that had simply stopped working.
-func TestWithoutAProposerTheProrationStillCharges(t *testing.T) {
-	store := newFakeStore()
-	user, _ := registeredAccount(store)
-	sc := newFakeStripe()
-	svc := appsSvc(store, sc)
-
-	appID := uuid.New()
-	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 0)
-
-	res, err := svc.ChargeCreationProration(context.Background(), appID)
-	require.NoError(t, err)
-
-	require.NotEqual(t, cycle.ProrationStatusProposed, res.Status)
-	require.NotEmpty(t, sc.finalizeCalls,
-		"the legacy path collected nothing; the cutover test above would not notice a broken leg")
-}
+// DELETED with the path it tested: TestWithoutAProposerTheProrationStillCharges
+// asserted that a service with NO proposer still finalized a Stripe invoice —
+// "or the test above would pass against a leg that had simply stopped
+// working". That non-vacuity argument was sound while two paths existed. There
+// is one now: the leg has no direct charge path at all, and a service without
+// a proposer cannot bill an app's creation period — it says so and fails.
+//
+// The test above is not vacuous without it. It asserts a POSITIVE outcome —
+// a sealed charge with a real amount, a terminal stamp naming that intent's
+// digest — which a leg that had stopped working could not produce.

@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
-	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 type pgxStore struct {
@@ -219,33 +218,6 @@ func (s *pgxStore) FindByStripeInvoice(
 		return Attempt{}, false, err
 	}
 	return attempt, true, nil
-}
-
-func (s *pgxStore) AttachInvoice(ctx context.Context, attempt Attempt, invoice billingstripe.Invoice) (Attempt, error) {
-	if invoice.ID == "" {
-		return Attempt{}, fmt.Errorf("stripe invoice id required")
-	}
-	_, err := s.q.AttachAutoTopUpInvoice(ctx, db.AttachAutoTopUpInvoiceParams{
-		StripeInvoiceID: invoice.ID,
-		ReceiptUrl:      invoice.HostedInvoiceURL,
-		AttemptID:       attempt.ID.String(),
-		AccountID:       attempt.AccountID.String(),
-	})
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return Attempt{}, err
-	}
-	current, getErr := s.Get(ctx, attempt.AccountID, attempt.ID)
-	if getErr != nil {
-		return Attempt{}, getErr
-	}
-	if current.StripeInvoiceID != invoice.ID {
-		return Attempt{}, fmt.Errorf(
-			"auto-top-up attempt %s is already attached to invoice %q",
-			attempt.ID,
-			current.StripeInvoiceID,
-		)
-	}
-	return current, nil
 }
 
 // MarkProposed stamps the intent-path terminal marker.

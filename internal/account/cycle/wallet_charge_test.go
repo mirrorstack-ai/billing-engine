@@ -85,13 +85,17 @@ func TestRunBillingCycle_StandardWalletDrawsThenChargesOnlyRemainder(t *testing.
 	sc := newFakeStripe()
 	sc.invoiceAmountDue = 60
 
-	resp, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	svc, p := chargeSvcProposing(store, sc)
+	resp, err := svc.WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.EqualValues(t, 400_000, resp.WalletDrawnMicros)
-	require.EqualValues(t, 60, resp.ChargedCents)
-	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 60, sc.itemCalls[0].amountCfg)
+	// The credit is CARRIED on the intents rather than netted out of them: the
+	// gross is still $1, and 400_000 micros of it are already funded, so what a
+	// provider is asked for is the same 600_000 the legacy path sent.
+	require.EqualValues(t, 1_000_000, proposedMicros(t, p))
+	require.EqualValues(t, 600_000, proposedRemainderMicros(t, p))
+	require.Empty(t, sc.itemCalls)
 	require.Zero(t, store.walletSources[source].remaining)
 }
 
@@ -183,20 +187,55 @@ func TestRunBillingCycle_PartialWalletCommitCrashThenMasterOffChargesOnlyFrozenR
 
 	store.hasPM = true
 	store.stripeCustomer = "cus_wallet_crash_remainder"
-	sc.invoiceAmountDue = 60
-	resp, err := chargeSvc(store, sc).
+	svc, p := chargeSvcProposing(store, sc)
+	resp, err := svc.
 		WithCreditWallet(false).
 		RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.Zero(t, resp.WalletDrawnMicros,
 		"true off must recover exclusively from the legacy billing_run marker")
-	require.EqualValues(t, 60, resp.ChargedCents)
-	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 60, sc.itemCalls[0].amountCfg)
+	require.Empty(t, sc.itemCalls)
 	require.EqualValues(t, 1, store.walletDrawCalls,
 		"the true-off reclaim performs zero migration-048 wallet operations")
+
+	// 🔴 DEFECT, PINNED WHERE IT HAPPENS — do not read this assertion as the
+	// intended amount.
+	//
+	// ✅ FIXED. The deleted collector charged the FROZEN REMAINDER — 60¢,
+	// because the wallet's 400_000 micros were already debited and durable.
+	//
+	// The proposal is still built from LIVE components, and
+	// summary.WalletDrawnMicros is still zero here: the wallet recovery read is
+	// gated on !hasFrozen, deliberately, because once a charge is frozen the
+	// run marker is the authority and true-off recovery must execute no
+	// migration-048 SQL.
+	//
+	// So splitBoundary DERIVES the wallet share from the frozen figure instead
+	// of reading it: remainder = frozen, wallet = gross − frozen. The gross is
+	// unchanged at 1_000_000 — that is what this boundary costs — and the
+	// customer is asked for 600_000, once, for the part the wallet did not
+	// already cover.
+	//
+	// The gross is asserted here and the SPLIT below, because a gross that
+	// looked right while the wallet share was zero is exactly the shape the
+	// defect had.
+	require.EqualValues(t, 1_000_000, proposedMicros(t, p),
+		"the boundary's gross changed; this period costs what it costs regardless of funding")
+
+	var wallet, remainder int64
+	for _, c := range p.groups[0] {
+		wallet += c.WalletAllocationMicros
+		remainder += c.TotalMicros() - c.WalletAllocationMicros
+	}
+	require.EqualValues(t, 400_000, wallet,
+		"the credit already debited by the crashed attempt was not carried into the proposal; "+
+			"the customer is being asked a second time for credit they already spent")
+	require.EqualValues(t, 600_000, remainder,
+		"the provider remainder is not the frozen 60¢ the crashed attempt committed to")
+	require.EqualValues(t, 60, frozenClaim(t, store).Cents,
+		"the frozen remainder the legacy path would have collected")
 }
 
 func TestRunBillingCycle_PartialWalletCommitCrashThenExcludedReclaimUsesRunMarker(t *testing.T) {
@@ -214,23 +253,27 @@ func TestRunBillingCycle_PartialWalletCommitCrashThenExcludedReclaimUsesRunMarke
 
 	store.hasPM = true
 	store.stripeCustomer = "cus_wallet_excluded_recovery"
-	sc.invoiceAmountDue = 60
 	var telemetry bytes.Buffer
-	resp, err := chargeSvc(store, sc).
+	svc, p := chargeSvcProposing(store, sc)
+	resp, err := svc.
 		WithCreditWallet(true).
 		WithCreditRollout(cycleRolloutController(rollout.ModeEnforce, "0", &telemetry)).
 		RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
-	require.EqualValues(t, 60, resp.ChargedCents)
+	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.EqualValues(t, 1, store.walletDrawCalls,
 		"an excluded reclaim must not re-enter the wallet graph")
 	require.Zero(t, store.walletModeCalls)
 	require.EqualValues(t, 1, store.walletStateCalls,
 		"only the original selected attempt read wallet state")
-	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 60, sc.itemCalls[0].amountCfg)
+	require.Empty(t, sc.itemCalls)
+	// Same defect as
+	// TestRunBillingCycle_PartialWalletCommitCrashThenMasterOffChargesOnlyFrozenRemainder,
+	// reached through the rollout exclusion instead of the master switch: the
+	// frozen 60¢ remainder is not what gets sealed.
+	require.EqualValues(t, 1_000_000, proposedMicros(t, p))
+	require.EqualValues(t, 60, frozenClaim(t, store).Cents)
 }
 
 func TestRunBillingCycle_FullWalletCommitCrashThenMasterOffTerminatesWithoutStripeOrPM(t *testing.T) {
@@ -283,19 +326,23 @@ func TestRunBillingCycle_ConcurrentStripeFreezeWinsBeforeWalletLockForbidsNewDeb
 	sc := newFakeStripe()
 	sc.invoiceAmountDue = 100
 
-	resp, err := chargeSvc(store, sc).
+	svc, p := chargeSvcProposing(store, sc)
+	resp, err := svc.
 		WithCreditWallet(true).
 		RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
-	require.EqualValues(t, 100, resp.ChargedCents)
+	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.Zero(t, resp.WalletDrawnMicros)
 	require.EqualValues(t, 1_000_000, store.walletSources[source].remaining,
 		"a marker found under the draw transaction's run lock forbids allocation")
 	require.Empty(t, store.walletDrawOrder)
-	require.Len(t, sc.itemCalls, 1)
-	require.EqualValues(t, 100, sc.itemCalls[0].amountCfg)
+	require.Empty(t, sc.itemCalls)
+	// Daemon A's frozen 100¢ and this process's live $1 agree, so the boundary
+	// is sealed unfunded by credit — which is the property under test: the lock
+	// held, and no lot was spent.
+	require.EqualValues(t, 1_000_000, proposedMicros(t, p))
+	require.EqualValues(t, 1_000_000, proposedRemainderMicros(t, p))
 }
 
 func TestRunBillingCycle_CreditWalletFlagOffReclaimKeepsLegacyZeroWalletSQL(t *testing.T) {
@@ -326,21 +373,24 @@ func TestRunBillingCycle_FrozenStripeAttemptNeverStartsNewWalletDraw(t *testing.
 	store.hasPM = true
 	store.stripeCustomer = "cus_wallet_frozen"
 	sc := newFakeStripe()
-	sc.errDraft = errors.New("stripe unavailable after boundary freeze")
+	svc, p := chargeSvcProposing(store, sc)
+	svc = svc.WithCreditWallet(true)
 
-	_, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	// The attempt dies AFTER the freeze — the point of the test is a run left
+	// frozen. The proposal is now the only thing that can fail there.
+	p.err = errors.New("proposal refused after the boundary freeze")
+	_, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.Error(t, err)
 	require.NotEmpty(t, store.frozenCharges)
 
 	lateSource := seedWalletSource(store, "grant", 1_000_000, time.Time{}, timeUTC(2026, 2, 1, 0))
-	sc.errDraft = nil
-	sc.invoiceAmountDue = 100
-	resp, err := chargeSvc(store, sc).WithCreditWallet(true).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	p.err = nil
+	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.Zero(t, resp.WalletDrawnMicros)
-	require.EqualValues(t, 1_000_000, store.walletSources[lateSource].remaining)
-	require.EqualValues(t, 100, resp.ChargedCents)
+	require.EqualValues(t, 1_000_000, store.walletSources[lateSource].remaining,
+		"credit added after the freeze must not be spent beside a claim already made")
 }
 
 func TestRunBillingCycle_CreditWalletFlagOffSkipsWalletStateAndKeepsLegacyPrepaidPath(t *testing.T) {
