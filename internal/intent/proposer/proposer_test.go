@@ -60,7 +60,7 @@ var (
 func domainCharge() Charge {
 	return Charge{
 		AccountID: "acct-1",
-		Kind:      intent.KindCustomDomain,
+		Kind:      intent.KindPlatformBase,
 		Currency:  "USD",
 		Lines: SingleLine(
 			"custom domain example.com",

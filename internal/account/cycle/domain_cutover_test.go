@@ -99,7 +99,7 @@ func TestDomainLegProposesInsteadOfCharging(t *testing.T) {
 	recorder.RequireNoProviderMutation(t, "a cut-over domain leg")
 
 	require.Len(t, p.charges, 1)
-	require.Equal(t, intent.KindCustomDomain, p.charges[0].Kind)
+	require.Equal(t, intent.KindPlatformBase, p.charges[0].Kind)
 	require.Positive(t, p.charges[0].TotalMicros(),
 		"the leg proposed a zero charge; the proration was lost in the cutover")
 	require.Contains(t, p.charges[0].Lines[0].Description, cand.Hostname)
