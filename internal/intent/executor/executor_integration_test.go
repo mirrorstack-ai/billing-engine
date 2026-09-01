@@ -71,7 +71,15 @@ func fullyEvidencedEnv() Environment {
 
 func sealedFixture(t *testing.T) intent.ChargeIntent {
 	t.Helper()
-	sealed, err := intent.Seal(intent.Draft{
+	sealed, err := intent.Seal(validExecutorDraft())
+	require.NoError(t, err)
+	return sealed
+}
+
+// validExecutorDraft is the draft every executor fixture seals, so a test that
+// needs a variant changes one field rather than copying twenty.
+func validExecutorDraft() intent.Draft {
+	return intent.Draft{
 		Payer:             intent.Subject{Kind: "org", ID: "org-1"},
 		Currency:          "USD",
 		Lines:             []intent.Line{intent.NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 25)},
@@ -89,9 +97,7 @@ func sealedFixture(t *testing.T) intent.ChargeIntent {
 		ExecuteNotBefore:      windowStart,
 		ExecuteNotAfter:       windowEnd,
 		SourceFactKeys:        []string{"fact-1"},
-	})
-	require.NoError(t, err)
-	return sealed
+	}
 }
 
 // ready seeds an intent that every clause accepts, so each test can
@@ -114,6 +120,12 @@ func ready(t *testing.T, s *store.Store) intent.ChargeIntent {
 	})
 	require.NoError(t, err)
 	require.NoError(t, s.SaveAuthorization(ctx, auth))
+
+	// The engine-issued acceptance the standing gate rests on. Without it
+	// ClauseAuthorityEvidence refuses, which is the whole point of §12 item
+	// 16 option C piece 2: a standing authorization is not evidence of
+	// consent on its own.
+	issueAndAccept(t, s, auth, intent.Subject{Kind: "org", ID: "org-1"})
 
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
@@ -449,5 +461,114 @@ func sealKind(t *testing.T, kind intent.ChargeKind, micros int64) intent.ChargeI
 	if err != nil {
 		t.Fatalf("Seal(%s): %v", kind, err)
 	}
+	return sealed
+}
+
+// issueAndAccept records that the engine showed the customer this
+// authorization's terms and that they answered.
+//
+// It is what a real deployment does before minting: the disclosure digest is
+// the authorization's own, so the challenge is for exactly the document being
+// charged under.
+func issueAndAccept(t *testing.T, s *store.Store, auth intent.BillingAuthorization, payer intent.Subject) {
+	t.Helper()
+	ctx := context.Background()
+
+	require.NoError(t, s.IssueAcceptance(ctx, store.IssuedAcceptance{
+		AuthorizationID:  auth.ID(),
+		DisclosureDigest: auth.AcceptanceDigest(),
+		Payer:            payer,
+		Nonce:            "nonce-" + auth.ID(),
+		Audience:         "customer",
+		ReplayIdentity:   "replay-" + auth.ID(),
+		IssuedAt:         evalNow.Add(-72 * time.Hour),
+		ExpiresAt:        evalNow.Add(365 * 24 * time.Hour),
+	}))
+	require.NoError(t, s.AcceptIssuedAcceptance(ctx,
+		auth.ID(), auth.AcceptanceDigest(), evalNow.Add(-71*time.Hour)))
+}
+
+// 🔴 An authorization with NO issued acceptance must not collect.
+//
+// This is the case the whole of §12 item 16 option C piece 2 exists for: a
+// standing authorization, valid in every other respect, whose terms the
+// engine never showed anybody. Before this wave it collected, because the
+// gate was `AcceptanceDigest() != ""` and the digest is always set.
+//
+// It also exercises the store's missing-row path, which nothing else does:
+// LoadStandingAcceptance returns the ZERO value for a row that is not there,
+// and the zero value must authorise nothing. A version that returned
+// "issued and accepted" for a missing row passes every other test in this
+// package.
+func TestAnAuthorizationWithNoIssuedAcceptanceIsRefused(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	sealed := ready(t, s)
+
+	// Remove the challenge the fixture issued, leaving the authorization
+	// otherwise untouched — exactly the state of an authorization minted
+	// without ever showing the customer its terms.
+	_, err := pool.Exec(ctx,
+		`DELETE FROM ms_billing.authorization_acceptances WHERE authorization_id = 'auth-1'`)
+	require.Error(t, err, "the acceptance table is append-only; the fixture cannot be cleared this way")
+
+	// So issue the intent against an authorization that never had one.
+	other := freshAuthorizationWithoutAcceptance(t, s)
+	orphan := sealAgainst(t, s, other)
+
+	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, orphan.Digest())
+	require.NoError(t, err)
+
+	require.False(t, out.Permitted,
+		"a standing authorization whose terms were never shown to anyone collected")
+	require.Contains(t, out.Refused, predicate.ClauseAuthorityEvidence)
+	require.Zero(t, collector.count(), "a refused intent reached the provider")
+
+	_ = sealed
+}
+
+// freshAuthorizationWithoutAcceptance mints a standing authorization the
+// engine never issued a document for.
+func freshAuthorizationWithoutAcceptance(t *testing.T, s *store.Store) intent.BillingAuthorization {
+	t.Helper()
+	auth, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
+		ID: "auth-no-acceptance", Scope: intent.ScopeStanding,
+		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
+		Currency: "USD", Kinds: []intent.ChargeKind{kindCycle},
+		PerChargeCeiling: 1_000_000, PeriodCeiling: 500_000_000, FrequencyCeiling: 100,
+		NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
+		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
+		NoticePolicy:  "email/v1",
+		EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ExpiresAt:     time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.SaveAuthorization(context.Background(), auth))
+	// Deliberately no issueAndAccept: that is what this test is about.
+	return auth
+}
+
+// sealAgainst seals an otherwise-executable intent naming a given
+// authorization, and walks it to eligible with a delivered notice.
+func sealAgainst(t *testing.T, s *store.Store, auth intent.BillingAuthorization) intent.ChargeIntent {
+	t.Helper()
+	ctx := context.Background()
+
+	d := validExecutorDraft()
+	d.AuthorizationID = auth.ID()
+	sealed, err := intent.Seal(d)
+	require.NoError(t, err)
+	require.NoError(t, s.SaveIntent(ctx, sealed))
+
+	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
+		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
+		Policy: "email/v1", TerminalStatus: "delivered",
+		DeliveredAt:          evalNow.Add(-48 * time.Hour),
+		EligibilityNotBefore: evalNow.Add(-24 * time.Hour), RevocationPathFresh: true,
+	}))
+	require.NoError(t, s.AdvanceState(ctx, sealed.Digest(), "proposed", "eligible"))
 	return sealed
 }

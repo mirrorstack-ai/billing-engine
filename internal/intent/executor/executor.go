@@ -276,6 +276,14 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		return Outcome{}, err
 	}
 
+	// The engine-issued acceptance the standing gate rests on. A missing row
+	// yields the zero value, which authorises nothing — "we could not find
+	// the record" and "the record refuses" must reach the same answer.
+	acceptance, err := e.store.LoadStandingAcceptance(ctx, auth.ID(), auth.AcceptanceDigest())
+	if err != nil {
+		return Outcome{}, err
+	}
+
 	env := e.env(ctx)
 	verdict := predicate.Evaluate(predicate.SealedState{
 		Intent:                       sealed,
@@ -284,6 +292,7 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		BuildIdentified:              env.BuildIdentified,
 		Authorization:                auth,
 		Mode:                         e.authorityMode(auth),
+		StandingAcceptance:           acceptance,
 		Notice:                       noticeFor(sealed, notice),
 		Funding:                      funding,
 		PolicyDigestsMatch:           env.PolicyDigestsMatch,

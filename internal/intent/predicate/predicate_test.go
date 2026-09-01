@@ -74,6 +74,10 @@ func permittedState(t *testing.T) SealedState {
 		BuildIdentified: true,
 		Authorization:   standingAuth(t),
 		Mode:            AuthorityStandingAuto,
+		// The engine-issued challenge the standing gate now rests on. It is
+		// built from the authorization's own acceptance digest, because that
+		// is what a real one would be: the document these terms constitute.
+		StandingAcceptance: acceptedChallenge(t, sealed),
 		Notice: NoticeReceipt{
 			DeliveredBytesDigest: sealed.Digest(),
 			Policy:               "email/v1",
@@ -534,4 +538,99 @@ func resealWithRail(t *testing.T, rail string) intent.ChargeIntent {
 		t.Fatalf("Seal(rail=%q): %v", rail, err)
 	}
 	return sealed
+}
+
+// acceptedChallenge is the stored acceptance a standing authorization rests
+// on: engine-issued, answered, unexpired, unrevoked, for this payer and for
+// the document these terms constitute.
+func acceptedChallenge(t *testing.T, sealed intent.ChargeIntent) StandingAcceptance {
+	t.Helper()
+	return StandingAcceptance{
+		Issued:           true,
+		DisclosureDigest: standingAuth(t).AcceptanceDigest(),
+		Payer:            sealed.Payer(),
+		Accepted:         true,
+		ExpiresAt:        evalNow.Add(365 * 24 * time.Hour),
+	}
+}
+
+// 🔴 The standing gate now requires an engine-ISSUED, customer-ANSWERED
+// acceptance that still stands.
+//
+// Until this wave it was `Authorization.AcceptanceDigest() != ""` — any
+// non-empty string authorised recurring, automatic collection, which is
+// exactly the consent-authority problem §12 item 16 names.
+//
+// intent.Authorize already refuses a grant whose digest is not the document
+// its own terms constitute, and store.LoadAuthorization re-runs Authorize on
+// every read — so that is a CONSTRUCTOR guarantee and re-checking it here
+// would verify nothing. Each case below is a fact the constructor cannot
+// know, because each is a row that changes after the authorization was built.
+func TestTheStandingGateRequiresAnIssuedAndAnsweredAcceptance(t *testing.T) {
+	for name, break_ := range map[string]func(*StandingAcceptance){
+		"never issued": func(a *StandingAcceptance) { *a = StandingAcceptance{} },
+		"issued but never answered": func(a *StandingAcceptance) {
+			a.Accepted = false
+		},
+		"withdrawn": func(a *StandingAcceptance) { a.Revoked = true },
+		"expired":   func(a *StandingAcceptance) { a.ExpiresAt = evalNow.Add(-time.Second) },
+		"no expiry at all": func(a *StandingAcceptance) {
+			a.ExpiresAt = time.Time{}
+		},
+		"for another document": func(a *StandingAcceptance) {
+			a.DisclosureDigest = "some-other-document"
+		},
+		"naming no document": func(a *StandingAcceptance) { a.DisclosureDigest = "" },
+		"accepted by someone else": func(a *StandingAcceptance) {
+			a.Payer = intent.Subject{Kind: "org", ID: "somebody-else"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := permittedState(t)
+			if !Evaluate(s).Permitted {
+				t.Fatal("the base state is already refused; this test proves nothing")
+			}
+			break_(&s.StandingAcceptance)
+
+			verdict := Evaluate(s)
+			if verdict.Permitted {
+				t.Fatalf("a standing charge was permitted on an acceptance that was %s", name)
+			}
+			if !hasClause(verdict.Refused, ClauseAuthorityEvidence) {
+				t.Errorf("refused, but not on authority evidence: %v", verdict.Refused)
+			}
+		})
+	}
+}
+
+// The customer-present gate must be unaffected: it rests on a FRESH receipt,
+// not on a standing acceptance, and docs/DESIGN.md §4 keeps the two mutually
+// exclusive.
+func TestTheCustomerPresentGateDoesNotConsultTheStandingAcceptance(t *testing.T) {
+	s := permittedState(t)
+	s.Mode = AuthorityCustomerPresent
+	s.StandingAcceptance = StandingAcceptance{}
+	s.Acceptance = AcceptanceReceipt{
+		DisclosureDigest: s.Intent.Digest(),
+		Payer:            s.Intent.Payer(),
+		Audience:         "customer",
+		Nonce:            "nonce-1",
+		ReplayIdentity:   "replay-1",
+		ExpiresAt:        evalNow.Add(time.Hour),
+	}
+
+	if !authorityEvidenceBinds(s) {
+		t.Fatal("a customer-present acceptance was refused because no STANDING acceptance " +
+			"existed; the two gates are supposed to be mutually exclusive")
+	}
+}
+
+// hasClause reports whether a verdict refused on a particular clause.
+func hasClause(refused []Clause, want Clause) bool {
+	for _, c := range refused {
+		if c == want {
+			return true
+		}
+	}
+	return false
 }

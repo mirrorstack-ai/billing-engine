@@ -56,6 +56,31 @@ type AcceptanceReceipt struct {
 	ReplayIdentity   string
 }
 
+// StandingAcceptance is an engine-issued acceptance challenge, as stored.
+//
+// The zero value authorises nothing, like every other field here: an absent
+// acceptance and a refused one must be the same answer, because "we could not
+// find the record" has never been a reason to charge someone.
+type StandingAcceptance struct {
+	// Issued is true when a row exists at all. A caller that could not find
+	// one leaves this false, and the clause refuses.
+	Issued bool
+	// DisclosureDigest is the document that was shown. It must equal the
+	// authorization's own AcceptanceDigest, which is what ties the stored
+	// challenge to the terms being charged under.
+	DisclosureDigest string
+	// Payer is who was shown it.
+	Payer intent.Subject
+	// Accepted is true once the customer answered. A challenge that was shown
+	// and not answered is a real state, and it authorises nothing.
+	Accepted bool
+	// ExpiresAt is when the answer stops counting.
+	ExpiresAt time.Time
+	// Revoked is true once consent to the document was withdrawn. Separate
+	// from the authorization's own revocation: either alone stops collection.
+	Revoked bool
+}
+
 // NoticeReceipt is delivery evidence for the standing-automatic gate.
 //
 // INV-005: "Automatic collection requires durable evidence that the
@@ -133,6 +158,25 @@ type SealedState struct {
 	Mode       AuthorityMode
 	Acceptance AcceptanceReceipt
 	Notice     NoticeReceipt
+
+	// StandingAcceptance is the engine-issued challenge the standing
+	// authorization rests on, loaded from storage by whoever assembled this
+	// state.
+	//
+	// 🔴 It exists because the constructor cannot supply this.
+	//
+	// intent.Authorize already refuses a grant whose AcceptanceDigest is not
+	// the digest of the document its own terms constitute, and
+	// store.LoadAuthorization re-runs Authorize on every read — so a clause
+	// re-checking THAT would verify what the constructor just guaranteed,
+	// which is the "clause named for a check it does not perform" defect this
+	// repository keeps finding.
+	//
+	// What a constructor cannot know is whether the engine ever ISSUED the
+	// document, whether the customer ANSWERED it, and whether the answer has
+	// since expired or been withdrawn. Those are rows, they change after the
+	// authorization is built, and they are what this carries.
+	StandingAcceptance StandingAcceptance
 
 	Funding FundingPlan
 

@@ -76,6 +76,16 @@ func placeholderState(t *testing.T) SealedState {
 	state := permittedState(t)
 	state.Intent = sealed
 	state.Authorization = auth
+	// The stored acceptance follows the authorization and the payer it is
+	// overridden with, or the standing gate refuses for a reason this test is
+	// not about — and the refusal it IS about would be hidden behind it.
+	state.StandingAcceptance = StandingAcceptance{
+		Issued:           true,
+		DisclosureDigest: auth.AcceptanceDigest(),
+		Payer:            sealed.Payer(),
+		Accepted:         true,
+		ExpiresAt:        evalNow.Add(365 * 24 * time.Hour),
+	}
 	state.Notice.DeliveredBytesDigest = sealed.Digest()
 	state.Notice.Policy = placeholderNotice
 	state.Funding.GrossMicros = sealed.TotalMicros()
