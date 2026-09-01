@@ -50,6 +50,10 @@ type Response struct {
 	Preconditions []Precondition `json:"preconditions,omitempty"`
 	// Census carries table totals — aggregates only, same rule again.
 	Census []CensusRow `json:"census,omitempty"`
+	// Grants carries privilege booleans about the ops role itself. It reads
+	// the catalog, never a billing table, which is why it is the one action
+	// that still answers when the grants are missing.
+	Grants []GrantRow `json:"grants,omitempty"`
 }
 
 // handler runs one action inside one read-only transaction.
@@ -120,9 +124,25 @@ func runAction(ctx context.Context, tx pgx.Tx, req Request) (Response, error) {
 		// the questions were answerable, not that the answers are good.
 		res.OK = true
 
+	case "grants":
+		answers, err := runGrants(ctx, tx)
+		if err != nil {
+			return res, err
+		}
+		res.Grants = answers
+		// OK means every privilege is as it should be — this action HAS a
+		// gate, unlike the census, because "the role can read nothing" and
+		// "the role can read the evidence outbox" are both failures.
+		res.OK = true
+		for _, a := range answers {
+			if !a.OK {
+				res.OK = false
+			}
+		}
+
 	default:
 		return res, fmt.Errorf(
-			"unknown action %q (want \"shadow\", \"preconditions\" or \"census\")", req.Action)
+			"unknown action %q (want \"shadow\", \"preconditions\", \"census\" or \"grants\")", req.Action)
 	}
 	return res, nil
 }

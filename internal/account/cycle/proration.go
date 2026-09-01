@@ -80,6 +80,14 @@ const (
 	// unreachable for a real survived app whose base is ≥ $20) → nothing to
 	// invoice, guard left unarmed.
 	ProrationStatusNoCharge ProrationStatus = "no_charge"
+
+	// ProrationStatusProposed: the intent cutover was armed, so this
+	// attempt's charge was SEALED AS AN INTENT and nothing was collected.
+	//
+	// Distinct from no_charge, which means there was nothing to bill. This
+	// attempt had an amount and the intent rail now owns it, so a caller
+	// that conflated the two would report a real charge as absent.
+	ProrationStatusProposed ProrationStatus = "proposed"
 	// ProrationStatusNotFound: no roster row for the app id (never registered).
 	ProrationStatusNotFound ProrationStatus = "not_found"
 	// ProrationStatusWalletCharged (credit mode, billing-engine #99): the
@@ -110,6 +118,10 @@ type ProrationResult struct {
 	Status             ProrationStatus
 	ProrationInvoiceID string
 	ProrationCents     int64
+	// IntentDigest is the intent this attempt's charge was sealed as, when
+	// the cutover was armed. Empty on the legacy path. It is the link from
+	// the proration row to the document that replaced its charge.
+	IntentDigest string
 }
 
 // ProrationOutcome is the store's report from the locked charge section
@@ -463,6 +475,10 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// in a second short transaction, then and only then reaches Stripe.
 	var cents int64
 	var concurrentlyResolvedInvoice string
+	// proposedDigest is set when the cutover branch sealed this attempt as an
+	// intent instead of collecting it. It is the link from the app's proration
+	// row to the document that replaced its charge.
+	var proposedDigest string
 	atomicNoPM := false
 	outcome, invID, err := s.store.ChargeProrationLocked(ctx, appID, func(locked AppMirror) (*ProrationCharge, error) {
 		var candidate CombinedProrationChargeShape
@@ -541,6 +557,37 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		}
 		if custID == "" {
 			return nil, billing.Internal("combined proration funder has a usable PM but no Stripe customer id", nil)
+		}
+
+		// 🔴 THE CUTOVER BRANCH, after the durable arming claim and after the
+		// recovery read — the same position as every other leg's.
+		//
+		// recoveredInv is a prior attempt that already reached Stripe. It must
+		// be FINISHED there: abandoning a finalized invoice strands a charge
+		// the customer can see and nobody can prove. So it takes the legacy
+		// path even when the cutover is armed, and that exception drains as
+		// those attempts complete.
+		if s.proposer != nil && recoveredInv == nil {
+			sealed, perr := s.proposeCombinedProration(ctx, attempt)
+			if perr != nil {
+				return nil, perr
+			}
+			// 🔴 THE TERMINAL STAMP, so the app stops being re-swept.
+			//
+			// AppsPendingProration selects on proration_invoice_id AND
+			// proration_skipped_at both being NULL. Without this the attempt
+			// is re-derived on every sweep and seals a NEW intent each time,
+			// for one charge — and on a disarm the legacy branch would then
+			// mint a real Stripe invoice for a period the intent rail already
+			// sealed. The domain and overage legs each stamp here; this is the
+			// same act, and its absence was the defect.
+			if merr := s.store.MarkCombinedProrationProposed(
+				ctx, appID, s.nowFn().UTC(), "intent:"+sealed.Digest(),
+			); merr != nil {
+				return nil, billing.Internal("mark combined proration proposed failed", merr)
+			}
+			proposedDigest = sealed.Digest()
+			return nil, nil
 		}
 
 		expectedTotalCents, err := combinedProrationTotalCents(attempt)
@@ -653,6 +700,16 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				AppID:              appID,
 				Status:             ProrationStatusAlreadyCharged,
 				ProrationInvoiceID: concurrentlyResolvedInvoice,
+			}, nil
+		}
+		if proposedDigest != "" {
+			// Sealed, not collected. Distinct from NoCharge, which means
+			// there was nothing to bill: this attempt HAD an amount and the
+			// intent rail now owns it.
+			return &ProrationResult{
+				AppID:        appID,
+				Status:       ProrationStatusProposed,
+				IntentDigest: proposedDigest,
 			}, nil
 		}
 		return &ProrationResult{AppID: appID, Status: ProrationStatusNoCharge}, nil

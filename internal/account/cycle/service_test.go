@@ -24,6 +24,7 @@ type aggKey struct {
 }
 
 type fakeStore struct {
+	proposedProrations []string
 	// rollup inputs
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
@@ -751,6 +752,25 @@ func (f *fakeStore) UpsertInvoice(_ context.Context, inv cycle.InvoiceMirror) er
 		return f.errInvoice
 	}
 	f.invoices[inv.StripeInvoiceID] = inv
+	return nil
+}
+
+// MarkCombinedProrationProposed records the terminal stamp, so a test can
+// assert the app stops being re-swept.
+func (f *fakeStore) MarkCombinedProrationProposed(
+	_ context.Context, appID uuid.UUID, at time.Time, ref string,
+) error {
+	if ref == "" {
+		return errors.New("fake store: a proposed proration needs its intent reference")
+	}
+	app, ok := f.apps[appID]
+	if !ok {
+		return fmt.Errorf("fake store: no app %s to stamp", appID)
+	}
+	app.ProrationInvoiceID = ref
+	f.apps[appID] = app
+	f.proposedProrations = append(f.proposedProrations, ref)
+	_ = at
 	return nil
 }
 
