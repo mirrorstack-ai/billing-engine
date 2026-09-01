@@ -67,7 +67,7 @@ func TestAPassThatRefusesEverythingSaysSoAndNamesTheGate(t *testing.T) {
 	ready(t, s)
 
 	// The honest production Environment: nothing is evidenced.
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	result, err := RunOnce(ctx, s, newExecutor(t, s, collector, Environment{}), 10, quiet())
 	require.NoError(t, err)
 
@@ -115,7 +115,7 @@ func TestAnUnresolvedIntentIsNotOfferedAgain(t *testing.T) {
 		"the fixture no longer exercises the claim filter: the state moved out of the "+
 			"executable set, so this test would pass with the filter removed")
 
-	second := &recordingCollector{result: CollectResult{Succeeded: true}}
+	second := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	again, err := RunOnce(ctx, s, newExecutor(t, s, second, fullyEvidencedEnv()), 10, quiet())
 	require.NoError(t, err)
 
@@ -159,7 +159,7 @@ func TestAPassIsBounded(t *testing.T) {
 		readyN(t, s, i)
 	}
 
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	result, err := RunOnce(ctx, s, newExecutor(t, s, collector, fullyEvidencedEnv()), 2, quiet())
 	require.NoError(t, err)
 	require.Equal(t, 2, result.Considered, "the limit was not honoured")
@@ -220,7 +220,7 @@ func TestOneErroringIntentDoesNotStopThePass(t *testing.T) {
 		readyN(t, s, i)
 	}
 
-	collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	result, err := RunOnce(ctx, s, newExecutor(t, s, collector, fullyEvidencedEnv()), 10, quiet())
 	require.NoError(t, err, "one intent's failure aborted the whole pass")
 
@@ -326,7 +326,7 @@ func TestATerminalIntentIsNeverOffered(t *testing.T) {
 			sealed := readyN(t, s, terminalFixtureIndex(state))
 			require.NoError(t, s.AdvanceState(ctx, sealed.Digest(), "eligible", state))
 
-			collector := &recordingCollector{result: CollectResult{Succeeded: true}}
+			collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 			result, err := RunOnce(ctx, s, newExecutor(t, s, collector, fullyEvidencedEnv()), 10, quiet())
 			require.NoError(t, err)
 

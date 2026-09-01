@@ -41,7 +41,7 @@ func priorSettlement(t *testing.T, s *store.Store, micros int64) {
 	sealed := sealKind(t, kindCycle, micros)
 	require.NoError(t, s.SaveIntent(ctx, sealed))
 	require.NoError(t, s.ClaimSettlement(ctx, sealed.Digest(), "prior-use-test"))
-	require.NoError(t, s.RecordOutcome(ctx, sealed.Digest(), "succeeded", evalNow))
+	require.NoError(t, s.RecordOutcome(ctx, sealed.Digest(), "succeeded", "in_test_ref", evalNow))
 }
 
 // priorAttempt puts a FAILED settlement on the same authorization. It consumes
@@ -54,7 +54,7 @@ func priorAttempt(t *testing.T, s *store.Store, micros int64) {
 	sealed := sealKind(t, kindCycle, micros)
 	require.NoError(t, s.SaveIntent(ctx, sealed))
 	require.NoError(t, s.ClaimSettlement(ctx, sealed.Digest(), "prior-use-test"))
-	require.NoError(t, s.RecordOutcome(ctx, sealed.Digest(), "failed", evalNow))
+	require.NoError(t, s.RecordOutcome(ctx, sealed.Digest(), "failed", "", evalNow))
 }
 
 // The period ceiling must bound the PERIOD, not each charge.
@@ -236,7 +236,7 @@ func TestTheFrequencyCeilingRefusesOnceItsAttemptsAreSpent(t *testing.T) {
 	spent := sealUnder(t, authID, 1_000)
 	require.NoError(t, s.SaveIntent(ctx, spent))
 	require.NoError(t, s.ClaimSettlement(ctx, spent.Digest(), "prior-use-test"))
-	require.NoError(t, s.RecordOutcome(ctx, spent.Digest(), "failed", evalNow))
+	require.NoError(t, s.RecordOutcome(ctx, spent.Digest(), "failed", "", evalNow))
 
 	next := sealUnder(t, authID, 2_000)
 	require.NoError(t, s.SaveIntent(ctx, next))
