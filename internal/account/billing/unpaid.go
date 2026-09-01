@@ -118,6 +118,10 @@ type PayInvoiceRequest struct {
 // paid path, the client's first refetch can observe the settled state.
 type PayInvoiceResponse struct {
 	Status string `json:"status"`
+	// IntentDigest is the receivable this retry was sealed as, when the
+	// intent cutover took it. Empty on the legacy path, and omitted from the
+	// wire so an existing client sees exactly the response it saw before.
+	IntentDigest string `json:"intent_digest,omitempty"`
 }
 
 // PayInvoice pays one unpaid Stripe invoice with the owner's default card:
@@ -178,6 +182,37 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 	}
 	if target.Status != "open" && target.Status != "uncollectible" {
 		return nil, InvalidInput("invoice is not payable")
+	}
+
+	// 🔴 THE CUTOVER BRANCH, and it is narrower than the other five.
+	//
+	// §6's collect_receivable is CollectRemainderOf(source): it links to a
+	// SOURCE INTENT and collects what is left of it. So this leg can only
+	// propose for an invoice the intent rail itself RAISED. Every unpaid
+	// invoice in production predates the rail and has no source, so those keep
+	// the legacy path — the same guard every other leg applies to a charge that
+	// already reached the provider.
+	//
+	// It sits before the funding gates deliberately. Those gates exist to pick
+	// a Stripe customer and card for a payment this branch does not make: a
+	// proposal moves no money, and the payer is resolved by the proposer from
+	// the account, not chosen here.
+	if s.proposer != nil {
+		sourceDigest, found, err := s.proposer.SourceIntentFor(ctx, target.StripeInvoiceID)
+		if err != nil {
+			return nil, Internal("source intent lookup failed", err)
+		}
+		if found {
+			digest, err := s.proposer.ProposeReceivable(
+				ctx, sourceDigest, accountID.String(), target.AmountDueMicros)
+			if err != nil {
+				return nil, Internal("receivable proposal failed", err)
+			}
+			// Not "paid" and not "pending". The obligation is recorded and
+			// nothing was collected; reporting either would claim a payment
+			// attempt that did not happen.
+			return &PayInvoiceResponse{Status: "proposed", IntentDigest: digest}, nil
+		}
 	}
 
 	if target.FundingLegacyUnresolved || target.ChargeFundingAccountID == uuid.Nil {

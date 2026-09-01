@@ -686,6 +686,8 @@ type MsBillingIntentSettlementClaim struct {
 	ClaimedAt    time.Time          `json:"claimed_at"`
 	Outcome      pgtype.Text        `json:"outcome"`
 	OutcomeAt    pgtype.Timestamptz `json:"outcome_at"`
+	// The provider object the money moved through, so a receivable can link to the intent that raised an unpaid invoice and a reconciler can walk provider -> document.
+	ProviderReference pgtype.Text `json:"provider_reference"`
 }
 
 type MsBillingInvoice struct {
