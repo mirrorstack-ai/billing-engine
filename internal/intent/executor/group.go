@@ -160,7 +160,10 @@ func (e *Executor) ExecuteGroup(ctx context.Context, collector GroupCollector, d
 
 	case result.Succeeded:
 		for _, m := range members {
-			if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, m.digest, "succeeded", evidence.Event{
+			// Every member of a group settles through the SAME provider object —
+			// one invoice, which is what a group is — so they share the
+			// reference. That is the link a receivable follows back.
+			if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, m.digest, "succeeded", result.Reference, evidence.Event{
 				Kind:         evidence.KindSettlement,
 				Subject:      m.debit.Payer,
 				IntentDigest: m.digest,
@@ -177,7 +180,7 @@ func (e *Executor) ExecuteGroup(ctx context.Context, collector GroupCollector, d
 
 	default:
 		for _, m := range members {
-			if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, m.digest, "failed", evidence.Event{
+			if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, m.digest, "failed", result.Reference, evidence.Event{
 				Kind:         evidence.KindSettlement,
 				Subject:      m.debit.Payer,
 				IntentDigest: m.digest,

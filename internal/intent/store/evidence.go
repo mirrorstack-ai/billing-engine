@@ -100,18 +100,37 @@ func (s *Store) AppendEvidence(ctx context.Context, rec *evidence.Recorder, e ev
 // start rolling back the outcome record AND its evidence, producing "money
 // moved and nothing was recorded", which is the exact failure joining the
 // evidence write to the outcome is here to prevent.
+// RecordOutcomeWithEvidence records how a claim ended, and WHICH provider
+// object it ended through.
+//
+// 🔴 providerReference was flowing through the executor and being discarded.
+// Outcome{Reference: result.Reference} was returned to the caller and never
+// written, so after a successful collection nothing mapped the Stripe invoice
+// back to the sealed document that authorised it. Migration 069 adds the
+// column and a CHECK that a 'succeeded' claim names one; this is the writer.
+//
+// Empty is permitted for 'voided' and 'failed', which may never have reached a
+// provider at all. It is not permitted for 'succeeded' — the database refuses
+// it, and so does this, one layer earlier where the message can say why.
 func (s *Store) RecordOutcomeWithEvidence(
 	ctx context.Context,
 	rec *evidence.Recorder,
-	digest, outcome string,
+	digest, outcome, providerReference string,
 	e evidence.Event,
 ) error {
+	if outcome == "succeeded" && providerReference == "" {
+		return fmt.Errorf(
+			"store: refusing to record intent %s as succeeded with no provider reference — "+
+				"the money moved through something, and a settlement that cannot name it "+
+				"cannot be reconciled or collected against", digest)
+	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE ms_billing.intent_settlement_claims
-			   SET outcome = $2, outcome_at = $3
+			   SET outcome = $2, outcome_at = $3,
+			       provider_reference = NULLIF($4, '')
 			 WHERE intent_digest = $1 AND outcome IS NULL`,
-			digest, outcome, e.OccurredAt)
+			digest, outcome, e.OccurredAt, providerReference)
 		if err != nil {
 			return fmt.Errorf("record outcome: %w", err)
 		}
