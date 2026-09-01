@@ -259,7 +259,7 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		Subject:      sealed.Payer(),
 		IntentDigest: sealed.Digest(),
 		// Closed vocabulary, never customer prose: the charge kind is one of
-		// docs/DESIGN.md §6's nine, and it is what a reader needs to know
+		// docs/DESIGN.md §6's seven, and it is what a reader needs to know
 		// which rule of an authorization this document was sealed under.
 		Detail:     string(sealed.Kind()),
 		OccurredAt: p.now(),
