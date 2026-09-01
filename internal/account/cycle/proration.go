@@ -572,6 +572,20 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			if perr != nil {
 				return nil, perr
 			}
+			// 🔴 THE TERMINAL STAMP, so the app stops being re-swept.
+			//
+			// AppsPendingProration selects on proration_invoice_id AND
+			// proration_skipped_at both being NULL. Without this the attempt
+			// is re-derived on every sweep and seals a NEW intent each time,
+			// for one charge — and on a disarm the legacy branch would then
+			// mint a real Stripe invoice for a period the intent rail already
+			// sealed. The domain and overage legs each stamp here; this is the
+			// same act, and its absence was the defect.
+			if merr := s.store.MarkCombinedProrationProposed(
+				ctx, appID, s.nowFn().UTC(), "intent:"+sealed.Digest(),
+			); merr != nil {
+				return nil, billing.Internal("mark combined proration proposed failed", merr)
+			}
 			proposedDigest = sealed.Digest()
 			return nil, nil
 		}
