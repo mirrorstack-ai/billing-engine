@@ -56,7 +56,7 @@ jobs:
         run: |
           for f in migrations/billing/*.up.sql; do
             echo "Applying $f"
-            psql -f "$f"
+            psql -v ON_ERROR_STOP=1 -f "$f"
           done
 
       - name: Validate migrations (down + up idempotent)
@@ -68,11 +68,11 @@ jobs:
         run: |
           for f in $(ls -r migrations/billing/*.down.sql); do
             echo "Rolling back $f"
-            psql -f "$f"
+            psql -v ON_ERROR_STOP=1 -f "$f"
           done
           for f in migrations/billing/*.up.sql; do
             echo "Re-applying $f"
-            psql -f "$f"
+            psql -v ON_ERROR_STOP=1 -f "$f"
           done
 
       - name: Vet
