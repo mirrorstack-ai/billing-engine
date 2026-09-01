@@ -36,6 +36,7 @@ package cycle
 
 import (
 	"github.com/google/uuid"
+	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
@@ -292,3 +293,19 @@ type WalletCreditState struct {
 	SpendableBalanceMicros int64
 	PeriodDrawnMicros      int64
 }
+
+// executionWindow is how long a proposed charge stays collectable.
+//
+// It is a property of the EXECUTION, not of what is being billed for. The
+// window docs/DESIGN.md §4 checks answers "is it still reasonable to take
+// this money", and the answer stops being yes some time after the charge was
+// derived — not at the end of the period the charge covers.
+//
+// Two shipped legs sealed the coverage window here instead, which made every
+// intent they produced dead on arrival: the leg runs at or after the period
+// boundary, so the window had already closed when the document was sealed.
+//
+// Thirty days is chosen to be longer than any retry or backlog this engine
+// has, and short enough that a charge nobody collected stops being collectable
+// rather than surfacing months later on a customer's card.
+const executionWindow = 30 * 24 * time.Hour

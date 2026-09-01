@@ -431,8 +431,28 @@ func (s *Service) proposeDomainCharge(
 			// and is exactly what this class names.
 			Verification: intent.TaxNotApplicable,
 		},
-		ExecuteNotBefore: coverageStart,
-		ExecuteNotAfter:  coverageEnd,
+		// 🔴 The EXECUTION window, not the coverage window. They are
+		// different things, and sealing one as the other made this leg
+		// produce intents that could never be collected.
+		//
+		// coverageEnd is the end of the period being billed, and this leg
+		// runs AT or AFTER that boundary — so `at` was already past
+		// ExecuteNotAfter the moment the document was sealed, and
+		// predicate.ClauseWithinExecutionWindow (predicate.go:74-84) refuses
+		// it forever. The charge would have evaporated silently: the legacy
+		// provider call had already been skipped in favour of the proposal.
+		//
+		// window_sanity_test.go caught it, and only because the clock crossed
+		// a period boundary — it had been passing on the luck of the
+		// calendar. The auto-top-up leg had it right all along
+		// (autotopup/executor.go:1365).
+		//
+		// The window therefore opens at the seal instant and runs for
+		// executionWindow. The coverage period is NOT sealed anywhere yet;
+		// that is a canonical field the intent does not have, noted where the
+		// adapter drops the invoice line period.
+		ExecuteNotBefore: at,
+		ExecuteNotAfter:  at.Add(executionWindow),
 	})
 	if err != nil {
 		return nil, billing.Internal("propose domain charge intent failed", err)
