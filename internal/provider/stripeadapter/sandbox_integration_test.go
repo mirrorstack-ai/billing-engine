@@ -223,6 +223,27 @@ func seedIntentReadyToCollect(t *testing.T, s *store.Store, payerID string) inte
 	require.NoError(t, err)
 	require.NoError(t, s.SaveAuthorization(ctx, auth))
 
+	// 🔴 The engine-issued acceptance the standing gate rests on.
+	//
+	// Without it ClauseAuthorityEvidence refuses and this end-to-end proves
+	// nothing — which is exactly what happened: the acceptance control landed
+	// with every OTHER standing fixture converted, and this one was missed
+	// because CI skips it (ci.yml sets neither REQUIRE_STRIPE nor
+	// STRIPE_SECRET_KEY), so it stayed green here and red only for whoever
+	// next ran the sandbox E2E with a test key.
+	require.NoError(t, s.IssueAcceptance(ctx, store.IssuedAcceptance{
+		AuthorizationID:  auth.ID(),
+		DisclosureDigest: auth.AcceptanceDigest(),
+		Payer:            intent.Subject{Kind: "org", ID: payerID},
+		Nonce:            "nonce-sandbox",
+		Audience:         "customer",
+		ReplayIdentity:   "replay-sandbox",
+		IssuedAt:         now.Add(-48 * time.Hour),
+		ExpiresAt:        now.Add(365 * 24 * time.Hour),
+	}))
+	require.NoError(t, s.AcceptIssuedAcceptance(ctx,
+		auth.ID(), auth.AcceptanceDigest(), now.Add(-47*time.Hour)))
+
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
 		Policy: "email/v1", TerminalStatus: "delivered",
