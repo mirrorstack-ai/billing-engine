@@ -1,7 +1,13 @@
 package cycle
 
 import (
+	"context"
 	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
@@ -169,3 +175,104 @@ func advanceLines(b boundaryComponents) []proposer.ChargeLine {
 // boundaryArrearsRef ties the arrears line back to the account it was derived
 // from, the way every other leg's ref ties to its own row.
 func boundaryArrearsRef(accountID string) string { return "arrears:" + accountID }
+
+// proposeBoundary seals this boundary as intents instead of collecting it.
+//
+// 🔴 IT MOVES NO MONEY, AND THAT IS THE POINT — see WithIntentProposer. A leg
+// that proposes holds no write port, so once every leg is cut over
+// cmd/billing-cycle cannot charge anyone, which is a stronger statement than
+// any check over its call graph could make.
+//
+// The run is marked 'proposed': terminal for this worker, and deliberately
+// neither 'invoiced' (no invoice exists, no money moved) nor 'failed'. Both
+// would corrupt the measurement the legacy drop depends on.
+func (s *Service) proposeBoundary(
+	ctx context.Context,
+	runID uuid.UUID,
+	accountID uuid.UUID,
+	summary *ChargeSummary,
+	components boundaryComponents,
+	periodStart, periodEnd, newPeriodEnd time.Time,
+) (*ChargeSummary, error) {
+	charges, err := splitBoundary(components, proposer.Charge{
+		// The proposer resolves this to the account's FUNDER's owner. A leg
+		// that built an intent.Subject here is how the payer and the
+		// executor's resolver came to disagree; see proposer.Charge.AccountID.
+		AccountID: accountID.String(),
+		Currency:  chargeCurrency,
+
+		AuthorizationID:   "boundary:" + accountID.String(),
+		TermsRevision:     proposedTermsRevision,
+		PriceBookRevision: proposedPriceBookRevision,
+		NoticePolicy:      proposedNoticePolicy,
+		SelectedRail:      proposedRail,
+
+		RoutingPolicyRevision: proposedRoutingPolicy,
+		// 🔴 Zero tax, resolved — the same honest state the other legs record.
+		// This leg has never applied tax, so claiming an unresolved
+		// determination would quarantine every boundary while claiming a
+		// computed one would invent a figure. docs/DESIGN.md §12's tax
+		// decisions are what change it.
+		Tax: intent.TaxDetermination{
+			Resolved:     true,
+			Jurisdiction: "not-applicable",
+			RuleRevision: proposedTaxRuleRevision,
+			Verification: intent.TaxNotApplicable,
+		},
+		// The window a collection may happen in — NOT the period being billed.
+		// Sealing the coverage window as the execution window is what made two
+		// earlier legs' intents dead on arrival: the boundary instant is the
+		// END of the coverage, so an intent that may only execute inside it
+		// could never execute at all.
+		ExecuteNotBefore: periodEnd,
+		ExecuteNotAfter:  newPeriodEnd,
+	})
+	if err != nil {
+		return nil, billing.Internal("boundary intent split failed", err)
+	}
+	if len(charges) == 0 {
+		// Nothing to charge. The zero-cents short-circuit above already
+		// covers this on the legacy path; reaching it here means the split
+		// found no positive component, and marking the run invoiced is the
+		// same terminal answer with no money either way.
+		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
+			return nil, billing.Internal("mark billing run (nothing to propose) failed", err)
+		}
+		summary.Status = RunStatusInvoiced
+		return summary, nil
+	}
+
+	sealed, err := s.proposer.ProposeGroup(ctx, charges)
+	if err != nil {
+		// A failed proposal leaves the run PENDING for the next reclaim. It
+		// must not be marked failed: nothing was attempted at a provider, so
+		// there is nothing to reconcile and a retry is safe.
+		return nil, billing.Internal("boundary intent proposal failed", err)
+	}
+
+	if err := s.store.MarkBillingRun(ctx, runID, RunStatusProposed, "", 0); err != nil {
+		return nil, billing.Internal("mark billing run proposed failed", err)
+	}
+	summary.Status = RunStatusProposed
+	// 🔴 Nothing was charged, so nothing may report cents as charged.
+	//
+	// The legacy path sets ChargedCents from the frozen amount before this
+	// branch is reached (charge.go:664). Leaving it set would have a proposed
+	// run claim it collected money it did not — the same lie the 'proposed'
+	// status exists to avoid, arriving by a different field. The amounts are
+	// still on the summary as ArrearsMicros / Advance*Micros, which is what a
+	// caller comparing the two rails needs.
+	summary.ChargedCents = 0
+	summary.ProposedDigests = digestsOf(sealed)
+	return summary, nil
+}
+
+// digestsOf is the link from this run to the intents that replaced its charge.
+// It is what makes the cutover auditable in both directions.
+func digestsOf(sealed []intent.ChargeIntent) []string {
+	out := make([]string, 0, len(sealed))
+	for _, in := range sealed {
+		out = append(out, in.Digest())
+	}
+	return out
+}

@@ -22,8 +22,12 @@ package proposer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
@@ -52,6 +56,13 @@ type Store interface {
 		sealed intent.ChargeIntent,
 		rec *evidence.Recorder,
 		e evidence.Event,
+	) error
+	SaveIntentGroupWithEvidence(
+		ctx context.Context,
+		groupID string,
+		sealed []intent.ChargeIntent,
+		rec *evidence.Recorder,
+		events []evidence.Event,
 	) error
 }
 
@@ -196,6 +207,35 @@ var ErrNotProposable = errors.New("proposer: charge cannot be sealed")
 // legacy legs get from deterministic Stripe idempotency keys, obtained
 // here from the identity of the content instead.
 func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, error) {
+	sealed, err := p.seal(ctx, c)
+	if err != nil {
+		return intent.ChargeIntent{}, err
+	}
+
+	// The intent and its evidence record commit together. docs/DESIGN.md:398
+	// makes evidence "a durable side effect of the money moving", so a seal
+	// this deployment cannot record is a seal it does not perform.
+	if err := p.store.SaveIntentWithEvidence(ctx, sealed, p.recorder, evidence.Event{
+		Kind:         evidence.KindSealedIntent,
+		Subject:      sealed.Payer(),
+		IntentDigest: sealed.Digest(),
+		// Closed vocabulary, never customer prose: the charge kind is one of
+		// docs/DESIGN.md §6's seven, and it is what a reader needs to know
+		// which rule of an authorization this document was sealed under.
+		Detail:     string(sealed.Kind()),
+		OccurredAt: p.now(),
+	}); err != nil {
+		return intent.ChargeIntent{}, fmt.Errorf("proposer: store sealed intent: %w", err)
+	}
+	return sealed, nil
+}
+
+// seal validates a charge and turns it into a sealed intent, WITHOUT storing
+// it. Propose stores one; ProposeGroup stores several plus their grouping, in
+// one transaction. Sharing this means the two paths cannot disagree about what
+// a valid charge is — the divergence that would show up as a boundary sealing
+// under different rules than every other leg.
+func (p *Proposer) seal(ctx context.Context, c Charge) (intent.ChargeIntent, error) {
 	if len(c.Lines) == 0 {
 		return intent.ChargeIntent{}, fmt.Errorf("%w: no lines", ErrNotProposable)
 	}
@@ -251,20 +291,86 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		return intent.ChargeIntent{}, fmt.Errorf("%w: %w", ErrNotProposable, err)
 	}
 
-	// The intent and its evidence record commit together. docs/DESIGN.md:398
-	// makes evidence "a durable side effect of the money moving", so a seal
-	// this deployment cannot record is a seal it does not perform.
-	if err := p.store.SaveIntentWithEvidence(ctx, sealed, p.recorder, evidence.Event{
-		Kind:         evidence.KindSealedIntent,
-		Subject:      sealed.Payer(),
-		IntentDigest: sealed.Digest(),
-		// Closed vocabulary, never customer prose: the charge kind is one of
-		// docs/DESIGN.md §6's nine, and it is what a reader needs to know
-		// which rule of an authorization this document was sealed under.
-		Detail:     string(sealed.Kind()),
-		OccurredAt: p.now(),
-	}); err != nil {
-		return intent.ChargeIntent{}, fmt.Errorf("proposer: store sealed intent: %w", err)
+	return sealed, nil
+}
+
+// ProposeGroup seals several charges that must settle on ONE invoice, and
+// stores them with their grouping in a single transaction.
+//
+// This is what the period boundary proposes through. A boundary is two charges
+// — the closed period's usage arrears and the next period's subscription — and
+// the reason they are two is the authorization control: an intent carries one
+// kind, and migration 054's header says a kind "selects which rule of a
+// standing authorization applies", so one intent for the whole boundary would
+// let whichever kind it named authorize the other half.
+//
+// 🔴 ALL OF THEM OR NONE.
+//
+// The grouping is not bookkeeping. PendingExecutionGrouped returns an
+// UNGROUPED intent as a group of one, so a boundary whose grouping was lost is
+// collected as two invoices with two roundings — a silent divergence of a few
+// cents from what the legacy path took, and "a cutover must seal exactly what
+// a collection takes" is the rule this repository has already been bitten by.
+// So the intents and the grouping commit together, and a partial group is not
+// a state the executor can observe.
+//
+// The group id is derived from the sealed digests rather than supplied, for
+// the same reason the payer is resolved rather than supplied: a caller that
+// chose it could group two charges that were never meant to settle together,
+// or re-propose the same boundary under a second id and collect it twice.
+// Sorted, so the same set in any order is the same group.
+func (p *Proposer) ProposeGroup(ctx context.Context, charges []Charge) ([]intent.ChargeIntent, error) {
+	if len(charges) == 0 {
+		return nil, nil
+	}
+
+	sealed := make([]intent.ChargeIntent, 0, len(charges))
+	events := make([]evidence.Event, 0, len(charges))
+	for i, c := range charges {
+		in, err := p.seal(ctx, c)
+		if err != nil {
+			return nil, fmt.Errorf("group member %d: %w", i, err)
+		}
+		sealed = append(sealed, in)
+		events = append(events, evidence.Event{
+			Kind:         evidence.KindSealedIntent,
+			Subject:      in.Payer(),
+			IntentDigest: in.Digest(),
+			Detail:       string(in.Kind()),
+			OccurredAt:   p.now(),
+		})
+	}
+
+	// Every member must name the same payer. A group settles on one invoice
+	// against one instrument, so a set spanning two payers would charge one
+	// of them for the other's half — and the payer is resolved per charge
+	// from its AccountID, so this is reachable by grouping charges derived
+	// from different accounts.
+	for i, in := range sealed[1:] {
+		if in.Payer() != sealed[0].Payer() {
+			return nil, fmt.Errorf("%w: group member %d names a different payer than member 0",
+				ErrNotProposable, i+1)
+		}
+	}
+
+	if err := p.store.SaveIntentGroupWithEvidence(ctx, GroupID(sealed), sealed, p.recorder, events); err != nil {
+		return nil, fmt.Errorf("proposer: store intent group: %w", err)
 	}
 	return sealed, nil
+}
+
+// GroupID is the identity of a set of intents that settle together: a digest
+// of their sorted digests.
+//
+// Derived rather than supplied so the same set is always the same group and a
+// different set is never the same group. Sorting means the order a leg happened
+// to build them in cannot produce two ids for one boundary.
+func GroupID(sealed []intent.ChargeIntent) string {
+	digests := make([]string, 0, len(sealed))
+	for _, in := range sealed {
+		digests = append(digests, in.Digest())
+	}
+	sort.Strings(digests)
+	sum := sha256.Sum256([]byte(strings.Join(digests, "\n")))
+	return hex.EncodeToString(sum[:])
 }
