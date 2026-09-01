@@ -3,9 +3,11 @@ package cycle_test
 // Credit-mode per-module overage — Leg 1 (billing-engine Job 3): a credits-mode
 // account settles its per-module over-module overage through the credit wallet (an
 // append-only ledger draw), EXACTLY mirroring how #99 settles the creation-proration
-// base from the wallet. Standard accounts stay on the Stripe overage rail even when
-// they carry a spendable wallet balance, and the whole credit branch is dark unless
-// the fail-closed credit-wallet flag is set.
+// base from the wallet. Standard accounts stay OFF the wallet even when they carry
+// a spendable wallet balance — since the Leg-1 cutover their overage is SEALED as
+// an intent rather than invoiced, but either way the wallet is not their rail —
+// and the whole credit branch is dark unless the fail-closed credit-wallet flag is
+// set.
 // Reuses the in-memory fakeStore (service_test.go), fakeStripe (charge_test.go),
 // and the registeredAccount / seedTimer / seedIncluded / seedWalletSource helpers.
 
@@ -84,17 +86,21 @@ func TestChargeModuleOverage_CreditModeDrawsFromWallet(t *testing.T) {
 	require.Len(t, observer.calls, 1, "an idempotent replay emits no second standing observation")
 }
 
-// (2) standard mode stays on Stripe even with enough gifted credit to cover the
-// overage. Standard balances are applied only by the boundary spine, never here.
-func TestChargeModuleOverage_StandardModeChargesStripe(t *testing.T) {
+// (2) standard mode stays OFF the wallet even with enough gifted credit to cover
+// the overage. Standard balances are applied only by the boundary spine, never
+// here. Since the cutover the standard rail seals an intent instead of invoicing,
+// so what this pins is that the covering grant is still untouched.
+func TestChargeModuleOverage_StandardModeStaysOffTheWallet(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store) // walletMode defaults to standard
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
 	observer := &fakeWalletMutationObserver{}
+	p := &capturingProposer{}
 	svc := cycle.NewService(store, sc).
 		WithCreditWallet(true).
-		WithWalletMutationObserver(observer)
+		WithWalletMutationObserver(observer).
+		WithIntentProposer(p)
 	ctx := context.Background()
 
 	app := uuid.New()
@@ -103,29 +109,35 @@ func TestChargeModuleOverage_StandardModeChargesStripe(t *testing.T) {
 
 	res, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Charged)
-	require.Len(t, sc.itemCalls, 1, "standard mode keeps the Stripe overage draft→item→finalize flow")
-	require.Len(t, sc.invoiceCalls, 1)
-	require.Len(t, sc.finalizeCalls, 1)
+	require.Zero(t, res.Charged, "a proposal collects nothing, so nothing is charged")
+	require.Equal(t, 1, res.Skipped)
+	require.Len(t, p.charges, 1, "standard mode seals the overage as an intent")
+	require.Empty(t, sc.invoiceCalls, "the leg reaches no provider")
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.finalizeCalls)
 	require.Zero(t, store.moduleOverageDrawn[over], "the wallet is never drawn on the standard path")
 	require.Zero(t, store.moduleOverageDrawCalls, "standard mode never enters the wallet draw leg")
 	require.Equal(t, 1, store.walletStateCalls, "the durable mode probe still runs to select the rail")
 	require.EqualValues(t, 50_000_000, store.walletSources[grant].remaining)
-	// The guard armed with the GENUINE Stripe invoice id, not a wallet ref.
+	// The guard armed with the intent reference, not a wallet ref.
 	require.True(t, store.timers[over].graceCharged)
-	require.False(t, strings.HasPrefix(store.timers[over].graceInvoiceID, "wallet:"))
-	require.Empty(t, observer.calls, "the standard Stripe rail emits no wallet observation")
+	require.True(t, strings.HasPrefix(store.timers[over].graceInvoiceID, "intent:"),
+		"the guard must name the rail that settled it")
+	require.Empty(t, observer.calls, "the standard rail emits no wallet observation")
 }
 
 // (3) the feature flag is fail-closed: even a credits-mode account with spendable
-// credit executes NO wallet query and follows the legacy Stripe overage path.
-func TestChargeModuleOverage_WalletFlagOffUsesStripe(t *testing.T) {
+// credit executes NO wallet query and follows the ordinary provider-rail path,
+// which since the cutover means it seals an intent.
+func TestChargeModuleOverage_WalletFlagOffNeverReadsTheWallet(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	store.walletMode = cycle.CreditBillingModeCredits
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	svc := cycle.NewService(store, sc) // WithCreditWallet intentionally omitted
+	p := &capturingProposer{}
+	// WithCreditWallet intentionally omitted.
+	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
 	app := uuid.New()
@@ -134,8 +146,9 @@ func TestChargeModuleOverage_WalletFlagOffUsesStripe(t *testing.T) {
 
 	res, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Charged)
-	require.Len(t, sc.itemCalls, 1, "the flag-off path is the unchanged Stripe overage behavior")
+	require.Equal(t, 1, res.Skipped)
+	require.Len(t, p.charges, 1, "the flag-off path is the ordinary provider-rail path")
+	require.Empty(t, sc.itemCalls)
 	require.Zero(t, store.walletStateCalls, "the credit branch never runs with the flag off")
 	require.Zero(t, store.moduleOverageDrawCalls, "zero wallet store calls when the flag is off")
 	require.Zero(t, store.moduleOverageDrawn[over])
@@ -216,14 +229,18 @@ func TestChargeModuleOverage_UnderLockAlreadyResolvedIsStaleNotDrawn(t *testing.
 
 // (6) under-lock defect-1 race: a concurrent Stripe attempt stamps charge_attempted_at
 // under the lock. The store defers, the wallet performs NO debit, and the caller
-// falls through to the Stripe leg (mirroring #99's caller), which charges.
-func TestChargeModuleOverage_UnderLockAttemptedDefersToStripe(t *testing.T) {
+// falls through to the provider leg (mirroring #99's caller), which since the
+// cutover seals an intent rather than invoicing. The property under test survives
+// the cutover unchanged: the wallet must not debit beside a charge that may
+// already have moved money.
+func TestChargeModuleOverage_UnderLockAttemptedDefersOutOfTheWallet(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	store.walletMode = cycle.CreditBillingModeCredits
 	seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	svc := cycle.NewService(store, sc).WithCreditWallet(true)
+	p := &capturingProposer{}
+	svc := cycle.NewService(store, sc).WithCreditWallet(true).WithIntentProposer(p)
 	ctx := context.Background()
 
 	app := uuid.New()
@@ -235,29 +252,32 @@ func TestChargeModuleOverage_UnderLockAttemptedDefersToStripe(t *testing.T) {
 
 	res, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Charged, "the defer falls through to the Stripe leg, which charges")
+	require.Equal(t, 1, res.Skipped)
+	require.Len(t, p.charges, 1, "the defer falls through to the provider leg, which proposes")
 	require.Equal(t, 1, store.moduleOverageDrawCalls, "the attempted marker is discovered inside the wallet transaction")
 	require.Zero(t, store.moduleOverageDrawn[over], "the wallet must not draw beside a Stripe attempt")
-	require.Len(t, sc.itemCalls, 1, "the Stripe overage leg charges after the defer")
+	require.Empty(t, sc.itemCalls)
 	require.True(t, store.timers[over].graceCharged)
 	require.False(t, strings.HasPrefix(store.timers[over].graceInvoiceID, "wallet:"),
-		"the settlement is a Stripe id, not a wallet ref")
+		"the settlement is not a wallet ref")
 }
 
 // (7) the initial rail classification is intentionally unlocked. If an owner
 // flips credits→standard before the wallet transaction obtains the account lock,
 // the locked durable mode wins: even a fully covering grant is untouched and the
-// entire mid-period overage proceeds through Stripe.
-func TestChargeModuleOverage_ModeFlipsToStandardBeforeWalletLockDefersToStripe(t *testing.T) {
+// entire mid-period overage proceeds through the provider leg.
+func TestChargeModuleOverage_ModeFlipsToStandardBeforeWalletLockDefersOutOfTheWallet(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	store.walletMode = cycle.CreditBillingModeCredits
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
 	observer := &fakeWalletMutationObserver{}
+	p := &capturingProposer{}
 	svc := cycle.NewService(store, sc).
 		WithCreditWallet(true).
-		WithWalletMutationObserver(observer)
+		WithWalletMutationObserver(observer).
+		WithIntentProposer(p)
 	ctx := context.Background()
 
 	app := uuid.New()
@@ -269,7 +289,8 @@ func TestChargeModuleOverage_ModeFlipsToStandardBeforeWalletLockDefersToStripe(t
 
 	res, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Charged, "the full charge stays on the Stripe rail")
+	require.Equal(t, 1, res.Skipped)
+	require.Len(t, p.charges, 1, "the full charge stays on the provider rail")
 	require.Equal(t, 1, store.moduleOverageDrawCalls,
 		"the mode change is discovered inside the wallet transaction")
 	require.Zero(t, store.moduleOverageDrawn[over], "standard mode never receives a mid-period wallet draw")
@@ -277,12 +298,12 @@ func TestChargeModuleOverage_ModeFlipsToStandardBeforeWalletLockDefersToStripe(t
 		"a covering grant must remain untouched after the mode change")
 	require.Empty(t, store.walletDrawOrder)
 	require.Empty(t, observer.calls, "a no-draw defer emits no wallet mutation")
-	require.Len(t, sc.invoiceCalls, 1)
-	require.Len(t, sc.itemCalls, 1)
-	require.Len(t, sc.finalizeCalls, 1)
+	require.Empty(t, sc.invoiceCalls)
+	require.Empty(t, sc.itemCalls)
+	require.Empty(t, sc.finalizeCalls)
 	require.True(t, store.timers[over].graceCharged)
-	require.False(t, strings.HasPrefix(store.timers[over].graceInvoiceID, "wallet:"),
-		"the settlement is a Stripe id, not a wallet ref")
+	require.True(t, strings.HasPrefix(store.timers[over].graceInvoiceID, "intent:"),
+		"the settlement is an intent reference, not a wallet ref")
 }
 
 // (8) the WALLET-FIRST → concurrent STANDARD-Stripe double-charge window (Job 3

@@ -22,37 +22,62 @@ import (
 //     atomically;
 //   - a simulated process death immediately after that commit leaves the run
 //     pending and reclaimable;
-//   - a true wallet-off service finishes from billing_runs alone, charging only
+//   - a true wallet-off service finishes from billing_runs alone, sealing only
 //     the frozen partial remainder or terminally adopting a full wallet draw.
+//
+// 🔴 THE SAME BILLING FACTS, ON THE INTENT RAIL.
+//
+// The reclaim's subject is unchanged by the collector's deletion: a run that
+// crashed after freezing its charge is picked up again, and the amount it
+// committed to is what settles — never a figure re-derived from live state.
+//
+// What changed is where that figure is read. A sealed boundary states the
+// GROSS on its lines and carries the wallet credit already spent as a
+// WalletAllocationMicros, so the provider REMAINDER — gross minus allocation —
+// is the number the deleted draft→item→finalize flow used to send to Stripe.
+// The partial case therefore pins remainder == the frozen 60 cents, which is
+// the same claim the old `sc.itemCalls[0].amountCfg == 60` made.
 func TestBillingRunWalletDraw_Integration_CrashThenTrueOffReclaim(t *testing.T) {
 	tests := []struct {
-		name              string
-		walletMicros      int64
-		wantFrozenCents   int64
-		wantStripeCalls   int
-		wantStripeCents   int64
-		installPayment    bool
-		wantDrawnMicros   int64
-		wantRunTotalCents int64
+		name            string
+		walletMicros    int64
+		wantFrozenCents int64
+		installPayment  bool
+		wantDrawnMicros int64
+
+		// The boundary as the intent rail states it.
+		wantProposed                bool
+		wantStatus                  cycle.BillingRunStatus
+		wantProposedGrossMicros     int64
+		wantProposedWalletMicros    int64
+		wantProposedRemainderMicros int64
+		wantRunTotalCents           int64
 	}{
 		{
-			name:              "partial draw charges only frozen remainder",
-			walletMicros:      400_000,
-			wantFrozenCents:   60,
-			wantStripeCalls:   1,
-			wantStripeCents:   60,
-			installPayment:    true,
-			wantDrawnMicros:   400_000,
-			wantRunTotalCents: 60,
+			name:            "partial draw seals only frozen remainder",
+			walletMicros:    400_000,
+			wantFrozenCents: 60,
+			installPayment:  true,
+			wantDrawnMicros: 400_000,
+
+			wantProposed:             true,
+			wantStatus:               cycle.RunStatusProposed,
+			wantProposedGrossMicros:  1_000_000,
+			wantProposedWalletMicros: 400_000,
+			// 600_000 micros == the 60 frozen cents == what Stripe was sent.
+			wantProposedRemainderMicros: 600_000,
+			// A proposed run collected nothing, so it mirrors no total.
+			wantRunTotalCents: 0,
 		},
 		{
-			name:              "full draw terminates without Stripe or PM",
-			walletMicros:      1_000_000,
-			wantFrozenCents:   0,
-			wantStripeCalls:   0,
-			wantStripeCents:   0,
-			installPayment:    false,
-			wantDrawnMicros:   1_000_000,
+			name:            "full draw terminates without a proposal or a PM",
+			walletMicros:    1_000_000,
+			wantFrozenCents: 0,
+			installPayment:  false,
+			wantDrawnMicros: 1_000_000,
+
+			wantProposed:      false,
+			wantStatus:        cycle.RunStatusInvoiced,
 			wantRunTotalCents: 0,
 		},
 	}
@@ -156,21 +181,43 @@ func TestBillingRunWalletDraw_Integration_CrashThenTrueOffReclaim(t *testing.T) 
 			}
 
 			sc := newFakeStripe()
-			sc.invoiceAmountDue = tt.wantStripeCents
-			resp, err := cycle.NewService(store, sc).
-				WithCreditWallet(false).
-				RunBillingCycle(ctx, accountID, start, end, 0)
+			svc, p := boundarySvcProposing(store, sc)
+			resp, err := svc.WithCreditWallet(false).RunBillingCycle(ctx, accountID, start, end, 0)
 			require.NoError(t, err)
-			require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+			require.Equal(t, tt.wantStatus, resp.Status)
 			require.Zero(t, resp.WalletDrawnMicros,
 				"true off recovers through billing_runs, never the wallet graph")
-			require.EqualValues(t, tt.wantStripeCents, resp.ChargedCents)
-			require.Len(t, sc.itemCalls, tt.wantStripeCalls)
-			require.Len(t, sc.invoiceCalls, tt.wantStripeCalls)
-			require.Len(t, sc.finalizeCalls, tt.wantStripeCalls)
-			if tt.wantStripeCalls == 1 {
-				require.EqualValues(t, tt.wantStripeCents, sc.itemCalls[0].amountCfg)
+			require.Zero(t, resp.ChargedCents,
+				"nothing was collected, so nothing may report cents as charged")
+
+			// 🔴 Nothing reached the provider — the drop's central claim.
+			require.Empty(t, sc.invoiceCalls)
+			require.Empty(t, sc.itemCalls)
+			require.Empty(t, sc.finalizeCalls)
+
+			if tt.wantProposed {
+				require.Len(t, p.groups, 1,
+					"the boundary must seal exactly one group — one boundary, one rounding")
+				require.EqualValues(t, tt.wantProposedGrossMicros, proposedMicros(t, p),
+					"the sealed boundary must state the gross this run priced")
+
+				var wallet int64
+				for _, c := range p.groups[0] {
+					wallet += c.WalletAllocationMicros
+				}
+				require.EqualValues(t, tt.wantProposedWalletMicros, wallet,
+					"the committed wallet debit must ride the intents as an allocation, "+
+						"or the boundary collects it a second time")
+
+				// The figure the deleted collector sent to Stripe, read off the
+				// intents instead: gross minus the credit already spent.
+				require.EqualValues(t, tt.wantProposedRemainderMicros, proposedRemainderMicros(t, p),
+					"the provider remainder must equal what the crashed attempt froze")
+				require.EqualValues(t, tt.wantFrozenCents*10_000, proposedRemainderMicros(t, p),
+					"the reclaim must reuse the durable amount, not a live re-derivation")
 			} else {
+				require.Empty(t, p.groups,
+					"a full wallet draw is already settled — it must seal no intent")
 				require.Empty(t, sc.findByRefCalls,
 					"a zero marker is wallet-terminal and never searches Stripe")
 			}
@@ -186,7 +233,8 @@ func TestBillingRunWalletDraw_Integration_CrashThenTrueOffReclaim(t *testing.T) 
 				WHERE id = $1`,
 				runID,
 			).Scan(&status, &gotRunTotalCents))
-			require.Equal(t, "invoiced", status)
+			require.EqualValues(t, tt.wantStatus, status,
+				"the run must reach its terminal state for this worker")
 			require.EqualValues(t, tt.wantRunTotalCents, gotRunTotalCents)
 		})
 	}

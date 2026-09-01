@@ -2,6 +2,7 @@ package autotopup
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -83,8 +84,10 @@ func TestAutoTopUpProposesInsteadOfCharging(t *testing.T) {
 }
 
 // 🔴 The exception that keeps the boundary leg's bug from repeating: an
-// attempt that ALREADY has a provider invoice must not be proposed over. The
-// rail that started the charge is the rail that finishes it.
+// attempt that ALREADY has a provider invoice must not be proposed over —
+// that would be a second obligation for the same money. It is finished on the
+// rail that started it, which after the drop means settled if Stripe already
+// took the money and closed if it did not. Never paid.
 func TestAnAttemptWithAProviderInvoiceIsNotProposedOver(t *testing.T) {
 	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
 	attempt := testAttempt(now, 5_005_000)
@@ -102,6 +105,33 @@ func TestAnAttemptWithAProviderInvoiceIsNotProposedOver(t *testing.T) {
 	if len(p.charges) != 0 {
 		t.Fatal("the leg sealed an intent for an attempt that already had an invoice at the " +
 			"provider — that is a second obligation for the same money")
+	}
+}
+
+// 🔴 With NO proposer installed the leg REFUSES. It does not fall back to
+// collecting, because the collector it used to fall back to is deleted — and a
+// leg that quietly did nothing would be indistinguishable from an account that
+// did not need topping up.
+func TestAnUnarmedExecutorRefusesInsteadOfCollecting(t *testing.T) {
+	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	attempt := testAttempt(now, 5_005_000)
+	store := newMemoryStore(attempt, AcquireNew)
+	stripe := &scriptedStripe{}
+
+	e := NewExecutor(store, &memorySettler{store: store}, stripe).
+		WithNow(func() time.Time { return now })
+
+	res, err := e.Trigger(context.Background(), attempt.AccountID, 1_000_000)
+
+	if !errors.Is(err, ErrProposerUnarmed) {
+		t.Fatalf("err = %v, want ErrProposerUnarmed", err)
+	}
+	if len(stripe.sequence) != 0 {
+		t.Fatalf("an unarmed leg reached the provider: %v", stripe.sequence)
+	}
+	if res.Status != "pending" || store.mustGet(attempt.ID).Status != "pending" {
+		t.Fatalf("a refused trigger must leave the durable attempt recoverable, got %q/%q",
+			res.Status, store.mustGet(attempt.ID).Status)
 	}
 }
 

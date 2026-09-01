@@ -14,13 +14,16 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 )
 
-// boundaryComponents is the boundary invoice as the legacy path computes it,
-// in micros, before any rounding.
+// boundaryComponents is the whole boundary, in micros, before any rounding.
 //
 // It is the input to the split and nothing else: the fields are exactly the
-// four the legacy total sums (charge.go:299) plus the wallet draw, so a reader
-// can check the split against the collection it must reproduce without holding
-// the whole of RunBillingCycle in their head.
+// four RunBillingCycle sums into boundaryTotal (charge.go:322) plus the wallet
+// draw, so a reader can check the split against the collection it must
+// reproduce without holding the whole of RunBillingCycle in their head.
+//
+// The derivation above it is UNCHANGED by the collector's deletion — the same
+// arrears, base, capacity and domain figures the deleted draft→item→finalize
+// flow would have charged arrive here.
 type boundaryComponents struct {
 	// ArrearsMicros is the CLOSED period's netted usage.
 	ArrearsMicros int64
@@ -33,9 +36,15 @@ type boundaryComponents struct {
 	AdvanceOverageMicros int64
 	AdvanceDomainsMicros int64
 	// WalletDrawnMicros is the stored-value credit already allocated to this
-	// boundary. The legacy path subtracts it from the total; the split has
-	// to place it on the right intents.
+	// boundary. The collector subtracted it from the total it sent; the split
+	// has to place it on the right intents instead.
 	WalletDrawnMicros int64
+	// FrozenCents is what a prior attempt of this run committed to, and
+	// HasFrozenCents says whether there was one. A reclaim must seal the same
+	// number that attempt did, or two daemons produce two digests for one
+	// boundary.
+	FrozenCents    int64
+	HasFrozenCents bool
 }
 
 func (b boundaryComponents) advanceMicros() int64 {
@@ -60,28 +69,30 @@ func (b boundaryComponents) grossMicros() int64 {
 // it named authorize the other.
 //
 // It was FOUR kinds until §12 item 12 (module_usage, platform_base,
-// module_capacity, custom_domain), and four was the objection: the legacy path
-// rounds ONCE on the net (charge.go:595), so four intents rounded four times and
-// the totals disagreed. Two dissolves it. The three fee components are exact
-// whole-cent multiples, so folding them into one platform_base introduces no
-// rounding at all, and the only sub-cent-fractional terms — arrears and the
-// wallet draw — now sit in the SAME intent. A group that rounds once over the
-// summed remainders therefore takes exactly the cents the legacy path takes.
+// module_capacity, custom_domain), and four was the objection: a boundary is
+// rounded ONCE, on the net — the deleted collector rounded at its cents
+// conversion, which survives as the freeze's own figure (charge.go:628) — so
+// four intents rounded four times and the totals disagreed. Two dissolves it.
+// The three fee components are exact whole-cent multiples, so folding them into
+// one platform_base introduces no rounding at all, and the only
+// sub-cent-fractional terms — arrears and the wallet draw — now sit in the SAME
+// intent. A group that rounds once over the summed remainders therefore takes
+// exactly the cents the deleted collector would have taken.
 //
 // Nothing is rounded here on purpose. These are micros; the single rounding
-// happens at the provider boundary, over the group, where the legacy path's
-// also happens.
+// happens at the provider boundary, over the group — the same place, and the
+// same number of times, as before.
 //
 // # The wallet draw is split, not attached
 //
-// The draw is NOT simply the arrears intent's allocation. The legacy path
+// The draw is NOT simply the arrears intent's allocation. RunBillingCycle
 // applies it to the total and to the arrears independently, each clamped at
-// zero (charge.go:347-356), so a draw LARGER than the arrears spills onto the
+// zero (charge.go:370-380), so a draw LARGER than the arrears spills onto the
 // forward half. Attaching all of it to the arrears intent would make that
 // intent's funding identity fail — the predicate requires
 // wallet + providerRemainder == gross (predicate.go:170) — and would understate
 // what the forward intent collects by the spill. So it is allocated arrears
-// first, remainder forward, which is the same order the legacy path consumes it.
+// first, remainder forward, the same order RunBillingCycle consumes it in.
 func splitBoundary(b boundaryComponents, tmpl proposer.Charge) ([]proposer.Charge, error) {
 	if b.ArrearsMicros < 0 || b.advanceMicros() < 0 {
 		return nil, fmt.Errorf("boundary split: negative component (arrears %d, advance %d)",
@@ -90,15 +101,70 @@ func splitBoundary(b boundaryComponents, tmpl proposer.Charge) ([]proposer.Charg
 	if b.WalletDrawnMicros < 0 {
 		return nil, fmt.Errorf("boundary split: negative wallet draw %d", b.WalletDrawnMicros)
 	}
+	// 🔴 A RECLAIM SEALS THE REMAINDER ITS OWN ATTEMPT COMMITTED TO.
+	//
+	// A run that crashed after freezing already debited the wallet — those lots
+	// are durable — and froze the EXACT remainder the provider was to be asked
+	// for. The deleted collector reused that figure verbatim
+	// (charge.go:396-407). The proposal is built from live components, and
+	// summary.WalletDrawnMicros is ZERO on such a reclaim: the wallet recovery
+	// read is gated on !hasFrozen, precisely because the run marker is the
+	// authority once a charge is frozen.
+	//
+	// Left uncorrected, the split seals the GROSS and the customer is asked a
+	// second time for credit they already spent. That defect is pinned in
+	// wallet_charge_test.go, which says so in as many words.
+	//
+	// So the frozen figure is taken as the provider remainder, and the wallet
+	// share is DERIVED as gross − frozen rather than read. The funding identity
+	// the predicate enforces then holds by construction:
+	// wallet + remainder == gross.
+	if b.HasFrozenCents {
+		frozenMicros := b.FrozenCents * microsPerCent
+		if b.FrozenCents > 0 && frozenMicros/microsPerCent != b.FrozenCents {
+			return nil, fmt.Errorf("boundary split: frozen %d cents overflows micros", b.FrozenCents)
+		}
+		// 🔴 COMPARE IN CENTS, NOT MICROS. The frozen figure is whole cents and
+		// the gross is micros, and centsFromMicros rounds HALF UP — so a gross
+		// of 5,000 micros freezes as 1 cent, and 1 cent is 10,000 micros.
+		// Subtracting one from the other would make the wallet share negative
+		// on every sub-cent boundary, which is rounding, not drift. Comparing
+		// at the precision the freeze was taken at is the only comparison that
+		// means anything.
+		liveCents, err := centsFromMicros(b.grossMicros())
+		if err != nil {
+			return nil, fmt.Errorf("boundary split: frozen comparison: %w", err)
+		}
+		if b.FrozenCents > liveCents {
+			// A prior attempt committed the provider to MORE than this period
+			// now costs. That is real drift, and it cannot be reconciled here:
+			// the wallet share would have to be negative, meaning the frozen
+			// remainder exceeds the whole boundary. Refusing is the only
+			// honest answer — the alternative seals a document for more than
+			// the period costs.
+			return nil, fmt.Errorf(
+				"boundary split: this run froze %d cents but live state now derives %d; "+
+					"a frozen remainder cannot exceed the boundary it is part of",
+				b.FrozenCents, liveCents)
+		}
+		// Clamped at zero for the rounding case above: a sub-cent gross rounds
+		// UP to the frozen cent, so there is nothing left for the wallet.
+		if drawn := b.grossMicros() - frozenMicros; drawn > 0 {
+			b.WalletDrawnMicros = drawn
+		} else {
+			b.WalletDrawnMicros = 0
+		}
+	}
+
 	if b.WalletDrawnMicros > b.grossMicros() {
 		// The draw may equal the gross — a boundary fully paid from the
-		// wallet — but never exceed it. The legacy path clamps instead,
+		// wallet — but never exceed it. RunBillingCycle clamps instead,
 		// which hides the arithmetic error; a sealed intent must not.
 		return nil, fmt.Errorf("boundary split: wallet draw %d exceeds the boundary gross %d",
 			b.WalletDrawnMicros, b.grossMicros())
 	}
 
-	// Arrears first, remainder forward — the order the legacy path consumes it.
+	// Arrears first, remainder forward — the order RunBillingCycle consumes it.
 	walletToArrears := b.WalletDrawnMicros
 	if walletToArrears > b.ArrearsMicros {
 		walletToArrears = b.ArrearsMicros
@@ -176,12 +242,20 @@ func advanceLines(b boundaryComponents) []proposer.ChargeLine {
 // from, the way every other leg's ref ties to its own row.
 func boundaryArrearsRef(accountID string) string { return "arrears:" + accountID }
 
-// proposeBoundary seals this boundary as intents instead of collecting it.
+// proposeBoundary seals this boundary as intents. It is not an alternative to
+// collecting it any more: the collector is deleted, so this is the only way a
+// boundary is ever billed.
 //
 // 🔴 IT MOVES NO MONEY, AND THAT IS THE POINT — see WithIntentProposer. A leg
 // that proposes holds no write port, so once every leg is cut over
 // cmd/billing-cycle cannot charge anyone, which is a stronger statement than
 // any check over its call graph could make.
+//
+// A service with no proposer therefore reaches ProposeGroup on a nil interface
+// and panics. That is deliberate in the sense that it is not papered over: the
+// alternative — returning early, or "just this once" charging — is the
+// fallback this wave exists to remove. Wiring the cycle without a proposer is a
+// deployment that cannot bill, and it must fail where it happens.
 //
 // The run is marked 'proposed': terminal for this worker, and deliberately
 // neither 'invoiced' (no invoice exists, no money moved) nor 'failed'. Both
@@ -231,10 +305,10 @@ func (s *Service) proposeBoundary(
 		return nil, billing.Internal("boundary intent split failed", err)
 	}
 	if len(charges) == 0 {
-		// Nothing to charge. The zero-cents short-circuit above already
-		// covers this on the legacy path; reaching it here means the split
-		// found no positive component, and marking the run invoiced is the
-		// same terminal answer with no money either way.
+		// Nothing to charge. The zero-cents short-circuit in RunBillingCycle
+		// already covers this; reaching it here means the split found no
+		// positive component, and marking the run invoiced is the same
+		// terminal answer with no money either way.
 		if err := s.store.MarkBillingRun(ctx, runID, RunStatusInvoiced, "", 0); err != nil {
 			return nil, billing.Internal("mark billing run (nothing to propose) failed", err)
 		}
@@ -256,8 +330,8 @@ func (s *Service) proposeBoundary(
 	summary.Status = RunStatusProposed
 	// 🔴 Nothing was charged, so nothing may report cents as charged.
 	//
-	// The legacy path sets ChargedCents from the frozen amount before this
-	// branch is reached (charge.go:664). Leaving it set would have a proposed
+	// RunBillingCycle sets ChargedCents from the frozen amount before this
+	// branch is reached (charge.go:697). Leaving it set would have a proposed
 	// run claim it collected money it did not — the same lie the 'proposed'
 	// status exists to avoid, arriving by a different field. The amounts are
 	// still on the summary as ArrearsMicros / Advance*Micros, which is what a
@@ -275,4 +349,14 @@ func digestsOf(sealed []intent.ChargeIntent) []string {
 		out = append(out, in.Digest())
 	}
 	return out
+}
+
+// frozenCentsForProposal is the cents a prior attempt of this run committed to,
+// or zero when none did. Split out so the call site reads as one field rather
+// than a conditional.
+func frozenCentsForProposal(has bool, frozen FrozenBoundaryCharge) int64 {
+	if !has {
+		return 0
+	}
+	return frozen.Cents
 }

@@ -48,30 +48,16 @@ var allowedProviderMutations = map[string]string{
 	"internal/account/webhook/handlers.go (*Router).handlePaymentMethodAttached SetDefaultPaymentMethod": "first attached card becomes the default so later invoices have something to charge",
 
 	// --- the cycle: draft assembly (no money moves) ---
-	"internal/account/cycle/charge.go (*Service).charge CreateDraftInvoice":                                               "the boundary invoice's inert draft; a crash here leaves something that can never charge",
-	"internal/account/cycle/charge.go (*Service).charge CreateInvoiceItem":                                                "the boundary invoice's lines, pinned to that draft",
-	"internal/account/cycle/charge.go (*Service).boundaryInvoice CreateInvoiceItem":                                       "resume path re-pinning a line to the replayed draft",
-	"internal/account/cycle/overage.go (*Service).ChargeModuleOverage CreateDraftInvoice":                                 "per-timer module overage draft",
-	"internal/account/cycle/overage.go (*Service).ChargeModuleOverage CreateInvoiceItem":                                  "the module overage line",
-	"internal/account/cycle/overage.go (*Service).recoverModuleOverageCharge CreateInvoiceItem":                           "crash recovery re-pinning the overage line",
-	"internal/account/cycle/domain_charges.go (*Service).ChargeDomain CreateDraftInvoice":                                 "custom-domain charge draft",
-	"internal/account/cycle/domain_charges.go (*Service).ChargeDomain CreateInvoiceItem":                                  "the custom-domain line",
-	"internal/account/cycle/domain_charges.go (*Service).recoverDomainCharge CreateInvoiceItem":                           "crash recovery re-pinning the domain line",
-	"internal/account/cycle/proration.go (*Service).reconcileCombinedProrationInvoice CreateDraftInvoice":                 "combined creation-proration draft",
-	"internal/account/cycle/proration.go (*Service).reconcileCombinedProrationInvoice CreateCombinedProrationInvoiceItem": "the proration line, carrying the identity that lets a crashed leg be reconciled",
+	"internal/account/cycle/overage.go (*Service).recoverModuleOverageCharge CreateInvoiceItem": "crash recovery re-pinning the overage line",
+	"internal/account/cycle/domain_charges.go (*Service).recoverDomainCharge CreateInvoiceItem": "crash recovery re-pinning the domain line",
 
 	// --- credit purchase: draft assembly ---
-	"internal/account/creditpurchase/executor.go (*Executor).recoverOrCreateInvoice CreateCreditPurchaseInvoice": "the purchase draft, stamped with the ledger anchors that route its webhook",
-	"internal/account/creditpurchase/executor.go (*Executor).ensureDraftLine CreateInvoiceItem":                  "the purchase line",
-	"internal/account/creditpurchase/executor.go (*Executor).reconcileUncollectible VoidInvoice":                 "closing out a purchase the provider gave up collecting",
+	"internal/account/creditpurchase/executor.go (*Executor).reconcileUncollectible VoidInvoice": "closing out a purchase the provider gave up collecting",
 
 	// --- automatic top-up: draft assembly ---
-	"internal/account/autotopup/executor.go (*Executor).recoverOrCreateInvoice CreateAutoTopUpInvoice":   "the top-up draft, stamped with the ledger anchors that route its webhook",
-	"internal/account/autotopup/executor.go (*Executor).ensureDraftLine CreateInvoiceItem":               "the top-up line",
-	"internal/account/autotopup/executor.go (*Executor).finalizeDraft FinalizeInvoiceWithoutAutoAdvance": "finalizes without automatic collection, so the pay step below stays the single money-moving call",
-	"internal/account/autotopup/executor.go (*Executor).voidAndFail VoidInvoice":                         "abandoning a top-up whose charge will not be attempted",
-	"internal/account/autotopup/executor.go (*Executor).deleteDraftAndFail DeleteDraftInvoice":           "discarding a draft that was never finalized",
-	"internal/account/autotopup/executor.go (*Executor).ReconcileWebhookFailure VoidInvoice":             "closing out a top-up the provider reported as failed",
+	"internal/account/autotopup/executor.go (*Executor).voidAndFail VoidInvoice":               "abandoning a top-up whose charge will not be attempted",
+	"internal/account/autotopup/executor.go (*Executor).deleteDraftAndFail DeleteDraftInvoice": "discarding a draft that was never finalized",
+	"internal/account/autotopup/executor.go (*Executor).ReconcileWebhookFailure VoidInvoice":   "closing out a top-up the provider reported as failed",
 
 	// --- the eleven service call sites that can take money ---
 	//
@@ -85,17 +71,16 @@ var allowedProviderMutations = map[string]string{
 	//
 	// A header that disagrees with the list it heads is a small thing sitting
 	// on top of the one constant the intent-only claim rests on.
-	"internal/account/cycle/charge.go (*Service).charge FinalizeInvoice":                               "COLLECT: the period-boundary invoice — the closed period's usage arrears plus the new period's advance base, overage and domains, in one charge",
-	"internal/account/cycle/charge.go (*Service).boundaryInvoice FinalizeInvoice":                      "COLLECT: resume of the same boundary invoice after a crash, replaying the original finalization key",
-	"internal/account/cycle/overage.go (*Service).ChargeModuleOverage FinalizeInvoice":                 "COLLECT: a module installed beyond the included allowance, after its grace",
-	"internal/account/cycle/overage.go (*Service).recoverModuleOverageCharge FinalizeInvoice":          "COLLECT: resume of the same overage charge after a crash",
-	"internal/account/cycle/domain_charges.go (*Service).ChargeDomain FinalizeInvoice":                 "COLLECT: a custom domain",
-	"internal/account/cycle/domain_charges.go (*Service).recoverDomainCharge FinalizeInvoice":          "COLLECT: resume of the same domain charge after a crash",
-	"internal/account/cycle/proration.go (*Service).reconcileCombinedProrationInvoice FinalizeInvoice": "COLLECT: the prorated remainder of the period an app was created in",
-	"internal/account/creditpurchase/executor.go (*Executor).finalizeDraft FinalizeInvoice":            "COLLECT: a customer-initiated credit purchase; docs/SECURITY.md §2 records that this finalizes with auto-advance before the browser holds its client secret",
-	"internal/account/autotopup/executor.go (*Executor).resume PayInvoiceWithMethod":                   "COLLECT: automatic top-up against the stored card; docs/SECURITY.md §2 records that four ordinary read and ingest paths can reach it",
-	"internal/account/billing/unpaid.go (*Service).PayInvoice PayInvoice":                              "COLLECT: retrying an invoice the customer already owes",
-	"cmd/account-api/main.go (*dispatcher).dispatch PayInvoice":                                        "dispatcher delegating to the service method above",
+	"internal/account/cycle/overage.go (*Service).recoverModuleOverageCharge FinalizeInvoice": "COLLECT: resume of the same overage charge after a crash",
+	"internal/account/cycle/domain_charges.go (*Service).recoverDomainCharge FinalizeInvoice": "COLLECT: resume of the same domain charge after a crash",
+	// 🔴 NOT a provider call, and since the legacy drop not even an indirect
+	// one. ScanProviderMutations matches the selector name without resolving
+	// the receiver, and this is d.svc.PayInvoice — billing's OWN service
+	// method, which now PROPOSES a receivable and never reaches Stripe. The
+	// scan over-approximates deliberately: "a missed site is a money path
+	// nobody reviewed while a spurious one costs an allow-list entry and a
+	// comment explaining why it is harmless."
+	"cmd/account-api/main.go (*dispatcher).dispatch PayInvoice": "NOT A PROVIDER CALL: billing's own Service.PayInvoice, which proposes a receivable",
 
 	// --- the intent path ---
 	//

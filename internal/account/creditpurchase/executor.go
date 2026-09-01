@@ -54,7 +54,13 @@ func NewExecutor(store Store, settler Settler, stripe StripeClient) *Executor {
 	return &Executor{store: store, settler: settler, stripe: stripe}
 }
 
-// WithIntentProposer cuts this leg over to the intent path.
+// WithIntentProposer installs the seam this leg proposes through.
+//
+// 🔴 IT IS NO LONGER OPTIONAL. The legacy collector is deleted, so an executor
+// without a proposer cannot start a purchase at all — Resume refuses a fresh
+// one rather than charging it. The seam stays a setter only because the
+// constructor is called from three binaries this change may not touch; those
+// call sites are what must be wired next.
 //
 // 🔴 ARMING THIS CHANGES A CUSTOMER-FACING CONTRACT, which is why it is the
 // last leg to be routed and why it took an owner decision rather than an
@@ -117,36 +123,67 @@ func (e *Executor) Resume(ctx context.Context, supplied Attempt) (Result, error)
 		return Result{Attempt: attempt}, nil
 	}
 
-	// 🔴 THE CUTOVER BRANCH, before any Stripe object is created.
+	// 🔴 THE CUTOVER, and there is no branch left: this leg PROPOSES.
 	//
 	// Unlike the cycle legs there is no durable arming claim to sit after:
 	// this leg's claim IS the pending ledger row, taken when the purchase was
 	// inserted, and MarkProposed moves that same row under a pending-only
-	// predicate. So the branch belongs here — after the recovery guard above,
-	// which is what keeps an attempt that already reached Stripe on the legacy
-	// path.
+	// predicate. So the proposal belongs here — after the recovery guard
+	// above, which is what keeps an attempt that already reached Stripe out
+	// of it.
 	//
 	// A purchase carrying a StripeInvoiceID has an invoice at the provider and
 	// must be FINISHED there. Abandoning it would strand a charge the customer
 	// can see and nobody can prove.
-	if e.proposer != nil && attempt.StripeInvoiceID == "" {
-		return e.proposePurchase(ctx, attempt)
+	if attempt.StripeInvoiceID != "" {
+		return e.finishInFlightInvoice(ctx, attempt)
 	}
 
-	invoice, attempt, err := e.recoverOrCreateInvoice(ctx, attempt)
-	if err != nil {
-		return Result{Attempt: attempt}, err
-	}
-	if invoice.Status == "draft" {
-		invoice, err = e.finalizeDraft(ctx, attempt, invoice)
-		if err != nil {
-			return Result{Attempt: attempt, Invoice: invoice}, err
-		}
-	} else if invoice.Status == "" {
-		return Result{Attempt: attempt, Invoice: invoice}, fmt.Errorf(
-			"manual credit purchase invoice %s has empty status",
-			invoice.ID,
+	// 🔴 Fail closed — and deliberately BELOW the in-flight path.
+	//
+	// There is no collector to fall back to any more, so an unarmed executor
+	// must say so rather than dereference a nil seam. It is checked here and
+	// not at the top of Resume because an in-flight invoice has to stay
+	// finishable on a deployment that was never armed; refusing it up there
+	// would strand exactly the charge the guard above exists to protect.
+	if e.proposer == nil {
+		return Result{Attempt: attempt}, fmt.Errorf(
+			"manual credit purchase %s cannot proceed: this leg no longer charges "+
+				"and no intent proposer is installed",
+			attempt.ID,
 		)
+	}
+	return e.proposePurchase(ctx, attempt)
+}
+
+// finishInFlightInvoice completes a purchase whose invoice already exists at
+// the provider.
+//
+// 🔴 THE ONLY PATH LEFT IN THIS LEG THAT TOUCHES STRIPE, and it ORIGINATES
+// NOTHING: it re-reads the invoice this attempt is already attached to and
+// reconciles the ledger against what it finds. The attachment is the proof
+// that a charge left this process — abandoning it would leave a customer who
+// can see that invoice, and may already have paid it, with a wallet that never
+// moved and a row nobody can settle.
+//
+// A draft that was attached but never finalized reaches reconcileResource's
+// default arm and errors by name. That is deliberate rather than an oversight:
+// such a draft carries auto_advance=false so it can never collect on its own,
+// nothing was taken from the customer, and finalizing it is precisely the code
+// this cutover deleted.
+func (e *Executor) finishInFlightInvoice(
+	ctx context.Context,
+	attempt Attempt,
+) (Result, error) {
+	invoice, err := e.stripe.GetInvoice(ctx, attempt.StripeInvoiceID)
+	if err != nil {
+		return Result{Attempt: attempt}, fmt.Errorf(
+			"retrieve in-flight manual credit purchase invoice: %w",
+			err,
+		)
+	}
+	if err := validateInvoiceIdentity(attempt, invoice, true); err != nil {
+		return Result{Attempt: attempt, Invoice: invoice}, err
 	}
 	return e.reconcileResource(ctx, attempt, invoice)
 }
@@ -263,208 +300,6 @@ func (e *Executor) ReconcileWebhookFailure(
 		result.FailureCode = ""
 	}
 	return result, nil
-}
-
-func (e *Executor) recoverOrCreateInvoice(
-	ctx context.Context,
-	attempt Attempt,
-) (billingstripe.Invoice, Attempt, error) {
-	ref := "credit-purchase:" + attempt.ID.String()
-	var (
-		invoice billingstripe.Invoice
-		err     error
-	)
-	if attempt.StripeInvoiceID != "" {
-		invoice, err = e.stripe.GetInvoice(ctx, attempt.StripeInvoiceID)
-		if err != nil {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf(
-				"retrieve manual credit purchase invoice: %w",
-				err,
-			)
-		}
-	} else {
-		if strings.TrimSpace(attempt.StripeCustomerID) == "" {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf(
-				"manual credit purchase %s has no expected Stripe customer",
-				attempt.ID,
-			)
-		}
-		var found bool
-		invoice, found, err = e.stripe.FindInvoiceByRef(
-			ctx,
-			attempt.StripeCustomerID,
-			ref,
-		)
-		if err != nil {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf(
-				"recover manual credit purchase invoice: %w",
-				err,
-			)
-		}
-		if !found {
-			invoice, err = e.stripe.CreateCreditPurchaseInvoice(
-				ctx,
-				attempt.StripeCustomerID,
-				attempt.AccountID.String(),
-				attempt.ID.String(),
-				"credit-inv:"+attempt.ID.String(),
-			)
-			if err != nil {
-				return billingstripe.Invoice{}, attempt, fmt.Errorf(
-					"create manual credit purchase invoice: %w",
-					err,
-				)
-			}
-		}
-		if invoice.CustomerID != attempt.StripeCustomerID {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf(
-				"manual credit purchase invoice customer %q does not match expected customer %q",
-				invoice.CustomerID,
-				attempt.StripeCustomerID,
-			)
-		}
-		if err := validateInvoiceIdentity(attempt, invoice, false); err != nil {
-			return billingstripe.Invoice{}, attempt, err
-		}
-		attempt, err = e.store.AttachInvoice(ctx, attempt, invoice)
-		if err != nil {
-			return billingstripe.Invoice{}, attempt, fmt.Errorf(
-				"attach manual credit purchase invoice: %w",
-				err,
-			)
-		}
-	}
-	if err := validateInvoiceIdentity(attempt, invoice, true); err != nil {
-		return billingstripe.Invoice{}, attempt, err
-	}
-	return invoice, attempt, nil
-}
-
-func (e *Executor) finalizeDraft(
-	ctx context.Context,
-	attempt Attempt,
-	invoice billingstripe.Invoice,
-) (billingstripe.Invoice, error) {
-	verified, err := e.ensureDraftLine(ctx, attempt, invoice)
-	if err != nil {
-		return invoice, err
-	}
-	finalized, err := e.stripe.FinalizeInvoice(
-		ctx,
-		verified.ID,
-		"credit-fin:"+attempt.ID.String(),
-	)
-	if err != nil {
-		return invoice, fmt.Errorf("finalize manual credit purchase invoice: %w", err)
-	}
-	if finalized.ID != verified.ID {
-		return finalized, fmt.Errorf(
-			"Stripe finalized invoice %q instead of attached invoice %q",
-			finalized.ID,
-			verified.ID,
-		)
-	}
-	// Never trust the finalize response as payment truth.
-	latest, err := e.stripe.GetInvoice(ctx, verified.ID)
-	if err != nil {
-		return finalized, fmt.Errorf(
-			"retrieve finalized manual credit purchase invoice: %w",
-			err,
-		)
-	}
-	return latest, nil
-}
-
-func (e *Executor) ensureDraftLine(
-	ctx context.Context,
-	attempt Attempt,
-	invoice billingstripe.Invoice,
-) (billingstripe.Invoice, error) {
-	if err := validateInertDraft(attempt, invoice); err != nil {
-		return invoice, err
-	}
-	items, err := e.stripe.ListInvoiceItems(ctx, invoice.ID)
-	if err != nil {
-		return invoice, fmt.Errorf("list manual credit purchase draft items: %w", err)
-	}
-	if len(items) > 1 {
-		return invoice, fmt.Errorf(
-			"manual credit purchase invoice %s has %d draft items; expected zero or one",
-			invoice.ID,
-			len(items),
-		)
-	}
-	if len(items) == 1 {
-		if err := validateExactItem(attempt, invoice.ID, items[0]); err != nil {
-			return invoice, err
-		}
-	} else {
-		if invoice.Total != 0 ||
-			invoice.AmountDue != 0 ||
-			invoice.AmountPaid != 0 ||
-			invoice.AmountRemaining != 0 ||
-			invoice.AmountPaidOffStripe != 0 {
-			return invoice, fmt.Errorf(
-				"empty manual credit purchase draft %s carries money total=%d due=%d paid=%d remaining=%d off_stripe=%d",
-				invoice.ID,
-				invoice.Total,
-				invoice.AmountDue,
-				invoice.AmountPaid,
-				invoice.AmountRemaining,
-				invoice.AmountPaidOffStripe,
-			)
-		}
-		expectedCents := microsToCentsRoundHalfUp(attempt.AmountMicros)
-		if _, err := e.stripe.CreateInvoiceItem(
-			ctx,
-			invoice.CustomerID,
-			invoice.ID,
-			expectedCents,
-			"usd",
-			"MirrorStack credit purchase",
-			billingstripe.LinePeriod{},
-			"credit-item:"+attempt.ID.String(),
-		); err != nil {
-			return invoice, fmt.Errorf("create manual credit purchase invoice item: %w", err)
-		}
-		invoice, err = e.stripe.GetInvoice(ctx, invoice.ID)
-		if err != nil {
-			return invoice, fmt.Errorf(
-				"retrieve manual credit purchase draft after item: %w",
-				err,
-			)
-		}
-		items, err = e.stripe.ListInvoiceItems(ctx, invoice.ID)
-		if err != nil {
-			return invoice, fmt.Errorf(
-				"re-list manual credit purchase draft items: %w",
-				err,
-			)
-		}
-	}
-	if err := validateInertDraft(attempt, invoice); err != nil {
-		return invoice, err
-	}
-	if err := validateInvoiceIdentityAndLine(attempt, invoice, items); err != nil {
-		return invoice, err
-	}
-	expectedCents := microsToCentsRoundHalfUp(attempt.AmountMicros)
-	if invoice.AmountDue != expectedCents ||
-		invoice.AmountPaid != 0 ||
-		invoice.AmountRemaining != expectedCents ||
-		invoice.AmountPaidOffStripe != 0 {
-		return invoice, fmt.Errorf(
-			"manual credit purchase draft %s has due=%d paid=%d remaining=%d off_stripe=%d; expected %d/0/%d/0",
-			invoice.ID,
-			invoice.AmountDue,
-			invoice.AmountPaid,
-			invoice.AmountRemaining,
-			invoice.AmountPaidOffStripe,
-			expectedCents,
-			expectedCents,
-		)
-	}
-	return invoice, nil
 }
 
 func (e *Executor) reconcileResource(
@@ -758,33 +593,6 @@ func validateInvoiceIdentity(
 			invoice.ID,
 			attempt.AccountID,
 			attempt.ID,
-		)
-	}
-	return nil
-}
-
-func validateInertDraft(attempt Attempt, invoice billingstripe.Invoice) error {
-	if err := validateInvoiceIdentity(attempt, invoice, true); err != nil {
-		return err
-	}
-	if invoice.Status != "draft" {
-		return fmt.Errorf(
-			"manual credit purchase invoice %s status is %q; expected draft",
-			invoice.ID,
-			invoice.Status,
-		)
-	}
-	if invoice.CollectionMethod != string(stripego.InvoiceCollectionMethodChargeAutomatically) {
-		return fmt.Errorf(
-			"manual credit purchase draft %s collection_method is %q; expected charge_automatically",
-			invoice.ID,
-			invoice.CollectionMethod,
-		)
-	}
-	if invoice.AutoAdvance {
-		return fmt.Errorf(
-			"manual credit purchase draft %s has auto_advance enabled",
-			invoice.ID,
 		)
 	}
 	return nil

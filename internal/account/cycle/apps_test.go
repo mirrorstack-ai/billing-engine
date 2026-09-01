@@ -242,13 +242,17 @@ func TestRegisterApp_EchoesArmedGuardOnRetry(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc := appsSvc(store, sc)
+	// The creation-proration leg has no direct charge path left, so the sweep
+	// needs the proposer to bill at all; the guard it arms now carries the
+	// intent reference rather than a Stripe invoice id.
+	p := &capturingProposer{}
+	svc := appsSvc(store, sc).WithIntentProposer(p)
 	appID := uuid.New()
 	req := cycle.RegisterAppRequest{OwnerUserID: user, AppID: appID, CreatedAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
 
 	_, err := svc.RegisterApp(context.Background(), req)
 	require.NoError(t, err)
-	// The sweep charges it (grace elapsed).
+	// The sweep bills it (grace elapsed).
 	_, err = svc.SweepCreationProrations(context.Background(), time.Date(2026, 7, 5, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	armed := store.apps[appID].ProrationInvoiceID
@@ -257,7 +261,7 @@ func TestRegisterApp_EchoesArmedGuardOnRetry(t *testing.T) {
 	resp, err := svc.RegisterApp(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, armed, resp.ProrationInvoiceID)
-	require.Len(t, sc.itemCalls, 1, "the retry must not add a second charge")
+	require.Len(t, p.charges, 1, "the retry must not add a second charge")
 }
 
 func TestRegisterApp_RetryKeepsFirstRegistrationsAnchor(t *testing.T) {
@@ -561,26 +565,30 @@ func TestRunBillingCycle_InvoicesUsagePlusAdvanceBase(t *testing.T) {
 	tiered := seedApp(store, chargeAccount, 6, false)
 	sc := newFakeStripe()
 
-	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	svc, p := chargeSvcProposing(store, sc)
+	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.EqualValues(t, 1_000_000, resp.ArrearsMicros)
 	require.EqualValues(t, 40_000_000, resp.AdvanceBaseMicros) // 2 × flat $20
-	require.EqualValues(t, 4_100, resp.ChargedCents)
-	require.Len(t, sc.itemCalls, 1, "usage + base pool into ONE line on ONE invoice")
-	require.EqualValues(t, 4_100, sc.itemCalls[0].amountCfg)
+	require.EqualValues(t, 41_000_000, proposedMicros(t, p),
+		"usage + base seal as ONE group, the same total the one invoice carried")
+	require.Empty(t, sc.itemCalls)
 
-	// The advance leg froze one migration-028 base snapshot per billed app for
-	// the NEW window [Jul 1, Aug 1) — the FLAT base (overage is not billed here).
-	fs, ok := store.baseSnapshots[snapKey{flat, periodEnd}]
-	require.True(t, ok)
-	require.Equal(t, "advance", fs.source)
-	require.EqualValues(t, usage.BaseFeeMicros, fs.snap.BaseMicros)
-	require.Equal(t, periodEnd.AddDate(0, 1, 0), fs.snap.PeriodEnd)
-	ts, ok := store.baseSnapshots[snapKey{tiered, periodEnd}]
-	require.True(t, ok)
-	require.EqualValues(t, usage.BaseFeeMicros, ts.snap.BaseMicros, "per-app base is flat")
-	require.Equal(t, 6, ts.snap.ModuleCount)
+	// 🔴 KNOWN GAP, recorded rather than quietly dropped.
+	//
+	// The migration-028 advance base snapshot — the display's authoritative
+	// per-app base for the new window — was written AFTER the Stripe call, so a
+	// boundary that proposes writes none. Nothing in this leg writes it any
+	// more; whatever settles the intents has to, or the billing display falls
+	// back to a base it recomputes and can drift from what was collected.
+	//
+	// Asserted as absent so the gap is visible and this test fails the day it
+	// is closed, instead of a deleted assertion hiding it.
+	_, flatSnap := store.baseSnapshots[snapKey{flat, periodEnd}]
+	require.False(t, flatSnap, "a proposed boundary wrote an advance base snapshot — good, but update this test")
+	_, tieredSnap := store.baseSnapshots[snapKey{tiered, periodEnd}]
+	require.False(t, tieredSnap)
 }
 
 func TestRunBillingCycle_BaseOnlyInvoiceWhenNoUsage(t *testing.T) {
@@ -593,13 +601,14 @@ func TestRunBillingCycle_BaseOnlyInvoiceWhenNoUsage(t *testing.T) {
 	seedApp(store, chargeAccount, 0, false)
 	sc := newFakeStripe()
 
-	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	svc, p := chargeSvcProposing(store, sc)
+	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.EqualValues(t, 0, resp.ArrearsMicros)
 	require.EqualValues(t, usage.BaseFeeMicros, resp.AdvanceBaseMicros)
-	require.EqualValues(t, 2_000, resp.ChargedCents) // $20 → 2000 cents
-	require.Len(t, sc.invoiceCalls, 1)
+	require.EqualValues(t, usage.BaseFeeMicros, proposedMicros(t, p), "the base alone is still a boundary")
+	require.Empty(t, sc.invoiceCalls)
 }
 
 func TestRunBillingCycle_BothZeroSkipsStripe(t *testing.T) {
@@ -630,11 +639,12 @@ func TestRunBillingCycle_DeletedAppsExcludedFromBaseButUsageStillBills(t *testin
 	seedApp(store, chargeAccount, 9, true) // deleted — its 9-module tier must NOT bill
 	sc := newFakeStripe()
 
-	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	svc, p := chargeSvcProposing(store, sc)
+	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.EqualValues(t, 5_000_000, resp.ArrearsMicros)
 	require.EqualValues(t, usage.BaseFeeMicros, resp.AdvanceBaseMicros, "only the live app's base")
-	require.EqualValues(t, 2_500, resp.ChargedCents) // (5e6 + 20e6) / 10_000
+	require.EqualValues(t, 25_000_000, proposedMicros(t, p)) // 5e6 usage + 20e6 base
 }
 
 func TestRunBillingCycle_OtherAccountsAppsDoNotBill(t *testing.T) {
@@ -665,13 +675,13 @@ func TestRunBillingCycle_ExcludesAppCreatedInsideNewPeriod(t *testing.T) {
 	seedApp(store, chargeAccount, 0, false)                                               // pre-existing → counts
 	newApp := seedAppCreated(store, chargeAccount, 6, false, periodEnd.Add(10*time.Hour)) // inside the new period → excluded
 	sc := newFakeStripe()
-	svc := chargeSvc(store, sc)
+	svc, p := chargeSvcProposing(store, sc)
 
 	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.EqualValues(t, usage.BaseFeeMicros, resp.AdvanceBaseMicros,
 		"only the pre-existing app's base — the new app's new-period base is the proration leg's")
-	require.EqualValues(t, 2_000, resp.ChargedCents)
+	require.EqualValues(t, usage.BaseFeeMicros, proposedMicros(t, p))
 
 	// And no advance snapshot was minted for the excluded app (nothing was
 	// billed for it at this boundary).
@@ -686,7 +696,12 @@ func TestRunBillingCycle_ExcludesAppCreatedInsideNewPeriod(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 2*usage.BaseFeeMicros, resp.AdvanceBaseMicros,
 		"the new app joins the advance leg at the NEXT boundary (flat base)")
-	require.EqualValues(t, 4_000, resp.ChargedCents, "2 × flat $20, no boundary overage")
+	require.Len(t, p.groups, 2, "the second boundary sealed its own group")
+	var second int64
+	for _, c := range p.groups[1] {
+		second += c.TotalMicros()
+	}
+	require.EqualValues(t, 2*usage.BaseFeeMicros, second, "2 × flat $20, no boundary overage")
 }
 
 func TestRunBillingCycle_ReclaimedRunNoDoubleBase(t *testing.T) {
@@ -705,7 +720,8 @@ func TestRunBillingCycle_ReclaimedRunNoDoubleBase(t *testing.T) {
 	store.activation[acct] = time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC) // anchor day 1 → [Jun 1, Jul 1), [Jul 1, Aug 1)
 	preApp := seedAppCreated(store, acct, 0, false, time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC))
 	sc := newFakeStripe()
-	svc := cycle.NewService(store, sc).WithNow(func() time.Time {
+	p := &capturingProposer{}
+	svc := cycle.NewService(store, sc).WithIntentProposer(p).WithNow(func() time.Time {
 		return time.Date(2026, 7, 2, 13, 0, 0, 0, time.UTC)
 	})
 
@@ -727,34 +743,38 @@ func TestRunBillingCycle_ReclaimedRunNoDoubleBase(t *testing.T) {
 	require.NoError(t, err)
 	reg, err := svc.ChargeCreationProration(context.Background(), newApp)
 	require.NoError(t, err)
-	require.EqualValues(t, 1_935, reg.ProrationCents)
-	require.Len(t, sc.invoiceCalls, 1)
+	require.Equal(t, cycle.ProrationStatusProposed, reg.Status)
+	require.NotEmpty(t, reg.IntentDigest, "the app's creation period must still be billed to something")
+	require.Empty(t, sc.invoiceCalls)
 
 	// Reclaim: the advance leg bills ONLY the pre-existing app's base.
 	second, err := svc.RunBillingCycle(context.Background(), acct, periodStart, periodEnd, 0)
 	require.NoError(t, err)
 	require.True(t, second.FirstRun, "skipped_no_pm is reclaimed")
-	require.Equal(t, cycle.RunStatusInvoiced, second.Status)
+	require.Equal(t, cycle.RunStatusProposed, second.Status)
 	require.EqualValues(t, usage.BaseFeeMicros, second.AdvanceBaseMicros,
 		"the reclaimed run must NOT re-bill the prorated app's period")
-	require.EqualValues(t, 2_100, second.ChargedCents) // 1e6 arrears + 20e6 base
+	require.EqualValues(t, 21_000_000, proposedMicros(t, p), // 1e6 arrears + 20e6 base
+		"the boundary sealed the prorated app's period a second time")
 
-	// Exactly ONE proration invoice + ONE boundary invoice — never a third.
-	require.Len(t, sc.invoiceCalls, 2)
+	// Neither leg collects any more, so there is no invoice of any kind.
+	require.Empty(t, sc.invoiceCalls)
 
-	// Snapshot ledger for the new period [Jul 1, Aug 1): the proration row for
-	// the new app + the advance row for the pre-existing app — one row per
-	// app-period, each recording exactly what its leg billed.
+	// 🔴 KNOWN GAP (see TestRunBillingCycle_InvoicesUsagePlusAdvanceBase).
+	//
+	// The migration-028 snapshot ledger for the new period [Jul 1, Aug 1) used
+	// to carry one row per app-period — 'proration' for the app created inside
+	// it, 'advance' for the pre-existing one — each recording exactly what its
+	// leg billed. Both legs wrote it AFTER their provider call, so both stop
+	// writing it when they propose. The double-base property this test exists
+	// for is still pinned above, on the amounts; the display's authoritative
+	// base is what has no writer.
 	jul1 := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
-	pro, ok := store.baseSnapshots[snapKey{newApp, jul1}]
-	require.True(t, ok)
-	require.Equal(t, "proration", pro.source)
-	require.EqualValues(t, 19_354_839, pro.snap.BaseMicros)
-	adv, ok := store.baseSnapshots[snapKey{preApp, jul1}]
-	require.True(t, ok)
-	require.Equal(t, "advance", adv.source)
-	require.EqualValues(t, usage.BaseFeeMicros, adv.snap.BaseMicros)
-	require.Len(t, store.baseSnapshots, 2)
+	_, proSnap := store.baseSnapshots[snapKey{newApp, jul1}]
+	require.False(t, proSnap)
+	_, advSnap := store.baseSnapshots[snapKey{preApp, jul1}]
+	require.False(t, advSnap)
+	require.Empty(t, store.baseSnapshots)
 }
 
 func TestAccountHasLiveApps(t *testing.T) {
