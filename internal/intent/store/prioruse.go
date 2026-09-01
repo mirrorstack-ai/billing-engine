@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 )
@@ -89,4 +92,40 @@ func (s *Store) PriorUseFor(ctx context.Context, authorizationID string, since t
 		Attempts:    attempts,
 		Unresolved:  unresolved,
 	}, nil
+}
+
+// IntentForProviderReference finds the intent a provider object settled.
+//
+// 🔴 THIS IS THE LINK §6's collect_receivable IS DEFINED ON. A receivable is
+// CollectRemainderOf(source) — it names a SOURCE INTENT and collects what is
+// left of it. Retrying an unpaid invoice therefore has to answer "which intent
+// raised this?", and until migration 069 persisted the provider reference that
+// question had no answer at all, which is why the unpaid-retry leg could not be
+// routed.
+//
+// Returns found=false for an invoice the intent rail never raised. That is the
+// ordinary case today and for a long time yet: every unpaid invoice in
+// production predates the rail, so the caller keeps the legacy path. It is the
+// same shape as every other leg's recovery guard — a charge that already exists
+// at the provider under the old rail must be finished under the old rail.
+func (s *Store) IntentForProviderReference(
+	ctx context.Context,
+	providerReference string,
+) (string, bool, error) {
+	if providerReference == "" {
+		return "", false, nil
+	}
+	var digest string
+	err := s.pool.QueryRow(ctx, `
+		SELECT intent_digest
+		  FROM ms_billing.intent_settlement_claims
+		 WHERE provider_reference = $1
+		   AND outcome = 'succeeded'`, providerReference).Scan(&digest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("intent for provider reference %s: %w", providerReference, err)
+	}
+	return digest, true, nil
 }

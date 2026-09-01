@@ -231,6 +231,11 @@ type InvoicePayTarget struct {
 	Status                  string
 	ChargeFundingAccountID  uuid.UUID
 	FundingLegacyUnresolved bool
+	// AmountDueMicros is what is still owed. A receivable collects the
+	// REMAINDER of its source, and the provider's own figure for this invoice
+	// is the only one that can be right about what is left — deriving it again
+	// from our side would be the INV-001 inversion in reverse.
+	AmountDueMicros int64
 }
 
 // GetServiceStatusRequest is the payload of GetServiceStatus — the account is
