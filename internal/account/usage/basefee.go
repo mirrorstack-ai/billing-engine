@@ -1,6 +1,12 @@
 package usage
 
-import "time"
+import (
+	"bytes"
+	"sort"
+	"time"
+
+	"github.com/google/uuid"
+)
 
 const microsPerCent = 10_000
 
@@ -175,4 +181,80 @@ func ProrationCoverageStart(createdAt, periodStart time.Time) time.Time {
 // date), so the division is exact — UTC has no DST to break the 24h day.
 func wholeDaysUTC(from, to time.Time) int64 {
 	return int64(to.Sub(from) / (24 * time.Hour))
+}
+
+// projectedBaseFeeByApp allocates the account's NEXT-PERIOD recurring base to
+// the apps that own it, keyed by app id. Σ of the returned values equals the
+// account line GetAccountBill publishes:
+//
+//	Σ = activatedApps × baseFeeMicros
+//	  + ModuleBlockMicros(Σ overCounts)
+//	  + Σ domainCounts × DomainFeeMicros
+//
+// exactly, for any share set — that identity is the whole point, and
+// TestProjectedBaseFeeByAppSumsToAccountTotal pins it.
+//
+// Two of the three terms are already per-app: an activated app owns its flat
+// base, and a custom domain owns its $2. The OVERAGE is not. Overage is sold in
+// whole blocks against an ACCOUNT-WIDE allowance (migration 033), so the account
+// pays ceil(over/ModuleBlockSize) blocks no matter how the over-modules are
+// spread — two apps with two over-modules each cost ONE block between them, and
+// recomputing the block price per app would bill two. The block total is
+// therefore DISTRIBUTED, never recomputed: each app takes the share of the
+// account's block money that its over-count earns.
+//
+// The split is by largest remainder, so the parts sum to the whole with no
+// rounding drift, and ties break on app id — a stable, arbitrary-but-repeatable
+// order beats a map-iteration one that would move money between apps run to run.
+// An account with all its over-modules on one app (the common shape) gives that
+// app every block, which is the intuitive answer and falls out of the general
+// rule rather than being special-cased.
+func projectedBaseFeeByApp(shares []AppRecurringFeeShare, baseFeeMicros int64) map[uuid.UUID]int64 {
+	if len(shares) == 0 {
+		return nil
+	}
+	byApp := make(map[uuid.UUID]int64, len(shares))
+	var totalOver int64
+	for _, share := range shares {
+		var micros int64
+		if share.Activated {
+			micros += baseFeeMicros
+		}
+		micros += int64(share.CustomDomainCount) * DomainFeeMicros
+		byApp[share.AppID] = micros
+		totalOver += int64(share.OverModuleCount)
+	}
+	if totalOver == 0 {
+		return byApp
+	}
+
+	// Largest remainder over the account's whole-block money. floor + the top
+	// remainders exhausts blockTotal precisely; nothing is created or lost.
+	blockTotal := ModuleBlockMicros(totalOver)
+	type portion struct {
+		appID     uuid.UUID
+		remainder int64
+	}
+	portions := make([]portion, 0, len(shares))
+	allocated := int64(0)
+	for _, share := range shares {
+		over := int64(share.OverModuleCount)
+		if over == 0 {
+			continue
+		}
+		exact := blockTotal * over
+		byApp[share.AppID] += exact / totalOver
+		allocated += exact / totalOver
+		portions = append(portions, portion{appID: share.AppID, remainder: exact % totalOver})
+	}
+	sort.Slice(portions, func(i, j int) bool {
+		if portions[i].remainder != portions[j].remainder {
+			return portions[i].remainder > portions[j].remainder
+		}
+		return bytes.Compare(portions[i].appID[:], portions[j].appID[:]) < 0
+	})
+	for i := int64(0); i < blockTotal-allocated; i++ {
+		byApp[portions[i%int64(len(portions))].appID]++
+	}
+	return byApp
 }

@@ -147,6 +147,25 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		}, nil
 	}
 
+	// The next-period recurring base, decomposed by owning app. Only the CURRENT
+	// live window forecasts one (a frozen window's projection is the flat per-app
+	// base and nothing else), so a historical bill reads no shares and allocates
+	// the flat fee directly below.
+	var recurringShares []AppRecurringFeeShare
+	if periodID == "" {
+		store, ok := s.store.(interface {
+			ActivatedRecurringFeeShares(context.Context, uuid.UUID, int) ([]AppRecurringFeeShare, error)
+		})
+		if !ok {
+			return nil, billing.Internal("activated recurring fee share store unavailable", nil)
+		}
+		recurringShares, err = store.ActivatedRecurringFeeShares(ctx, accountID, IncludedModules)
+		if err != nil {
+			return nil, billing.Internal("activated recurring fee shares failed", err)
+		}
+	}
+	projectedBaseByApp := projectedBaseFeeByApp(recurringShares, resolveBaseFeeMicros(plan))
+
 	usageApps, err := s.store.AppIDsWithUsage(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("app usage enumeration failed", err)
@@ -184,8 +203,12 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// A deleted app contributes NOTHING to this bill once its estimated base
 		// zeroes (computeAppBill) and it has no usage/infra arrears — drop the
 		// row rather than rendering a dead $0 line. A deleted app WITH arrears
-		// stays: its usage still bills at the boundary (cycle/charge.go).
-		if parts.IsDeleted && total == 0 {
+		// stays: its usage still bills at the boundary (cycle/charge.go). It also
+		// stays while it still carries next-period recurring base — a removed app
+		// can keep a live charged custom domain, and dropping the row would delete
+		// that money from the per-app decomposition while leaving it in the
+		// account total.
+		if parts.IsDeleted && total == 0 && projectedBaseByApp[appID] == 0 {
 			continue
 		}
 		apps = append(apps, AccountAppBill{
@@ -195,6 +218,9 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			BaseFeeMicros:     parts.BaseFeeMicros,
 			ModuleUsageMicros: parts.ModuleUsageTotalMicros,
 			InfraMicros:       parts.InfraTotalMicros,
+			// Set for the current window from the shares above; a frozen window
+			// gets the flat per-app base assigned after the roster is complete.
+			ProjectedBaseFeeMicros: projectedBaseByApp[appID],
 			// PRE-credit by contract: the account-level credit below is never
 			// allocated back per-app.
 			TotalMicros: total,
@@ -275,25 +301,29 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	projectedBaseFeeTotal := liveAppCount * resolveBaseFeeMicros(plan)
 	projectedRecurringSurcharges := accountOverage + customDomains
 	if periodID == "" {
-		store, ok := s.store.(interface {
-			ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int) (RecurringFeeCounts, error)
-		})
-		if !ok {
-			return nil, billing.Internal("activated recurring fee count store unavailable", nil)
-		}
-		counts, err := store.ActivatedRecurringFeeCounts(ctx, accountID, IncludedModules)
-		if err != nil {
-			return nil, billing.Internal("activated recurring fee counts failed", err)
-		}
 		// Modules are a RECURRING leg → whole blocks, matching the boundary
 		// advance leg (cycle.charge) and AccountOverageMicros to the micro. Apps
 		// and domains stay per-unit — neither has an allowance or a block.
+		//
+		// The counts are SUMMED FROM the same shares the per-app allocation was
+		// built from, so this total and Σ Apps[].ProjectedBaseFeeMicros are one
+		// row set added up two ways — they cannot drift into disagreement.
+		counts := RecurringFeeCountsOf(recurringShares)
 		projectedBaseFeeTotal = int64(counts.Apps)*resolveBaseFeeMicros(plan) +
 			ModuleBlockMicros(int64(counts.ModuleOverages)) +
 			int64(counts.CustomDomains)*DomainFeeMicros
 		// The current-period base line is the complete activation-gated recurring
 		// forecast, so module/domain units are folded into it exactly once.
 		projectedRecurringSurcharges = 0
+	} else {
+		// A frozen window forecasts the flat per-app base only — the surcharge
+		// lines stay account-level there (projectedRecurringSurcharges above), so
+		// every live app carries exactly the plan base and nothing else.
+		for i := range response.Apps {
+			if !response.Apps[i].IsDeleted {
+				response.Apps[i].ProjectedBaseFeeMicros = resolveBaseFeeMicros(plan)
+			}
+		}
 	}
 	response.ProjectedBaseFeeTotalMicros = projectedBaseFeeTotal
 

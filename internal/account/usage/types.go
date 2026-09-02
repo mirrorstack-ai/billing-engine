@@ -554,6 +554,22 @@ type AccountAppBill struct {
 	// FIRST exactly like GetAppBill (charged periods show what was invoiced;
 	// un-charged ones the live mirror estimate, prorated for a creation period).
 	BaseFeeMicros int64 `json:"base_fee_micros"`
+	// ProjectedBaseFeeMicros is this app's slice of the account's NEXT-PERIOD
+	// recurring base — its flat plan base once its activation charge has settled,
+	// PLUS the surcharges it owns: its custom domains at DomainFeeMicros each and
+	// its distributed share of the account's whole module-overage blocks.
+	//
+	// Distinct from BaseFeeMicros, which is what THIS period accrued (prorated
+	// for a creation period). Σ Apps[].ProjectedBaseFeeMicros ==
+	// ProjectedBaseFeeTotalMicros exactly, by construction: both are built from
+	// the one ActivatedRecurringFeeShares row set (see projectedBaseFeeByApp).
+	// That identity is what lets a bill UI show the recurring base ON each app
+	// instead of as an unattributable account line.
+	//
+	// On a FROZEN window the projection is the flat per-app base only — module
+	// and domain surcharges stay account-level there — so a live app carries
+	// exactly resolveBaseFeeMicros(plan) and a deleted one carries 0.
+	ProjectedBaseFeeMicros int64 `json:"projected_base_fee_micros"`
 	// ModuleUsageMicros is Σ of the app's non-reserved 模組使用量 line charges.
 	ModuleUsageMicros int64 `json:"module_usage_micros"`
 	// InfraMicros is the app's 基礎設施 total (residual + per-module attributed,

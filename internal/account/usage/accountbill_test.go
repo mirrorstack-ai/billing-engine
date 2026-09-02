@@ -274,11 +274,14 @@ func TestGetAccountBill_AgentModelsDecomposeModelCarryingLines(t *testing.T) {
 	require.EqualValues(t, 2500, resp.Agent.TotalMicros)
 
 	require.Equal(t, []usage.AccountAppBill{{
-		AppID:             app,
-		BaseFeeMicros:     usage.BaseFeeMicros,
-		ModuleUsageMicros: 700,
-		InfraMicros:       80,
-		TotalMicros:       usage.BaseFeeMicros + 780,
+		AppID:         app,
+		BaseFeeMicros: usage.BaseFeeMicros,
+		// The live app owns the whole next-period recurring base here: it is
+		// activated, and the account carries no overage or domain surcharges.
+		ProjectedBaseFeeMicros: usage.BaseFeeMicros,
+		ModuleUsageMicros:      700,
+		InfraMicros:            80,
+		TotalMicros:            usage.BaseFeeMicros + 780,
 	}}, resp.Apps)
 	appJSON, err := json.Marshal(resp.Apps[0])
 	require.NoError(t, err)
@@ -759,6 +762,83 @@ func TestGetAccountBill_CurrentProjectedBaseJoinsOnlyAfterInitialChargesSettle(t
 	require.NoError(t, err)
 	require.EqualValues(t, 105_000_000, bill.ProjectedBaseFeeTotalMicros)
 	require.Equal(t, bill.ProjectedBaseFeeTotalMicros, bill.ProjectedTotalMicros)
+}
+
+// The bill page shows the next-period recurring base ON each app rather than as
+// an account line, so the parts must equal the whole at the RESPONSE level, not
+// just inside the allocator. If they ever diverge, the page silently shows the
+// customer less than the estimated total it also prints.
+func TestGetAccountBill_PerAppProjectedBaseSumsToTheAccountLine(t *testing.T) {
+	store := newFakeStore()
+	owner, accountID := uuid.New(), uuid.New()
+	store.accounts[owner] = accountID
+	createdAt := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	for i := byte(1); i <= 5; i++ {
+		store.appMirrors[seqUUID(i)] = usage.AppMirrorInfo{CreatedAt: createdAt}
+	}
+	// The owner's real shape: one app holding 13 modules and one custom domain,
+	// four idle apps alongside it. 13 − 5 included = 8 over → 2 blocks.
+	app := store.appMirrors[seqUUID(1)]
+	app.ModuleCount = 13
+	store.appMirrors[seqUUID(1)] = app
+	store.liveDomainCount = 1
+	store.activatedRecurring = &usage.RecurringFeeCounts{
+		Apps: 5, ModuleOverages: 8, CustomDomains: 1,
+	}
+
+	bill, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+	})
+	require.NoError(t, err)
+
+	// $20×5 + 2 blocks + $2 domain = $112.00 — the account line as before.
+	require.EqualValues(t, 112_000_000, bill.ProjectedBaseFeeTotalMicros)
+
+	var perApp int64
+	for _, row := range bill.Apps {
+		perApp += row.ProjectedBaseFeeMicros
+	}
+	require.Equal(t, bill.ProjectedBaseFeeTotalMicros, perApp,
+		"every recurring-base unit belongs to exactly one app row")
+
+	// And it lands on the app that owns it: $20 + $10 of blocks + $2 = $32.
+	byApp := make(map[uuid.UUID]int64, len(bill.Apps))
+	for _, row := range bill.Apps {
+		byApp[row.AppID] = row.ProjectedBaseFeeMicros
+	}
+	require.EqualValues(t, 32_000_000, byApp[seqUUID(1)],
+		"the app holding the modules and the domain carries their fees")
+	require.EqualValues(t, usage.BaseFeeMicros, byApp[seqUUID(2)],
+		"an app owning no surcharge carries only the flat base")
+}
+
+// A frozen window has no surcharge forecast to allocate — its projection is the
+// flat per-app base — so the same identity must hold there by a different route.
+func TestGetAccountBill_FrozenWindowProjectsTheFlatBasePerApp(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+	pid := mirrorPeriod(store) // frozen [May 1, Jun 1)
+	createdAt := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	for i := byte(1); i <= 3; i++ {
+		store.appMirrors[seqUUID(i)] = usage.AppMirrorInfo{CreatedAt: createdAt}
+	}
+	// Surcharges the CURRENT window would forecast; a frozen one must not
+	// allocate them to an app, so they stay in the account-level line.
+	store.liveDomainCount = 2
+
+	bill, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner,
+		PeriodID:    pid.String(),
+	})
+	require.NoError(t, err)
+
+	var perApp int64
+	for _, row := range bill.Apps {
+		perApp += row.ProjectedBaseFeeMicros
+		require.EqualValues(t, usage.BaseFeeMicros, row.ProjectedBaseFeeMicros)
+	}
+	require.Equal(t, bill.ProjectedBaseFeeTotalMicros, perApp)
 }
 
 func TestGetAccountBill_UnresolvedOneTimeChargeShapesAndRecurringDedup(t *testing.T) {

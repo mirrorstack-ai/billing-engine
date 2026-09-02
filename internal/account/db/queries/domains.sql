@@ -167,9 +167,9 @@ FROM ms_billing.app_custom_domains
 WHERE account_id = $1
   AND removed_at IS NULL;
 
--- ActivatedRecurringFeeCounts is the CURRENT next-period recurring-base input.
--- A live entity joins the forecast only after its one-time activation charge
--- has reached a durable charged state:
+-- ActivatedRecurringFeeShares is the CURRENT next-period recurring-base input,
+-- decomposed BY APP. A live entity joins the forecast only after its one-time
+-- activation charge has reached a durable charged state:
 --   * app: creation-proration guard armed (or a legacy advance snapshot proves
 --     it was charged before the guard existed);
 --   * module overage: current account-FIFO over row with grace_charged_at set;
@@ -178,42 +178,79 @@ WHERE account_id = $1
 -- an atomic handoff: create Aug 30 → creation charge Sep 2 (covering the
 -- remaining creation window plus the straddled window) → recurring base joins
 -- only after that Sep 2 settlement succeeds.
--- name: ActivatedRecurringFeeCounts :one
+--
+-- This SUPERSEDES the scalar ActivatedRecurringFeeCounts. The account totals
+-- are now SUMS of these rows rather than three sibling counts, so the bill's
+-- per-app decomposition and its account line can never disagree: they are the
+-- same rows added up two ways, not two queries that must be kept in step.
+--
+-- The row set is the UNION of the three sources, not just activated apps: an
+-- app whose creation charge is still pending can already own a charged domain
+-- or a charged over-timer, and that money is in the account forecast, so it
+-- needs an app to land on. `activated` is therefore a per-row FLAG, not a
+-- filter — an app can contribute surcharges while contributing no base fee.
+--
+-- The FIFO window is account-wide by design (migration 033: ONE included pool
+-- for the whole account, ordered installed_at ASC, id ASC across every app), so
+-- WHICH app owns the free five is decided globally here and the per-app
+-- over-count falls out of that one ordering.
+-- name: ActivatedRecurringFeeShares :many
 WITH live_timer_fifo AS (
-    SELECT grace_charged_at,
+    SELECT app_id,
+           grace_charged_at,
            row_number() OVER (ORDER BY installed_at, id) AS fifo_position
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = @account_id::uuid
       AND removed_at IS NULL
+),
+activated_apps AS (
+    SELECT app.app_id
+    FROM ms_billing.apps app
+    WHERE app.account_id = @account_id::uuid
+      AND app.deleted_at IS NULL
+      AND (
+          app.proration_invoice_id IS NOT NULL
+          OR EXISTS (
+              SELECT 1
+              FROM ms_billing.app_base_snapshots snap
+              WHERE snap.app_id = app.app_id
+                AND snap.source = 'advance'
+          )
+      )
+),
+over_timers AS (
+    SELECT app_id, count(*)::bigint AS over_count
+    FROM live_timer_fifo
+    WHERE fifo_position > @included_modules::int
+      AND grace_charged_at IS NOT NULL
+    GROUP BY app_id
+),
+charged_domains AS (
+    SELECT app_id, count(*)::bigint AS domain_count
+    FROM ms_billing.app_custom_domains
+    WHERE account_id = @account_id::uuid
+      AND removed_at IS NULL
+      AND charged_at IS NOT NULL
+    GROUP BY app_id
+),
+app_universe AS (
+    SELECT app_id FROM activated_apps
+    UNION
+    SELECT app_id FROM over_timers
+    UNION
+    SELECT app_id FROM charged_domains
 )
-SELECT (
-           SELECT count(*)::bigint
-           FROM ms_billing.apps app
-           WHERE app.account_id = @account_id::uuid
-             AND app.deleted_at IS NULL
-             AND (
-                 app.proration_invoice_id IS NOT NULL
-                 OR EXISTS (
-                     SELECT 1
-                     FROM ms_billing.app_base_snapshots snap
-                     WHERE snap.app_id = app.app_id
-                       AND snap.source = 'advance'
-                 )
-             )
-       ) AS app_count,
-       (
-           SELECT count(*)::bigint
-           FROM live_timer_fifo
-           WHERE fifo_position > @included_modules::int
-             AND grace_charged_at IS NOT NULL
-       ) AS module_overage_count,
-       (
-           SELECT count(*)::bigint
-           FROM ms_billing.app_custom_domains domain_row
-           WHERE domain_row.account_id = @account_id::uuid
-             AND domain_row.removed_at IS NULL
-             AND domain_row.charged_at IS NOT NULL
-       ) AS custom_domain_count;
+SELECT universe.app_id,
+       EXISTS (
+           SELECT 1 FROM activated_apps
+           WHERE activated_apps.app_id = universe.app_id
+       ) AS activated,
+       COALESCE(over_timers.over_count, 0)::bigint AS over_module_count,
+       COALESCE(charged_domains.domain_count, 0)::bigint AS custom_domain_count
+FROM app_universe universe
+LEFT JOIN over_timers ON over_timers.app_id = universe.app_id
+LEFT JOIN charged_domains ON charged_domains.app_id = universe.app_id
+ORDER BY universe.app_id;
 
 -- SettledDomainCreationCharges feeds 本期新建立 with custom-domain activation
 -- charges. Membership follows charged_at (the actual settlement instant), so a
