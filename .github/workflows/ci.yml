@@ -90,18 +90,15 @@ jobs:
       # .golangci.yml for what is excluded and why. The tree is currently
       # clean, so this is a BLOCKING gate from its first run — a check that
       # nobody has to pass is not a control.
-      # Installed through the Go toolchain rather than golangci-lint-action.
-      # The org allowlists third-party actions, and widening that list to add
-      # one is a bigger change than this gate warrants: an action runs with
-      # access to the job's environment, where `go install pkg@version` is
-      # fetched through the module proxy and verified against the Go checksum
-      # database. It also keeps this step copyable to api-platform,
-      # mirrorstack-infra and dns-delegate-engine, which sit behind the same
-      # allowlist.
+      # Pinned to a full commit SHA, and allowlisted at the org
+      # (Settings -> Actions -> General -> Allow specified actions) so the
+      # same step is adoptable in api-platform, mirrorstack-infra and
+      # dns-delegate-engine without a further allowlist change. A moving tag
+      # would not be accepted: the org requires full-length SHAs.
       - name: Security analysis (gosec)
-        run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
-          "$(go env GOPATH)/bin/golangci-lint" run ./...
+        uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
+        with:
+          version: v2.13.2
 
       - name: Build
         run: go build ./...
