@@ -193,10 +193,12 @@ func (s *Store) settleStripeInvoice(
 		if row.AmountMicros%microsPerCent != 0 {
 			return fmt.Errorf(
 				"credit invoice %s requests %d micros, which is not a whole number of cents; "+
-					"a card can only be charged in cents, so crediting it would grant %d micros nobody paid for",
+					"a card can only be charged in cents, so it would be charged %d micros and "+
+					"credited %d — settling it would move money nobody agreed to either way",
 				stripeInvoiceID,
 				row.AmountMicros,
-				row.AmountMicros-microsToCentsRoundHalfUp(row.AmountMicros)*microsPerCent,
+				microsToCentsRoundHalfUp(row.AmountMicros)*microsPerCent,
+				row.AmountMicros,
 			)
 		}
 		expectedCents := microsToCentsRoundHalfUp(row.AmountMicros)
