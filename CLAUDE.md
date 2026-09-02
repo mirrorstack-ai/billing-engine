@@ -5,11 +5,18 @@ endpoint: `api-platform` calls it over private RPC, and
 [`README.md#runtime-and-trust-boundary`](README.md#runtime-and-trust-boundary)
 owns that boundary with its citations.
 
-> 🔴 **`docs/DESIGN.md` is a specification, not production.** `main` still
-> carries direct Stripe paths outside the intent, notice, and authorization
-> boundary. Never present a target document as a current guarantee. Overstating
-> the code is a defect of the same class as a code bug, and
-> [`SECURITY.md`](SECURITY.md) treats it that way.
+> 🔴 **`docs/DESIGN.md` is a specification, not production.** Every collecting
+> leg now only proposes a sealed `ChargeIntent`; `cmd/intent-executor` is the
+> only collector and it refuses to start
+> (`capabilities.LegacyMoneyPaths` is **3**, not 0). What remains outside the
+> intent boundary is three paths, and none of them is a collector: two finish a
+> charge a legacy run already put in front of the provider, and the third is a
+> scan false positive on billing's own `PayInvoice`. They drain rather than being
+> deleted — `internal/account/capabilities/capabilities.go` says how, and
+> `scripts/legacy-drop-preconditions.sql` measures when they are done.
+> Never present a target document as a current guarantee. Overstating the code is
+> a defect of the same class as a code bug, and [`SECURITY.md`](SECURITY.md)
+> treats it that way.
 >
 > 🔴 **Automatic merge and promotion are paused.** Work on a branch, keep manual
 > billing and security review, and never enable collection because CI went green.
@@ -21,20 +28,28 @@ owns that boundary with its citations.
 
 ## Layout
 
-Seven binaries. Six are built and uploaded per commit
-(`.github/workflows/publish.yml:35-41`). `pm-default-backfill` is not, and is run
-by hand.
+Ten binaries. Eight are built and uploaded per commit — the `for pair in` list in
+`.github/workflows/publish.yml`. `pm-default-backfill` and `signing-keygen` are
+not, and are run by hand.
 
 ```text
-cmd/account-api/                  internal RPC Lambda; local HTTP :8091   (published)
-cmd/account-webhook/              Stripe HTTPS receiver, checks signature (published)
-cmd/account-webhook-eventbridge/  Stripe partner EventBridge consumer     (published)
+cmd/account-api/                  internal RPC Lambda; local HTTP :8091    (published)
+cmd/account-webhook/              HTTP ingress for PSPs that cannot reach
+                                  EventBridge; dispatch table empty        (published)
+cmd/account-webhook-eventbridge/  Stripe partner EventBridge consumer;
+                                  the ONLY path Stripe events arrive on    (published)
 cmd/billing-cycle/                scheduled per-period usage charge driver (published)
-cmd/infra-egress-sync/            pulls CDN egress totals from Cloudflare (published)
+cmd/infra-egress-sync/            pulls CDN egress totals from Cloudflare  (published)
 cmd/infra-ssr-compute-sync/       pulls SSR compute totals from CloudWatch (published)
-cmd/pm-default-backfill/          one-shot Stripe default-PM repair       (by hand)
-internal/{account,billingperiod,shared}/   195 Go files
-migrations/billing/               ms_billing schema, 001..052 up/down (040 unused)
+cmd/intent-executor/              the only collector on the intent rail;
+                                  refuses to start, see the banner above   (published)
+cmd/intent-shadow/                read-only shadow rater, no money path    (published)
+cmd/pm-default-backfill/          one-shot Stripe default-PM repair        (by hand)
+cmd/signing-keygen/               mints one signing key; PRINTS THE SEED   (by hand)
+internal/{account,architecture,billingperiod,intent,
+          meteringlock,provider,shared}/           324 Go files
+migrations/billing/               ms_billing schema, 001..069 up/down
+                                  (040 and 053 unused)
 ```
 
 ## Schema source of truth
@@ -47,39 +62,53 @@ is the bug.
 
 ## Two secrets, not one
 
-Both gate local HTTP from `internal/shared/auth/internal_secret.go`, and both
-fail closed: an unset secret returns 503 (`:59`) rather than opening the route.
+`internal/shared/auth` exposes two middlewares, `InternalSecret` and
+`MeterSecret`, over one constant-time `secretGuard`. Both fail closed: an unset
+secret returns 503 rather than opening the route.
 
-- `X-MS-Internal-Secret` (`:80`) gates every control-plane RPC route
-  (`cmd/account-api/main.go:652`). `/__health` is the one route outside it (`:647`).
-- `X-MS-Meter-Secret` (`:81`) gates `RecordUsage` alone
-  (`cmd/account-api/main.go:775-778`), so the meter credential rotates on its own.
+- `InternalSecret` gates every control-plane RPC route on the local HTTP
+  transport. The static health probe is the one route outside it.
+- `MeterSecret` gates `RecordUsage` alone, on its own credential, so the
+  high-volume metering seam rotates independently of the Stripe-touching RPCs.
 
-Production differs, and the difference is a filed gap: the dispatch role can
-invoke the whole account-api Lambda. Never describe the metering seam as
-dedicated.
+**This split exists only on the local HTTP path.** Production invokes
+`account-api` through Lambda, where IAM gates the call and the dispatch role
+reaches the whole action dispatcher — so the metering credential is not a
+narrower capability in production. That is a filed gap in
+[`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps). Never
+describe the metering seam as dedicated without saying which transport you mean.
 
 ## Hard rules
 
 - **Every table this repo owns lives in `ms_billing.*`. Never write outside it.**
   `owner_user_id` and `owner_org_id` are soft FKs
-  (`migrations/billing/001_init.up.sql:25-26`); nothing reads `ms_account`
-  (`internal/account/db/queries/cycle.sql:375-376`).
+  (`migrations/billing/001_init.up.sql:24-26`); nothing reads `ms_account`
+  (`AccountCollectionFields` in `internal/account/db/queries/cycle.sql`).
 - **`api-platform` must never touch Stripe.** Every Stripe API call belongs in
   this repo, behind `internal/shared/stripe/client.go`.
 - **`account-api` must never become customer-reachable.** Its only
-  unauthenticated route is the static health body at
-  `cmd/account-api/main.go:647`. Provider ingress stays in the webhook binaries.
+  unauthenticated route is the static health body (`health` in
+  `cmd/account-api/main.go`). Provider ingress stays in the webhook binaries.
 - **`api-platform` initiates account RPCs.** The engine must not call the browser
   or push into the customer-facing account API. State is pulled by authenticated
   read, or delivered by `internal/account/standing/notifier.go`.
-- **Do not widen the infrastructure charge path.** It is already a customer
-  charge kind, against [INV-010](docs/DESIGN.md#inv-010), and
+- **Do not widen the infrastructure charge path.** Infrastructure cost already
+  reaches the customer bill as a marked-up usage line — `infraMarkupNum` /
+  `infraMarkupDen` in `internal/account/cycle/types.go`, snapshotted onto each
+  aggregate — which is what [INV-010](docs/DESIGN.md#inv-010) says it must not
+  be. (It is not a charge *kind*: the closed catalog in
+  `internal/intent/catalog.go` has seven and none is infrastructure.)
   [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps) holds the
   detail. Another caller makes the release blocker worse.
-- **Do not call the deployment intent-only** until the `Capabilities` action
-  (unbuilt) reports `legacyMoneyPaths: 0` and legacy provider credentials are
-  revoked. The weakest reachable legacy path defines the real guarantee.
+- **Do not call the deployment intent-only** until `Capabilities` reports
+  `legacyMoneyPaths: 0` and legacy provider credentials are revoked. The action
+  is built and served, at `/v1/billing.Capabilities` and through the Lambda
+  dispatcher; today it reports **3**. The weakest reachable legacy path defines
+  the real guarantee.
+- **Never lower `LegacyMoneyPaths` by editing the scanner.** The constant is
+  pinned against an AST scan of the tree (`internal/architecture`), and it falls
+  only when a money path is deleted. Changing the count any other way is the
+  one edit that makes every other claim in these documents untrue.
 
 ## Where the rules actually live
 
@@ -93,7 +122,8 @@ Link, never restate. [`docs/DESIGN.md`](docs/DESIGN.md) owns every invariant:
 assumptions, and limits. [`docs/VERIFICATION.md`](docs/VERIFICATION.md) owns
 evidence levels and the charge bundle, and
 [its §5](docs/VERIFICATION.md#5--what-ci-enforces-against-this-tree) owns the
-checks CI should grow. [`README.md`](README.md) owns the five money flows.
+checks CI should grow. [`README.md`](README.md) owns the outside reader's
+entry point: what can be checked against a clone, and what cannot.
 
 ## Commit identity
 
@@ -134,6 +164,23 @@ A schema change spans two repos, then the parent, in one cycle.
 - Frontend or `web-*` UI code — `web-account/` or `web-applications/` owns it.
 - Schema docs for shipped state. Those graduate to `mirrorstack-docs/`.
 - A second copy of any rule DESIGN, SECURITY, or README already owns.
+- 🔴 **Root-level plan, decision, status, migration-wave or session files.** No
+  `*-PLAN.md`, `DECISION-*.md`, `*-GAP.md` or working note at the repository
+  root, ever — and no second defect list anywhere, for the reason above.
+
+  Two things make this a hard rule rather than tidiness. **This repository is
+  public**: a working file carries production counts, owner quotes, unlaunched
+  pricing, credential blast-radius maps and open legal questions, none of which
+  anyone chose to publish, and none of which appears in `README.md`'s
+  documentation map. And **`git rm` does not undo it**: the content stays
+  world-readable at every commit and in every merged PR diff, in every fork and
+  clone, permanently. Removing such a file is a rule going forward, not
+  remediation.
+
+  Write the plan outside the repository. When a decision inside it turns out to
+  be durable, fold that one paragraph into `docs/DESIGN.md`, `SECURITY.md` or
+  `docs/VERIFICATION.md`, which are the documents that own rules — and cite the
+  symbol that makes it checkable.
 
 ## Quickstart
 
@@ -146,16 +193,19 @@ make test       # unit tests, no external calls
 ```
 
 `make test-integration` needs a reachable Docker daemon, and not the `make db`
-instance. Each test boots its own ephemeral Postgres 17 container and skips when
-Docker is unreachable (`internal/shared/testutil/db.go:34-58`).
+instance. Each test boots its own ephemeral Postgres 17 container and **skips**
+when Docker is unreachable (`NewTestDB` in `internal/shared/testutil/db.go`) — a
+skipped package still reports `ok`, so set `REQUIRE_DOCKER=1` wherever the green
+is load-bearing.
 
 Lambda-capable binaries switch on `AWS_LAMBDA_FUNCTION_NAME` and otherwise run
-local HTTP (`internal/shared/config/config.go:40`).
+local HTTP (`config.IsLambda`).
 
-- `cd cmd/account-api && go run .` — `:8091`, `ACCOUNT_API_PORT` overrides
-  (`cmd/account-api/main.go:860`).
-- `make dev-webhook` — `:8092`, `ACCOUNT_WEBHOOK_PORT` overrides
-  (`cmd/account-webhook/main.go:51`). Pair with
-  `stripe listen --forward-to localhost:8092/webhook`.
+- `cd cmd/account-api && go run .` — `:8091`, `ACCOUNT_API_PORT` overrides.
+- `make dev-webhook` — `:8092`, `ACCOUNT_WEBHOOK_PORT` overrides. **There is
+  nothing to forward to it.** Stripe now arrives only on the EventBridge partner
+  bus, consumed by `cmd/account-webhook-eventbridge`, which has no local HTTP
+  mode — so `stripe listen` no longer replicates anything, and this binary's
+  dispatch table is empty until a non-Stripe PSP is wired.
 - `make dev-cycle`, `make dev-egress-sync`, `make dev-ssr-compute-sync` — one-shot
   runs of the three scheduled workers.

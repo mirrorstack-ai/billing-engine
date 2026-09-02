@@ -14,15 +14,13 @@ import (
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
-// 🔴 THIS IMPLEMENTS OPTION B OF BOUNDARY-KIND-DECISION.md, WHICH IS OPEN.
+// This is the provider half of the grouping design in docs/DESIGN.md §8: a
+// set of sealed intents settles onto one invoice from one rounding over the
+// summed remainders, keyed on the sorted set of the group's digests.
 //
-// The decision is the owner's and has not been made. This is built under the
-// stated assumption that B is chosen, because B is the recommendation and it
-// is the only option requiring engineering rather than a published rule.
-//
-// It is wired to NOTHING. No caller exists, no leg produces a group, and
-// removing this file removes the whole of it — so choosing A, C or D costs a
-// deletion and no rework anywhere else.
+// Nothing calls CollectGroup. It is reached only through
+// (*Executor).ExecuteGroup, which has no production caller, and the executor
+// refuses to start at all while legacy money paths remain.
 //
 // # The problem it solves
 //

@@ -1,7 +1,8 @@
 -- Migration 066: which intents settle on one invoice.
 --
--- 🔴 THIS SUPPORTS OPTION B OF BOUNDARY-KIND-DECISION.md, WHICH IS OPEN.
--- Nothing writes to this table yet. If A, C or D is chosen, it is dropped.
+-- This table is on a live path. The period-boundary leg proposes a group
+-- (internal/account/cycle/boundary_charges.go), and the proposer writes here
+-- through SaveIntentGroupWithEvidence. See docs/DESIGN.md §8.
 --
 -- The period-boundary invoice is FOUR of §6's charge kinds and combined
 -- proration is two, while a ChargeIntent carries ONE Kind — and migration

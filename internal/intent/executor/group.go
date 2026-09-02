@@ -11,9 +11,10 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/predicate"
 )
 
-// 🔴 THIS SUPPORTS OPTION B OF BOUNDARY-KIND-DECISION.md, WHICH IS OPEN.
-// Nothing produces a group yet. If A, C or D is chosen, this file and
-// migration 066 are deleted together.
+// Grouping is settled and shipped: see docs/DESIGN.md §8. A leg produces a
+// group — internal/account/cycle/boundary_charges.go calls ProposeGroup — so
+// this file is on a live path and must not be deleted as speculative.
+// Nothing calls ExecuteGroup yet; the executor does not collect at all.
 
 // GroupCollector settles several sealed intents onto one provider invoice.
 //
