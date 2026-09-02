@@ -77,7 +77,7 @@ func TestLiveOverModuleTimerCountForApp_Integration_AttributesAccountFIFO(t *tes
 	require.Equal(t, 4, overB, "only one of app B's five timers occupies the final included slot")
 }
 
-func TestActivatedRecurringFeeCountsAndSettledDomains_Integration(t *testing.T) {
+func TestActivatedRecurringFeeSharesAndSettledDomains_Integration(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := usage.NewStore(pool)
 	ctx := context.Background()
@@ -131,14 +131,34 @@ func TestActivatedRecurringFeeCountsAndSettledDomains_Integration(t *testing.T) 
 	require.NoError(t, err)
 
 	readStore, ok := store.(interface {
-		ActivatedRecurringFeeCounts(context.Context, uuid.UUID, int) (usage.RecurringFeeCounts, error)
+		ActivatedRecurringFeeShares(context.Context, uuid.UUID, int) ([]usage.AppRecurringFeeShare, error)
 		SettledDomainCreationCharges(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.SettledDomainCreationChargeRaw, error)
 	})
 	require.True(t, ok)
 
-	counts, err := readStore.ActivatedRecurringFeeCounts(ctx, accountID, usage.IncludedModules)
+	shares, err := readStore.ActivatedRecurringFeeShares(ctx, accountID, usage.IncludedModules)
 	require.NoError(t, err)
-	require.Equal(t, usage.RecurringFeeCounts{Apps: 2, ModuleOverages: 2, CustomDomains: 1}, counts,
+
+	// pendingApp is absent entirely: not activated, and it owns no surcharge —
+	// nothing to attribute, so it contributes no row.
+	byApp := make(map[uuid.UUID]usage.AppRecurringFeeShare, len(shares))
+	for _, share := range shares {
+		byApp[share.AppID] = share
+	}
+	require.Len(t, shares, 2)
+	require.NotContains(t, byApp, pendingApp,
+		"an app with no activation and no surcharge owns none of the recurring base")
+	require.Equal(t, usage.AppRecurringFeeShare{
+		AppID: chargedApp, Activated: true, OverModuleCount: 2, CustomDomainCount: 1,
+	}, byApp[chargedApp],
+		"the charged app owns its two grace-charged over-timers and its one charged domain")
+	require.Equal(t, usage.AppRecurringFeeShare{AppID: legacyApp, Activated: true}, byApp[legacyApp],
+		"a legacy advance snapshot activates the base fee and nothing else")
+
+	// The account line is these rows summed — the identity the per-app bill
+	// presentation depends on, asserted against the real query, not the fake.
+	require.Equal(t, usage.RecurringFeeCounts{Apps: 2, ModuleOverages: 2, CustomDomains: 1},
+		usage.RecurringFeeCountsOf(shares),
 		"only durably charged live entities join the next-period recurring base")
 
 	domains, err := readStore.SettledDomainCreationCharges(ctx, accountID,

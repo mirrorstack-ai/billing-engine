@@ -356,6 +356,22 @@ type SettledNewCreationChargeRaw struct {
 	BaseMicros         int64
 }
 
+// AppRecurringFeeShare is ONE app's contribution to the account's next-period
+// recurring base. Activated is a FLAG, not a filter: an app whose creation
+// charge is still pending contributes no base fee but can already own a charged
+// custom domain or a charged over-timer, and that money is in the account
+// forecast, so it needs an owner.
+//
+// OverModuleCount is this app's share of the ACCOUNT-WIDE FIFO over-count — the
+// included allowance is one pool for the whole account (migration 033), so which
+// app owns the free five is decided globally, not per app.
+type AppRecurringFeeShare struct {
+	AppID             uuid.UUID
+	Activated         bool
+	OverModuleCount   int
+	CustomDomainCount int
+}
+
 // RecurringFeeCounts is the activation-gated CURRENT forecast input. Counts
 // are kept separate because app base fees are plan-aware while module/domain
 // unit prices are fixed billing constants.
@@ -363,6 +379,22 @@ type RecurringFeeCounts struct {
 	Apps           int
 	ModuleOverages int
 	CustomDomains  int
+}
+
+// RecurringFeeCountsOf sums per-app shares into the account totals. The account
+// line and the per-app decomposition are therefore the SAME rows added up two
+// ways — not two queries that must be kept in step, which is the shape that
+// lets a bill's parts silently stop equalling its whole.
+func RecurringFeeCountsOf(shares []AppRecurringFeeShare) RecurringFeeCounts {
+	var counts RecurringFeeCounts
+	for _, share := range shares {
+		if share.Activated {
+			counts.Apps++
+		}
+		counts.ModuleOverages += share.OverModuleCount
+		counts.CustomDomains += share.CustomDomainCount
+	}
+	return counts
 }
 
 // SettledDomainCreationChargeRaw is one charged custom-domain activation. Its
@@ -1588,19 +1620,28 @@ func (s *pgxStore) LiveDomainCountForAccount(ctx context.Context, accountID uuid
 	return int(n), nil
 }
 
-func (s *pgxStore) ActivatedRecurringFeeCounts(ctx context.Context, accountID uuid.UUID, includedModules int) (RecurringFeeCounts, error) {
-	row, err := s.q.ActivatedRecurringFeeCounts(ctx, db.ActivatedRecurringFeeCountsParams{
+func (s *pgxStore) ActivatedRecurringFeeShares(ctx context.Context, accountID uuid.UUID, includedModules int) ([]AppRecurringFeeShare, error) {
+	rows, err := s.q.ActivatedRecurringFeeShares(ctx, db.ActivatedRecurringFeeSharesParams{
 		AccountID:       accountID.String(),
 		IncludedModules: int32(includedModules), //nolint:gosec // pricing allowance is a small positive constant
 	})
 	if err != nil {
-		return RecurringFeeCounts{}, err
+		return nil, err
 	}
-	return RecurringFeeCounts{
-		Apps:           int(row.AppCount),
-		ModuleOverages: int(row.ModuleOverageCount),
-		CustomDomains:  int(row.CustomDomainCount),
-	}, nil
+	shares := make([]AppRecurringFeeShare, 0, len(rows))
+	for _, row := range rows {
+		appID, err := uuid.Parse(row.AppID)
+		if err != nil {
+			return nil, fmt.Errorf("parse recurring-fee share app id %q: %w", row.AppID, err)
+		}
+		shares = append(shares, AppRecurringFeeShare{
+			AppID:             appID,
+			Activated:         row.Activated,
+			OverModuleCount:   int(row.OverModuleCount),
+			CustomDomainCount: int(row.CustomDomainCount),
+		})
+	}
+	return shares, nil
 }
 
 func (s *pgxStore) SettledDomainCreationCharges(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]SettledDomainCreationChargeRaw, error) {

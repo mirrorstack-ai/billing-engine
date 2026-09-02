@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -412,26 +413,59 @@ func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (i
 	return f.liveDomainCount, nil
 }
 
-func (f *fakeStore) ActivatedRecurringFeeCounts(_ context.Context, _ uuid.UUID, _ int) (usage.RecurringFeeCounts, error) {
+// ActivatedRecurringFeeShares re-implements the SQL contract's SHAPE over the
+// fake's mirrors: one row per live app, carrying the activation flag and the
+// surcharge units it owns. Tests that pin exact account totals set
+// activatedRecurring; the counts are then spread over the live apps so that
+// usage.RecurringFeeCountsOf(shares) reproduces them exactly — the same
+// sum-of-rows identity the real query guarantees.
+func (f *fakeStore) ActivatedRecurringFeeShares(_ context.Context, _ uuid.UUID, _ int) ([]usage.AppRecurringFeeShare, error) {
 	if f.errActivatedRecurring != nil {
-		return usage.RecurringFeeCounts{}, f.errActivatedRecurring
+		return nil, f.errActivatedRecurring
 	}
-	if f.activatedRecurring != nil {
-		return *f.activatedRecurring, nil
-	}
-	// Unrelated account-bill tests predate the activation markers in this fake;
-	// preserve their all-settled posture unless a test opts into exact counts.
-	apps := 0
-	for _, app := range f.appMirrors {
+
+	liveIDs := make([]uuid.UUID, 0, len(f.appMirrors))
+	for appID, app := range f.appMirrors {
 		if !app.Deleted {
-			apps++
+			liveIDs = append(liveIDs, appID)
 		}
 	}
-	return usage.RecurringFeeCounts{
-		Apps:           apps,
+	// The map is unordered; the real query is ORDER BY app_id. Sort so an
+	// allocation tie-break lands on the same app every run.
+	sort.Slice(liveIDs, func(i, j int) bool {
+		return bytes.Compare(liveIDs[i][:], liveIDs[j][:]) < 0
+	})
+
+	counts := usage.RecurringFeeCounts{
+		Apps:           len(liveIDs),
 		ModuleOverages: max(0, f.liveModuleTimerCount()-usage.IncludedModules),
 		CustomDomains:  f.liveDomainCount,
-	}, nil
+	}
+	if f.activatedRecurring != nil {
+		counts = *f.activatedRecurring
+	}
+
+	shares := make([]usage.AppRecurringFeeShare, 0, len(liveIDs))
+	for i, appID := range liveIDs {
+		share := usage.AppRecurringFeeShare{AppID: appID, Activated: i < counts.Apps}
+		// Surcharges concentrate on the first live app — the account totals are
+		// what these tests assert, and the allocator's own spreading behaviour is
+		// covered directly in projected_base_alloc_test.go.
+		if i == 0 {
+			share.OverModuleCount = counts.ModuleOverages
+			share.CustomDomainCount = counts.CustomDomains
+		}
+		shares = append(shares, share)
+	}
+	if len(shares) == 0 && (counts.ModuleOverages > 0 || counts.CustomDomains > 0) {
+		// Surcharges with no app to own them cannot happen against the real
+		// schema (both tables carry a NOT NULL app_id FK), and letting the fake
+		// invent an off-roster owner would drop the money from the per-app
+		// decomposition while leaving it in the account total.
+		return nil, fmt.Errorf("fake: %d overage + %d domain units with no live app to own them",
+			counts.ModuleOverages, counts.CustomDomains)
+	}
+	return shares, nil
 }
 
 func (f *fakeStore) liveModuleTimerCount() int {
