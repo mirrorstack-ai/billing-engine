@@ -160,6 +160,22 @@ func (s *Service) StartCreditPurchase(ctx context.Context, req StartCreditPurcha
 	if req.AmountMicros < MinCreditPurchaseMicros || req.AmountMicros > MaxCreditPurchaseMicros {
 		return nil, InvalidInput("amount_micros must be between 5000000 and 5000000000")
 	}
+	// 🔴 A purchase must be a WHOLE NUMBER OF CENTS, because a card is charged
+	// in cents and this ledger is denominated in micros.
+	//
+	// Settlement checks that the rounded cents were paid and then credits the
+	// RAW micros (creditledger/settlement.go). For any amount that is not a
+	// whole cent those are two different numbers, and the difference — up to
+	// 4,999 micros, always in the payer's favour — is credit nobody paid for,
+	// repeatable per purchase. The bounds above are the only other check, and
+	// they do not constrain the sub-cent digits at all.
+	//
+	// Rejecting here rather than rounding: rounding would silently charge a
+	// number the caller did not ask for. This is caller error, so it fails
+	// closed and says so.
+	if req.AmountMicros%microsPerCent != 0 {
+		return nil, InvalidInput("amount_micros must be a whole number of cents (a multiple of 10000)")
+	}
 	if strings.TrimSpace(req.IdempotencyKey) == "" {
 		return nil, InvalidInput("idempotency_key required")
 	}
@@ -384,6 +400,12 @@ func (s *Service) SetAutoTopUp(ctx context.Context, req SetAutoTopUpRequest) (*S
 	}
 	if amount < MinCreditPurchaseMicros || amount > MaxCreditPurchaseMicros {
 		return nil, InvalidInput("amount_micros must be between 5000000 and 5000000000")
+	}
+	// Same whole-cent rule as StartCreditPurchase: this amount is what the
+	// top-up executor later charges, so a sub-cent value stored here would
+	// reach settlement on every single top-up rather than once.
+	if amount%microsPerCent != 0 {
+		return nil, InvalidInput("amount_micros must be a whole number of cents (a multiple of 10000)")
 	}
 	if req.Enabled && strings.TrimSpace(req.PaymentMethodID) == "" {
 		return nil, InvalidInput("payment_method_id required when auto top-up is enabled")
