@@ -467,7 +467,8 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 	}
 	for _, raw := range raws {
 		// Resolve the per-unit price by (module, metric, model, module_version):
-		// a version-stamped event resolves VERSION-FIRST from the immutable
+		// task GPU usage resolves its exact admitted model first and never falls
+		// back; otherwise a version-stamped event resolves from the immutable
 		// metric_version_prices snapshot (migration 044); an infra.ai.* event
 		// with no version snapshot carries a model → priced PER MODEL from
 		// metric_model_prices, with the catalog row as fallback; every other
@@ -475,6 +476,9 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		// (migration 018).
 		priceMicros, priced, err := s.store.MetricPriceMicros(ctx, raw.ModuleID, raw.Metric, raw.Model, raw.ModuleVersion)
 		if err != nil {
+			if errors.Is(err, ErrTaskGPUModelPrice) {
+				return nil, billing.Internal("infra.task.gpu.hours requires an admitted model with a positive active exact price; refusing every fallback for model "+raw.Model, err)
+			}
 			// A RETIRED per-model price (active=false) must fail the cycle loud,
 			// not silently fall back to the cheaper catalog floor and under-bill
 			// the retired model. Surface it as a distinct, ops-actionable error.

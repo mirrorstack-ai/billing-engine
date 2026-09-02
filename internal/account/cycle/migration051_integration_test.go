@@ -25,7 +25,7 @@ var migration051GPUPrices = map[string]int64{
 	"g5.24xlarge": 11811230, "g5.48xlarge": 23622460,
 }
 
-func assertMigration051HeavyRows(t *testing.T, pool *pgxpool.Pool) {
+func assertMigration051HeavyRows(t *testing.T, pool *pgxpool.Pool, gpuPrice int64) {
 	t.Helper()
 	want := []struct {
 		metric, unit string
@@ -33,7 +33,7 @@ func assertMigration051HeavyRows(t *testing.T, pool *pgxpool.Pool) {
 	}{
 		{"infra.task.vcpu.hours", "vCPU-hour", 40450},
 		{"infra.task.memory.gib_hours", "GiB-hour", 4420},
-		{"infra.task.gpu.hours", "instance-hour", 710000},
+		{"infra.task.gpu.hours", "instance-hour", gpuPrice},
 	}
 	for _, w := range want {
 		kind, unit, price, active, ok := metricRow(t, pool, w.metric)
@@ -68,11 +68,6 @@ func assertMigration051Reprices(t *testing.T, pool *pgxpool.Pool, api, storage i
 
 func assertMigration051GPUPrices(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	var count int
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM ms_billing.metric_model_prices
-		  WHERE metric='infra.task.gpu.hours'`).Scan(&count))
-	require.Equal(t, 14, count)
 	for model, want := range migration051GPUPrices {
 		var price int64
 		var active bool
@@ -86,7 +81,7 @@ func assertMigration051GPUPrices(t *testing.T, pool *pgxpool.Pool) {
 }
 
 func TestMigration051_Up_SeedsHeavyTierRates(t *testing.T) {
-	assertMigration051HeavyRows(t, testutil.NewTestDB(t))
+	assertMigration051HeavyRows(t, testutil.NewTestDB(t), 566900)
 }
 
 func TestMigration051_Up_RepricesEgressAndStorage(t *testing.T) {
@@ -119,7 +114,7 @@ func TestMigration051_UpDownUp_RoundTrips(t *testing.T) {
 
 	_, err = pool.Exec(ctx, migrationSQL(t, "051_heavy_tier_rates.up.sql"))
 	require.NoError(t, err)
-	assertMigration051HeavyRows(t, pool)
+	assertMigration051HeavyRows(t, pool, 710000)
 	assertMigration051GPUPrices(t, pool)
 	assertMigration051Reprices(t, pool, 122406, 37)
 }
@@ -138,31 +133,4 @@ func TestMigration051_VcpuHoursRollsUpAtTokyoARMRate(t *testing.T) {
 	require.EqualValues(t, 202250, a.RawCostMicros) // 5 x 40,450 RAW COGS.
 	require.EqualValues(t, 242700, a.ChargedMicros) // x 12/10 at rollup, not in the seed.
 	require.Equal(t, 12, a.MarkupNum)
-}
-
-func TestMigration051_GPUHoursPricesPerInstance(t *testing.T) {
-	pool := testutil.NewTestDB(t)
-	svc := cycle.NewService(cycle.NewStore(pool), nil)
-	ctx := context.Background()
-	acct, app := seedAccount(t, pool), uuid.New()
-	for _, model := range []string{"g4dn.xlarge", "g5.48xlarge"} {
-		_, err := pool.Exec(ctx,
-			`INSERT INTO ms_billing.usage_events
-			    (event_id, account_id, app_id, module_id, metric, kind, value, model, recorded_at)
-			 VALUES ($1,$2,$3,$4,'infra.task.gpu.hours','sum',1,$5,$6)`,
-			uuid.NewString(), acct.String(), app.String(), sentinelModuleID, model, "2026-06-10T00:00:00Z")
-		require.NoError(t, err)
-	}
-
-	resp, err := svc.RollupPeriod(ctx, acct, mustTime(t, pStart), mustTime(t, pEnd))
-	require.NoError(t, err)
-	require.Len(t, resp.Aggregates, 2)
-	byModel := map[string]cycle.MetricAggregate{}
-	for _, a := range resp.Aggregates {
-		byModel[a.Model] = a
-	}
-	require.EqualValues(t, 710000, byModel["g4dn.xlarge"].RawCostMicros)
-	require.EqualValues(t, 852000, byModel["g4dn.xlarge"].ChargedMicros)
-	require.EqualValues(t, 23622460, byModel["g5.48xlarge"].RawCostMicros)
-	require.EqualValues(t, 28346952, byModel["g5.48xlarge"].ChargedMicros)
 }

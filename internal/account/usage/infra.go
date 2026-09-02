@@ -22,6 +22,25 @@ import (
 // kind-lookup and the rollup price-lookup will resolve through different rows.
 const PlatformInfraModuleIDString = "00000000-0000-0000-0000-000000000000"
 
+// TaskGPUModelG5GXlarge is the only model the managed task plane admits.
+const TaskGPUModelG5GXlarge = "g5g.xlarge"
+
+// AdmittedTaskGPUModels returns a copy of the task GPU admission contract.
+func AdmittedTaskGPUModels() []string {
+	return []string{TaskGPUModelG5GXlarge}
+}
+
+// IsAdmittedTaskGPUModel reports whether model is in the managed task plane's
+// admitted/provisioned contract.
+func IsAdmittedTaskGPUModel(model string) bool {
+	return model == TaskGPUModelG5GXlarge
+}
+
+// modelPriceLookup is required only for task GPU admission.
+type modelPriceLookup interface {
+	LookupModelPrice(context.Context, string, string) (ModelPrice, bool, error)
+}
+
 // platformInfraModuleID is the parsed reserved sentinel module_id the
 // platform-infra plane records under. ms_billing.metric_definitions.module_id is
 // NOT NULL + UNIQUE(module_id, metric), so the platform-measured infra metrics
@@ -366,13 +385,23 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	if req.Model != "" && !metricHasPriceDimension(req.Metric) {
 		return nil, billing.InvalidInput("model is only valid for infra.ai.* and infra.task.gpu.hours metrics")
 	}
-	// GPU prices span $0.71 to $23.62/hour. Unlike AI's optional-model
-	// near-miss fallback, a model-less g5.48xlarge would silently bill at the
-	// g4dn.xlarge floor, about a 33x under-charge. No producer exists yet, so
-	// requiring the instance type now closes the footgun without rejecting an
-	// in-flight event; AI's optional-model behavior remains unchanged.
-	if req.Metric == "infra.task.gpu.hours" && req.Model == "" {
-		return nil, billing.InvalidInput("model is required for infra.task.gpu.hours (use the EC2 instance type)")
+	// Task GPU admission requires its exact positive active price row. AI keeps
+	// its established compatibility fallback.
+	if req.Metric == "infra.task.gpu.hours" {
+		if !IsAdmittedTaskGPUModel(req.Model) {
+			return nil, billing.InvalidInput("unsupported task GPU model: " + req.Model)
+		}
+		priceStore, ok := s.store.(modelPriceLookup)
+		if !ok {
+			return nil, billing.Internal("task GPU model price lookup is unavailable; refusing admission", nil)
+		}
+		price, found, err := priceStore.LookupModelPrice(ctx, req.Metric, req.Model)
+		if err != nil {
+			return nil, billing.Internal("task GPU model price lookup failed", err)
+		}
+		if !found || !price.Active || price.UnitPriceMicros <= 0 {
+			return nil, billing.Internal("task GPU model "+req.Model+" has no positive active exact price; refusing admission", nil)
+		}
 	}
 
 	// Resolve the owner's billing account. Nil owner (or no account yet)
