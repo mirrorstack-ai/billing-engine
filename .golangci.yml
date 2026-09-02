@@ -23,6 +23,23 @@ run:
 # tree already carries 19 `//nolint:gosec` annotations, which standalone gosec
 # does not honour. Running it standalone would report suppressed findings as
 # new ones and make the first run unpassable for no reason.
+issues:
+  # 🔴 golangci-lint TRUNCATES its report by default: max-same-issues 3 and
+  # max-issues-per-linter 50. It does so silently — the summary line counts
+  # what it printed, not what it found.
+  #
+  # Measured in api-platform (#682) while porting this gate: the first run
+  # reported 41 findings and the true number was 66. An entire file of OAuth
+  # open-redirect candidates was never displayed. G101 alone was 20 hits,
+  # shown as 3.
+  #
+  # This tree is at zero, where truncation can hide nothing — verified by
+  # re-running with both caps disabled. These lines are for the NEXT person,
+  # who will be triaging a non-zero count and would otherwise be working from
+  # a number the tool quietly capped.
+  max-same-issues: 0
+  max-issues-per-linter: 0
+
 linters:
   default: none
   enable:

@@ -95,6 +95,16 @@ jobs:
       # same step is adoptable in api-platform, mirrorstack-infra and
       # dns-delegate-engine without a further allowlist change. A moving tag
       # would not be accepted: the org requires full-length SHAs.
+      # Catches a config this golangci-lint would otherwise silently ignore
+      # parts of. A misspelt key — `excludez:` for `excludes:` — disarms the
+      # gate's only rule exclusion without failing anything, and the run still
+      # reports success. Verified against a control: renaming a key here does
+      # fail this command. Borrowed from mirrorstack-infra #252.
+      - name: Verify the linter config
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+          "$(go env GOPATH)/bin/golangci-lint" config verify
+
       - name: Security analysis (gosec)
         uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
         with:
