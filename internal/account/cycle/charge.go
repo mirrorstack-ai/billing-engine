@@ -36,11 +36,9 @@ import (
 //     period_end) of the FLAT BaseFeeMicros. An app created INSIDE the new
 //     period is excluded — RegisterApp's creation-proration leg already charged
 //     its new-period base (full or prorated); it joins the advance leg at the
-//     NEXT boundary. module_count is snapshotted AT CHARGE TIME. 🔴 The
-//     app_base_snapshots freeze (migration 028) that made the display show what
-//     was invoiced was written AFTER the provider call, so a boundary that
-//     PROPOSES writes none — nothing in this leg writes one any more, and
-//     whatever settles the intents has to. The allowance nets USAGE only,
+//     NEXT boundary. module_count is snapshotted AT CHARGE TIME, and each billed
+//     app-period is frozen into ms_billing.app_base_snapshots (migration 028) so
+//     the display always shows what was invoiced. The allowance nets USAGE only,
 //     never the base (it offsets ModuleUsage+Infra in the display math too). An
 //     account with NO mirror rows (pre-backfill) gets base 0 — exactly the
 //     pre-027 arrears-only invoice — until the api-platform backfill populates
@@ -57,27 +55,18 @@ import (
 //  5. no usable default PM → MarkBillingRun('skipped_no_pm'). The usage is
 //     RETAINED (usage_aggregates untouched); the next cycle re-attempts. NOT a
 //     failure, NOT lost usage.
-//  6. otherwise PROPOSE: freeze the request (the durable arming claim, which
-//     also pins the funding instrument and converts micros → whole cents,
-//     round-half-up), then seal the boundary as TWO intents — the closed
-//     period's usage arrears and the next period's subscription — and
-//     MarkBillingRun('proposed'). NO money moves and no invoice exists. This
-//     leg's draft→item→finalize collector is DELETED: it holds no write port,
-//     so cmd/billing-cycle cannot charge anyone through it, which is a stronger
-//     statement than any check over its call graph could make.
-//  7. the ONE exception, and it collects nothing either: a run whose crashed
-//     predecessor already FINALIZED an invoice under this run's ms_charge_ref
-//     is finished rather than re-derived — the invoice is mirrored into
-//     ms_billing.invoices and the run marked 'invoiced'. Abandoning it would
-//     strand a charge the customer can see and nothing here recorded. A
-//     recovered INERT draft is not that case (it moved no money) and is
-//     proposed like any other boundary.
+//  6. otherwise CHARGE: convert micros → whole cents (round-half-up), create a
+//     Stripe invoice item (deterministic Idempotency-Key ii-<run>) → a draft
+//     invoice (charge_automatically + auto_advance, Idempotency-Key inv-<run>)
+//     which Stripe finalizes + runs off-session against the default PM → mirror
+//     the invoice into ms_billing.invoices → MarkBillingRun('invoiced',
+//     stripe_invoice_id, total). The two deterministic Idempotency-Keys are the
+//     SECOND idempotency layer: even if step 1's gate were somehow bypassed, a
+//     re-run reuses the SAME Stripe objects and never double-charges.
 //
-// A failure while finishing an in-flight charge marks the run 'failed'
-// (auditable; PR #7 webhook reconciliation + risk-graded retry build on it) and
-// returns the error. A failed PROPOSAL marks nothing — nothing was attempted at
-// a provider, so the run stays pending and the next reclaim retries it. Money
-// is integer micro-dollars → cents; never float.
+// A charge error after the PM gate marks the run 'failed' (auditable; PR #7
+// webhook reconciliation + risk-graded retry build on it) and returns the
+// error. Money is integer micro-dollars → cents; never float.
 func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time, allowanceMicros int64) (*ChargeSummary, error) {
 	if accountID == uuid.Nil {
 		return nil, billing.InvalidInput("account_id required")
@@ -111,14 +100,13 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// (review 2026-07-06, H8). A frozen charge means a prior attempt of this run
 	// committed to a Stripe request under the deterministic idem keys — and may
 	// have already MOVED MONEY before crashing short of MarkBillingRun. From that
-	// point the run's ONE job is to finish: ADOPT the invoice that attempt left,
-	// mirror it, mark invoiced. (It is adoption, not replay: nothing re-sends
-	// those idem keys now that the collector is deleted.) Every early-out that
-	// used to run first (prepaid fast-path, zero-skip, spend ceiling, risk
-	// judge, PM gate) would record the run as skipped/invoiced WITHOUT
-	// mirroring the charge that already fired — unmirrored money, and then the
-	// intent rail sealing the same boundary a second time. So each of those
-	// gates below applies ONLY when no frozen charge exists.
+	// point the run's ONE job is to finish: replay the same Stripe objects,
+	// mirror the invoice, mark invoiced. Every early-out that used to run first
+	// (prepaid fast-path, zero-skip, spend ceiling, risk judge, PM gate) would
+	// record the run as skipped/invoiced WITHOUT mirroring the charge that
+	// already fired — unmirrored money now, and a fresh double-charge after the
+	// idem keys age out. So each of those gates below applies ONLY when no
+	// frozen charge exists.
 	frozen, hasFrozen, err := s.store.BillingRunFrozenCharge(ctx, runID)
 	if err != nil {
 		return nil, billing.Internal("frozen boundary charge lookup failed", err)
@@ -146,29 +134,18 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		}
 	}
 
-	// THE CRASH-RECOVERY READ. It outlives the collector it was written for,
-	// because what it looks for outlives the collector too: an invoice a
-	// crashed attempt left at the provider.
-	//
-	// The freeze was stamped BEFORE that attempt's first Stripe call, so
-	// "frozen" alone never meant money moved — a crash between the freeze and
-	// the draft creation left nothing on Stripe at all. Resolve which case this
-	// reclaim is NOW (wave 2, D6): an invoice found under the run's
+	// The freeze is stamped BEFORE the first Stripe call, so "frozen" alone does
+	// not mean money moved — a crash (or Stripe 4xx) between the freeze and
+	// CreateDraftInvoice leaves nothing on Stripe at all. Resolve which case
+	// this reclaim is NOW (wave 2, D6): an invoice found under the run's
 	// ms_charge_ref means a prior attempt reached Stripe and this run's only
 	// job is to finish it (gates bypassed, below); nothing found means the
-	// boundary is proposed like any other and every collection gate applies —
+	// retry is a genuinely FRESH charge and every collection gate must apply —
 	// bypassing them let a prepaid-tightened / PM-removed account be charged
-	// fresh. Skips taken on that path are non-terminal; the frozen amount
-	// survives for a later reclaim.
-	//
-	// 🔴 The search-lag backstop is GONE, and it went with the collector. The
-	// Search API lags writes by ≲1min; the old note said a lag-missed invoice
-	// was re-found by replaying the ~24h idem keys, so a false "nothing" could
-	// not double-charge. Nothing replays those keys any more — a false
-	// "nothing" now proposes, and if the missed invoice was finalized the rail
-	// can collect the same boundary twice. The window is small and it is real:
-	// the boundary must not be armed for collection while a run this recent
-	// can be reclaimed.
+	// fresh. (Search-lag safety: the Search API lags writes by ≲1min while idem
+	// keys live ~24h — a lag-missed invoice is re-found by idem-key replay, so
+	// a false "nothing" can never double-charge.) Skips taken on the re-gated
+	// path are non-terminal; the frozen amount survives for a later reclaim.
 	var recovered *billingstripe.Invoice
 	if hasFrozen && frozen.Cents < 0 {
 		return nil, billing.Internal("frozen boundary charge is negative", nil)
@@ -555,17 +532,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		}
 	}
 
-	// PM gate. It stays exactly where it was: a boundary with no way to be paid
-	// is skipped and RETAINED, whether the next step collects it or seals it.
-	// Removing it because "a proposal moves no money" would start sealing
-	// documents against accounts that cannot fund them.
-	//
-	// custID is resolved but no longer CONSUMED — nothing here sends a request.
-	// What survives is the assertion it carries: a usable PM implies a provider
-	// customer, so an empty id is an anomaly this leg refuses rather than
-	// papers over.
-	//
-	// Fresh run — including a frozen reclaim whose prior attempt never
+	// PM gate. Fresh run — including a frozen reclaim whose prior attempt never
 	// reached Stripe (D6) — no usable default PM (or the usable-PM-implies-
 	// Customer anomaly) → skip (usage RETAINED), re-attempt next cycle. Only
 	// when the prior attempt's invoice EXISTS on Stripe is the gate bypassed
@@ -696,86 +663,24 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 	summary.ChargedCents = cents
 
-	// 🔴 THIS LEG NO LONGER COLLECTS. Everything above ran: the amounts are
-	// derived, the wallet is drawn, the funding is armed and the request is
-	// FROZEN. What used to sit below — draft → pinned item → finalize — is
-	// DELETED, so the proposal is UNCONDITIONAL: there is no `s.proposer !=
-	// nil` fallback left to fall back TO. A service wired without a proposer
-	// now fails loudly inside proposeBoundary instead of quietly charging.
-	//
-	// The proposal still sits here, after the freeze and after the recovery
-	// read, for the same reason the other legs put theirs after their own
-	// arming claim (domain_charges.go:140, overage.go:452): a run whose money
-	// MAY ALREADY HAVE MOVED must be FINISHED, not re-derived as an intent.
-	// Abandoning a finalized invoice would strand a charge the customer can
-	// see, that nothing in this tree mirrored, while the rail sealed a second
-	// intent for the same money.
-	//
-	// That case is `moneyMayHaveMoved`, and it is EXACTLY the case — no wider.
-	// A recovered INERT DRAFT is on the proposing side of this branch: its
-	// params carry AutoAdvance(false) (shared/stripe/client.go
-	// inertDraftInvoiceParams), so Stripe never finalizes it on its own and no
-	// money has moved or can move. Finalizing one here would have been a FRESH
-	// off-session debit — the very collect this cutover removes — which is why
-	// the gates above already refused to bypass themselves for a draft. The
-	// draft is left inert; the boundary is sealed as intents like any other.
-	//
-	// The finalized-invoice exception drains as those runs complete, and
-	// scripts/legacy-drop-preconditions.sql row 1 (billing_runs holding a
-	// frozen charge while not 'invoiced') is the query that asks production
-	// when it has.
-	if !moneyMayHaveMoved {
-		return s.proposeBoundary(ctx, runID, accountID, summary, boundaryComponents{
-			// summary.ArrearsMicros is the ORIGINAL arrears. remainingArrears
-			// cannot be used to recover it: it is clamped at zero, so a wallet
-			// draw larger than the arrears loses the difference and the split
-			// would understate the closed period.
-			ArrearsMicros:        summary.ArrearsMicros,
-			AdvanceBaseMicros:    summary.AdvanceBaseMicros,
-			AdvanceOverageMicros: summary.AdvanceOverageMicros,
-			AdvanceDomainsMicros: summary.AdvanceDomainsMicros,
-			WalletDrawnMicros:    summary.WalletDrawnMicros,
-			// 🔴 The frozen figure, when a prior attempt committed to one.
-			//
-			// The proposal below is derived from LIVE state, and a reclaim can
-			// see different live state than the attempt that froze: a module
-			// uninstalled, an app deleted. The freeze exists precisely so two
-			// processes working the same run commit to the SAME number — and
-			// on the intent rail that matters more, not less, because the
-			// amount is sealed into a digest. Two daemons deriving different
-			// live totals would seal two different documents for one boundary,
-			// and ON CONFLICT DO NOTHING dedupes only IDENTICAL digests.
-			//
-			// So it is passed in and CHECKED, not silently substituted: the
-			// components cannot be recovered from a single frozen cents
-			// figure, so a drifted reclaim must refuse rather than seal an
-			// amount nobody committed to.
-			FrozenCents:    frozenCentsForProposal(hasFrozen, frozen),
-			HasFrozenCents: hasFrozen,
-		}, periodStart, periodEnd, newPeriodEnd)
-	}
-
-	// IN-FLIGHT COMPLETION, AND IT MOVES NO MONEY. Reaching here means a prior
-	// attempt of this run already FINALIZED an invoice under the run's
-	// ms_charge_ref (found once, next to the frozen read — D6), so the debit
-	// may already have happened at the provider. Finishing it is a mirror and
-	// a mark: boundaryInvoice makes no provider write at all now that the
-	// draft→item→finalize collect underneath it is deleted. Its only failure
-	// modes are the two refusals it must keep making — a VOID invoice and (as
-	// a defence of the branch above) a draft — and either marks the run
-	// 'failed' (auditable) and returns the error.
-	// The window the adopted invoice's line disclosed, reconstructed from the
-	// FROZEN charge shape so the mirror records what that attempt actually
-	// billed. It always begins at the closed usage period; a charge shape that
-	// included advance base/overage also covered the new period, and so runs
-	// through its next anchored boundary. Only the mirror reads this now — the
-	// line it describes was created by the attempt being adopted.
+	// The aggregated boundary line always begins with the closed usage period.
+	// Pure usage covers only that closed window; when the final, post-freeze
+	// charge shape includes advance base/overage, the same line also covers the
+	// new period and therefore extends through its next anchored boundary.
 	linePeriod := billingstripe.LinePeriod{Start: periodStart, End: periodEnd}
 	if withBase {
 		linePeriod.End = newPeriodEnd
 	}
 
-	inv, err := s.boundaryInvoice(runID, *recovered)
+	// Charge — or, on a frozen reclaim, RECONCILE against Stripe first (H5): the
+	// frozen marker means a prior attempt reached its Stripe section, and past
+	// the ~24h idempotency-key window a bare "replay" would mint brand-new
+	// objects and double-charge. boundaryInvoice finishes the invoice already
+	// FOUND under the run's ms_charge_ref (looked up once, next to the frozen
+	// read — D6); with nothing recovered it charges fresh (through the gates
+	// above). A failure after the PM gate marks the run 'failed' (auditable)
+	// and returns the error.
+	inv, err := s.boundaryInvoice(ctx, runID, custID, cents, withBase, linePeriod, recovered)
 	if err != nil {
 		if markErr := s.store.MarkBillingRun(ctx, runID, RunStatusFailed, "", 0); markErr != nil {
 			// Both failed: surface the original charge error; the failed-mark is
@@ -870,44 +775,74 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	return summary, nil
 }
 
-// boundaryInvoice ADOPTS a boundary run's already-finalized Stripe invoice —
-// `found` is what RunBillingCycle recovered under the run's ms_charge_ref
-// anchor, next to the frozen read (H5/D6), in the one state that means a
-// crashed attempt may already have debited the customer. It performs NO
-// provider write: the draft→item→finalize collect that used to live here (and
-// the fresh s.charge it fell through to) is deleted, and the caller proposes
-// for every state but this one.
-//
-// A finalized invoice (paid/open/uncollectible) is returned as-is, so the
-// caller mirrors the charge that exists and marks the run invoiced. The two
-// refusals it still has to make:
-//
-//   - VOID — the charge was CANCELED at the provider. Adopting it would mark
-//     the run invoiced against an invoice that collects nothing, silently
-//     forgiving the boundary and terminally consuming the run. Ops resolves it.
-//   - DRAFT — unreachable while the caller's guard holds (a draft is inert,
-//     moved no money, and is proposed instead). Kept as a defence of that
-//     guard, because the failure it prevents is silent: adopting a draft would
-//     record a boundary as invoiced that no invoice ever charged.
-func (s *Service) boundaryInvoice(runID uuid.UUID, found billingstripe.Invoice) (billingstripe.Invoice, error) {
-	switch found.Status {
-	case "void":
-		return billingstripe.Invoice{}, fmt.Errorf(
-			"boundary recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (run %s needs ops resolution)",
-			found.ID, boundaryChargeRef(runID), runID)
-	case "draft":
-		return billingstripe.Invoice{}, fmt.Errorf(
-			"boundary recovery: invoice %s under %s is still a DRAFT — it moved no money, so the boundary is proposed, never adopted (run %s)",
-			found.ID, boundaryChargeRef(runID), runID)
+// charge runs the boundary total (usage arrears + advance base + advance
+// overage) through the draft→pinned-item→finalize flow with three
+// deterministic Idempotency-Keys (inv-<run>, ii-<run>, fin-<run>) so a re-run
+// reuses the same Stripe objects. The item is PINNED to this run's own draft
+// (never a floating pending item another leg's invoice could sweep up — C2),
+// and only the finalize step moves money. withBase preserves the historical
+// description choice; RunBillingCycle separately uses that same final charge
+// shape to set linePeriod through the new period's anchored end. Returns the
+// finalized invoice projection (id/status/amounts) for the mirror upsert.
+func (s *Service) charge(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool, linePeriod billingstripe.LinePeriod) (billingstripe.Invoice, error) {
+	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, boundaryChargeRef(runID), invoiceIdemKey(runID))
+	if err != nil {
+		return billingstripe.Invoice{}, err
 	}
-	return found, nil // finalized (paid/open/uncollectible) — the charge exists; mirror it
+	if _, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), linePeriod, invoiceItemIdemKey(runID)); err != nil {
+		return billingstripe.Invoice{}, err
+	}
+	return s.stripe.FinalizeInvoice(ctx, draft.ID, invoiceFinalizeIdemKey(runID))
 }
 
-// boundaryChargeRef is the deterministic ms_charge_ref metadata anchor a
-// crashed attempt stamped on its invoice — what FindInvoiceByRef recovers by.
-// Nothing writes it any more; it survives because the recovery READ still has
-// to find what the deleted collector left behind.
+// boundaryInvoice resolves the boundary run's Stripe invoice. recovered (the
+// invoice RunBillingCycle already found under the run's ms_charge_ref anchor,
+// next to the frozen read — H5/D6) is finished: a finalized invoice is
+// returned as-is (money already moved); a VOID one is refused loudly (the
+// charge was canceled — adopting it would silently forgive the arrears and
+// terminally consume the run); an inert draft is completed — the
+// deterministic line attached if it never landed, then finalized; a
+// mismatched draft is refused loudly. recovered == nil (nothing on Stripe, or
+// a fresh run) charges through s.charge — that path re-entered every
+// collection gate in RunBillingCycle.
+func (s *Service) boundaryInvoice(ctx context.Context, runID uuid.UUID, custID string, cents int64, withBase bool, linePeriod billingstripe.LinePeriod, recovered *billingstripe.Invoice) (billingstripe.Invoice, error) {
+	if recovered != nil {
+		found := *recovered
+		if found.Status == "void" {
+			return billingstripe.Invoice{}, fmt.Errorf(
+				"boundary recovery: invoice %s under %s is VOID — refusing to adopt a canceled charge (run %s needs ops resolution)",
+				found.ID, boundaryChargeRef(runID), runID)
+		}
+		if found.Status != "draft" {
+			return found, nil // finalized (paid/open/uncollectible) — the charge exists; mirror it
+		}
+		switch found.AmountDue {
+		case 0:
+			if _, err := s.stripe.CreateInvoiceItem(ctx, custID, found.ID, cents, chargeCurrency, boundaryChargeDesc(runID, withBase), linePeriod, invoiceItemIdemKey(runID)); err != nil {
+				return billingstripe.Invoice{}, err
+			}
+		case cents:
+			// line already attached — nothing to add
+		default:
+			return billingstripe.Invoice{}, fmt.Errorf(
+				"boundary recovery: draft %s carries %d cents but the frozen amount is %d — refusing to finalize a mismatched draft (run %s)",
+				found.ID, found.AmountDue, cents, runID)
+		}
+		return s.stripe.FinalizeInvoice(ctx, found.ID, invoiceFinalizeIdemKey(runID))
+	}
+	return s.charge(ctx, runID, custID, cents, withBase, linePeriod)
+}
+
+// boundaryChargeRef is the deterministic ms_charge_ref metadata anchor for one
+// boundary run's invoice — what FindInvoiceByRef recovers by.
 func boundaryChargeRef(runID uuid.UUID) string { return "run:" + runID.String() }
+
+func boundaryChargeDesc(runID uuid.UUID, withBase bool) string {
+	if withBase {
+		return fmt.Sprintf("MirrorStack usage + app base fees — run %s", runID)
+	}
+	return fmt.Sprintf("MirrorStack usage — run %s", runID)
+}
 
 // AccountsWithUsageEvents returns the accounts with raw usage_events in the
 // [periodStart, periodEnd) window — the rollup-phase (phase 1) work list
@@ -1013,6 +948,18 @@ func (s *Service) LatestClosedPeriodEnd(ctx context.Context, accountID uuid.UUID
 	}
 	return end, found, nil
 }
+
+// invoiceItemIdemKey / invoiceIdemKey / invoiceFinalizeIdemKey build the
+// deterministic per-run Stripe Idempotency-Keys for the boundary leg's
+// draft→item→finalize flow. The run id is the stable charge identity, so a
+// re-fire (same run row) produces the SAME keys and Stripe returns the
+// original objects instead of creating duplicates. The arrears charge is a
+// SINGLE pooled line per run (Σ charged across all metrics), so the item key
+// is ii-<run> (not per-metric) — matching the single combined invoice item
+// this leg creates.
+func invoiceItemIdemKey(runID uuid.UUID) string     { return "ii-" + runID.String() }
+func invoiceIdemKey(runID uuid.UUID) string         { return "inv-" + runID.String() }
+func invoiceFinalizeIdemKey(runID uuid.UUID) string { return "fin-" + runID.String() }
 
 // flagLargeAutoCollect is the ONE large-charge disclosure resolver (scenario 5,
 // migration 034), called from EVERY off-session charge site — the boundary leg

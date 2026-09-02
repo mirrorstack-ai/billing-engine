@@ -110,40 +110,17 @@ WHERE id = $1 AND activated_at IS NULL
 -- before the sponsor confirms — the authoritative charge happens later,
 -- through the normal rollup, once the sweep re-points the events.
 -- name: OrgUnbilledBacklogMicros :one
-WITH base_events AS (
-    SELECT
-        e.app_id, e.module_id, e.metric, e.aggregation_key, e.subject,
-        COALESCE(e.model, '') AS model,
-        COALESCE(e.module_version, '') AS module_version,
-        e.value
-    FROM ms_billing.usage_events e
-    WHERE e.account_id IS NULL
-      AND e.app_id IN (SELECT app_id FROM ms_billing.apps WHERE owner_org_id = $1)
-),
-billable_events AS (
-    SELECT app_id, module_id, metric, model, module_version, value AS billable_value
-    FROM base_events
-    WHERE aggregation_key IS DISTINCT FROM 'subject'
-    UNION ALL
-    -- The same opaque subject may legitimately exist in multiple apps. Take
-    -- its peak inside each authoritative app/meter/price scope, then let the
-    -- outer disclosure sum those independently billable app contributions.
-    SELECT
-        app_id, module_id, metric, model, module_version,
-        MAX(value)::numeric AS billable_value
-    FROM base_events
-    WHERE aggregation_key = 'subject'
-    GROUP BY app_id, module_id, metric, model, module_version, subject
-)
 SELECT COALESCE(SUM(
     CASE
         WHEN e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%'
-            THEN e.billable_value * COALESCE(md.unit_price_micros, 0) * 12 / 10
-        ELSE e.billable_value * COALESCE(md.unit_price_micros, 0)
+            THEN e.value * COALESCE(md.unit_price_micros, 0) * 12 / 10
+        ELSE e.value * COALESCE(md.unit_price_micros, 0)
     END), 0)::numeric AS backlog_micros
-FROM billable_events e
+FROM ms_billing.usage_events e
 LEFT JOIN ms_billing.metric_definitions md
-    ON md.module_id = e.module_id AND md.metric = e.metric;
+    ON md.module_id = e.module_id AND md.metric = e.metric
+WHERE e.account_id IS NULL
+  AND e.app_id IN (SELECT app_id FROM ms_billing.apps WHERE owner_org_id = $1);
 
 -- AttachOrgAppsToAccount backfills account_id onto the org's unbilled roster
 -- rows — the roster half of the RepointOrgUsage sweep. Attached rows enter
@@ -161,44 +138,25 @@ WHERE owner_org_id = $1 AND account_id IS NULL
 
 -- RepointOrgNullAccountEvents folds the org's pre-designation NULL-account
 -- events into its funded account — the events half of the sweep. The rollup
--- sweep CLAMPS its billing time to the current open window — "backfilled
--- events bill in the first period that closes after designation" (decision
--- 1). recorded_at/repointed_from retain their migration-041 behavior for v1;
--- billable_at is set for EVERY swept row so v2 can clamp occurred_at without
--- mutating that original-occurrence audit field. Scoped through the
--- roster's owner_org_id so lazy USER events are never swept. Idempotent:
--- account_id IS NULL never matches a swept row again.
+-- windows events by recorded_at, so an event older than the account's current
+-- open window (@window_start) would never fall inside ANY future window: the
+-- sweep CLAMPS its recorded_at to the window start — "backfilled events bill
+-- in the first period that closes after designation" (decision 1) — and
+-- preserves the original instant in repointed_from (migration 041 audit
+-- column). Scoped through the roster's owner_org_id so lazy USER events are
+-- never swept. Idempotent: account_id IS NULL never matches a swept row again.
 -- name: RepointOrgNullAccountEvents :execrows
 UPDATE ms_billing.usage_events
-SET account_id              = @account_id::uuid,
-    billable_at             = GREATEST(
-        COALESCE(occurred_at, recorded_at),
-        @window_start::timestamptz
-    ),
-    occurrence_policy       = CASE
-        WHEN observation_version = 2
-         AND occurred_at < @window_start::timestamptz
-        THEN 'first_funded'
-        ELSE occurrence_policy
-    END,
-    repointed_from          = CASE WHEN recorded_at < @window_start::timestamptz
-                                   THEN recorded_at ELSE repointed_from END,
-    recorded_at             = GREATEST(recorded_at, @window_start::timestamptz)
+SET account_id     = @account_id::uuid,
+    repointed_from = CASE WHEN recorded_at < @window_start::timestamptz
+                          THEN recorded_at ELSE repointed_from END,
+    recorded_at    = GREATEST(recorded_at, @window_start::timestamptz)
 WHERE account_id IS NULL
   AND app_id IN (SELECT app_id FROM ms_billing.apps WHERE owner_org_id = @org_id::uuid)
   AND NOT EXISTS (
       SELECT 1 FROM ms_billing.org_deletion_finalizations f
       WHERE f.org_id = @org_id::uuid
   );
-
--- ClosedBillingPeriodEndAtStart lets the repoint transaction advance a lazy
--- backlog past a period whose rollup barrier won the advisory-lock race.
--- name: ClosedBillingPeriodEndAtStart :one
-SELECT period_end
-FROM ms_billing.billing_periods
-WHERE account_id = @account_id::uuid
-  AND period_start = @period_start::timestamptz
-  AND status IN ('closing', 'invoiced');
 
 -- OrgLiveAppIDs lists the org's live roster rows — the timer-synthesis loop
 -- of the RepointOrgUsage sweep reconciles each one after attach.

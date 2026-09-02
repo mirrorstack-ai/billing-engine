@@ -134,8 +134,7 @@ func TestChargeCreationProration_StandardModeWithBalanceChargesStripe(t *testing
 	user, _ := registeredAccount(store)
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := appsSvc(store, sc).WithCreditWallet(true).WithIntentProposer(p)
+	svc := appsSvc(store, sc).WithCreditWallet(true)
 
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	appID := uuid.New()
@@ -143,13 +142,11 @@ func TestChargeCreationProration_StandardModeWithBalanceChargesStripe(t *testing
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	// The standard rail no longer COLLECTS — it seals. What this test is about
-	// is which rail was selected, and that is still exactly observable: the
-	// wallet was not drawn and the charge went out as an intent.
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.Equal(t, "intent:"+resp.IntentDigest, store.apps[appID].ProrationInvoiceID)
-	require.Len(t, p.charges, 1, "the standard rail seals the creation charge")
-	require.Empty(t, sc.invoiceCalls)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Equal(t, sc.invoiceID, resp.ProrationInvoiceID, "standard mode arms the guard with the Stripe invoice id")
+	require.Len(t, sc.invoiceCalls, 1, "the standard Stripe draft→item→finalize flow is unchanged")
+	require.Len(t, sc.itemCalls, 1)
+	require.Len(t, sc.finalizeCalls, 1)
 	require.Zero(t, store.creationDrawn[appID], "the wallet is never touched on the standard path")
 	require.Empty(t, store.walletDrawOrder)
 	require.EqualValues(t, 50_000_000, store.walletSources[grant].remaining)
@@ -273,15 +270,14 @@ func TestChargeCreationProration_WalletFlagOffUsesLegacyStripePath(t *testing.T)
 	store.walletMode = cycle.CreditBillingModeCredits
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := appsSvc(store, sc).WithIntentProposer(p) // WithCreditWallet intentionally omitted.
+	svc := appsSvc(store, sc) // WithCreditWallet intentionally omitted.
 
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 0)
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.Len(t, p.charges, 1, "the non-wallet rail bills through the intent path")
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Len(t, sc.invoiceCalls, 1)
 	require.Zero(t, store.walletStateCalls)
 	require.Zero(t, store.creationWalletDrawCalls)
 	require.EqualValues(t, 50_000_000, store.walletSources[grant].remaining)
@@ -298,11 +294,9 @@ func TestChargeCreationProration_ModeFlipsToStandardBeforeWalletLockDefersToStri
 	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
 	observer := &fakeWalletMutationObserver{}
-	p := &capturingProposer{}
 	svc := appsSvc(store, sc).
 		WithCreditWallet(true).
-		WithWalletMutationObserver(observer).
-		WithIntentProposer(p)
+		WithWalletMutationObserver(observer)
 
 	appID := uuid.New()
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
@@ -313,8 +307,8 @@ func TestChargeCreationProration_ModeFlipsToStandardBeforeWalletLockDefersToStri
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.Equal(t, "intent:"+resp.IntentDigest, store.apps[appID].ProrationInvoiceID)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Equal(t, sc.invoiceID, resp.ProrationInvoiceID)
 	require.Equal(t, 1, store.creationWalletDrawCalls,
 		"the mode change is discovered inside the wallet transaction")
 	require.Zero(t, store.creationDrawn[appID], "standard mode never receives a mid-period wallet draw")
@@ -322,8 +316,9 @@ func TestChargeCreationProration_ModeFlipsToStandardBeforeWalletLockDefersToStri
 		"a covering grant must remain untouched after the mode change")
 	require.Empty(t, store.walletDrawOrder)
 	require.Empty(t, observer.calls, "a no-draw defer emits no wallet mutation")
-	require.Len(t, p.charges, 1, "the full charge stays on the non-wallet rail")
-	require.Empty(t, sc.invoiceCalls)
+	require.Len(t, sc.invoiceCalls, 1, "the full charge stays on the Stripe rail")
+	require.Len(t, sc.itemCalls, 1)
+	require.Len(t, sc.finalizeCalls, 1)
 }
 
 // Defect #1: the unlocked mirror can race with a concurrent Stripe attempt.
@@ -335,18 +330,17 @@ func TestChargeCreationProration_LockedAttemptDefersWalletToStripeRecovery(t *te
 	store.walletMode = cycle.CreditBillingModeCredits
 	seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := appsSvc(store, sc).WithCreditWallet(true).WithIntentProposer(p)
+	svc := appsSvc(store, sc).WithCreditWallet(true)
 
 	appID := uuid.New()
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, created, 0)
 	store.beforeCreationWalletDraw = func(f *fakeStore, id uuid.UUID) {
 		// A concurrent standard-rail worker freezes exact ownership and crashes
-		// before its charge lands, while this worker is between its unlocked
-		// mode read and wallet app-row lock.
+		// before draft creation while this worker is between its unlocked mode
+		// read and wallet app-row lock.
 		f.walletMode = cycle.CreditBillingModeStandard
-		attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, id)
+		attempt := freezeCombinedBeforeDraft(t, svc, store, sc, id)
 		f.walletMode = cycle.CreditBillingModeCredits
 		sc.setFindByRef("app-proration:"+id.String(), billingstripe.Invoice{
 			ID:         "in_race_winner",
@@ -367,9 +361,6 @@ func TestChargeCreationProration_LockedAttemptDefersWalletToStripeRecovery(t *te
 	require.Zero(t, store.creationDrawn[appID], "the wallet must not draw beside a Stripe attempt")
 	require.Equal(t, []string{"app-proration:" + appID.String()}, sc.findByRefCalls)
 	require.Empty(t, sc.invoiceCalls, "recovery adopts the prior invoice instead of creating another")
-	require.Empty(t, p.charges,
-		"the money already moved at the provider, so adopting it is the only correct answer — "+
-			"sealing an intent beside it would bill the app twice")
 }
 
 func cycleInvoice(id string, amountDue int64) billingstripe.Invoice {

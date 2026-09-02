@@ -117,12 +117,6 @@ func (c *Coordinator) WithNow(nowFn func() time.Time) *Coordinator {
 }
 
 func (c *Coordinator) EvaluateCreditUsage(ctx context.Context, event UsageEvent) error {
-	// Usage arriving is an event, not a read: this is how spend reaches
-	// the wallet, and refusing it a refill would block a credits
-	// customer rather than protect one. So it grants the capability
-	// explicitly — a caller that acquires it by accident is the failure
-	// this grant exists to make impossible.
-	ctx = authorizeCollection(ctx)
 	snapshot, err := c.snapshots.CreditGateSnapshot(ctx, event.AccountID)
 	if err != nil {
 		return fmt.Errorf("credit snapshot: %w", err)
@@ -320,26 +314,6 @@ func (c *Coordinator) evaluateForcedProjection(
 }
 
 func (c *Coordinator) OutOfCredits(ctx context.Context, accountID uuid.UUID) (bool, error) {
-	// 🔴 This grant is the gap docs/SECURITY.md §2 records: "A nominal
-	// credit-status gate (OutOfCredits) may synchronously trigger
-	// automatic top-up through the coordinator."
-	//
-	// It is kept, for now, because removing it deadlocks the customer it
-	// would protect. OutOfCredits is the read behind the platform's
-	// service-block gate (internal/account/billing/service.go:392). An
-	// account at its threshold that is refused a refill here answers
-	// "blocked"; being blocked, it serves no requests; serving none, it
-	// records no usage; and usage is what drives the other refill path.
-	// The account would then wait for the period boundary — up to a
-	// month — to become usable again.
-	//
-	// The fix is not a narrower grant here. It is the intent executor of
-	// docs/DESIGN.md §11: the read returns a verdict and a proposed
-	// refill, and something holding an authorization executes it. Until
-	// that exists this path collects, and it says so rather than
-	// inheriting the capability silently.
-	ctx = authorizeCollection(ctx)
-
 	snapshot, err := c.snapshots.CreditGateSnapshot(ctx, accountID)
 	if err != nil {
 		return false, fmt.Errorf("credit snapshot: %w", err)
@@ -417,11 +391,6 @@ func (c *Coordinator) OutOfCredits(ctx context.Context, accountID uuid.UUID) (bo
 }
 
 func (c *Coordinator) ObserveAccount(ctx context.Context, accountID uuid.UUID) error {
-	// A settlement observed against the wallet can leave a balance that
-	// needs refilling, so this path may collect. Where the observation
-	// is itself part of a charge already in flight,
-	// creditledger.IsSettlementObservation still holds it back.
-	ctx = authorizeCollection(ctx)
 	deferNotification := autoTopUpObserverNotificationDeferred(ctx)
 	snapshot, err := c.snapshots.CreditGateSnapshot(ctx, accountID)
 	if err != nil {
@@ -519,9 +488,6 @@ func (c *Coordinator) ObserveAccount(ctx context.Context, accountID uuid.UUID) e
 // notification claims make crash/retry replays winner-only without preventing
 // a later usage crossing in the same period from notifying.
 func (c *Coordinator) ReconcileBoundary(ctx context.Context, accountID uuid.UUID, periodStart time.Time, estimateMicros int64) error {
-	// The period boundary is the scheduled run that charges; a refill
-	// here is the point of the wallet.
-	ctx = authorizeCollection(ctx)
 	if estimateMicros != 0 {
 		return fmt.Errorf("boundary unpaid exposure must be zero after the durable draw: %d", estimateMicros)
 	}
@@ -617,7 +583,6 @@ func (c *Coordinator) maybeTriggerAutoTopUp(
 	deferObserverNotification bool,
 ) (Snapshot, AutoTopUpTriggerResult) {
 	if c.autoTopUp == nil ||
-		!collectionAuthorized(ctx) ||
 		creditledger.IsSettlementObservation(ctx) ||
 		autoTopUpSuppressed(ctx) ||
 		!autoTopUpCandidate(snapshot, projectedChargeMicros) {
@@ -646,44 +611,6 @@ func (c *Coordinator) maybeTriggerAutoTopUp(
 		return snapshot, result
 	}
 	return fresh, result
-}
-
-type collectionAuthorityContextKey struct{}
-
-// authorizeCollection marks a call tree as one that may originate an
-// automatic card charge.
-//
-// This inverts the default that SuppressAutoTopUp was written against.
-// Suppression is opt-out: safety depends on every caller remembering to
-// ask for it, and docs/SECURITY.md §2 records what that cost — four
-// ordinary read and ingest paths reaching the executor, among them a
-// nominal credit-status gate. A caller who forgets an opt-out charges a
-// card; a caller who forgets an opt-in does not.
-//
-// So the capability is granted at named entrypoints rather than
-// inherited: usage arriving, a settlement observed, a period boundary
-// reconciled.
-//
-// 🔴 OutOfCredits also grants it, and that is the gap
-// docs/SECURITY.md §2 records rather than the design working as
-// intended. It is the read behind the platform's service-block gate,
-// and refusing it a refill deadlocks the account it would protect —
-// see the comment at OutOfCredits itself. The target is that a read
-// grants nothing; the intent executor of docs/DESIGN.md §11 is what
-// gets there. internal/architecture counts the grants and separates
-// the events from this one, so the number is visible rather than
-// asserted here.
-//
-// Suppression is kept rather than replaced: the webhook transports
-// already pass it, and a deny that two independent mechanisms agree on
-// is worth more than a tidier one.
-func authorizeCollection(ctx context.Context) context.Context {
-	return context.WithValue(ctx, collectionAuthorityContextKey{}, true)
-}
-
-func collectionAuthorized(ctx context.Context) bool {
-	authorized, _ := ctx.Value(collectionAuthorityContextKey{}).(bool)
-	return authorized
 }
 
 type autoTopUpSuppressionContextKey struct{}

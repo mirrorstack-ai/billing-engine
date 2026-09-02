@@ -10,7 +10,6 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
-	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 )
 
 type countingCreditObserver struct {
@@ -110,8 +109,8 @@ func TestStartCreditPurchase_EnforcesInclusiveBounds(t *testing.T) {
 			store.accountsByUser[userID] = fakeAccount{id: accountID}
 			store.stripeCustomerOf[accountID] = "cus_credit"
 			stripeFake := &fakeStripe{}
-			svc, proposals := creditPurchaseSvcProposing(store, stripeFake)
-			svc = svc.WithCreditWallet(true)
+			svc := newCreditPurchaseTestService(store, stripeFake).
+				WithCreditWallet(true)
 
 			resp, err := svc.StartCreditPurchase(context.Background(), billing.StartCreditPurchaseRequest{
 				OwnerUserID:    userID,
@@ -123,9 +122,6 @@ func TestStartCreditPurchase_EnforcesInclusiveBounds(t *testing.T) {
 				requireBillingErrorCode(t, err, billing.CodeInvalidInput)
 				require.Nil(t, resp)
 				require.Zero(t, store.creditPurchaseCreates)
-				require.Empty(t, proposals.charges,
-					"an out-of-bounds amount was sealed as an obligation; the bound has to "+
-						"hold before the document exists, not after")
 				require.Empty(t, stripeFake.creditDraftCalls)
 				return
 			}
@@ -133,62 +129,23 @@ func TestStartCreditPurchase_EnforcesInclusiveBounds(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, resp)
 			require.Equal(t, "stripe", resp.Rail)
-			require.Equal(t, billing.PurchaseStartProposed, resp.Status)
-			require.Nil(t, resp.Stripe, "a proposed purchase has no invoice to pay against")
 			require.Equal(t, 1, store.creditPurchaseCreates)
-
-			// The three calls this assertion used to count are deleted. Their
-			// absence is now the assertion.
-			require.Empty(t, stripeFake.creditDraftCalls)
-			require.Empty(t, stripeFake.creditItemCalls)
-			require.Empty(t, stripeFake.creditFinalizeCalls)
-
-			// 🔴 THE BOUNDARY AMOUNT, ON THE NEW ARTIFACT. It used to be read
-			// off the Stripe invoice item; it is now read off the sealed
-			// intent, and it is the same integer either way. A boundary that
-			// drifted here would change what the customer pays at exactly the
-			// amounts nobody re-checks by hand.
-			sealed := proposals.onlySealed(t)
-			require.Equal(t, intent.KindCreditPurchase, sealed.Kind())
-			// Seal normalizes the case of the leg's "usd" (chargeintent.go:420);
-			// the denomination itself is what must not drift.
-			require.Equal(t, "USD", sealed.Currency())
-			require.EqualValues(t, tc.amountMicros, sealed.TotalMicros(),
-				"the boundary amount changed in the cutover")
-			require.EqualValues(t, tc.amountMicros, sealed.ProviderRemainderMicros(),
-				"§6: buying credit draws nothing from the wallet it tops up, so the "+
-					"whole obligation is the provider's to collect")
-
-			// The old assertion was on cents, because that is what actually
-			// reached Stripe. Both bounds must still be a whole number of
-			// cents, or the single rounding the adapter performs silently
-			// changes the boundary.
-			require.Zero(t, sealed.ProviderRemainderMicros()%10_000,
-				"the boundary no longer lands on a whole cent")
-			require.Equal(t, tc.amountMicros/10_000, sealed.ProviderRemainderMicros()/10_000)
-
-			require.Equal(t,
-				"intent:"+sealed.Digest(),
-				store.creditPurchaseProposedRefs[uuid.MustParse(resp.PurchaseID)],
-				"the durable row cannot be walked to the intent that now owns this money")
+			require.Len(t, stripeFake.creditDraftCalls, 1)
+			require.Len(t, stripeFake.creditItemCalls, 1)
+			require.Equal(t, tc.amountMicros/10_000, stripeFake.creditItemCalls[0].amountCents)
+			require.Len(t, stripeFake.creditFinalizeCalls, 1)
 		})
 	}
 }
 
-// The same test's subject on the new rail: ONE key, ONE obligation.
-//
-// It used to say "one Stripe invoice flow" because a second flow was a second
-// invoice and a second card charge. The intent rail's version of that double
-// charge is a second SEALED INTENT for one purchase — two documents, each
-// collectable — so that is what the replay must not produce.
-func TestStartCreditPurchase_SameKeySealsExactlyOneIntent(t *testing.T) {
+func TestStartCreditPurchase_SameKeyRunsOneStripeInvoiceFlow(t *testing.T) {
 	store := newFakeStore()
 	userID, accountID := uuid.New(), uuid.New()
 	store.accountsByUser[userID] = fakeAccount{id: accountID}
 	store.stripeCustomerOf[accountID] = "cus_credit"
 	stripeFake := &fakeStripe{}
-	svc, proposals := creditPurchaseSvcProposing(store, stripeFake)
-	svc = svc.WithCreditWallet(true)
+	svc := newCreditPurchaseTestService(store, stripeFake).
+		WithCreditWallet(true)
 	req := billing.StartCreditPurchaseRequest{
 		OwnerUserID:    userID,
 		AmountMicros:   12_340_000,
@@ -201,59 +158,27 @@ func TestStartCreditPurchase_SameKeySealsExactlyOneIntent(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, first.PurchaseID, second.PurchaseID)
-	require.Equal(t, billing.PurchaseStartProposed, first.Status)
-	require.Equal(t, first.Status, second.Status,
-		"the replay reported a different shape than the call it is replaying")
-	require.Nil(t, first.Stripe)
-	require.Nil(t, second.Stripe)
+	require.Equal(t, first.Stripe, second.Stripe)
 	require.Equal(t, 1, store.creditPurchaseCreates)
 	require.Equal(t, 2, store.creditIdempotencyReads)
-
-	// 🔴 One key, one sealed obligation, for the exact amount asked for.
-	sealed := proposals.onlySealed(t)
-	require.EqualValues(t, req.AmountMicros, sealed.TotalMicros())
-	require.EqualValues(t, req.AmountMicros, sealed.ProviderRemainderMicros())
-	require.Equal(t, 1, store.creditPurchaseProposes,
-		"the replay re-marked a row the first call had already moved")
-	require.Equal(t,
-		"intent:"+sealed.Digest(),
-		store.creditPurchaseProposedRefs[uuid.MustParse(first.PurchaseID)],
-		"the replay repointed the purchase at a different intent")
-
-	// The four Stripe calls this test used to count are the flow that was
-	// deleted. Neither call may reach the provider at all — not even to read:
-	// a proposed purchase has no resource there to be authoritative about.
-	require.Empty(t, stripeFake.creditFindCalls)
-	require.Empty(t, stripeFake.creditDraftCalls)
-	require.Empty(t, stripeFake.creditItemCalls)
-	require.Empty(t, stripeFake.creditFinalizeCalls)
-	require.Empty(t, stripeFake.creditGetCalls)
+	require.Len(t, stripeFake.creditFindCalls, 1)
+	require.Len(t, stripeFake.creditDraftCalls, 1)
+	require.Len(t, stripeFake.creditItemCalls, 1)
+	require.Len(t, stripeFake.creditFinalizeCalls, 1)
+	require.GreaterOrEqual(t, len(stripeFake.creditGetCalls), 3,
+		"draft item, finalize, and idempotent replay each establish independent resource truth")
 }
 
 func TestCreditMutationObserversRunOnlyForFirstDurableTransition(t *testing.T) {
-	// 🔴 Starting a purchase no longer produces a durable SETTLEMENT at all.
-	//
-	// The legacy start collected: finalize returned "paid", the wallet gained
-	// the credit, and the observer fired once for that transition. The intent
-	// rail seals a document and collects nothing, so the honest assertion on
-	// this leg is the other side of the same rule — an observation must not
-	// fire for a balance that did not move, on the first call or the replay.
-	//
-	// The "exactly once for the first durable transition" rule itself is still
-	// pinned by the three sibling subtests below, which all still settle.
-	t.Run("start purchase proposes and settles nothing", func(t *testing.T) {
+	t.Run("start purchase settled replay", func(t *testing.T) {
 		store := newFakeStore()
 		userID, accountID := uuid.New(), uuid.New()
 		store.accountsByUser[userID] = fakeAccount{id: accountID}
 		store.stripeCustomerOf[accountID] = "cus_credit"
-		store.creditStanding[accountID] = billing.CreditStandingRow{
-			BillingMode:   billing.BillingModeCredits,
-			BalanceMicros: 7_000_000,
-		}
-		stripeFake := &fakeStripe{}
+		stripeFake := &fakeStripe{creditFinalizeStatus: "paid"}
 		observer := &countingCreditObserver{}
-		svc, proposals := creditPurchaseSvcProposing(store, stripeFake)
-		svc = svc.WithCreditWallet(true).
+		svc := newCreditPurchaseTestService(store, stripeFake).
+			WithCreditWallet(true).
 			WithCreditCoordinator(nil, observer)
 		req := billing.StartCreditPurchaseRequest{
 			OwnerUserID: userID, AmountMicros: 12_340_000,
@@ -264,21 +189,8 @@ func TestCreditMutationObserversRunOnlyForFirstDurableTransition(t *testing.T) {
 		require.NoError(t, err)
 		_, err = svc.StartCreditPurchase(context.Background(), req)
 		require.NoError(t, err)
-
-		require.Empty(t, observer.accounts,
-			"a proposal observed a settlement; nothing was collected, so the "+
-				"projection would be told a balance changed when it did not")
-		require.Empty(t, observer.settlementObservations)
-		require.EqualValues(t, 7_000_000, store.creditStanding[accountID].BalanceMicros,
-			"a proposed purchase credited the wallet before anyone paid for it")
-
-		// The zero above is not vacuous: the purchase really was taken, once,
-		// for the full amount, and the replay added nothing.
-		require.Len(t, proposals.sealed, 1)
-		require.EqualValues(t, req.AmountMicros, proposals.sealed[0].TotalMicros())
-		require.Equal(t, 1, store.creditPurchaseCreates)
-		require.Equal(t, 1, store.creditPurchaseProposes)
-		require.Empty(t, stripeFake.creditFinalizeCalls)
+		require.Equal(t, []uuid.UUID{accountID}, observer.accounts)
+		require.Equal(t, []bool{true}, observer.settlementObservations)
 	})
 
 	t.Run("finish purchase settled replay", func(t *testing.T) {

@@ -37,14 +37,6 @@ func (s *stubUsageStore) InsertUsageEvent(_ context.Context, e usage.UsageEvent)
 	s.last = &e
 	return true, nil
 }
-
-func (s *stubUsageStore) CheckUsageEventID(context.Context, string, []byte) (bool, error) {
-	return false, nil
-}
-func (s *stubUsageStore) InsertUsageObservation(_ context.Context, e usage.UsageEvent, _, _ time.Time, _ usage.UsageRejectionReason) (bool, float64, error) {
-	s.last = &e
-	return true, e.Value, nil
-}
 func (stubUsageStore) AccountByOwner(context.Context, usage.Owner) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil
 }
@@ -54,9 +46,6 @@ func (stubUsageStore) AppOwnerOrg(context.Context, uuid.UUID) (uuid.UUID, bool, 
 }
 func (stubUsageStore) AccountAnchorDay(context.Context, uuid.UUID) (int, error) {
 	return 1, nil
-}
-func (stubUsageStore) AccountActivation(context.Context, uuid.UUID) (time.Time, bool, error) {
-	return time.Time{}, false, nil
 }
 func (stubUsageStore) CurrentPeriodUsage(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.MetricUsageRaw, error) {
 	return nil, nil

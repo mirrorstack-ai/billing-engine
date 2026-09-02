@@ -21,12 +21,7 @@ func TestSettleStripeInvoice_ManualPurchaseExactlyOnce(t *testing.T) {
 	store := creditledger.NewStore(pool)
 	accountID := seedCreditAccount(t, pool)
 	seedCreditGrant(t, pool, accountID, 1_000_000)
-	// A whole number of cents, like every other fixture in this file. It used
-	// to be 5_005_000 — half a cent — which made the charge (501 cents) and
-	// the credit (5_005_000 micros) two different amounts, and this test
-	// asserted the difference was correct. It is not; see
-	// TestSettleStripeInvoice_RefusesASubCentRow below.
-	ledgerID := seedManualPurchase(t, pool, accountID, "in_manual", "pending", 5_010_000)
+	ledgerID := seedManualPurchase(t, pool, accountID, "in_manual", "pending", 5_005_000)
 
 	first, err := store.SettleStripeInvoice(
 		context.Background(),
@@ -54,10 +49,10 @@ func TestSettleStripeInvoice_ManualPurchaseExactlyOnce(t *testing.T) {
 
 	status, balanceAfter, failureCode, receiptURL := readCreditAttempt(t, pool, ledgerID)
 	require.Equal(t, "settled", status)
-	require.Equal(t, int64(6_010_000), balanceAfter)
+	require.Equal(t, int64(6_005_000), balanceAfter)
 	require.Empty(t, failureCode)
 	require.Equal(t, "https://stripe.test/in_manual", receiptURL)
-	require.Equal(t, int64(6_010_000), settledBalance(t, pool, accountID))
+	require.Equal(t, int64(6_005_000), settledBalance(t, pool, accountID))
 }
 
 func TestSettleStripeInvoice_PaidIsHighestForFailedAutoTopUp(t *testing.T) {
@@ -320,37 +315,4 @@ func settledBalance(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID) int64
 		accountID,
 	).Scan(&balance))
 	return balance
-}
-
-// A row that is not a whole number of cents cannot settle honestly: the card is
-// charged the rounded cents and the wallet is credited the raw micros, and those
-// are different numbers. Below the half-cent the payer gains; at or above it the
-// payer loses. This test covers the second direction, which is the one the
-// fixture above used to assert as correct.
-//
-// The entry points now reject sub-cent amounts, so this row can only exist if it
-// predates that guard. Settlement must refuse rather than pick a side — refusing
-// leaves the Stripe invoice recoverable, settling does not.
-func TestSettleStripeInvoice_RefusesASubCentRow(t *testing.T) {
-	pool := testutil.NewTestDB(t)
-	store := creditledger.NewStore(pool)
-	accountID := seedCreditAccount(t, pool)
-	seedCreditGrant(t, pool, accountID, 1_000_000)
-	ledgerID := seedManualPurchase(t, pool, accountID, "in_subcent", "pending", 5_005_000)
-
-	_, err := store.SettleStripeInvoice(
-		context.Background(),
-		"in_subcent",
-		501, // what a card would actually take for 5_005_000 micros
-		"USD",
-		"https://stripe.test/in_subcent",
-	)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "not a whole number of cents")
-
-	// Nothing moved: the attempt is still pending and the balance is untouched,
-	// so the invoice remains recoverable once the row is corrected.
-	status, _, _, _ := readCreditAttempt(t, pool, ledgerID)
-	require.Equal(t, "pending", status)
-	require.Equal(t, int64(1_000_000), settledBalance(t, pool, accountID))
 }

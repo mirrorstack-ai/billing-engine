@@ -51,21 +51,13 @@ import (
 )
 
 // ProrationStatus classifies one ChargeCreationProration outcome for the sweep's
-// tally + per-app log line.
-//
-// No outcome mints an invoice any more: a fresh charge is SEALED
-// (ProrationStatusProposed) or drawn from the credit wallet
-// (ProrationStatusWalletCharged), and ProrationStatusCharged now means only
-// that an invoice a LEGACY run had already finalized was adopted into this
-// database. The rest are legitimate no-charge outcomes (D1d/D1e) or the
-// idempotent guard.
+// tally + per-app log line. Only ProrationStatusCharged mints a new invoice; the
+// rest are legitimate no-charge outcomes (D1d/D1e) or the idempotent guard.
 type ProrationStatus string
 
 const (
-	// ProrationStatusCharged: a creation-proration invoice a legacy run had
-	// already finalized at the provider was ADOPTED on this call — mirrored,
-	// its timers marked against it, and the one-shot guard armed with its id.
-	// Nothing was created or collected here; this leg has no such call left.
+	// ProrationStatusCharged: the creation-proration invoice was created and the
+	// one-shot guard armed on THIS call.
 	ProrationStatusCharged ProrationStatus = "charged"
 	// ProrationStatusAlreadyCharged: the guard was already armed (a prior sweep,
 	// or a concurrent one, charged) — idempotent success, no second invoice.
@@ -88,14 +80,6 @@ const (
 	// unreachable for a real survived app whose base is ≥ $20) → nothing to
 	// invoice, guard left unarmed.
 	ProrationStatusNoCharge ProrationStatus = "no_charge"
-
-	// ProrationStatusProposed: the intent cutover was armed, so this
-	// attempt's charge was SEALED AS AN INTENT and nothing was collected.
-	//
-	// Distinct from no_charge, which means there was nothing to bill. This
-	// attempt had an amount and the intent rail now owns it, so a caller
-	// that conflated the two would report a real charge as absent.
-	ProrationStatusProposed ProrationStatus = "proposed"
 	// ProrationStatusNotFound: no roster row for the app id (never registered).
 	ProrationStatusNotFound ProrationStatus = "not_found"
 	// ProrationStatusWalletCharged (credit mode, billing-engine #99): the
@@ -126,14 +110,6 @@ type ProrationResult struct {
 	Status             ProrationStatus
 	ProrationInvoiceID string
 	ProrationCents     int64
-	// IntentDigest is the intent this attempt's charge was sealed as. It is
-	// the link from the proration row to the document that replaced its
-	// charge, and it is set on every fresh Stripe-rail charge.
-	//
-	// Empty on the two outcomes that are not a seal: a wallet settlement
-	// (ProrationStatusWalletCharged) and the adoption of an in-flight legacy
-	// invoice (ProrationStatusCharged).
-	IntentDigest string
 }
 
 // ProrationOutcome is the store's report from the locked charge section
@@ -169,8 +145,7 @@ const (
 )
 
 // ProrationCharge is the persistence payload the charge callback returns from
-// inside the locked transaction: the ADOPTED Stripe invoice to mirror (one a
-// legacy run finalized before it crashed — nothing here creates one), the base
+// inside the locked transaction: the created Stripe invoice to mirror, the base
 // snapshot to freeze (migration 028, source='proration'), and the invoice id
 // that arms the one-shot guard. Cents is echoed to the caller. A nil return from
 // the callback means "nothing to charge" (0 cents) — the store persists nothing.
@@ -255,12 +230,6 @@ type ProrationWalletCharge struct {
 // deleted / unactivated / period-closed / no-PM) short-circuit first; the
 // actual charge + arm runs under the lock (ChargeProrationLocked), which
 // re-verifies the deleted + guard state authoritatively.
-//
-// 🔴 THE CHARGE ITSELF IS NO LONGER COLLECTED HERE. The amount above is
-// derived exactly as it always was, then SEALED AS AN INTENT for something
-// holding the write port to collect. The one thing this leg still finishes at
-// the provider is an invoice a legacy run finalized before it crashed, and it
-// finishes that by mirroring it, not by writing anything back.
 func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) (*ProrationResult, error) {
 	if appID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
@@ -494,10 +463,6 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// in a second short transaction, then and only then reaches Stripe.
 	var cents int64
 	var concurrentlyResolvedInvoice string
-	// proposedDigest is set when the cutover branch sealed this attempt as an
-	// intent instead of collecting it. It is the link from the app's proration
-	// row to the document that replaced its charge.
-	var proposedDigest string
 	atomicNoPM := false
 	outcome, invID, err := s.store.ChargeProrationLocked(ctx, appID, func(locked AppMirror) (*ProrationCharge, error) {
 		var candidate CombinedProrationChargeShape
@@ -578,56 +543,16 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, billing.Internal("combined proration funder has a usable PM but no Stripe customer id", nil)
 		}
 
-		// 🔴 THE CUTOVER, after the durable arming claim and after the
-		// recovery read — the same position it has always held.
-		//
-		// It is no longer a BRANCH on an installed proposer: the legacy
-		// collector below it is gone, so this leg proposes, always. The only
-		// thing it does not propose is a charge that ALREADY MOVED MONEY at
-		// the provider, and that is the guard below, not this one.
-		//
-		// moneyMayHaveMoved is narrower than the `recoveredInv == nil` it
-		// replaces, deliberately. recoveredInv also covers an inert DRAFT, and
-		// this leg's own recovery contract (wave 2, D6, ~90 lines above) says
-		// what a draft is: nothing moved, and finalizing it is a FRESH
-		// off-session debit with every gate applying, exactly as on a first
-		// attempt. A fresh debit is precisely what the intent rail now owns.
-		// The draft is created with auto_advance=false (inertDraftInvoiceParams),
-		// so it cannot finalize or collect on its own — abandoning it strands
-		// no charge and can double-bill nobody.
-		if !moneyMayHaveMoved {
-			sealed, perr := s.proposeCombinedProration(ctx, attempt)
-			if perr != nil {
-				return nil, perr
-			}
-			// 🔴 THE TERMINAL STAMP, so the app stops being re-swept.
-			//
-			// AppsPendingProration selects on proration_invoice_id AND
-			// proration_skipped_at both being NULL. Without this the attempt
-			// is re-derived on every sweep and seals a NEW intent each time,
-			// for one charge — and on a disarm the legacy branch would then
-			// mint a real Stripe invoice for a period the intent rail already
-			// sealed. The domain and overage legs each stamp here; this is the
-			// same act, and its absence was the defect.
-			if merr := s.store.MarkCombinedProrationProposed(
-				ctx, appID, s.nowFn().UTC(), "intent:"+sealed.Digest(),
-			); merr != nil {
-				return nil, billing.Internal("mark combined proration proposed failed", merr)
-			}
-			proposedDigest = sealed.Digest()
-			return nil, nil
-		}
-
 		expectedTotalCents, err := combinedProrationTotalCents(attempt)
 		if err != nil {
 			return nil, billing.Internal("combined proration total cents overflow", err)
 		}
-		inv, landed, err := s.adoptFinalizedProrationInvoice(
+		inv, landed, err := s.reconcileCombinedProrationInvoice(
 			ctx,
 			combinedStripe,
 			custID,
 			attempt,
-			*recoveredInv,
+			recoveredInv,
 			expectedTotalCents,
 		)
 		if err != nil {
@@ -728,16 +653,6 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 				AppID:              appID,
 				Status:             ProrationStatusAlreadyCharged,
 				ProrationInvoiceID: concurrentlyResolvedInvoice,
-			}, nil
-		}
-		if proposedDigest != "" {
-			// Sealed, not collected. Distinct from NoCharge, which means
-			// there was nothing to bill: this attempt HAD an amount and the
-			// intent rail now owns it.
-			return &ProrationResult{
-				AppID:        appID,
-				Status:       ProrationStatusProposed,
-				IntentDigest: proposedDigest,
 			}, nil
 		}
 		return &ProrationResult{AppID: appID, Status: ProrationStatusNoCharge}, nil
@@ -860,16 +775,14 @@ func combinedProrationTimerItemKey(timerID uuid.UUID) string {
 	return "timer:" + timerID.String()
 }
 
-// combinedProrationExpectedItem is one line the frozen attempt says the
-// provider invoice must carry. It is now a VERIFICATION shape only: the
-// idempotency key and the item identity it also held were the arguments to
-// CreateCombinedProrationInvoiceItem, and this leg creates no invoice items.
 type combinedProrationExpectedItem struct {
 	key         string
 	amountCents int64
 	currency    string
 	description string
 	period      billingstripe.LinePeriod
+	idemKey     string
+	identity    billingstripe.CombinedProrationItemIdentity
 }
 
 func combinedProrationExpectedItems(attempt CombinedProrationAttempt) []combinedProrationExpectedItem {
@@ -884,6 +797,10 @@ func combinedProrationExpectedItems(attempt CombinedProrationAttempt) []combined
 		currency:    attempt.Shape.Currency,
 		description: attempt.Shape.BaseDescription,
 		period:      period,
+		idemKey:     appProrationItemIdemKey(attempt.AppID),
+		identity: billingstripe.CombinedProrationItemIdentity{
+			AppID: attempt.AppID.String(),
+		},
 	})
 	for _, timerID := range attempt.TimerIDs {
 		items = append(items, combinedProrationExpectedItem{
@@ -892,22 +809,20 @@ func combinedProrationExpectedItems(attempt CombinedProrationAttempt) []combined
 			currency:    attempt.Shape.Currency,
 			description: attempt.Shape.ModuleDescription,
 			period:      period,
+			idemKey:     moduleOverageItemIdemKey(timerID),
+			identity: billingstripe.CombinedProrationItemIdentity{
+				AppID:   attempt.AppID.String(),
+				TimerID: timerID.String(),
+			},
 		})
 	}
 	return items
 }
 
-// validateCombinedProrationInvoiceItems proves the provider's invoice carries
-// EXACTLY the frozen attempt's lines: every one of them, each at its frozen
-// amount, currency, description, and period, and nothing else.
-//
-// It used to take a requireComplete flag, false while a draft was still being
-// assembled. There is no assembly any more — the only invoice this leg reads is
-// one a legacy run already finalized — so an incomplete set is always a
-// disagreement between the provider and the frozen attempt.
 func validateCombinedProrationInvoiceItems(
 	attempt CombinedProrationAttempt,
 	actual []billingstripe.InvoiceItem,
+	requireComplete bool,
 ) (map[string]billingstripe.InvoiceItem, error) {
 	expectedList := combinedProrationExpectedItems(attempt)
 	expected := make(map[string]combinedProrationExpectedItem, len(expectedList))
@@ -968,7 +883,7 @@ func validateCombinedProrationInvoiceItems(
 		}
 		landed[key] = item
 	}
-	if len(landed) != len(expected) {
+	if requireComplete && len(landed) != len(expected) {
 		return nil, fmt.Errorf(
 			"combined invoice has %d of %d frozen items",
 			len(landed), len(expected),
@@ -977,42 +892,53 @@ func validateCombinedProrationInvoiceItems(
 	return landed, nil
 }
 
-// adoptFinalizedProrationInvoice completes a combined creation-proration charge
-// that ALREADY MOVED MONEY at the provider, and completes it in this
-// database only.
-//
-// 🔴 IT WRITES NOTHING AT STRIPE, AND THAT IS THE WHOLE POINT.
-//
-// This is what is left of the legacy collector. The leg used to create a
-// draft, attach its lines, and finalize; every one of those calls is gone,
-// because every fresh charge is now sealed as an intent. What could not go is
-// the case where a legacy run finalized an invoice and died before its
-// terminal transaction: Stripe is collecting that invoice, or already has, and
-// abandoning it would leave a charge on the customer's statement that this
-// database has never heard of — no mirror, no snapshot, the one-shot guard
-// unarmed, and the app swept again forever.
-//
-// So it reads the invoice back, proves it is the frozen attempt's invoice down
-// to each line's identity and the total, and hands it to the caller to MIRROR.
-// A draft cannot arrive here (the caller's moneyMayHaveMoved guard), and if one
-// somehow does this refuses rather than finalizing it — nothing in this leg
-// finalizes anything any more.
-//
-// The exception drains: once no app row carries an unresolved
-// proration_attempted_at, this function has nothing left to adopt. That is one
-// of the questions scripts/legacy-drop-preconditions.sql asks production.
-func (s *Service) adoptFinalizedProrationInvoice(
+func (s *Service) reconcileCombinedProrationInvoice(
 	ctx context.Context,
 	combinedStripe billingstripe.CombinedProrationClient,
 	custID string,
 	attempt CombinedProrationAttempt,
-	recovered billingstripe.Invoice,
+	recovered *billingstripe.Invoice,
 	expectedTotalCents int64,
 ) (billingstripe.Invoice, map[string]billingstripe.InvoiceItem, error) {
-	if recovered.ID == "" {
+	var invoice billingstripe.Invoice
+	var err error
+	if recovered != nil {
+		invoice = *recovered
+	} else {
+		invoice, err = s.stripe.CreateDraftInvoice(
+			ctx,
+			custID,
+			appProrationChargeRef(attempt.AppID),
+			appProrationInvoiceIdemKey(attempt.AppID),
+		)
+		if err != nil {
+			return billingstripe.Invoice{}, nil, billing.StripeError("proration draft invoice failed", err)
+		}
+	}
+	if invoice.ID == "" {
 		return billingstripe.Invoice{}, nil, billing.Internal("combined proration invoice id is empty", nil)
 	}
-	current, err := s.stripe.GetInvoice(ctx, recovered.ID)
+
+	listItems := func(requireComplete bool) (map[string]billingstripe.InvoiceItem, error) {
+		items, listErr := combinedStripe.ListInvoiceItems(ctx, invoice.ID)
+		if listErr != nil {
+			return nil, billing.StripeError("combined proration invoice item list failed", listErr)
+		}
+		landed, validateErr := validateCombinedProrationInvoiceItems(attempt, items, requireComplete)
+		if validateErr != nil {
+			return nil, billing.Internal(fmt.Sprintf(
+				"proration recovery: invoice %s item truth is invalid",
+				invoice.ID,
+			), validateErr)
+		}
+		return landed, nil
+	}
+
+	landed, err := listItems(false)
+	if err != nil {
+		return billingstripe.Invoice{}, nil, err
+	}
+	current, err := s.stripe.GetInvoice(ctx, invoice.ID)
 	if err != nil {
 		return billingstripe.Invoice{}, nil, billing.StripeError("combined proration invoice refresh failed", err)
 	}
@@ -1028,33 +954,82 @@ func (s *Service) adoptFinalizedProrationInvoice(
 			current.ID, current.CustomerID, custID,
 		), nil)
 	}
-	if current.Status == "draft" {
-		// It was not a draft when the caller read it, or the caller would have
-		// proposed instead. Something un-finalized it, which no code here does.
-		return billingstripe.Invoice{}, nil, billing.Internal(fmt.Sprintf(
-			"proration recovery: invoice %s is a draft; this leg no longer finalizes, so app %s needs ops resolution",
-			current.ID, attempt.AppID,
-		), nil)
+	if current.Status != "draft" {
+		landed, err = listItems(true)
+		if err != nil {
+			return billingstripe.Invoice{}, nil, err
+		}
+		if current.AmountDue != expectedTotalCents {
+			return billingstripe.Invoice{}, nil, billing.Internal(fmt.Sprintf(
+				"proration recovery: finalized invoice %s carries %d cents, expected frozen %d",
+				current.ID, current.AmountDue, expectedTotalCents,
+			), nil)
+		}
+		return current, landed, nil
 	}
 
-	items, err := combinedStripe.ListInvoiceItems(ctx, current.ID)
-	if err != nil {
-		return billingstripe.Invoice{}, nil, billing.StripeError("combined proration invoice item list failed", err)
+	for _, expected := range combinedProrationExpectedItems(attempt) {
+		if _, ok := landed[expected.key]; ok {
+			continue
+		}
+		if _, err := combinedStripe.CreateCombinedProrationInvoiceItem(
+			ctx,
+			custID,
+			invoice.ID,
+			expected.amountCents,
+			expected.currency,
+			expected.description,
+			expected.period,
+			expected.idemKey,
+			expected.identity,
+		); err != nil {
+			return billingstripe.Invoice{}, nil, billing.StripeError(
+				"combined proration invoice item failed",
+				err,
+			)
+		}
 	}
-	landed, err := validateCombinedProrationInvoiceItems(attempt, items)
+	landed, err = listItems(true)
 	if err != nil {
+		return billingstripe.Invoice{}, nil, err
+	}
+	current, err = s.stripe.GetInvoice(ctx, invoice.ID)
+	if err != nil {
+		return billingstripe.Invoice{}, nil, billing.StripeError("combined proration invoice refresh failed", err)
+	}
+	if current.Status == "void" {
 		return billingstripe.Invoice{}, nil, billing.Internal(fmt.Sprintf(
-			"proration recovery: invoice %s item truth is invalid",
+			"proration recovery: invoice %s became VOID before finalize",
 			current.ID,
-		), err)
+		), nil)
 	}
 	if current.AmountDue != expectedTotalCents {
 		return billingstripe.Invoice{}, nil, billing.Internal(fmt.Sprintf(
-			"proration recovery: finalized invoice %s carries %d cents, expected frozen %d",
+			"proration recovery: draft %s carries %d cents, expected frozen %d",
 			current.ID, current.AmountDue, expectedTotalCents,
 		), nil)
 	}
-	return current, landed, nil
+	if current.Status != "draft" {
+		// A concurrent worker finalized the exact complete resource set.
+		return current, landed, nil
+	}
+	finalized, err := s.stripe.FinalizeInvoice(
+		ctx,
+		invoice.ID,
+		appProrationFinalizeIdemKey(attempt.AppID),
+	)
+	if err != nil {
+		return billingstripe.Invoice{}, nil, billing.StripeError("proration invoice finalize failed", err)
+	}
+	if finalized.Status == "draft" ||
+		finalized.Status == "void" ||
+		finalized.AmountDue != expectedTotalCents {
+		return billingstripe.Invoice{}, nil, billing.Internal(fmt.Sprintf(
+			"proration finalize returned invalid invoice %s status=%s amount_due=%d expected=%d",
+			finalized.ID, finalized.Status, finalized.AmountDue, expectedTotalCents,
+		), nil)
+	}
+	return finalized, landed, nil
 }
 
 // chargeCreationProrationFromWallet is ChargeCreationProration's credit-mode leg
@@ -1176,18 +1151,9 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 // cmd/billing-cycle log line + exit code.
 type SweepProrationsResult struct {
 	Pending int // apps past grace with an unarmed guard (the work list size)
-	Charged int // creation prorations SETTLED this sweep (wallet draws)
-	// Proposed is the charges this sweep SEALED AS INTENTS — the normal
-	// outcome for a Stripe-rail app now that this leg collects nothing.
-	//
-	// 🔴 It is not Skipped, and folding it in there was the reason for
-	// splitting it out: a sweep that bills twelve apps would have reported
-	// "charged 0, skipped 12", which reads as a quiet outage. Nor is it
-	// Charged: nothing was collected, and a tally that says otherwise is the
-	// same overstatement docs treat as a defect.
-	Proposed int
-	Skipped  int // legitimate no-charge outcomes (deleted / unactivated / no-PM / already / 0¢)
-	Failed   int // per-app errors (charge failures) — retried next sweep
+	Charged int // creation-proration invoices minted this sweep
+	Skipped int // legitimate no-charge outcomes (deleted / unactivated / no-PM / already / 0¢)
+	Failed  int // per-app errors (charge failures) — retried next sweep
 }
 
 // SweepCreationProrations charges the creation-period base for every app that has
@@ -1215,12 +1181,9 @@ func (s *Service) SweepCreationProrations(ctx context.Context, at time.Time) (*S
 			res.Failed++
 			continue
 		}
-		switch r.Status {
-		case ProrationStatusCharged, ProrationStatusWalletCharged:
+		if r.Status == ProrationStatusCharged || r.Status == ProrationStatusWalletCharged {
 			res.Charged++
-		case ProrationStatusProposed:
-			res.Proposed++
-		default:
+		} else {
 			res.Skipped++
 		}
 		slog.InfoContext(ctx, "creation-proration",
@@ -1242,11 +1205,16 @@ func appLineLabel(name string, appID uuid.UUID) string {
 	return fmt.Sprintf("%s (app %s)", name, appID)
 }
 
-// The draft→items→finalize idempotency keys (app-ii- / app-inv- / app-fin-)
-// were deleted with the calls that took them: this leg creates no draft,
-// attaches no line, and finalizes nothing. A charge sealed as an intent gets
-// its idempotency from the intent's own digest, and the one invoice this leg
-// still reads is found by appProrationChargeRef below, not minted under a key.
+// appProrationItemIdemKey / appProrationInvoiceIdemKey /
+// appProrationFinalizeIdemKey build the deterministic Stripe Idempotency-Keys
+// for the creation-proration charge's draft→items→finalize flow. The APP id is
+// the stable charge identity (each app prorates at most once — the one-shot
+// proration_invoice_id guard), so a re-attempt (a retried sweep after a crash
+// between the Stripe calls and the guard-arm) reuses the SAME Stripe objects
+// and can never double-charge even before the guard is armed.
+func appProrationItemIdemKey(appID uuid.UUID) string     { return "app-ii-" + appID.String() }
+func appProrationInvoiceIdemKey(appID uuid.UUID) string  { return "app-inv-" + appID.String() }
+func appProrationFinalizeIdemKey(appID uuid.UUID) string { return "app-fin-" + appID.String() }
 
 // appProrationChargeRef is the deterministic ms_charge_ref metadata anchor for
 // one app's combined creation invoice — what FindInvoiceByRef recovers by.

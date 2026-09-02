@@ -160,22 +160,6 @@ func (s *Service) StartCreditPurchase(ctx context.Context, req StartCreditPurcha
 	if req.AmountMicros < MinCreditPurchaseMicros || req.AmountMicros > MaxCreditPurchaseMicros {
 		return nil, InvalidInput("amount_micros must be between 5000000 and 5000000000")
 	}
-	// 🔴 A purchase must be a WHOLE NUMBER OF CENTS, because a card is charged
-	// in cents and this ledger is denominated in micros.
-	//
-	// Settlement checks that the rounded cents were paid and then credits the
-	// RAW micros (creditledger/settlement.go). For any amount that is not a
-	// whole cent those are two different numbers, and the difference — up to
-	// 4,999 micros, always in the payer's favour — is credit nobody paid for,
-	// repeatable per purchase. The bounds above are the only other check, and
-	// they do not constrain the sub-cent digits at all.
-	//
-	// Rejecting here rather than rounding: rounding would silently charge a
-	// number the caller did not ask for. This is caller error, so it fails
-	// closed and says so.
-	if req.AmountMicros%microsPerCent != 0 {
-		return nil, InvalidInput("amount_micros must be a whole number of cents (a multiple of 10000)")
-	}
 	if strings.TrimSpace(req.IdempotencyKey) == "" {
 		return nil, InvalidInput("idempotency_key required")
 	}
@@ -322,42 +306,8 @@ func (s *Service) FinishCreditPurchase(ctx context.Context, req FinishCreditPurc
 		return nil, NotFound("credit purchase not found")
 	}
 
-	// 🔴 A POSITIVE list, not a negative composite.
-	//
-	// Migration 057 widened this table's status vocabulary with 'proposed',
-	// and its header argues the change is safe because "every credit_ledger
-	// status comparison in the codebase is POSITIVE ... There is no <>, != or
-	// NOT IN on ledger status anywhere". That measurement was not true: this
-	// line was one of the counterexamples, and a 'proposed' purchase fell
-	// through it into reconciliation — which then reached the executor's
-	// unsupported-status error.
-	//
-	// Written positively so the next value added to the vocabulary is a
-	// compile-visible decision rather than a silent membership.
-	//
-	// 057's header is left as it stands: it is an APPLIED migration and this
-	// org's tooling hashes migration file content, so its bytes are not worth
-	// changing for a comment. Three negative comparisons existed when it was
-	// written — this one, creditpurchase/executor.go's unsupported-status
-	// guard, and creditledger/settlement.go:178. The third is left alone: it
-	// is keyed on a Stripe invoice id and a proposed purchase has no invoice,
-	// so nothing can reach it, and it fails closed if anything ever does.
-	//
-	// The lesson is not that 057's argument was wrong — it is right, and it is
-	// why the first two had to be fixed before this leg could route. The
-	// lesson is that its grep searched SQL and did not search Go.
-	needsReconcile := false
-	switch purchase.Status {
-	case "pending", "refunded":
-		needsReconcile = true
-	case "failed":
-		// A failure with no invoice never reached Stripe; there is nothing to
-		// reconcile against.
-		needsReconcile = purchase.StripeInvoiceID != ""
-	case "settled", "proposed":
-		// Terminal. 'proposed' means the intent rail owns this attempt.
-	}
-	if needsReconcile {
+	if purchase.Status != "settled" &&
+		(purchase.Status != "failed" || purchase.StripeInvoiceID != "") {
 		start, reconcileErr := s.resumeCreditPurchase(ctx, purchase)
 		if reconcileErr != nil {
 			return nil, reconcileErr
@@ -400,12 +350,6 @@ func (s *Service) SetAutoTopUp(ctx context.Context, req SetAutoTopUpRequest) (*S
 	}
 	if amount < MinCreditPurchaseMicros || amount > MaxCreditPurchaseMicros {
 		return nil, InvalidInput("amount_micros must be between 5000000 and 5000000000")
-	}
-	// Same whole-cent rule as StartCreditPurchase: this amount is what the
-	// top-up executor later charges, so a sub-cent value stored here would
-	// reach settlement on every single top-up rather than once.
-	if amount%microsPerCent != 0 {
-		return nil, InvalidInput("amount_micros must be a whole number of cents (a multiple of 10000)")
 	}
 	if req.Enabled && strings.TrimSpace(req.PaymentMethodID) == "" {
 		return nil, InvalidInput("payment_method_id required when auto top-up is enabled")
@@ -678,25 +622,6 @@ func validateCreditOwner(userID, orgID uuid.UUID) error {
 }
 
 func creditPurchaseStartResponse(purchase CreditPurchaseRow, invoice billingstripe.Invoice) *StartCreditPurchaseResponse {
-	// 🔴 A PROPOSED PURCHASE HAS NO RAIL BLOCK, and saying so is the point.
-	//
-	// The intent rail sealed this purchase and created no Stripe object, so
-	// there is no client secret and nothing to redirect to. Returning
-	// Stripe{ClientSecret: "", HostedInvoiceURL: ""} would be a lie in the
-	// shape of an answer: the field says "here is how to pay" and carries
-	// nothing that can pay.
-	//
-	// Omitting it makes a client that does not understand `status` fail SAFE —
-	// it finds no hosted URL, takes its existing no-checkout branch, and
-	// refreshes. A browser that does understand it polls.
-	if purchase.Status == "proposed" {
-		return &StartCreditPurchaseResponse{
-			PurchaseID: purchase.ID.String(),
-			Rail:       "stripe",
-			Status:     PurchaseStartProposed,
-		}
-	}
-
 	hostedURL := invoice.HostedInvoiceURL
 	if hostedURL == "" {
 		hostedURL = purchase.ReceiptURL
@@ -704,7 +629,6 @@ func creditPurchaseStartResponse(purchase CreditPurchaseRow, invoice billingstri
 	return &StartCreditPurchaseResponse{
 		PurchaseID: purchase.ID.String(),
 		Rail:       "stripe",
-		Status:     PurchaseStartReady,
 		Stripe: &StripePurchaseInit{
 			ClientSecret:     invoice.ClientSecret,
 			HostedInvoiceURL: hostedURL,

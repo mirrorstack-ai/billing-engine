@@ -40,7 +40,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -50,22 +49,17 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/legacyrestamp"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
-	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
-	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
-	intentstore "github.com/mirrorstack-ai/billing-engine/internal/intent/store"
-	"github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
-	"github.com/mirrorstack-ai/billing-engine/internal/shared/signing"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -351,7 +345,11 @@ func buildService() *cycle.Service {
 				rollout.ReadOnlySelectedAccess(controller),
 			))
 			coordinator := credit.NewCoordinator(counter, standingStore, projection, nil)
-			autoTopUpExecutor := autotopup.NewStandardExecutor(pool, stripeKey).WithSettlementObserver(coordinator)
+			autoTopUpExecutor := autotopup.NewExecutor(
+				autotopup.NewStore(pool),
+				creditledger.NewStore(pool),
+				billingstripe.NewAutoTopUpClient(stripeKey),
+			).WithSettlementObserver(coordinator)
 			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
 				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
 					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
@@ -377,136 +375,7 @@ func buildService() *cycle.Service {
 		svc.WithBoundaryEstimateReconciler(coordinator).
 			WithWalletMutationObserver(coordinator)
 	}
-	return withIntentCutover(svc, pool, os.Getenv(intentCutoverEnv))
-}
-
-// intentCutoverEnv arms the intent cutover for every leg that has one.
-//
-// It must be set to the literal string below. A flag whose truthiness is
-// inferred from "1", "true" or "yes" would let a typo in a deploy
-// template stop this worker collecting, and a worker that proposes
-// collects nothing at all.
-const (
-	intentCutoverEnv   = "BILLING_CYCLE_INTENT_CUTOVER"
-	intentCutoverArmed = "propose-do-not-collect"
-)
-
-// withIntentCutover attaches the proposer seam, or leaves the service on
-// the legacy collecting path.
-//
-// 🔴 Arming this STOPS THIS WORKER COLLECTING FOR NEW CHARGES. A
-// cut-over leg derives the same amount, seals it as an intent, stores it
-// and returns — and cmd/intent-executor, which holds the only write
-// port, refuses to start while any legacy money path remains. Nothing
-// downstream picks the intent up yet. So the flag's effect today is a
-// revenue stop, not a migration, and it exists to make the seam
-// REACHABLE rather than to be switched on.
-//
-// ⚠️ It is NOT "this worker collects nothing", and the difference is
-// load-bearing. Each leg takes its durable arming claim BEFORE the
-// proposer branch, and each leg's crash-recovery path runs BEFORE that
-// claim (domain_charges.go:100, overage.go:262). A row armed by a
-// legacy run that left a draft or finalized invoice at the provider is
-// therefore still completed after this flag is set.
-//
-// That is deliberate. Abandoning a finalized invoice would strand a
-// charge the customer can see and nobody can finish or prove. The
-// exception drains: once no row carries an unresolved charge-attempt
-// marker, the recovery path has nothing left to complete —
-// scripts/legacy-drop-preconditions.sql asks production exactly that
-// question, and it is one of the preconditions for deleting the
-// collectors.
-//
-// Until 2026-08-30 WithIntentProposer had no non-test caller at all: the
-// cutover branch in every leg was unreachable in production, and the two
-// legs described as "cut over" could not propose anything on a
-// deployed worker. That is the failure this function exists to make
-// impossible to repeat — the arming path is now exercised by a test
-// rather than asserted in a comment.
-func withIntentCutover(svc *cycle.Service, pool *pgxpool.Pool, flag string) *cycle.Service {
-	arm, err := intentCutoverDecision(flag)
-	if err != nil {
-		slog.Error("intent cutover flag is not a recognised value; refusing to start",
-			"env", intentCutoverEnv, "error", err)
-		os.Exit(1)
-	}
-	if !arm {
-		return svc
-	}
-	// 🔴 Arming the cutover now REQUIRES an evidence signing key.
-	//
-	// Sealing an intent is the first of docs/DESIGN.md:388's eight evidence
-	// events, and :398 makes an evidence record a durable side effect of the
-	// money moving rather than a report something chooses to render. A
-	// deployment that can seal charge documents but cannot record them
-	// produces documents the customer has no independent trace of, and no
-	// later reconciler can tell "never recorded" from "recorded and withheld".
-	//
-	// So this refuses to start rather than degrading. The alternative —
-	// proposing without evidence when the key is absent — is the silent-skip
-	// this design exists to remove, and it would be invisible: the legs would
-	// run, intents would appear, and the outbox would simply stay empty.
-	//
-	// The flag is unset in every environment today, so nothing changes until
-	// somebody deliberately arms it, which is exactly when they should be
-	// told a key is missing.
-	signer, err := signing.Load(os.Getenv)
-	if err != nil {
-		slog.Error("intent cutover is armed but the signing key material will not load; refusing to start",
-			"env", intentCutoverEnv, "error", err.Error())
-		os.Exit(1)
-	}
-	recorder, err := evidence.NewRecorder(signer, evidence.Options{
-		Issuer:      "billing-engine",
-		Audience:    "customer",
-		Environment: buildinfo.Current().Environment,
-		Now:         func() time.Time { return time.Now().UTC() },
-	})
-	if err != nil {
-		slog.Error("intent cutover is armed but this deployment cannot record evidence; refusing to start",
-			"env", intentCutoverEnv,
-			"needs", signing.EnvBillingEvidenceKey,
-			"why", "docs/DESIGN.md INV-014: an evidence record is a side effect of the money moving, not a report",
-			"error", err.Error())
-		os.Exit(1)
-	}
-
-	p, err := proposer.New(intentstore.New(pool), recorder, func() time.Time { return time.Now().UTC() })
-	if err != nil {
-		slog.Error("intent cutover is armed but the proposer will not construct; refusing to start",
-			"env", intentCutoverEnv, "error", err.Error())
-		os.Exit(1)
-	}
-
-	slog.Warn("INTENT CUTOVER ARMED — cut-over legs will propose sealed intents instead of charging",
-		"env", intentCutoverEnv,
-		"evidence_key", recorder != nil,
-		"exception", "in-flight legacy charges are still completed by each leg's crash-recovery path")
-	return svc.WithIntentProposer(p)
-}
-
-// errUnrecognisedCutoverFlag refuses a flag that is neither unset nor the
-// exact armed value.
-//
-// It refuses rather than defaulting to legacy on purpose. Defaulting
-// would make "BILLING_CYCLE_INTENT_CUTOVER=true" silently collect from
-// customers while an operator believed the worker was only proposing,
-// and a wrong belief about whether money is moving is worse than a
-// worker that will not start.
-var errUnrecognisedCutoverFlag = errors.New("unrecognised intent cutover flag")
-
-// intentCutoverDecision is the whole policy, as a pure function, so the
-// arming path can be exercised by a test instead of reasoned about.
-func intentCutoverDecision(flag string) (arm bool, err error) {
-	switch flag {
-	case "":
-		return false, nil
-	case intentCutoverArmed:
-		return true, nil
-	default:
-		return false, fmt.Errorf("%w: %q (expected %q or unset)",
-			errUnrecognisedCutoverFlag, flag, intentCutoverArmed)
-	}
+	return svc
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The

@@ -100,14 +100,11 @@ func TestRunBillingCycle_SpendCeilingAppliedToNettedArrears(t *testing.T) {
 	}
 	sc := newFakeStripe()
 
-	// allowance 1_000_000 → netted arrears 1_000_000 <= ceiling 1_500_000 → the
-	// gate passes and the boundary is sealed.
-	svc, p := chargeSvcProposing(store, sc)
-	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 1_000_000)
+	// allowance 1_000_000 → netted arrears 1_000_000 <= ceiling 1_500_000 → charge.
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 1_000_000)
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusProposed, resp.Status)
-	require.EqualValues(t, 1_000_000, proposedMicros(t, p))
-	require.Empty(t, sc.invoiceCalls)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Len(t, sc.invoiceCalls, 1)
 }
 
 // --- credit limit exceeded: tighten + persist + retain --------------------
@@ -156,7 +153,7 @@ func TestRunBillingCycle_DelinquencyTightensToPrepaid(t *testing.T) {
 
 // --- within limits, clean: charges as today -------------------------------
 
-func TestRunBillingCycle_ArrearsWithinLimitsProceeds(t *testing.T) {
+func TestRunBillingCycle_ArrearsWithinLimitsCharges(t *testing.T) {
 	store := newFakeStore()
 	store.chargedTotal = 1_000_000
 	store.hasPM = true
@@ -164,12 +161,10 @@ func TestRunBillingCycle_ArrearsWithinLimitsProceeds(t *testing.T) {
 	store.collection = cycle.AccountCollection{Mode: cycle.BillingModeArrears, CreditLimitMicros: 1_000_000_000}
 	sc := newFakeStripe()
 
-	svc, p := chargeSvcProposing(store, sc)
-	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	resp, err := chargeSvc(store, sc).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
 	require.NoError(t, err)
-	require.Equal(t, cycle.RunStatusProposed, resp.Status)
-	require.EqualValues(t, 1_000_000, proposedMicros(t, p))
-	require.Empty(t, sc.invoiceCalls)
+	require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+	require.Len(t, sc.invoiceCalls, 1)
 	require.Nil(t, store.updatedCollection, "no transition when within limits + clean")
 }
 

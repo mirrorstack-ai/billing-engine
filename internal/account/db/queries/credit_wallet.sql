@@ -485,10 +485,6 @@ SELECT
     charge_funding_account_id,
     charge_funding_generation,
     COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
-    -- The intent this purchase was sealed as, when the cutover is armed.
-    -- Empty on the legacy path. Without it a proposed purchase can report its
-    -- status and nobody can walk it to its document.
-    COALESCE(proposed_reference, '')::text AS proposed_reference,
     charge_funding_legacy_unresolved,
     created_at
 FROM ms_billing.credit_ledger
@@ -550,7 +546,6 @@ RETURNING
     charge_funding_account_id,
     charge_funding_generation,
     COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
-    COALESCE(proposed_reference, '')::text AS proposed_reference,
     charge_funding_legacy_unresolved,
     created_at;
 
@@ -671,29 +666,7 @@ RETURNING
     charge_funding_legacy_unresolved,
     created_at;
 
--- MarkCreditPurchaseProposed records that this purchase's charge was sealed as
--- an intent instead of collected. Terminal for the legacy rail.
---
--- proposed_reference is NOT NULL by the paired CHECK migration 057 added:
--- "a proposed row without its reference is a sealed obligation nobody can walk
--- to its document — the defect the custom-domain leg shipped with".
---
--- type = 'purchase' is load-bearing. credit_ledger carries auto-top-up attempts
--- in the same table under the same statuses, and this must not move one.
--- status = 'pending' is the first-write-wins guard: a row already settled,
--- failed or proposed does not move, and the caller sees zero rows rather than
--- a silent overwrite.
--- name: MarkCreditPurchaseProposed :one
-UPDATE ms_billing.credit_ledger
-SET status = 'proposed',
-    proposed_reference = sqlc.arg(proposed_reference)::text
-WHERE id = sqlc.arg(purchase_id)::uuid
-  AND account_id = sqlc.arg(account_id)::uuid
-  AND type = 'purchase'
-  AND status = 'pending'
-RETURNING id;
-
--- FinalizeCreditPurchase is the purchase's terminal-outcome transition.
+-- FinalizeCreditPurchase is the sole purchase status transition primitive.
 -- Only pending rows may move, and the target is constrained to the two terminal
 -- outcomes accepted by the RPC. Retrying a terminal result is a read through
 -- GetCreditPurchaseByID, never a second balance mutation.

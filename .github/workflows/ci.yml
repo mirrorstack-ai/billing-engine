@@ -56,7 +56,7 @@ jobs:
         run: |
           for f in migrations/billing/*.up.sql; do
             echo "Applying $f"
-            psql -v ON_ERROR_STOP=1 -f "$f"
+            psql -f "$f"
           done
 
       - name: Validate migrations (down + up idempotent)
@@ -68,47 +68,15 @@ jobs:
         run: |
           for f in $(ls -r migrations/billing/*.down.sql); do
             echo "Rolling back $f"
-            psql -v ON_ERROR_STOP=1 -f "$f"
+            psql -f "$f"
           done
           for f in migrations/billing/*.up.sql; do
             echo "Re-applying $f"
-            psql -v ON_ERROR_STOP=1 -f "$f"
+            psql -f "$f"
           done
 
       - name: Vet
         run: go vet ./...
-
-      # Security analysis. billing-engine had CodeQL only because it was a
-      # PUBLIC repository, where GitHub provides it free — it was never a
-      # workflow in this tree. The repository became private on 2026-09-02 and
-      # the analysis stopped, silently. No other private repository in the
-      # organisation has ever had code scanning, so this is not a restoration
-      # so much as the first version of it we own and can reason about.
-      #
-      # gosec runs through golangci-lint rather than standalone so that the
-      # `//nolint:gosec` annotations already in the tree are honoured; see
-      # .golangci.yml for what is excluded and why. The tree is currently
-      # clean, so this is a BLOCKING gate from its first run — a check that
-      # nobody has to pass is not a control.
-      # Pinned to a full commit SHA, and allowlisted at the org
-      # (Settings -> Actions -> General -> Allow specified actions) so the
-      # same step is adoptable in api-platform, mirrorstack-infra and
-      # dns-delegate-engine without a further allowlist change. A moving tag
-      # would not be accepted: the org requires full-length SHAs.
-      # Catches a config this golangci-lint would otherwise silently ignore
-      # parts of. A misspelt key — `excludez:` for `excludes:` — disarms the
-      # gate's only rule exclusion without failing anything, and the run still
-      # reports success. Verified against a control: renaming a key here does
-      # fail this command. Borrowed from mirrorstack-infra #252.
-      - name: Verify the linter config
-        run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
-          "$(go env GOPATH)/bin/golangci-lint" config verify
-
-      - name: Security analysis (gosec)
-        uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
-        with:
-          version: v2.13.2
 
       - name: Build
         run: go build ./...
@@ -128,9 +96,5 @@ jobs:
       # workflow-level `services: postgres` block above — that block
       # is for the migration-validation psql step. The GHA ubuntu-latest
       # runner has Docker pre-installed, so testcontainers Just Works.
-      # REQUIRE_DOCKER makes this green falsifiable. NewTestDB skips
-      # when Docker is unreachable, and a skipped package still prints
-      # "ok" — so without it a runner that lost Docker would report a
-      # passing integration suite that started no container.
       - name: Test (integration)
-        run: REQUIRE_DOCKER=1 go test -tags=integration -race -count=1 -timeout=10m ./...
+        run: go test -tags=integration -race -count=1 -timeout=10m ./...

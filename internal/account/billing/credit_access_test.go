@@ -74,7 +74,6 @@ func (s *fakeStore) creditWalletCallCount() int {
 		s.creditPurchaseReads +
 		s.creditPurchaseAttaches +
 		s.creditPurchaseFinalizes +
-		s.creditPurchaseProposes +
 		s.creditAutoTopUpWrites +
 		s.creditGateSnapshotReads +
 		s.creditBillingModeWrites +

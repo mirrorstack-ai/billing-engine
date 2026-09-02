@@ -19,7 +19,7 @@ WHERE a.id = (
     SELECT e.account_id
     FROM ms_billing.usage_events e
     WHERE e.app_id = $1 AND e.account_id IS NOT NULL
-    ORDER BY COALESCE(e.billable_at, e.recorded_at) DESC
+    ORDER BY e.recorded_at DESC
     LIMIT 1
 )
 `
@@ -40,39 +40,19 @@ func (q *Queries) AppAccountActivatedAt(ctx context.Context, appID string) (pgty
 }
 
 const appPeriodSpendMicros = `-- name: AppPeriodSpendMicros :one
-WITH base_events AS (
-    SELECT
-        module_id, metric, aggregation_key, subject,
-        COALESCE(model, '') AS model,
-        COALESCE(module_version, '') AS module_version,
-        value
-    FROM ms_billing.usage_events
-    WHERE app_id = $1
-      AND COALESCE(billable_at, recorded_at) >= $2
-      AND COALESCE(billable_at, recorded_at) <  $3
-),
-billable_events AS (
-    SELECT module_id, metric, model, module_version, value AS billable_value
-    FROM base_events
-    WHERE aggregation_key IS DISTINCT FROM 'subject'
-    UNION ALL
-    SELECT
-        module_id, metric, model, module_version,
-        MAX(value)::numeric AS billable_value
-    FROM base_events
-    WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, model, module_version, subject
-)
-SELECT COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
-FROM billable_events e
+SELECT COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM ms_billing.usage_events e
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric
+WHERE e.app_id = $1
+  AND e.recorded_at >= $2
+  AND e.recorded_at <  $3
 `
 
 type AppPeriodSpendMicrosParams struct {
-	AppID        string             `json:"app_id"`
-	BillableAt   pgtype.Timestamptz `json:"billable_at"`
-	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+	AppID        string    `json:"app_id"`
+	RecordedAt   time.Time `json:"recorded_at"`
+	RecordedAt_2 time.Time `json:"recorded_at_2"`
 }
 
 // AppPeriodSpendMicros sums the app's current-period spend in micro-dollars:
@@ -83,7 +63,7 @@ type AppPeriodSpendMicrosParams struct {
 // single-rounding-point helper CurrentPeriodUsage uses). This is the SAME
 // spend window GetUsageSummary shows the user (current calendar month).
 func (q *Queries) AppPeriodSpendMicros(ctx context.Context, arg AppPeriodSpendMicrosParams) (pgtype.Numeric, error) {
-	row := q.db.QueryRow(ctx, appPeriodSpendMicros, arg.AppID, arg.BillableAt, arg.BillableAt_2)
+	row := q.db.QueryRow(ctx, appPeriodSpendMicros, arg.AppID, arg.RecordedAt, arg.RecordedAt_2)
 	var total_raw_cost_micros pgtype.Numeric
 	err := row.Scan(&total_raw_cost_micros)
 	return total_raw_cost_micros, err

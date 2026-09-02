@@ -42,25 +42,6 @@ WHERE owner_kind = 'user' AND owner_user_id = $1;
 -- name: AccountActivatedAt :one
 SELECT activated_at FROM ms_billing.accounts WHERE id = $1;
 
--- RewindowAccountV2UsageAtActivation folds pending v2 observations from an
--- unactivated account's provisional calendar window into its first funded
--- anchor window. Unactivated rollup intentionally excludes observation_version
--- 2, even when it closes the legacy calendar period, so these rows remain safe
--- to move after that rollup. The activation writer holds the account row UPDATE
--- lock, while ingest and rollup take FOR SHARE, so this sees every admission
--- that committed first and finishes before a later admission derives the new
--- anchor.
--- name: RewindowAccountV2UsageAtActivation :execrows
-UPDATE ms_billing.usage_events event
-SET billable_at = GREATEST(event.occurred_at, @first_funded_start::timestamptz),
-    occurrence_policy = CASE
-        WHEN event.occurred_at < @first_funded_start::timestamptz
-        THEN 'first_funded'
-        ELSE event.occurrence_policy
-    END
-WHERE event.account_id = @account_id::uuid
-  AND event.observation_version = 2;
-
 -- HasUsablePaymentMethod is the hot-path Ensure predicate: at least one
 -- active (not soft-deleted) and not-expired mirror row on the account.
 -- name: HasUsablePaymentMethod :one

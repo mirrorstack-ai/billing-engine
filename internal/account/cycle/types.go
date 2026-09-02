@@ -36,7 +36,6 @@ package cycle
 
 import (
 	"github.com/google/uuid"
-	"time"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
@@ -44,9 +43,6 @@ import (
 // Kind aliases usage.Kind so the cycle package speaks the same accumulation
 // vocabulary as the ingest path without re-declaring the four constants.
 type Kind = usage.Kind
-
-// AggregationKey aliases the catalog-owned usage aggregation identity.
-type AggregationKey = usage.AggregationKey
 
 // Visibility aliases usage.Visibility (the developer margin-share class).
 type Visibility = usage.Visibility
@@ -91,9 +87,8 @@ type MetricAggregate struct {
 	// Purely reporting — it never affects price — but it is part of the
 	// usage_aggregates idempotency key so two versions on one metric are
 	// distinct billable rows, exactly like two models are distinct under 018.
-	ModuleVersion  string
-	Kind           Kind
-	AggregationKey AggregationKey
+	ModuleVersion string
+	Kind          Kind
 
 	// BillableQuantity is the per-kind aggregate (count/sum → SUM, peak → MAX,
 	// time_weighted → integral). Carried as the exact NUMERIC string so the
@@ -191,19 +186,6 @@ const (
 	// arrears netted below it). The usage is RETAINED. Distinct from
 	// RunStatusSkippedPrepaid so the skip reason is unambiguous in the audit trail.
 	RunStatusSkippedCeiling BillingRunStatus = "skipped_ceiling"
-
-	// RunStatusProposed: the intent cutover was armed, so this run's charge
-	// was SEALED AS INTENTS and nothing was collected.
-	//
-	// Terminal for this worker and distinct from every other outcome on
-	// purpose. It is not 'invoiced' — no invoice exists and no money moved —
-	// and it is not 'failed'. Recording it as either would corrupt the
-	// measurement the legacy drop depends on:
-	// scripts/legacy-drop-preconditions.sql asks whether any boundary run is
-	// still in flight, and a proposed run reading as 'pending' would block the
-	// drop forever while one reading as 'invoiced' would claim money was
-	// collected that never was.
-	RunStatusProposed BillingRunStatus = "proposed"
 )
 
 // chargeCurrency is the Stripe charge currency. Fixed to usd for v1 (matching
@@ -271,13 +253,6 @@ type ChargeSummary struct {
 	// StripeInvoiceID is the created Stripe invoice id, empty when no charge
 	// happened (zero arrears or skipped_no_pm).
 	StripeInvoiceID string
-	// ProposedDigests are the intents this run's charge was sealed as, when
-	// the intent cutover was armed. Empty on the legacy path.
-	//
-	// The link from a legacy run to the intents that replaced its charge is
-	// what makes the cutover auditable in both directions — from the row to
-	// the documents, and from a document back to the row that caused it.
-	ProposedDigests []string
 }
 
 // CreditBillingMode is the universal-wallet billing mode stored in
@@ -313,19 +288,3 @@ type WalletCreditState struct {
 	SpendableBalanceMicros int64
 	PeriodDrawnMicros      int64
 }
-
-// executionWindow is how long a proposed charge stays collectable.
-//
-// It is a property of the EXECUTION, not of what is being billed for. The
-// window docs/DESIGN.md §4 checks answers "is it still reasonable to take
-// this money", and the answer stops being yes some time after the charge was
-// derived — not at the end of the period the charge covers.
-//
-// Two shipped legs sealed the coverage window here instead, which made every
-// intent they produced dead on arrival: the leg runs at or after the period
-// boundary, so the window had already closed when the document was sealed.
-//
-// Thirty days is chosen to be longer than any retry or backlog this engine
-// has, and short enough that a charge nobody collected stops being collectable
-// rather than surfacing months later on a customer's card.
-const executionWindow = 30 * 24 * time.Hour

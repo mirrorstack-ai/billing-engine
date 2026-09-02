@@ -40,33 +40,13 @@ WHERE scope = $1 AND scope_id = $2;
 -- single-rounding-point helper CurrentPeriodUsage uses). This is the SAME
 -- spend window GetUsageSummary shows the user (current calendar month).
 -- name: AppPeriodSpendMicros :one
-WITH base_events AS (
-    SELECT
-        module_id, metric, aggregation_key, subject,
-        COALESCE(model, '') AS model,
-        COALESCE(module_version, '') AS module_version,
-        value
-    FROM ms_billing.usage_events
-    WHERE app_id = $1
-      AND COALESCE(billable_at, recorded_at) >= $2
-      AND COALESCE(billable_at, recorded_at) <  $3
-),
-billable_events AS (
-    SELECT module_id, metric, model, module_version, value AS billable_value
-    FROM base_events
-    WHERE aggregation_key IS DISTINCT FROM 'subject'
-    UNION ALL
-    SELECT
-        module_id, metric, model, module_version,
-        MAX(value)::numeric AS billable_value
-    FROM base_events
-    WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, model, module_version, subject
-)
-SELECT COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
-FROM billable_events e
+SELECT COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM ms_billing.usage_events e
 LEFT JOIN ms_billing.metric_definitions md
-    ON md.module_id = e.module_id AND md.metric = e.metric;
+    ON md.module_id = e.module_id AND md.metric = e.metric
+WHERE e.app_id = $1
+  AND e.recorded_at >= $2
+  AND e.recorded_at <  $3;
 
 -- AppAccountActivatedAt resolves the billing-period ANCHOR (migration 025) for an
 -- APP-scoped budget: the payer account's activated_at, found via the app's own
@@ -83,7 +63,7 @@ WHERE a.id = (
     SELECT e.account_id
     FROM ms_billing.usage_events e
     WHERE e.app_id = $1 AND e.account_id IS NOT NULL
-    ORDER BY COALESCE(e.billable_at, e.recorded_at) DESC
+    ORDER BY e.recorded_at DESC
     LIMIT 1
 );
 

@@ -44,7 +44,6 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/budget"
-	"github.com/mirrorstack-ai/billing-engine/internal/account/capabilities"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
@@ -54,7 +53,6 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
-	"github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/httputil"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -88,17 +86,6 @@ type dispatcher struct {
 
 func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload json.RawMessage) (any, error) {
 	switch action {
-	// Capabilities reports what this deployment can do and what it has
-	// not yet stopped doing. docs/VERIFICATION.md §2 records that the
-	// action table had no case for it, and makes legacyMoneyPaths the
-	// field the intent-only claim rests on.
-	//
-	// It takes no request payload and reads nothing, so it needs no
-	// account context — it is a statement about the build, not about a
-	// customer.
-	case "Capabilities":
-		return capabilities.Current(), nil
-
 	case "Ensure":
 		var req billing.EnsureRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -459,8 +446,6 @@ func httpStatusForError(err error) int {
 		switch be.Code {
 		case billing.CodeInvalidInput:
 			return http.StatusBadRequest
-		case billing.CodeConflict:
-			return http.StatusConflict
 		case billing.CodePaymentRequired:
 			return http.StatusPaymentRequired
 		case billing.CodeNotFound:
@@ -530,7 +515,11 @@ func buildDispatcher() *dispatcher {
 		creditledger.NewStore(pool),
 		billingstripe.NewCreditPurchaseClient(stripeKey),
 	)
-	autoTopUpExecutor := autotopup.NewStandardExecutor(pool, stripeKey)
+	autoTopUpExecutor := autotopup.NewExecutor(
+		autotopup.NewStore(pool),
+		creditledger.NewStore(pool),
+		billingstripe.NewAutoTopUpClient(stripeKey),
+	)
 	recoveryCapability := creditrecovery.NewRuntimeCapability(
 		func(ctx context.Context) (bool, error) {
 			return config.CreditRecoverySchemaReady(ctx, pool)
@@ -661,12 +650,6 @@ func buildRouter(d *dispatcher) *chi.Mux {
 	internalSecret := os.Getenv("INTERNAL_SECRET")
 	r.Group(func(r chi.Router) {
 		r.Use(auth.InternalSecret(internalSecret))
-		// Capabilities reports the build and how many legacy money
-		// paths remain. It was reachable only through the Lambda
-		// dispatcher until now, which meant the local HTTP mode could
-		// not answer the question docs/VERIFICATION.md §2 makes the
-		// intent-only claim rest on.
-		r.Post("/v1/billing.Capabilities", makeHTTPHandler(d, "Capabilities"))
 		r.Post("/v1/billing.Ensure", makeHTTPHandler(d, "Ensure"))
 		r.Post("/v1/billing.PrepareAddPaymentMethod", makeHTTPHandler(d, "PrepareAddPaymentMethod"))
 		r.Post("/v1/billing.StartAddPaymentMethod", makeHTTPHandler(d, "StartAddPaymentMethod"))
@@ -797,36 +780,10 @@ func buildRouter(d *dispatcher) *chi.Mux {
 	return r
 }
 
-// health answers the one unauthenticated route.
-//
-// docs/VERIFICATION.md §2: "You cannot tie a charge to a revision of
-// this repository until the running service says which revision it is",
-// and Health "must return the same identity fields whether the service
-// is healthy or not. A binary that hides its build while it is sick
-// hides it when that matters most."
-//
-// So the identity is written unconditionally, and the status is a field
-// beside it rather than a gate in front of it. The fields carry no
-// secret: a commit, an artifact name, a binary role and an environment
-// label.
 func health(w http.ResponseWriter, _ *http.Request) {
-	body, err := json.Marshal(struct {
-		Status string         `json:"status"`
-		Build  buildinfo.Info `json:"build"`
-	}{
-		Status: "ok",
-		Build:  buildinfo.Current(),
-	})
 	w.Header().Set("Content-Type", "application/json")
-	if err != nil {
-		// Marshalling a struct of strings cannot fail, but if it ever
-		// does the route must still answer something well-formed.
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"status":"error"}`))
-		return
-	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
 func requestLogger(next http.Handler) http.Handler {
@@ -902,17 +859,7 @@ func main() {
 	}
 	port := config.Port("ACCOUNT_API_PORT", "8091")
 	slog.Info("account-api starting", "port", port, "mode", "http-local")
-	// An explicit Server rather than ListenAndServe: the package-level helper
-	// sets no timeouts at all, so a client that opens a connection and never
-	// finishes its headers holds a goroutine indefinitely. This path is
-	// local-development only — production runs on Lambda — but a dev server
-	// with no read deadline is still the wrong default to leave lying around.
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           buildRouter(disp),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	if err := srv.ListenAndServe(); err != nil {
+	if err := http.ListenAndServe(":"+port, buildRouter(disp)); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}

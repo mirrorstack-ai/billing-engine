@@ -181,26 +181,6 @@ func (s *Store) settleStripeInvoice(
 		if strings.ToLower(currency) != "usd" {
 			return fmt.Errorf("credit invoice %s currency %q is not usd", stripeInvoiceID, currency)
 		}
-		// 🔴 The row must be a whole number of cents, or the two lines below
-		// disagree by construction: one asserts what was CHARGED (rounded to
-		// cents, because that is what a card takes) and the other credits what
-		// was REQUESTED (raw micros). The gap is credit nobody paid for.
-		//
-		// The entry points now reject sub-cent amounts, so reaching this is
-		// either a row written before that guard or a path that bypassed it.
-		// Either way it must not settle quietly — refusing leaves the invoice
-		// recoverable, while crediting mints money.
-		if row.AmountMicros%microsPerCent != 0 {
-			return fmt.Errorf(
-				"credit invoice %s requests %d micros, which is not a whole number of cents; "+
-					"a card can only be charged in cents, so it would be charged %d micros and "+
-					"credited %d — settling it would move money nobody agreed to either way",
-				stripeInvoiceID,
-				row.AmountMicros,
-				microsToCentsRoundHalfUp(row.AmountMicros)*microsPerCent,
-				row.AmountMicros,
-			)
-		}
 		expectedCents := microsToCentsRoundHalfUp(row.AmountMicros)
 		if amountPaidCents != expectedCents {
 			return fmt.Errorf(

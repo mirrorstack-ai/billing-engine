@@ -2,9 +2,14 @@ package billing
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
+	stripego "github.com/stripe/stripe-go/v85"
+
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 // ============================================================================
@@ -15,14 +20,13 @@ import (
 // ListUnpaidInvoices feeds the web-account post-card-bind "pay N unpaid
 // invoices ($X)?" prompt and the invoices table's Pay affordance: count +
 // total + the rows, over the SAME unpaid predicate GetServiceStatus's gate 4
-// blocks on (open/uncollectible mirror rows with amount_due > 0).
+// blocks on (open/uncollectible mirror rows with amount_due > 0) — paying
+// them down through PayInvoice is the unblock-recovery flow.
 //
-// PayInvoice used to collect: it paid ONE open Stripe invoice with the owner's
-// default card, through an UNKEYED Invoices.Pay. That collector is DELETED.
-// PayInvoice now proposes a receivable against the intent the rail raised the
-// invoice from and moves no money at all, so nothing in this file reaches the
-// provider. The webhook remains the policy writer for relax/notify and
-// ever_failed, and still settles the mirror however an invoice gets paid.
+// PayInvoice pays ONE open Stripe invoice with the owner's default card and
+// applies Stripe's returned post-pay snapshot through the same monotonic guard
+// the webhook uses. The webhook remains the policy writer for relax/notify and
+// ever_failed; its later status re-apply is idempotent.
 // ============================================================================
 
 // ListUnpaidInvoicesRequest is the payload of ListUnpaidInvoices: the owner
@@ -107,42 +111,43 @@ type PayInvoiceRequest struct {
 	InvoiceID   uuid.UUID `json:"invoice_id"`
 }
 
-// PayInvoiceResponse reports what happened to the unpaid row: "proposed" when
-// a receivable was sealed for the remainder (the only outcome that advances
-// anything — the obligation is recorded and NO money moved), and "paid" for
-// the idempotent echo of a mirror row the webhook already settled.
-//
-// "pending" is gone with the collector that produced it: nothing here asks a
-// provider to charge a card any more, so there is no in-flight payment to
-// report.
+// PayInvoiceResponse reports Stripe's post-pay invoice state: "paid" when the
+// charge settled synchronously, "pending" when Stripe accepted the pay but
+// the payment is still processing (e.g. asynchronous payment methods). Either
+// way the returned snapshot is synchronously applied to the mirror; on the
+// paid path, the client's first refetch can observe the settled state.
 type PayInvoiceResponse struct {
 	Status string `json:"status"`
-	// IntentDigest is the receivable this retry was sealed as. Omitted from
-	// the wire on the "paid" echo, where nothing was sealed, so an existing
-	// client sees exactly the response it saw before.
-	IntentDigest string `json:"intent_digest,omitempty"`
 }
 
-// PayInvoice records what the owner still owes on one unpaid invoice as a
-// sealed receivable:
+// PayInvoice pays one unpaid Stripe invoice with the owner's default card:
 //
 //  1. resolve the owner's account and the mirror row scoped to it — a foreign
 //     or unknown invoice_id is NOT_FOUND (never leaking existence, matching
 //     the payment-method ownership gates);
 //  2. an already-'paid' mirror row short-circuits to {"status":"paid"} — the
-//     retry-after-success path stays idempotent, and needs no proposer since
-//     there is nothing left to collect; any other non-payable state
-//     (draft/void) is INVALID_INPUT;
-//  3. propose a receivable for the remainder, linked to the intent the rail
-//     raised this invoice from.
+//     retry-after-success path stays idempotent without a Stripe call;
+//     any other non-payable state (draft/void) is INVALID_INPUT;
+//  3. require a usable default card on the FUNDING account (the sponsor hop
+//     for sponsor-funded orgs — Stripe collects from the invoice customer's
+//     default PM, which lives there) — else PAYMENT_REQUIRED;
+//  4. verify the Stripe invoice's customer IS the pay-time funding account's
+//     customer — the invoice's payer was frozen at creation, so an org
+//     funding-designation switch since then would otherwise charge the
+//     PREVIOUS funding account's card behind a gate that checked the new
+//     one; a mismatch is INVALID_INPUT, never a silent stale charge;
+//  5. pay via Stripe with NO idempotency key: Stripe replays a keyed
+//     response — a decline included — for ~24h, which would dead-end the
+//     fix-card-then-retry recovery this RPC exists for. Double-pay safety is
+//     resource-level instead: the mirror 'paid' short-circuit (step 2)
+//     absorbs the client double-tap, and a concurrent double-submit loses to
+//     Stripe's invoice_already_paid, absorbed as {"status":"paid"}. Card
+//     declines map to PAYMENT_REQUIRED (a 402 the UI renders as a payment
+//     problem), never STRIPE_ERROR (a 502 that reads as a Stripe outage).
 //
-// The funding-account hop, the usable-card gate, the frozen-customer
-// coherence read and the Invoices.Pay call that used to follow are DELETED.
-// They are not missing gates: every one of them existed to choose a Stripe
-// customer and a card for a collection this leg no longer performs, which is
-// why the proposal already sat in front of them before the cutover. A
-// proposal moves no money, and the payer is resolved by the proposer from the
-// account rather than chosen here.
+// After Stripe succeeds, its returned snapshot is applied synchronously through
+// the webhook's monotonic status guard. A later invoice.paid webhook re-apply is
+// idempotent and still owns policy side effects (relax/notify/ever_failed).
 func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayInvoiceResponse, error) {
 	if err := validateOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
 		return nil, err
@@ -175,61 +180,129 @@ func (s *Service) PayInvoice(ctx context.Context, req PayInvoiceRequest) (*PayIn
 		return nil, InvalidInput("invoice is not payable")
 	}
 
-	// 🔴 THIS LEG IS CUT OVER. There is no second branch.
-	//
-	// The proposer is no longer optional, and this is NOT the old
-	// fall-through nil check: there is nothing left to fall through to. An
-	// unarmed service cannot answer this RPC at all, and has to say so rather
-	// than nil-panic at the seal. It is checked HERE rather than at the top
-	// of the function so the two answers that need no collector — the
-	// ownership NOT_FOUND and the already-'paid' echo — keep working
-	// unchanged on a service that was never armed.
-	if s.proposer == nil {
-		return nil, Internal("PayInvoice requires an intent proposer: the legacy collect path is deleted", nil)
+	if target.FundingLegacyUnresolved || target.ChargeFundingAccountID == uuid.Nil {
+		return nil, InvalidInput("invoice funding account is unresolved — contact support")
 	}
-	sourceDigest, found, err := s.proposer.SourceIntentFor(ctx, target.StripeInvoiceID)
+	fundingID := target.ChargeFundingAccountID
+	hasPM, err := s.store.HasUsableDefaultPM(ctx, fundingID)
 	if err != nil {
-		return nil, Internal("source intent lookup failed", err)
+		return nil, Internal("usable PM check failed", err)
 	}
-	if !found {
-		// 🔴 §6's collect_receivable is CollectRemainderOf(source): it links
-		// to a SOURCE INTENT and collects what is left of it, so an invoice
-		// the rail never raised has nothing to collect the remainder OF.
-		//
-		// This deliberately does NOT keep a provider path, and it is not the
-		// in-flight case the other legs keep one for. Such an invoice is at
-		// REST, not mid-flight: finalized, open or uncollectible, amount_due
-		// > 0, and mirrored. Nothing is ambiguous about whether money moved —
-		// it demonstrably did not — so refusing strands no charge that nobody
-		// can prove. The debt also stays payable without us: the finalization
-		// webhook stores hosted_invoice_url (migration 026) and invoice.paid
-		// settles the mirror however the customer pays.
-		//
-		// Both alternatives are worse than refusing. Proposing with an empty
-		// source would fabricate the link §6 requires. Keeping Invoices.Pay
-		// for these rows would carry the one UNKEYED collector in the tree
-		// past the cutover — the exact property the intent path's keyed,
-		// instrument-named collect exists to remove — on a set that is only
-		// finite because no leg raises invoices outside the rail any more.
-		//
-		// The set therefore DRAINS: once every leg raises through the rail, a
-		// settlement records which provider object it moved through
-		// (migration 069) and SourceIntentFor finds it. What is left is the
-		// pre-rail backlog, and its size is a production QUESTION, not a code
-		// one — scripts/legacy-drop-preconditions.sql check 7 counts it and
-		// deliberately answers REVIEW rather than READY, because each of those
-		// rows needs a replacement intent before this refusal is harmless.
-		return nil, InvalidInput("invoice predates the receivable rail and cannot be retried here — pay it from the invoice link, or contact support")
+	if !hasPM {
+		return nil, PaymentRequired("no usable payment card on file; add a card before paying")
 	}
-	digest, err := s.proposer.ProposeReceivable(
-		ctx, sourceDigest, accountID.String(), target.AmountDueMicros)
+
+	// Gate/charge coherence: Stripe collects from the invoice's immutable
+	// Customer, so use the exact funder persisted with that invoice rather than
+	// following the owner's mutable current designation.
+	fundingCustomer, err := s.store.AccountStripeCustomer(ctx, fundingID)
 	if err != nil {
-		return nil, Internal("receivable proposal failed", err)
+		return nil, Internal("funding customer lookup failed", err)
 	}
-	// Not "paid" and not "pending". The obligation is recorded and
-	// nothing was collected; reporting either would claim a payment
-	// attempt that did not happen.
-	return &PayInvoiceResponse{Status: "proposed", IntentDigest: digest}, nil
+	stripeInv, err := s.stripe.GetInvoice(ctx, target.StripeInvoiceID)
+	if err != nil {
+		return nil, StripeError("invoice lookup failed", err)
+	}
+	if fundingCustomer == "" || stripeInv.CustomerID != fundingCustomer {
+		return nil, InvalidInput("invoice belongs to a previous funding account — contact support")
+	}
+
+	// The mirror usable-PM gate can pass while Stripe's Customer has no actual
+	// invoice-settings default; Invoices.Pay would then fail as a non-card
+	// invalid request and surface as a misleading 502. Refuse deterministically
+	// as PAYMENT_REQUIRED before any payment attempt.
+	cust, err := s.stripe.GetCustomer(ctx, fundingCustomer)
+	if err != nil {
+		return nil, StripeError("customer lookup failed", err)
+	}
+	if cust.InvoiceSettings == nil || cust.InvoiceSettings.DefaultPaymentMethod == nil ||
+		cust.InvoiceSettings.DefaultPaymentMethod.ID == "" {
+		return nil, PaymentRequired("no default payment method on file; re-add or set a default card")
+	}
+
+	inv, err := s.stripe.PayInvoice(ctx, target.StripeInvoiceID)
+	if err != nil {
+		return s.payFailure(ctx, target.StripeInvoiceID, err)
+	}
+	// Settle the mirror NOW from Stripe's returned snapshot so the first
+	// post-pay refetch reads 'paid' (core#162 — the webhook's later
+	// invoice.paid re-apply is an idempotent no-op via the monotonic
+	// guard's identical-re-apply branch; relax/notify still run there).
+	s.syncPaidMirror(ctx, inv)
+	status := "pending"
+	if inv.Status == "paid" {
+		status = "paid"
+	}
+	return &PayInvoiceResponse{Status: status}, nil
+}
+
+// syncPaidMirror applies a post-pay Stripe invoice snapshot onto the mirror
+// through the webhook's monotonic status guard, so the first post-pay refetch
+// reads the settled status instead of the still-open row's Failed badge
+// (core#162 — the webhook's later invoice.paid re-apply is idempotent; it still
+// owns policy side effects like relax/notify/ever_failed). Best-effort by
+// contract: the money already moved, so a mirror miss must NEVER fail the RPC —
+// the webhook settles the row seconds later regardless. Both a store error and a
+// guard no-op (applied=false: no mirror row, or a transition the guard rejected)
+// are logged, since on the pay path the row provably exists (InvoiceForPayment
+// just read it) and 'paid' outranks open/uncollectible, so a no-op is unexpected.
+func (s *Service) syncPaidMirror(ctx context.Context, inv billingstripe.Invoice) {
+	switch applied, err := s.store.SyncInvoiceMirror(ctx, inv); {
+	case err != nil:
+		slog.WarnContext(ctx, "PayInvoice mirror sync failed; webhook will settle",
+			"stripe_invoice_id", inv.ID, "error", err)
+	case !applied:
+		slog.WarnContext(ctx, "PayInvoice mirror sync not applied; webhook will settle",
+			"stripe_invoice_id", inv.ID)
+	}
+}
+
+// payFailure maps a failed Stripe Invoices.Pay to the RPC surface. Declines
+// and off-session 3DS challenges are the USER's card problem — mapped to
+// PAYMENT_REQUIRED (402, which web-account's pay path renders as a payment
+// problem), never STRIPE_ERROR (502, indistinguishable from a Stripe outage).
+// The invoice_already_paid loser — a concurrent double-submit, OR an invoice
+// settled out-of-band during the webhook-lag window (the hosted invoice page one
+// click from the same row, a second org payer, the Stripe dashboard) — is
+// absorbed as the same {"status":"paid"} echo the winner got, not an error.
+func (s *Service) payFailure(ctx context.Context, stripeInvoiceID string, err error) (*PayInvoiceResponse, error) {
+	var se *stripego.Error
+	if !errors.As(err, &se) {
+		return nil, StripeError("pay invoice failed", err)
+	}
+	// Not in v85's generated ErrorCode enum; match Stripe's wire string.
+	if se.Code == "invoice_already_paid" {
+		// The money is in, but THIS request never ran the success-path sync, so
+		// the mirror can still be open+ever_failed → the first post-pay refetch
+		// renders Failed under the success snackbar (core#162). Re-read the
+		// now-settled snapshot and sync it before echoing paid; best-effort like
+		// the success path (the pure double-submit case is already settled by the
+		// winner, so this re-apply is an idempotent no-op there).
+		if inv, gerr := s.stripe.GetInvoice(ctx, stripeInvoiceID); gerr != nil {
+			slog.WarnContext(ctx, "PayInvoice already-paid re-read failed; webhook will settle",
+				"stripe_invoice_id", stripeInvoiceID, "error", gerr)
+		} else {
+			s.syncPaidMirror(ctx, inv)
+		}
+		return &PayInvoiceResponse{Status: "paid"}, nil
+	}
+	if se.Type == stripego.ErrorTypeCard || se.DeclineCode != "" {
+		// Prefer the issuer's decline reason; fall back to the error code
+		// (e.g. expired_card arrives without a decline_code).
+		reason := string(se.DeclineCode)
+		if reason == "" {
+			reason = string(se.Code)
+		}
+		if reason == "" {
+			reason = "card_declined"
+		}
+		return nil, PaymentRequired("card declined: " + reason)
+	}
+	if se.Code == stripego.ErrorCodeInvoicePaymentIntentRequiresAction {
+		// Off-session 3DS challenge — the card needs the user, not Stripe.
+		return nil, PaymentRequired("card declined: authentication_required")
+	}
+	return nil, StripeError("pay invoice failed", err)
 }
 
 // invoiceOwnerAccount resolves the account whose invoices the (user XOR org)

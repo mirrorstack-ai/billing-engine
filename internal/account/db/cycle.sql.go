@@ -150,8 +150,8 @@ const accountsWithUsageEvents = `-- name: AccountsWithUsageEvents :many
 SELECT DISTINCT account_id::uuid AS account_id
 FROM ms_billing.usage_events
 WHERE account_id  IS NOT NULL
-  AND COALESCE(billable_at, recorded_at) >= $1
-  AND COALESCE(billable_at, recorded_at) <  $2
+  AND recorded_at >= $1
+  AND recorded_at <  $2
   AND NOT EXISTS (
       SELECT 1
       FROM ms_billing.accounts a
@@ -162,8 +162,8 @@ WHERE account_id  IS NOT NULL
 `
 
 type AccountsWithUsageEventsParams struct {
-	BillableAt   pgtype.Timestamptz `json:"billable_at"`
-	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+	RecordedAt   time.Time `json:"recorded_at"`
+	RecordedAt_2 time.Time `json:"recorded_at_2"`
 }
 
 // AccountsWithUsageEvents returns the distinct accounts with at least one raw
@@ -176,7 +176,7 @@ type AccountsWithUsageEventsParams struct {
 // [start, end): recorded_at >= start AND recorded_at < end, matching the rollup
 // SELECTs in rollup.sql.
 func (q *Queries) AccountsWithUsageEvents(ctx context.Context, arg AccountsWithUsageEventsParams) ([]string, error) {
-	rows, err := q.db.Query(ctx, accountsWithUsageEvents, arg.BillableAt, arg.BillableAt_2)
+	rows, err := q.db.Query(ctx, accountsWithUsageEvents, arg.RecordedAt, arg.RecordedAt_2)
 	if err != nil {
 		return nil, err
 	}
@@ -530,27 +530,6 @@ func (q *Queries) LockBillingRunFundingArm(ctx context.Context, id string) (Lock
 	return i, err
 }
 
-const markBillingPeriodInvoicedByRun = `-- name: MarkBillingPeriodInvoicedByRun :exec
-UPDATE ms_billing.billing_periods period
-SET status = 'invoiced'
-FROM ms_billing.billing_runs run
-WHERE run.id = $1::uuid
-  AND run.status = 'invoiced'
-  AND period.account_id = run.account_id
-  AND period.period_start = run.period_start
-  AND period.period_end = run.period_end
-  AND period.status = 'closing'
-`
-
-// MarkBillingPeriodInvoicedByRun completes migration 008's
-// open→closing→invoiced lifecycle. It is called in the same transaction as a
-// successful billing-run terminal mark, so the intake/audit state cannot
-// disagree with the durable charge outcome.
-func (q *Queries) MarkBillingPeriodInvoicedByRun(ctx context.Context, runID string) error {
-	_, err := q.db.Exec(ctx, markBillingPeriodInvoicedByRun, runID)
-	return err
-}
-
 const markBillingRun = `-- name: MarkBillingRun :exec
 UPDATE ms_billing.billing_runs
 SET status            = $2,
@@ -637,8 +616,8 @@ SELECT DISTINCT e.account_id::uuid AS account_id
 FROM ms_billing.usage_events e
 JOIN ms_billing.accounts a ON a.id = e.account_id
 WHERE a.activated_at IS NULL
-  AND COALESCE(e.billable_at, e.recorded_at) >= $1
-  AND COALESCE(e.billable_at, e.recorded_at) <  $2
+  AND e.recorded_at >= $1
+  AND e.recorded_at <  $2
   AND NOT EXISTS (
       SELECT 1 FROM ms_billing.org_deletion_finalizations f
       WHERE a.owner_kind = 'org' AND f.org_id = a.owner_org_id
@@ -646,8 +625,8 @@ WHERE a.activated_at IS NULL
 `
 
 type UnactivatedAccountsWithUsageParams struct {
-	BillableAt   pgtype.Timestamptz `json:"billable_at"`
-	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+	RecordedAt   time.Time `json:"recorded_at"`
+	RecordedAt_2 time.Time `json:"recorded_at_2"`
 }
 
 // UnactivatedAccountsWithUsage is the ROLLUP-ONLY work list for accounts with
@@ -655,7 +634,7 @@ type UnactivatedAccountsWithUsageParams struct {
 // GetUsageHistory) before a card later arrives; these accounts are never
 // handed to the charge phase.
 func (q *Queries) UnactivatedAccountsWithUsage(ctx context.Context, arg UnactivatedAccountsWithUsageParams) ([]string, error) {
-	rows, err := q.db.Query(ctx, unactivatedAccountsWithUsage, arg.BillableAt, arg.BillableAt_2)
+	rows, err := q.db.Query(ctx, unactivatedAccountsWithUsage, arg.RecordedAt, arg.RecordedAt_2)
 	if err != nil {
 		return nil, err
 	}

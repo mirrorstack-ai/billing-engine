@@ -14,9 +14,8 @@ import (
 )
 
 type fakeStore struct {
-	proposedRefs []string
-	attempt      Attempt
-	failCalls    int
+	attempt   Attempt
+	failCalls int
 }
 
 func (s *fakeStore) Get(
@@ -76,24 +75,6 @@ func (s *fakeStore) Fail(
 	s.attempt.Status = "failed"
 	s.attempt.ReceiptURL = receiptURL
 	return s.attempt, true, nil
-}
-
-// MarkProposed records the intent reference the way the real store does.
-//
-// Pending-only, matching the SQL predicate. A row already moved is a lost race,
-// not a fault — a fake that ignored this would make the executor's race
-// handling untestable.
-func (s *fakeStore) MarkProposed(_ context.Context, _ Attempt, ref string) (bool, error) {
-	if ref == "" {
-		return false, errors.New("fake store: a proposed attempt needs its intent reference")
-	}
-	if s.attempt.Status != "pending" {
-		return false, nil
-	}
-	s.attempt.Status = "proposed"
-	s.attempt.ProposedReference = ref
-	s.proposedRefs = append(s.proposedRefs, ref)
-	return true, nil
 }
 
 type fakeSettler struct {
@@ -304,6 +285,26 @@ func exactPayment(attempt Attempt, invoice billingstripe.Invoice) billingstripe.
 		AmountReceived:        expectedCents,
 		PaymentIntentCurrency: "usd",
 	}
+}
+
+func TestResumeCreatesAndRereadsExactlyOneDraftLineBeforeFinalize(t *testing.T) {
+	attempt := testAttempt("pending")
+	attempt.StripeInvoiceID = ""
+	store := &fakeStore{attempt: attempt}
+	stripe := &fakeStripe{}
+	settler := &fakeSettler{store: store}
+	executor := NewExecutor(store, settler, stripe)
+
+	result, err := executor.Resume(context.Background(), attempt)
+
+	require.NoError(t, err)
+	require.Equal(t, "open", result.Invoice.Status)
+	require.Equal(t, 1, stripe.createInvoiceCalls)
+	require.Equal(t, 1, stripe.createItemCalls)
+	require.Equal(t, 1, stripe.finalizeCalls)
+	require.GreaterOrEqual(t, stripe.getCalls, 2)
+	require.GreaterOrEqual(t, stripe.listItemCalls, 3)
+	require.Zero(t, settler.calls)
 }
 
 func TestReconcileWebhookPaidRejectsEveryUnprovedMoneyShape(t *testing.T) {

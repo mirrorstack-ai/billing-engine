@@ -26,13 +26,10 @@ type Service struct {
 	// roots install it from the API controller before any public credit RPC can
 	// name a wallet object. A nil selector preserves the component-test
 	// behavior of WithCreditWallet(true).
-	creditAccess    func(uuid.UUID) bool
-	creditGate      credit.Gate
-	observer        credit.SettlementObserver
-	creditPurchases creditrecovery.ManualPurchaseExecutor
-	// proposer is the intent seam for the unpaid-retry leg. Nil leaves it
-	// on the legacy path.
-	proposer          receivableProposer
+	creditAccess      func(uuid.UUID) bool
+	creditGate        credit.Gate
+	observer          credit.SettlementObserver
+	creditPurchases   creditrecovery.ManualPurchaseExecutor
 	creditRecovery    *creditrecovery.RuntimeCapability
 	autoTopUpRecovery AutoTopUpRecovery
 }
@@ -634,40 +631,3 @@ func (s *Service) paymentMethodTarget(ctx context.Context, userID, orgID, paymen
 	}
 	return s.store.PaymentMethodTarget(ctx, userID, paymentMethodID)
 }
-
-// receivableProposer is the narrow seam the unpaid-retry leg proposes through.
-//
-// 🔴 IT NEEDS A SOURCE, WHICH IS WHY THIS LEG WAS LAST. §6's
-// collect_receivable is CollectRemainderOf(source): it links to a SOURCE
-// INTENT and collects what is left of it. An invoice the intent rail never
-// raised has no source to link to, so there is nothing to propose — the leg
-// keeps the legacy path for those, exactly as every other leg keeps it for a
-// charge that already reached the provider.
-//
-// Declared here rather than imported so this package does not depend on the
-// intent packages when the seam is unwired.
-type receivableProposer interface {
-	// SourceIntentFor answers which intent a provider object settled. Not
-	// found is the ordinary case: every unpaid invoice in production predates
-	// the rail.
-	SourceIntentFor(ctx context.Context, providerReference string) (string, bool, error)
-	// ProposeReceivable seals a receivable for what is still owed on the
-	// source, linked to it.
-	ProposeReceivable(ctx context.Context, sourceDigest, accountID string, remainderMicros int64) (string, error)
-}
-
-// WithReceivableProposer cuts the unpaid-retry leg over to the intent path.
-//
-// 🔴 Arming it does NOT stop this leg collecting. Unlike the other five, it
-// changes behaviour only for invoices the intent rail itself raised — of which
-// there are none until the rail is enabled. That is not a hedge: it is what
-// makes this leg's cutover safe to land before the others are armed, and it is
-// why the leg could not be routed at all until a settlement recorded which
-// provider object it moved through (migration 069).
-func (s *Service) WithReceivableProposer(p receivableProposer) *Service {
-	s.proposer = p
-	return s
-}
-
-// ReceivableProposerArmed reports whether the seam is attached.
-func (s *Service) ReceivableProposerArmed() bool { return s.proposer != nil }

@@ -6,19 +6,6 @@ package cycle_test
 // monotonicity / permanent-inclusion property. Reuses the in-memory fakeStore
 // (service_test.go) + fakeStripe (charge_test.go) + the registeredAccount /
 // registerMirror / appsSvc helpers (apps_test.go / proration_test.go).
-//
-// 🔴 Since the Leg-1 cutover the sweep COLLECTS NOTHING: an "over" install is
-// sealed as a charge intent and the per-timer draft → item → finalize invoice is
-// deleted. So an assertion that the leg reached no provider is now VACUOUS on its
-// own — nothing in this leg can — and every test below that means "not charged"
-// arms a capturingProposer and asserts against p.charges instead. Where a test
-// asserts an AMOUNT, it asserts the same figure the invoice line used to carry,
-// in micros: sealed micros == cents × 10_000, by collectableMicros.
-//
-// The one path here that still reaches the provider is the crash-recovery read,
-// which finishes an invoice a LEGACY run already created. Its tests are
-// unchanged, and they now also assert that recovery does NOT propose over the
-// top of money that may already have moved.
 
 import (
 	"context"
@@ -86,8 +73,7 @@ func TestModuleOverage_IncludedIsPermanentNeverReEvaluated(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 	app := uuid.New()
 
@@ -104,7 +90,7 @@ func TestModuleOverage_IncludedIsPermanentNeverReEvaluated(t *testing.T) {
 	require.Equal(t, 5, res.Pending)
 	require.Equal(t, 5, res.Included)
 	require.Equal(t, 0, res.Charged)
-	require.Empty(t, p.charges, "included modules are never charged, and never sealed either")
+	require.Empty(t, sc.itemCalls, "included modules are never charged")
 	for _, id := range earlyIDs {
 		require.True(t, store.timers[id].graceResolved)
 		require.False(t, store.timers[id].graceCharged)
@@ -122,8 +108,8 @@ func TestModuleOverage_IncludedIsPermanentNeverReEvaluated(t *testing.T) {
 	res2, err := svc.SweepModuleOverage(ctx, late.AddDate(0, 0, 4))
 	require.NoError(t, err)
 	require.Equal(t, 10, res2.Pending, "only the unresolved newcomers are candidates")
-	require.Len(t, p.charges, 10, "each over-module seals its own intent")
-	require.Empty(t, sc.itemCalls, "a cut-over leg mints no invoice line")
+	require.Equal(t, 10, res2.Charged)
+	require.Len(t, sc.itemCalls, 10)
 	for _, id := range earlyIDs {
 		require.False(t, store.timers[id].graceCharged,
 			"an included module is never charged even after the pool grows past 5")
@@ -140,8 +126,7 @@ func TestModuleOverage_FlipsToIncludedWhenEarlierRemovedBeforeGrace(t *testing.T
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 	app := uuid.New()
 
@@ -165,7 +150,7 @@ func TestModuleOverage_FlipsToIncludedWhenEarlierRemovedBeforeGrace(t *testing.T
 	require.Equal(t, 5, res.Pending, "the removed module is out of the work list")
 	require.Equal(t, 5, res.Included)
 	require.Equal(t, 0, res.Charged)
-	require.Empty(t, p.charges, "an over→included flip seals nothing")
+	require.Empty(t, sc.itemCalls)
 	require.True(t, store.timers[x].graceResolved)
 	require.False(t, store.timers[x].graceCharged, "an over→included flip is never charged")
 }
@@ -176,8 +161,7 @@ func TestModuleOverage_RemovedWithinGraceNeverCharged(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -192,7 +176,7 @@ func TestModuleOverage_RemovedWithinGraceNeverCharged(t *testing.T) {
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, 0, res.Pending, "a removed timer is excluded from the sweep")
-	require.Empty(t, p.charges)
+	require.Empty(t, sc.itemCalls)
 	require.False(t, store.timers[over].graceCharged)
 }
 
@@ -206,8 +190,7 @@ func TestModuleOverage_D1dStraddleChargesThePostActivationPeriod(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store) // activated 2026-05-04 09:00 → anchor day 4
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), 5)
@@ -218,18 +201,20 @@ func TestModuleOverage_D1dStraddleChargesThePostActivationPeriod(t *testing.T) {
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Skipped, "the straddled post-activation period is owed — only the install period is forgiven")
+	require.Equal(t, 1, res.Charged, "the straddled post-activation period is owed — only the install period is forgiven")
 	require.True(t, store.timers[over].graceCharged)
-	// Full $1 per-module stub for the straddled period alone. (One-time legs price
-	// per module at the amortized rate, not in blocks.) The 100¢ the invoice line
-	// used to carry is the 1_000_000 micros the intent seals.
-	require.Len(t, p.charges, 1)
-	require.EqualValues(t, 1_000_000, p.charges[0].TotalMicros())
-	// The coverage window ([May 4, Jun 4) here) is NOT sealed: the intent carries
-	// the EXECUTION window instead, and proposeModuleOverage records that the
-	// coverage period is a canonical field the document does not yet have. It is
-	// therefore unobservable from here, and nothing mirrors an invoice for it.
-	require.Empty(t, store.invoices, "a proposed charge mirrors no provider invoice")
+	// Full $1 per-module stub for the straddled period alone, window narrowed to
+	// it. (One-time legs price per module at the amortized rate, not in blocks.)
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 100, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC))
+	require.Len(t, store.invoices, 1)
+	for _, inv := range store.invoices {
+		require.Equal(t, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), inv.PeriodStart)
+		require.Equal(t, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd)
+	}
 }
 
 // The complement: a pre-activation install whose ENTIRE coverage (install
@@ -238,8 +223,7 @@ func TestModuleOverage_D1dFullyPreActivationStaysForgiven(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store) // activated 2026-05-04 09:00 → anchor day 4
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), 5)
@@ -250,7 +234,7 @@ func TestModuleOverage_D1dFullyPreActivationStaysForgiven(t *testing.T) {
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Zero(t, res.Charged)
-	require.Empty(t, p.charges, "a fully pre-activation coverage is never retroactively billed, or sealed")
+	require.Empty(t, sc.itemCalls, "a fully pre-activation coverage is never retroactively billed")
 	require.True(t, store.timers[over].graceResolved, "resolved terminally (period_closed)")
 	require.False(t, store.timers[over].graceCharged)
 }
@@ -267,8 +251,7 @@ func TestModuleOverage_GraceStraddlingBoundaryCoversStraddledPeriod(t *testing.T
 	store := newFakeStore()
 	_, acct := registeredAccount(store) // activated 2026-05-04 → anchor day 4
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 	app := uuid.New()
 
@@ -279,17 +262,25 @@ func TestModuleOverage_GraceStraddlingBoundaryCoversStraddledPeriod(t *testing.T
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Skipped)
+	require.Equal(t, 1, res.Charged)
 	require.True(t, store.timers[over].graceCharged)
 
 	// $1 × 2/30 days (Jul 2 → Jul 4 of the 30-day install period, round-half-up
 	// = $0.07) + the FULL $1 for the straddled [Jul 4, Aug 4) period = $1.07.
-	require.Len(t, p.charges, 1)
-	require.EqualValues(t, 1_070_000, p.charges[0].TotalMicros(),
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 107, sc.itemCalls[0].amountCfg,
 		"install-period proration + the full straddled period")
-	// The coverage window that used to be mirrored is not a field the intent
-	// carries yet — see proposeModuleOverage.
-	require.Empty(t, store.invoices)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC))
+
+	// The mirrored window agrees with the amount: coverage runs through the END
+	// of the period the grace elapsed into.
+	require.Len(t, store.invoices, 1)
+	for _, inv := range store.invoices {
+		require.Equal(t, time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC), inv.PeriodStart)
+		require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd)
+	}
 }
 
 // The complement: a grace that elapses INSIDE the install period keeps the
@@ -298,8 +289,7 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store) // anchor day 4
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -308,14 +298,20 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Skipped)
+	require.Equal(t, 1, res.Charged)
 	require.True(t, store.timers[over].graceCharged)
 
-	// $1 × 24/30 days (Jun 10 → Jul 4) = $0.80 — and nothing more. The straddle
-	// surcharge asserted by the sibling test would show up here as 1_800_000.
-	require.Len(t, p.charges, 1)
-	require.EqualValues(t, 800_000, p.charges[0].TotalMicros())
-	require.Empty(t, store.invoices)
+	// $1 × 24/30 days (Jun 10 → Jul 4) = $0.80 — and nothing more.
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 80, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC))
+	require.Len(t, store.invoices, 1)
+	for _, inv := range store.invoices {
+		require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), inv.PeriodEnd,
+			"no straddle → coverage ends at the install period's end")
+	}
 }
 
 // Regression (review 2026-07-06, H9): a crash between the Stripe charge and
@@ -329,8 +325,7 @@ func TestModuleOverage_RetryAfterCrashRecoversChargeEvenWhenRankFlipped(t *testi
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -361,11 +356,6 @@ func TestModuleOverage_RetryAfterCrashRecoversChargeEvenWhenRankFlipped(t *testi
 	// H5: no NEW Stripe objects were minted on recovery.
 	require.Empty(t, sc.invoiceCalls, "no second draft")
 	require.Empty(t, sc.finalizeCalls, "no second finalize")
-	// …and the cut-over leg did NOT propose over the top of it. A proposal here
-	// would double-count the charge: once on the customer's card, once in the
-	// intent ledger.
-	require.Empty(t, p.charges,
-		"a legacy charge already at the provider was proposed over instead of adopted")
 }
 
 // H5, the draft-completion arm: the crashed attempt created its draft but died
@@ -376,8 +366,7 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -389,8 +378,6 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, 1, res.Charged)
-	require.Empty(t, p.charges,
-		"a legacy draft still at the provider must be finished, never proposed over")
 	require.Empty(t, sc.invoiceCalls, "the found draft is completed — never a second CreateDraftInvoice")
 	require.Len(t, sc.itemCalls, 1)
 	require.Equal(t, "in_orphan_draft", sc.itemCalls[0].invoiceID, "the line lands on the crashed attempt's own draft")
@@ -405,17 +392,12 @@ func TestModuleOverage_RetryCompletesCrashedDraftInsteadOfMintingSecond(t *testi
 }
 
 // The recovery no-op arm: the marker is set but Stripe has NOTHING under the
-// ref — the crashed attempt never created its invoice. There is no in-flight
-// charge to complete, so the retry proposes and touches no provider. This is the
-// boundary of the recovery exception, and the reason it drains: once no row
-// carries an unresolved charge_attempted_at marker with an invoice behind it,
-// this leg cannot reach Stripe at all.
-func TestModuleOverage_AttemptedButNothingOnStripeProposesFresh(t *testing.T) {
+// ref — the crashed attempt never created its invoice. The retry charges fresh.
+func TestModuleOverage_AttemptedButNothingOnStripeChargesFresh(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -425,12 +407,10 @@ func TestModuleOverage_AttemptedButNothingOnStripeProposesFresh(t *testing.T) {
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 16, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Skipped)
+	require.Equal(t, 1, res.Charged)
 	require.NotEmpty(t, sc.findByRefCalls, "the recovery lookup ran")
-	require.Len(t, p.charges, 1, "nothing to recover → seal the charge fresh")
-	require.Empty(t, sc.invoiceCalls, "and mint nothing at the provider")
-	require.Empty(t, sc.itemCalls)
-	require.Empty(t, sc.finalizeCalls)
+	require.Len(t, sc.invoiceCalls, 1, "nothing to recover → fresh draft→item→finalize")
+	require.Len(t, sc.finalizeCalls, 1)
 	require.True(t, store.timers[x].graceCharged)
 }
 
@@ -441,8 +421,7 @@ func TestModuleOverage_StaleCandidateNotCharged(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -461,7 +440,7 @@ func TestModuleOverage_StaleCandidateNotCharged(t *testing.T) {
 	res, err := svc.ChargeModuleOverage(ctx, cand, time.Date(2026, 6, 14, 1, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, cycle.ModuleOverageSkippedStale, res.Status)
-	require.Empty(t, p.charges, "a stale candidate is never sealed")
+	require.Empty(t, sc.invoiceCalls, "a stale candidate never reaches Stripe")
 	require.False(t, store.timers[x].graceCharged)
 }
 
@@ -469,13 +448,12 @@ func TestModuleOverage_FrozenCombinedChildDefersBeforeRemovedOrImprovedRank(t *t
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := appsSvc(store, sc).WithIntentProposer(p)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, createdAt, 7)
 
-	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
 	require.Len(t, attempt.TimerIDs, 2)
 	timerID := attempt.TimerIDs[0]
 	timer := store.timers[timerID]
@@ -496,9 +474,7 @@ func TestModuleOverage_FrozenCombinedChildDefersBeforeRemovedOrImprovedRank(t *t
 	require.NoError(t, err)
 	require.Equal(t, cycle.ModuleOverageDeferredToCombined, res.Status)
 	require.Empty(t, sc.findByRefCalls)
-	require.Empty(t, p.charges,
-		"a timer the combined invoice owns must not be sealed by Leg 1 either — that "+
-			"would record the same overage twice")
+	require.Empty(t, sc.invoiceCalls)
 	require.False(t, timer.graceResolved)
 }
 
@@ -506,13 +482,12 @@ func TestModuleOverage_KnownCombinedSetDoesNotCaptureLaterNonChild(t *testing.T)
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := appsSvc(store, sc).WithIntentProposer(p)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, createdAt, 7)
 
-	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
 	require.Len(t, attempt.TimerIDs, 2)
 	laterAt := createdAt.AddDate(0, 0, 10)
 	laterID := seedTimer(store, acct, appID, laterAt)
@@ -526,9 +501,9 @@ func TestModuleOverage_KnownCombinedSetDoesNotCaptureLaterNonChild(t *testing.T)
 		ActivatedAt:    store.activation[acct],
 	}, laterAt.AddDate(0, 0, 4))
 	require.NoError(t, err)
-	require.Equal(t, cycle.ModuleOverageProposed, res.Status,
+	require.Equal(t, cycle.ModuleOverageCharged, res.Status,
 		"a known frozen set owns only its children; a later over timer keeps the standalone Leg-1 path")
-	require.Len(t, p.charges, 1)
+	require.Len(t, sc.invoiceCalls, 1)
 	require.True(t, store.timers[laterID].graceResolved)
 }
 
@@ -541,8 +516,7 @@ func TestModuleOverage_PrepaidAccountSkippedNotCharged(t *testing.T) {
 	_, acct := registeredAccount(store)
 	store.collection.Mode = cycle.BillingModePrepaid
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -553,67 +527,72 @@ func TestModuleOverage_PrepaidAccountSkippedNotCharged(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, res.Skipped)
 	require.Zero(t, res.Charged)
-	require.Empty(t, p.charges,
-		"a prepaid account is not auto-charged by Leg 1, and its overage is not sealed "+
-			"either — the gate is upstream of the proposal")
+	require.Empty(t, sc.invoiceCalls, "a prepaid account is never auto-charged by Leg 1")
 	require.False(t, store.timers[over].graceResolved, "transient skip — nothing resolved")
 
-	// The account relaxes back to arrears → the deferred charge is sealed.
+	// The account relaxes back to arrears → the deferred charge fires.
 	store.collection.Mode = cycle.BillingModeArrears
 	res, err = svc.SweepModuleOverage(ctx, sweepAt)
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Skipped)
-	require.Len(t, p.charges, 1)
+	require.Equal(t, 1, res.Charged)
 	require.True(t, store.timers[over].graceCharged)
 }
 
-// --- a failed seal leaves the timer retryable, and the retry re-seals --------
+// --- C2: items are pinned to their own draft; Stripe failures stay retryable --
 
-// TestModuleOverage_StripeFailureLeavesTimerRetryableWithSameKeys used to live
-// here. It asserted the C2 property of the legacy collector — every line item
-// PINNED to the timer's own draft, money moving only at finalize, and three
-// attempts replaying mod-overage-inv- / -ii- / -fin- — and that collector no
-// longer exists, so the test was deleted rather than rewritten: there is no
-// draft, no pinned item, and no invoice idem key left to assert about.
-//
-// What survives the cutover is the retryability underneath it: a failure at the
-// money step must leave the timer UNRESOLVED and must not abort the batch, so
-// the next sweep converges. That property is asserted here against the seal.
-func TestModuleOverage_SealFailureLeavesTimerRetryable(t *testing.T) {
+// Regression (review 2026-07-06, C2): every Leg-1 line item is PINNED to the
+// timer's own draft invoice (created first, pending_invoice_items_behavior=
+// exclude) and money moves only at finalize — a crash at any step leaves an
+// inert draft that no other charge leg's invoice can sweep up. Also the first
+// Stripe-failure injection on this leg: a failed item or finalize leaves the
+// timer unresolved, and the retry replays the SAME deterministic idem keys.
+func TestModuleOverage_StripeFailureLeavesTimerRetryableWithSameKeys(t *testing.T) {
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	p := &capturingProposer{err: errors.New("proposer: seal boom")}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
 	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 	sweepAt := time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
 
+	// Attempt 1: the pinned-item create fails AFTER the draft exists.
+	sc.errItem = errors.New("stripe: item boom")
 	res, err := svc.SweepModuleOverage(ctx, sweepAt)
 	require.NoError(t, err, "a per-timer failure never aborts the batch")
 	require.Equal(t, 1, res.Failed)
+	require.Empty(t, sc.finalizeCalls, "no finalize → no money moved")
 	require.False(t, store.timers[over].graceResolved, "left unresolved for the retry")
-	require.False(t, store.timers[over].graceCharged)
 	require.Empty(t, store.invoices, "nothing mirrored")
-	// The arming claim DID land, which is the point of taking it before the
-	// proposal: the retry below arrives as an attempted candidate.
-	require.False(t, store.timers[over].chargeAttemptedAt.IsZero())
 
-	// The retry runs the recovery read first (the marker is set), finds nothing
-	// at the provider because nothing was ever sent there, and seals.
-	p.err = nil
+	// Attempt 2: the finalize (money-moving step) fails.
+	sc.errItem = nil
+	sc.errInvoice = errors.New("stripe: finalize boom")
 	res, err = svc.SweepModuleOverage(ctx, sweepAt)
 	require.NoError(t, err)
-	require.Zero(t, res.Failed)
-	require.Equal(t, 1, res.Skipped)
-	require.Len(t, p.charges, 1, "exactly one intent for one install, across both attempts")
-	require.EqualValues(t, 800_000, p.charges[0].TotalMicros(),
-		"the retry seals the same amount the first attempt derived")
+	require.Equal(t, 1, res.Failed)
+	require.False(t, store.timers[over].graceResolved)
+	require.Empty(t, store.invoices)
+
+	// Attempt 3 succeeds — through the SAME deterministic keys as both failures.
+	sc.errInvoice = nil
+	res, err = svc.SweepModuleOverage(ctx, sweepAt)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Charged)
 	require.True(t, store.timers[over].graceCharged)
-	require.NotEmpty(t, sc.findByRefCalls, "the recovery read ran on the attempted retry")
-	require.Empty(t, sc.invoiceCalls, "and reached no provider beyond that read")
+
+	require.GreaterOrEqual(t, len(sc.invoiceCalls), 3)
+	require.GreaterOrEqual(t, len(sc.itemCalls), 2)
+	for _, dc := range sc.invoiceCalls {
+		require.Equal(t, "mod-overage-inv-"+over.String(), dc.idemKey, "every attempt reuses the same draft idem key")
+		require.Equal(t, "timer:"+over.String(), dc.ref, "the draft carries the charge-ref metadata anchor")
+	}
+	for _, ic := range sc.itemCalls {
+		require.Equal(t, "mod-overage-ii-"+over.String(), ic.idemKey)
+		require.NotEmpty(t, ic.invoiceID, "the line item is PINNED to the timer's own draft, never a floating pending item")
+	}
+	require.Equal(t, "mod-overage-fin-"+over.String(), sc.finalizeCalls[len(sc.finalizeCalls)-1].idemKey)
 }
 
 // --- over module with no usable PM is skipped and retried (not resolved) ------
@@ -623,8 +602,7 @@ func TestModuleOverage_NoPMSkipsAndRetries(t *testing.T) {
 	_, acct := registeredAccount(store)
 	store.hasPM = false // account activated but no usable default PM
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -636,17 +614,16 @@ func TestModuleOverage_NoPMSkipsAndRetries(t *testing.T) {
 	require.Equal(t, 1, res.Pending)
 	require.Equal(t, 0, res.Charged)
 	require.Equal(t, 1, res.Skipped)
-	require.Empty(t, p.charges,
-		"no PM → the arming claim refuses, upstream of the proposal, so nothing is sealed")
+	require.Empty(t, sc.itemCalls, "no PM → no Stripe call")
 	// NOT resolved — it stays a candidate for the next sweep once a PM is added.
 	require.False(t, store.timers[over].graceResolved)
 
-	// Add a PM → the next sweep seals it.
+	// Add a PM → the next sweep charges it (idempotent per-timer idem keys).
 	store.hasPM = true
 	res2, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res2.Skipped)
-	require.Len(t, p.charges, 1)
+	require.Equal(t, 1, res2.Charged)
+	require.Len(t, sc.itemCalls, 1)
 	require.True(t, store.timers[over].graceCharged)
 }
 
@@ -657,8 +634,7 @@ func TestModuleOverage_UnactivatedAccountNeverSwept(t *testing.T) {
 	_, acct := registeredAccount(store)
 	delete(store.activation, acct) // never bound a card
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
@@ -667,7 +643,7 @@ func TestModuleOverage_UnactivatedAccountNeverSwept(t *testing.T) {
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, 0, res.Pending, "unactivated accounts are excluded from the work list")
-	require.Empty(t, p.charges)
+	require.Empty(t, sc.itemCalls)
 	require.False(t, store.timers[over].graceResolved)
 }
 
@@ -683,14 +659,13 @@ func TestModuleOverage_NoRetroactiveCatchUpWhenActivatedAfterPeriodClosed(t *tes
 	// sweep charged the 3 "over" timers (ranks 5-7) a REAL Stripe invoice for that
 	// historical, never-chargeable January period — exactly the retroactive
 	// catch-up D1d forbids. Fixed: the over timers are resolved terminally WITH NO
-	// charge (period_closed), never resurface, and nothing is billed by any rail;
-	// the 5 included ones resolve as included as usual.
+	// charge (period_closed), never resurface, and Stripe is never called; the 5
+	// included ones resolve as included as usual.
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	delete(store.activation, acct) // unactivated at install time
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 	app := uuid.New()
 
@@ -715,9 +690,7 @@ func TestModuleOverage_NoRetroactiveCatchUpWhenActivatedAfterPeriodClosed(t *tes
 	require.Equal(t, 0, res.Charged, "no retroactive catch-up charge for a closed period (D1d)")
 	require.Equal(t, 5, res.Included, "the 5 earliest installs resolve as included")
 	require.Equal(t, 3, res.Skipped, "the 3 over installs resolve period_closed (counted as skipped)")
-	require.Empty(t, p.charges,
-		"nothing is sealed for a period the account was never chargeable in — a "+
-			"retroactive catch-up is as wrong sealed as it was invoiced")
+	require.Empty(t, sc.itemCalls, "no Stripe call for a period the account was never chargeable in")
 	for _, id := range ids {
 		require.True(t, store.timers[id].graceResolved, "every timer reached a terminal verdict")
 		require.False(t, store.timers[id].graceCharged, "none charged")
@@ -727,20 +700,19 @@ func TestModuleOverage_NoRetroactiveCatchUpWhenActivatedAfterPeriodClosed(t *tes
 	res2, err := svc.SweepModuleOverage(ctx, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, 0, res2.Pending, "resolved timers never resurface")
-	require.Empty(t, p.charges)
+	require.Empty(t, sc.itemCalls)
 }
 
-func TestModuleOverage_ActivatedBeforePeriodClosesStillBills(t *testing.T) {
+func TestModuleOverage_ActivatedBeforePeriodClosesStillCharges(t *testing.T) {
 	// Guard against an over-broad fix: an over-module whose account activated
-	// BEFORE its install-anchored period closes must still be billed normally. The
+	// BEFORE its install-anchored period closes must still charge normally. The
 	// period-closed check compares against ActivatedAt (not the sweep instant), so
 	// an account activated well before the install (registeredAccount: May 4) that
 	// is swept a few days late is NOT treated as a retroactive catch-up.
 	store := newFakeStore()
 	_, acct := registeredAccount(store) // activated 2026-05-04, anchor day 4
 	sc := newFakeStripe()
-	p := &capturingProposer{}
-	svc := cycle.NewService(store, sc).WithIntentProposer(p)
+	svc := cycle.NewService(store, sc)
 	ctx := context.Background()
 
 	// 5 included + one over-module installed Jun 10 → period [Jun 4, Jul 4), which
@@ -750,10 +722,8 @@ func TestModuleOverage_ActivatedBeforePeriodClosesStillBills(t *testing.T) {
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 9, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Skipped)
-	require.Len(t, p.charges, 1,
-		"an over-module whose period opened after activation is billed normally")
-	require.EqualValues(t, 800_000, p.charges[0].TotalMicros())
+	require.Equal(t, 1, res.Charged, "an over-module whose period opened after activation charges normally")
+	require.Len(t, sc.itemCalls, 1)
 	require.True(t, store.timers[over].graceCharged)
 }
 

@@ -29,56 +29,21 @@ func registerMirror(t *testing.T, svc *cycle.Service, user, appID uuid.UUID, cre
 	require.NoError(t, err)
 }
 
-// prorationSvc is appsSvc with the intent proposer this leg now REQUIRES.
-//
-// The creation-proration leg has no direct charge path left: it derives the
-// amount it always did, seals it, and stops. It returns the capturing proposer
-// beside the service because the SEALED CHARGE is where the amount assertions
-// live now — no invoice item carries them any more.
-func prorationSvc(store *fakeStore, sc *fakeStripe) (*cycle.Service, *capturingProposer) {
-	p := &capturingProposer{}
-	return appsSvc(store, sc).WithIntentProposer(p), p
-}
-
-// sealedProrationCents is the whole-cent total of the ONE charge the leg sealed.
-//
-// Lines are sealed at cents×microsPerCent (proration_charges.go), so this is
-// exactly the integer the deleted invoice would have carried — which is what
-// makes every amount below a real regression test on the derivation rather
-// than a restatement of whatever the new path happens to produce.
-func sealedProrationCents(t *testing.T, p *capturingProposer) int64 {
-	t.Helper()
-	require.Len(t, p.charges, 1, "the leg did not seal exactly one charge")
-	total := p.charges[0].TotalMicros()
-	require.Zero(t, total%10_000, "a sealed proration must be a whole number of cents")
-	return total / 10_000
-}
-
-// freezeCombinedAttemptThenCrash commits the durable arming claim (the exact
-// combined ownership header + apps.proration_attempted_at) and then fails,
-// leaving the row in the state a crashed attempt leaves it in.
-//
-// It used to crash the Stripe DRAFT call, which no longer exists. It crashes
-// the PROPOSAL instead, and that is the same instant in the leg's order: the
-// claim commits first, the money step (now a seal) fails after it. What comes
-// back is what the next sweep will find.
-func freezeCombinedAttemptThenCrash(
+func freezeCombinedBeforeDraft(
 	t *testing.T,
 	svc *cycle.Service,
 	store *fakeStore,
 	sc *fakeStripe,
-	p *capturingProposer,
 	appID uuid.UUID,
 ) cycle.CombinedProrationAttempt {
 	t.Helper()
-	p.err = errors.New("simulated crash after the durable arming claim")
+	sc.errDraft = errors.New("simulated crash before draft creation")
 	_, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.Error(t, err)
-	p.err = nil
+	sc.errDraft = nil
 	attempt, ok := store.combinedProrationAttempts[appID]
-	require.True(t, ok, "the exact ownership header must commit before the charge is sealed")
+	require.True(t, ok, "the exact ownership header must commit before the failed first Stripe call")
 	require.True(t, store.apps[appID].ProrationAttempted)
-	require.Empty(t, p.charges, "the crash must leave no sealed charge behind")
 	sc.invoiceCalls = nil
 	return cloneCombinedProrationAttempt(attempt)
 }
@@ -216,16 +181,13 @@ func TestChargeCreationProration_FrozenRecoveryBypassesLaterPeriodClosedDecision
 	store := newFakeStore()
 	user, accountID := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, createdAt, 0)
 
-	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
 	require.Empty(t, attempt.TimerIDs)
-	// An INERT draft: the prior run created it and never finalized it, so no
-	// money moved (auto_advance=false). The leg proposes over it rather than
-	// finalizing it — nothing here finalizes anything any more.
 	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
 		ID: "in_period_closed_recovery", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
 	})
@@ -233,35 +195,35 @@ func TestChargeCreationProration_FrozenRecoveryBypassesLaterPeriodClosedDecision
 
 	// Simulate a later gate read deciding that this creation period is closed.
 	// Once an exact header exists this cannot convert recovery into a permanent
-	// skip: the frozen request is what the charge is, whatever the mutable
-	// roster says afterwards.
+	// skip: Stripe may already own the frozen request.
 	store.activation[accountID] = time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
 	result, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, result.Status)
-	require.NotEmpty(t, result.IntentDigest)
+	require.Equal(t, cycle.ProrationStatusCharged, result.Status)
+	require.Equal(t, "in_period_closed_recovery", result.ProrationInvoiceID)
 	require.False(t, store.apps[appID].ProrationSkipped)
-	require.Empty(t, sc.finalizeCalls, "the leg holds no finalize call at all")
-	require.Equal(t, attempt.Shape.BaseChargeCents, sealedProrationCents(t, p),
-		"the sealed amount is the FROZEN shape's, not one re-derived through the later gate")
+	require.Len(t, sc.finalizeCalls, 1)
 }
 
 // A timer uninstall/rank improvement after the attempt freezes cannot rewrite
 // ownership: recovery consumes the exact child IDs and Stripe metadata truth.
-func TestChargeCreationProration_SealsTheFrozenSetAfterRemoval(t *testing.T) {
+func TestChargeCreationProration_RecoveredDraftUsesFrozenSetAfterRemoval(t *testing.T) {
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
-	// Created mid-period with 7 co-created modules → 2 over. Base 15/30 days of
-	// $20 = $10 (1000¢); each overage line 15/30 of the $1.00 amortized
-	// per-module rate = 50¢.
+	// Created mid-period with 7 co-created modules → 2 over. Base 15/30 days =
+	// $10 (1000¢); each overage line 15/30 of $3 = $1.50 (150¢).
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	registerMirror(t, svc, user, appID, created, 7)
 	_ = acct
-	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
 	require.Len(t, attempt.TimerIDs, 2)
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
+		ID: "in_shrunk_draft", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
+	})
+	seedCombinedAttemptItems(t, sc, "in_shrunk_draft", attempt, attempt.TimerIDs)
 
 	// Between crash and retry one co-created over-module is uninstalled — the
 	// live set shrinks to 1.
@@ -270,40 +232,47 @@ func TestChargeCreationProration_SealsTheFrozenSetAfterRemoval(t *testing.T) {
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err, "a shrunk live set must not rewrite frozen ownership")
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.Equal(t, "intent:"+resp.IntentDigest, store.apps[appID].ProrationInvoiceID,
-		"the terminal stamp — without it the app is re-swept forever")
-
-	// The seal carries the FROZEN two timers, not the one that is still live.
-	// This is the whole point of the header: ownership is decided once, before
-	// the money step, and a later roster edit cannot re-price it.
-	require.Len(t, p.charges, 1)
-	require.Len(t, p.charges[0].Lines, 3, "base + the TWO frozen timer lines")
-	sealedRefs := map[string]bool{}
-	for _, line := range p.charges[0].Lines {
-		sealedRefs[line.SourceRef] = true
-	}
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Equal(t, "in_shrunk_draft", resp.ProrationInvoiceID)
+	require.Empty(t, sc.itemCalls, "resource truth proves every frozen line already landed")
+	require.Len(t, sc.finalizeCalls, 1)
+	require.Equal(t, "in_shrunk_draft", sc.finalizeCalls[0].invoiceID)
+	require.Equal(t, "in_shrunk_draft", store.apps[appID].ProrationInvoiceID, "the guard arms — no livelock")
+	resolved := store.combinedProrationAttempts[appID]
+	require.Equal(t, "in_shrunk_draft", resolved.ResolvedInvoiceID)
 	for _, timerID := range attempt.TimerIDs {
-		require.True(t, sealedRefs["timer:"+timerID.String()],
-			"frozen timer %s lost its line, so its charge cannot be walked back to it", timerID)
+		require.True(t, store.timers[timerID].graceResolved)
+		require.Equal(t, "in_shrunk_draft", store.timers[timerID].graceInvoiceID)
 	}
-	require.EqualValues(t, 1000+50+50, sealedProrationCents(t, p))
 }
 
-// DELETED with the path it tested: TestChargeCreationProration_
-// RecoveredPartialDraftCreatesOnlyMissingFrozenItem asserted that a half-built
-// DRAFT was repaired — the missing frozen line created, then the invoice
-// finalized. This leg creates no invoice items and finalizes nothing, so there
-// is no partial draft to repair: an inert draft moved no money, and the charge
-// it was going to collect is sealed as an intent instead (see
-// TestChargeCreationProration_FrozenRecoveryBypassesLaterPeriodClosedDecision,
-// which keeps the recovered-draft case).
+// A crash during item attachment is repaired from exact Stripe metadata even
+// after idempotency retention: only the missing frozen identity is created.
+func TestChargeCreationProration_RecoveredPartialDraftCreatesOnlyMissingFrozenItem(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	sc := newFakeStripe()
+	svc := appsSvc(store, sc)
+	appID := uuid.New()
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
 
-// The remaining Stripe-reading path — adopting an invoice a legacy run already
-// finalized — must still refuse an invoice whose lines are not exactly the
-// frozen attempt's. It mirrors what it adopts, so adopting a stranger's line
-// would record a charge this app never froze.
-func TestChargeCreationProration_InvalidAdoptedItemMetadataFailsClosed(t *testing.T) {
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
+	require.Len(t, attempt.TimerIDs, 2)
+	sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
+		ID: "in_partial_draft", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
+	})
+	seedCombinedAttemptItems(t, sc, "in_partial_draft", attempt, attempt.TimerIDs[:1])
+
+	resp, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.Len(t, sc.itemCalls, 1, "only the one missing frozen timer line is repaired")
+	require.Equal(t, attempt.TimerIDs[1].String(), sc.itemsByInvoice["in_partial_draft"][2].CombinedProrationTimerID)
+	require.Len(t, sc.finalizeCalls, 1)
+	require.Equal(t, "in_partial_draft", store.apps[appID].ProrationInvoiceID)
+}
+
+func TestChargeCreationProration_InvalidRecoveredItemMetadataFailsClosed(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*fakeStripe, string, cycle.CombinedProrationAttempt)
@@ -353,25 +322,20 @@ func TestChargeCreationProration_InvalidAdoptedItemMetadataFailsClosed(t *testin
 			store := newFakeStore()
 			user, _ := registeredAccount(store)
 			sc := newFakeStripe()
-			svc, p := prorationSvc(store, sc)
+			svc := appsSvc(store, sc)
 			appID := uuid.New()
 			registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
 
-			attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
-			totalCents := attempt.Shape.BaseChargeCents +
-				attempt.Shape.ModuleChargeCents*int64(len(attempt.TimerIDs))
-			// FINALIZED, so the money moved and the leg must adopt rather than
-			// propose. That is the only branch left that reads Stripe at all.
+			attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
 			sc.setFindByRef("app-proration:"+appID.String(), billingstripe.Invoice{
-				ID: "in_invalid_metadata", CustomerID: store.stripeCustomer, Status: "paid",
-				AmountDue: totalCents, AmountPaid: totalCents, Currency: "usd",
+				ID: "in_invalid_metadata", CustomerID: store.stripeCustomer, Status: "draft", Currency: "usd",
 			})
 			seedCombinedAttemptItems(t, sc, "in_invalid_metadata", attempt, attempt.TimerIDs)
 			tt.mutate(sc, "in_invalid_metadata", attempt)
 
 			_, err := svc.ChargeCreationProration(context.Background(), appID)
 			require.Error(t, err)
-			require.Empty(t, p.charges, "an unprovable invoice must not be sealed over either")
+			require.Empty(t, sc.finalizeCalls, "invalid resource truth must never reach the money-moving finalize")
 			require.Empty(t, store.apps[appID].ProrationInvoiceID)
 			require.Empty(t, store.combinedProrationAttempts[appID].ResolvedInvoiceID)
 		})
@@ -387,7 +351,7 @@ func TestChargeCreationProration_D1dStraddleChargesThePostActivationPeriod(t *te
 	store := newFakeStore()
 	user, _ := registeredAccount(store) // activated 2026-05-04 09:00 → anchor day 4
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	// Created May 2 — pre-activation (creation period [Apr 4, May 4) closes at
 	// activation) — grace expires May 5, inside [May 4, Jun 4).
@@ -395,13 +359,20 @@ func TestChargeCreationProration_D1dStraddleChargesThePostActivationPeriod(t *te
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.EqualValues(t, 2000, sealedProrationCents(t, p),
-		"the straddled period's FULL $20 base — the creation period is forgiven")
-	// The coverage window survives the seal as the execution window's start:
-	// a collection may not happen before the period it covers has ended.
-	require.Equal(t, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC), p.charges[0].ExecuteNotBefore,
-		"the seal covers the straddled period, not the forgiven creation period")
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2000, resp.ProrationCents, "the straddled period's FULL $20 base — the creation period is forgiven")
+	require.Len(t, sc.itemCalls, 1)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC))
+	mirror := store.invoices[sc.invoiceID]
+	require.Equal(t, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodStart, "window narrowed to the straddled period")
+	require.Equal(t, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
+	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)}]
+	require.True(t, ok, "the straddled period gets the snapshot")
+	require.EqualValues(t, 20_000_000, snap.snap.BaseMicros)
+	_, forgiven := store.baseSnapshots[snapKey{appID, time.Date(2026, 4, 4, 0, 0, 0, 0, time.UTC)}]
+	require.False(t, forgiven, "the forgiven creation period gets no snapshot")
 }
 
 func TestChargeCreationProration_D1dFullyPreActivationStaysSkipped(t *testing.T) {
@@ -420,31 +391,22 @@ func TestChargeCreationProration_D1dFullyPreActivationStaysSkipped(t *testing.T)
 	require.True(t, store.apps[appID].ProrationSkipped)
 }
 
-// 🔴 THE IN-FLIGHT EXCEPTION, and the reason this leg still reads Stripe.
-//
-// A legacy run finalized this invoice and died before its terminal
-// transaction. Stripe is collecting it, or already has. Proposing over it
-// would double-count the charge — once on the customer's statement, once in
-// the intent ledger — and abandoning it would leave a charge on that statement
-// this database has never heard of. So it is ADOPTED: mirrored, its timers
-// marked against it, the guard armed with ITS id, and not one write sent to
-// the provider.
-//
-// Originally a regression test for review 2026-07-06 H5 (recovery past
-// Stripe's ~24h idempotency-key window, by the app's ms_charge_ref anchor);
-// that property is unchanged and still asserted here.
+// Regression (review 2026-07-06, H5): a creation-proration retry past Stripe's
+// ~24h idempotency-key window reconciles by the app's ms_charge_ref anchor —
+// a crashed attempt's finalized combined invoice is adopted (guard armed with
+// ITS id, timers marked against it) with no new Stripe objects.
 func TestChargeCreationProration_LateRetryAdoptsFoundInvoice(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
 
 	// A prior attempt froze its exact app + two FIFO-over timer identities,
 	// finalized the complete invoice, and crashed before the terminal DB
 	// transaction.
-	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
 	require.Len(t, attempt.TimerIDs, 2)
 	totalCents := attempt.Shape.BaseChargeCents +
 		attempt.Shape.ModuleChargeCents*int64(len(attempt.TimerIDs))
@@ -466,9 +428,6 @@ func TestChargeCreationProration_LateRetryAdoptsFoundInvoice(t *testing.T) {
 	require.Empty(t, sc.invoiceCalls, "no second draft")
 	require.Empty(t, sc.itemCalls, "no re-attached lines")
 	require.Empty(t, sc.finalizeCalls, "no second finalize — the money moved once")
-	require.Empty(t, p.charges,
-		"the leg sealed an intent for a charge already finalized at the provider — "+
-			"that double-counts it, once on the card and once in the ledger")
 	for _, timerID := range attempt.TimerIDs {
 		timer := store.timers[timerID]
 		require.True(t, timer.graceResolved)
@@ -489,23 +448,21 @@ func TestChargeCreationProration_PrepaidAccountSkippedNotCharged(t *testing.T) {
 	user, _ := registeredAccount(store)
 	store.collection.Mode = cycle.BillingModePrepaid
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 0)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
 	require.Equal(t, cycle.ProrationStatusPrepaid, resp.Status)
-	require.Empty(t, p.charges,
-		"a prepaid account is not auto-charged off-session, and sealing an intent for one "+
-			"hands the executor a charge the gate refused")
+	require.Empty(t, sc.invoiceCalls, "a prepaid account is never auto-charged by the creation leg")
 	require.Empty(t, store.apps[appID].ProrationInvoiceID, "transient skip — the guard stays unarmed")
 
 	// Relax → the deferred creation charge fires normally.
 	store.collection.Mode = cycle.BillingModeArrears
 	resp, err = svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
 	require.NotEmpty(t, store.apps[appID].ProrationInvoiceID)
 }
 
@@ -515,31 +472,30 @@ func TestSweep_ChargesSurvivorExactlyOnceAcrossReruns(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), 0)
 
-	// First sweep past grace → seals the creation proration once.
+	// First sweep past grace → charges the creation proration once.
 	first, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 7, 5, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, 1, first.Pending)
-	require.Equal(t, 1, first.Proposed)
-	require.Equal(t, 0, first.Skipped, "a billed app must not be tallied as skipped")
+	require.Equal(t, 1, first.Charged)
+	require.Len(t, sc.itemCalls, 1)
 	// 3 of 30 days of $20 ($2) + the straddled [Jul 4, Aug 4) period in full
 	// ($20) — created Jul 1 08:00, so the grace crosses the Jul 4 boundary and
 	// the advance leg excludes the app there (coverage contract, H2).
-	require.EqualValues(t, 2200, sealedProrationCents(t, p))
+	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
 	armed := store.apps[appID].ProrationInvoiceID
 	require.NotEmpty(t, armed)
 
-	// Second sweep (a re-fire the next day): the terminal stamp is set, so the
-	// app is no longer pending and NO SECOND INTENT is sealed. An unstamped
-	// proposal would seal a fresh one on every sweep, for one charge.
+	// Second sweep (a re-fire the next day): the guard is armed, so the app is no
+	// longer pending and no second invoice is created.
 	second, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 0, second.Pending, "an already-billed app drops out of the work list")
-	require.Equal(t, 0, second.Proposed)
-	require.Len(t, p.charges, 1, "the re-fire must never bill twice")
+	require.Equal(t, 0, second.Pending, "an already-charged app drops out of the work list")
+	require.Equal(t, 0, second.Charged)
+	require.Len(t, sc.itemCalls, 1, "the re-fire must never charge twice")
 	require.Equal(t, armed, store.apps[appID].ProrationInvoiceID)
 }
 
@@ -555,9 +511,8 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 	// straddled period's full base.
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
-	_ = acct
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
 		OwnerUserID: user, AppID: appID, ModuleCount: 0,
@@ -567,21 +522,41 @@ func TestChargeCreationProration_AmountMatchesLegacyProration(t *testing.T) {
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.EqualValues(t, 2200, sealedProrationCents(t, p),
-		"the amount is unchanged by the cutover — only who collects it is")
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2200, resp.ProrationCents)
 
-	require.Empty(t, sc.invoiceCalls, "the leg mints no invoice")
-	require.Empty(t, sc.itemCalls)
-	require.Empty(t, sc.finalizeCalls)
+	require.Len(t, sc.itemCalls, 1)
+	require.Len(t, sc.invoiceCalls, 1)
+	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
+	requireLinePeriod(t, sc.itemCalls[0].period,
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC))
+	require.Equal(t, "cus_apps_1", sc.itemCalls[0].custID)
+	require.Equal(t, "app-ii-"+appID.String(), sc.itemCalls[0].idemKey)
+	require.Contains(t, sc.itemCalls[0].desc, "My App")
+	require.Contains(t, sc.itemCalls[0].desc, appID.String())
+	require.Equal(t, "app-inv-"+appID.String(), sc.invoiceCalls[0].idemKey)
+	require.Len(t, sc.finalizeCalls, 1, "the draft is finalized (auto_advance) — the money-moving step")
 
-	// The line still names the app a human will look for on their bill.
-	require.Len(t, p.charges[0].Lines, 1)
-	require.Contains(t, p.charges[0].Lines[0].Description, "My App")
-	require.Contains(t, p.charges[0].Lines[0].Description, appID.String())
-	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), p.charges[0].ExecuteNotBefore,
-		"coverage runs through the straddled period's end")
-	require.Equal(t, "intent:"+resp.IntentDigest, store.apps[appID].ProrationInvoiceID)
+	require.Equal(t, sc.invoiceID, resp.ProrationInvoiceID)
+	mirror := store.invoices[sc.invoiceID]
+	require.Equal(t, acct, mirror.AccountID)
+	require.Equal(t, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), mirror.PeriodStart) // partial coverage start
+	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd, "coverage runs through the straddled period's end")
+	require.Equal(t, sc.invoiceID, store.apps[appID].ProrationInvoiceID)
+
+	snap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}]
+	require.True(t, ok, "the charge freezes its base keyed on the FULL anchored period start")
+	require.Equal(t, "proration", snap.source)
+	require.EqualValues(t, 2_000_000, snap.snap.BaseMicros, "the creation-period snapshot carries only the prorated part")
+	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), snap.snap.PeriodEnd)
+	require.Equal(t, 0, snap.snap.ModuleCount)
+
+	straddleSnap, ok := store.baseSnapshots[snapKey{appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)}]
+	require.True(t, ok, "the straddled period billed in full gets its own snapshot (the boundary leg writes nothing for it)")
+	require.Equal(t, "proration", straddleSnap.source)
+	require.EqualValues(t, 20_000_000, straddleSnap.snap.BaseMicros)
+	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), straddleSnap.snap.PeriodEnd)
 }
 
 func TestChargeCreationProration_ChargesExactlyThePreviewedAmount(t *testing.T) {
@@ -626,19 +601,26 @@ func TestChargeCreationProration_ChargesExactlyThePreviewedAmount(t *testing.T) 
 			sc.invoiceAmountDue = previewCents
 
 			now := usage.GraceExpiry(tt.createdAt).Add(time.Hour)
-			p := &capturingProposer{}
-			svc := cycle.NewService(store, sc).
-				WithNow(func() time.Time { return now }).
-				WithIntentProposer(p)
+			svc := cycle.NewService(store, sc).WithNow(func() time.Time { return now })
 			appID := uuid.New()
 			registerMirror(t, svc, user, appID, tt.createdAt, 0)
 
 			resp, err := svc.ChargeCreationProration(context.Background(), appID)
 			require.NoError(t, err)
-			require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-			require.Equal(t, previewCents, sealedProrationCents(t, p),
-				"the customer is billed the previewed amount, rounded to cents exactly "+
-					"where the deleted invoice rounded it")
+			require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+			require.Equal(t, previewCents, resp.ProrationCents)
+			require.Len(t, sc.itemCalls, 1)
+			require.Equal(t, previewCents, sc.itemCalls[0].amountCfg,
+				"Stripe receives the preview amount converted to cents only at its boundary")
+			require.Equal(t, previewCents, store.invoices[sc.invoiceID].AmountDueCents)
+
+			// The sweep's micro snapshots sum to the preview exactly, including
+			// the full-base straddle snapshot for the period-end-eve case.
+			var sweptBaseMicros int64
+			for _, snapshot := range store.baseSnapshots {
+				sweptBaseMicros += snapshot.snap.BaseMicros
+			}
+			require.Equal(t, previewMicros, sweptBaseMicros)
 		})
 	}
 }
@@ -653,19 +635,16 @@ func TestChargeCreationProration_ChargesFlatBaseNotFoldedOverage(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	// The base line is the flat prorated $20. The two co-created over-modules
-	// ride the SAME sealed charge as their own lines (150¢ each), exactly as
-	// they rode the same invoice as separate items.
-	require.Len(t, p.charges[0].Lines, 3)
-	require.EqualValues(t, 1000, p.charges[0].Lines[0].AmountMicros/10_000,
-		"flat base only — the module overage is its own line, never folded into the base")
+	require.EqualValues(t, 1000, resp.ProrationCents, "flat base only — overage is billed per module instance, not folded here")
+	// The frozen created_module_count (7) is still recorded on the snapshot for
+	// display, even though it no longer moves the base amount.
+	require.Equal(t, 7, store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}].snap.ModuleCount)
 }
 
 func TestChargeCreationProration_CreatedOnBoundaryChargesFullNewPeriodBase(t *testing.T) {
@@ -675,16 +654,19 @@ func TestChargeCreationProration_CreatedOnBoundaryChargesFullNewPeriodBase(t *te
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), 0)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.EqualValues(t, 2_000, sealedProrationCents(t, p), "creation-day == period start → full base")
-	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), p.charges[0].ExecuteNotBefore,
-		"the coverage this seals is the whole [Jul 4, Aug 4) period")
+	require.EqualValues(t, 2_000, resp.ProrationCents, "creation-day == period start → full base")
+	mirror := store.invoices[sc.invoiceID]
+	require.Equal(t, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodStart)
+	require.Equal(t, time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC), mirror.PeriodEnd)
+	snap := store.baseSnapshots[snapKey{appID, time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)}]
+	require.Equal(t, "proration", snap.source)
+	require.EqualValues(t, usage.BaseFeeMicros, snap.snap.BaseMicros)
 }
 
 func TestChargeCreationProration_DelayedPastPeriodEndStillCharges(t *testing.T) {
@@ -705,15 +687,17 @@ func TestChargeCreationProration_DelayedPastPeriodEndStillCharges(t *testing.T) 
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC), 0)
 
 	res, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Proposed, "the late sweep still bills the creation period")
-	require.EqualValues(t, 968, sealedProrationCents(t, p))
-	require.NotEmpty(t, store.apps[appID].ProrationInvoiceID)
+	require.Equal(t, 1, res.Charged)
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 968, sc.itemCalls[0].amountCfg)
+	snap := store.baseSnapshots[snapKey{appID, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)}]
+	require.Equal(t, "proration", snap.source)
 }
 
 // --- ChargeCreationProration: idempotency + gates ----------------------------
@@ -722,19 +706,19 @@ func TestChargeCreationProration_IdempotentGuard(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), 0)
 
 	first, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, first.Status)
+	require.Equal(t, cycle.ProrationStatusCharged, first.Status)
 
 	second, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
 	require.Equal(t, cycle.ProrationStatusAlreadyCharged, second.Status)
-	require.Equal(t, "intent:"+first.IntentDigest, second.ProrationInvoiceID)
-	require.Len(t, p.charges, 1, "the one-shot guard prevents a second charge")
+	require.Equal(t, first.ProrationInvoiceID, second.ProrationInvoiceID)
+	require.Len(t, sc.itemCalls, 1, "the one-shot guard prevents a second charge")
 }
 
 func TestChargeCreationProration_SkipsDeleted(t *testing.T) {
@@ -805,7 +789,7 @@ func TestSweep_ChargesOnlyPastGraceLiveUnchargedApps(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, _ := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 
 	past := uuid.New()  // past grace, live, uncharged → charged
 	young := uuid.New() // within grace → skipped
@@ -822,7 +806,7 @@ func TestSweep_ChargesOnlyPastGraceLiveUnchargedApps(t *testing.T) {
 	res, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, 1, res.Pending)
-	require.Equal(t, 1, res.Proposed)
+	require.Equal(t, 1, res.Charged)
 	require.NotEmpty(t, store.apps[past].ProrationInvoiceID)
 	require.Empty(t, store.apps[young].ProrationInvoiceID)
 	require.Empty(t, store.apps[gone].ProrationInvoiceID)
@@ -837,7 +821,7 @@ func TestSweep_AppDeletedAfterGraceStillPaysCreationCharge(t *testing.T) {
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	// Created Jul 1 08:00 → grace ends Jul 4 08:00 (straddles the Jul 4 anchor
 	// boundary). Deleted Jul 4 12:00 — AFTER grace, BEFORE the daily sweep.
@@ -848,10 +832,10 @@ func TestSweep_AppDeletedAfterGraceStillPaysCreationCharge(t *testing.T) {
 
 	res, err := svc.SweepCreationProrations(context.Background(), time.Date(2026, 7, 5, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Proposed,
+	require.Equal(t, 1, res.Charged,
 		"a post-grace delete survived the grace — the creation (+straddle) charge is owed, not dodgeable")
 	require.NotEmpty(t, store.apps[appID].ProrationInvoiceID)
-	require.EqualValues(t, 2200, sealedProrationCents(t, p))
+	require.Len(t, sc.finalizeCalls, 1)
 }
 
 // --- FINDING 1: the creation-proration charge must price off the module count
@@ -873,7 +857,7 @@ func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceInsta
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC), 0)
 
@@ -887,11 +871,17 @@ func TestChargeCreationProration_PricesFrozenCountNotLiveCountAfterMidGraceInsta
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.EqualValues(t, 2200, sealedProrationCents(t, p),
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2200, resp.ProrationCents,
 		"must price off the FROZEN count (0 modules → $20 base), not the live count (7 → $26 base)")
-	require.Len(t, p.charges[0].Lines, 1,
-		"the mid-grace installs were not co-created, so they own no line on this charge")
+	require.Len(t, sc.itemCalls, 1)
+	require.EqualValues(t, 2200, sc.itemCalls[0].amountCfg)
+
+	// The migration-028 snapshot must also record the FROZEN count/amount — the
+	// display must never show a tier that never applied to those days either.
+	snap := store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}]
+	require.Equal(t, 0, snap.snap.ModuleCount)
+	require.EqualValues(t, 2_000_000, snap.snap.BaseMicros)
 
 	// The LIVE count survives untouched for the boundary advance leg's future
 	// periods — only the historical creation-period charge is frozen.
@@ -907,7 +897,7 @@ func TestChargeCreationProration_FlatBaseUnaffectedByMidGraceUninstall(t *testin
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
 
@@ -920,9 +910,9 @@ func TestChargeCreationProration_FlatBaseUnaffectedByMidGraceUninstall(t *testin
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.EqualValues(t, 1_000, p.charges[0].Lines[0].AmountMicros/10_000,
-		"flat base — unaffected by the module count or its mid-grace change")
+	require.EqualValues(t, 1_000, resp.ProrationCents, "flat base — unaffected by the module count or its mid-grace change")
+	// The frozen count is still recorded on the snapshot for display.
+	require.Equal(t, 7, store.baseSnapshots[snapKey{appID, time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)}].snap.ModuleCount)
 }
 
 // --- FINDING 2: no retroactive catch-up (D1d) when an account only activates
@@ -994,7 +984,7 @@ func TestChargeCreationProration_ActivatedBeforePeriodClosesStillCharges(t *test
 	store := newFakeStore()
 	user, acct := registeredAccount(store)
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 	appID := uuid.New()
 	registerMirror(t, svc, user, appID, time.Date(2026, 1, 10, 6, 0, 0, 0, time.UTC), 0)
 	delete(store.activation, acct) // legacy pre-gate row: unactivated at creation
@@ -1010,20 +1000,21 @@ func TestChargeCreationProration_ActivatedBeforePeriodClosesStillCharges(t *test
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
-	require.EqualValues(t, 2_000, sealedProrationCents(t, p), "created on/after the period start → full base")
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
+	require.EqualValues(t, 2_000, resp.ProrationCents, "created on/after the period start → full base")
+	require.Len(t, sc.itemCalls, 1)
 	require.False(t, store.apps[appID].ProrationSkipped)
 }
 
-// Recovery resolves the SAME funding hop the charge itself rides: a
+// Recovery resolves the SAME funding hop as the fresh-charge path: a
 // sponsor-funded org app's crashed proration attempt is looked up under the
 // SPONSOR's Stripe customer — the org account has none, so a recovery
-// resolving the attribution account directly would fail loudly, or worse miss
-// money that already moved and seal a second charge for it.
+// resolving the attribution account directly would fail loudly (or, worse,
+// miss the moved money and re-charge fresh once the idem key ages out).
 func TestChargeCreationProration_RecoveryResolvesSponsorCustomer(t *testing.T) {
 	store := newFakeStore()
 	sc := newFakeStripe()
-	svc, p := prorationSvc(store, sc)
+	svc := appsSvc(store, sc)
 
 	org, orgAcct, sponsorAcct := uuid.New(), uuid.New(), uuid.New()
 	store.accountsByOrg[org] = orgAcct
@@ -1048,15 +1039,15 @@ func TestChargeCreationProration_RecoveryResolvesSponsorCustomer(t *testing.T) {
 	// A prior attempt committed exact ownership and crashed before any Stripe
 	// object survived. Recovery must SEARCH the sponsor's customer, then charge
 	// fresh through the same funding hop.
-	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
+	attempt := freezeCombinedBeforeDraft(t, svc, store, sc, appID)
 	require.Empty(t, attempt.TimerIDs)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, resp.Status)
+	require.Equal(t, cycle.ProrationStatusCharged, resp.Status)
 	require.Equal(t, []string{"cus_sponsor"}, sc.findByRefCustIDs,
 		"the recovery lookup must search the FUNDING customer, not the org account's")
-	require.Empty(t, sc.invoiceCalls, "nothing moved at the provider — the charge is sealed instead")
-	require.Positive(t, sealedProrationCents(t, p),
-		"the recovery found nothing, so the charge is owed and must be sealed, not dropped")
+	require.Len(t, sc.invoiceCalls, 1)
+	require.Equal(t, "cus_sponsor", sc.invoiceCalls[0].custID,
+		"the fresh charge after a not-found recovery rides the same funding hop")
 }

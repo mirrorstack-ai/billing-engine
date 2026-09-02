@@ -593,16 +593,11 @@ func (s *pgxStore) InvoiceForPayment(ctx context.Context, invoiceID, accountID u
 	if err != nil {
 		return InvoicePayTarget{}, false, err
 	}
-	due, err := centsNumericToMicros(row.AmountDue)
-	if err != nil {
-		return InvoicePayTarget{}, false, fmt.Errorf("invoice amount due: %w", err)
-	}
 	return InvoicePayTarget{
 		StripeInvoiceID:         row.StripeInvoiceID,
 		Status:                  row.Status,
 		ChargeFundingAccountID:  uuidFromPgtype(row.ChargeFundingAccountID),
 		FundingLegacyUnresolved: row.ChargeFundingLegacyUnresolved,
-		AmountDueMicros:         due,
 	}, true, nil
 }
 

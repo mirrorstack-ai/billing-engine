@@ -353,28 +353,3 @@ WHERE id = sqlc.arg(attempt_id)::uuid
   AND type = 'auto_topup'
   AND status = 'pending'
 RETURNING id;
-
--- MarkAutoTopUpProposed records that this attempt's charge was sealed as an
--- intent instead of collected.
---
--- 'proposed' is terminal for the legacy rail: the resume and retry paths
--- select `status IN ('pending','failed')`, so a proposed row is invisible to
--- them and cannot be picked up and charged. That is the point — the intent
--- rail has taken this attempt.
---
--- The guard is `status = 'pending'`, the same as FailAutoTopUpAttempt: an
--- attempt that already settled or failed is not ours to propose, and a zero
--- row count tells the caller it lost a race rather than silently overwriting a
--- terminal state.
---
--- The reference is written prefixed as 'intent:<digest>' by the caller, so
--- nothing downstream reads a digest as a provider object id.
--- name: MarkAutoTopUpProposed :one
-UPDATE ms_billing.credit_ledger
-SET status = 'proposed',
-    proposed_reference = sqlc.arg(proposed_reference)::text
-WHERE id = sqlc.arg(attempt_id)::uuid
-  AND account_id = sqlc.arg(account_id)::uuid
-  AND type = 'auto_topup'
-  AND status = 'pending'
-RETURNING id;

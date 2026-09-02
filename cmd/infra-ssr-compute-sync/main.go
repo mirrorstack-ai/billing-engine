@@ -58,10 +58,12 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/awslambdainv"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 func main() {
@@ -142,7 +144,11 @@ func buildDeps() (*usage.Service, lambdaLister, metricsQuerier, idleChecker) {
 			}
 			coordinator = credit.NewCoordinator(counter, standingStore, svc, nil)
 			stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
-			autoTopUpExecutor := autotopup.NewStandardExecutor(pool, stripeKey).WithSettlementObserver(coordinator)
+			autoTopUpExecutor := autotopup.NewExecutor(
+				autotopup.NewStore(pool),
+				creditledger.NewStore(pool),
+				billingstripe.NewAutoTopUpClient(stripeKey),
+			).WithSettlementObserver(coordinator)
 			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
 				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
 					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)

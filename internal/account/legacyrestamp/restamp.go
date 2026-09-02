@@ -80,11 +80,9 @@ func NewRunner(
 		panic("legacyrestamp.NewRunner: page size and concurrency must be positive")
 	}
 	return &Runner{
-		source:   source,
-		notifier: notifier,
-		// Rejected at <= 0 four lines above; the caller supplies a page size,
-		// not a length.
-		pageSize:    int32(pageSize), //nolint:gosec // operator-supplied page size, validated > 0
+		source:      source,
+		notifier:    notifier,
+		pageSize:    int32(pageSize),
 		concurrency: concurrency,
 	}
 }

@@ -32,16 +32,13 @@
 -- NULL for a metered-but-unpriced metric.
 -- name: UpsertMetricDefinition :exec
 INSERT INTO ms_billing.metric_definitions (
-    module_id, metric, kind, aggregation_key, unit, unit_price_micros, active
+    module_id, metric, kind, unit, unit_price_micros, active
 ) VALUES (
-    @module_id::uuid, @metric::text, @kind::ms_billing.metric_kind,
-    sqlc.narg(aggregation_key)::text, @unit::text,
-    sqlc.narg(unit_price_micros)::bigint, @active::boolean
+    $1, $2, $3, $4, $5, $6
 )
 ON CONFLICT (module_id, metric)
 DO UPDATE SET
     kind              = EXCLUDED.kind,
-    aggregation_key   = EXCLUDED.aggregation_key,
     unit              = EXCLUDED.unit,
     unit_price_micros = EXCLUDED.unit_price_micros,
     active            = EXCLUDED.active;
@@ -89,13 +86,12 @@ ON CONFLICT (module_id, metric, module_version) DO NOTHING;
 -- metric_model_prices, a secondary price layered over the same sentinel row).
 -- name: UpsertInfraPriceOverride :execrows
 INSERT INTO ms_billing.metric_definitions (
-    module_id, metric, kind, aggregation_key, unit, unit_price_micros, active
+    module_id, metric, kind, unit, unit_price_micros, active
 )
 SELECT
     @module_id::uuid,
     sentinel.metric,
     sentinel.kind,
-    sentinel.aggregation_key,
     sentinel.unit,
     @unit_price_micros::bigint,
     true
@@ -105,7 +101,6 @@ WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
 ON CONFLICT (module_id, metric)
 DO UPDATE SET
     unit_price_micros = EXCLUDED.unit_price_micros,
-    aggregation_key   = EXCLUDED.aggregation_key,
     active            = true;
 
 -- AbsorbAllInfraPriceOverrides writes a price-0 override for EVERY active
@@ -128,13 +123,12 @@ DO UPDATE SET
 -- except egress" is expressible. :execrows so the store can report the count.
 -- name: AbsorbAllInfraPriceOverrides :execrows
 INSERT INTO ms_billing.metric_definitions (
-    module_id, metric, kind, aggregation_key, unit, unit_price_micros, active
+    module_id, metric, kind, unit, unit_price_micros, active
 )
 SELECT
     @module_id::uuid,
     sentinel.metric,
     sentinel.kind,
-    sentinel.aggregation_key,
     sentinel.unit,
     0,
     true
@@ -144,7 +138,6 @@ WHERE sentinel.module_id = '00000000-0000-0000-0000-000000000000'
 ON CONFLICT (module_id, metric)
 DO UPDATE SET
     unit_price_micros = 0,
-    aggregation_key   = EXCLUDED.aggregation_key,
     active            = true;
 
 -- DeleteInfraPriceOverridesNotIn makes a module's reserved-metric override set
@@ -195,7 +188,7 @@ WHERE t.module_id = @module_id::uuid
 -- undeclared metric (no row → INVALID_INPUT) and to snapshot `kind` onto
 -- the usage_events row; an inactive metric is handled in Go.
 -- name: LookupMetricDefinition :one
-SELECT kind, aggregation_key, unit, unit_price_micros, active
+SELECT kind, unit, unit_price_micros, active
 FROM ms_billing.metric_definitions
 WHERE module_id = $1 AND metric = $2;
 
@@ -210,115 +203,11 @@ WHERE module_id = $1 AND metric = $2;
 -- never affects price) — NULL for every event that carries no version.
 -- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
-    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
-    model, module_version, observation_version, subject, metadata, occurred_at,
-    billable_at, aggregation_key, payload_fingerprint, occurrence_policy
+    event_id, account_id, app_id, module_id, metric, kind, value, recorded_at, model, module_version
 ) VALUES (
-    @event_id::text, sqlc.narg(account_id)::uuid, @app_id::uuid,
-    @module_id::uuid, @metric::text, @kind::ms_billing.metric_kind,
-    @value::numeric, @recorded_at::timestamptz, sqlc.narg(model)::text,
-    sqlc.narg(module_version)::text, @observation_version::smallint,
-    sqlc.narg(subject)::text, sqlc.narg(metadata)::json,
-    sqlc.narg(occurred_at)::timestamptz, @billable_at::timestamptz,
-    sqlc.narg(aggregation_key)::text,
-    @payload_fingerprint::bytea, @occurrence_policy::text
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 )
 ON CONFLICT (event_id) DO NOTHING;
-
--- UsageEventFingerprint resolves an event-id retry after an INSERT conflict.
--- A NULL fingerprint identifies a pre-055 historical row: it remains a legacy
--- idempotent success because its original authoritative owner cannot be
--- reconstructed safely enough to compare a new canonical payload.
--- name: UsageEventFingerprint :one
-SELECT payload_fingerprint
-FROM ms_billing.usage_events
-WHERE event_id = $1;
-
--- UsageRejectionFingerprint extends event-id collision detection across a
--- previous policy rejection. The identical payload may become admissible later
--- (for example once a future timestamp enters tolerance), but the id can never
--- be rebound to different semantics.
--- name: UsageRejectionFingerprint :one
-SELECT payload_fingerprint
-FROM ms_billing.usage_observation_rejections
-WHERE event_id = $1
-ORDER BY rejected_at ASC
-LIMIT 1;
-
--- LockUsageAccountActivation serializes v2 period derivation with the
--- first-card activation transition. The caller compares this authoritative
--- row state with the precomputed anchor and retries if activation won first.
--- Rollup takes the same row lock before its period barrier.
--- name: LockUsageAccountActivation :one
-SELECT activated_at
-FROM ms_billing.accounts
-WHERE id = @account_id::uuid
-FOR SHARE;
-
--- UsagePeriodClosed is evaluated while the caller holds the account-period
--- advisory transaction lock shared with rollup. `closing` is terminal for
--- observation intake even if a later payment attempt is retried.
--- name: UsagePeriodClosed :one
-SELECT (
-    EXISTS (
-        SELECT 1
-        FROM ms_billing.billing_periods p
-        WHERE p.account_id = @account_id::uuid
-          AND p.period_start = @period_start::timestamptz
-          AND p.period_end = @period_end::timestamptz
-          AND p.status IN ('closing', 'invoiced')
-    )
-    OR EXISTS (
-        SELECT 1
-        FROM ms_billing.billing_runs r
-        WHERE r.account_id = @account_id::uuid
-          AND r.period_start = @period_start::timestamptz
-          AND r.period_end = @period_end::timestamptz
-    )
-    OR EXISTS (
-        -- Defense in depth for any pre-055/manual row whose status repair was
-        -- missed: a frozen aggregate is already an immutable rollup snapshot.
-        SELECT 1
-        FROM ms_billing.billing_periods p
-        JOIN ms_billing.usage_aggregates aggregate ON aggregate.period_id = p.id
-        WHERE p.account_id = @account_id::uuid
-          AND p.period_start = @period_start::timestamptz
-          AND p.period_end = @period_end::timestamptz
-    )
-)::boolean;
-
--- UsageSubjectPeak reads the current keyed maximum under the account-period
--- advisory lock. The ingest service uses only the positive increase as its
--- disposable-credit fast-path delta; rollup remains the authoritative bill.
--- name: UsageSubjectPeak :one
-SELECT COALESCE(MAX(value), 0)::numeric
-FROM ms_billing.usage_events
-WHERE account_id = @account_id::uuid
-  AND app_id = @app_id::uuid
-  AND module_id = @module_id::uuid
-  AND metric = @metric::text
-  AND COALESCE(model, '') = @model::text
-  AND COALESCE(module_version, '') = @module_version::text
-  AND subject = @subject::text
-  AND aggregation_key = 'subject'
-  AND COALESCE(billable_at, recorded_at) >= @period_start::timestamptz
-  AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz;
-
--- InsertUsageObservationRejection persists only bounded identifiers and the
--- canonical fingerprint. Diagnostic metadata is deliberately never stored on
--- a rejected row.
--- name: InsertUsageObservationRejection :execrows
-INSERT INTO ms_billing.usage_observation_rejections (
-    event_id, account_id, app_id, module_id, owner_user_id, owner_org_id,
-    metric, subject, occurred_at, reason, payload_fingerprint
-) VALUES (
-    @event_id::text, sqlc.narg(account_id)::uuid, @app_id::uuid,
-    @module_id::uuid, sqlc.narg(owner_user_id)::uuid,
-    sqlc.narg(owner_org_id)::uuid, @metric::text, sqlc.narg(subject)::text,
-    sqlc.narg(occurred_at)::timestamptz, @reason::text,
-    @payload_fingerprint::bytea
-)
-ON CONFLICT (event_id, reason, payload_fingerprint) DO NOTHING;
 
 -- UpsertModuleVisibility records a module's published/private visibility
 -- (developer margin-share dimension; NEVER a customer markup). Fired by
@@ -351,40 +240,14 @@ DO UPDATE SET visibility = EXCLUDED.visibility;
 -- §7-B: never under-collect on a lagging publish) for a module with no
 -- visibility row yet.
 -- name: CurrentPeriodUsageSummary :many
-WITH base_events AS (
-    SELECT
-        app_id, module_id, metric, kind, aggregation_key, subject,
-        COALESCE(model, '') AS model,
-        COALESCE(module_version, '') AS module_version,
-        value
-    FROM ms_billing.usage_events
-    WHERE account_id = $1
-      AND COALESCE(billable_at, recorded_at) >= $2
-      AND COALESCE(billable_at, recorded_at) <  $3
-),
-billable_events AS (
-    -- Every legacy/non-keyed row keeps the exact coarse live behavior.
-    SELECT app_id, module_id, metric, kind, model, module_version, value AS billable_value
-    FROM base_events
-    WHERE aggregation_key IS DISTINCT FROM 'subject'
-    UNION ALL
-    -- Keyed peak is exact even before rollup: one MAX per authoritative
-    -- subject inside the existing app/model/version bill-line dimensions.
-    SELECT
-        app_id, module_id, metric, kind, model, module_version,
-        MAX(value)::numeric AS billable_value
-    FROM base_events
-    WHERE aggregation_key = 'subject'
-    GROUP BY app_id, module_id, metric, kind, model, module_version, subject
-)
 SELECT
     e.module_id                                         AS module_id,
     e.metric                                            AS metric,
     e.kind                                              AS kind,
-    COALESCE(SUM(e.billable_value), 0)::numeric         AS total_quantity,
+    COALESCE(SUM(e.value), 0)::numeric                  AS total_quantity,
     COALESCE(MAX(md.unit_price_micros), 0)::bigint      AS unit_price_micros,
     COALESCE(
-        SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)),
+        SUM(e.value * COALESCE(md.unit_price_micros, 0)),
         0
     )::numeric                                          AS raw_cost_micros,
     -- display_group is the §11 compaction taxonomy the frontend rolls up by.
@@ -399,11 +262,14 @@ SELECT
     -- module_visibility's PRIMARY KEY, so at most one row per group).
     COALESCE(MAX(mv.visibility), 'private')::ms_billing.margin_share_class
                                                         AS visibility
-FROM billable_events e
+FROM ms_billing.usage_events e
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric
 LEFT JOIN ms_billing.module_visibility mv
     ON mv.module_id = e.module_id
+WHERE e.account_id = $1
+  AND e.recorded_at >= $2
+  AND e.recorded_at <  $3
 GROUP BY e.module_id, e.metric, e.kind
 ORDER BY e.metric;
 
@@ -551,41 +417,17 @@ WITH rolled AS (
       AND bp.period_start = @period_start::timestamptz
     GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
 ),
-live_base AS (
-    SELECT
-        module_id, metric, kind, aggregation_key, subject,
-        COALESCE(model, '') AS model,
-        COALESCE(module_version, '') AS module_version,
-        value
-    FROM ms_billing.usage_events
-    WHERE account_id = @account_id::uuid
-      AND app_id = @app_id::uuid
-      AND COALESCE(billable_at, recorded_at) >= @period_start::timestamptz
-      AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz
-),
-live_values AS (
-    SELECT module_id, metric, kind, model, module_version, value AS billable_value
-    FROM live_base
-    WHERE aggregation_key IS DISTINCT FROM 'subject'
-    UNION ALL
-    SELECT
-        module_id, metric, kind, model, module_version,
-        MAX(value)::numeric AS billable_value
-    FROM live_base
-    WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, kind, model, module_version, subject
-),
 live AS (
     SELECT
         e.module_id                                        AS module_id,
         e.metric                                           AS metric,
         e.kind                                             AS kind,
-        e.model                                             AS model,
-        e.module_version                                    AS module_version,
-        COALESCE(SUM(e.billable_value), 0)::numeric         AS billable_quantity,
+        COALESCE(e.model, '')                              AS model,
+        COALESCE(e.module_version, '')                     AS module_version,
+        COALESCE(SUM(e.value), 0)::numeric                 AS billable_quantity,
         COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
         COALESCE(
-            SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)),
+            SUM(e.value * COALESCE(md.unit_price_micros, 0)),
             0
         )::numeric                                         AS charged_micros,
         -- The live (pre-rollup) estimate has no window-segmentation logic —
@@ -594,10 +436,14 @@ live AS (
         -- before a period rolls up, the active window is simply unknown.
         NULL::numeric                                      AS active_seconds,
         NULL::numeric                                      AS period_days
-    FROM live_values e
+    FROM ms_billing.usage_events e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
-    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version
+    WHERE e.account_id  = @account_id::uuid
+      AND e.app_id      = @app_id::uuid
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
+    GROUP BY e.module_id, e.metric, e.kind, COALESCE(e.model, ''), COALESCE(e.module_version, '')
 )
 SELECT
     module_id, metric, kind, model, module_version,
@@ -673,38 +519,14 @@ WITH rolled AS (
       AND bp.period_start = @period_start::timestamptz
     GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
 ),
-live_base AS (
-    SELECT
-        module_id, metric, kind, aggregation_key, subject,
-        COALESCE(model, '') AS model,
-        COALESCE(module_version, '') AS module_version,
-        value
-    FROM ms_billing.usage_events
-    WHERE account_id = @account_id::uuid
-      AND app_id = @app_id::uuid
-      AND COALESCE(billable_at, recorded_at) >= @period_start::timestamptz
-      AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz
-),
-live_values AS (
-    SELECT module_id, metric, kind, model, module_version, value AS billable_value
-    FROM live_base
-    WHERE aggregation_key IS DISTINCT FROM 'subject'
-    UNION ALL
-    SELECT
-        module_id, metric, kind, model, module_version,
-        MAX(value)::numeric AS billable_value
-    FROM live_base
-    WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, kind, model, module_version, subject
-),
 live AS (
     SELECT
         e.module_id                                        AS module_id,
         e.metric                                           AS metric,
         e.kind                                             AS kind,
-        e.model                                             AS model,
-        e.module_version                                    AS module_version,
-        COALESCE(SUM(e.billable_value), 0)::numeric         AS billable_quantity,
+        COALESCE(e.model, '')                              AS model,
+        COALESCE(e.module_version, '')                     AS module_version,
+        COALESCE(SUM(e.value), 0)::numeric                 AS billable_quantity,
         COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
         -- Custom metric → qty × price (identity 1×). Reserved infra.* / platform.*
         -- → qty × price × 12/10 (the SAME 1.2× the rollup freezes; mirrors
@@ -712,8 +534,8 @@ live AS (
         -- constant within each group.
         CASE
             WHEN e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%'
-                THEN COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
-            ELSE COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0)
+                THEN COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
+            ELSE COALESCE(SUM(e.value * COALESCE(md.unit_price_micros, 0)), 0)
         END::numeric                                       AS charged_micros,
         -- The live (pre-rollup) estimate has no window-segmentation logic —
         -- that lives only in cmd/billing-cycle's rollup. Explicit NULL,
@@ -721,10 +543,14 @@ live AS (
         -- before a period rolls up, the active window is simply unknown.
         NULL::numeric                                      AS active_seconds,
         NULL::numeric                                      AS period_days
-    FROM live_values e
+    FROM ms_billing.usage_events e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
-    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version
+    WHERE e.account_id  = @account_id::uuid
+      AND e.app_id      = @app_id::uuid
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
+    GROUP BY e.module_id, e.metric, e.kind, COALESCE(e.model, ''), COALESCE(e.module_version, '')
 )
 SELECT
     module_id, metric, kind, model, module_version,
@@ -803,8 +629,8 @@ live AS (
         ON md.module_id = e.module_id AND md.metric = e.metric
     WHERE e.account_id  = @account_id::uuid
       AND e.app_id      = @app_id::uuid
-      AND COALESCE(e.billable_at, e.recorded_at) >= @period_start::timestamptz
-      AND COALESCE(e.billable_at, e.recorded_at) <  @period_end::timestamptz
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
       AND e.module_id = '00000000-0000-0000-0000-000000000000'
     GROUP BY e.metric
@@ -894,8 +720,8 @@ live AS (
         ON md_ovr.module_id = e.module_id AND md_ovr.metric = e.metric
     WHERE e.account_id  = @account_id::uuid
       AND e.app_id      = @app_id::uuid
-      AND COALESCE(e.billable_at, e.recorded_at) >= @period_start::timestamptz
-      AND COALESCE(e.billable_at, e.recorded_at) <  @period_end::timestamptz
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
       AND e.module_id <> '00000000-0000-0000-0000-000000000000'
     GROUP BY e.module_id, COALESCE(e.module_version, ''), e.metric
@@ -994,8 +820,8 @@ SELECT app_id FROM (
     FROM ms_billing.usage_events e
     WHERE e.account_id  = @account_id::uuid
       AND e.app_id     <> '00000000-0000-0000-0000-000000000000'::uuid
-      AND COALESCE(e.billable_at, e.recorded_at) >= @period_start::timestamptz
-      AND COALESCE(e.billable_at, e.recorded_at) <  @period_end::timestamptz
+      AND e.recorded_at >= @period_start::timestamptz
+      AND e.recorded_at <  @period_end::timestamptz
 ) apps_with_usage
 ORDER BY app_id;
 

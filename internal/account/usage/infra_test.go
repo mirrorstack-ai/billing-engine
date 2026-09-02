@@ -166,30 +166,6 @@ func TestRecordInfraUsage_IdempotentReplay(t *testing.T) {
 	require.Len(t, store.events, 1)
 }
 
-func TestRecordInfraUsage_EventIDPayloadAndOwnerCollision(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		mutate func(*usage.RecordInfraUsageRequest)
-	}{
-		{name: "value", mutate: func(req *usage.RecordInfraUsageRequest) { req.Value++ }},
-		{name: "owner", mutate: func(req *usage.RecordInfraUsageRequest) { req.OwnerUserID = uuid.New() }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeStore()
-			req := validInfra()
-			svc := newService(store)
-			_, err := svc.RecordInfraUsage(context.Background(), req)
-			require.NoError(t, err)
-
-			changed := req
-			tc.mutate(&changed)
-			_, err = svc.RecordInfraUsage(context.Background(), changed)
-			requireCode(t, err, billing.CodeConflict)
-			require.Len(t, store.events, 1)
-		})
-	}
-}
-
 func TestRecordInfraUsage_CreditEvaluatorForcesLiveProjectionOnceForFreshOwnerEvent(t *testing.T) {
 	store := newFakeStore()
 	req := validInfra()

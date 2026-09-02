@@ -31,17 +31,6 @@ ON CONFLICT (account_id, period_start)
 DO UPDATE SET status = ms_billing.billing_periods.status
 RETURNING id, status;
 
--- CloseBillingPeriodForRollup transitions the period to its intake barrier.
--- The caller holds the same account-period advisory transaction lock as v2
--- observation insertion, so no accepted row can race the rollup snapshot.
--- A retry may re-enter an already-closing period; invoiced is also left intact.
--- name: CloseBillingPeriodForRollup :exec
-UPDATE ms_billing.billing_periods
-SET status = CASE WHEN status = 'open' THEN 'closing' ELSE status END
-WHERE account_id = @account_id::uuid
-  AND period_start = @period_start::timestamptz
-  AND period_end = @period_end::timestamptz;
-
 -- RollupSumKinds aggregates the additive kinds (count, sum) by SUM(value)
 -- over [period_start, period_end) per (app, module, metric, model,
 -- module_version). count and sum both roll up by SUM; kind is carried
@@ -59,18 +48,13 @@ SELECT
     module_id                      AS module_id,
     metric                         AS metric,
     kind                           AS kind,
-    NULL::text                     AS aggregation_key,
     COALESCE(model, '')            AS model,
     COALESCE(module_version, '')   AS module_version,
     COALESCE(SUM(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
-  AND COALESCE(billable_at, recorded_at) >= $2
-  AND COALESCE(billable_at, recorded_at) <  $3
-  -- Card-less calendar rollup freezes legacy usage for existing disclosure
-  -- behavior but leaves v2 pending until activation supplies its billable
-  -- anchor. include_v2 is true only for an activated, anchor-consistent window.
-  AND (sqlc.arg(include_v2)::boolean OR observation_version <> 2)
+  AND recorded_at >= $2
+  AND recorded_at <  $3
   AND kind IN ('count', 'sum')
 GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '');
 
@@ -129,21 +113,19 @@ WITH raw_events AS (
         app_id, module_id, metric, kind,
         COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
-        value, COALESCE(billable_at, recorded_at) AS observation_at, event_id,
+        value, recorded_at, event_id,
         sqlc.arg(period_start)::timestamptz AS period_start
     FROM ms_billing.usage_events
     WHERE account_id = $1
-      AND COALESCE(billable_at, recorded_at) >= sqlc.arg(period_start)::timestamptz
-      AND COALESCE(billable_at, recorded_at) <  sqlc.arg(period_end)::timestamptz
-      AND (sqlc.arg(include_v2)::boolean OR observation_version <> 2)
+      AND recorded_at >= sqlc.arg(period_start)::timestamptz
+      AND recorded_at <  sqlc.arg(period_end)::timestamptz
       AND kind = 'peak'
-      AND aggregation_key IS NULL
 ),
 windowed AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version, value, observation_at, period_start,
-        LEAD(observation_at, 1, sqlc.arg(period_end)::timestamptz)
-            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end,
+        app_id, module_id, metric, kind, model, module_version, value, recorded_at, period_start,
+        LEAD(recorded_at, 1, sqlc.arg(period_end)::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end,
         -- row_num identifies the EARLIEST-observed row of the WHOLE (app,
         -- module, metric, model) stream this period (rn=1 — the same
         -- ORDER BY as the LEAD above, so ties resolve to the identical row).
@@ -155,7 +137,7 @@ windowed AS (
         -- period boundary) would otherwise lose that gap from EVERY
         -- version's window on EVERY period, silently shrinking window_v/P
         -- below 1 even in the single-version, no-change common case.
-        ROW_NUMBER() OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS row_num
+        ROW_NUMBER() OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS row_num
     FROM raw_events
 )
 SELECT
@@ -163,64 +145,15 @@ SELECT
     module_id,
     metric,
     kind,
-    NULL::text AS aggregation_key,
     model,
     module_version,
     COALESCE(MAX(value), 0)::numeric AS billable_quantity,
     COALESCE(SUM(
-        EXTRACT(EPOCH FROM (segment_end - observation_at))
-        + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (observation_at - period_start)) ELSE 0 END
+        EXTRACT(EPOCH FROM (segment_end - recorded_at))
+        + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (recorded_at - period_start)) ELSE 0 END
     ), 0)::numeric AS active_seconds
 FROM windowed
 GROUP BY app_id, module_id, metric, kind, model, module_version;
-
--- RollupKeyedPeakKind implements aggregation_key="subject": inside an
--- account's period, each authoritative subject contributes its own MAX(value),
--- and those subject maxima are summed. Subject identity is scoped to the meter
--- (app, module, metric), not diagnostic metadata, provider, or retry event id.
---
--- Existing authoritative bill-line dimensions remain part of the scope:
--- account/app/module/metric/model/module_version/window. A model or version
--- change is a distinct pricing definition and therefore a distinct keyed line;
--- no arrival-order-dependent "latest wins" reassignment can move usage between
--- prices. Keyed peak is a cardinality-style quantity and receives no
--- level-window proration.
--- name: RollupKeyedPeakKind :many
-WITH eligible AS (
-    SELECT
-        app_id,
-        module_id,
-        metric,
-        subject,
-        COALESCE(model, '') AS model,
-        COALESCE(module_version, '') AS module_version,
-        value
-    FROM ms_billing.usage_events
-    WHERE account_id = @account_id::uuid
-      AND COALESCE(billable_at, recorded_at) >= @period_start::timestamptz
-      AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz
-      AND (sqlc.arg(include_v2)::boolean OR observation_version <> 2)
-      AND kind = 'peak'
-      AND aggregation_key = 'subject'
-),
-subject_peaks AS (
-    SELECT
-        app_id, module_id, metric, subject, model, module_version,
-        MAX(value)::numeric AS subject_peak
-    FROM eligible
-    GROUP BY app_id, module_id, metric, subject, model, module_version
-)
-SELECT
-    p.app_id,
-    p.module_id,
-    p.metric,
-    'peak'::ms_billing.metric_kind AS kind,
-    'subject'::text AS aggregation_key,
-    p.model,
-    p.module_version,
-    COALESCE(SUM(p.subject_peak), 0)::numeric AS billable_quantity
-FROM subject_peaks p
-GROUP BY p.app_id, p.module_id, p.metric, p.model, p.module_version;
 
 -- RollupTimeWeightedKind integrates the step function under the ordered
 -- samples PER VERSION (usage-time-pricing Phase 1 — supersedes #58's
@@ -267,26 +200,25 @@ WITH raw_events AS (
         app_id, module_id, metric, kind,
         COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
-        value, COALESCE(billable_at, recorded_at) AS observation_at, event_id
+        value, recorded_at, event_id
     FROM ms_billing.usage_events
     WHERE account_id = $1
-      AND COALESCE(billable_at, recorded_at) >= $2
-      AND COALESCE(billable_at, recorded_at) <  $3
-      AND (sqlc.arg(include_v2)::boolean OR observation_version <> 2)
+      AND recorded_at >= $2
+      AND recorded_at <  $3
       AND kind = 'time_weighted'
 ),
 windowed AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version, value, observation_at,
-        LEAD(observation_at, 1, $3::timestamptz)
-            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end
+        app_id, module_id, metric, kind, model, module_version, value, recorded_at,
+        LEAD(recorded_at, 1, $3::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY recorded_at, event_id) AS segment_end
     FROM raw_events
 ),
 segments AS (
     SELECT
         app_id, module_id, metric, kind, model, module_version,
-        EXTRACT(EPOCH FROM (segment_end - observation_at)) AS duration_seconds,
-        value * EXTRACT(EPOCH FROM (segment_end - observation_at)) / 3600.0 AS segment_byte_hours
+        EXTRACT(EPOCH FROM (segment_end - recorded_at)) AS duration_seconds,
+        value * EXTRACT(EPOCH FROM (segment_end - recorded_at)) / 3600.0 AS segment_byte_hours
     FROM windowed
 )
 SELECT
@@ -294,7 +226,6 @@ SELECT
     module_id,
     metric,
     kind,
-    NULL::text AS aggregation_key,
     model,
     module_version,
     COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity,
@@ -368,26 +299,15 @@ WHERE metric = $1 AND model = $2;
 -- name: UpsertUsageAggregate :exec
 INSERT INTO ms_billing.usage_aggregates (
     period_id, account_id, app_id, module_id, metric, model, module_version, kind,
-    aggregation_key,
     billable_quantity, unit_price_micros,
     customer_markup_num, customer_markup_den,
     raw_cost_micros, charged_micros, active_seconds, period_days, rolled_up_at
 ) VALUES (
-    @period_id::uuid, @account_id::uuid, @app_id::uuid, @module_id::uuid,
-    @metric::text, @model::text, @module_version::text,
-    @kind::ms_billing.metric_kind, sqlc.narg(aggregation_key)::text,
-    @billable_quantity::numeric, @unit_price_micros::bigint,
-    @customer_markup_num::integer, @customer_markup_den::integer,
-    @raw_cost_micros::bigint, @charged_micros::bigint,
-    sqlc.narg(active_seconds)::numeric, sqlc.narg(period_days)::numeric, now()
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now()
 )
-ON CONFLICT (
-    period_id, app_id, module_id, metric, model, module_version,
-    COALESCE(aggregation_key, '')
-)
+ON CONFLICT (period_id, app_id, module_id, metric, model, module_version)
 DO UPDATE SET
     billable_quantity   = EXCLUDED.billable_quantity,
-    aggregation_key     = EXCLUDED.aggregation_key,
     unit_price_micros   = EXCLUDED.unit_price_micros,
     customer_markup_num = EXCLUDED.customer_markup_num,
     customer_markup_den = EXCLUDED.customer_markup_den,

@@ -80,12 +80,7 @@ ORDER BY created_at ASC, id ASC;
 SELECT stripe_invoice_id,
        status,
        charge_funding_account_id,
-       charge_funding_legacy_unresolved,
-       -- What is still owed. A receivable collects the REMAINDER of its
-       -- source, so the amount is read from the mirror rather than derived:
-       -- the provider's own figure for this invoice is the only one that can
-       -- be right about what is left.
-       amount_due
+       charge_funding_legacy_unresolved
 FROM ms_billing.invoices
 WHERE id = $1
   AND account_id = $2;
