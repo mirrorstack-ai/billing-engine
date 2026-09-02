@@ -423,7 +423,7 @@ func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (i
 // activatedRecurring; the counts are then spread over the live apps so that
 // usage.RecurringFeeCountsOf(shares) reproduces them exactly — the same
 // sum-of-rows identity the real query guarantees.
-func (f *fakeStore) ActivatedRecurringFeeShares(_ context.Context, _ uuid.UUID, _ int) ([]usage.AppRecurringFeeShare, error) {
+func (f *fakeStore) ActivatedRecurringFeeShares(_ context.Context, _ uuid.UUID, _ int, _ time.Time) ([]usage.AppRecurringFeeShare, error) {
 	if f.errActivatedRecurring != nil {
 		return nil, f.errActivatedRecurring
 	}

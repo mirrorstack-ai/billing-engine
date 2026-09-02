@@ -154,12 +154,12 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	var recurringShares []AppRecurringFeeShare
 	if periodID == "" {
 		store, ok := s.store.(interface {
-			ActivatedRecurringFeeShares(context.Context, uuid.UUID, int) ([]AppRecurringFeeShare, error)
+			ActivatedRecurringFeeShares(context.Context, uuid.UUID, int, time.Time) ([]AppRecurringFeeShare, error)
 		})
 		if !ok {
 			return nil, billing.Internal("activated recurring fee share store unavailable", nil)
 		}
-		recurringShares, err = store.ActivatedRecurringFeeShares(ctx, accountID, IncludedModules)
+		recurringShares, err = store.ActivatedRecurringFeeShares(ctx, accountID, IncludedModules, periodEnd)
 		if err != nil {
 			return nil, billing.Internal("activated recurring fee shares failed", err)
 		}
@@ -342,15 +342,39 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		}
 	}
 	response.unresolvedOneTimeMicros = unresolvedOneTimeTotal
-	response.ProjectedTotalMicros = projectedBaseFeeTotal +
+	response.ProjectedTotalMicros = projectedTotalMicros(
+		projectedBaseFeeTotal,
+		moduleUsageTotal,
+		infraTotal,
+		projectedRecurringSurcharges,
+		agent.TotalMicros,
+		paasCredit,
+		unresolvedOneTimeTotal,
+	)
+
+	return response, nil
+}
+
+// projectedTotalMicros is the same composition as TotalMicros: the PaaS credit
+// is SUBTRACTED. It is a free function so the sign is testable independently of
+// `const subscriptionActive = false`, which forces the credit to 0 on every path
+// today and is why no fixture could catch the sign inverting here.
+func projectedTotalMicros(
+	projectedBaseFeeTotal int64,
+	moduleUsageTotal int64,
+	infraTotal int64,
+	projectedRecurringSurcharges int64,
+	agentTotalMicros int64,
+	paasCredit int64,
+	unresolvedOneTimeTotal int64,
+) int64 {
+	return projectedBaseFeeTotal +
 		moduleUsageTotal +
 		infraTotal +
 		projectedRecurringSurcharges +
-		agent.TotalMicros +
+		agentTotalMicros -
 		paasCredit +
 		unresolvedOneTimeTotal
-
-	return response, nil
 }
 
 // unresolvedOneTimeChargeMicros is the authoritative current-bill projection

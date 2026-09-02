@@ -16,6 +16,7 @@ const activatedRecurringFeeShares = `-- name: ActivatedRecurringFeeShares :many
 WITH live_timer_fifo AS (
     SELECT app_id,
            grace_charged_at,
+           grace_resolved,
            row_number() OVER (ORDER BY installed_at, id) AS fifo_position
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = $1::uuid
@@ -28,6 +29,13 @@ activated_apps AS (
       AND app.deleted_at IS NULL
       AND (
           app.proration_invoice_id IS NOT NULL
+          -- D1d terminal no-charge verdict: the creation proration was
+          -- permanently skipped (app created before the account activated), so
+          -- no invoice id will ever be written. LiveAppModuleCountsCreatedBefore
+          -- reads no proration state and bills the full recurring base, and
+          -- UnresolvedOneTimeCharges excludes a skipped-never-attempted app —
+          -- so without this arm the app is in NEITHER projection.
+          OR app.proration_skipped_at IS NOT NULL
           OR EXISTS (
               SELECT 1
               FROM ms_billing.app_base_snapshots snap
@@ -40,15 +48,27 @@ over_timers AS (
     SELECT app_id, count(*)::bigint AS over_count
     FROM live_timer_fifo
     WHERE fifo_position > $2::int
-      AND grace_charged_at IS NOT NULL
+      -- Durably RESOLVED, not merely charged. CountOngoingOverModuleTimers (the
+      -- boundary precharge input) reads no resolution state at all, so a timer
+      -- resolved with no charge under D1d is billed at every subsequent boundary
+      -- while the charged-marker gate kept it out of the forecast forever. A
+      -- resolved row ranked inside the allowance cannot leak in: FIFO rank is
+      -- stable, so it fails fifo_position.
+      AND (grace_charged_at IS NOT NULL OR grace_resolved)
     GROUP BY app_id
 ),
-charged_domains AS (
+live_domains AS (
+    -- CountLiveDomainsActivatedBefore's predicate, verbatim: every still-live
+    -- domain activated before the next boundary owes one full domain fee, and
+    -- charge state is deliberately NOT read. charged_at is written only by
+    -- MarkDomainCharged, which four terminal no-charge paths never reach —
+    -- prepaid/credits accounts never reach it at all — so the customer was
+    -- billed $2/domain while this forecast said $0.
     SELECT app_id, count(*)::bigint AS domain_count
     FROM ms_billing.app_custom_domains
     WHERE account_id = $1::uuid
       AND removed_at IS NULL
-      AND charged_at IS NOT NULL
+      AND activated_at < $3::timestamptz
     GROUP BY app_id
 ),
 app_universe AS (
@@ -56,7 +76,7 @@ app_universe AS (
     UNION
     SELECT app_id FROM over_timers
     UNION
-    SELECT app_id FROM charged_domains
+    SELECT app_id FROM live_domains
 )
 SELECT universe.app_id,
        EXISTS (
@@ -64,16 +84,17 @@ SELECT universe.app_id,
            WHERE activated_apps.app_id = universe.app_id
        ) AS activated,
        COALESCE(over_timers.over_count, 0)::bigint AS over_module_count,
-       COALESCE(charged_domains.domain_count, 0)::bigint AS custom_domain_count
+       COALESCE(live_domains.domain_count, 0)::bigint AS custom_domain_count
 FROM app_universe universe
 LEFT JOIN over_timers ON over_timers.app_id = universe.app_id
-LEFT JOIN charged_domains ON charged_domains.app_id = universe.app_id
+LEFT JOIN live_domains ON live_domains.app_id = universe.app_id
 ORDER BY universe.app_id
 `
 
 type ActivatedRecurringFeeSharesParams struct {
-	AccountID       string `json:"account_id"`
-	IncludedModules int32  `json:"included_modules"`
+	AccountID       string    `json:"account_id"`
+	IncludedModules int32     `json:"included_modules"`
+	PeriodEnd       time.Time `json:"period_end"`
 }
 
 type ActivatedRecurringFeeSharesRow struct {
@@ -84,17 +105,20 @@ type ActivatedRecurringFeeSharesRow struct {
 }
 
 // ActivatedRecurringFeeShares is the CURRENT next-period recurring-base input,
-// decomposed BY APP. A live entity joins the forecast only after its one-time
-// activation charge has reached a durable charged state:
-//   - app: creation-proration guard armed (or a legacy advance snapshot proves
-//     it was charged before the guard existed);
-//   - module overage: current account-FIFO over row with grace_charged_at set;
-//   - custom domain: activation charge recorded in charged_at.
+// decomposed BY APP. Membership mirrors WHAT THE BOUNDARY WILL ACTUALLY BILL,
+// per entity type — never a mutable "was it charged yet" marker. Gating on the
+// marker is what let three classes of live entity forecast as $0 while the
+// boundary billed them every period:
+//   - app: creation-proration guard armed, a legacy advance snapshot, or a D1d
+//     terminal skip — all three mean the boundary advance leg owns it now;
+//   - module overage: current account-FIFO over row that is durably RESOLVED,
+//     charged or D1d-forgiven;
+//   - custom domain: still live and activated before the next boundary, which
+//     is CountLiveDomainsActivatedBefore's predicate exactly.
 //
-// Pending creations stay solely in the one-time projection. This gives the UI
-// an atomic handoff: create Aug 30 → creation charge Sep 2 (covering the
-// remaining creation window plus the straddled window) → recurring base joins
-// only after that Sep 2 settlement succeeds.
+// Pending creations stay solely in the one-time projection. Recurring timing
+// depends only on activation timing, so a settled one-time row may legitimately
+// overlap a recurring row in the same period.
 //
 // This SUPERSEDES the scalar ActivatedRecurringFeeCounts. The account totals
 // are now SUMS of these rows rather than three sibling counts, so the bill's
@@ -102,7 +126,7 @@ type ActivatedRecurringFeeSharesRow struct {
 // same rows added up two ways, not two queries that must be kept in step.
 //
 // The row set is the UNION of the three sources, not just activated apps: an
-// app whose creation charge is still pending can already own a charged domain
+// app whose creation charge is still pending can already own a live domain
 // or a charged over-timer, and that money is in the account forecast, so it
 // needs an app to land on. `activated` is therefore a per-row FLAG, not a
 // filter — an app can contribute surcharges while contributing no base fee.
@@ -112,7 +136,7 @@ type ActivatedRecurringFeeSharesRow struct {
 // WHICH app owns the free five is decided globally here and the per-app
 // over-count falls out of that one ordering.
 func (q *Queries) ActivatedRecurringFeeShares(ctx context.Context, arg ActivatedRecurringFeeSharesParams) ([]ActivatedRecurringFeeSharesRow, error) {
-	rows, err := q.db.Query(ctx, activatedRecurringFeeShares, arg.AccountID, arg.IncludedModules)
+	rows, err := q.db.Query(ctx, activatedRecurringFeeShares, arg.AccountID, arg.IncludedModules, arg.PeriodEnd)
 	if err != nil {
 		return nil, err
 	}

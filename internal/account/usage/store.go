@@ -1637,10 +1637,11 @@ func (s *pgxStore) LiveDomainCountForAccount(ctx context.Context, accountID uuid
 	return int(n), nil
 }
 
-func (s *pgxStore) ActivatedRecurringFeeShares(ctx context.Context, accountID uuid.UUID, includedModules int) ([]AppRecurringFeeShare, error) {
+func (s *pgxStore) ActivatedRecurringFeeShares(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) ([]AppRecurringFeeShare, error) {
 	rows, err := s.q.ActivatedRecurringFeeShares(ctx, db.ActivatedRecurringFeeSharesParams{
 		AccountID:       accountID.String(),
 		IncludedModules: int32(includedModules), //nolint:gosec // pricing allowance is a small positive constant
+		PeriodEnd:       periodEnd,
 	})
 	if err != nil {
 		return nil, err
