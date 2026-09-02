@@ -44,6 +44,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -74,7 +75,17 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle(webhookPath, httpHandler())
 	slog.Info("local HTTP mode", "port", port, "path", webhookPath)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	// An explicit Server rather than ListenAndServe: the package-level helper
+	// sets no timeouts at all, so a client that opens a connection and never
+	// finishes its headers holds a goroutine indefinitely. This path is
+	// local-development only — production runs on Lambda — but a dev server
+	// with no read deadline is still the wrong default to leave lying around.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("listener failed", "error", err)
 		os.Exit(1)
 	}

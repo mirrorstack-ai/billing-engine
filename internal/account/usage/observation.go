@@ -369,8 +369,16 @@ func isASCIILetter(value byte) bool {
 func observationFingerprint(event UsageEvent) []byte {
 	hash := sha256.New()
 	writeFingerprintField := func(value string) {
+		// 🔴 Same reasoning as meteringlock.SubjectKey: a truncated length
+		// prefix breaks injectivity, and here that means two DIFFERENT usage
+		// events sharing a fingerprint — one silently deduplicated away and
+		// never billed. Unreachable in practice, and the width cannot change
+		// without invalidating every fingerprint already stored.
+		if uint64(len(value)) > math.MaxUint32 {
+			panic("usage: fingerprint field exceeds the 4 GiB length prefix")
+		}
 		var size [4]byte
-		binary.BigEndian.PutUint32(size[:], uint32(len(value)))
+		binary.BigEndian.PutUint32(size[:], uint32(len(value))) //nolint:gosec // guarded immediately above
 		_, _ = hash.Write(size[:])
 		_, _ = hash.Write([]byte(value))
 	}

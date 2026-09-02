@@ -904,16 +904,17 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 	}
 
 	rows, err := qtx.InsertUsageEvent(ctx, db.InsertUsageEventParams{
-		EventID:            ev.EventID,
-		AccountID:          nullableAccountID(ev.AccountID),
-		AppID:              ev.AppID.String(),
-		ModuleID:           ev.ModuleID.String(),
-		Metric:             ev.Metric,
-		Kind:               db.MsBillingMetricKind(ev.Kind),
-		Value:              value,
-		RecordedAt:         ev.RecordedAt,
-		Model:              nullableModel(ev.Model),
-		ModuleVersion:      nullableModuleVersion(ev.ModuleVersion),
+		EventID:       ev.EventID,
+		AccountID:     nullableAccountID(ev.AccountID),
+		AppID:         ev.AppID.String(),
+		ModuleID:      ev.ModuleID.String(),
+		Metric:        ev.Metric,
+		Kind:          db.MsBillingMetricKind(ev.Kind),
+		Value:         value,
+		RecordedAt:    ev.RecordedAt,
+		Model:         nullableModel(ev.Model),
+		ModuleVersion: nullableModuleVersion(ev.ModuleVersion),
+		//nolint:gosec // a small monotonic schema version, not caller-supplied
 		ObservationVersion: int16(ev.ObservationVersion),
 		Subject:            nullableText(ev.Subject),
 		Metadata:           []byte(ev.Metadata),
@@ -1152,16 +1153,17 @@ func (s *pgxStore) InsertUsageObservation(
 	}
 
 	rows, err := qtx.InsertUsageEvent(ctx, db.InsertUsageEventParams{
-		EventID:            ev.EventID,
-		AccountID:          nullableAccountID(ev.AccountID),
-		AppID:              ev.AppID.String(),
-		ModuleID:           ev.ModuleID.String(),
-		Metric:             ev.Metric,
-		Kind:               db.MsBillingMetricKind(ev.Kind),
-		Value:              value,
-		RecordedAt:         ev.RecordedAt,
-		Model:              nullableModel(ev.Model),
-		ModuleVersion:      nullableModuleVersion(ev.ModuleVersion),
+		EventID:       ev.EventID,
+		AccountID:     nullableAccountID(ev.AccountID),
+		AppID:         ev.AppID.String(),
+		ModuleID:      ev.ModuleID.String(),
+		Metric:        ev.Metric,
+		Kind:          db.MsBillingMetricKind(ev.Kind),
+		Value:         value,
+		RecordedAt:    ev.RecordedAt,
+		Model:         nullableModel(ev.Model),
+		ModuleVersion: nullableModuleVersion(ev.ModuleVersion),
+		//nolint:gosec // a small monotonic schema version, not caller-supplied
 		ObservationVersion: int16(ev.ObservationVersion),
 		Subject:            nullableText(ev.Subject),
 		Metadata:           []byte(ev.Metadata),
@@ -1454,7 +1456,7 @@ func (s *pgxStore) PendingNewCreationCharges(ctx context.Context, accountID uuid
 func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error) {
 	rows, err := s.q.PendingAddonModuleCharges(ctx, db.PendingAddonModuleChargesParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules),
+		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
 		Now:             now,
 	})
 	if err != nil {
@@ -1481,8 +1483,8 @@ func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid
 func (s *pgxStore) UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, includedModules, graceHours int) ([]UnresolvedOneTimeChargeRaw, error) {
 	rows, err := s.q.UnresolvedOneTimeCharges(ctx, db.UnresolvedOneTimeChargesParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules),
-		GraceHours:      int32(graceHours),
+		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
+		GraceHours:      int32(graceHours),      //nolint:gosec // a configured grace window in hours
 	})
 	if err != nil {
 		return nil, err
@@ -1539,7 +1541,7 @@ func (s *pgxStore) CoCreatedOverModuleTimerCount(ctx context.Context, accountID,
 		AccountID:       accountID.String(),
 		AppID:           appID.String(),
 		CreatedAt:       createdAt,
-		IncludedModules: int32(includedModules),
+		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
 	})
 	if err != nil {
 		return 0, err
