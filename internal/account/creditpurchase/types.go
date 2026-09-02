@@ -27,7 +27,31 @@ type Attempt struct {
 	FundingAccountID  uuid.UUID
 	FundingGeneration uuid.UUID
 	StripeCustomerID  string
+	// ProposedReference is the intent this purchase was sealed as, prefixed
+	// "intent:<digest>" per migration 057. Empty until the seal, and empty
+	// forever on a pre-cutover row that was collected before this leg stopped
+	// charging.
+	ProposedReference string
 }
+
+// Placeholder policy revisions, identical to every other cut-over leg.
+//
+// 🔴 They are what makes proposing SAFE. predicate.ClausePolicyPublished
+// refuses to collect an intent sealed under an unpublished revision, so a
+// proposed purchase is a document and not yet a charge. Routing a leg and
+// ENABLING it are separate steps, and these constants are the separation.
+const (
+	proposedTermsRevision     = "unpublished/pending-decision-12"
+	proposedPriceBookRevision = "unpublished/pending-decision-12"
+	proposedNoticePolicy      = "unpublished/pending-decision-12"
+	proposedTaxRuleRevision   = "unpublished/pending-decision-12"
+	proposedRail              = "stripe"
+	proposedRoutingPolicy     = "unpublished/pending-decision-12"
+
+	// purchaseCurrency is the only currency this leg has ever collected in;
+	// §12 item 11 (currency) is unanswered, so it is not a parameter.
+	purchaseCurrency = "usd"
+)
 
 // Result is the latest independently-read Stripe truth. TerminalFailure is
 // deliberately separate from settlement: only the billing service may apply
@@ -51,6 +75,15 @@ type Store interface {
 	FindByStripeInvoice(ctx context.Context, stripeInvoiceID string) (Attempt, bool, error)
 	AttachInvoice(ctx context.Context, attempt Attempt, invoice billingstripe.Invoice) (Attempt, error)
 	Fail(ctx context.Context, attempt Attempt, receiptURL string) (Attempt, bool, error)
+	// MarkProposed records that this attempt's charge was sealed as an intent
+	// instead of collected. Terminal for the legacy rail.
+	//
+	// Returns false rather than an error when no row moved: the update is
+	// scoped to a PENDING purchase, so a row another worker already settled,
+	// failed or proposed is a lost race, not a fault. The caller decides what
+	// a lost race means; a store that raised here would make an ordinary
+	// concurrency outcome look like a defect.
+	MarkProposed(ctx context.Context, attempt Attempt, intentReference string) (bool, error)
 }
 
 // Settler is satisfied by creditledger.Store. Manual paid proof is completed
@@ -66,6 +99,21 @@ type Settler interface {
 	) (creditledger.Settlement, error)
 }
 
+// StripeClient is the surface this leg keeps after the cutover.
+//
+// 🔴 It deliberately no longer embeds billingstripe.CreditPurchaseClient.
+// That interface carries CreateCreditPurchaseInvoice, CreateInvoiceItem and
+// FinalizeInvoice — the three calls this leg used to collect with — and
+// embedding it would leave the executor holding a write port it must never use
+// again. Narrowing it here is what makes the deletion structural instead of
+// merely a code path nobody happens to reach.
 type StripeClient interface {
-	billingstripe.CreditPurchaseClient
+	GetInvoice(ctx context.Context, stripeInvoiceID string) (billingstripe.Invoice, error)
+	ListInvoiceItems(ctx context.Context, invoiceID string) ([]billingstripe.InvoiceItem, error)
+	ListInvoicePayments(ctx context.Context, invoiceID string) ([]billingstripe.InvoicePaymentProof, error)
+	// VoidInvoice is the one mutation left, and it moves no money: it closes
+	// an in-flight invoice the provider gave up collecting so the ledger row
+	// can reach a terminal state. Reachable only for an attempt already
+	// attached to that invoice.
+	VoidInvoice(ctx context.Context, invoiceID, idemKey string) (billingstripe.Invoice, error)
 }

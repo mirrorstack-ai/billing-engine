@@ -65,7 +65,7 @@ WITH target AS MATERIALIZED (
         attempt_stripe_customer_id = claim.stripe_customer_id
     FROM claim
     WHERE purchase.id = claim.id
-    RETURNING purchase.id, purchase.account_id, purchase.amount_micros, purchase.type, purchase.status, purchase.balance_after_micros, purchase.actor, purchase.idempotency_key, purchase.stripe_invoice_id, purchase.receipt_url, purchase.expires_at, purchase.period_id, purchase.source_credit_id, purchase.created_at, purchase.attempt_payment_method_id, purchase.attempt_stripe_payment_method_id, purchase.attempt_stripe_customer_id, purchase.attempt_expires_at, purchase.failure_code, purchase.charge_funding_account_id, purchase.charge_funding_generation, purchase.charge_funding_legacy_unresolved
+    RETURNING purchase.id, purchase.account_id, purchase.amount_micros, purchase.type, purchase.status, purchase.balance_after_micros, purchase.actor, purchase.idempotency_key, purchase.stripe_invoice_id, purchase.receipt_url, purchase.expires_at, purchase.period_id, purchase.source_credit_id, purchase.created_at, purchase.attempt_payment_method_id, purchase.attempt_stripe_payment_method_id, purchase.attempt_stripe_customer_id, purchase.attempt_expires_at, purchase.failure_code, purchase.charge_funding_account_id, purchase.charge_funding_generation, purchase.charge_funding_legacy_unresolved, purchase.proposed_reference
 )
 SELECT id,
        account_id,
@@ -289,7 +289,7 @@ type FinalizeCreditPurchaseRow struct {
 	CreatedAt                     time.Time   `json:"created_at"`
 }
 
-// FinalizeCreditPurchase is the sole purchase status transition primitive.
+// FinalizeCreditPurchase is the purchase's terminal-outcome transition.
 // Only pending rows may move, and the target is constrained to the two terminal
 // outcomes accepted by the RPC. Retrying a terminal result is a read through
 // GetCreditPurchaseByID, never a second balance mutation.
@@ -550,6 +550,10 @@ SELECT
     charge_funding_account_id,
     charge_funding_generation,
     COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    -- The intent this purchase was sealed as, when the cutover is armed.
+    -- Empty on the legacy path. Without it a proposed purchase can report its
+    -- status and nobody can walk it to its document.
+    COALESCE(proposed_reference, '')::text AS proposed_reference,
     charge_funding_legacy_unresolved,
     created_at
 FROM ms_billing.credit_ledger
@@ -578,6 +582,7 @@ type GetCreditPurchaseByIDRow struct {
 	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
 	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
 	AttemptStripeCustomerID       string      `json:"attempt_stripe_customer_id"`
+	ProposedReference             string      `json:"proposed_reference"`
 	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
 	CreatedAt                     time.Time   `json:"created_at"`
 }
@@ -602,6 +607,7 @@ func (q *Queries) GetCreditPurchaseByID(ctx context.Context, arg GetCreditPurcha
 		&i.ChargeFundingAccountID,
 		&i.ChargeFundingGeneration,
 		&i.AttemptStripeCustomerID,
+		&i.ProposedReference,
 		&i.ChargeFundingLegacyUnresolved,
 		&i.CreatedAt,
 	)
@@ -834,6 +840,7 @@ RETURNING
     charge_funding_account_id,
     charge_funding_generation,
     COALESCE(attempt_stripe_customer_id, '')::text AS attempt_stripe_customer_id,
+    COALESCE(proposed_reference, '')::text AS proposed_reference,
     charge_funding_legacy_unresolved,
     created_at
 `
@@ -859,6 +866,7 @@ type InsertPendingCreditPurchaseRow struct {
 	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
 	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
 	AttemptStripeCustomerID       string      `json:"attempt_stripe_customer_id"`
+	ProposedReference             string      `json:"proposed_reference"`
 	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
 	CreatedAt                     time.Time   `json:"created_at"`
 }
@@ -888,6 +896,7 @@ func (q *Queries) InsertPendingCreditPurchase(ctx context.Context, arg InsertPen
 		&i.ChargeFundingAccountID,
 		&i.ChargeFundingGeneration,
 		&i.AttemptStripeCustomerID,
+		&i.ProposedReference,
 		&i.ChargeFundingLegacyUnresolved,
 		&i.CreatedAt,
 	)
@@ -1275,6 +1284,42 @@ func (q *Queries) LockWalletLedgerEntries(ctx context.Context, accountID string)
 		return nil, err
 	}
 	return items, nil
+}
+
+const markCreditPurchaseProposed = `-- name: MarkCreditPurchaseProposed :one
+UPDATE ms_billing.credit_ledger
+SET status = 'proposed',
+    proposed_reference = $1::text
+WHERE id = $2::uuid
+  AND account_id = $3::uuid
+  AND type = 'purchase'
+  AND status = 'pending'
+RETURNING id
+`
+
+type MarkCreditPurchaseProposedParams struct {
+	ProposedReference string `json:"proposed_reference"`
+	PurchaseID        string `json:"purchase_id"`
+	AccountID         string `json:"account_id"`
+}
+
+// MarkCreditPurchaseProposed records that this purchase's charge was sealed as
+// an intent instead of collected. Terminal for the legacy rail.
+//
+// proposed_reference is NOT NULL by the paired CHECK migration 057 added:
+// "a proposed row without its reference is a sealed obligation nobody can walk
+// to its document — the defect the custom-domain leg shipped with".
+//
+// type = 'purchase' is load-bearing. credit_ledger carries auto-top-up attempts
+// in the same table under the same statuses, and this must not move one.
+// status = 'pending' is the first-write-wins guard: a row already settled,
+// failed or proposed does not move, and the caller sees zero rows rather than
+// a silent overwrite.
+func (q *Queries) MarkCreditPurchaseProposed(ctx context.Context, arg MarkCreditPurchaseProposedParams) (string, error) {
+	row := q.db.QueryRow(ctx, markCreditPurchaseProposed, arg.ProposedReference, arg.PurchaseID, arg.AccountID)
+	var id string
+	err := row.Scan(&id)
+	return id, err
 }
 
 const setCreditAccountBillingMode = `-- name: SetCreditAccountBillingMode :one

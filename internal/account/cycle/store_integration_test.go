@@ -13,8 +13,24 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
+
+// boundarySvcProposing is chargeSvcProposing (charge_test.go) for the
+// integration suite: the same rule — a boundary service can only be built WITH
+// an intent proposer — applied over the REAL store. chargeSvcProposing itself
+// takes *fakeStore, so it cannot be reused here.
+//
+// It exists for the same reason it does there. The boundary's
+// draft→item→finalize collector is deleted, so a service built without a
+// proposer cannot finish a boundary at all: it reaches ProposeGroup on a nil
+// interface and panics. A fixture that omitted one would not be exercising a
+// leaner leg, it would be exercising a deployment that cannot bill.
+func boundarySvcProposing(store cycle.Store, sc billingstripe.Client) (*cycle.Service, *capturingProposer) {
+	p := &capturingProposer{}
+	return cycle.NewService(store, sc).WithIntentProposer(p), p
+}
 
 // These exercise the generated sqlc queries against a real Postgres (gated by
 // the `integration` build tag; run via `make test-integration`, skipped when
@@ -253,6 +269,12 @@ func TestChargeCycleSQL_ReclaimAndExactWindow(t *testing.T) {
 
 	// Mark invoiced → terminal. Now it disappears + reclaim refuses.
 	require.NoError(t, store.MarkBillingRun(ctx, run2, cycle.RunStatusInvoiced, "in_test_x", 123))
+	var periodStatus string
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT status::text FROM ms_billing.billing_periods
+		WHERE account_id=$1 AND period_start=$2 AND period_end=$3`, acct, start, end).Scan(&periodStatus))
+	require.Equal(t, "invoiced", periodStatus,
+		"billing-run and billing-period terminal states commit together")
 	unbilled, err = store.AccountsWithUnbilledUsage(ctx, start, end)
 	require.NoError(t, err)
 	require.NotContains(t, unbilled, acct, "invoiced run excludes the account")

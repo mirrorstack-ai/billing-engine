@@ -1,7 +1,9 @@
 package usage
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -16,6 +18,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	"github.com/mirrorstack-ai/billing-engine/internal/meteringlock"
 )
 
 // Store is the persistence interface Service depends on. Narrow on
@@ -81,6 +84,22 @@ type Store interface {
 	// zero UUID for a lazy (account-less) event, stored as NULL.
 	InsertUsageEvent(ctx context.Context, ev UsageEvent) (recorded bool, err error)
 
+	// InsertUsageObservation atomically applies the v2 time policy and writes a
+	// custom-meter observation. The implementation checks an existing event ID
+	// before a policy rejection so an identical retry remains idempotent even
+	// after its acceptance window closes. periodStart/periodEnd identify the
+	// observation's billing window; policyRejection is empty, future, or too-old.
+	// A closed period is detected under the same period advisory lock the cycle
+	// rollup takes. Rejections are durably audited without storing Metadata.
+	InsertUsageObservation(ctx context.Context, ev UsageEvent, periodStart, periodEnd time.Time, policyRejection UsageRejectionReason) (recorded bool, billableDelta float64, err error)
+
+	// CheckUsageEventID performs the read-only early binding check needed before
+	// mutable catalog gates. accepted=true means the same canonical payload was
+	// already stored; a different accepted or rejected binding returns
+	// ErrUsageEventConflict. An identical rejected payload is not accepted and
+	// continues through current admission policy.
+	CheckUsageEventID(ctx context.Context, eventID string, fingerprint []byte) (accepted bool, err error)
+
 	// AccountByOwner resolves the billing account for an owner principal
 	// (user or org), or (Nil, false) when none exists yet. Read-only;
 	// missing-account is a normal lazy-state outcome, not an error.
@@ -98,6 +117,11 @@ type Store interface {
 	// calendar month, the pre-025 window). Read once per RPC so each read windows
 	// the account's OWN anchored period rather than the calendar month.
 	AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (int, error)
+
+	// AccountActivation returns the immutable first-card activation instant.
+	// v2 admission uses its anchored boundary to clamp otherwise-unbillable
+	// pre-activation occurrences into the first funded period.
+	AccountActivation(ctx context.Context, accountID uuid.UUID) (activatedAt time.Time, activated bool, err error)
 
 	// CurrentPeriodUsage sums raw usage_events for the account in
 	// [periodStart, periodEnd), joined to metric_definitions, projecting
@@ -442,6 +466,7 @@ type AppMirrorInfo struct {
 // metered-but-unpriced (catalog price is NULL).
 type MetricDefinition struct {
 	Kind            Kind
+	AggregationKey  AggregationKey
 	Unit            string
 	UnitPriceMicros int64
 	Priced          bool
@@ -456,6 +481,7 @@ type MetricDeclaration struct {
 	ModuleID        uuid.UUID
 	Metric          string
 	Kind            Kind
+	AggregationKey  AggregationKey
 	Unit            string
 	UnitPriceMicros int64
 	Priced          bool
@@ -490,16 +516,28 @@ func (o Owner) IsZero() bool { return o.UserID == uuid.Nil && o.OrgID == uuid.Ni
 // dimension (migration 023, purely reporting — never priced): empty when no
 // version is carried, persisted as a NULL usage_events.module_version.
 type UsageEvent struct {
-	EventID       string
-	AccountID     uuid.UUID
-	AppID         uuid.UUID
-	ModuleID      uuid.UUID
-	Metric        string
-	Kind          Kind
-	Value         float64
-	RecordedAt    time.Time
-	Model         string
-	ModuleVersion string
+	ObservationVersion int
+	EventID            string
+	AccountID          uuid.UUID
+	AccountActivatedAt time.Time
+	AccountActivated   bool
+	AppID              uuid.UUID
+	ModuleID           uuid.UUID
+	Metric             string
+	Kind               Kind
+	AggregationKey     AggregationKey
+	Value              float64
+	RecordedAt         time.Time
+	OccurredAt         time.Time
+	BillableAt         time.Time
+	Subject            string
+	Metadata           json.RawMessage
+	PayloadFingerprint []byte
+	OccurrencePolicy   OccurrencePolicy
+	OwnerUserID        uuid.UUID
+	OwnerOrgID         uuid.UUID
+	Model              string
+	ModuleVersion      string
 }
 
 // MetricUsageRaw is one grouped row from the live current-period query.
@@ -687,6 +725,7 @@ func (s *pgxStore) LookupMetricDefinition(ctx context.Context, moduleID uuid.UUI
 	}
 	return MetricDefinition{
 		Kind:            Kind(row.Kind),
+		AggregationKey:  AggregationKey(row.AggregationKey.String),
 		Unit:            row.Unit,
 		UnitPriceMicros: row.UnitPriceMicros.Int64,
 		Priced:          row.UnitPriceMicros.Valid,
@@ -712,6 +751,7 @@ func (s *pgxStore) UpsertMetricDefinitions(ctx context.Context, defs []MetricDec
 			ModuleID:        def.ModuleID.String(),
 			Metric:          def.Metric,
 			Kind:            db.MsBillingMetricKind(def.Kind),
+			AggregationKey:  nullableAggregationKey(def.AggregationKey),
 			Unit:            def.Unit,
 			UnitPriceMicros: nullablePriceMicros(def.UnitPriceMicros, def.Priced),
 			Active:          def.Active,
@@ -823,11 +863,47 @@ func (s *pgxStore) SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UU
 }
 
 func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, error) {
+	if ev.ObservationVersion == 0 {
+		ev.ObservationVersion = observationVersionLegacy
+	}
+	if ev.OccurrencePolicy == "" {
+		ev.OccurrencePolicy = OccurrencePolicyV1IngestTime
+	}
+	if len(ev.PayloadFingerprint) == 0 {
+		ev.PayloadFingerprint = observationFingerprint(ev)
+	}
 	value, err := numericFromFloat(ev.Value)
 	if err != nil {
 		return false, err
 	}
-	rows, err := s.q.InsertUsageEvent(ctx, db.InsertUsageEventParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Rejections and accepted rows share one global event-id namespace across
+	// both observation versions. Without this lock a legacy writer could claim
+	// an id while a v2 writer was reserving it in the rejection ledger.
+	if _, err := tx.Exec(ctx, meteringlock.AdvisorySQL, meteringlock.EventKey(ev.EventID)); err != nil {
+		return false, err
+	}
+	qtx := s.q.WithTx(tx)
+	accepted, err := acceptedUsageEventRetry(ctx, qtx, ev.EventID, ev.PayloadFingerprint)
+	if err != nil {
+		return false, err
+	}
+	if accepted {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if err := checkUsageRejectionBinding(ctx, qtx, ev.EventID, ev.PayloadFingerprint); err != nil {
+		return false, err
+	}
+
+	rows, err := qtx.InsertUsageEvent(ctx, db.InsertUsageEventParams{
 		EventID:       ev.EventID,
 		AccountID:     nullableAccountID(ev.AccountID),
 		AppID:         ev.AppID.String(),
@@ -838,12 +914,318 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 		RecordedAt:    ev.RecordedAt,
 		Model:         nullableModel(ev.Model),
 		ModuleVersion: nullableModuleVersion(ev.ModuleVersion),
+		//nolint:gosec // a small monotonic schema version, not caller-supplied
+		ObservationVersion: int16(ev.ObservationVersion),
+		Subject:            nullableText(ev.Subject),
+		Metadata:           []byte(ev.Metadata),
+		OccurredAt:         nullableTime(ev.OccurredAt),
+		BillableAt:         usageEventBillableAt(ev),
+		AggregationKey:     nullableAggregationKey(ev.AggregationKey),
+		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
+		OccurrencePolicy:   string(ev.OccurrencePolicy),
 	})
 	if err != nil {
 		return false, err
 	}
-	// :execrows returns 1 on a fresh insert, 0 when ON CONFLICT deduped.
-	return rows > 0, nil
+	if rows > 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if err := s.checkUsageEventFingerprint(ctx, qtx, ev.EventID, ev.PayloadFingerprint); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (s *pgxStore) CheckUsageEventID(ctx context.Context, eventID string, fingerprint []byte) (bool, error) {
+	accepted, err := acceptedUsageEventRetry(ctx, s.q, eventID, fingerprint)
+	if err != nil || accepted {
+		return accepted, err
+	}
+	if err := checkUsageRejectionBinding(ctx, s.q, eventID, fingerprint); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// queryUsageFingerprints is implemented by both *db.Queries and its tx-bound
+// form. Keeping collision checks on this tiny interface lets the v1 and v2
+// insertion paths share exact byte comparison.
+type queryUsageFingerprints interface {
+	UsageEventFingerprint(context.Context, string) ([]byte, error)
+	UsageRejectionFingerprint(context.Context, string) ([]byte, error)
+}
+
+// acceptedUsageEventRetry reports whether eventID already names an accepted
+// observation with the same canonical payload. A historical NULL fingerprint
+// remains legacy-idempotent because its authoritative inputs cannot be safely
+// reconstructed. A different non-NULL fingerprint is always a conflict.
+func acceptedUsageEventRetry(ctx context.Context, q queryUsageFingerprints, eventID string, fingerprint []byte) (bool, error) {
+	existing, err := q.UsageEventFingerprint(ctx, eventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if len(existing) == 0 || bytes.Equal(existing, fingerprint) {
+		return true, nil
+	}
+	return false, ErrUsageEventConflict
+}
+
+// checkUsageRejectionBinding enforces the same global identity against the
+// rejection ledger. An identical rejected v2 payload may proceed because a
+// future occurrence can become admissible later; a different payload may
+// never rebind that event id, including from the legacy insertion path.
+func checkUsageRejectionBinding(ctx context.Context, q queryUsageFingerprints, eventID string, fingerprint []byte) error {
+	rejected, err := q.UsageRejectionFingerprint(ctx, eventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(rejected, fingerprint) {
+		return nil
+	}
+	return ErrUsageEventConflict
+}
+
+func (s *pgxStore) checkUsageEventFingerprint(ctx context.Context, q queryUsageFingerprints, eventID string, fingerprint []byte) error {
+	accepted, err := acceptedUsageEventRetry(ctx, q, eventID, fingerprint)
+	if err != nil || accepted {
+		return err
+	}
+	if err := checkUsageRejectionBinding(ctx, q, eventID, fingerprint); err != nil {
+		return err
+	}
+	// The INSERT conflict should always resolve to an accepted row. A nil
+	// result here can only come from an old binary deleting/racing outside the
+	// advisory-lock contract; surface it rather than treating a lost write as
+	// an idempotent success.
+	return errors.New("usage event insert conflicted without a durable event-id binding")
+}
+
+func (s *pgxStore) InsertUsageObservation(
+	ctx context.Context,
+	ev UsageEvent,
+	periodStart, periodEnd time.Time,
+	policyRejection UsageRejectionReason,
+) (bool, float64, error) {
+	if ev.ObservationVersion != observationVersionV2 {
+		return false, 0, fmt.Errorf("usage observation version must be %d", observationVersionV2)
+	}
+	if len(ev.PayloadFingerprint) == 0 {
+		ev.PayloadFingerprint = observationFingerprint(ev)
+	}
+	if ev.OccurrencePolicy == "" {
+		ev.OccurrencePolicy = OccurrencePolicyOnTime
+	}
+	if policyRejection != "" && policyRejection != UsageRejectionOccurredFuture &&
+		policyRejection != UsageRejectionOccurredTooOld && policyRejection != UsageRejectionPeriodClosed {
+		return false, 0, fmt.Errorf("unsupported occurrence rejection %q", policyRejection)
+	}
+
+	value, err := numericFromFloat(ev.Value)
+	if err != nil {
+		return false, 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Event identity is locked first on every observation path. A retry with a
+	// different claimed period therefore cannot race another writer and bind the
+	// globally unique id twice. Period is always locked second; rollup only takes
+	// the period lock, so the order has no cycle.
+	if _, err := tx.Exec(ctx, meteringlock.AdvisorySQL, meteringlock.EventKey(ev.EventID)); err != nil {
+		return false, 0, err
+	}
+	qtx := s.q.WithTx(tx)
+
+	accepted, err := acceptedUsageEventRetry(ctx, qtx, ev.EventID, ev.PayloadFingerprint)
+	if err != nil {
+		return false, 0, err
+	}
+	if accepted {
+		if err := tx.Commit(ctx); err != nil {
+			return false, 0, err
+		}
+		return false, 0, nil
+	}
+	// A rejected id also cannot be rebound. The identical payload may proceed:
+	// a future observation can become valid once wall time enters tolerance.
+	if err := checkUsageRejectionBinding(ctx, qtx, ev.EventID, ev.PayloadFingerprint); err != nil {
+		return false, 0, err
+	}
+
+	if ev.AccountID != uuid.Nil {
+		// Hold a shared lock on the account row through commit so first-card
+		// activation cannot change the anchor between the service's read and this
+		// admission. If activation committed first, reject this derived window and
+		// let the service recompute it once from the new immutable anchor. If this
+		// lock wins first, the activation writer waits, then rewinds this committed
+		// observation into the first funded window in its own transaction.
+		activatedAt, err := qtx.LockUsageAccountActivation(ctx, ev.AccountID.String())
+		if err != nil {
+			return false, 0, err
+		}
+		if activatedAt.Valid != ev.AccountActivated ||
+			(activatedAt.Valid && !activatedAt.Time.UTC().Equal(ev.AccountActivatedAt.UTC())) {
+			return false, 0, ErrUsageAccountTimingChanged
+		}
+
+		if _, err := tx.Exec(ctx, meteringlock.SharedAdvisorySQL, meteringlock.PeriodKey(ev.AccountID, periodStart)); err != nil {
+			return false, 0, err
+		}
+		if ev.AggregationKey == AggregationKeySubject {
+			key := meteringlock.SubjectKey(
+				ev.AccountID, ev.AppID, ev.ModuleID, ev.Metric, ev.Model,
+				ev.ModuleVersion, ev.Subject, periodStart,
+			)
+			if _, err := tx.Exec(ctx, meteringlock.AdvisorySQL, key); err != nil {
+				return false, 0, err
+			}
+		}
+	}
+
+	if policyRejection != "" {
+		if err := insertUsageObservationRejection(ctx, qtx, ev, policyRejection); err != nil {
+			return false, 0, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, 0, err
+		}
+		return false, 0, occurrenceRejectionError(policyRejection)
+	}
+
+	if ev.AccountID != uuid.Nil {
+		closed, err := qtx.UsagePeriodClosed(ctx, db.UsagePeriodClosedParams{
+			AccountID: ev.AccountID.String(), PeriodStart: periodStart, PeriodEnd: periodEnd,
+		})
+		if err != nil {
+			return false, 0, err
+		}
+		if closed {
+			if err := insertUsageObservationRejection(ctx, qtx, ev, UsageRejectionPeriodClosed); err != nil {
+				return false, 0, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return false, 0, err
+			}
+			return false, 0, ErrUsagePeriodClosed
+		}
+	}
+
+	billableDelta := ev.Value
+	if ev.AggregationKey == AggregationKeySubject && ev.AccountID != uuid.Nil {
+		previous, err := qtx.UsageSubjectPeak(ctx, db.UsageSubjectPeakParams{
+			AccountID:     ev.AccountID.String(),
+			AppID:         ev.AppID.String(),
+			ModuleID:      ev.ModuleID.String(),
+			Metric:        ev.Metric,
+			Model:         ev.Model,
+			ModuleVersion: ev.ModuleVersion,
+			Subject:       ev.Subject,
+			PeriodStart:   periodStart,
+			PeriodEnd:     periodEnd,
+		})
+		if err != nil {
+			return false, 0, err
+		}
+		previousValue, err := floatFromNumeric(previous)
+		if err != nil {
+			return false, 0, err
+		}
+		if previousValue >= ev.Value {
+			billableDelta = 0
+		} else {
+			billableDelta = ev.Value - previousValue
+		}
+	}
+
+	rows, err := qtx.InsertUsageEvent(ctx, db.InsertUsageEventParams{
+		EventID:       ev.EventID,
+		AccountID:     nullableAccountID(ev.AccountID),
+		AppID:         ev.AppID.String(),
+		ModuleID:      ev.ModuleID.String(),
+		Metric:        ev.Metric,
+		Kind:          db.MsBillingMetricKind(ev.Kind),
+		Value:         value,
+		RecordedAt:    ev.RecordedAt,
+		Model:         nullableModel(ev.Model),
+		ModuleVersion: nullableModuleVersion(ev.ModuleVersion),
+		//nolint:gosec // a small monotonic schema version, not caller-supplied
+		ObservationVersion: int16(ev.ObservationVersion),
+		Subject:            nullableText(ev.Subject),
+		Metadata:           []byte(ev.Metadata),
+		OccurredAt:         nullableTime(ev.OccurredAt),
+		BillableAt:         usageEventBillableAt(ev),
+		AggregationKey:     nullableAggregationKey(ev.AggregationKey),
+		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
+		OccurrencePolicy:   string(ev.OccurrencePolicy),
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	if rows == 0 {
+		if err := s.checkUsageEventFingerprint(ctx, qtx, ev.EventID, ev.PayloadFingerprint); err != nil {
+			return false, 0, err
+		}
+		billableDelta = 0
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, 0, err
+	}
+	return rows > 0, billableDelta, nil
+}
+
+func usageEventBillableAt(ev UsageEvent) time.Time {
+	if !ev.BillableAt.IsZero() {
+		return ev.BillableAt.UTC()
+	}
+	if !ev.OccurredAt.IsZero() {
+		return ev.OccurredAt.UTC()
+	}
+	return ev.RecordedAt.UTC()
+}
+
+func insertUsageObservationRejection(ctx context.Context, q *db.Queries, ev UsageEvent, reason UsageRejectionReason) error {
+	_, err := q.InsertUsageObservationRejection(ctx, db.InsertUsageObservationRejectionParams{
+		EventID:            ev.EventID,
+		AccountID:          nullableAccountID(ev.AccountID),
+		AppID:              ev.AppID.String(),
+		ModuleID:           ev.ModuleID.String(),
+		OwnerUserID:        nullableAccountID(ev.OwnerUserID),
+		OwnerOrgID:         nullableAccountID(ev.OwnerOrgID),
+		Metric:             ev.Metric,
+		Subject:            nullableText(ev.Subject),
+		OccurredAt:         nullableTime(ev.OccurredAt),
+		Reason:             string(reason),
+		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
+	})
+	return err
+}
+
+func occurrenceRejectionError(reason UsageRejectionReason) error {
+	switch reason {
+	case UsageRejectionOccurredFuture:
+		return ErrUsageOccurredFuture
+	case UsageRejectionOccurredTooOld:
+		return ErrUsageOccurredTooOld
+	case UsageRejectionPeriodClosed:
+		return ErrUsagePeriodClosed
+	default:
+		return fmt.Errorf("unsupported occurrence rejection %q", reason)
+	}
 }
 
 func (s *pgxStore) AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, bool, error) {
@@ -1074,7 +1456,7 @@ func (s *pgxStore) PendingNewCreationCharges(ctx context.Context, accountID uuid
 func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error) {
 	rows, err := s.q.PendingAddonModuleCharges(ctx, db.PendingAddonModuleChargesParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules),
+		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
 		Now:             now,
 	})
 	if err != nil {
@@ -1101,8 +1483,8 @@ func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid
 func (s *pgxStore) UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, includedModules, graceHours int) ([]UnresolvedOneTimeChargeRaw, error) {
 	rows, err := s.q.UnresolvedOneTimeCharges(ctx, db.UnresolvedOneTimeChargesParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules),
-		GraceHours:      int32(graceHours),
+		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
+		GraceHours:      int32(graceHours),      //nolint:gosec // a configured grace window in hours
 	})
 	if err != nil {
 		return nil, err
@@ -1159,7 +1541,7 @@ func (s *pgxStore) CoCreatedOverModuleTimerCount(ctx context.Context, accountID,
 		AccountID:       accountID.String(),
 		AppID:           appID.String(),
 		CreatedAt:       createdAt,
-		IncludedModules: int32(includedModules),
+		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
 	})
 	if err != nil {
 		return 0, err
@@ -1289,11 +1671,25 @@ func (s *pgxStore) AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (i
 	return billingperiod.AnchorDay(at.Time), nil
 }
 
+func (s *pgxStore) AccountActivation(ctx context.Context, accountID uuid.UUID) (time.Time, bool, error) {
+	at, err := s.q.AccountActivatedAt(ctx, accountID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !at.Valid {
+		return time.Time{}, false, nil
+	}
+	return at.Time.UTC(), true, nil
+}
+
 func (s *pgxStore) CurrentPeriodUsage(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]MetricUsageRaw, error) {
 	rows, err := s.q.CurrentPeriodUsageSummary(ctx, db.CurrentPeriodUsageSummaryParams{
 		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
-		RecordedAt:   periodStart,
-		RecordedAt_2: periodEnd,
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
 	})
 	if err != nil {
 		return nil, err
@@ -1740,6 +2136,27 @@ func nullableModuleVersion(version string) pgtype.Text {
 		return pgtype.Text{} // Valid: false → NULL
 	}
 	return pgtype.Text{String: version, Valid: true}
+}
+
+func nullableAggregationKey(key AggregationKey) pgtype.Text {
+	if key == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: string(key), Valid: true}
+}
+
+func nullableText(value string) pgtype.Text {
+	if value == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: value, Valid: true}
+}
+
+func nullableTime(value time.Time) pgtype.Timestamptz {
+	if value.IsZero() {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: value.UTC(), Valid: true}
 }
 
 // nullablePriceMicros maps a declared price to the nullable BIGINT the

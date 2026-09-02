@@ -73,8 +73,8 @@ LIMIT 1;
 SELECT DISTINCT account_id::uuid AS account_id
 FROM ms_billing.usage_events
 WHERE account_id  IS NOT NULL
-  AND recorded_at >= $1
-  AND recorded_at <  $2
+  AND COALESCE(billable_at, recorded_at) >= $1
+  AND COALESCE(billable_at, recorded_at) <  $2
   AND NOT EXISTS (
       SELECT 1
       FROM ms_billing.accounts a
@@ -222,6 +222,21 @@ WHERE id = $1
   AND frozen_charge_cents IS NULL
   AND status <> 'invoiced';
 
+-- MarkBillingPeriodInvoicedByRun completes migration 008's
+-- open→closing→invoiced lifecycle. It is called in the same transaction as a
+-- successful billing-run terminal mark, so the intake/audit state cannot
+-- disagree with the durable charge outcome.
+-- name: MarkBillingPeriodInvoicedByRun :exec
+UPDATE ms_billing.billing_periods period
+SET status = 'invoiced'
+FROM ms_billing.billing_runs run
+WHERE run.id = @run_id::uuid
+  AND run.status = 'invoiced'
+  AND period.account_id = run.account_id
+  AND period.period_start = run.period_start
+  AND period.period_end = run.period_end
+  AND period.status = 'closing';
+
 -- FreezeBillingRunCharge records, BEFORE the boundary Stripe charge, the exact
 -- whole-cent amount AND the base/overage description determinant this run will
 -- send Stripe under the deterministic idem keys ii-<run> / inv-<run> (migration
@@ -351,8 +366,8 @@ SELECT DISTINCT e.account_id::uuid AS account_id
 FROM ms_billing.usage_events e
 JOIN ms_billing.accounts a ON a.id = e.account_id
 WHERE a.activated_at IS NULL
-  AND e.recorded_at >= $1
-  AND e.recorded_at <  $2
+  AND COALESCE(e.billable_at, e.recorded_at) >= $1
+  AND COALESCE(e.billable_at, e.recorded_at) <  $2
   AND NOT EXISTS (
       SELECT 1 FROM ms_billing.org_deletion_finalizations f
       WHERE a.owner_kind = 'org' AND f.org_id = a.owner_org_id

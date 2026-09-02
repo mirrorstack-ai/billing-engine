@@ -3,6 +3,8 @@ package cycle
 import (
 	"context"
 	"fmt"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	"log/slog"
 	"time"
 
@@ -22,8 +24,11 @@ const (
 	DomainChargeSkippedNoPM      DomainChargeStatus = "skipped_no_pm"
 	DomainChargeSkippedPrepaid   DomainChargeStatus = "skipped_prepaid"
 	DomainChargeSkippedZeroCents DomainChargeStatus = "zero_cents"
-	DomainChargePeriodClosed     DomainChargeStatus = "period_closed"
-	DomainChargeSkippedStale     DomainChargeStatus = "skipped_stale"
+	// DomainChargeProposed: the leg has cut over to the intent path.
+	// A sealed intent records the charge; nothing has collected it.
+	DomainChargeProposed     DomainChargeStatus = "proposed"
+	DomainChargePeriodClosed DomainChargeStatus = "period_closed"
+	DomainChargeSkippedStale DomainChargeStatus = "skipped_stale"
 )
 
 // DomainChargeResult reports what one ChargeDomain call did.
@@ -32,7 +37,30 @@ type DomainChargeResult struct {
 	Status          DomainChargeStatus
 	ChargedCents    int64
 	StripeInvoiceID string
+	// IntentDigest is set when the leg proposed instead of charging.
+	// It is the identity of the sealed document, so a domain row can be
+	// walked forward to the intent that replaced its charge.
+	IntentDigest string
 }
+
+// Policy identifiers a proposed charge is sealed under.
+//
+// 🔴 These are placeholders, and named so. DESIGN §12 leaves the terms,
+// price-book and notice policies for these charge kinds undecided, and
+// sealing under an invented revision would put a fiction inside the
+// digest — which a customer's charge bundle would then attest to.
+//
+// A cutover must not be ENABLED in production until they name real,
+// published revisions. The shadow reconciliation of §11 step 4 is what
+// happens first; this is the second thing that must be true.
+const (
+	proposedTermsRevision     = "unpublished/pending-decision-12"
+	proposedPriceBookRevision = "unpublished/pending-decision-12"
+	proposedNoticePolicy      = "unpublished/pending-decision-12"
+	proposedTaxRuleRevision   = "not-applicable/pending-decision-12"
+	proposedRail              = "stripe"
+	proposedRoutingPolicy     = "unpublished/pending-decision-12"
+)
 
 // domainChargeShape prices only the domain's first, activation-containing
 // period. Domains have no grace, included pool, or straddle top-up: the
@@ -57,7 +85,17 @@ func (s *Service) ChargeDomain(ctx context.Context, cand DomainChargeCandidate, 
 		return nil, billing.InvalidInput("charge instant required")
 	}
 	if s.stripe == nil {
+		// Still required: recoverDomainCharge below finishes a charge a
+		// LEGACY run already put in front of the provider. Nothing else
+		// in this leg touches Stripe any more.
 		return nil, billing.Internal("ChargeDomain requires a Stripe client", nil)
+	}
+	// The proposer is no longer optional. This leg has no second branch to
+	// fall back to, so a service built without one cannot charge for a
+	// domain at all — and must say so rather than silently skip the row or
+	// nil-panic at the seal.
+	if s.proposer == nil {
+		return nil, billing.Internal("ChargeDomain requires an intent proposer: the legacy collect path is deleted", nil)
 	}
 	res := &DomainChargeResult{DomainID: cand.ID}
 
@@ -121,52 +159,28 @@ func (s *Service) ChargeDomain(ctx context.Context, cand DomainChargeCandidate, 
 		res.Status = DomainChargeSkippedStale
 		return res, nil
 	}
-	custID := claim.StripeCustomerID
-	if custID == "" {
+	// The claim says this funding account has a usable payment method, and a
+	// usable payment method implies a Stripe customer. If the two disagree
+	// the row is inconsistent, and sealing an intent against it would
+	// produce a document the executor can never route. Fail closed instead.
+	if claim.StripeCustomerID == "" {
 		return nil, billing.Internal("domain funding account has a usable PM but no Stripe customer id", nil)
 	}
 
-	draft, err := s.stripe.CreateDraftInvoice(ctx, custID, domainChargeRef(cand.ID), domainInvoiceIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("domain draft invoice failed", err)
-	}
-	desc := fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname)
-	linePeriod := billingstripe.LinePeriod{Start: coverageStart, End: coverageEnd}
-	item, err := s.stripe.CreateInvoiceItem(ctx, custID, draft.ID, cents, chargeCurrency, desc, linePeriod, domainItemIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("domain invoice item failed", err)
-	}
-	inv, err := s.stripe.FinalizeInvoice(ctx, draft.ID, domainFinalizeIdemKey(cand.ID))
-	if err != nil {
-		return nil, billing.StripeError("domain invoice finalize failed", err)
-	}
-
-	acct, err := s.store.AccountCollection(ctx, cand.AccountID)
-	if err != nil {
-		return nil, billing.Internal("account collection lookup failed", err)
-	}
-	if err := s.store.UpsertInvoice(ctx, InvoiceMirror{
-		AccountID:               cand.AccountID,
-		ChargeFundingAccountID:  claim.FundingAccountID,
-		ChargeFundingGeneration: claim.FundingGeneration,
-		StripeInvoiceID:         inv.ID,
-		Status:                  inv.Status,
-		AmountDueCents:          inv.AmountDue,
-		AmountPaidCents:         inv.AmountPaid,
-		Currency:                chargeCurrency,
-		PeriodStart:             coverageStart,
-		PeriodEnd:               coverageEnd,
-		IsLargeAutoCollect:      flagLargeAutoCollect(proratedMicros, acct),
-	}); err != nil {
-		return nil, billing.Internal("invoice mirror upsert failed", err)
-	}
-	if err := s.store.MarkDomainCharged(ctx, cand.ID, at.UTC(), inv.ID, item.ID); err != nil {
-		return nil, billing.Internal("mark domain charged failed", err)
-	}
-
-	res.Status = DomainChargeCharged
-	res.StripeInvoiceID = inv.ID
-	return res, nil
+	// 🔴 This leg is CUT OVER. There is no second branch.
+	//
+	// Everything above is unchanged: the same staleness re-check, the
+	// same proration, the same durable arming claim. What used to follow
+	// — draft invoice, line item, finalize, mirror — is deleted, so
+	// ChargeDomain now holds no provider write port on its own path and
+	// the sealed intent is the only record of the charge.
+	//
+	// The arming claim is still taken FIRST, and that ordering is now
+	// load-bearing rather than merely symmetric: it is what stamps the
+	// charge-attempt marker recoverDomainCharge reads, and proposing
+	// without it would let a re-run derive the same charge against a row
+	// nothing had claimed.
+	return s.proposeDomainCharge(ctx, cand, res, proratedMicros, coverageStart, coverageEnd, at)
 }
 
 // SweepDomainChargesResult tallies one custom-domain activation-charge batch.
@@ -215,6 +229,23 @@ func (s *Service) SweepDomainCharges(ctx context.Context, at time.Time) (*SweepD
 // recoverDomainCharge reconciles a candidate whose charge-attempt marker was
 // stamped before a prior process died. A found finalized invoice is mirrored
 // and marked; a found draft is completed with the deterministic line and keys.
+//
+// 🔴 This is the ONLY path in this leg that still reaches the provider, and it
+// is kept deliberately. It runs only when a LEGACY run already put a draft or
+// a finalized invoice under domainChargeRef — a charge that has already
+// reached Stripe. Deleting it would not prevent that charge; it would abandon
+// it: a finalized invoice the customer can see on their statement, that nobody
+// can finish, void, or prove. Proposing over the top would be worse still,
+// counting the same domain once on the card and once in the intent ledger.
+//
+// The exception DRAINS. Nothing stamps a marker with a provider object any
+// more, so once no row carries an unresolved charge-attempt marker with an
+// invoice behind it, FindInvoiceByRef finds nothing and this function only
+// ever falls through to the proposal. That is one of the questions
+// scripts/legacy-drop-preconditions.sql asks production, and it is what makes
+// removing this function a later, measurable step rather than a guess.
+// Pinned end-to-end by recovery_exception_test.go's
+// TestRecoveryStillCompletesInFlightLegacyChargesWithAProposerArmed.
 func (s *Service) recoverDomainCharge(ctx context.Context, cand DomainChargeCandidate, at time.Time, res *DomainChargeResult) (bool, error) {
 	if cand.ChargeFundingAccountID == uuid.Nil || cand.ChargeFundingGeneration == uuid.Nil {
 		return false, billing.Internal("domain recovery marker has no pinned funding authorization", nil)
@@ -311,10 +342,124 @@ func domainItemIdemKey(domainID uuid.UUID) string {
 	return "domain-fee-ii-" + domainID.String()
 }
 
-func domainInvoiceIdemKey(domainID uuid.UUID) string {
-	return "domain-fee-inv-" + domainID.String()
-}
-
 func domainFinalizeIdemKey(domainID uuid.UUID) string {
 	return "domain-fee-fin-" + domainID.String()
+}
+
+// proposeDomainCharge seals this leg's derived charge instead of
+// collecting it.
+//
+// The intent records the same figure the legacy path would have
+// charged, against the same domain row, inside the same coverage
+// window. What it does not do is move money — that waits for something
+// holding the write port, and for the predicate to permit it.
+//
+// The domain row is marked resolved on a successful proposal for the
+// same reason the legacy path marks it after a successful finalize:
+// the leg is done with it. A row left unresolved would be re-derived
+// on the next sweep and proposed again — harmlessly, since the digest
+// makes that the same document, but it would also never leave the
+// candidate set.
+func (s *Service) proposeDomainCharge(
+	ctx context.Context,
+	cand DomainChargeCandidate,
+	res *DomainChargeResult,
+	proratedMicros int64,
+	coverageStart, coverageEnd time.Time,
+	at time.Time,
+) (*DomainChargeResult, error) {
+	// Seal what a collection would actually take, not the raw derived
+	// micros — see collectableMicros. Sealing the unrounded figure would
+	// attest to an amount the customer was never charged.
+	sealMicros, err := collectableMicros(proratedMicros)
+	if err != nil {
+		return nil, billing.Internal("micros to collectable micros conversion failed", err)
+	}
+
+	sealed, err := s.proposer.Propose(ctx, proposer.Charge{
+		// The proposer resolves this to the account OWNER. A leg that built
+		// an intent.Subject here is how the payer and the executor's
+		// resolver came to disagree; see proposer.Charge.AccountID.
+		AccountID: cand.AccountID.String(),
+		Kind:      intent.KindPlatformBase,
+		Currency:  chargeCurrency,
+		Lines: proposer.SingleLine(
+			fmt.Sprintf("MirrorStack custom domain (prorated) — %s", cand.Hostname),
+			domainChargeRef(cand.ID),
+			sealMicros,
+		),
+
+		AuthorizationID:   "domain:" + cand.AccountID.String(),
+		TermsRevision:     proposedTermsRevision,
+		PriceBookRevision: proposedPriceBookRevision,
+		NoticePolicy:      proposedNoticePolicy,
+		// The only rail this engine has an adapter for. The routing
+		// policy that is supposed to CHOOSE it does not exist yet, so
+		// the revision is a placeholder like the other four and
+		// ClausePolicyPublished refuses on it — which is the honest
+		// state, not a gap being hidden.
+		SelectedRail:          proposedRail,
+		RoutingPolicyRevision: proposedRoutingPolicy,
+		// 🔴 Zero tax, resolved. This leg has never applied tax, so
+		// claiming an unresolved determination would quarantine every
+		// domain charge, and claiming a computed one would invent a
+		// figure. Recording what is actually true — no tax was
+		// determined for this charge kind — is the honest option, and
+		// docs/DESIGN.md §12's tax decisions are what change it.
+		Tax: intent.TaxDetermination{
+			Resolved:     true,
+			Jurisdiction: "not-applicable",
+			RuleRevision: proposedTaxRuleRevision,
+			// Not "reproducible": nothing recomputed this. The engine
+			// determined no tax arises, which is a real determination
+			// and is exactly what this class names.
+			Verification: intent.TaxNotApplicable,
+		},
+		// 🔴 The EXECUTION window, not the coverage window. They are
+		// different things, and sealing one as the other made this leg
+		// produce intents that could never be collected.
+		//
+		// coverageEnd is the end of the period being billed, and this leg
+		// runs AT or AFTER that boundary — so `at` was already past
+		// ExecuteNotAfter the moment the document was sealed, and
+		// predicate.ClauseWithinExecutionWindow (predicate.go:74-84) refuses
+		// it forever. The charge would have evaporated silently: the legacy
+		// provider call had already been skipped in favour of the proposal.
+		//
+		// window_sanity_test.go caught it, and only because the clock crossed
+		// a period boundary — it had been passing on the luck of the
+		// calendar. The auto-top-up leg had it right all along
+		// (autotopup/executor.go:1365).
+		//
+		// The window therefore opens at the seal instant and runs for
+		// executionWindow. The coverage period is NOT sealed anywhere yet;
+		// that is a canonical field the intent does not have, noted where the
+		// adapter drops the invoice line period.
+		ExecuteNotBefore: at,
+		ExecuteNotAfter:  at.Add(executionWindow),
+	})
+	if err != nil {
+		return nil, billing.Internal("propose domain charge intent failed", err)
+	}
+
+	// MarkDomainCharged, not MarkDomainChargeResolved.
+	//
+	// Resolved is the terminal NO-CHARGE verdict — the marker the
+	// period-closed and zero-cent branches take. Using it here would
+	// record a sealed obligation as a forgiveness: the row would be
+	// indistinguishable from a domain nobody was ever going to bill, and
+	// the digest would exist only in the return value of a function that
+	// has already returned.
+	//
+	// The reference is written PREFIXED as "intent:<digest>", the same
+	// shape the module-overage leg uses (overage.go), so nothing
+	// downstream can read a digest as a provider invoice id. There is no
+	// invoice item, so that field stays empty.
+	if err := s.store.MarkDomainCharged(ctx, cand.ID, at.UTC(), "intent:"+sealed.Digest(), ""); err != nil {
+		return nil, billing.Internal("mark domain charge proposed failed", err)
+	}
+
+	res.Status = DomainChargeProposed
+	res.IntentDigest = sealed.Digest()
+	return res, nil
 }

@@ -74,9 +74,17 @@ type Store interface {
 	Acquire(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64, now time.Time) (Attempt, AcquireKind, error)
 	Pending(ctx context.Context, accountID uuid.UUID) (Attempt, bool, error)
 	Get(ctx context.Context, accountID, attemptID uuid.UUID) (Attempt, error)
+	// FindByStripeInvoice resolves a webhook back to the attempt that owns
+	// its invoice. It is a READ of a column nothing writes any more: the
+	// collector that called AttachInvoice is deleted, so every row carrying
+	// a stripe_invoice_id was written before the cutover.
 	FindByStripeInvoice(ctx context.Context, stripeInvoiceID string) (Attempt, bool, error)
-	AttachInvoice(ctx context.Context, attempt Attempt, invoice billingstripe.Invoice) (Attempt, error)
 	Fail(ctx context.Context, attempt Attempt, failureCode, receiptURL string) (Attempt, bool, error)
+	// MarkProposed records that this attempt's charge was sealed as an
+	// intent instead of collected. Terminal for the legacy rail: resume
+	// and retry select status IN ('pending','failed'), so a proposed row
+	// is invisible to them and cannot be picked up and charged.
+	MarkProposed(ctx context.Context, attempt Attempt, intentReference string) (bool, error)
 }
 
 type Settler interface {

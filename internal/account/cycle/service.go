@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	"log/slog"
 	"math/big"
 	"time"
@@ -23,8 +25,19 @@ import (
 // injectable for deterministic tests (RegisterApp windows "now" into the
 // account's current anchored period).
 type Service struct {
-	store         Store
-	stripe        billingstripe.Client
+	store  Store
+	stripe billingstripe.Client
+	// proposer, when set, cuts a charge leg over to the intent path:
+	// the leg derives the same amount it always did, seals it, stores
+	// it, and STOPS. Something holding the write port decides whether
+	// to collect it.
+	//
+	// nil is the legacy path, so a deployment that installs nothing
+	// behaves exactly as before. That is what makes the cutover
+	// reversible per leg rather than all at once, and what lets it wait
+	// on shadow reconciliation (docs/DESIGN.md §11 step 4) instead of
+	// being blocked by it.
+	proposer      chargeProposer
 	nowFn         func() time.Time
 	walletEnabled bool
 	// creditRollout is the immutable, account-scoped production rollout
@@ -181,6 +194,48 @@ func (s *Service) WithNow(now func() time.Time) *Service {
 // WithCreditWallet enables access to the migration-048 credit-wallet schema.
 // It defaults to false so callers must opt in only after the startup capability
 // probe succeeds. Returns the Service for chaining.
+// chargeProposer is the narrow seam a cut-over leg proposes through.
+//
+// An interface rather than the concrete *proposer.Proposer so that this
+// package does not depend on the intent packages at all when no
+// proposer is installed — and so a test can observe a proposal without
+// a database.
+type chargeProposer interface {
+	Propose(ctx context.Context, c proposer.Charge) (intent.ChargeIntent, error)
+	// ProposeGroup seals several charges that must settle on ONE invoice.
+	//
+	// The period boundary needs it and the other legs do not: a boundary is
+	// two charge kinds — the closed period's usage arrears and the next
+	// period's subscription — and an intent carries one kind, because the
+	// kind selects which rule of a standing authorization applies. Proposing
+	// them separately would let the executor collect them as two invoices
+	// with two roundings, which is not what the legacy path takes.
+	ProposeGroup(ctx context.Context, charges []proposer.Charge) ([]intent.ChargeIntent, error)
+}
+
+// WithIntentProposer cuts this service's charge legs over to the intent
+// path.
+//
+// docs/VERIFICATION.md §5 wants the write port only in the isolated
+// executor deployment. A leg that proposes holds no write port, so once
+// every leg is cut over, cmd/billing-cycle stops being able to charge
+// anyone — which is a stronger statement than any check over its call
+// graph could make.
+func (s *Service) WithIntentProposer(p chargeProposer) *Service {
+	s.proposer = p
+	return s
+}
+
+// IntentProposerArmed reports whether the intent cutover seam is
+// attached to this service.
+//
+// It exists so a deployment test can prove the wiring, rather than a
+// comment asserting it. WithIntentProposer spent its first two legs
+// with no non-test caller: every cutover branch was unreachable in
+// production and nothing failed, because nothing could observe the
+// difference from outside the package.
+func (s *Service) IntentProposerArmed() bool { return s.proposer != nil }
+
 func (s *Service) WithCreditWallet(enabled bool) *Service {
 	s.walletEnabled = enabled
 	return s
@@ -459,7 +514,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		// never prorated. The PERSISTED billable_quantity (below) always stays
 		// the raw, unscaled representative level — proration is pricing-only.
 		pricedQuantity := raw.BillableQuantity
-		if raw.Kind == usage.KindPeak {
+		if raw.Kind == usage.KindPeak && raw.AggregationKey == "" {
 			pricedQuantity, err = prorateLevelQuantity(raw.BillableQuantity, raw.ActiveSeconds, periodSeconds)
 			if err != nil {
 				return nil, billing.Internal("compute window-prorated peak quantity failed", err)
@@ -487,6 +542,7 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			Model:            raw.Model,
 			ModuleVersion:    raw.ModuleVersion,
 			Kind:             raw.Kind,
+			AggregationKey:   raw.AggregationKey,
 			BillableQuantity: raw.BillableQuantity,
 			UnitPriceMicros:  priceMicros,
 			MarkupNum:        num,

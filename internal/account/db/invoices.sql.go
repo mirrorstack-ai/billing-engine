@@ -42,7 +42,12 @@ const invoiceForPayment = `-- name: InvoiceForPayment :one
 SELECT stripe_invoice_id,
        status,
        charge_funding_account_id,
-       charge_funding_legacy_unresolved
+       charge_funding_legacy_unresolved,
+       -- What is still owed. A receivable collects the REMAINDER of its
+       -- source, so the amount is read from the mirror rather than derived:
+       -- the provider's own figure for this invoice is the only one that can
+       -- be right about what is left.
+       amount_due
 FROM ms_billing.invoices
 WHERE id = $1
   AND account_id = $2
@@ -54,10 +59,11 @@ type InvoiceForPaymentParams struct {
 }
 
 type InvoiceForPaymentRow struct {
-	StripeInvoiceID               string      `json:"stripe_invoice_id"`
-	Status                        string      `json:"status"`
-	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
-	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	StripeInvoiceID               string         `json:"stripe_invoice_id"`
+	Status                        string         `json:"status"`
+	ChargeFundingAccountID        pgtype.UUID    `json:"charge_funding_account_id"`
+	ChargeFundingLegacyUnresolved bool           `json:"charge_funding_legacy_unresolved"`
+	AmountDue                     pgtype.Numeric `json:"amount_due"`
 }
 
 // InvoiceForPayment resolves a mirror invoice by (id, account) for the
@@ -73,6 +79,7 @@ func (q *Queries) InvoiceForPayment(ctx context.Context, arg InvoiceForPaymentPa
 		&i.Status,
 		&i.ChargeFundingAccountID,
 		&i.ChargeFundingLegacyUnresolved,
+		&i.AmountDue,
 	)
 	return i, err
 }

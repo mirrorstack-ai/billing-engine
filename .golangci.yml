@@ -1,0 +1,78 @@
+version: "2"
+
+run:
+  # Test code is not deployed. gosec on a _test.go file reports reading a
+  # fixture by path and ignoring an error in a table-driven case — neither is
+  # a property of the shipped binary, and a gate that fails on them trains
+  # people to ignore it.
+  #
+  # 🔴 This exempts only files ending _test.go. internal/shared/testutil is an
+  # ordinary package and is excluded separately, by path, below.
+  tests: false
+
+# Security analysis for a service that moves money.
+#
+# billing-engine had CodeQL only because it was a PUBLIC repository, where
+# GitHub provides it free. It was never a workflow in this tree — it was
+# GitHub's default setup — so when the repository became private on 2026-09-02
+# the analysis stopped, silently and with nothing in the repo to show for it.
+# No other private repository in the organisation has ever had code scanning.
+#
+# gosec runs free on a private repository as an ordinary linter. It is run
+# THROUGH golangci-lint rather than standalone for one specific reason: this
+# tree already carries 19 `//nolint:gosec` annotations, which standalone gosec
+# does not honour. Running it standalone would report suppressed findings as
+# new ones and make the first run unpassable for no reason.
+issues:
+  # 🔴 golangci-lint TRUNCATES its report by default: max-same-issues 3 and
+  # max-issues-per-linter 50. It does so silently — the summary line counts
+  # what it printed, not what it found.
+  #
+  # Measured in api-platform (#682) while porting this gate: the first run
+  # reported 41 findings and the true number was 66. An entire file of OAuth
+  # open-redirect candidates was never displayed. G101 alone was 20 hits,
+  # shown as 3.
+  #
+  # This tree is at zero, where truncation can hide nothing — verified by
+  # re-running with both caps disabled. These lines are for the NEXT person,
+  # who will be triaging a non-zero count and would otherwise be working from
+  # a number the tool quietly capped.
+  max-same-issues: 0
+  max-issues-per-linter: 0
+
+linters:
+  default: none
+  enable:
+    - gosec
+
+  settings:
+    gosec:
+      excludes:
+        # G101 "Potential hardcoded credentials" matches IDENTIFIER NAMES, not
+        # values. Every hit in this tree is a header name or a schema constant
+        # — `headerInternalSecret = "X-MS-Internal-Secret"`, and SQL constants
+        # whose text contains the word. The real secrets arrive from the
+        # environment and are never literals here; there is a separate control
+        # for that (the repository has no committed .env.local, verified by
+        # `git rev-list --all --objects`).
+        #
+        # 🔴 Re-check this exclusion if the rule ever changes to inspect
+        # VALUES: at that point it would start finding what it is named for.
+        - G101
+
+  exclusions:
+    # Test code is not deployed. gosec on a _test.go file reports reading a
+    # fixture by path and ignoring an error in a table-driven case — neither
+    # is a property of the shipped binary, and a gate that fails on them
+    # trains people to ignore it.
+    #
+    # 🔴 This does NOT cover internal/shared/testutil or the architecture
+    # tests' subjects: those are ordinary packages that gosec still analyses.
+    # Only files ending _test.go are exempt.
+    rules:
+      # Test infrastructure reads files by construted path — migration files
+      # and a local .env.local — which is what it is for. Not reachable from
+      # any deployed binary.
+      - path: internal/shared/testutil/
+        linters:
+          - gosec

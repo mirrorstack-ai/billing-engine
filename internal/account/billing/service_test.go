@@ -15,6 +15,8 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -60,27 +62,34 @@ type fakeStore struct {
 	// credit-wallet state. These maps model the service-facing projections,
 	// not the SQL implementation details: an idempotency key resolves one
 	// immutable ledger record and purchases are separately owner-scoped.
-	creditStanding           map[uuid.UUID]billing.CreditStandingRow
-	creditLedgerEntries      map[uuid.UUID][]billing.CreditLedgerEntry
-	creditLedgerByKey        map[string]billing.CreditLedgerRecord
-	creditPurchases          map[uuid.UUID]billing.CreditPurchaseRow
-	creditAutoTopUps         map[uuid.UUID]billing.AutoTopUpConfig
-	distributorCustomers     map[distributorCustomerKey]uuid.UUID
-	distributorStates        map[uuid.UUID][]billing.DistributorCustomerState
-	creditStandingReads      int
-	creditLedgerListReads    int
-	creditPurchaseCreates    int
-	creditIdempotencyReads   int
-	creditPurchaseReads      int
-	creditPurchaseAttaches   int
-	creditPurchaseFinalizes  int
-	creditAutoTopUpWrites    int
-	creditGateSnapshotReads  int
-	creditBillingModeWrites  int
-	distributorRelationReads int
-	distributorStateReads    int
-	creditGrantInserts       int
-	chargeFundingReads       int
+	creditStanding      map[uuid.UUID]billing.CreditStandingRow
+	creditLedgerEntries map[uuid.UUID][]billing.CreditLedgerEntry
+	creditLedgerByKey   map[string]billing.CreditLedgerRecord
+	creditPurchases     map[uuid.UUID]billing.CreditPurchaseRow
+	// creditPurchaseProposedRefs is the durable "intent:<digest>" marker
+	// migration 057 added, keyed by purchase id. billing.CreditPurchaseRow
+	// does not carry it, so the fake keeps it beside the row — it is the only
+	// way a test can walk a proposed purchase back to the intent that now owns
+	// its money.
+	creditPurchaseProposedRefs map[uuid.UUID]string
+	creditAutoTopUps           map[uuid.UUID]billing.AutoTopUpConfig
+	distributorCustomers       map[distributorCustomerKey]uuid.UUID
+	distributorStates          map[uuid.UUID][]billing.DistributorCustomerState
+	creditStandingReads        int
+	creditLedgerListReads      int
+	creditPurchaseCreates      int
+	creditIdempotencyReads     int
+	creditPurchaseReads        int
+	creditPurchaseAttaches     int
+	creditPurchaseFinalizes    int
+	creditPurchaseProposes     int
+	creditAutoTopUpWrites      int
+	creditGateSnapshotReads    int
+	creditBillingModeWrites    int
+	distributorRelationReads   int
+	distributorStateReads      int
+	creditGrantInserts         int
+	chargeFundingReads         int
 
 	// Injected failures (set per-test as needed).
 	errEnsureAccount        error
@@ -197,6 +206,37 @@ func (s *fakeCreditPurchaseStore) Fail(
 	return fakeCreditPurchaseAttempt(failed), failed.Transitioned, nil
 }
 
+// MarkProposed moves the pending row to "proposed" and records which intent
+// took it, mirroring the real store (creditpurchase/store.go).
+//
+// 🔴 The PENDING-ONLY predicate is the point, and it is reproduced rather than
+// assumed: a row another worker already settled, failed or proposed must
+// return false — a lost race, not a fault — so an idempotent replay can never
+// re-seal a purchase that already moved.
+func (s *fakeCreditPurchaseStore) MarkProposed(
+	_ context.Context,
+	attempt creditpurchase.Attempt,
+	intentReference string,
+) (bool, error) {
+	if intentReference == "" {
+		return false, errors.New("fakeCreditPurchaseStore: proposed reference required")
+	}
+	s.store.creditPurchaseProposes++
+	purchase, ok := s.store.creditPurchases[attempt.ID]
+	if !ok || purchase.AccountID != attempt.AccountID {
+		return false, errors.New("credit purchase not found")
+	}
+	if purchase.Status != "pending" {
+		return false, nil
+	}
+	purchase.Status = "proposed"
+	purchase.Transitioned = true
+	s.store.creditPurchases[purchase.ID] = purchase
+	s.store.putCreditPurchaseRecord(purchase)
+	s.store.creditPurchaseProposedRefs[purchase.ID] = intentReference
+	return true, nil
+}
+
 type fakeCreditPurchaseSettler struct {
 	store *fakeStore
 }
@@ -255,47 +295,130 @@ func fakeCreditPurchaseAttempt(
 	}
 }
 
+// capturingProposer is the seam the credit-purchase leg proposes through,
+// recording every charge it was handed and every intent it sealed.
+//
+// It seals for real — intent.Seal, not a stub — so a test asserting on the
+// total is asserting on the same derivation production would perform: Seal is
+// the one place the arithmetic (subtotal, wallet split, provider remainder,
+// digest) happens.
+//
+// The interface creditpurchase.WithIntentProposer takes is unexported but
+// structural, so this external test package can satisfy it.
+type capturingProposer struct {
+	charges []proposer.Charge
+	sealed  []intent.ChargeIntent
+	err     error
+}
+
+func (p *capturingProposer) Propose(
+	_ context.Context,
+	c proposer.Charge,
+) (intent.ChargeIntent, error) {
+	if p.err != nil {
+		return intent.ChargeIntent{}, p.err
+	}
+	lines := make([]intent.Line, 0, len(c.Lines))
+	facts := make([]string, 0, len(c.Lines))
+	for _, l := range c.Lines {
+		lines = append(lines, intent.NewLine(l.Description, l.SourceRef, "1", 1, l.AmountMicros))
+		facts = append(facts, l.SourceRef)
+	}
+	sealed, err := intent.Seal(intent.Draft{
+		// The real proposer resolves the account to its FUNDER's owner; the
+		// leg never constructs a Subject.
+		Payer:                  intent.Subject{Kind: "user", ID: "owner-of-" + c.AccountID},
+		Currency:               c.Currency,
+		Lines:                  lines,
+		Kind:                   c.Kind,
+		PriceBookRevision:      c.PriceBookRevision,
+		TermsRevision:          c.TermsRevision,
+		Tax:                    c.Tax,
+		WalletAllocationMicros: c.WalletAllocationMicros,
+		AuthorizationID:        c.AuthorizationID,
+		NoticePolicy:           c.NoticePolicy,
+		SelectedRail:           c.SelectedRail,
+		RoutingPolicyRevision:  c.RoutingPolicyRevision,
+		ExecuteNotBefore:       c.ExecuteNotBefore,
+		ExecuteNotAfter:        c.ExecuteNotAfter,
+		SourceFactKeys:         facts,
+	})
+	if err != nil {
+		return intent.ChargeIntent{}, err
+	}
+	p.charges = append(p.charges, c)
+	p.sealed = append(p.sealed, sealed)
+	return sealed, nil
+}
+
+// onlySealed is the single intent this leg sealed, and it fails rather than
+// index into an empty slice — a purchase that sealed nothing is the failure
+// these tests exist to catch, and it must not surface as a panic.
+func (p *capturingProposer) onlySealed(t *testing.T) intent.ChargeIntent {
+	t.Helper()
+	require.Len(t, p.sealed, 1, "expected exactly one sealed charge intent")
+	return p.sealed[0]
+}
+
+// newCreditPurchaseTestService builds the leg ARMED.
+//
+// 🔴 It has to be. The legacy Stripe collector is deleted, so an unarmed
+// executor refuses a fresh purchase outright; a service built without a
+// proposer here would only ever prove the refusal.
 func newCreditPurchaseTestService(
 	store *fakeStore,
 	stripe *fakeStripe,
 ) *billing.Service {
+	svc, _ := creditPurchaseSvcProposing(store, stripe)
+	return svc
+}
+
+// creditPurchaseSvcProposing is the same service, handing back the proposer so
+// a test can assert on WHAT was sealed and not merely that nothing failed.
+func creditPurchaseSvcProposing(
+	store *fakeStore,
+	stripe *fakeStripe,
+) (*billing.Service, *capturingProposer) {
+	p := &capturingProposer{}
 	executor := creditpurchase.NewExecutor(
 		&fakeCreditPurchaseStore{store: store},
 		&fakeCreditPurchaseSettler{store: store},
 		stripe,
-	)
-	return billing.NewService(store, stripe, "").
+	).WithIntentProposer(p)
+	svc := billing.NewService(store, stripe, "").
 		WithCreditPurchaseExecutor(executor).
 		WithCreditRecoveryCapability(creditrecovery.NewRuntimeCapability(
 			func(context.Context) (bool, error) { return true, nil },
 		))
+	return svc, p
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		accountsByUser:       map[uuid.UUID]fakeAccount{},
-		hasUsablePM:          map[uuid.UUID]bool{},
-		hasUnpaidInvoice:     map[uuid.UUID]bool{},
-		paymentMethodsBy:     map[uuid.UUID][]billing.PaymentMethod{},
-		serviceSignals:       map[uuid.UUID]billing.ServiceSignals{},
-		pmTargets:            map[uuid.UUID]pmTarget{},
-		addCardRequests:      map[uuid.UUID]*fakeAddCardRequest{},
-		accountsByOrg:        map[uuid.UUID]fakeAccount{},
-		fundedOrgs:           map[uuid.UUID]bool{},
-		fundingOf:            map[uuid.UUID]uuid.UUID{},
-		orgPMTargets:         map[uuid.UUID]pmTarget{},
-		unpaidCount:          map[uuid.UUID]int{},
-		unpaidInvoices:       map[uuid.UUID][]billing.UnpaidInvoiceRow{},
-		payTargets:           map[uuid.UUID]fakePayTarget{},
-		hasUsableDefPM:       map[uuid.UUID]bool{},
-		stripeCustomerOf:     map[uuid.UUID]string{},
-		creditStanding:       map[uuid.UUID]billing.CreditStandingRow{},
-		creditLedgerEntries:  map[uuid.UUID][]billing.CreditLedgerEntry{},
-		creditLedgerByKey:    map[string]billing.CreditLedgerRecord{},
-		creditPurchases:      map[uuid.UUID]billing.CreditPurchaseRow{},
-		creditAutoTopUps:     map[uuid.UUID]billing.AutoTopUpConfig{},
-		distributorCustomers: map[distributorCustomerKey]uuid.UUID{},
-		distributorStates:    map[uuid.UUID][]billing.DistributorCustomerState{},
+		accountsByUser:             map[uuid.UUID]fakeAccount{},
+		hasUsablePM:                map[uuid.UUID]bool{},
+		hasUnpaidInvoice:           map[uuid.UUID]bool{},
+		paymentMethodsBy:           map[uuid.UUID][]billing.PaymentMethod{},
+		serviceSignals:             map[uuid.UUID]billing.ServiceSignals{},
+		pmTargets:                  map[uuid.UUID]pmTarget{},
+		addCardRequests:            map[uuid.UUID]*fakeAddCardRequest{},
+		accountsByOrg:              map[uuid.UUID]fakeAccount{},
+		fundedOrgs:                 map[uuid.UUID]bool{},
+		fundingOf:                  map[uuid.UUID]uuid.UUID{},
+		orgPMTargets:               map[uuid.UUID]pmTarget{},
+		unpaidCount:                map[uuid.UUID]int{},
+		unpaidInvoices:             map[uuid.UUID][]billing.UnpaidInvoiceRow{},
+		payTargets:                 map[uuid.UUID]fakePayTarget{},
+		hasUsableDefPM:             map[uuid.UUID]bool{},
+		stripeCustomerOf:           map[uuid.UUID]string{},
+		creditStanding:             map[uuid.UUID]billing.CreditStandingRow{},
+		creditLedgerEntries:        map[uuid.UUID][]billing.CreditLedgerEntry{},
+		creditLedgerByKey:          map[string]billing.CreditLedgerRecord{},
+		creditPurchases:            map[uuid.UUID]billing.CreditPurchaseRow{},
+		creditPurchaseProposedRefs: map[uuid.UUID]string{},
+		creditAutoTopUps:           map[uuid.UUID]billing.AutoTopUpConfig{},
+		distributorCustomers:       map[distributorCustomerKey]uuid.UUID{},
+		distributorStates:          map[uuid.UUID][]billing.DistributorCustomerState{},
 	}
 }
 

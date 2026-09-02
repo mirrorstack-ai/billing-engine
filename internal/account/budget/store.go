@@ -111,8 +111,8 @@ func (s *pgxStore) GetBudget(ctx context.Context, scope Scope, scopeID uuid.UUID
 func (s *pgxStore) AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
 	n, err := s.q.AppPeriodSpendMicros(ctx, db.AppPeriodSpendMicrosParams{
 		AppID:        appID.String(),
-		RecordedAt:   periodStart,
-		RecordedAt_2: periodEnd,
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
 	})
 	if err != nil {
 		return 0, err
@@ -140,7 +140,9 @@ func (s *pgxStore) InsertBudgetAlerts(ctx context.Context, records []AlertRecord
 		rows, err := qtx.InsertBudgetAlert(ctx, db.InsertBudgetAlertParams{
 			BudgetID:    a.BudgetID.String(),
 			PeriodStart: a.PeriodStart,
-			Percent:     int32(a.Percent),
+			// normalizePercents (service.go) rejects anything outside 1..100
+			// before a record reaches here, so this cannot truncate.
+			Percent:     int32(a.Percent), //nolint:gosec // bounded 1..100 by normalizePercents
 			SpendMicros: a.SpendMicros,
 			LimitMicros: a.LimitMicros,
 		})
@@ -235,7 +237,10 @@ func nullableAccountID(id uuid.UUID) pgtype.UUID {
 func intsToInt32(in []int) []int32 {
 	out := make([]int32, len(in))
 	for i, v := range in {
-		out[i] = int32(v)
+		// Callers pass percents, already validated 1..100 by
+		// normalizePercents. This helper does not re-check: if it ever takes
+		// an unvalidated slice, that assumption is what breaks.
+		out[i] = int32(v) //nolint:gosec // percents, bounded by the caller
 	}
 	return out
 }

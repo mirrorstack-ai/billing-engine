@@ -639,6 +639,45 @@ func (q *Queries) LockCreditAttemptByStripeInvoice(ctx context.Context, stripeIn
 	return i, err
 }
 
+const markAutoTopUpProposed = `-- name: MarkAutoTopUpProposed :one
+UPDATE ms_billing.credit_ledger
+SET status = 'proposed',
+    proposed_reference = $1::text
+WHERE id = $2::uuid
+  AND account_id = $3::uuid
+  AND type = 'auto_topup'
+  AND status = 'pending'
+RETURNING id
+`
+
+type MarkAutoTopUpProposedParams struct {
+	ProposedReference string `json:"proposed_reference"`
+	AttemptID         string `json:"attempt_id"`
+	AccountID         string `json:"account_id"`
+}
+
+// MarkAutoTopUpProposed records that this attempt's charge was sealed as an
+// intent instead of collected.
+//
+// 'proposed' is terminal for the legacy rail: the resume and retry paths
+// select `status IN ('pending','failed')`, so a proposed row is invisible to
+// them and cannot be picked up and charged. That is the point — the intent
+// rail has taken this attempt.
+//
+// The guard is `status = 'pending'`, the same as FailAutoTopUpAttempt: an
+// attempt that already settled or failed is not ours to propose, and a zero
+// row count tells the caller it lost a race rather than silently overwriting a
+// terminal state.
+//
+// The reference is written prefixed as 'intent:<digest>' by the caller, so
+// nothing downstream reads a digest as a provider object id.
+func (q *Queries) MarkAutoTopUpProposed(ctx context.Context, arg MarkAutoTopUpProposedParams) (string, error) {
+	row := q.db.QueryRow(ctx, markAutoTopUpProposed, arg.ProposedReference, arg.AttemptID, arg.AccountID)
+	var id string
+	err := row.Scan(&id)
+	return id, err
+}
+
 const readAutoTopUpBalance = `-- name: ReadAutoTopUpBalance :one
 WITH source_lots AS (
     SELECT

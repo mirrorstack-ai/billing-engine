@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
-	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
 type pgxStore struct {
@@ -221,31 +220,32 @@ func (s *pgxStore) FindByStripeInvoice(
 	return attempt, true, nil
 }
 
-func (s *pgxStore) AttachInvoice(ctx context.Context, attempt Attempt, invoice billingstripe.Invoice) (Attempt, error) {
-	if invoice.ID == "" {
-		return Attempt{}, fmt.Errorf("stripe invoice id required")
+// MarkProposed stamps the intent-path terminal marker.
+//
+// The guard is status = 'pending', the same as Fail: an attempt that already
+// settled or failed is not ours to propose. A false return means the row was
+// not pending — the caller lost a race — rather than a silent overwrite of a
+// terminal state.
+func (s *pgxStore) MarkProposed(
+	ctx context.Context,
+	attempt Attempt,
+	intentReference string,
+) (bool, error) {
+	if intentReference == "" {
+		return false, errors.New("autotopup: a proposed attempt needs its intent reference")
 	}
-	_, err := s.q.AttachAutoTopUpInvoice(ctx, db.AttachAutoTopUpInvoiceParams{
-		StripeInvoiceID: invoice.ID,
-		ReceiptUrl:      invoice.HostedInvoiceURL,
-		AttemptID:       attempt.ID.String(),
-		AccountID:       attempt.AccountID.String(),
+	_, err := s.q.MarkAutoTopUpProposed(ctx, db.MarkAutoTopUpProposedParams{
+		AttemptID:         attempt.ID.String(),
+		AccountID:         attempt.AccountID.String(),
+		ProposedReference: intentReference,
 	})
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return Attempt{}, err
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
 	}
-	current, getErr := s.Get(ctx, attempt.AccountID, attempt.ID)
-	if getErr != nil {
-		return Attempt{}, getErr
+	if err != nil {
+		return false, fmt.Errorf("mark auto top-up proposed: %w", err)
 	}
-	if current.StripeInvoiceID != invoice.ID {
-		return Attempt{}, fmt.Errorf(
-			"auto-top-up attempt %s is already attached to invoice %q",
-			attempt.ID,
-			current.StripeInvoiceID,
-		)
-	}
-	return current, nil
+	return true, nil
 }
 
 func (s *pgxStore) Fail(
