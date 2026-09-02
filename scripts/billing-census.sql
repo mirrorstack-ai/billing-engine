@@ -116,9 +116,9 @@ FROM ms_billing.billing_authorizations;
 
 -- 8. WHICH PRICING TIER actually priced production's usage.
 --
--- Added 2026-08-31 after the census found 38,326 usage_events and 15 invoices
--- against an EMPTY metric_version_prices. That combination is only possible if
--- the charges resolved through a tier the shadow rater does not read.
+-- Added 2026-08-31 after the census found usage events and invoices against an
+-- EMPTY metric_version_prices. That combination is only possible if the charges
+-- resolved through a tier the shadow rater does not read.
 --
 -- cycle.Store.MetricPriceMicros (store.go:102-120) resolves in THREE tiers:
 --   1. version-first — metric_version_prices, when module_version != ''
@@ -159,8 +159,8 @@ WHERE unit_price_micros > 0;
 
 -- 9. ROLLUP COVERAGE: was that usage ever actually billable?
 --
--- Added 2026-08-31 because the census returned 38,326 usage_events against
--- only 12 usage_aggregates and 1 billing_run. Three readings fit, and they
+-- Added 2026-08-31 because the census returned orders of magnitude more
+-- usage_events than usage_aggregates or billing_runs. Three readings fit, and they
 -- imply different things about whether the legacy collectors are doing the job
 -- the legacy-drop decision assumes they are doing:
 --
@@ -201,9 +201,9 @@ FROM ms_billing.usage_aggregates;
 
 -- 10. Is the rollup BEHIND, or are the unrolled periods simply still OPEN?
 --
--- Added 2026-08-31 after §9 measured 6,937 of 38,326 events inside a
--- rolled-up period (18%) with only 2 of 6 periods carrying aggregates, and
--- only 50 events lacking an account — which kills the innocent "structurally
+-- Added 2026-08-31 after §9 measured a small minority of events inside a
+-- rolled-up period, a minority of periods carrying aggregates, and very few
+-- events lacking an account — which kills the innocent "structurally
 -- unbillable" reading.
 --
 -- But 82% uncovered is only alarming if those periods should have been rolled

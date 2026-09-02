@@ -21,44 +21,58 @@ unrestricted merchant credential, can charge out of band. Attestation, credentia
 isolation and reconciliation make that bypass narrow or detectable. They do not
 make it impossible, and nothing here claims they do.
 
-> **Status: target design. Not implemented, not deployed.**
+> **Status: partly built. Nothing on this rail can collect.**
 >
-> Every model type named below returns zero files from
-> `git grep <Type> -- '*.go'` on `main`, and each is marked `(unbuilt)` where its
-> section first names it. Present-state facts about shipped code appear only with
-> a file path in the same paragraph. Read every other verb as *must*.
+> A type marked `(unbuilt)` where its section first names it has no declaration
+> in the tree; `git grep 'type <Name>' -- '*.go'` finds nothing. `UsageFact`,
+> `PriceBookRevision`, `TaxDetermination`, `BillingAuthorization`, `FundingPlan`,
+> `NoticeReceipt` and `ChargeIntent` are built and carry no marker. Present-state
+> facts appear only with a file path in the same paragraph; read every other verb
+> as *must*.
 >
-> **What is shipped is not a smaller version of this.** The engine already
-> derives amounts, already holds the mutation-capable Stripe credential in the
-> binary that serves the account API (`cmd/account-api/main.go:506`), and already
-> collects. What it lacks is the ceremony that would make those amounts
-> answerable to you. The trust you extend to MirrorStack today is therefore not
-> the trust this document describes, and this document is not permission to
-> charge under unfinished rules.
+> **What is shipped is not a smaller version of this.** The engine derives every
+> amount, and holds the mutation-capable Stripe credential in the binary serving
+> the account API (`cmd/account-api/main.go`, `stripeKey`). Until 2026-09-01 it
+> also collected, from that binary and from the billing cycle. Those collectors
+> are deleted. Every leg now ends by sealing a `ChargeIntent` and stopping — the
+> cycle's overage, domain, proration and boundary legs, automatic top-up, credit
+> purchase and the unpaid-invoice retry all call `Propose`, `ProposeGroup` or
+> `ProposeReceivable` on `internal/intent/proposer` and reach no provider.
 >
-> 🔴 **The intent, notice and authority ceremony does not exist.** There is no
-> sealed object you can be shown before collection, and no receipt you can
-> recompute after. §3 says what each must be, §4 the order they run in.
+> 🔴 **And nothing executes what they propose.** `cmd/intent-executor` is the
+> only collector on this rail, and it refuses to start: `readiness` requires
+> `capabilities.LegacyMoneyPaths == 0` and the constant is 3
+> (`internal/account/capabilities/capabilities.go`). Started anyway it would
+> collect nothing — `environment()` returns every evidence gate false, so the
+> predicate refuses every intent.
+>
+> 🔴 **Notice and authority are still unbuilt.** Nothing delivers a notice: the
+> evidence outbox declares `notice_eligibility_result` unproducible, and
+> `internal/architecture/evidence_producible_test.go` fails the build if that
+> stops being true. `internal/intent/enrolment`, the package that issues a
+> `BillingAuthorization`, is imported by nothing but its own test. A sealed
+> document exists; no path shows it to you before collection or hands you a
+> receipt to recompute after. §3 says what each must be, §4 the order.
 >
 > 🔴 **INV-006 is a trust assumption, not a control.** `api-platform` holds your
 > session, and the engine treats the subject id it is handed as opaque
-> (`internal/account/billing/service.go:105-109`). It can relay an acceptance you
-> never gave. The engine records what it was told and can reproduce it later,
-> which is detection rather than prevention. §3 says it plainly; the stronger
-> form is decision 16 in §12.
+> (`internal/account/billing/service.go`, `Service.Ensure`). It can relay an
+> acceptance you never gave, and the engine records rather than prevents it. §3
+> owns that rule and what has been narrowed since; the stronger form is decision
+> 16 in §12.
 >
 > 🔴 **One mutation-capable credential is not one attested enclave.** INV-007 is
 > that rule, and §9 is its only owner.
 >
 > 🔴 **A customer-visible infrastructure line carries a markup its own displayed
-> unit price does not include.** INV-010 says infrastructure is not a customer
-> charge dimension, and §6 owns that rule and the present state, with paths. The
-> remedy is settled — fold the line into a published base price (§12, decision
-> 15) — and the migration has not shipped, so the bill still carries it.
+> unit price does not include.** §6 owns that rule and the present state, with
+> paths; the remedy is settled (§12 item 15) and has not shipped.
 >
 > The single enumeration of current defects is
-> [`SECURITY.md` § Known current gaps](../SECURITY.md#known-current-gaps). This
-> file links there and never restates it.
+> [`SECURITY.md` § Known current gaps](../SECURITY.md#known-current-gaps). The
+> separate per-call-site inventory of everything in this tree that can still
+> reach a provider mutation is `internal/architecture/allowlist.go`. This file
+> links to both and restates neither.
 
 [`VERIFICATION.md`](VERIFICATION.md) owns the charge-bundle field contract and
 the static architecture checks CI runs. [`../SECURITY.md`](../SECURITY.md) owns
@@ -69,7 +83,7 @@ the adversary model and the defect register.
 ## 1 · Why deriving the charge is the whole design
 
 The shipped engine is careful. Money is integer. Usage events dedupe on
-`event_id` (`internal/account/db/queries/usage.sql:210`). Charge amounts freeze
+`event_id` (`InsertUsageEvent`, `internal/account/db/queries/usage.sql`). Charge amounts freeze
 before dispatch, and ambiguous failures reconcile instead of retrying.
 
 Every one of those answers the same question:
@@ -144,12 +158,12 @@ turns a preview into a promise.
 
 ### The five facts that keep getting confused
 
-Four substitutions are why today's shape cannot answer you. A billing run created
-moments before a provider request is an execution record, not your intent. A
-mutable draft invoice you cannot see is not notice. A post-charge "large amount"
-badge is not a pre-charge control. An alert-only budget is not a stop — today's
-budget service is alert-only by design
-(`internal/account/budget/service.go:260`).
+Four substitutions are why the shape this replaces could not answer you. A
+billing run created moments before a provider request is an execution record,
+not your intent. A mutable draft invoice you cannot see is not notice. A
+post-charge "large amount" badge is not a pre-charge control. An alert-only
+budget is not a stop, and the shipped budget service is alert-only by design
+(`internal/account/budget/service.go`, `maxPercentUsed`).
 
 So the rebuild pulls five facts apart and gives each its own record:
 
@@ -161,15 +175,20 @@ So the rebuild pulls five facts apart and gives each its own record:
 | what effect is proposed | `ChargeIntent` |
 | what an external rail actually did | `PaymentAttempt`, `ChargeReceipt` |
 
-Every type in that table is unbuilt. No one record may substitute for another,
-and §3 spends its whole length enforcing that one sentence.
+Two of those are unbuilt — `PaymentAttempt` and `ChargeReceipt`, the records of
+what a rail did. The other four exist in `internal/intent`. No one record may
+substitute for another, and §3 spends its length enforcing that one sentence.
 
 ---
 
 ## 2 · What api-platform can ask for, and what it cannot
 
-The private half has two ways to reach this engine about money, and neither one
-is a charge.
+On the target surface the private half has two ways to reach this engine about
+money, and neither is a charge. Only the first ships: `RecordUsage` exists, the
+three intent RPCs below do not, and what a caller actually reaches today is one
+Lambda action dispatcher carrying every billing action there is
+(`buildDispatcher`, `cmd/account-api/main.go`). Narrowing that surface is a gap,
+and `SECURITY.md` § Known current gaps carries it.
 
 **It can report a fact.** `RecordUsage` carries an observation and no money:
 
@@ -203,7 +222,7 @@ credential, and nothing typed there becomes authoritative by being relayed.
 - **An amount, in any spelling** — `amount`, `total`, `subtotal`, `rate`,
   `discount`, `credit`, rejected on every surface above.
 - **A funding split.** Which part comes from wallet and which from a card is a
-  `FundingPlan` (unbuilt) the engine freezes before you are shown anything.
+  `FundingPlan` the engine freezes before you are shown anything.
 - **A provider or rail.** Your accepted authorization names the permitted rails,
   and the engine chooses among them under published policy — §5.
 - **A mandate.** A saved payment method is a receipt this engine holds, never a
@@ -269,7 +288,7 @@ be collected against, and that a clock started when they arrived.
 
 <a id="inv-006"></a>
 **INV-006 — every debit has customer authority.** Every debit must reference a
-valid `BillingAuthorization` (unbuilt), either one-time for one sealed intent or
+valid `BillingAuthorization`, either one-time for one sealed intent or
 standing. A standing authorization declares charge kinds, currencies, cadence,
 price and terms revisions, ceilings, notice rules, effective time and expiry.
 
@@ -281,8 +300,13 @@ charge bundle.
 
 🔴 **That is a trust assumption, not a control.** `api-platform` holds your
 session, and the engine treats the caller-supplied subject id as opaque
-(`internal/account/billing/service.go:105-109`). It can assert an acceptance you
-never made, and this engine cannot disprove it.
+(`internal/account/billing/service.go`, `Service.Ensure`). It can assert an
+acceptance you never made, and this engine cannot disprove it. What it can no
+longer do is authorize standing collection with an acceptance nobody issued:
+`Authorize` derives the digest of the document a grant constitutes and refuses a
+grant whose acceptance names anything else, and the predicate requires a
+challenge row this engine issued, answered, unexpired and unrevoked
+(`internal/intent/authorization_disclosure.go`, migration 065).
 
 What survives is reproducibility: the disclosure, its digest and the receipt stay
 readable, so a fabricated acceptance is something you can later point at. That is
@@ -373,7 +397,7 @@ admission races revocation and window close on the authority and checkpoint rows
 instead, which is where those cutoffs live. Adding metering here would make one
 Postgres row the ceiling on a customer's whole billing activity, and today that
 path is a lock-free idempotent insert
-(`internal/account/db/queries/usage.sql:210`).
+(`InsertUsageEvent`, `internal/account/db/queries/usage.sql`).
 
 The ordering this buys is precise. A revocation accepted before the capability
 changes from `active` to `dispatching` revokes it and wins. One serialized after
@@ -395,15 +419,22 @@ mutate one. Reads require a payer-bound `CustomerReadProof` (unbuilt); an
 
 `CustomerReadProof` binds an independently enrolled customer factor that does not
 exist today, so this stronger form also waits on decision 16 in §12. The outbox
-is worth building first anyway: it makes your evidence a durable side effect of
-the money moving, rather than a report the relay chooses to render.
+did not wait, and it is built (`internal/intent/evidence`, migration 064): a
+signed record commits inside the transaction that changes the state it attests,
+so evidence is a durable side effect of money moving rather than a report the
+relay chooses to render. The verifying key is pinned in the tree, unexported so
+no package can add a second at runtime, and its id derives from its own public
+bytes (`internal/shared/signing/trustroot.go`) — which is verification, not
+signing: a deployment holding the pin and no seed can check evidence and produce
+none. Four of the eight event kinds still have no writer.
 
 ### What the objects are for
 
-Every type below is unbuilt. This table replaces the field-by-field catalogue an
-earlier draft carried: it says which rule each object exists to carry, and the
-schema says what is inside it. Four of them have a shape that is itself a
-control, and only those four get paragraphs.
+Seven of the types below exist in `internal/intent` — `UsageFact`,
+`PriceBookRevision`, `TaxDetermination`, `BillingAuthorization`, `FundingPlan`,
+`ChargeIntent`, `NoticeReceipt` — and every other row is unbuilt. The table says
+which rule each object carries; the schema says what is inside it. Four have a
+shape that is itself a control, and only those four get paragraphs.
 
 | type | carries | what it is for |
 |---|---|---|
@@ -507,9 +538,10 @@ a reserved slice. Refund, clawback, close and expiry share one range fence, so a
 crash leaves either the reservation or the terminal expiry, never both.
 
 That binds to live code. Credit lots carry a nullable `expires_at`
-(`migrations/billing/048_credit_wallet.up.sql:60-61`), and `WalletSpendableLots`
+(`expires_at`, `migrations/billing/048_credit_wallet.up.sql`), and
+`WalletSpendableLots`
 filters on `(lot.expires_at IS NULL OR lot.expires_at > CURRENT_TIMESTAMP)`
-(`internal/account/db/queries/credit_wallet.sql:270-292`). A grant can therefore
+(`internal/account/db/queries/credit_wallet.sql`). A grant can therefore
 be filtered out in the middle of a service window today.
 
 #### Ceilings that are reservations, not counters
@@ -586,7 +618,7 @@ suggestion.
 
 `ServiceAccrualExposure` is a per-fact reservation, and the only bound on your
 liability while budgets stay alert-only
-(`internal/account/budget/service.go:260`). Every billable service authority has
+(`internal/account/budget/service.go`). Every billable service authority has
 a finite service-time accrual ceiling, independent of the product budget control.
 Service admission — not later collection — must require a current
 `TimeReadinessPolicy`. It then reserves a deterministic gross-obligation upper
@@ -611,12 +643,19 @@ triggers the accepted service-stop policy. Card-backed usage may accrue a
 receivable within its service-authority ceiling; prepaid mode may not. A
 deployment that cannot enforce the mandatory authority ceiling at service time
 must not create the obligation at all.
+
 ---
 
 ## 4 · What happens after you accept
 
-Nothing in this section runs on `main`. `ChargeIntent`, `NoticeReceipt` and
-`PaymentAttempt` are unbuilt. Read every arrow as *must*.
+Step 14 runs on `main`: `internal/intent/predicate` is this section's predicate,
+one exported total function over sealed state with no I/O, no clock and no error
+return, evaluating every clause rather than short-circuiting so a refusal names
+every reason at once — and `internal/architecture/predicate_single_caller_test.go`
+fails the build if a second caller appears. What the clauses ask for has largely
+not shipped: `PaymentAttempt` is unbuilt, nothing delivers a notice, and the
+executor supplies no evidence, so no execution can be permitted. Read the arrows
+as *must*.
 
 ```mermaid
 sequenceDiagram
@@ -880,8 +919,10 @@ provider defines the domain model. No Stripe SDK type, NewebPay request field,
 provider invoice status or webhook payload may cross into the intent or ledger
 packages.
 
-None of it is built. The Go below is the target shape, not code on `main`, and
-the insight the whole section rests on is short:
+None of the Go below is built — not one of those type names appears in the tree.
+What exists is a single adapter method reachable only through the executor
+(`internal/provider/stripeadapter`, `Adapter.Collect`), and it is not this shape.
+The insight the whole section rests on is short:
 
 > **An ambiguous timeout is not a failure. Treating it as one is how a customer
 > gets charged twice.**
@@ -1135,10 +1176,13 @@ under a published rule you accepted.
 | `tax` | tax on the listed taxable lines | the frozen taxable basis plus your tax evidence | an immutable tax-policy revision and a versioned determination | before notice, before the seal |
 | infrastructure / `infra_total_micros` | **shipped today; not in the target vocabulary** — infrastructure as its own customer line, at cost × 1.2 | `infra.*` and `platform.*` usage rows | `ms_billing.metric_definitions` and `metric_model_prices` | a current-cycle read; the disclosure below |
 
-`ChargeIntent` (unbuilt) carries these lines; `FundingPlan` (unbuilt) says what
-pays for them. Prices, allowance, tier shape, grace windows and domain policy
-are product decisions (§12). Today's compiled constants must not enter the
-target rater until published as immutable, future-effective revisions.
+`ChargeIntent` carries these lines; `FundingPlan` says what pays for them. The
+closure is enforced, not merely stated: the three kinds above and the four
+funding and collection kinds below are the whole of `internal/intent/catalog.go`
+— seven — and `Seal` refuses a draft naming anything else, so an invented kind
+cannot reach a digest. Prices, allowance, tier shape, grace windows and domain
+policy are product decisions (§12). Today's compiled constants must not enter
+the target rater until published as immutable, future-effective revisions.
 
 ### What a provider may be asked to do on your account
 
@@ -1301,20 +1345,20 @@ module price you already accepted.
 
 🔴 **The shipped code does the opposite, and it is on your bill now.** `infra.*`
 and `platform.*` metrics are ingested by `RecordInfraUsage`
-(`internal/account/usage/infra.go:326`), fed by `cmd/infra-egress-sync` and
+(`internal/account/usage/infra.go`), fed by `cmd/infra-egress-sync` and
 `cmd/infra-ssr-compute-sync`. They are priced from the same
 `metric_definitions` and `metric_model_prices` tables `module_usage` reads; the
 live priced catalog is migrations 018, 019, 020, 045 and 046 under
 `migrations/billing/`. The markup is 12/10, cost × 1.2, declared at
-`internal/account/cycle/types.go:59-60` and applied once in SQL. It reaches you
-through `AppInfraBill` and `AppModuleInfraBill`
-(`internal/account/usage/bill.go:500-530`), served by `GetAppBill` and
-`GetAccountBill` (`cmd/account-api/main.go:690`) as the wire fields
+`infraMarkupNum`/`infraMarkupDen` (`internal/account/cycle/types.go`) and
+applied once in SQL. It reaches you through `AppInfraBill` and
+`AppModuleInfraBill` (`internal/account/usage/bill.go`), served by `GetAppBill`
+and `GetAccountBill` (`cmd/account-api/main.go`) as the wire fields
 `infra_total_micros`, `infra_lines` and `module_infra_lines`.
 
 🔴 **And the line does not add up on its face.** The `UnitPriceMicros` shown to
 you is pre-markup COGS, while `ChargedMicros` carries the 1.2 multiplier
-(`internal/account/usage/types.go:446-448`). Quantity times the displayed unit
+(`AppMetricUsage`, `internal/account/usage/types.go`). Quantity times the unit
 price does not equal the charge, so a customer who checks the arithmetic on a
 infrastructure line finds it wrong. The direction is settled — the line and its
 markup fold into a published base price (§12, decision 15) — but the migration has
@@ -1326,11 +1370,8 @@ Two seeds are dead and must not be cited as evidence about this plane: migration
 its `infra.egress.bytes` price was zeroed by
 `migrations/billing/019_infra_catalog_hygiene.up.sql:80-82`.
 
-Whether to disclose the markup, fold it into a published base price, or delete
-the line is an open product decision (§12 item 15). It is not a migration step,
-and this document does not decide it. Stripe, NewebPay, card-network, settlement,
-payout, FX and adapter fees stay internal costs on the same reasoning. An
-adapter must never append its own fee.
+Stripe, NewebPay, card-network, settlement, payout, FX and adapter fees stay
+internal costs on the same reasoning. An adapter must never append its own fee.
 
 ---
 
@@ -1342,7 +1383,7 @@ receipt and verification boundary as every other line. This section is the only
 owner of these rules. It gives no legal or tax advice, and infers no
 jurisdictional obligation from code.
 
-Every proposed intent carries a `TaxDetermination` (unbuilt) in one of three
+Every proposed intent carries a `TaxDetermination` in one of three
 states. `final` means the calculation is independently reproducible under one
 immutable public policy and evidence snapshot; the amount may be zero or
 positive. `not_applicable` means an immutable public rule and its inputs
@@ -1447,7 +1488,7 @@ line (INV-010); §6 records that the shipped code surfaces one today.
 
 ### When the number changes after you were told
 
-The `ChargeIntent` (unbuilt) digest covers the whole determination and the tax
+The `ChargeIntent` digest covers the whole determination and the tax
 amount. The notice shows the subtotal before tax, credits with their tax
 allocation, the taxable basis, the tax amount, the presentation rule, a readable
 jurisdiction explanation, and the final amount.
@@ -1471,7 +1512,7 @@ jurisdiction's allocation and rounding rule.
 ### What a vendor's number can and cannot buy
 
 An external calculator, if one is selected, is a constrained evidence source
-behind a provider-neutral `TaxResolver` (unbuilt). It builds requests only from
+behind a provider-neutral `TaxResolver` (`internal/intent/rater.go`). It builds requests only from
 enumerated intent lines and the verified profile, and records its ruleset and
 API version with request and response digests. It validates the returned
 currency, basis, line identity and total, and refuses lines it cannot match.
@@ -1494,11 +1535,14 @@ invoice finalization. If a NewebPay flow needs Taiwan invoice fields, the
 adapter receives the frozen permitted presentation data and must return evidence
 matching the sealed intent.
 
-Taiwan e-invoice issuance is an obligation the engine must satisfy
-before collecting in that market, and it is not behavior the engine has today.
+Taiwan e-invoice issuance is an obligation that attaches to selling into that
+market, not to adding a local rail, and it is not behavior the engine has today.
 Issuance, numbering, retention and correction duties must be settled and
 recorded as an immutable policy revision (§12 item 10). The resulting invoice
-identity must then bind into the receipt like any other frozen input.
+identity must then bind into the receipt like any other frozen input. Nothing in
+this tree can currently tell one market from another: every leg seals
+`Jurisdiction: "not-applicable"`, and `migrations/billing` holds no customer
+country, address, tax id or exemption.
 This document makes no claim about NewebPay tax, e-invoice, refund or settlement
 behavior until the merchant agreement and the official integration specification
 are reviewed and tested.
@@ -1520,8 +1564,8 @@ questions, and none may stand in for another:
 
 | record | the question it answers | may it move money? |
 |---|---|---|
-| `ChargeIntent` (unbuilt) | what effect was proposed and permitted? | no |
-| `FundingPlan` (unbuilt) | which credit lots, exposure windows and external remainder fund it? | it reserves credit and exposure only; no debit |
+| `ChargeIntent` | what effect was proposed and permitted? | no |
+| `FundingPlan` | which credit lots, exposure windows and external remainder fund it? | it reserves credit and exposure only; no debit |
 | `PaymentAttempt` (unbuilt) | what did one frozen attempt and its finite step plan try to do? | through permit-gated writers only; absent for wallet-only settlement |
 | `LedgerTransaction` (unbuilt) | what monetary state did MirrorStack commit? | it records the effect; it calls no provider |
 | `ProviderEvidence` (unbuilt) | what does the provider report happened? | read-only |
@@ -1709,25 +1753,31 @@ deployed credential. 🔴 **That separation is a migration requirement, not a
 current property** — the read path that can reach auto top-up today is listed in
 [`SECURITY.md` § Known current gaps](../SECURITY.md#known-current-gaps).
 
-### 🔴 One invoice, two periods, and no split shown
+### One invoice, two periods, and the split that carries it
 
-The boundary invoice carries the closed period's netted usage arrears plus the
-next period's advance base, module overage and custom domains, summed into one
-total (`internal/account/cycle/charge.go:296-299`). That combination is
-intended — it is what a cycle boundary is — and the allowance nets usage only,
-so recurring account fees ride on top of it.
+A cycle boundary covers two periods at once: the closed period's netted usage
+arrears, and the next period's advance base. One collection with both halves
+shown is the answer, not two collections — and the split now lives in the sealed
+documents. `internal/account/cycle/boundary_charges.go` proposes **two** intents,
+arrears as `module_usage` and the forward half as `platform_base`, because §6's
+kinds are what select which rule of a standing authorization applies: one intent
+spanning both would let whichever kind it named authorize the other.
 
-🔴 **What is missing is the split.** You are charged one number covering a period
-that ended and a period that has not started, and nothing today shows which part
-is which. The fix is presentation and receipt structure, not a change to when
-money is collected. The owner's answer is one collection with both halves shown,
-not two collections.
+**Which charges share an invoice is an execution concern, deliberately outside
+the seal.** Two payers owed identical amounts under identical terms hold
+identical documents whether invoiced together or separately, so a group in the
+digest would attest to something you never agreed to. The grouping is a side
+table instead (`migrations/billing/066_intent_groups.up.sql`), stated when a leg
+proposes rather than inferred, and an intent's digest is the same either way.
+Rounding stays single: the group rounds once over the summed provider
+remainders, at the provider boundary.
 
-Module overage and custom domains fold into the base price under §12 item 12, so
-in the target vocabulary the forward half is a single `platform_base`. Until that
-price-book revision ships, the boundary invoice still derives and carries them as
-separate components — the fold has closed the kind set, not the price. Every current defect is enumerated once, in
-[`SECURITY.md` § Known current gaps](../SECURITY.md#known-current-gaps).
+What has not shipped is the collection that renders it. Module overage and
+custom domains fold into the base price under §12 item 12, so in the target
+vocabulary the forward half is one `platform_base`; until that price-book
+revision publishes, the boundary still derives them as separate components. The
+fold closed the kind set, not the price. Every current defect is enumerated once,
+in [`SECURITY.md` § Known current gaps](../SECURITY.md#known-current-gaps).
 
 ---
 
@@ -1816,10 +1866,9 @@ Raising a ceiling or replacing a method needs a new acceptance ceremony, and old
 and new revisions must never spend at the same time.
 
 **Cancel a specific intent.** `CancelChargeIntent` and
-`RevokeBillingAuthorization` block future execution of a `ChargeIntent`
-(unbuilt) or a `BillingAuthorization` (unbuilt), against an applied acceptance
-receipt or a typed operator policy reason. Neither erases a settlement that
-already happened.
+`RevokeBillingAuthorization` block future execution of a `ChargeIntent` or a
+`BillingAuthorization`, against an applied acceptance receipt or a typed
+operator policy reason. Neither erases a settlement that already happened.
 
 Exposure is gross and monotonic inside its accepted window, which is what makes
 those ceilings mean anything. A verified pre-debit void or release frees its
@@ -1846,8 +1895,8 @@ cancellation. Wall-clock arrival order is not authority here, and saying
 otherwise would be the more comfortable lie.
 
 🔴 **A budget, today.** The shipped budget service is alert-only: spend can pass
-the cap and nothing stops accrual
-(`internal/account/budget/service.go:260`). It notifies. It does not refuse
+the cap and nothing stops accrual (`internal/account/budget/service.go`). It
+notifies. It does not refuse
 service and it does not block collection. Whether a stop should pause billable
 service, block collection, or both, is undecided (§12 item 2). Until that lands,
 the only ceiling on liability while service runs is the per-fact
@@ -1866,7 +1915,15 @@ The rebuild proceeds without trusting the new calculator on day one:
    verifier. Then generate shadow intents from current usage that notify nobody
    and move no money.
 4. Reconcile shadow totals against current invoices until every difference is
-   explained. Never tune the rater to hide an unexplained difference.
+   explained. Never tune the rater to hide an unexplained difference. **Not
+   reachable for every row.** The shadow rater prices only from
+   `ms_billing.metric_version_prices`, the immutable per-version snapshot
+   (`internal/intent/shadow/source.go`) — deliberately, because pricing a row
+   from its own stored unit price is a reconciliation that cannot fail. A row
+   priced instead through `ms_billing.metric_definitions` has no reproducible
+   source: `UpsertMetricDefinition` rewrites `unit_price_micros` in place, with
+   no effective date and no prior value kept. Such a row can be quarantined; it
+   cannot be reconciled.
 5. Add authorizations, notice receipts, fail-closed tax, ceilings, and the
    customer review and download surface.
 6. Give each mutation-capable credential one exclusive scoped enclave owner,
@@ -1876,9 +1933,18 @@ The rebuild proceeds without trusting the new calculator on day one:
    response, rail switch, notification outage, tax outage, revocation and
    concurrent ceiling changes.
 8. Migrate every caller to intents, then delete the direct charge code and
-   revoke the legacy provider credentials.
+   revoke the legacy provider credentials. **Two of three done** — every leg
+   proposes, and the legacy collectors were deleted on 2026-09-01. The
+   credentials are not revoked.
 9. Enable collection only when `Capabilities` proves the deployment is
    intent-only, and a manual billing and security review accepts the evidence.
+
+Steps 1 and 2 have landed. Steps 3, 5 and 7 are part-built: the rater, the
+sealed schema, `cmd/intent-shadow`, the authorization with its ceilings and
+fail-closed tax all exist, while no policy store publishes a price revision, no
+binary verifies a bundle, nothing delivers a notice, no customer surface reads a
+sealed intent, and there is one adapter and no conformance suite. Step 6 has not
+started, and step 9 is blocked by the paragraphs below.
 
 **The weakest reachable money path defines the guarantee.** Shipping an intent
 surface beside a legacy direct-charge route does not make a deployment
@@ -1890,18 +1956,32 @@ until three things hold together:
 - every caller has migrated to the intent surface; and
 - the legacy provider credentials are revoked.
 
-The money paths reachable on `main` today, each with the file that carries it,
-are listed in [`SECURITY.md` § Known current
-gaps](../SECURITY.md#known-current-gaps). That register is the migration
-checklist, and this section does not copy it.
+Every money path reachable on `main` is enumerated per call site, with the reason
+it exists, in `internal/architecture/allowlist.go` — and that file is not an
+assertion: `internal/architecture/surface_test.go` walks the tree's AST and fails
+the build when the inventory or `capabilities.LegacyMoneyPaths` disagrees with
+it. The count a deployment reports is one CI proved, not one the service computed
+about itself. `SECURITY.md` § Known current gaps is the defect register, not this
+inventory.
+
+**The last three legacy paths and the executor cannot both be live, which is why
+nothing collects.** The executor refuses to start while `LegacyMoneyPaths != 0`,
+so the intent rail cannot be exercised against real money until the legacy rail
+is gone; the three remaining are two crash-recovery paths finishing a charge a
+legacy run already handed to the provider, plus one scan false positive.
+Deleting the recovery paths would not prevent those charges, it would abandon
+them, so they drain instead — nothing stamps a provider marker any more, and
+once no row carries an unresolved one they find nothing. The consequence is
+worth saying rather than discovering: the intent rail's first real collection
+will be its first, and step 9's review is all that stands before it.
 
 ---
 
 ## 12 · What we have not decided
 
 This is the one list, and it is deliberately the last thing you read. Each item
-names the gate it holds shut. Ownership is the repository owner's to assign, and
-is left **TBD** here rather than invented.
+names the gate it holds shut. Where an item has been settled, the settled half is
+marked and the rest is left open rather than rounded up.
 
 | gate | what stays closed until its items resolve |
 |---|---|
@@ -1924,6 +2004,22 @@ is left **TBD** here rather than invented.
 4. **Merchant of record.** The seller entity per market and rail, and who owns
    the tax liability. Blocks G1, G3 and G4: the settlement route and the tax
    determination both bind to it.
+
+   Nothing on a charge says who sold it. `charge_intents` has no seller
+   column — migration 062 added the rail and the routing-policy revision and
+   deliberately left out a merchant-account policy, because nothing produces
+   one — and `ClauseMerchantOfRecord` reads an unbuilt evidence flag that the
+   only production caller leaves false, so the predicate refuses on it today.
+   Adding it later is not free: a sealed field joins the canonical digest,
+   which is why `internal/intent/canonical.go` is already at `v4`. A seller
+   would be one more supersession, and it is cheapest before intents are being
+   executed against it.
+
+   Whichever way this is answered, a seller other than the platform depends on
+   item 8. §7 refuses a tax determination it cannot reproduce, and a
+   determination supplied by a third party records as `provider_attested`
+   (`internal/intent/chargeintent.go`), leaving the tax state unresolved and
+   `ClauseTaxFinal` refusing.
 5. **Registrations and treatment.** Which registrations exist, which customer
    jurisdictions are supported, and how B2B versus B2C, tax-id validation,
    exemption and reverse charge are treated. Blocks G3.
@@ -1952,21 +2048,18 @@ is left **TBD** here rather than invented.
 12. **Which kinds exist, and their timing.** The base, module and domain price
     and tier policy; and proration, grace, cycle consolidation and late usage.
 
-    The **kind set is settled**: `module_capacity` and `custom_domain` fold
-    into `platform_base`, which recovers both, so neither is separately
-    chargeable and neither keeps a kind of its own. §6's table above no longer
-    lists them and the Go catalog no longer defines them. Do not re-decide the
-    direction.
+    The **kind set is settled**: `module_capacity` and `custom_domain` fold into
+    `platform_base`, which recovers both, so neither is separately chargeable
+    and neither keeps a kind of its own. §6's table and
+    `internal/intent/catalog.go` both reflect that.
 
-    What remains is the price, and none of it is decided here: the base price
-    that absorbs capacity and domains (together with item 15's infrastructure
-    markup), the included tier and the rate above it, proration, grace, cycle
-    consolidation and late usage. Those are a price-book revision, and both
-    shipped legs still seal `unpublished/pending-decision-12` until it is
-    published.
-
-    Blocks G1 and G2: the catalog half of G2 moves with this answer; G2 stays
-    shut on items 1, 6, 9, 11 and 13.
+    The price does not follow from it. The base price that absorbs capacity and
+    domains (with item 15's infrastructure markup), the included tier and the
+    rate above it, proration, grace, cycle consolidation and late usage are a
+    price-book revision nobody has published — which is why every leg still
+    seals `unpublished/pending-decision-12` and `ClausePolicyPublished` refuses
+    it. Blocks G1, and the catalog half of G2; G2 also stays shut on items 1, 6,
+    9, 11 and 13.
 13. **Credit, wallet and developer settlement.** Credit expiry, refundability,
     exposure, allocation order and the legal characterization of stored value;
     plus developer take rate, reserve, refund and payout timing. Blocks G2 and
@@ -1981,51 +2074,41 @@ is left **TBD** here rather than invented.
     reassignment. Blocks G1.
 
     The infrastructure half of this decision is **settled**: the line and its
-    12/10 markup are folded into a published base price, not disclosed and not
-    left as a separate customer line. That is the direction INV-010 already
-    describes, so the target does not change — only the migration does. What
-    remains is execution, and none of it is decided here:
-
-    - the new published base price, and whether one price replaces the flat
-      per-app base or sits beside it;
-    - whether existing accounts are re-priced at their next boundary or
-      grandfathered, and for how long;
-    - the notice each affected customer must receive before the first boundary
-      that charges the new price;
-    - whether the infra metrics keep being measured for internal margin
-      analysis after they stop being rated — §6 says they may, as internal
-      cost only.
-
-    Until that migration ships, the shipped bill still carries the line and the
-    markup. See [`SECURITY.md`](../SECURITY.md#known-current-gaps).
+    12/10 markup fold into a published base price rather than being disclosed or
+    kept as a separate customer line, which is the direction INV-010 already
+    describes. What is undecided is the migration — the new price, whether
+    existing accounts are re-priced at their next boundary or grandfathered, and
+    the notice owed before the first boundary that charges it. Until it ships,
+    the bill still carries the line and the markup. See
+    [`SECURITY.md`](../SECURITY.md#known-current-gaps).
 16. **Consent authority, and reads you can verify yourself.** Whether
     billing-engine must be able to distrust `api-platform` about who accepted a
     charge, and about who may read the evidence.
 
-    That independence needs a public consent edge. It was dropped as a mechanism
-    and kept here as a costed option, because its price is a separate identity
-    product and the requirements are concrete. The first customer factor must
-    not be enrolled from an `api-platform` bearer, a session, or an email
-    assertion. Enrollment must require proof of possession plus an
-    `AccountAuthorityCredential` (unbuilt) under a pinned public identity root.
-    A customer-held verifier must run at an independently distributed top-level
-    origin, with a reproducible signed release and `frame-ancestors 'none'`. It
-    must show amount and lines, seller, payment method, caps, destination and
-    consequences before a distinct, non-programmatic approval gesture.
-    Lost-factor recovery must use that root or a documented offline recovery
-    authority, with a published cooling interval and notice to every enrolled
-    destination. Operators must not shorten cooling or assert identity
-    themselves. Native verifiers stay `unsupported` until each OS has a
-    versioned public profile. The identity issuer, the verifier device and any
-    offline recovery authority are trusted-computing-base members whose roots
-    must be published in `Capabilities`.
+    Full independence needs a public consent edge, and its price is a separate
+    identity product: a customer factor that cannot be enrolled from an
+    `api-platform` bearer, a session or an email assertion, under a pinned
+    public identity root, with a customer-held verifier at an independently
+    distributed origin that shows amount, lines, seller, method, caps and
+    destination before a distinct non-programmatic gesture, plus a documented
+    offline recovery authority with a published cooling interval. Every root in
+    that chain would have to be published in `Capabilities`.
 
-    🔴 **Declining that cost is the current position, and this is what it costs
-    you.** Acceptance rests on a receipt `api-platform` relays, so **INV-006**
-    in its stronger form is a trust assumption with after-the-fact reproduction,
-    not independent verification. **INV-014** has the same dependency, because
+    **The direction is settled, and two pieces of it have shipped.** Rather than
+    build that edge or leave the gate open, the engine strengthens what it can
+    check without one. Evidence became a durable side effect of money moving
+    instead of a report the relay chooses to render: a billing-owned outbox
+    writes inside the same transaction as the state it attests
+    (`migrations/billing/064_evidence_outbox.up.sql`, four of its eight event
+    kinds having writers). And a standing authorization now needs an acceptance
+    this engine issued and the customer answered (§3, migration 065).
+
+    🔴 **What that does not buy, and what it therefore still costs you.**
+    `api-platform` still relays the acceptance, so **INV-006** in its stronger
+    form remains a trust assumption with after-the-fact reproduction rather than
+    independent verification. **INV-014** has the same dependency, because
     `CustomerReadProof` (unbuilt) binds an enrolled factor that does not exist.
-    One answer governs both. Blocks G1 and G4.
+    One answer governs both, and it is not given. Blocks G1 and G4.
 
 Until each of these is accepted as an immutable policy revision and an ADR, they
 stay named decisions. They must not be reconstructed from current constants,

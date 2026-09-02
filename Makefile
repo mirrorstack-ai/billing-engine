@@ -33,23 +33,25 @@ lint:
 build:
 	go build ./...
 
-# Run the local-HTTP webhook receiver. Requires STRIPE_WEBHOOK_SECRET
-# and DATABASE_URL set in the environment (load .env.local first).
-# Pair with `stripe listen --forward-to localhost:8092/webhook` to
-# receive real test-mode events from your Stripe sandbox.
+# Run the local-HTTP webhook receiver. It is a deliberately empty ingress:
+# Stripe now arrives only on the EventBridge partner bus (consumed by
+# cmd/account-webhook-eventbridge), so this binary verifies nothing, holds no
+# provider credential, touches no database, and answers 501. It is kept so a
+# payment provider that cannot publish to EventBridge has a URL to register
+# against. `stripe listen` will not exercise anything here.
 dev-webhook:
 	cd cmd/account-webhook && go run .
 
-# Run the billing charge cycle once locally (the USAGE/arrears leg, Milestone D
-# PR #6). Derives the just-closed UTC calendar-month window, charges every
-# account with unbilled usage in it via Stripe, then exits. Requires
-# DATABASE_URL + STRIPE_SECRET_KEY (use a restricted rk_test_* key from
-# .env.local). Prod runs the same binary on an EventBridge schedule.
+# Run the billing charge cycle once locally (the usage/arrears leg). Derives
+# the just-closed UTC calendar-month window, seals a ChargeIntent for every
+# account with unbilled usage in it, then exits. It proposes; it does not
+# collect. Requires DATABASE_URL + STRIPE_SECRET_KEY (use a restricted
+# rk_test_* key from .env.local). Prod runs the same binary on a schedule.
 dev-cycle:
 	cd cmd/billing-cycle && go run .
 
 # Run the CDN-egress puller once locally (the platform-infra egress metering
-# chokepoint, Milestone D PR #10c). Sweeps the last few CLOSED hour windows,
+# chokepoint). Sweeps the last few CLOSED hour windows,
 # queries the Cloudflare Analytics Engine "cdn_egress" dataset, and records each
 # (app, module) egress total via RecordInfraUsage (idempotent on a deterministic
 # event_id), then exits. Requires DATABASE_URL + CF_ANALYTICS_API_TOKEN (a
@@ -58,8 +60,8 @@ dev-cycle:
 dev-egress-sync:
 	cd cmd/infra-egress-sync && go run .
 
-# Run the SSR-compute puller once locally (app-hosting SSR metering,
-# docs-temp/app-hosting/ssr-metering-design.md). Enumerates the ms-apphost-*
+# Run the SSR-compute puller once locally (app-hosting SSR metering).
+# Enumerates the ms-apphost-*
 # Lambda fleet via lambda:ListFunctions, pulls Duration/Invocations sums from
 # cloudwatch:GetMetricData over the last few CLOSED hour windows, and records
 # both infra.compute.ssr.gb_seconds / infra.compute.ssr.request.count via

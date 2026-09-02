@@ -16,13 +16,14 @@ package architecture
 //     inventory cannot drift into describing code that is gone.
 //
 // The `collect` entries are the ones that can take money from a stored
-// payment method. There are eleven, which is the number
+// payment method. There are three, which is the number
 // capabilities.LegacyMoneyPaths reports and which the test in this
 // package pins against an AST scan of the tree. docs/SECURITY.md §2
 // says of them that there is no single capability
 // choke point proving every payment consumed the same authorization and
-// notice gates. Until the intent executor exists, this map is the only
-// enumeration of that surface, which is why the reasons below say what
+// notice gates. While those three remain the intent executor refuses to
+// start, so this map is still the only enumeration of the surface that
+// could actually take money, which is why the reasons below say what
 // each one charges for rather than merely that it charges.
 var allowedProviderMutations = map[string]string{
 	// --- the provider adapter itself ---
@@ -59,18 +60,19 @@ var allowedProviderMutations = map[string]string{
 	"internal/account/autotopup/executor.go (*Executor).deleteDraftAndFail DeleteDraftInvoice": "discarding a draft that was never finalized",
 	"internal/account/autotopup/executor.go (*Executor).ReconcileWebhookFailure VoidInvoice":   "closing out a top-up the provider reported as failed",
 
-	// --- the eleven service call sites that can take money ---
+	// --- the three remaining legacy money-path entries ---
 	//
-	// ELEVEN, not ten. The header said ten over eleven entries for as long as
-	// the list has existed. The eleventh is the dispatcher row at the end of
-	// this block, which LEGACY-DROP-PLAN.md explains is a miscount the scanner
-	// makes by matching a method NAME without its receiver — and which must
-	// NOT be corrected until the other ten are deleted, because lowering the
-	// count by editing the scanner is what LegacyMoneyPaths's own comment
-	// forbids.
+	// There were eleven. Every leg now only proposes a sealed ChargeIntent,
+	// and the collectors behind the other eight were deleted. What is left is
+	// two crash-recovery resumes, which drain rather than being called afresh,
+	// and one scanner false positive.
 	//
-	// A header that disagrees with the list it heads is a small thing sitting
-	// on top of the one constant the intent-only claim rests on.
+	// The false positive is the dispatcher row at the end of this block: the
+	// scan matches a method NAME without resolving the receiver, and that row
+	// is billing's OWN Service.PayInvoice. It stays listed rather than being
+	// argued away in the scanner, because lowering the count by editing the
+	// scanner is what LegacyMoneyPaths's own comment forbids — the count falls
+	// when a money path is deleted, not when a matcher is narrowed.
 	"internal/account/cycle/overage.go (*Service).recoverModuleOverageCharge FinalizeInvoice": "COLLECT: resume of the same overage charge after a crash",
 	"internal/account/cycle/domain_charges.go (*Service).recoverDomainCharge FinalizeInvoice": "COLLECT: resume of the same domain charge after a crash",
 	// 🔴 NOT a provider call, and since the legacy drop not even an indirect
@@ -104,8 +106,8 @@ var allowedProviderMutations = map[string]string{
 	// It exists because the period-boundary invoice spans more than one §6
 	// charge kind — module_usage arrears plus the forward platform_base, two
 	// since §12 item 12 folded capacity and domains into the base price — and
-	// an intent carries one. See BOUNDARY-KIND-DECISION.md. Nothing calls
-	// CollectGroup yet.
+	// an intent carries one. See docs/DESIGN.md §8. Nothing calls CollectGroup
+	// yet.
 	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup CreateDraftInvoice":                "INTENT: the inert draft for a group of sealed intents",
 	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup CreateInvoiceItem":                 "INTENT: one line per sealed line across the group, apportioned from ONE rounding over the summed remainders",
 	"internal/provider/stripeadapter/group.go (*Adapter).CollectGroup FinalizeInvoiceWithoutAutoAdvance": "INTENT: finalizes WITHOUT automatic collection, so the pay below stays the single money-moving step with an answer this code receives",
