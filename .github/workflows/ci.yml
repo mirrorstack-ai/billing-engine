@@ -78,6 +78,28 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Security analysis. billing-engine had CodeQL only because it was a
+      # PUBLIC repository, where GitHub provides it free — it was never a
+      # workflow in this tree. The repository became private on 2026-09-02 and
+      # the analysis stopped, silently. No other private repository in the
+      # organisation has ever had code scanning, so this is not a restoration
+      # so much as the first version of it we own and can reason about.
+      #
+      # gosec runs through golangci-lint rather than standalone so that the
+      # `//nolint:gosec` annotations already in the tree are honoured; see
+      # .golangci.yml for what is excluded and why. The tree is currently
+      # clean, so this is a BLOCKING gate from its first run — a check that
+      # nobody has to pass is not a control.
+      # Pinned to a full commit SHA, and allowlisted at the org
+      # (Settings -> Actions -> General -> Allow specified actions) so the
+      # same step is adoptable in api-platform, mirrorstack-infra and
+      # dns-delegate-engine without a further allowlist change. A moving tag
+      # would not be accepted: the org requires full-length SHAs.
+      - name: Security analysis (gosec)
+        uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
+        with:
+          version: v2.13.2
+
       - name: Build
         run: go build ./...
 

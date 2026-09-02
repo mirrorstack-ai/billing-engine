@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,8 +36,17 @@ func PeriodKey(accountID uuid.UUID, periodStart time.Time) string {
 func SubjectKey(accountID, appID, moduleID uuid.UUID, metric, model, moduleVersion, subject string, periodStart time.Time) string {
 	hash := sha256.New()
 	write := func(value string) {
+		// 🔴 A length prefix that truncates defeats the injectivity it exists
+		// to provide: two different field sequences could hash identically and
+		// share a lock key. Unreachable — every field here is a UUID or a
+		// bounded usage-event string — but the encoding CANNOT be widened to
+		// remove the risk, because the prefix width is part of the hash and
+		// changing it moves every existing key. So this fails loudly instead.
+		if uint64(len(value)) > math.MaxUint32 {
+			panic("meteringlock: subject field exceeds the 4 GiB length prefix")
+		}
 		var length [4]byte
-		binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+		binary.BigEndian.PutUint32(length[:], uint32(len(value))) //nolint:gosec // guarded immediately above
 		_, _ = hash.Write(length[:])
 		_, _ = hash.Write([]byte(value))
 	}

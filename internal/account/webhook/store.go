@@ -111,9 +111,11 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 		StripePaymentMethodID: pm.StripePaymentMethodID,
 		Brand:                 pm.Brand,
 		Last4:                 pm.Last4,
-		ExpMonth:              int32(pm.ExpMonth),
-		ExpYear:               int32(pm.ExpYear),
-		Column7:               pm.Fingerprint,
+		//nolint:gosec // card expiry from the provider: 1..12 and a 4-digit year
+		ExpMonth: int32(pm.ExpMonth),
+		//nolint:gosec // card expiry from the provider
+		ExpYear: int32(pm.ExpYear),
+		Column7: pm.Fingerprint,
 	})
 	if err != nil {
 		return false, false, false, err

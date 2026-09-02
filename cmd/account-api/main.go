@@ -902,7 +902,17 @@ func main() {
 	}
 	port := config.Port("ACCOUNT_API_PORT", "8091")
 	slog.Info("account-api starting", "port", port, "mode", "http-local")
-	if err := http.ListenAndServe(":"+port, buildRouter(disp)); err != nil {
+	// An explicit Server rather than ListenAndServe: the package-level helper
+	// sets no timeouts at all, so a client that opens a connection and never
+	// finishes its headers holds a goroutine indefinitely. This path is
+	// local-development only — production runs on Lambda — but a dev server
+	// with no read deadline is still the wrong default to leave lying around.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           buildRouter(disp),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}

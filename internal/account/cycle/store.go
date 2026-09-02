@@ -1244,19 +1244,25 @@ func (s *pgxStore) UpsertUsageAggregate(ctx context.Context, periodID, accountID
 		return err
 	}
 	return s.q.UpsertUsageAggregate(ctx, db.UpsertUsageAggregateParams{
-		PeriodID:          periodID.String(),
-		AccountID:         accountID.String(),
-		AppID:             agg.AppID.String(),
-		ModuleID:          agg.ModuleID.String(),
-		Metric:            agg.Metric,
-		Model:             agg.Model,
-		ModuleVersion:     agg.ModuleVersion,
-		Kind:              db.MsBillingMetricKind(agg.Kind),
-		AggregationKey:    nullableAggregationKey(agg.AggregationKey),
-		BillableQuantity:  qty,
-		UnitPriceMicros:   agg.UnitPriceMicros,
-		CustomerMarkupNum: int32(agg.MarkupNum),
-		CustomerMarkupDen: int32(agg.MarkupDen),
+		PeriodID:         periodID.String(),
+		AccountID:        accountID.String(),
+		AppID:            agg.AppID.String(),
+		ModuleID:         agg.ModuleID.String(),
+		Metric:           agg.Metric,
+		Model:            agg.Model,
+		ModuleVersion:    agg.ModuleVersion,
+		Kind:             db.MsBillingMetricKind(agg.Kind),
+		AggregationKey:   nullableAggregationKey(agg.AggregationKey),
+		BillableQuantity: qty,
+		UnitPriceMicros:  agg.UnitPriceMicros,
+		// Never caller-supplied: MarkupNum/Den are one of two compile-time
+		// pairs — customMarkupNum/Den 10/10 or infraMarkupNum/Den 12/10
+		// (cycle/types.go) — and the column additionally CHECKs > 0
+		// (migration 009). A truncation here would silently change what a
+		// customer is charged, which is why the reason is stated rather
+		// than assumed.
+		CustomerMarkupNum: int32(agg.MarkupNum), //nolint:gosec // one of two literals, 10 or 12
+		CustomerMarkupDen: int32(agg.MarkupDen), //nolint:gosec // one of two literals, both 10
 		RawCostMicros:     agg.RawCostMicros,
 		ChargedMicros:     agg.ChargedMicros,
 		ActiveSeconds:     activeSeconds,
