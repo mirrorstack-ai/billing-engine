@@ -84,13 +84,22 @@ func TestActivatedRecurringFeeSharesAndSettledDomains_Integration(t *testing.T) 
 
 	accountID := appSeedAccount(t, pool)
 	chargedApp, legacyApp, pendingApp := uuid.New(), uuid.New(), uuid.New()
+	skippedApp := uuid.New()
 	seedMirrorApp(t, pool, accountID, chargedApp, "2026-06-01T00:00:00Z", "")
 	seedMirrorApp(t, pool, accountID, legacyApp, "2026-06-02T00:00:00Z", "")
 	seedMirrorApp(t, pool, accountID, pendingApp, "2026-06-03T00:00:00Z", "")
+	seedMirrorApp(t, pool, accountID, skippedApp, "2026-06-03T12:00:00Z", "")
 
 	_, err := pool.Exec(ctx,
 		`UPDATE ms_billing.apps SET proration_invoice_id = 'in_app' WHERE app_id = $1`,
 		chargedApp)
+	require.NoError(t, err)
+	// D1d: created before the account activated, so SetAppProrationSkipped
+	// stamps a PERMANENT skip and proration_invoice_id stays NULL forever. The
+	// boundary advance leg still bills its full recurring base.
+	_, err = pool.Exec(ctx,
+		`UPDATE ms_billing.apps SET proration_skipped_at = $2 WHERE app_id = $1`,
+		skippedApp, appMustTime(t, "2026-06-03T13:00:00Z"))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx,
 		`INSERT INTO ms_billing.app_base_snapshots
@@ -105,12 +114,18 @@ func TestActivatedRecurringFeeSharesAndSettledDomains_Integration(t *testing.T) 
 		if i == 5 || i == 6 {
 			chargedAt = installedAt.Add(usage.GraceDays * 24 * time.Hour)
 		}
+		// FIFO position 8 (i==7) is over the allowance and was FORGIVEN under
+		// D1d: MarkModuleTimerIncluded stamps a terminal verdict with no charge,
+		// so grace_resolved is true while grace_charged_at stays NULL forever.
+		// CountOngoingOverModuleTimers bills it at every boundary regardless.
+		resolved := i == 7
 		_, err = pool.Exec(ctx,
 			`INSERT INTO ms_billing.app_module_overage_timers
-			   (account_id, app_id, installed_at, grace_expires_at, grace_charged_at)
-			 VALUES ($1, $2, $3, $4, $5)`,
+			   (account_id, app_id, installed_at, grace_expires_at, grace_charged_at,
+			    grace_resolved)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
 			accountID, chargedApp, installedAt,
-			installedAt.Add(usage.GraceDays*24*time.Hour), chargedAt)
+			installedAt.Add(usage.GraceDays*24*time.Hour), chargedAt, resolved)
 		require.NoError(t, err)
 	}
 
@@ -131,12 +146,13 @@ func TestActivatedRecurringFeeSharesAndSettledDomains_Integration(t *testing.T) 
 	require.NoError(t, err)
 
 	readStore, ok := store.(interface {
-		ActivatedRecurringFeeShares(context.Context, uuid.UUID, int) ([]usage.AppRecurringFeeShare, error)
+		ActivatedRecurringFeeShares(context.Context, uuid.UUID, int, time.Time) ([]usage.AppRecurringFeeShare, error)
 		SettledDomainCreationCharges(context.Context, uuid.UUID, time.Time, time.Time) ([]usage.SettledDomainCreationChargeRaw, error)
 	})
 	require.True(t, ok)
 
-	shares, err := readStore.ActivatedRecurringFeeShares(ctx, accountID, usage.IncludedModules)
+	shares, err := readStore.ActivatedRecurringFeeShares(ctx, accountID,
+		usage.IncludedModules, appMustTime(t, appPeriodEnd))
 	require.NoError(t, err)
 
 	// pendingApp is absent entirely: not activated, and it owns no surcharge —
@@ -145,21 +161,24 @@ func TestActivatedRecurringFeeSharesAndSettledDomains_Integration(t *testing.T) 
 	for _, share := range shares {
 		byApp[share.AppID] = share
 	}
-	require.Len(t, shares, 2)
+	require.Len(t, shares, 3)
 	require.NotContains(t, byApp, pendingApp,
 		"an app with no activation and no surcharge owns none of the recurring base")
 	require.Equal(t, usage.AppRecurringFeeShare{
-		AppID: chargedApp, Activated: true, OverModuleCount: 2, CustomDomainCount: 1,
+		AppID: chargedApp, Activated: true, OverModuleCount: 3, CustomDomainCount: 2,
 	}, byApp[chargedApp],
-		"the charged app owns its two grace-charged over-timers and its one charged domain")
+		"the charged app owns every over-timer the boundary bills (2 charged + 1 "+
+			"D1d-forgiven) and every live domain it bills (1 charged + 1 never-charged)")
 	require.Equal(t, usage.AppRecurringFeeShare{AppID: legacyApp, Activated: true}, byApp[legacyApp],
 		"a legacy advance snapshot activates the base fee and nothing else")
+	require.Equal(t, usage.AppRecurringFeeShare{AppID: skippedApp, Activated: true}, byApp[skippedApp],
+		"a D1d-skipped app never gets an invoice id, and the boundary bills it anyway")
 
 	// The account line is these rows summed — the identity the per-app bill
 	// presentation depends on, asserted against the real query, not the fake.
-	require.Equal(t, usage.RecurringFeeCounts{Apps: 2, ModuleOverages: 2, CustomDomains: 1},
+	require.Equal(t, usage.RecurringFeeCounts{Apps: 3, ModuleOverages: 3, CustomDomains: 2},
 		usage.RecurringFeeCountsOf(shares),
-		"only durably charged live entities join the next-period recurring base")
+		"the forecast is exactly the set the boundary will bill, not the set already charged")
 
 	domains, err := readStore.SettledDomainCreationCharges(ctx, accountID,
 		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
