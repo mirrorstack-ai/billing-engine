@@ -24,7 +24,11 @@ type aggKey struct {
 }
 
 type fakeStore struct {
-	proposedProrations []string
+	// orgDistributors maps customer org -> distributor org (migration 053);
+	// orgDistributorSources carries the link provenance, defaulting to 'manual'.
+	orgDistributors       map[uuid.UUID]uuid.UUID
+	orgDistributorSources map[uuid.UUID]string
+	proposedProrations    []string
 	// rollup inputs
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
@@ -987,6 +991,27 @@ func (f *fakeStore) OrgAccountID(_ context.Context, orgID uuid.UUID) (uuid.UUID,
 func (f *fakeStore) OrgDesignation(_ context.Context, orgID uuid.UUID) (cycle.OrgDesignation, bool, error) {
 	d, ok := f.orgDesignations[orgID]
 	return d, ok, nil
+}
+
+func (f *fakeStore) OrgIsDistributor(_ context.Context, orgID uuid.UUID) (bool, error) {
+	for _, d := range f.orgDistributors {
+		if d == orgID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeStore) OrgDistributor(_ context.Context, orgID uuid.UUID) (uuid.UUID, string, bool, error) {
+	d, ok := f.orgDistributors[orgID]
+	if !ok {
+		return uuid.Nil, "", false, nil
+	}
+	src := f.orgDistributorSources[orgID]
+	if src == "" {
+		src = "manual"
+	}
+	return d, src, true, nil
 }
 
 func (f *fakeStore) UpsertOrgDesignation(_ context.Context, d cycle.OrgDesignation) error {

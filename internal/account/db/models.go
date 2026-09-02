@@ -794,6 +794,16 @@ type MsBillingOrgDeletionRetiredSponsorship struct {
 	RetiredAt           time.Time `json:"retired_at"`
 }
 
+// B2B2B distributor attribution: customer org C is distributed by org B. Separate from org_billing_designations because that table decides who PAYS (sponsor_account_id feeds funding_account_id) and requires a funding choice, while this link is established at registration and must never by itself move liability.
+type MsBillingOrgDistributor struct {
+	CustomerOrgID    string `json:"customer_org_id"`
+	DistributorOrgID string `json:"distributor_org_id"`
+	// registration = derived from the ?org= / org-custom-domain context the customer signed up through; manual = set explicitly.
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type MsBillingPaymentMethodsMirror struct {
 	ID                    string             `json:"id"`
 	AccountID             string             `json:"account_id"`

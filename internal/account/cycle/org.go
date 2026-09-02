@@ -137,6 +137,22 @@ type GetOrgDesignationResponse struct {
 	AccountID            uuid.UUID `json:"account_id,omitempty"`
 	Activated            bool      `json:"activated"`
 	PendingBacklogMicros int64     `json:"pending_backlog_micros"`
+
+	// IsDistributor: this org distributes at least one customer org. DERIVED
+	// from ms_billing.org_distributors (migration 053), never a stored flag,
+	// so it cannot drift from the links themselves.
+	IsDistributor bool `json:"is_distributor"`
+	// DistributorOrgID: the org that distributes THIS org, Nil when none.
+	// Note the two fields are independent and describe opposite directions —
+	// an org can be both a distributor and itself distributed.
+	//
+	// Both are populated INDEPENDENTLY of Found. A customer bound to its
+	// distributor at registration has no funding designation yet, so gating
+	// these on Found would hide exactly the case they exist to report.
+	DistributorOrgID uuid.UUID `json:"distributor_org_id,omitempty"`
+	// DistributorSource: 'registration' (derived from the ?org= / custom-domain
+	// context the customer signed up through) or 'manual'. Empty when unlinked.
+	DistributorSource string `json:"distributor_source,omitempty"`
 }
 
 // RevokeSponsorshipRequest is the sponsor SELF-revoke: authorized by BEING
@@ -320,6 +336,24 @@ func (s *Service) GetOrgDesignation(ctx context.Context, req GetOrgDesignationRe
 		return nil, billing.Internal("unbilled backlog estimate failed", err)
 	}
 	resp.PendingBacklogMicros = backlog
+
+	// Distributor facts are read BEFORE the designation, because they are
+	// independent of it: a customer bound at registration has a link and no
+	// designation at all, and the !found path below returns early.
+	isDistributor, err := s.store.OrgIsDistributor(ctx, req.OrgID)
+	if err != nil {
+		return nil, billing.Internal("org is-distributor lookup failed", err)
+	}
+	resp.IsDistributor = isDistributor
+
+	distributorOrgID, distributorSource, linked, err := s.store.OrgDistributor(ctx, req.OrgID)
+	if err != nil {
+		return nil, billing.Internal("org distributor lookup failed", err)
+	}
+	if linked {
+		resp.DistributorOrgID = distributorOrgID
+		resp.DistributorSource = distributorSource
+	}
 
 	accountID, accountFound, err := s.store.OrgAccountID(ctx, req.OrgID)
 	if err != nil {

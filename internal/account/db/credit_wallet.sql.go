@@ -697,29 +697,28 @@ func (q *Queries) GetCreditStandingSnapshot(ctx context.Context, accountID strin
 
 const getDistributorCustomerAccount = `-- name: GetDistributorCustomerAccount :one
 SELECT customer.id AS account_id
-FROM ms_billing.org_billing_designations designation
-JOIN ms_billing.accounts distributor
-  ON distributor.id = designation.sponsor_account_id
- AND distributor.owner_kind = 'org'
- AND distributor.owner_org_id = $1::uuid
+FROM ms_billing.org_distributors link
 JOIN ms_billing.accounts customer
   ON customer.owner_kind = 'org'
- AND customer.owner_org_id = designation.org_id
-WHERE designation.org_id = $2::uuid
-  AND designation.funding = 'sponsor'
+ AND customer.owner_org_id = link.customer_org_id
+WHERE link.customer_org_id = $1::uuid
+  AND link.distributor_org_id = $2::uuid
 `
 
 type GetDistributorCustomerAccountParams struct {
-	DistributorOrgID string `json:"distributor_org_id"`
 	CustomerOrgID    string `json:"customer_org_id"`
+	DistributorOrgID string `json:"distributor_org_id"`
 }
 
 // GetDistributorCustomerAccount validates the distributor -> customer
-// relationship and returns the customer's wallet account in one lookup. A
-// distributor is represented by an org-owned account named by the customer's
-// sponsor_account_id; personal sponsorship never passes this join.
+// relationship and returns the customer's wallet account in one lookup.
+// Authority comes from the ms_billing.org_distributors link (migration 053),
+// NOT from the designation's sponsor_account_id: that column decides who PAYS,
+// and a distributor must not gain wallet authority merely by funding, nor lose
+// it by not funding. Pre-053 this joined sponsor_account_id and could never
+// match at all (billing-engine#134).
 func (q *Queries) GetDistributorCustomerAccount(ctx context.Context, arg GetDistributorCustomerAccountParams) (string, error) {
-	row := q.db.QueryRow(ctx, getDistributorCustomerAccount, arg.DistributorOrgID, arg.CustomerOrgID)
+	row := q.db.QueryRow(ctx, getDistributorCustomerAccount, arg.CustomerOrgID, arg.DistributorOrgID)
 	var account_id string
 	err := row.Scan(&account_id)
 	return account_id, err
@@ -1101,7 +1100,7 @@ func (q *Queries) ListCreditLedgerPage(ctx context.Context, arg ListCreditLedger
 
 const listDistributorCustomerSnapshots = `-- name: ListDistributorCustomerSnapshots :many
 SELECT
-    designation.org_id AS customer_org_id,
+    link.customer_org_id AS customer_org_id,
     customer.id AS account_id,
     customer.billing_mode,
     customer.credit_limit_micros,
@@ -1111,14 +1110,10 @@ SELECT
     COALESCE(auto_topup.threshold_micros, 0)::bigint AS auto_topup_threshold_micros,
     COALESCE(auto_topup.amount_micros, 0)::bigint AS auto_topup_amount_micros,
     COALESCE(auto_topup.payment_method_id::text, '')::text AS auto_topup_payment_method_id
-FROM ms_billing.org_billing_designations designation
-JOIN ms_billing.accounts distributor
-  ON distributor.id = designation.sponsor_account_id
- AND distributor.owner_kind = 'org'
- AND distributor.owner_org_id = $1::uuid
+FROM ms_billing.org_distributors link
 JOIN ms_billing.accounts customer
   ON customer.owner_kind = 'org'
- AND customer.owner_org_id = designation.org_id
+ AND customer.owner_org_id = link.customer_org_id
 LEFT JOIN LATERAL (
     SELECT SUM(entry.amount_micros)::bigint AS balance_micros
     FROM ms_billing.credit_ledger entry
@@ -1127,8 +1122,8 @@ LEFT JOIN LATERAL (
 ) balance ON true
 LEFT JOIN ms_billing.credit_auto_topup_configs auto_topup
        ON auto_topup.account_id = customer.id
-WHERE designation.funding = 'sponsor'
-ORDER BY designation.org_id
+WHERE link.distributor_org_id = $1::uuid
+ORDER BY link.customer_org_id
 `
 
 type ListDistributorCustomerSnapshotsRow struct {
@@ -1144,9 +1139,15 @@ type ListDistributorCustomerSnapshotsRow struct {
 	AutoTopupPaymentMethodID string `json:"auto_topup_payment_method_id"`
 }
 
-// ListDistributorCustomerSnapshots lists every customer whose designation
-// names the distributor's org account, including the wallet fields needed for
+// ListDistributorCustomerSnapshots lists every customer linked to the
+// distributor (migration 053), including the wallet fields needed for
 // service-side ok/low/blocked classification.
+//
+// The customer-account JOIN is INNER: a customer bound at registration that
+// has never had any billing activity has no ms_billing.accounts row yet
+// (EnsureOrgAccount is lazy) and so has no wallet to report. Such a customer
+// is linked but not yet listed here; surfacing pre-account customers needs a
+// nullable account_id and is deliberately left to a follow-up.
 func (q *Queries) ListDistributorCustomerSnapshots(ctx context.Context, distributorOrgID string) ([]ListDistributorCustomerSnapshotsRow, error) {
 	rows, err := q.db.Query(ctx, listDistributorCustomerSnapshots, distributorOrgID)
 	if err != nil {
@@ -1211,22 +1212,18 @@ func (q *Queries) LockCreditAccountBalance(ctx context.Context, accountID string
 
 const lockDistributorCustomerAccountForMutation = `-- name: LockDistributorCustomerAccountForMutation :one
 SELECT customer.id AS account_id
-FROM ms_billing.org_billing_designations designation
-JOIN ms_billing.accounts distributor
-  ON distributor.id = designation.sponsor_account_id
- AND distributor.owner_kind = 'org'
- AND distributor.owner_org_id = $1::uuid
+FROM ms_billing.org_distributors link
 JOIN ms_billing.accounts customer
   ON customer.owner_kind = 'org'
- AND customer.owner_org_id = designation.org_id
-WHERE designation.org_id = $2::uuid
-  AND designation.funding = 'sponsor'
-FOR UPDATE OF designation
+ AND customer.owner_org_id = link.customer_org_id
+WHERE link.customer_org_id = $1::uuid
+  AND link.distributor_org_id = $2::uuid
+FOR UPDATE OF link
 `
 
 type LockDistributorCustomerAccountForMutationParams struct {
-	DistributorOrgID string `json:"distributor_org_id"`
 	CustomerOrgID    string `json:"customer_org_id"`
+	DistributorOrgID string `json:"distributor_org_id"`
 }
 
 // LockDistributorCustomerAccountForMutation repeats the exact authority lookup
@@ -1234,7 +1231,7 @@ type LockDistributorCustomerAccountForMutationParams struct {
 // redirecting authority after a distributor mutation has re-authorized inside
 // its write transaction; the relationship change linearizes after that write.
 func (q *Queries) LockDistributorCustomerAccountForMutation(ctx context.Context, arg LockDistributorCustomerAccountForMutationParams) (string, error) {
-	row := q.db.QueryRow(ctx, lockDistributorCustomerAccountForMutation, arg.DistributorOrgID, arg.CustomerOrgID)
+	row := q.db.QueryRow(ctx, lockDistributorCustomerAccountForMutation, arg.CustomerOrgID, arg.DistributorOrgID)
 	var account_id string
 	err := row.Scan(&account_id)
 	return account_id, err

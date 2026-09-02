@@ -799,3 +799,69 @@ func decodeCreditLedgerCursor(encoded string) (CreditLedgerCursor, error) {
 	}
 	return CreditLedgerCursor{CreatedAt: createdAt, ID: id}, nil
 }
+
+// distributorLinkSources are the accepted provenances for an org distributor
+// link. 'registration' means the link was derived from the org context the
+// customer signed up through (?org= or the distributor's org custom domain);
+// 'manual' means it was set explicitly. Anything else is rejected rather than
+// silently coerced — the CHECK constraint would reject it at the DB anyway,
+// and a 500 there is a worse report than a 400 here.
+var distributorLinkSources = map[string]bool{"registration": true, "manual": true}
+
+// SetOrgDistributor binds customer org C to distributor org B (migration 053).
+//
+// This is ATTRIBUTION ONLY and deliberately moves no money: it does not touch
+// org_billing_designations, so it never changes who funds C's invoices. A
+// customer that signed up through a distributor's white-label domain must not
+// thereby make that distributor liable for its bill — see the migration for
+// why the link does not live on the designation row.
+//
+// Idempotent: re-binding the same pair is a no-op UPDATE. Re-binding a
+// DIFFERENT distributor is allowed and replaces the link (PK on
+// customer_org_id), so an org always has at most one distributor.
+func (s *Service) SetOrgDistributor(ctx context.Context, req SetOrgDistributorRequest) (*SetOrgDistributorResponse, error) {
+	if req.CustomerOrgID == uuid.Nil {
+		return nil, InvalidInput("customer_org_id required")
+	}
+	if req.DistributorOrgID == uuid.Nil {
+		return nil, InvalidInput("distributor_org_id required")
+	}
+	if req.CustomerOrgID == req.DistributorOrgID {
+		// Self-distribution would hand an org distributor authority over its
+		// OWN wallet through the customer-account lookups.
+		return nil, InvalidInput("an org cannot be its own distributor")
+	}
+	source := req.Source
+	if source == "" {
+		source = "manual"
+	}
+	if !distributorLinkSources[source] {
+		return nil, InvalidInput("source must be 'registration' or 'manual'")
+	}
+
+	stored, err := s.store.UpsertOrgDistributor(ctx, req.CustomerOrgID, req.DistributorOrgID, source)
+	if err != nil {
+		return nil, Internal("write org distributor link failed", err)
+	}
+	return &SetOrgDistributorResponse{
+		CustomerOrgID:    req.CustomerOrgID,
+		DistributorOrgID: req.DistributorOrgID,
+		// The STORED source, not the requested one: an existing 'manual' link
+		// is preserved over a later 'registration' write.
+		Source: stored,
+	}, nil
+}
+
+// ClearOrgDistributor removes customer org C's distributor link. Removed is
+// false when there was nothing to remove, so the caller never reads a no-op as
+// a successful unlink.
+func (s *Service) ClearOrgDistributor(ctx context.Context, req ClearOrgDistributorRequest) (*ClearOrgDistributorResponse, error) {
+	if req.CustomerOrgID == uuid.Nil {
+		return nil, InvalidInput("customer_org_id required")
+	}
+	removed, err := s.store.DeleteOrgDistributor(ctx, req.CustomerOrgID)
+	if err != nil {
+		return nil, Internal("clear org distributor link failed", err)
+	}
+	return &ClearOrgDistributorResponse{Removed: removed}, nil
+}

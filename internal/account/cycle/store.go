@@ -356,6 +356,13 @@ type Store interface {
 	// the designating user confirms.
 	OrgUnbilledBacklogMicros(ctx context.Context, orgID uuid.UUID) (int64, error)
 
+	// OrgIsDistributor reports whether orgID distributes at least one customer
+	// org (migration 053). Derived from the links, never a stored flag.
+	OrgIsDistributor(ctx context.Context, orgID uuid.UUID) (bool, error)
+	// OrgDistributor returns the org that distributes orgID and the link's
+	// provenance ('registration' | 'manual'). found=false when unlinked.
+	OrgDistributor(ctx context.Context, orgID uuid.UUID) (distributorOrgID uuid.UUID, source string, found bool, err error)
+
 	// AttachOrgAppsToAccount backfills account_id onto the org's unbilled
 	// roster rows (the roster half of the RepointOrgUsage sweep); returns the
 	// attached-row count.
@@ -3832,6 +3839,25 @@ func (s *pgxStore) ActivateAccountIfUnset(ctx context.Context, accountID uuid.UU
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *pgxStore) OrgIsDistributor(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	return s.q.OrgIsDistributor(ctx, orgID.String())
+}
+
+func (s *pgxStore) OrgDistributor(ctx context.Context, orgID uuid.UUID) (uuid.UUID, string, bool, error) {
+	row, err := s.q.GetOrgDistributor(ctx, orgID.String())
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, "", false, nil
+		}
+		return uuid.Nil, "", false, err
+	}
+	id, err := uuid.Parse(row.DistributorOrgID)
+	if err != nil {
+		return uuid.Nil, "", false, err
+	}
+	return id, row.Source, true, nil
 }
 
 func (s *pgxStore) OrgUnbilledBacklogMicros(ctx context.Context, orgID uuid.UUID) (int64, error) {
