@@ -129,11 +129,7 @@ a diagram below.
 
 ### Flow 1 · bind a card for recurring use
 
-Saving a card must be the cheapest thing you can do with money, in the sense
-that it moves none. This is the flow the other four depend on, so it is the one
-whose blast radius must stay smallest.
-
-**Target, not deployed.** `PaymentMethodSetup` and its receipt are unbuilt.
+Save a card once; move no money doing it. The other four flows depend on the mandate this one creates. **Target, not deployed:** `PaymentMethodSetup` and its receipt are unbuilt.
 
 ```mermaid
 sequenceDiagram
@@ -171,37 +167,16 @@ sequenceDiagram
     Engine->>DB: PaymentMethodSetupReceipt, after re-applying the recorded head
 ```
 
-Four things this diagram makes obvious:
-
-- **Your card number never enters this repository.** Step 10 goes from the
-  Elements iframe to Stripe. `web-account` renders the field but its server
-  never sees the value, and neither `api-platform` nor this engine is on that
-  path. What comes back in step 17 is a mandate reference, not a card.
-- **No arrow creates authority to charge you.** Step 16 authorizes one
-  `mandate_setup` step and nothing more. Subscription and auto top-up must each
-  request their own authority against that mandate later. The effect classes are
-  enumerated in
-  [`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#6--what-you-can-be-charged-for).
-- **Steps 8 and 9 relay bytes the engine signed, and steps 12 and 13 relay your
-  answer back.** `api-platform` must author neither. It could also assert an
-  acceptance you never gave. The engine records what it was told and can
-  reproduce it later, which is detection, not prevention —
-  [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
-- 🔴 **Step 18 is where today's code diverges, and it costs you a billing
-  period.** A Stripe `payment_method.attached` event currently stamps
-  `accounts.activated_at` (`internal/account/webhook/handlers.go:132`), so
-  saving a card starts a cycle. It is filed in
-  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
+- **Your card number never enters this repository.** Step 10 goes from the Elements iframe to Stripe; step 17 returns a mandate reference, not a card.
+- **No arrow creates authority to charge you.** Step 16 authorizes one `mandate_setup` step; subscription and auto top-up must each request their own authority later ([`docs/DESIGN.md#6`](docs/DESIGN.md#6--what-you-can-be-charged-for)).
+- **Steps 8–9 and 12–13 relay bytes, unchanged.** `api-platform` authors neither — and could assert an acceptance you never gave; the engine records what it was told, which is detection, not prevention ([INV-006](docs/DESIGN.md#inv-006)).
+- 🔴 **Today, step 18 starts a billing period.** `payment_method.attached` stamps `accounts.activated_at` (`internal/account/webhook/handlers.go:132`) — [known gap](SECURITY.md#known-current-gaps).
 
 ---
 
 ### Flow 2 · buy credit
 
-A one-time, customer-present purchase of stored value. It is the simplest money
-movement in the set, which makes it the clearest place to see who is allowed to
-decide the amount.
-
-**Target, not deployed.** `ChargeIntent` and `FundingPlan` are unbuilt.
+A one-time, customer-present purchase of stored value — the clearest place to see who decides the amount. **Target, not deployed:** `ChargeIntent` and `FundingPlan` are unbuilt.
 
 ```mermaid
 sequenceDiagram
@@ -238,45 +213,16 @@ sequenceDiagram
     Engine->>DB: append the ledger transaction and grant the credit lot
 ```
 
-Four things this diagram makes obvious:
-
-- **Step 14 is you paying, not us pulling.** A one-time purchase is settled by a
-  customer-present payment at the provider. No saved mandate is consumed and no
-  standing authority is spent, which is what separates this flow from
-  [flow 3](#flow-3--auto-top-up-a-credit-wallet-from-a-saved-mandate).
-- **INV-006's trust assumption applies here too.** The gate is the relayed
-  acceptance receipt in steps 11 to 13, which `api-platform` could invent. The
-  provider evidence in step 15 proves the money moved, never who accepted —
-  [`docs/DESIGN.md#inv-006`](docs/DESIGN.md#inv-006).
-- **The amount you typed enters as a choice, not as a price.** The engine
-  re-derives currency, lines, tax and eligibility from the template it signed,
-  then seals the total in step 4 before any session exists —
-  [`docs/DESIGN.md#inv-001`](docs/DESIGN.md#inv-001).
-- 🔴 **Today `StartCreditPurchase` proposes and does not collect.** The legacy
-  collector that finalized an auto-advance invoice before the browser had its
-  client secret was removed; the leg now seals a `credit_purchase` intent
-  (`internal/account/billing/credit.go:156`, `:696`,
-  `internal/account/creditpurchase/executor.go:782`) and the intent executor
-  refuses to start while any legacy money path remains. The remaining gap is
-  the recovery path that finishes a charge a pre-cutover run had already
-  placed. It is filed in
-  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
-
-A credit purchase must never be funded by credit: `walletFunding = 0` and
-`providerRemainder = grossObligation`, so the wallet cannot buy itself. The
-kind-specific equations are in
-[`docs/DESIGN.md#8-what-customers-may-be-charged-for`](docs/DESIGN.md#6--what-you-can-be-charged-for).
+- **Step 14 is you paying, not us pulling.** No saved mandate is consumed and no standing authority is spent — the difference from [flow 3](#flow-3--auto-top-up-a-credit-wallet-from-a-saved-mandate).
+- **The amount you typed is a choice, not a price.** The engine re-derives currency, lines, tax and eligibility from the template it signed and seals the total in step 4 ([INV-001](docs/DESIGN.md#inv-001)). Credit never funds credit: `walletFunding = 0`, `providerRemainder = grossObligation`.
+- **The acceptance in steps 11–13 is relayed and could be invented**; the provider evidence in step 15 proves the money moved, never who accepted ([INV-006](docs/DESIGN.md#inv-006)).
+- 🔴 **Today `StartCreditPurchase` proposes and does not collect.** The collector that finalized an invoice before the browser had its client secret is gone; the leg seals a `credit_purchase` intent (`internal/account/billing/credit.go:156`, `:696`; `internal/account/creditpurchase/executor.go:782`) and the executor refuses to start while a legacy money path remains. What is left is the pre-cutover recovery path — [known gap](SECURITY.md#known-current-gaps).
 
 ---
 
 ### Flow 3 · auto top-up a credit wallet from a saved mandate
 
-The only flow in the set with nobody present. That absence is the entire
-difficulty: there is no acceptance to check at the moment of the debit, so
-something else must carry the authority.
-
-**Target, not deployed.** `AutoTopupTriggerReservation` and `NoticeReceipt` are
-unbuilt. Read the first bullet after the diagram before the diagram itself.
+The only flow with nobody present: there is no acceptance to check at the moment of the debit, so standing authority must carry it. **Target, not deployed:** `AutoTopupTriggerReservation` and `NoticeReceipt` are unbuilt.
 
 ```mermaid
 sequenceDiagram
@@ -307,39 +253,16 @@ sequenceDiagram
     Engine->>DB: grant credit, close the trigger epoch, append the ledger
 ```
 
-Four things this diagram makes obvious:
-
-- 🔴 **Step 1 must not be able to reach step 9, and today it still reaches
-  step 3.** An ordinary status or ingest read can still arm the auto-top-up
-  trigger; the trigger no longer collects — the leg proposes a sealed intent,
-  and the executor that would consume it refuses to start — but a read that can
-  create a trigger fact is still a read with a side effect. It remains on the
-  register —
-  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
-- **Step 3 is a reservation, not a counter.** Two concurrent triggers cannot
-  both pass, because the trigger key is unique and the predicate is recomputed
-  under the same lock at consume time —
-  [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
-- **The wait in the loop starts at delivery, not at sealing.** A late delivery
-  moves eligibility later, so the waiting period can never be consumed before
-  the notice arrives — [`docs/DESIGN.md#inv-005`](docs/DESIGN.md#inv-005).
-- 🔴 **The minimum lead time is not a number yet.** It is an open product
-  decision published through `Capabilities`, never a hidden deployment constant
-  ([`docs/DESIGN.md#12-open-product-decisions`](docs/DESIGN.md#12--what-we-have-not-decided)).
-  Turning on general billing must never turn this flow on.
+- 🔴 **Step 1 must not reach step 9; today it still reaches step 3.** An ordinary status or ingest read can arm the trigger. The trigger no longer collects (it proposes a sealed intent the executor refuses to consume), but a read with a side effect is still a read with a side effect — [known gap](SECURITY.md#known-current-gaps).
+- **Step 3 is a reservation, not a counter.** The trigger key is unique and the predicate is recomputed under the same lock at consume time, so two concurrent triggers cannot both pass ([INV-008](docs/DESIGN.md#inv-008)).
+- **The wait starts at delivery, not at sealing.** A late notice moves eligibility later ([INV-005](docs/DESIGN.md#inv-005)).
+- 🔴 **The minimum lead time is not a number yet** — an open product decision published through `Capabilities` ([`docs/DESIGN.md#12`](docs/DESIGN.md#12--what-we-have-not-decided)). Turning on general billing must never turn this flow on.
 
 ---
 
 ### Flow 4 · start or change a card-backed subscription
 
-Recurring money, on a rail that offers to run the recurrence for us. Declining
-that offer is the point of the flow.
-
-**Target, not deployed.** `ProviderExecutionPlan`, `PaymentAttempt` and
-`SubscriptionOffer` are unbuilt. What ships is a subscription-capability stub:
-`Ensure` always reports `subscription` missing
-(`internal/account/billing/service.go:105`, `:188-193`). The grace and
-allowance numbers below are shipped today and are named where they are cited.
+Recurring money on a rail that offers to run the recurrence for us; declining that offer is the point. **Target, not deployed:** `ProviderExecutionPlan`, `PaymentAttempt` and `SubscriptionOffer` are unbuilt; `Ensure` reports `subscription` missing (`internal/account/billing/service.go:105`, `:188-193`). The grace and allowance numbers below are shipped.
 
 ```mermaid
 sequenceDiagram
@@ -376,40 +299,16 @@ sequenceDiagram
     Engine->>DB: append the ledger, then activate the window on a successful CAS
 ```
 
-Four things this diagram makes obvious:
-
-- **A SaaS fee is not charged the moment you trigger it.** Creating an app, or
-  taking the account past its included modules, starts a grace timer instead.
-  `GraceDays = 3` and `IncludedModules = 5` (`internal/account/usage/bill.go:118`,
-  `:52`). After grace, one over-allowance install bills `$1.00` prorated
-  (`internal/account/usage/bill.go:37`,
-  `internal/account/cycle/overage.go:195-204`). The recurring boundary leg instead
-  prices `$5.00` per block of 5 (`internal/account/usage/bill.go:70`,
-  `internal/account/cycle/charge.go:306`). An app deleted inside its grace is
-  never billed, and each install timer carries its own grace. Org plans are the
-  exception: that tier is not built, and when it ships it must charge
-  immediately with no timer.
-- **Step 15 is one request, and that is a transport property.** Automatic SDK
-  and HTTP retries must be off, `MaxNetworkRetries` set to zero, and a guard at
-  the request boundary refuses a second send for that permit —
-  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes).
-- **Nothing in the picture lets Stripe schedule the next period.** The frozen
-  autonomy policy forbids provider-managed subscriptions, auto-advance, smart
-  retries, dunning debits and delayed capture. None of them can race your
-  revocation through the claim CAS in step 14.
-- **Changing the plan or the rail after the seal in step 6 is a new intent.** A sealed
-  intent is never edited, and a replacement carries new funding, digest,
-  disclosure and claim — [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
+- **A fee is not charged the moment you trigger it.** A new app or an install past the included 5 starts a 3-day grace timer (`GraceDays`, `IncludedModules` — `internal/account/usage/bill.go:118`, `:52`); after grace, one over-allowance install bills $1.00 prorated (`bill.go:37`, `internal/account/cycle/overage.go:195-204`) and the boundary leg prices $5.00 per block of 5 (`bill.go:70`, `internal/account/cycle/charge.go:306`). Deleted inside grace = never billed. Org tiers are unbuilt and must charge immediately when they ship.
+- **Step 15 is one request, as a transport property.** SDK/HTTP retries off, `MaxNetworkRetries = 0`, and a guard refuses a second send for the permit ([`docs/DESIGN.md#5`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes)).
+- **Stripe never schedules the next period.** Provider-managed subscriptions, auto-advance, smart retries, dunning debits and delayed capture are all forbidden, so none can race your revocation through the claim CAS in step 14.
+- **Changing plan or rail after the seal in step 6 is a new intent**, with new funding, digest, disclosure and claim ([INV-008](docs/DESIGN.md#inv-008)).
 
 ---
 
 ### Flow 5 · close a module usage period and open the new one
 
-The largest flow, and the only one where the money is discovered rather than
-requested. Millions of metered leaves must become one charge exactly once.
-
-**Target, not deployed.** `BillableSourceAllocation` and `ServiceAccrualExposure`
-are unbuilt.
+The largest flow, and the only one where money is discovered rather than requested: millions of metered leaves become one charge, exactly once. **Target, not deployed:** `BillableSourceAllocation` and `ServiceAccrualExposure` are unbuilt.
 
 ```mermaid
 sequenceDiagram
@@ -444,29 +343,11 @@ sequenceDiagram
     Engine->>DB: append the ledger and open the next window
 ```
 
-Five things this diagram makes obvious:
-
-- **Step 2 is at admission, and it is deliberately early.** Deferring the
-  ceiling to close would turn a prepaid wallet into an unauthorized credit
-  line, because the service is already rendered. 🔴 Product budgets are
-  alert-only today and never stop accrual
-  (`internal/account/budget/service.go:260`), filed in
-  [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps).
-- **A boundary charges backward and forward at once.** Steps 6 and 7 put the
-  closed period's usage arrears and the next period's advance charges — flat app
-  base, module overage, domains — into one total
-  (`internal/account/cycle/charge.go:306-322`). Apps still inside `GraceDays`
-  are excluded from the advance base and join at the next boundary.
-- **The loop exists so close is not one enormous transaction.** Batches claim
-  leaves and checkpoint; only the small seal barrier in step 5 is
-  all-or-nothing. A leaf may enter one allocation lineage, enforced by a
-  database constraint — [`docs/DESIGN.md#inv-008`](docs/DESIGN.md#inv-008).
-- **No arrow lets `api-platform` choose the grouping key.** The namespace is
-  derived inside the engine from accepted schedule and metric state, so a
-  regrouped call cannot make a source consumable twice.
-- **The latch after step 11 has no timeout release.** An operator may attach
-  evidence and still cannot clear it —
-  [`docs/DESIGN.md#5-payment-providers-are-adapters`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes).
+- **Step 2 gates at admission, deliberately early.** A ceiling checked only at close would turn a prepaid wallet into an unauthorized credit line. 🔴 Budgets are alert-only today and never stop accrual (`internal/account/budget/service.go:260`) — [known gap](SECURITY.md#known-current-gaps).
+- **A boundary charges backward and forward at once.** Steps 6–7 put the closed period's usage arrears and the next period's advance base, module overage and domains into one total (`internal/account/cycle/charge.go:306-322`); apps still inside grace join at the next boundary.
+- **The loop keeps close from being one enormous transaction.** Batches claim leaves and checkpoint; only the seal barrier in step 5 is all-or-nothing, and a leaf enters one allocation lineage by database constraint ([INV-008](docs/DESIGN.md#inv-008)).
+- **`api-platform` cannot choose the grouping key** — it is derived inside the engine, so a regrouped call cannot make a source consumable twice.
+- **The latch after step 11 has no timeout release**; an operator may attach evidence and still cannot clear it ([`docs/DESIGN.md#5`](docs/DESIGN.md#5--paying-and-what-happens-when-the-answer-never-comes)).
 
 ---
 
