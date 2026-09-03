@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   publish:
+    timeout-minutes: 10  # p95 2.3m over 19 runs (gh-hosted); 2x p95
     runs-on: ubuntu-latest
 
     steps:
