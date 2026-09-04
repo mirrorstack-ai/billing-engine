@@ -6,6 +6,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+)
+
+// EvaluateCreditUsage drops a usage event whose PeriodStart is not the start
+// of the anchored period containing the coordinator's clock, so the fixtures
+// below share one pinned instant: the coordinator reads fixtureNow, and the
+// event and projection carry the window that instant falls in for an account
+// anchored on the 4th. Reading the wall clock instead put the suite on a
+// timer — it went red at midnight UTC on the fixture's PeriodEnd.
+var (
+	fixtureNow         = time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	fixtureActivatedAt = time.Date(2026, time.May, 4, 0, 0, 0, 0, time.UTC)
+
+	fixturePeriodStart, fixturePeriodEnd = billingperiod.AnchoredPeriodWindow(
+		fixtureNow, billingperiod.AnchorDay(fixtureActivatedAt),
+	)
 )
 
 // topUpCandidateSnapshot returns a snapshot that autoTopUpCandidate
@@ -21,7 +38,7 @@ func topUpCandidateSnapshot(accountID uuid.UUID) Snapshot {
 		SpendableBalanceMicros: 500,
 		AutoTopUpEnabled:       true,
 		AutoTopUpThreshold:     1_000,
-		ActivatedAt:            time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),
+		ActivatedAt:            fixtureActivatedAt,
 	}
 }
 
@@ -30,8 +47,8 @@ func usageEventFor(accountID uuid.UUID) UsageEvent {
 		AccountID:               accountID,
 		EventID:                 "evt-" + accountID.String(),
 		ApproximateChargeMicros: 1,
-		PeriodStart:             time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC),
-		PeriodEnd:               time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC),
+		PeriodStart:             fixturePeriodStart,
+		PeriodEnd:               fixturePeriodEnd,
 	}
 }
 
@@ -40,12 +57,14 @@ func candidateCoordinator(trigger *fakeAutoTopUpTrigger) (*Coordinator, uuid.UUI
 	snapshots := &fakeSnapshots{snapshot: topUpCandidateSnapshot(accountID)}
 	projection := &fakeProjection{projection: Projection{
 		AmountMicros: 0,
-		PeriodStart:  time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC),
-		PeriodEnd:    time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC),
+		PeriodStart:  fixturePeriodStart,
+		PeriodEnd:    fixturePeriodEnd,
 	}}
 	// counter nil: OutOfCredits takes the live-projection path, which is
 	// the shorter of its two routes to maybeTriggerAutoTopUp.
-	return NewCoordinator(nil, snapshots, projection, nil).WithAutoTopUpTrigger(trigger), accountID
+	return NewCoordinator(nil, snapshots, projection, nil).
+		WithAutoTopUpTrigger(trigger).
+		WithNow(func() time.Time { return fixtureNow }), accountID
 }
 
 // maybeTriggerAutoTopUp is the one place in this package where a card
