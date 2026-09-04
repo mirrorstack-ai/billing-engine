@@ -2081,6 +2081,34 @@ marked and the rest is left open rather than rounded up.
     the notice owed before the first boundary that charges it. Until it ships,
     the bill still carries the line and the markup. See
     [`SECURITY.md`](../SECURITY.md#known-current-gaps).
+
+    **The transfer half is settled, and it ships as migration 071 plus the
+    `TransferApp` RPC (2026-09-04).** An app's billing account may be moved to
+    another owner in one of two modes, chosen by the caller. `keep` leaves the
+    closing period whole with the OLD account: the roster, domain and
+    overage-timer re-key is deferred to the next period boundary, and usage
+    already recorded stays where it was recorded. `move` re-keys immediately —
+    the current period's recurring fees and its recorded, not-yet-invoiced usage
+    both follow the app to the new account. There is no day-proration in either
+    mode, matching the whole-unit rule the recurring fees already use.
+
+    The rule that bounds it: **backdated re-attribution is permitted only within
+    the OPEN period; an issued or closed invoice never moves.** That is what
+    keeps this compatible with INV-006 and INV-011 — a transfer cannot rewrite a
+    fact that has already been billed, so no obligation is reassigned after the
+    fact.
+
+    🔴 **This settles the payer-transfer question only. The
+    infrastructure-pricing migration described above — the new price, re-price
+    at the next boundary versus grandfather, and the notice owed — remains
+    open**, and nothing in this wave touches it. The two subjects share a number
+    and not a decision.
+
+    Note what is deliberately NOT claimed: this is a field update with a
+    deferred half, not the typed payer cutoff §5's `BillingResponsibilityTransfer`
+    describes. Every original instant is preserved and every transfer is recorded
+    in `ms_billing.app_transfer_events`, so a typed cutoff can still be
+    reconstructed from what this RPC did — but it has not been built.
 16. **Consent authority, and reads you can verify yourself.** Whether
     billing-engine must be able to distrust `api-platform` about who accepted a
     charge, and about who may read the evidence.
