@@ -106,6 +106,21 @@ const (
 // usage is re-attributed into a period the target account has already closed
 // (INV-011 — a transfer may not rewrite a fact that has already been billed).
 //
+// WHAT NEVER TRAVELS: a one-time charge the OLD account still owes for the app
+// — its creation proration, a domain activation, a module's grace overage.
+// Each is billed by its sweep to whoever the row names WHEN THE SWEEP RUNS, so
+// re-keying with one outstanding would bill the new owner for a window it did
+// not own. If the old account can settle it soon (activated, arrears, a usable
+// card) or already has an attempt in flight, the transfer REFUSES with
+// app_transfer_charges_pending and the caller retries after the sweep. If it
+// cannot — never activated, prepaid, no card, or no account at all — the
+// charge is FORFEITED inside the transfer transaction and recorded on the
+// ledger row (forfeited_* / forfeit_reason, migration 071): nobody is ever
+// billed for it, which is the D1d no-retroactive-catch-up posture applied at
+// the instant the app leaves. The refusal is BOUNDED on purpose: an
+// unconditional one would have made a never-funded personal account unable to
+// hand its app to an org, ever (transfer_store.go, transferChargeDisposition).
+//
 // Idempotency: the (request_id) row in app_transfer_events is the record. A
 // replay returns it verbatim — the count, the window and recurring_from are
 // all read from the row, none recomputed — and the same request_id aimed at
@@ -155,7 +170,7 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 	case TransferPeriodClosed:
 		return nil, billing.Conflict("app_transfer_period_closed: a billing period for one of these accounts closed while the transfer ran; retry")
 	case TransferChargesPending:
-		return nil, billing.Conflict("app_transfer_charges_pending: a one-time charge for this app is still settling; retry after the sweeps run")
+		return nil, billing.Conflict("app_transfer_charges_pending: a one-time charge for this app is still settling on its current account; retry after the sweeps run")
 	}
 	return resp, nil
 }

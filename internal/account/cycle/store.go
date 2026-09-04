@@ -3238,11 +3238,26 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 		return err
 	}
 	defer deferredRollback(ctx, tx)
-	qtx := s.q.WithTx(tx)
 
 	if err := lockModuleTimers(ctx, tx, appID); err != nil {
 		return err
 	}
+	if err := reconcileModuleTimersToTargetTx(ctx, s.q.WithTx(tx), appID, installedAt, graceExpiresAt, removedAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// reconcileModuleTimersToTargetTx is the body of ReconcileModuleTimersToTarget
+// for a caller that ALREADY holds the per-app module-timer advisory lock in
+// its own transaction. TransferApp is that caller: it takes the lock first
+// (LOCK ORDER, transfer_store.go) and must synthesize an unbilled org app's
+// first timers inside the same transaction as the re-key — a separate
+// ReconcileModuleTimersToTarget call would block on the lock the transfer
+// itself holds, and a post-commit call would leave a crash window in which the
+// app has an account and no timers. The advisory lock is xact-scoped, so the
+// precondition cannot be checked here; the two callers are the guarantee.
+func reconcileModuleTimersToTargetTx(ctx context.Context, qtx *db.Queries, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error {
 	row, err := qtx.SelectAppMirror(ctx, appID.String())
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil // no roster row — nothing to reconcile against
@@ -3267,7 +3282,7 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 		// the designation instant (prospective billing, org-billing D1). Shrinks
 		// and removals below still run (they key on app_id only).
 		if !row.AccountID.Valid {
-			return tx.Commit(ctx)
+			return nil
 		}
 		if err := qtx.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
 			AccountID:      uuidFromPg(row.AccountID).String(),
@@ -3287,7 +3302,7 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // MarkAppDeletedAndRemoveTimers — the deletion write and the timer soft-remove

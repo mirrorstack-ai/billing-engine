@@ -24,6 +24,20 @@ BEGIN
     END IF;
 END $$;
 
+-- The forfeit stamps go with the ledger they point at. The guard above has
+-- already proven no transfer is recorded, so no row can carry one: every
+-- charge_forfeited_by / grace_forfeited_by is NULL here, and dropping the
+-- column erases no resolution — the row stays resolved, it just stops saying
+-- which transfer did it (which nothing did).
+ALTER TABLE ms_billing.app_module_overage_timers
+    DROP CONSTRAINT IF EXISTS app_module_overage_timers_forfeit_is_resolved_uncharged;
+ALTER TABLE ms_billing.app_module_overage_timers
+    DROP COLUMN IF EXISTS grace_forfeited_by;
+ALTER TABLE ms_billing.app_custom_domains
+    DROP CONSTRAINT IF EXISTS app_custom_domains_forfeit_is_resolved_uncharged;
+ALTER TABLE ms_billing.app_custom_domains
+    DROP COLUMN IF EXISTS charge_forfeited_by;
+
 -- The triggers and the functions go with the table: leaving the split guard
 -- behind would refuse writes on behalf of a ledger that no longer exists, and
 -- the append-only function would be an orphan.

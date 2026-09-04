@@ -82,8 +82,11 @@ func TestTransferAppMapsStoreOutcomesToWireCodes(t *testing.T) {
 		{"unknown app", cycle.TransferAppUnknown, billing.CodeNotFound, "app_unknown"},
 		{"replayed key, different target", cycle.TransferRequestConflict, billing.CodeConflict, "app_transfer_conflict"},
 		// The money refusal: a one-time charge is still owed by the old owner,
-		// and re-keying now would bill it to the new account.
+		// who is about to settle it, and re-keying now would bill it to the
+		// new account. (When the old owner CANNOT settle it, the store
+		// forfeits instead and this outcome never surfaces.)
 		{"one-time charge pending", cycle.TransferChargesPending, billing.CodeConflict, "app_transfer_charges_pending"},
+		{"period closed under the move", cycle.TransferPeriodClosed, billing.CodeConflict, "app_transfer_period_closed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

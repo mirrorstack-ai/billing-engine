@@ -74,11 +74,53 @@ CREATE TABLE IF NOT EXISTS ms_billing.app_transfer_events (
     open_period_end   TIMESTAMPTZ NOT NULL,
     recurring_from    TIMESTAMPTZ NOT NULL,
 
+    -- 🔴 WHAT THE TRANSFER FORFEITED, and why. A creation proration, a
+    -- custom-domain activation or a per-module grace overage that was still
+    -- unresolved on the OLD account at the transfer instant is billed by its
+    -- sweep to whoever the row points at WHEN THE SWEEP RUNS — so it cannot
+    -- travel with the re-key, or the new owner pays for a window it never
+    -- owned. When the old account can settle it soon the transfer REFUSES
+    -- (app_transfer_charges_pending) and the caller retries after the sweep.
+    -- When it cannot — no payer at all (from_account NULL), never activated,
+    -- prepaid, or no usable payment method — the charge is FORFEITED inside
+    -- the transfer transaction: proration_skipped_at armed, the domain and
+    -- timer rows resolved without a charge and stamped with this request_id
+    -- (charge_forfeited_by / grace_forfeited_by below). That is the D1d
+    -- posture, no retroactive catch-up, applied at the moment the app leaves.
+    -- These columns are the only place the forfeit is COUNTED; the rows
+    -- themselves only say which transfer did it.
+    forfeited_proration    BOOLEAN NOT NULL DEFAULT false,
+    forfeited_domain_count BIGINT  NOT NULL DEFAULT 0 CHECK (forfeited_domain_count >= 0),
+    forfeited_timer_count  BIGINT  NOT NULL DEFAULT 0 CHECK (forfeited_timer_count >= 0),
+    -- Which of the four "cannot settle soon" states the old account was in.
+    -- Closed set. NULL exactly when nothing was forfeited (the CHECKs below):
+    -- a row that forfeited something without saying why, or gave a reason
+    -- with nothing forfeited, was not written by TransferApp.
+    forfeit_reason         TEXT NULL
+        CHECK (forfeit_reason IN ('no_payer', 'unactivated', 'prepaid', 'no_payment_method')),
+
     -- Wall-clock arrival, matching the append-only convention (064, 065).
     recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT app_transfer_events_keep_moves_nothing
         CHECK (mode <> 'keep' OR moved_event_count = 0),
+
+    CONSTRAINT app_transfer_events_forfeit_reason_iff_forfeited
+        CHECK ((forfeit_reason IS NULL)
+               = (NOT forfeited_proration
+                  AND forfeited_domain_count = 0
+                  AND forfeited_timer_count = 0)),
+    -- "no payer" is the reason for a NULL from_account and for nothing else:
+    -- an unbilled org roster row has no account whose activation, mode or
+    -- card could be the reason, and an account that exists is never "no
+    -- payer". A NULL from_account also cannot have owned a domain or a timer
+    -- (both carry a NOT NULL account_id), so it can forfeit the proration only.
+    CONSTRAINT app_transfer_events_no_payer_is_the_null_source
+        CHECK ((forfeit_reason IS NOT DISTINCT FROM 'no_payer')
+               = (from_account IS NULL AND forfeit_reason IS NOT NULL)),
+    CONSTRAINT app_transfer_events_no_payer_forfeits_proration_only
+        CHECK (from_account IS NOT NULL
+               OR (forfeited_domain_count = 0 AND forfeited_timer_count = 0)),
 
     -- The open period is the one CONTAINING the transfer instant — that is
     -- how the writer derives it — and the first recurring boundary cannot
@@ -119,6 +161,57 @@ DROP TRIGGER IF EXISTS app_transfer_events_append_only ON ms_billing.app_transfe
 CREATE TRIGGER app_transfer_events_append_only
     BEFORE UPDATE OR DELETE ON ms_billing.app_transfer_events
     FOR EACH ROW EXECUTE FUNCTION ms_billing.app_transfer_events_reject_mutation();
+
+-- ---------------------------------------------------------------------------
+-- 🔴 A FORFEITED ROW SAYS WHICH TRANSFER FORFEITED IT.
+--
+-- app_custom_domains.charge_resolved and app_module_overage_timers
+-- .grace_resolved are TERMINAL booleans with more than one meaning already:
+-- "charged" (charged_at + the provider ids set), "D1d-forgiven" and, for a
+-- timer, "included" (resolved with nothing else set). A transfer that forfeits
+-- an unresolved row would add a fourth meaning to the same resolved-and-empty
+-- shape, and an auditor reading a $0 resolution could no longer tell a rank
+-- verdict from a forfeit. So the forfeit stamps the transfer's request_id on
+-- the row. It is the request_id and not the ledger's surrogate id because the
+-- request_id is what api-platform holds and what a replay presents.
+--
+-- The CHECKs make the state self-describing: a forfeited row is resolved,
+-- carries no charge and no provider object, and was never armed at the
+-- provider (charge_attempted_at IS NULL) — the transfer REFUSES rather than
+-- forfeits a row whose charge may already have moved money.
+ALTER TABLE ms_billing.app_custom_domains
+    ADD COLUMN IF NOT EXISTS charge_forfeited_by UUID NULL;
+
+ALTER TABLE ms_billing.app_custom_domains
+    DROP CONSTRAINT IF EXISTS app_custom_domains_forfeit_is_resolved_uncharged;
+ALTER TABLE ms_billing.app_custom_domains
+    ADD CONSTRAINT app_custom_domains_forfeit_is_resolved_uncharged
+    CHECK (charge_forfeited_by IS NULL
+           OR (charge_resolved
+               AND charged_at IS NULL
+               AND charge_attempted_at IS NULL
+               AND charge_invoice_id IS NULL
+               AND charge_invoice_item_id IS NULL));
+
+COMMENT ON COLUMN ms_billing.app_custom_domains.charge_forfeited_by IS
+    'The app_transfer_events.request_id of the transfer that resolved this activation charge WITHOUT charging it, because the account that owed it could not settle it soon (071). NULL for every other resolution.';
+
+ALTER TABLE ms_billing.app_module_overage_timers
+    ADD COLUMN IF NOT EXISTS grace_forfeited_by UUID NULL;
+
+ALTER TABLE ms_billing.app_module_overage_timers
+    DROP CONSTRAINT IF EXISTS app_module_overage_timers_forfeit_is_resolved_uncharged;
+ALTER TABLE ms_billing.app_module_overage_timers
+    ADD CONSTRAINT app_module_overage_timers_forfeit_is_resolved_uncharged
+    CHECK (grace_forfeited_by IS NULL
+           OR (grace_resolved
+               AND grace_charged_at IS NULL
+               AND charge_attempted_at IS NULL
+               AND grace_invoice_id IS NULL
+               AND grace_invoice_item_id IS NULL));
+
+COMMENT ON COLUMN ms_billing.app_module_overage_timers.grace_forfeited_by IS
+    'The app_transfer_events.request_id of the transfer that resolved this grace overage WITHOUT charging it, because the account that owed it could not settle it soon (071). NULL for every other resolution.';
 
 -- ---------------------------------------------------------------------------
 -- 🔴 THE SPLIT GUARD. This is the half that is not a ledger.

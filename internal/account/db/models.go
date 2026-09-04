@@ -434,6 +434,8 @@ type MsBillingAppCustomDomain struct {
 	ChargeFundingAccountID        pgtype.UUID        `json:"charge_funding_account_id"`
 	ChargeFundingGeneration       pgtype.UUID        `json:"charge_funding_generation"`
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
+	// The app_transfer_events.request_id of the transfer that resolved this activation charge WITHOUT charging it, because the account that owed it could not settle it soon (071). NULL for every other resolution.
+	ChargeForfeitedBy pgtype.UUID `json:"charge_forfeited_by"`
 }
 
 type MsBillingAppModuleOverageTimer struct {
@@ -453,22 +455,28 @@ type MsBillingAppModuleOverageTimer struct {
 	ChargeFundingAccountID        pgtype.UUID        `json:"charge_funding_account_id"`
 	ChargeFundingGeneration       pgtype.UUID        `json:"charge_funding_generation"`
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
+	// The app_transfer_events.request_id of the transfer that resolved this grace overage WITHOUT charging it, because the account that owed it could not settle it soon (071). NULL for every other resolution.
+	GraceForfeitedBy pgtype.UUID `json:"grace_forfeited_by"`
 }
 
 // One row per accepted app billing-account transfer. request_id is the caller's idempotency key; a replay returns the stored result and a different target for the same key is a conflict. Append-only.
 type MsBillingAppTransferEvent struct {
-	ID              string      `json:"id"`
-	RequestID       string      `json:"request_id"`
-	AppID           string      `json:"app_id"`
-	FromAccount     pgtype.UUID `json:"from_account"`
-	ToAccount       string      `json:"to_account"`
-	Mode            string      `json:"mode"`
-	MovedEventCount int64       `json:"moved_event_count"`
-	At              time.Time   `json:"at"`
-	OpenPeriodStart time.Time   `json:"open_period_start"`
-	OpenPeriodEnd   time.Time   `json:"open_period_end"`
-	RecurringFrom   time.Time   `json:"recurring_from"`
-	RecordedAt      time.Time   `json:"recorded_at"`
+	ID                   string      `json:"id"`
+	RequestID            string      `json:"request_id"`
+	AppID                string      `json:"app_id"`
+	FromAccount          pgtype.UUID `json:"from_account"`
+	ToAccount            string      `json:"to_account"`
+	Mode                 string      `json:"mode"`
+	MovedEventCount      int64       `json:"moved_event_count"`
+	At                   time.Time   `json:"at"`
+	OpenPeriodStart      time.Time   `json:"open_period_start"`
+	OpenPeriodEnd        time.Time   `json:"open_period_end"`
+	RecurringFrom        time.Time   `json:"recurring_from"`
+	ForfeitedProration   bool        `json:"forfeited_proration"`
+	ForfeitedDomainCount int64       `json:"forfeited_domain_count"`
+	ForfeitedTimerCount  int64       `json:"forfeited_timer_count"`
+	ForfeitReason        pgtype.Text `json:"forfeit_reason"`
+	RecordedAt           time.Time   `json:"recorded_at"`
 }
 
 type MsBillingAuthorizationAcceptance struct {

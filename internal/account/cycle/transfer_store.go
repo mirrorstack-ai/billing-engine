@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -46,7 +47,11 @@ const (
 	// soft-deleted. Both are NOT_FOUND to the caller.
 	TransferAppUnknown
 	// TransferChargesPending — a mid-period one-time charge is still owed for
-	// this app; re-keying now would bill it to the new account.
+	// this app AND the old account is about to settle it (or already has an
+	// attempt in flight); re-keying now would bill it to the new account.
+	// This is the BOUNDED refusal: when the old account cannot settle soon the
+	// charge is forfeited instead and the transfer proceeds — see
+	// transferChargeDisposition.
 	TransferChargesPending
 	// TransferPeriodClosed — the window the move would write into has already
 	// been closed or invoiced for one of the accounts. Refusing is the only
@@ -54,18 +59,72 @@ const (
 	TransferPeriodClosed
 )
 
+// TransferForfeitReason is WHY a transfer forfeited the old account's
+// unresolved one-time charges rather than refusing. Closed set, mirrored by
+// the CHECK on app_transfer_events.forfeit_reason (071). Each value is one
+// state in which the charge legs would skip the account transiently on every
+// sweep — for as long as the account stays so — which is what made the
+// unbounded refusal a transfer that could never happen.
+type TransferForfeitReason string
+
+const (
+	// TransferForfeitNoPayer — the app was an unbilled org roster row
+	// (account_id NULL): no account existed to settle anything.
+	TransferForfeitNoPayer TransferForfeitReason = "no_payer"
+	// TransferForfeitUnactivated — the old account never bound a card (D1d:
+	// an unactivated account is never charged).
+	TransferForfeitUnactivated TransferForfeitReason = "unactivated"
+	// TransferForfeitPrepaid — the old account is in prepaid collection mode
+	// (H10: never auto-charged off-session by any leg).
+	TransferForfeitPrepaid TransferForfeitReason = "prepaid"
+	// TransferForfeitNoPaymentMethod — activated and in arrears, but the
+	// funder has no usable card, so every leg reads skipped_no_pm.
+	TransferForfeitNoPaymentMethod TransferForfeitReason = "no_payment_method"
+)
+
+// transferForfeit is what one transfer forfeited. Decided BEFORE any write,
+// from the classification read under the app row lock, and written to the
+// ledger with the transfer — the row counts the forfeit writers report must
+// match these numbers exactly, or the transaction aborts.
+type transferForfeit struct {
+	proration bool
+	domains   int64
+	timers    int64
+	reason    TransferForfeitReason
+}
+
+func (f transferForfeit) any() bool {
+	return f.proration || f.domains > 0 || f.timers > 0
+}
+
 // TransferApp re-points one app's billing account, in ONE transaction.
 //
-// LOCK ORDER, and both locks are required:
+// LOCK ORDER, and every lock is required:
 //  1. the per-app module-timer advisory lock — the key every timer-set writer
 //     serializes on (lockModuleTimers). Without it a concurrent RegisterApp or
 //     SyncAppModules reconciles timers against the roster it read BEFORE this
-//     transfer and re-splits the attribution the transfer just aligned.
+//     transfer and re-splits the attribution the transfer just aligned. It is
+//     also what lets a NULL-source transfer synthesize the app's first timers
+//     in THIS transaction (reconcileModuleTimersToTargetTx).
 //  2. the apps row FOR UPDATE — serializes two concurrent transfers of the same
-//     app and pins the from-account the event records.
+//     app, pins the from-account the event records, and is the row the
+//     creation-proration sweep locks too (ChargeProrationLocked), so that
+//     sweep cannot slip between the pending-charge read and the forfeit or
+//     the re-key.
+//  3. both accounts' activation rows FOR SHARE, then the period barrier, in
+//     sorted account order (barrierBothAccounts).
+//  4. the domain and timer rows, by the forfeit UPDATEs first and the re-key
+//     UPDATEs second — same transaction, same order every time. The domain and
+//     timer sweeps lock ONLY their own rows (ArmDomainStripeCharge,
+//     ArmModuleTimerStripeCharge), never the app row, so they can interleave
+//     with steps 1–3; the forfeit writers close that by re-checking the arm
+//     marker in their WHERE and the store aborting on a row-count shortfall.
+//     The 052 lifecycle guards these UPDATEs fire take SHARED org-lifecycle
+//     advisory locks; only FinalizeOrgDeletion takes them exclusively.
 //
-// Everything decided is read under those locks, including the pending-charge
-// refusal, so a sweep cannot slip between the check and the re-key.
+// EVERY REFUSAL IS DECIDED BEFORE THE FIRST WRITE. The transaction commits on
+// a refusal too (pgx.BeginFunc commits a nil return), so a write that
+// preceded a refusal would land without the transfer it belonged to.
 func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*TransferAppResponse, TransferOutcome, error) {
 	var (
 		resp    *TransferAppResponse
@@ -124,23 +183,27 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			return err
 		}
 
-		// 🔴 THE MONEY REFUSAL. Creation proration, custom-domain activation and
-		// per-module grace overage each charge whoever the row points at WHEN
-		// THE SWEEP RUNS. Re-keying with one outstanding bills the new account
-		// for a window it did not own, so the transfer refuses and the caller
-		// retries after the sweeps settle.
-		pending, err := qtx.AppHasUnresolvedOneTimeCharge(ctx, p.AppID.String())
-		if err != nil {
-			return err
-		}
-		if pending.Valid && pending.Bool {
-			outcome = TransferChargesPending
-			return nil
-		}
-
 		var fromAccount uuid.UUID
 		if app.AccountID.Valid {
 			fromAccount = app.AccountID.Bytes
+		}
+
+		// 🔴 THE MONEY DECISION. Creation proration, custom-domain activation
+		// and per-module grace overage each charge whoever the row points at
+		// WHEN THE SWEEP RUNS, so none of them may travel with the re-key.
+		// Whether that means REFUSE (the old account settles it first) or
+		// FORFEIT (it never will) is decided here, before any write.
+		charges, err := qtx.AppUnresolvedOneTimeCharges(ctx, p.AppID.String())
+		if err != nil {
+			return err
+		}
+		forfeit, refuse, err := s.transferChargeDisposition(ctx, qtx, fromAccount, charges)
+		if err != nil {
+			return err
+		}
+		if refuse {
+			outcome = TransferChargesPending
+			return nil
 		}
 
 		// 🔴 THE PERIOD BARRIER. Ingest (usage/store.go) and the org repoint
@@ -170,6 +233,13 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		if closed {
 			outcome = TransferPeriodClosed
 			return nil
+		}
+
+		// The last refusal is behind us: from here every statement writes,
+		// and the forfeit goes first so the rows are resolved while they still
+		// name the account that owed them.
+		if err := s.forfeitTransferCharges(ctx, qtx, p, forfeit); err != nil {
+			return err
 		}
 
 		orgCol := pgtype.UUID{}
@@ -215,6 +285,20 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			moved = n
 		}
 
+		// An unbilled org roster row had no account to tier on, so it holds
+		// no timers (ReconcileModuleTimersToTarget declines to synthesize
+		// against a NULL account). Now that it has one, synthesize them the
+		// way the org attach sweep does (attachOrgBilling): fresh, anchored at
+		// the transfer instant, grace running from now — prospective billing,
+		// never a window the new account did not own. In THIS transaction,
+		// under the advisory lock taken at the top, so there is no committed
+		// state in which the app has an account and no timers.
+		if fromAccount == uuid.Nil {
+			if err := reconcileModuleTimersToTargetTx(ctx, qtx, p.AppID, p.At, moduleGraceExpiry(p.At), p.At); err != nil {
+				return err
+			}
+		}
+
 		// The answer is derived once, here, and written to the ledger with the
 		// transfer itself — the replay path above returns these columns, not a
 		// recomputation. Read under the barrier, so the target's anchor cannot
@@ -228,17 +312,25 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		if fromAccount != uuid.Nil {
 			fromCol = pgtype.UUID{Bytes: fromAccount, Valid: true}
 		}
+		reasonCol := pgtype.Text{}
+		if forfeit.any() {
+			reasonCol = pgtype.Text{String: string(forfeit.reason), Valid: true}
+		}
 		if err := qtx.InsertAppTransferEvent(ctx, db.InsertAppTransferEventParams{
-			RequestID:       p.RequestID.String(),
-			AppID:           p.AppID.String(),
-			FromAccount:     fromCol,
-			ToAccount:       p.ToAccount.String(),
-			Mode:            p.Mode,
-			MovedEventCount: moved,
-			At:              p.At,
-			OpenPeriodStart: window.Start,
-			OpenPeriodEnd:   window.End,
-			RecurringFrom:   from,
+			RequestID:            p.RequestID.String(),
+			AppID:                p.AppID.String(),
+			FromAccount:          fromCol,
+			ToAccount:            p.ToAccount.String(),
+			Mode:                 p.Mode,
+			MovedEventCount:      moved,
+			At:                   p.At,
+			OpenPeriodStart:      window.Start,
+			OpenPeriodEnd:        window.End,
+			RecurringFrom:        from,
+			ForfeitedProration:   forfeit.proration,
+			ForfeitedDomainCount: forfeit.domains,
+			ForfeitedTimerCount:  forfeit.timers,
+			ForfeitReason:        reasonCol,
 		}); err != nil {
 			return err
 		}
@@ -256,6 +348,133 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		return nil, TransferApplied, err
 	}
 	return resp, outcome, nil
+}
+
+// transferChargeDisposition decides what happens to the one-time charges the
+// old account still owes for this app: nothing (none pending), REFUSE, or
+// FORFEIT — and if forfeit, why.
+//
+// 🔴 THE BOUNDED RULE (decided 2026-09-04 after the be#193 review). The first
+// version refused whenever anything was pending, and "pending" includes states
+// the old account can NEVER leave on its own: skipped_no_pm and skipped_prepaid
+// re-attempt on every sweep (proration.go), and an unactivated account arms no
+// marker at all. A personal, never-funded account handing its app to an org —
+// the owner's own flow — would have been refused indefinitely. So:
+//
+//   - REFUSE only when the old account can settle soon: activated AND in
+//     arrears AND a usable card on its funder (TransferSourceSettlement — the
+//     three gates the legs themselves apply). The next sweep collects, and the
+//     caller retries after it.
+//   - REFUSE, unconditionally, when a charge is already IN FLIGHT: armed at the
+//     provider (charge_attempted_at) or frozen into an unresolved combined
+//     attempt. Money may have moved; forfeiting it would leave a collected
+//     charge with no mirror, and the recovery legs converge it soon anyway.
+//     This is not a widening of the refusal — an armed attempt IS the old
+//     account settling — and it is the one state the D1d posture does not
+//     reach, because D1d forgives charges that never started.
+//   - FORFEIT otherwise. The charges are resolved inside this transaction
+//     without being collected and never carried to the new owner: the
+//     no-retroactive-catch-up posture of D1d, applied at the instant the app
+//     leaves the account that could not pay for it.
+//
+// A sealed proposal (a resolved combined attempt) is not pending at all — the
+// intent rail owns it — and the classification query already reads it so.
+//
+// The reason is the FIRST failing gate in the legs' own order (activation,
+// then mode, then card), which is also the order in which an account acquires
+// them.
+func (s *pgxStore) transferChargeDisposition(ctx context.Context, qtx *db.Queries, from uuid.UUID, charges db.AppUnresolvedOneTimeChargesRow) (transferForfeit, bool, error) {
+	pending := charges.ProrationPending || charges.DomainPending > 0 || charges.TimerPending > 0
+	if !pending {
+		return transferForfeit{}, false, nil
+	}
+	if charges.ProrationInFlight || charges.DomainInFlight > 0 || charges.TimerInFlight > 0 {
+		return transferForfeit{}, true, nil
+	}
+	forfeit := transferForfeit{
+		proration: charges.ProrationPending,
+		domains:   charges.DomainPending,
+		timers:    charges.TimerPending,
+	}
+	if from == uuid.Nil {
+		// An unbilled org roster row: there is no account whose activation,
+		// mode or card could be asked about. Nothing to settle with.
+		forfeit.reason = TransferForfeitNoPayer
+		return forfeit, false, nil
+	}
+	src, err := qtx.TransferSourceSettlement(ctx, from.String())
+	if err != nil {
+		// ErrNoRows included: the roster row's account_id is a hard FK, so a
+		// missing accounts row under the app lock is a code bug, not a skip.
+		return transferForfeit{}, false, fmt.Errorf("transfer source account %s: %w", from, err)
+	}
+	switch {
+	case !src.Activated:
+		forfeit.reason = TransferForfeitUnactivated
+	case !src.Arrears:
+		forfeit.reason = TransferForfeitPrepaid
+	case !src.HasUsablePaymentMethod:
+		forfeit.reason = TransferForfeitNoPaymentMethod
+	default:
+		return transferForfeit{}, true, nil
+	}
+	return forfeit, false, nil
+}
+
+// forfeitTransferCharges performs the forfeit transferChargeDisposition
+// decided: the skip marker, then every pending domain and timer, each stamped
+// with the transfer's request_id.
+//
+// 🔴 EVERY WRITER'S ROW COUNT MUST EQUAL WHAT WAS READ AS PENDING. The
+// classification and these UPDATEs are one transaction under the app row
+// lock, but the domain and timer sweeps lock only their own rows, so an arm
+// can commit between the read and the write. Each writer excludes an armed
+// row in its WHERE; a shortfall here is therefore exactly that race, and the
+// only safe answer is to abort — the caller retries, and the retry reads the
+// arm as in-flight and refuses. Silently forfeiting fewer rows than the
+// ledger will say was forfeited is the kind of mismatch nothing downstream
+// would ever notice.
+func (s *pgxStore) forfeitTransferCharges(ctx context.Context, qtx *db.Queries, p TransferAppParams, f transferForfeit) error {
+	if !f.any() {
+		return nil
+	}
+	if f.proration {
+		n, err := qtx.ForfeitAppProrationOnTransfer(ctx, db.ForfeitAppProrationOnTransferParams{
+			At:    p.At,
+			AppID: p.AppID.String(),
+		})
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("transfer %s: app %s read as owing its creation proration but the skip marker landed on %d rows", p.RequestID, p.AppID, n)
+		}
+	}
+	if f.domains > 0 {
+		n, err := qtx.ForfeitAppDomainChargesOnTransfer(ctx, db.ForfeitAppDomainChargesOnTransferParams{
+			RequestID: p.RequestID.String(),
+			AppID:     p.AppID.String(),
+		})
+		if err != nil {
+			return err
+		}
+		if n != f.domains {
+			return fmt.Errorf("transfer %s: app %s read %d pending domain charges but %d were forfeited; a domain sweep armed one in between, retry", p.RequestID, p.AppID, f.domains, n)
+		}
+	}
+	if f.timers > 0 {
+		n, err := qtx.ForfeitAppModuleTimersOnTransfer(ctx, db.ForfeitAppModuleTimersOnTransferParams{
+			RequestID: p.RequestID.String(),
+			AppID:     p.AppID.String(),
+		})
+		if err != nil {
+			return err
+		}
+		if n != f.timers {
+			return fmt.Errorf("transfer %s: app %s read %d pending module timers but %d were forfeited; an overage sweep armed one in between, retry", p.RequestID, p.AppID, f.timers, n)
+		}
+	}
+	return nil
 }
 
 // transferWindows returns the TARGET account's open period and the boundary at
