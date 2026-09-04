@@ -23,9 +23,20 @@ import (
 // lost a day to that exact failure.
 
 type transferFixture struct {
-	pool     *pgxpool.Pool
-	oldAcct  uuid.UUID
-	newAcct  uuid.UUID
+	pool    *pgxpool.Pool
+	oldAcct uuid.UUID
+	newAcct uuid.UUID
+	// The owner_user_id each seeded account was created with. A test that
+	// means "transfer to the SEEDED account" passes newOwner as OwnerUserID.
+	//
+	// 🔴 uuid.New() as OwnerUserID is NOT a shorthand for that. The service
+	// resolves the target by owner, and an owner nobody seeded gets a FRESH
+	// account from EnsureUserAccount — activated_at NULL, anchor day 1 — so
+	// newAcct is never the target and every assertion about the target's
+	// window or anchor is made against an account the test did not describe.
+	// That is how the max() test below passed on nothing at f5c74ad7.
+	oldOwner uuid.UUID
+	newOwner uuid.UUID
 	appID    uuid.UUID
 	moduleID uuid.UUID
 	now      time.Time
@@ -54,17 +65,20 @@ func seedTransferFixtureAnchored(t *testing.T, oldActivated, newActivated time.T
 		pool:     pool,
 		oldAcct:  uuid.New(),
 		newAcct:  uuid.New(),
+		oldOwner: uuid.New(),
+		newOwner: uuid.New(),
 		appID:    uuid.New(),
 		moduleID: uuid.New(),
 		now:      mustTime(t, "2026-08-15T12:00:00Z"),
 	}
 	for _, a := range []struct {
 		id        uuid.UUID
+		owner     uuid.UUID
 		activated time.Time
-	}{{f.oldAcct, oldActivated}, {f.newAcct, newActivated}} {
+	}{{f.oldAcct, f.oldOwner, oldActivated}, {f.newAcct, f.newOwner, newActivated}} {
 		_, err := pool.Exec(ctx, `
 			INSERT INTO ms_billing.accounts (id, owner_kind, owner_user_id, activated_at)
-			VALUES ($1, 'user', $2, $3)`, a.id.String(), uuid.NewString(), a.activated)
+			VALUES ($1, 'user', $2, $3)`, a.id.String(), a.owner.String(), a.activated)
 		require.NoError(t, err)
 	}
 	// proration_invoice_id NOT NULL ⇒ the creation charge is settled, so the
@@ -83,6 +97,14 @@ func transferSvc(t *testing.T, f *transferFixture) *cycle.Service {
 	t.Helper()
 	return cycle.NewService(cycle.NewStore(f.pool), nil).
 		WithNow(func() time.Time { return f.now })
+}
+
+// requireSameInstant compares instants, not time.Time values: a timestamptz
+// read back through pgx carries a different Location than one built with
+// time.Date, and require.Equal would call two equal instants unequal.
+func requireSameInstant(t *testing.T, want, got time.Time, what string) {
+	t.Helper()
+	require.True(t, got.Equal(want), "%s = %s, want %s", what, got.UTC(), want.UTC())
 }
 
 func (f *transferFixture) rosterAccount(t *testing.T) string {
@@ -120,12 +142,13 @@ func TestTransferAppKeepMovesNoUsageAndMoveMovesIt(t *testing.T) {
 
 			resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
 				AppID:       f.appID,
-				OwnerUserID: uuid.New(),
+				OwnerUserID: f.newOwner,
 				Mode:        tc.mode,
 				RequestID:   uuid.New(),
 			})
 			require.NoError(t, err)
 			require.Equal(t, tc.wantMoved, resp.MovedEventCount)
+			require.Equal(t, f.newAcct, resp.AccountID, "the transfer did not land on the seeded target account")
 
 			// The re-key is UNCONDITIONAL — it happens in both modes. Being
 			// late is the expensive direction: an app still on the old roster
@@ -186,7 +209,7 @@ func TestTransferAppRefusesWhileAOneTimeChargeIsPending(t *testing.T) {
 
 			_, err := transferSvc(t, f).TransferApp(context.Background(), cycle.TransferAppRequest{
 				AppID:       f.appID,
-				OwnerUserID: uuid.New(),
+				OwnerUserID: f.newOwner,
 				Mode:        cycle.TransferModeMove,
 				RequestID:   uuid.New(),
 			})
@@ -208,14 +231,23 @@ func TestTransferAppAllowsASettledApp(t *testing.T) {
 
 	resp, err := transferSvc(t, f).TransferApp(context.Background(), cycle.TransferAppRequest{
 		AppID:       f.appID,
-		OwnerUserID: uuid.New(),
+		OwnerUserID: f.newOwner,
 		Mode:        cycle.TransferModeKeep,
 		RequestID:   uuid.New(),
 	})
 
 	require.NoError(t, err)
+	require.Equal(t, f.newAcct, resp.AccountID)
 	require.Equal(t, resp.AccountID.String(), f.rosterAccount(t))
-	require.False(t, resp.RecurringFrom.IsZero(), "recurring_from must carry the new account's next boundary")
+	// The window is the TARGET's own anchored period, not the default calendar
+	// month: the seeded account activated on the 4th, so with now = 08-15 its
+	// open period is [08-04, 09-04) and the first boundary that bills this
+	// app's recurring to the new account is 09-04. An unanchored (fresh)
+	// target would have answered 09-01 here.
+	requireSameInstant(t, mustTime(t, "2026-08-04T00:00:00Z"), resp.OpenPeriod.Start, "open_period.start")
+	requireSameInstant(t, mustTime(t, "2026-09-04T00:00:00Z"), resp.OpenPeriod.End, "open_period.end")
+	requireSameInstant(t, mustTime(t, "2026-09-04T00:00:00Z"), resp.RecurringFrom,
+		"recurring_from must be the target account's next anchored boundary")
 }
 
 // api-platform fires this post-commit with retry, so a replay must return the
@@ -226,7 +258,7 @@ func TestTransferAppIsIdempotentOnRequestID(t *testing.T) {
 	svc := transferSvc(t, f)
 	req := cycle.TransferAppRequest{
 		AppID:       f.appID,
-		OwnerUserID: uuid.New(),
+		OwnerUserID: f.newOwner,
 		Mode:        cycle.TransferModeKeep,
 		RequestID:   uuid.New(),
 	}
@@ -245,7 +277,9 @@ func TestTransferAppIsIdempotentOnRequestID(t *testing.T) {
 		req.RequestID.String()).Scan(&events))
 	require.Equal(t, 1, events, "a replay wrote a second ledger row")
 
-	// Same key, different target ⇒ conflict, never a second transfer.
+	// Same key, different target ⇒ conflict, never a second transfer. A fresh
+	// owner is deliberate here: it resolves to a DIFFERENT account, which is
+	// the whole condition being tested.
 	req.OwnerUserID = uuid.New()
 	_, err = svc.TransferApp(ctx, req)
 	require.Error(t, err)
@@ -296,7 +330,7 @@ func TestTransferAppMovesUsageWithNoOccurredAt(t *testing.T) {
 
 	resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
 		AppID:       f.appID,
-		OwnerUserID: uuid.New(),
+		OwnerUserID: f.newOwner,
 		Mode:        cycle.TransferModeMove,
 		RequestID:   uuid.New(),
 	})
@@ -305,37 +339,71 @@ func TestTransferAppMovesUsageWithNoOccurredAt(t *testing.T) {
 		"an event with NULL occurred_at did not move; the filter is not the rollup's expression")
 }
 
-// 🔴 THE max() TERM, actually exercised. With the OLD anchor earlier than the
-// NEW one, an event inside the old account's open period but BEFORE the new
-// account's period start must STAY: moving it would backdate usage into a
-// window the target has already closed and billed (INV-011).
+// 🔴 THE max() TERM, actually exercised. With the TARGET's open period starting
+// LATER than the old account's, an event inside the old period but before the
+// target's period start must STAY: moving it would backdate usage into a window
+// the target has already closed and billed (INV-011). An event after both
+// starts is the control and must move.
 //
-// Mutation: replace max() with fromWindow.Start and this fails. Note it is
-// unreachable in every other test here, which give both accounts one anchor.
+// The arithmetic, all from the one pinned now = 2026-08-15:
+//
+//	old activated 05-04 → anchor day 4  → open period [08-04, 09-04)
+//	new activated 05-10 → anchor day 10 → open period [08-10, 09-10)
+//	move window = [max(08-04, 08-10), now) = [08-10, 08-15T12:00)
+//	08-06 ∈ old period, < 08-10 → stays with the old account
+//	08-12 ≥ 08-10             → moves
+//
+// The direction matters: had the new anchor been EARLIER (day 20 puts the
+// target's start at 07-20), max() would return the OLD start and both events
+// would move — which is what the first version of this test asserted against,
+// and why it could not pass.
+//
+// Mutation: replace max() with fromWindow.Start and the window opens at 08-04,
+// so BOTH events move and the count reads 2. Every other test in this file
+// gives both accounts one anchor, where the two branches return the same
+// instant and the mutant is invisible.
 func TestTransferAppMoveLeavesUsageOlderThanTheTargetPeriod(t *testing.T) {
 	ctx := context.Background()
 	f := seedTransferFixtureAnchored(t,
 		mustTime(t, "2026-05-04T00:00:00Z"),
-		mustTime(t, "2026-05-20T00:00:00Z"))
+		mustTime(t, "2026-05-10T00:00:00Z"))
 	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
 
-	// now = 2026-08-15: old period opened 08-04; new period runs 07-20..08-20.
-	// This event is inside the old period and before the new period's start.
-	_, err := f.pool.Exec(ctx, `
-		INSERT INTO ms_billing.usage_events
-		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
-		VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 2, $5)`,
-		uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(),
-		mustTime(t, "2026-08-06T10:00:00Z"))
-	require.NoError(t, err)
+	stays := uuid.New()
+	moves := uuid.New()
+	for _, ev := range []struct {
+		id uuid.UUID
+		at string
+	}{{stays, "2026-08-06T10:00:00Z"}, {moves, "2026-08-12T10:00:00Z"}} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.usage_events
+			    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+			VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 2, $5)`,
+			ev.id.String(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(), mustTime(t, ev.at))
+		require.NoError(t, err)
+	}
 
+	// The SEEDED target, whose anchor this whole test is about — see the
+	// fixture's newOwner comment for why a fresh owner would not do.
 	resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
 		AppID:       f.appID,
-		OwnerUserID: uuid.New(),
+		OwnerUserID: f.newOwner,
 		Mode:        cycle.TransferModeMove,
 		RequestID:   uuid.New(),
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(0), resp.MovedEventCount,
-		"usage older than the target's open period was backdated into a window it has already billed")
+	require.Equal(t, f.newAcct, resp.AccountID)
+	require.Equal(t, int64(1), resp.MovedEventCount,
+		"exactly the 08-12 event should move: 08-06 is older than the target's open period (starts 08-10) and must stay")
+
+	accountOf := func(id uuid.UUID) string {
+		var got string
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT account_id::text FROM ms_billing.usage_events WHERE event_id = $1`, id.String()).Scan(&got))
+		return got
+	}
+	require.Equal(t, f.oldAcct.String(), accountOf(stays),
+		"the 08-06 event was backdated into a period the target has already billed")
+	require.Equal(t, f.newAcct.String(), accountOf(moves),
+		"the 08-12 event is inside both open periods and should have moved")
 }
