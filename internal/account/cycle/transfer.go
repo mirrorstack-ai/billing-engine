@@ -150,6 +150,8 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 		return nil, billing.NotFound("app_unknown: no billing mirror for this app")
 	case TransferRequestConflict:
 		return nil, billing.Conflict("app_transfer_conflict: this request_id already transferred a different app or target")
+	case TransferPeriodClosed:
+		return nil, billing.Conflict("app_transfer_period_closed: a billing period for one of these accounts closed while the transfer ran; retry")
 	case TransferChargesPending:
 		return nil, billing.Conflict("app_transfer_charges_pending: a one-time charge for this app is still settling; retry after the sweeps run")
 	}

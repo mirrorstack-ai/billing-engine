@@ -3,6 +3,7 @@ package cycle
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 	billingaccount "github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	"github.com/mirrorstack-ai/billing-engine/internal/meteringlock"
 )
 
 // TransferAppParams is the store-level transfer request. The service has
@@ -45,6 +47,10 @@ const (
 	// TransferChargesPending — a mid-period one-time charge is still owed for
 	// this app; re-keying now would bill it to the new account.
 	TransferChargesPending
+	// TransferPeriodClosed — the window the move would write into has already
+	// been closed or invoiced for one of the accounts. Refusing is the only
+	// safe answer: writing there backdates across a billed period.
+	TransferPeriodClosed
 )
 
 // TransferApp re-points one app's billing account, in ONE transaction.
@@ -130,6 +136,35 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		var fromAccount uuid.UUID
 		if app.AccountID.Valid {
 			fromAccount = app.AccountID.Bytes
+		}
+
+		// 🔴 THE PERIOD BARRIER. Ingest (usage/store.go) and the org repoint
+		// sweep (RepointOrgNullAccountEvents) both take it; a writer that moves
+		// usage between accounts and does NOT is racing the cycle Lambda. A
+		// transfer straddling an anchor boundary while the rollup closes it can
+		// have the moved rows counted twice — by the old account's rollup
+		// before the move and the new account's after.
+		//
+		// 🔴 LOCKED IN A DETERMINISTIC ORDER, sorted by account id. Two
+		// concurrent transfers in opposite directions (A→B and B→A) would
+		// otherwise take the same two locks in opposite orders and deadlock.
+		// Postgres would abort one with 40P01, which is survivable but is a
+		// self-inflicted retry storm on the money path.
+		if err := s.barrierBothAccounts(ctx, tx, qtx, fromAccount, p.ToAccount, p.At); err != nil {
+			return err
+		}
+
+		// The window the move writes into must still be open for BOTH sides.
+		// Refuse rather than advance: advancing silently changes which period
+		// the usage lands in, and this RPC is called by a request/approve flow
+		// that can retry after the boundary settles.
+		closed, err := s.anyPeriodClosed(ctx, qtx, fromAccount, p.ToAccount, p.At)
+		if err != nil {
+			return err
+		}
+		if closed {
+			outcome = TransferPeriodClosed
+			return nil
 		}
 
 		orgCol := pgtype.UUID{}
@@ -289,4 +324,58 @@ func (s *pgxStore) EnsureUserAccount(ctx context.Context, userID uuid.UUID) (uui
 		return uuid.Nil, err
 	}
 	return uuid.Parse(id)
+}
+
+// barrierBothAccounts takes the activation lock and the shared period barrier
+// for both accounts, in a deterministic (sorted) order so two opposite-direction
+// transfers cannot deadlock. A zero from-account (an unbilled org roster row)
+// has no window to protect and is skipped.
+func (s *pgxStore) barrierBothAccounts(ctx context.Context, tx pgx.Tx, qtx *db.Queries, from, to uuid.UUID, at time.Time) error {
+	accounts := make([]uuid.UUID, 0, 2)
+	if from != uuid.Nil {
+		accounts = append(accounts, from)
+	}
+	accounts = append(accounts, to)
+	sort.Slice(accounts, func(i, j int) bool {
+		return accounts[i].String() < accounts[j].String()
+	})
+	for _, id := range accounts {
+		if _, err := qtx.LockUsageAccountActivation(ctx, id.String()); err != nil {
+			return err
+		}
+		window, _, err := s.transferWindows(ctx, qtx, id, at)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, meteringlock.SharedAdvisorySQL, meteringlock.PeriodKey(id, window.Start)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// anyPeriodClosed reports whether either account's open window has already been
+// closed or invoiced — read AFTER the barrier, so the answer cannot change
+// under us for the rest of the transaction.
+func (s *pgxStore) anyPeriodClosed(ctx context.Context, qtx *db.Queries, from, to uuid.UUID, at time.Time) (bool, error) {
+	for _, id := range []uuid.UUID{from, to} {
+		if id == uuid.Nil {
+			continue
+		}
+		window, _, err := s.transferWindows(ctx, qtx, id, at)
+		if err != nil {
+			return false, err
+		}
+		_, err = qtx.ClosedBillingPeriodEndAtStart(ctx, db.ClosedBillingPeriodEndAtStartParams{
+			AccountID:   id.String(),
+			PeriodStart: window.Start,
+		})
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return false, err
+		}
+	}
+	return false, nil
 }
