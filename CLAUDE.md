@@ -18,8 +18,10 @@ owns that boundary with its citations.
 > a defect of the same class as a code bug, and [`SECURITY.md`](SECURITY.md)
 > treats it that way.
 >
-> 🔴 **Automatic merge and promotion are paused.** Work on a branch, keep manual
-> billing and security review, and never enable collection because CI went green.
+> 🔴 **Collection stays off until the owner enables it — never because CI went
+> green.** Work on a branch; every PR gets a manual billing and security review by
+> the merging reviewer before it merges. Green checks are a precondition, not the
+> review (owner rule 2026-08-17, reaffirmed 2026-09-04).
 >
 > Defects are enumerated in one place,
 > [`SECURITY.md#known-current-gaps`](SECURITY.md#known-current-gaps), and nothing
@@ -143,8 +145,9 @@ git config --local user.email "nothingchang@mirrorstack.ai"
    `mirrorstack-docs/db/ms_billing/` update in the same PR cycle.
 3. **Commit prefix** `feat:` / `fix:` / `chore:` / `docs:` / `refactor:`.
    Co-author tail: `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
-4. **Open a PR against `main`.** Never push directly to `main`, and never
-   auto-merge. Add **`Closes #N`** when a tracking issue exists.
+4. **Open a PR against `main`.** Never push directly to `main`; merge only after
+   the manual billing and security review above — green CI alone is not a merge.
+   Add **`Closes #N`** when a tracking issue exists.
 
 After a merge to `main`, a successful terminal `Publish` run triggers
 `.github/workflows/notify-core-pointer.yml`, which opens a pointer PR in
