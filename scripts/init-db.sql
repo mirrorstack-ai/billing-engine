@@ -115,3 +115,4 @@
 -- (053 and 067-069 exist under migrations/billing/ but were never added here;
 -- that drift predates this change and is deliberately not fixed in it.)
 \i migrations/billing/070_g5g_task_gpu_price.up.sql
+\i migrations/billing/071_app_transfer_events.up.sql

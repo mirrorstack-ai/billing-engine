@@ -253,6 +253,14 @@ type fakeStore struct {
 	errDrawModuleOverageWallet error // DrawModuleOverageFromWallet
 	errCountOngoingOver        error // CountOngoingOverModuleTimers
 	errCoCreatedOver           error // CoCreatedOverModuleTimers
+
+	// TransferApp (transfer_store.go). transferFn lets a test drive the
+	// outcome; transferCalls records what the service actually passed down,
+	// which is how the mode/window assertions are made without a database.
+	transferFn           func(context.Context, cycle.TransferAppParams) (*cycle.TransferAppResponse, cycle.TransferOutcome, error)
+	transferCalls        []cycle.TransferAppParams
+	ensureUserAccountID  uuid.UUID
+	ensureUserAccountErr error
 }
 
 func (f *fakeStore) FinalizeOrgDeletionBilling(
@@ -3144,4 +3152,26 @@ func TestRollupPeriod_P1StoragePutListPer1kNoFloorTo0(t *testing.T) {
 	require.EqualValues(t, 12, byMetric["infra.storage.put.count"].ChargedMicros)  // × 1.2
 	require.EqualValues(t, 10, byMetric["infra.storage.list.count"].RawCostMicros) // 2 × 5
 	require.EqualValues(t, 12, byMetric["infra.storage.list.count"].ChargedMicros) // × 1.2
+}
+
+// EnsureUserAccount is the user twin of EnsureOrgAccount. TransferApp resolves
+// its destination through this and deliberately NOT through fundedOwnerAccount,
+// so a fake that refused an unfunded user would be pinning the wrong contract.
+func (f *fakeStore) EnsureUserAccount(_ context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	if f.ensureUserAccountErr != nil {
+		return uuid.Nil, f.ensureUserAccountErr
+	}
+	if f.ensureUserAccountID != uuid.Nil {
+		return f.ensureUserAccountID, nil
+	}
+	return userID, nil
+}
+
+// TransferApp records the call and defers to transferFn when a test sets one.
+func (f *fakeStore) TransferApp(ctx context.Context, p cycle.TransferAppParams) (*cycle.TransferAppResponse, cycle.TransferOutcome, error) {
+	f.transferCalls = append(f.transferCalls, p)
+	if f.transferFn != nil {
+		return f.transferFn(ctx, p)
+	}
+	return &cycle.TransferAppResponse{AccountID: p.ToAccount}, cycle.TransferApplied, nil
 }

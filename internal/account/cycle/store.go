@@ -317,6 +317,18 @@ type Store interface {
 	// get-or-create, namespace 'lbto'). No Stripe Customer is created here.
 	EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, error)
 
+	// EnsureUserAccount is the user twin of EnsureOrgAccount: resolve the
+	// user's billing account, creating the row if none exists. Used ONLY by
+	// TransferApp, which may not refuse an unfunded destination — see
+	// Service.transferTargetAccount for why that is deliberately not
+	// fundedOwnerAccount.
+	EnsureUserAccount(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
+
+	// TransferApp re-points one app's billing account in a single transaction.
+	// The outcome discriminates the refusals so the store never builds a wire
+	// error (same shape as FinalizeOrgDeletionBilling).
+	TransferApp(ctx context.Context, p TransferAppParams) (*TransferAppResponse, TransferOutcome, error)
+
 	// AccountIDByUser resolves a user's EXISTING billing account (Nil, false
 	// when none). The sponsor-designation lookup: a sponsor must already have
 	// an account with a usable default PM — designation never creates one.

@@ -1,0 +1,135 @@
+package cycle_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+)
+
+// transferNow is one pinned instant. Nothing in these tests derives a window
+// from the calendar: a fixture that depends on the date passes on luck, and
+// this repository has already lost a day to exactly that (migration-era credit
+// fixtures pinned to 2026-09-04).
+var transferNow = time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+
+func transferService(t *testing.T) (*cycle.Service, *fakeStore) {
+	t.Helper()
+	store := newFakeStore()
+	svc := cycle.NewService(store, nil).WithNow(func() time.Time { return transferNow })
+	return svc, store
+}
+
+func validTransfer() cycle.TransferAppRequest {
+	return cycle.TransferAppRequest{
+		AppID:       uuid.New(),
+		OwnerUserID: uuid.New(),
+		Mode:        cycle.TransferModeKeep,
+		RequestID:   uuid.New(),
+	}
+}
+
+// The request shape is the api-platform contract. Each refusal here is a call
+// that must NEVER reach the store, because every one of them would otherwise
+// re-key an app on incomplete instructions.
+func TestTransferAppRejectsMalformedRequests(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*cycle.TransferAppRequest)
+		want   string
+	}{
+		{"no app", func(r *cycle.TransferAppRequest) { r.AppID = uuid.Nil }, "app_id required"},
+		{"no request id", func(r *cycle.TransferAppRequest) { r.RequestID = uuid.Nil }, "request_id required"},
+		{"no owner", func(r *cycle.TransferAppRequest) { r.OwnerUserID = uuid.Nil }, "owner_user_id or owner_org_id required"},
+		{"both owners", func(r *cycle.TransferAppRequest) { r.OwnerOrgID = uuid.New() }, "mutually exclusive"},
+		// 🔴 mode is NOT defaulted. keep and move bill different accounts, so a
+		// caller that omitted it has not chosen — defaulting would silently
+		// pick one of two money outcomes on their behalf.
+		{"no mode", func(r *cycle.TransferAppRequest) { r.Mode = "" }, `mode must be "keep" or "move"`},
+		{"unknown mode", func(r *cycle.TransferAppRequest) { r.Mode = "migrate" }, `mode must be "keep" or "move"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, store := transferService(t)
+			req := validTransfer()
+			tc.mutate(&req)
+
+			_, err := svc.TransferApp(context.Background(), req)
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+			require.Empty(t, store.transferCalls, "a malformed request reached the store")
+		})
+	}
+}
+
+// The store's refusals are not errors; they are outcomes. This pins the mapping
+// onto the closed billing.Code set, because api-platform matches on the CODE
+// and reads the token only as a message prefix.
+func TestTransferAppMapsStoreOutcomesToWireCodes(t *testing.T) {
+	cases := []struct {
+		name    string
+		outcome cycle.TransferOutcome
+		code    billing.Code
+		token   string
+	}{
+		{"unknown app", cycle.TransferAppUnknown, billing.CodeNotFound, "app_unknown"},
+		{"replayed key, different target", cycle.TransferRequestConflict, billing.CodeConflict, "app_transfer_conflict"},
+		// The money refusal: a one-time charge is still owed by the old owner,
+		// and re-keying now would bill it to the new account.
+		{"one-time charge pending", cycle.TransferChargesPending, billing.CodeConflict, "app_transfer_charges_pending"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, store := transferService(t)
+			store.transferFn = func(context.Context, cycle.TransferAppParams) (*cycle.TransferAppResponse, cycle.TransferOutcome, error) {
+				return nil, tc.outcome, nil
+			}
+
+			_, err := svc.TransferApp(context.Background(), validTransfer())
+
+			require.Error(t, err)
+			var be *billing.Error
+			require.True(t, errors.As(err, &be), "not a billing.Error: %v", err)
+			require.Equal(t, tc.code, be.Code)
+			require.Contains(t, err.Error(), tc.token)
+		})
+	}
+}
+
+// The transfer instant is the service clock, not the caller's, and it is the
+// upper bound of the move window — so a wrong clock re-attributes the wrong
+// events.
+func TestTransferAppStampsTheServiceClock(t *testing.T) {
+	svc, store := transferService(t)
+
+	_, err := svc.TransferApp(context.Background(), validTransfer())
+	require.NoError(t, err)
+
+	require.Len(t, store.transferCalls, 1)
+	require.Equal(t, transferNow, store.transferCalls[0].At)
+}
+
+// 🔴 The destination is resolved WITHOUT a funding gate, on purpose. Refusing
+// to CREATE an app when the owner cannot pay is cheap and reversible; refusing
+// to TRANSFER one strands an existing, accruing app on an owner who has asked
+// to stop paying for it. The owner ruled on 2026-09-04 that an unfunded
+// destination is allowed and the serving-block handles it.
+func TestTransferAppAcceptsAnUnfundedDestination(t *testing.T) {
+	svc, store := transferService(t)
+	target := uuid.New()
+	store.ensureUserAccountID = target
+
+	resp, err := svc.TransferApp(context.Background(), validTransfer())
+
+	require.NoError(t, err)
+	require.Equal(t, target, resp.AccountID)
+	require.Len(t, store.transferCalls, 1)
+	require.Equal(t, target, store.transferCalls[0].ToAccount)
+}
