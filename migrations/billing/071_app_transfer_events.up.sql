@@ -98,7 +98,27 @@ CREATE INDEX IF NOT EXISTS app_transfer_events_app_at_idx
     ON ms_billing.app_transfer_events (app_id, at DESC);
 
 COMMENT ON TABLE ms_billing.app_transfer_events IS
-    'One row per accepted app billing-account transfer. request_id is the caller''s idempotency key; a replay returns the stored result and a different target for the same key is a conflict.';
+    'One row per accepted app billing-account transfer. request_id is the caller''s idempotency key; a replay returns the stored result and a different target for the same key is a conflict. Append-only.';
+
+-- Append-only, for UPDATE and DELETE alike — the 064/065/066 convention, and
+-- for the same reason. A row here is the answer a replay returns and the only
+-- record of where a transfer moved usage FROM; edit it and the replay lies,
+-- delete it and the next retry of that request_id transfers again. There is
+-- no column anyone may change after the fact, so it is a blanket refusal
+-- rather than a column comparison. A transfer that should not have happened
+-- is undone by another transfer, with its own request_id and its own row.
+CREATE OR REPLACE FUNCTION ms_billing.app_transfer_events_reject_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION
+        'app_transfer_events is append-only: undo a transfer with another transfer, not by editing its record';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS app_transfer_events_append_only ON ms_billing.app_transfer_events;
+CREATE TRIGGER app_transfer_events_append_only
+    BEFORE UPDATE OR DELETE ON ms_billing.app_transfer_events
+    FOR EACH ROW EXECUTE FUNCTION ms_billing.app_transfer_events_reject_mutation();
 
 -- ---------------------------------------------------------------------------
 -- 🔴 THE SPLIT GUARD. This is the half that is not a ledger.
@@ -203,6 +223,17 @@ BEGIN
     END IF;
     EXECUTE 'GRANT SELECT, INSERT ON ms_billing.app_transfer_events TO billing_svc';
 
+    -- 🔴 AND TAKE BACK WHAT 024 HANDED OUT. The explicit GRANT above reads as
+    -- the whole privilege set, and it is not: 024's ALTER DEFAULT PRIVILEGES
+    -- gives billing_svc SELECT, INSERT, UPDATE, DELETE on every table the
+    -- admin user creates in this schema, this one included, the moment
+    -- CREATE TABLE ran. The trigger above refuses an edit; this makes the
+    -- service unable to attempt one, so a bug that tries reads as 42501 at
+    -- the connection rather than as an exception from inside a transaction.
+    -- Written as a REVOKE, as 064 did for billing_ro, because the default is
+    -- right for every other table and one exception should read as one.
+    EXECUTE 'REVOKE UPDATE, DELETE ON ms_billing.app_transfer_events FROM billing_svc';
+
     -- 🔴 GRANT billing_ro EXPLICITLY rather than leaning on 068's
     -- ALTER DEFAULT PRIVILEGES. 068 is one of four migrations missing from
     -- scripts/init-db.sql, so on a database built by `make db-init` that
@@ -230,6 +261,14 @@ BEGIN
     END IF;
     IF NOT has_table_privilege('billing_svc', 'ms_billing.app_transfer_events', 'SELECT') THEN
         RAISE EXCEPTION 'migration 071: billing_svc cannot SELECT ms_billing.app_transfer_events after the grant ran';
+    END IF;
+    -- The REVOKE has to have landed too. A default privilege the REVOKE
+    -- missed would leave the service able to rewrite its own idempotency
+    -- record, and nothing downstream would notice until a replay answered
+    -- differently from the first call.
+    IF has_table_privilege('billing_svc', 'ms_billing.app_transfer_events', 'UPDATE')
+        OR has_table_privilege('billing_svc', 'ms_billing.app_transfer_events', 'DELETE') THEN
+        RAISE EXCEPTION 'migration 071: billing_svc still holds UPDATE or DELETE on ms_billing.app_transfer_events after the revoke ran; the ledger is append-only';
     END IF;
     IF NOT has_table_privilege('billing_ro', 'ms_billing.app_transfer_events', 'SELECT') THEN
         RAISE EXCEPTION 'migration 071: billing_ro cannot SELECT ms_billing.app_transfer_events after the explicit grant ran';

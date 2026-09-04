@@ -24,10 +24,13 @@ BEGIN
     END IF;
 END $$;
 
--- The triggers and the function go with the table: leaving the guard behind
--- would refuse writes on behalf of a ledger that no longer exists.
+-- The triggers and the functions go with the table: leaving the split guard
+-- behind would refuse writes on behalf of a ledger that no longer exists, and
+-- the append-only function would be an orphan.
 DROP TRIGGER IF EXISTS app_custom_domains_attribution_agrees ON ms_billing.app_custom_domains;
 DROP TRIGGER IF EXISTS app_module_overage_timers_attribution_agrees ON ms_billing.app_module_overage_timers;
 DROP TRIGGER IF EXISTS apps_attribution_agrees ON ms_billing.apps;
 DROP FUNCTION IF EXISTS ms_billing.app_account_attribution_agrees();
+DROP TRIGGER IF EXISTS app_transfer_events_append_only ON ms_billing.app_transfer_events;
+DROP FUNCTION IF EXISTS ms_billing.app_transfer_events_reject_mutation();
 DROP TABLE IF EXISTS ms_billing.app_transfer_events;

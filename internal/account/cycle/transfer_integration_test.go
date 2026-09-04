@@ -326,6 +326,46 @@ func TestTransferAppRefusesADeletedApp(t *testing.T) {
 	require.Equal(t, 0, events, "a refused transfer wrote a ledger row")
 }
 
+// 🔴 THE LEDGER IS APPEND-ONLY. A row is the answer a replay returns and the
+// only record of where a transfer moved usage from; edit it and the replay
+// lies, delete it and the next retry of that request_id transfers again. The
+// test connection is the table owner, so the REVOKE from billing_svc cannot be
+// observed here (071's read-back asserts it at migration time); the trigger
+// fires for the owner too, and that is what this pins.
+//
+// Mutation: drop app_transfer_events_append_only from 071 and both statements
+// succeed.
+func TestTransferLedgerIsAppendOnly(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeKeep,
+		RequestID:   uuid.New(),
+	}
+	_, err := transferSvc(t, f).TransferApp(ctx, req)
+	require.NoError(t, err)
+
+	_, err = f.pool.Exec(ctx,
+		`UPDATE ms_billing.app_transfer_events SET moved_event_count = 99 WHERE request_id = $1`,
+		req.RequestID.String())
+	require.Error(t, err, "a ledger row was edited")
+	require.Contains(t, err.Error(), "append-only")
+
+	_, err = f.pool.Exec(ctx,
+		`DELETE FROM ms_billing.app_transfer_events WHERE request_id = $1`,
+		req.RequestID.String())
+	require.Error(t, err, "a ledger row was deleted")
+	require.Contains(t, err.Error(), "append-only")
+
+	var events int
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.app_transfer_events WHERE request_id = $1 AND moved_event_count = 0`,
+		req.RequestID.String()).Scan(&events))
+	require.Equal(t, 1, events, "the row is not as the transfer wrote it")
+}
+
 // 🔴 THE SPLIT GUARD. Before migration 071 nothing tied apps.account_id to the
 // denormalised copies on timers and domains — no FK, no CHECK, no trigger, no
 // asserting query — and a split bill renders without complaint. TransferApp is

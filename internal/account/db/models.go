@@ -455,7 +455,7 @@ type MsBillingAppModuleOverageTimer struct {
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 }
 
-// One row per accepted app billing-account transfer. request_id is the caller's idempotency key; a replay returns the stored result and a different target for the same key is a conflict.
+// One row per accepted app billing-account transfer. request_id is the caller's idempotency key; a replay returns the stored result and a different target for the same key is a conflict. Append-only.
 type MsBillingAppTransferEvent struct {
 	ID              string      `json:"id"`
 	RequestID       string      `json:"request_id"`
