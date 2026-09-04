@@ -93,13 +93,21 @@ WHERE app_id = $1 AND removed_at IS NULL;
 -- 🔴 EVERY TERM IN THE WINDOW IS LOAD-BEARING.
 --   app_id          — this app only; an account's other apps keep their usage.
 --   account_id      — only rows still attributed to the OLD account.
---   occurred_at >=  — the caller passes max(old.openStart, new.openStart): an
---                     event older than the TARGET's open period would be
---                     backdated into a period the target has already closed and
---                     billed, which INV-011 forbids. Taking the later of the
---                     two starts is what keeps a transfer from rewriting a
---                     billed fact.
---   occurred_at <   — the transfer instant. Usage after it belongs to the new
+--   the WINDOW EXPRESSION is COALESCE(billable_at, recorded_at), which is what
+--                     the ROLLUP itself buckets on (rollup.sql:66-69) and what
+--                     every bill read and the 055 index use. It is NOT
+--                     occurred_at: occurred_at is NULL for every infra.* and
+--                     platform.* event and for every legacy/v1 observation, and
+--                     `NULL >= $1` is NULL, so an occurred_at filter silently
+--                     moves NO infra or platform usage and leaves the OLD
+--                     account invoiced for the app's egress, AI and GPU. Every
+--                     writer keeps billable_at >= occurred_at, so filtering on
+--                     the rollup's own expression does not loosen the INV-011
+--                     bound — it applies it to the rows the bill actually reads.
+--   >= window_start — max(old.openStart, new.openStart): an event older than
+--                     the TARGET's open period would be backdated into a period
+--                     it has already closed and billed, which INV-011 forbids.
+--   <  window_end   — the transfer instant. Usage after it belongs to the new
 --                     account by ordinary attribution, not by re-attribution.
 -- The rollup reads usage_events.account_id and never joins the app roster, so
 -- moving these rows is exactly and only what changes which account bills them.
@@ -108,5 +116,5 @@ UPDATE ms_billing.usage_events
 SET account_id = $3
 WHERE app_id = $1
   AND account_id = $2
-  AND occurred_at >= @window_start::timestamptz
-  AND occurred_at < @window_end::timestamptz;
+  AND COALESCE(billable_at, recorded_at) >= @window_start::timestamptz
+  AND COALESCE(billable_at, recorded_at) <  @window_end::timestamptz;

@@ -37,6 +37,16 @@ type transferFixture struct {
 // test can introduce exactly one unsettled thing and nothing else differs.
 func seedTransferFixture(t *testing.T) *transferFixture {
 	t.Helper()
+	// Equal anchors: the ordinary case. seedTransferFixtureAnchored varies
+	// them, which is the ONLY way the max() term in the move window becomes
+	// reachable — with equal anchors both branches return the same instant, so
+	// a mutant that drops the max() passes every other test in this file.
+	anchor := mustTime(t, "2026-05-04T00:00:00Z")
+	return seedTransferFixtureAnchored(t, anchor, anchor)
+}
+
+func seedTransferFixtureAnchored(t *testing.T, oldActivated, newActivated time.Time) *transferFixture {
+	t.Helper()
 	ctx := context.Background()
 	pool := testutil.NewTestDB(t)
 
@@ -48,12 +58,13 @@ func seedTransferFixture(t *testing.T) *transferFixture {
 		moduleID: uuid.New(),
 		now:      mustTime(t, "2026-08-15T12:00:00Z"),
 	}
-	activatedAt := mustTime(t, "2026-05-04T00:00:00Z")
-
-	for _, id := range []uuid.UUID{f.oldAcct, f.newAcct} {
+	for _, a := range []struct {
+		id        uuid.UUID
+		activated time.Time
+	}{{f.oldAcct, oldActivated}, {f.newAcct, newActivated}} {
 		_, err := pool.Exec(ctx, `
 			INSERT INTO ms_billing.accounts (id, owner_kind, owner_user_id, activated_at)
-			VALUES ($1, 'user', $2, $3)`, id.String(), uuid.NewString(), activatedAt)
+			VALUES ($1, 'user', $2, $3)`, a.id.String(), uuid.NewString(), a.activated)
 		require.NoError(t, err)
 	}
 	// proration_invoice_id NOT NULL ⇒ the creation charge is settled, so the
@@ -154,11 +165,15 @@ func TestTransferAppRefusesWhileAOneTimeChargeIsPending(t *testing.T) {
 			require.NoError(t, err)
 		}},
 		{"module grace unresolved", func(t *testing.T, f *transferFixture) {
+			// Columns per migration 033: there is no module_id (one row per
+			// install EVENT, not per module identity) and grace_expires_at is
+			// NOT NULL. Same shape as org_deletion_integration_test.
 			_, err := f.pool.Exec(context.Background(), `
 				INSERT INTO ms_billing.app_module_overage_timers
-				    (id, account_id, app_id, module_id, installed_at, grace_resolved)
-				VALUES ($1, $2, $3, $4, $5, false)`,
-				uuid.NewString(), f.oldAcct.String(), f.appID.String(), uuid.NewString(),
+				    (id, account_id, app_id, installed_at, grace_expires_at, grace_resolved)
+				VALUES ($1, $2, $3, $4::timestamptz,
+				        $4::timestamptz + interval '3 days', false)`,
+				uuid.NewString(), f.oldAcct.String(), f.appID.String(),
 				mustTime(t, "2026-08-01T00:00:00Z"))
 			require.NoError(t, err)
 		}},
@@ -255,4 +270,72 @@ func TestSplitAppAttributionIsRefused(t *testing.T) {
 
 	require.Error(t, err, "a live domain on a different account than its app's roster was accepted")
 	require.Contains(t, err.Error(), "split app billing attribution")
+}
+
+// 🔴 THE ROLLUP BUCKETS ON COALESCE(billable_at, recorded_at), NOT occurred_at.
+// occurred_at is NULL for every infra.* and platform.* event and for every
+// legacy/v1 observation, and `NULL >= $1` is NULL — so a move filtered on
+// occurred_at silently moves NONE of them, and the OLD account stays invoiced
+// for the app's egress, AI and GPU across the whole open period.
+//
+// Mutation: put occurred_at back in MoveAppOpenUsage and this fails at 0.
+func TestTransferAppMovesUsageWithNoOccurredAt(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+
+	// occurred_at omitted (NULL), recorded_at inside the window — the shape
+	// every infra.*/platform.* event has.
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.usage_events
+		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 5, $5)`,
+		uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(),
+		mustTime(t, "2026-08-05T10:00:00Z"))
+	require.NoError(t, err)
+
+	resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: uuid.New(),
+		Mode:        cycle.TransferModeMove,
+		RequestID:   uuid.New(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), resp.MovedEventCount,
+		"an event with NULL occurred_at did not move; the filter is not the rollup's expression")
+}
+
+// 🔴 THE max() TERM, actually exercised. With the OLD anchor earlier than the
+// NEW one, an event inside the old account's open period but BEFORE the new
+// account's period start must STAY: moving it would backdate usage into a
+// window the target has already closed and billed (INV-011).
+//
+// Mutation: replace max() with fromWindow.Start and this fails. Note it is
+// unreachable in every other test here, which give both accounts one anchor.
+func TestTransferAppMoveLeavesUsageOlderThanTheTargetPeriod(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixtureAnchored(t,
+		mustTime(t, "2026-05-04T00:00:00Z"),
+		mustTime(t, "2026-05-20T00:00:00Z"))
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+
+	// now = 2026-08-15: old period opened 08-04; new period runs 07-20..08-20.
+	// This event is inside the old period and before the new period's start.
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.usage_events
+		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 2, $5)`,
+		uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(),
+		mustTime(t, "2026-08-06T10:00:00Z"))
+	require.NoError(t, err)
+
+	resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: uuid.New(),
+		Mode:        cycle.TransferModeMove,
+		RequestID:   uuid.New(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), resp.MovedEventCount,
+		"usage older than the target's open period was backdated into a window it has already billed")
 }
