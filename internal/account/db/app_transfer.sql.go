@@ -54,7 +54,8 @@ func (q *Queries) AppHasUnresolvedOneTimeCharge(ctx context.Context, appID strin
 }
 
 const appTransferEventByRequest = `-- name: AppTransferEventByRequest :one
-SELECT request_id, app_id, from_account, to_account, mode, moved_event_count, at
+SELECT request_id, app_id, from_account, to_account, mode, moved_event_count, at,
+       open_period_start, open_period_end, recurring_from
 FROM ms_billing.app_transfer_events
 WHERE request_id = $1
 `
@@ -67,12 +68,17 @@ type AppTransferEventByRequestRow struct {
 	Mode            string      `json:"mode"`
 	MovedEventCount int64       `json:"moved_event_count"`
 	At              time.Time   `json:"at"`
+	OpenPeriodStart time.Time   `json:"open_period_start"`
+	OpenPeriodEnd   time.Time   `json:"open_period_end"`
+	RecurringFrom   time.Time   `json:"recurring_from"`
 }
 
 // AppTransferEventByRequest reads the idempotency record for a request_id.
 // A hit means this transfer already happened: the caller gets the STORED
-// result, and a different target for the same key is a conflict rather than a
-// second transfer.
+// result — every field of it, the window and recurring_from included, so a
+// retry that lands after a boundary answers with the same dates the first
+// call did — and a different target for the same key is a conflict rather
+// than a second transfer.
 func (q *Queries) AppTransferEventByRequest(ctx context.Context, requestID string) (AppTransferEventByRequestRow, error) {
 	row := q.db.QueryRow(ctx, appTransferEventByRequest, requestID)
 	var i AppTransferEventByRequestRow
@@ -84,14 +90,18 @@ func (q *Queries) AppTransferEventByRequest(ctx context.Context, requestID strin
 		&i.Mode,
 		&i.MovedEventCount,
 		&i.At,
+		&i.OpenPeriodStart,
+		&i.OpenPeriodEnd,
+		&i.RecurringFrom,
 	)
 	return i, err
 }
 
 const insertAppTransferEvent = `-- name: InsertAppTransferEvent :exec
 INSERT INTO ms_billing.app_transfer_events (
-    request_id, app_id, from_account, to_account, mode, moved_event_count, at
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    request_id, app_id, from_account, to_account, mode, moved_event_count, at,
+    open_period_start, open_period_end, recurring_from
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 `
 
 type InsertAppTransferEventParams struct {
@@ -102,10 +112,14 @@ type InsertAppTransferEventParams struct {
 	Mode            string      `json:"mode"`
 	MovedEventCount int64       `json:"moved_event_count"`
 	At              time.Time   `json:"at"`
+	OpenPeriodStart time.Time   `json:"open_period_start"`
+	OpenPeriodEnd   time.Time   `json:"open_period_end"`
+	RecurringFrom   time.Time   `json:"recurring_from"`
 }
 
-// InsertAppTransferEvent records what the transfer did. request_id is UNIQUE,
-// so a concurrent duplicate loses on the index rather than transferring twice.
+// InsertAppTransferEvent records what the transfer did AND what it answered.
+// request_id is UNIQUE, so a concurrent duplicate loses on the index rather
+// than transferring twice.
 func (q *Queries) InsertAppTransferEvent(ctx context.Context, arg InsertAppTransferEventParams) error {
 	_, err := q.db.Exec(ctx, insertAppTransferEvent,
 		arg.RequestID,
@@ -115,6 +129,9 @@ func (q *Queries) InsertAppTransferEvent(ctx context.Context, arg InsertAppTrans
 		arg.Mode,
 		arg.MovedEventCount,
 		arg.At,
+		arg.OpenPeriodStart,
+		arg.OpenPeriodEnd,
+		arg.RecurringFrom,
 	)
 	return err
 }

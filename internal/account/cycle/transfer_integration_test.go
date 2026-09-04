@@ -407,3 +407,74 @@ func TestTransferAppMoveLeavesUsageOlderThanTheTargetPeriod(t *testing.T) {
 	require.Equal(t, f.newAcct.String(), accountOf(moves),
 		"the 08-12 event is inside both open periods and should have moved")
 }
+
+// 🔴 A REPLAY IS VERBATIM, ACROSS A BOUNDARY. api-platform fires TransferApp
+// post-commit with retry, so the retry can arrive after the target's next
+// anchor boundary. The window and recurring_from are functions of the transfer
+// instant and the target's anchor; recomputed from the RETRY's clock they would
+// name the next period and a later recurring_from — a date the customer was
+// never shown. The ledger stores what the first call answered and the replay
+// returns the row.
+//
+// Distinct anchors, so the first answer also proves it is the TARGET's window
+// (old anchor day 4 would say 09-04; the target's anchor day 10 says 09-10).
+//
+// Mutation: compute the replay's window from p.At again and the second call
+// answers [09-10, 10-10) / 10-10 — the assertion below reads the difference.
+func TestTransferAppReplayReturnsTheStoredWindowAcrossABoundary(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixtureAnchored(t,
+		mustTime(t, "2026-05-04T00:00:00Z"),
+		mustTime(t, "2026-05-10T00:00:00Z"))
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+	// Inside both open periods at the first call, so mode=move moves it and
+	// the replay has a non-zero count to repeat.
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.usage_events
+		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 1, $5)`,
+		uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(),
+		mustTime(t, "2026-08-12T10:00:00Z"))
+	require.NoError(t, err)
+
+	svc := transferSvc(t, f)
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeMove,
+		RequestID:   uuid.New(),
+	}
+
+	first, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), first.MovedEventCount)
+	requireSameInstant(t, mustTime(t, "2026-08-10T00:00:00Z"), first.OpenPeriod.Start, "first open_period.start")
+	requireSameInstant(t, mustTime(t, "2026-09-10T00:00:00Z"), first.OpenPeriod.End, "first open_period.end")
+	requireSameInstant(t, mustTime(t, "2026-09-10T00:00:00Z"), first.RecurringFrom, "first recurring_from")
+
+	// Advance the service clock past the target's boundary. The control that
+	// makes the equality below mean something: a recomputation at this instant
+	// CANNOT return the first window, because the first window is closed.
+	f.now = mustTime(t, "2026-09-15T12:00:00Z")
+	require.True(t, first.OpenPeriod.End.Before(f.now),
+		"fixture error: the replay clock must be past the first window's end")
+
+	second, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+
+	require.Equal(t, first.AccountID, second.AccountID)
+	require.Equal(t, first.MovedEventCount, second.MovedEventCount, "the replay recounted instead of returning the stored count")
+	requireSameInstant(t, first.OpenPeriod.Start, second.OpenPeriod.Start, "replayed open_period.start")
+	requireSameInstant(t, first.OpenPeriod.End, second.OpenPeriod.End, "replayed open_period.end")
+	requireSameInstant(t, first.RecurringFrom, second.RecurringFrom, "replayed recurring_from")
+
+	// And the ledger row is what both calls answered from.
+	var storedStart, storedEnd, storedFrom time.Time
+	require.NoError(t, f.pool.QueryRow(ctx, `
+		SELECT open_period_start, open_period_end, recurring_from
+		FROM ms_billing.app_transfer_events WHERE request_id = $1`, req.RequestID.String()).
+		Scan(&storedStart, &storedEnd, &storedFrom))
+	requireSameInstant(t, first.OpenPeriod.Start, storedStart, "ledger open_period_start")
+	requireSameInstant(t, first.OpenPeriod.End, storedEnd, "ledger open_period_end")
+	requireSameInstant(t, first.RecurringFrom, storedFrom, "ledger recurring_from")
+}

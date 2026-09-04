@@ -133,3 +133,33 @@ func TestTransferAppAcceptsAnUnfundedDestination(t *testing.T) {
 	require.Len(t, store.transferCalls, 1)
 	require.Equal(t, target, store.transferCalls[0].ToAccount)
 }
+
+// 🔴 The service adds nothing to the store's answer. On a replay the store
+// returns the STORED window and recurring_from, and the service must pass them
+// through untouched — a service that "helpfully" re-derived either from its
+// own clock would turn a verbatim replay back into a recomputation, which is
+// the defect the ledger columns exist to prevent. The fixture's window is
+// deliberately NOT the one transferNow would produce, so a recomputation is
+// visible.
+func TestTransferAppReturnsTheStoreResultVerbatim(t *testing.T) {
+	svc, store := transferService(t)
+	stored := &cycle.TransferAppResponse{
+		AccountID:       uuid.New(),
+		MovedEventCount: 7,
+		OpenPeriod: cycle.TransferPeriod{
+			Start: time.Date(2026, time.July, 10, 0, 0, 0, 0, time.UTC),
+			End:   time.Date(2026, time.August, 10, 0, 0, 0, 0, time.UTC),
+		},
+		RecurringFrom: time.Date(2026, time.August, 10, 0, 0, 0, 0, time.UTC),
+	}
+	require.True(t, stored.OpenPeriod.End.Before(transferNow),
+		"fixture error: the stored window must already be closed at the service clock, or a recomputation would be indistinguishable")
+	store.transferFn = func(context.Context, cycle.TransferAppParams) (*cycle.TransferAppResponse, cycle.TransferOutcome, error) {
+		return stored, cycle.TransferAlreadyApplied, nil
+	}
+
+	got, err := svc.TransferApp(context.Background(), validTransfer())
+
+	require.NoError(t, err)
+	require.Equal(t, stored, got)
+}

@@ -61,11 +61,34 @@ CREATE TABLE IF NOT EXISTS ms_billing.app_transfer_events (
     -- re-attribution window.
     at                TIMESTAMPTZ NOT NULL,
 
+    -- 🔴 THE REST OF THE RESPONSE, STORED, so a replay is verbatim. The target
+    -- account's open window at the transfer instant and the boundary at which
+    -- its recurring fees for this app begin (see the header). These are
+    -- functions of `at` and the target's anchor, and both move: a retry that
+    -- arrives after the boundary would recompute a LATER period and a later
+    -- recurring_from, and api-platform — which fires this post-commit with
+    -- retry — would show the customer a date the first call never promised.
+    -- Storing them costs three columns; recomputing them makes "replay returns
+    -- the stored result" true of one field and false of three.
+    open_period_start TIMESTAMPTZ NOT NULL,
+    open_period_end   TIMESTAMPTZ NOT NULL,
+    recurring_from    TIMESTAMPTZ NOT NULL,
+
     -- Wall-clock arrival, matching the append-only convention (064, 065).
     recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT app_transfer_events_keep_moves_nothing
-        CHECK (mode <> 'keep' OR moved_event_count = 0)
+        CHECK (mode <> 'keep' OR moved_event_count = 0),
+
+    -- The open period is the one CONTAINING the transfer instant — that is
+    -- how the writer derives it — and the first recurring boundary cannot
+    -- precede that period's end, because the period in progress was prepaid
+    -- by the old account and never moves. A row that says otherwise was not
+    -- written by TransferApp.
+    CONSTRAINT app_transfer_events_at_inside_open_period
+        CHECK (open_period_start <= at AND at < open_period_end),
+    CONSTRAINT app_transfer_events_recurring_after_open_period
+        CHECK (recurring_from >= open_period_end)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS app_transfer_events_request_id_uidx

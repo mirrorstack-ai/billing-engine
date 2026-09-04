@@ -79,6 +79,14 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		// Replay / conflict, before anything is read or written. A stored row
 		// is the record of what the first call did; a repeat must never
 		// recount or re-move.
+		//
+		// 🔴 EVERY FIELD COMES FROM THE ROW, p.At INCLUDED IN WHAT IS IGNORED.
+		// The window and recurring_from are functions of the transfer instant
+		// and the target's anchor. api-platform retries this call post-commit,
+		// and a retry that lands after the target's boundary would, if
+		// recomputed from the replay's clock, answer with the NEXT period and
+		// a later recurring_from — a second date the customer was never shown.
+		// The first call stored what it answered; the replay repeats it.
 		prior, err := qtx.AppTransferEventByRequest(ctx, p.RequestID.String())
 		switch {
 		case err == nil:
@@ -94,16 +102,12 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 				outcome = TransferRequestConflict
 				return nil
 			}
-			window, from, wErr := s.transferWindows(ctx, qtx, p.ToAccount, p.At)
-			if wErr != nil {
-				return wErr
-			}
 			outcome = TransferAlreadyApplied
 			resp = &TransferAppResponse{
 				AccountID:       p.ToAccount,
 				MovedEventCount: prior.MovedEventCount,
-				OpenPeriod:      window,
-				RecurringFrom:   from,
+				OpenPeriod:      TransferPeriod{Start: prior.OpenPeriodStart, End: prior.OpenPeriodEnd},
+				RecurringFrom:   prior.RecurringFrom,
 			}
 			return nil
 		case !errors.Is(err, pgx.ErrNoRows):
@@ -210,6 +214,15 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			moved = n
 		}
 
+		// The answer is derived once, here, and written to the ledger with the
+		// transfer itself — the replay path above returns these columns, not a
+		// recomputation. Read under the barrier, so the target's anchor cannot
+		// change between this and the insert.
+		window, from, wErr := s.transferWindows(ctx, qtx, p.ToAccount, p.At)
+		if wErr != nil {
+			return wErr
+		}
+
 		fromCol := pgtype.UUID{}
 		if fromAccount != uuid.Nil {
 			fromCol = pgtype.UUID{Bytes: fromAccount, Valid: true}
@@ -222,14 +235,13 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			Mode:            p.Mode,
 			MovedEventCount: moved,
 			At:              p.At,
+			OpenPeriodStart: window.Start,
+			OpenPeriodEnd:   window.End,
+			RecurringFrom:   from,
 		}); err != nil {
 			return err
 		}
 
-		window, from, wErr := s.transferWindows(ctx, qtx, p.ToAccount, p.At)
-		if wErr != nil {
-			return wErr
-		}
 		outcome = TransferApplied
 		resp = &TransferAppResponse{
 			AccountID:       p.ToAccount,

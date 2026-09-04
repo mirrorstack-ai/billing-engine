@@ -57,7 +57,8 @@ type TransferAppResponse struct {
 	MovedEventCount int64 `json:"moved_event_count"`
 
 	// OpenPeriod is the TARGET account's open window: the period the app now
-	// bills in.
+	// bills in. On a replay this, like RecurringFrom, is the STORED window
+	// from the first call, not one recomputed from the replay's clock.
 	OpenPeriod TransferPeriod `json:"open_period"`
 
 	// RecurringFrom is the new account's next anchored boundary — the first
@@ -106,8 +107,9 @@ const (
 // (INV-011 — a transfer may not rewrite a fact that has already been billed).
 //
 // Idempotency: the (request_id) row in app_transfer_events is the record. A
-// replay returns it verbatim; the same request_id aimed at a different target
-// is a conflict.
+// replay returns it verbatim — the count, the window and recurring_from are
+// all read from the row, none recomputed — and the same request_id aimed at
+// a different target is a conflict.
 func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*TransferAppResponse, error) {
 	if req.AppID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")

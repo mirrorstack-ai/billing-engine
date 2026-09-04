@@ -1,18 +1,23 @@
 -- AppTransferEventByRequest reads the idempotency record for a request_id.
 -- A hit means this transfer already happened: the caller gets the STORED
--- result, and a different target for the same key is a conflict rather than a
--- second transfer.
+-- result — every field of it, the window and recurring_from included, so a
+-- retry that lands after a boundary answers with the same dates the first
+-- call did — and a different target for the same key is a conflict rather
+-- than a second transfer.
 -- name: AppTransferEventByRequest :one
-SELECT request_id, app_id, from_account, to_account, mode, moved_event_count, at
+SELECT request_id, app_id, from_account, to_account, mode, moved_event_count, at,
+       open_period_start, open_period_end, recurring_from
 FROM ms_billing.app_transfer_events
 WHERE request_id = $1;
 
--- InsertAppTransferEvent records what the transfer did. request_id is UNIQUE,
--- so a concurrent duplicate loses on the index rather than transferring twice.
+-- InsertAppTransferEvent records what the transfer did AND what it answered.
+-- request_id is UNIQUE, so a concurrent duplicate loses on the index rather
+-- than transferring twice.
 -- name: InsertAppTransferEvent :exec
 INSERT INTO ms_billing.app_transfer_events (
-    request_id, app_id, from_account, to_account, mode, moved_event_count, at
-) VALUES ($1, $2, $3, $4, $5, $6, $7);
+    request_id, app_id, from_account, to_account, mode, moved_event_count, at,
+    open_period_start, open_period_end, recurring_from
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
 
 -- LockAppForTransfer takes the app's roster row FOR UPDATE and returns its
 -- current attribution. Everything the transfer decides is read here, under the
