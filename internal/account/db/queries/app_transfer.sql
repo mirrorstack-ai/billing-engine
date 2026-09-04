@@ -39,6 +39,27 @@ WHERE app_id = $1
   AND deleted_at IS NULL
 FOR UPDATE;
 
+-- AppHasUnbilledUsageBacklog reports whether this app still has usage
+-- recorded with NO account — the lazy, never-billed backlog an org app
+-- accrues before its org designates funding (migration 041).
+--
+-- 🔴 THE TRANSFER REFUSES WHILE ONE EXISTS. The org repoint sweep
+-- (org.sql RepointOrgNullAccountEvents) finds that backlog through
+-- apps.owner_org_id, which the transfer REWRITES: re-key to org B and the
+-- next sweep for B bills B for everything org A's members did before A ever
+-- paid — unbounded, and for usage B never saw; re-key to a user and no sweep
+-- can ever reach it, so it is stranded unbilled forever. Neither is a money
+-- outcome this RPC may choose. The backlog is A's to fund (or to leave), and
+-- the transfer waits for that: CONFLICT app_transfer_unbilled_backlog.
+-- Keyed on app_id (the app's own events), not owner_org_id — an org's OTHER
+-- apps' backlog is not this transfer's concern.
+-- name: AppHasUnbilledUsageBacklog :one
+SELECT EXISTS (
+    SELECT 1 FROM ms_billing.usage_events e
+    WHERE e.app_id = @app_id::uuid
+      AND e.account_id IS NULL
+)::bool AS has_backlog;
+
 -- AppUnresolvedOneTimeCharges classifies every MID-PERIOD ONE-TIME charge
 -- still owed for this app by whoever owns it now, so the transfer can decide
 -- between refusing and forfeiting (see 071 and transfer_store.go).

@@ -121,6 +121,11 @@ const (
 // unconditional one would have made a never-funded personal account unable to
 // hand its app to an org, ever (transfer_store.go, transferChargeDisposition).
 //
+// WHAT BLOCKS IT: usage the app recorded with no account at all (the lazy org
+// backlog). The repoint sweep finds that backlog through the roster column
+// this transfer rewrites, so moving the app would bill it to the wrong org or
+// strand it; app_transfer_unbilled_backlog until the old org funds it.
+//
 // Idempotency: the (request_id) row in app_transfer_events is the record. A
 // replay returns it verbatim — the count, the window and recurring_from are
 // all read from the row, none recomputed — and the same request_id aimed at
@@ -171,6 +176,8 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 		return nil, billing.Conflict("app_transfer_period_closed: a billing period for one of these accounts closed while the transfer ran; retry")
 	case TransferChargesPending:
 		return nil, billing.Conflict("app_transfer_charges_pending: a one-time charge for this app is still settling on its current account; retry after the sweeps run")
+	case TransferUnbilledBacklog:
+		return nil, billing.Conflict("app_transfer_unbilled_backlog: this app has usage recorded before its organization designated funding; that backlog must be attached to the current organization's account before the app can move")
 	}
 	return resp, nil
 }

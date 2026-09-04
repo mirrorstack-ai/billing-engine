@@ -656,6 +656,56 @@ func TestTransferAppFromNoPayerForfeitsTheCreationWindow(t *testing.T) {
 	require.Equal(t, 0, unguarded.Skipped)
 }
 
+// 🔴 THE BACKLOG REFUSAL. Usage recorded with NO account is the lazy org
+// backlog; the repoint sweep (RepointOrgNullAccountEvents) reaches it only
+// through apps.owner_org_id, which the transfer rewrites. Moving the app
+// would either bill org A's never-billed backlog to org B — all of it — or,
+// for a user target, strand it where no sweep can ever find it. The transfer
+// refuses until the backlog is attached; the control deletes the one event
+// and the same transfer succeeds.
+//
+// Mutation: drop AppHasUnbilledUsageBacklog from the store and the first call
+// succeeds.
+func TestTransferAppRefusesWhileAnUnbilledBacklogExists(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+	backlog := uuid.New()
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.usage_events
+		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, NULL, $2, $3, 'orders.placed', 'count', 1, $4)`,
+		backlog.String(), f.appID.String(), f.moduleID.String(), mustTime(t, "2026-08-05T10:00:00Z"))
+	require.NoError(t, err)
+	before := f.rosterAccount(t)
+	svc := transferSvc(t, f)
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeMove,
+		RequestID:   uuid.New(),
+	}
+
+	_, err = svc.TransferApp(ctx, req)
+
+	require.Error(t, err)
+	var be *billing.Error
+	require.True(t, errors.As(err, &be), "not a billing.Error: %v", err)
+	require.Equal(t, billing.CodeConflict, be.Code)
+	require.Contains(t, err.Error(), "app_transfer_unbilled_backlog")
+	require.Equal(t, before, f.rosterAccount(t), "roster changed despite the refusal")
+	_, found := f.ledgerRow(t, req.RequestID)
+	require.False(t, found, "a refused transfer wrote a ledger row")
+
+	// The control: the backlog was the only thing in the way.
+	_, err = f.pool.Exec(ctx, `DELETE FROM ms_billing.usage_events WHERE event_id = $1`, backlog.String())
+	require.NoError(t, err)
+	req.RequestID = uuid.New()
+	resp, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, f.newAcct, resp.AccountID)
+}
+
 // api-platform fires this post-commit with retry, so a replay must return the
 // FIRST result rather than transfer again.
 func TestTransferAppIsIdempotentOnRequestID(t *testing.T) {

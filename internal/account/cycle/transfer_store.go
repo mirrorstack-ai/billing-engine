@@ -57,6 +57,12 @@ const (
 	// been closed or invoiced for one of the accounts. Refusing is the only
 	// safe answer: writing there backdates across a billed period.
 	TransferPeriodClosed
+	// TransferUnbilledBacklog — the app still has usage recorded with NO
+	// account (the lazy org backlog, migration 041). The repoint sweep finds
+	// that backlog through apps.owner_org_id, which this transfer rewrites:
+	// re-key and the backlog is either billed to an org that never saw it or
+	// stranded where no sweep can reach it. Refused until the old org funds.
+	TransferUnbilledBacklog
 )
 
 // TransferForfeitReason is WHY a transfer forfeited the old account's
@@ -186,6 +192,20 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		var fromAccount uuid.UUID
 		if app.AccountID.Valid {
 			fromAccount = app.AccountID.Bytes
+		}
+
+		// 🔴 THE BACKLOG REFUSAL. Usage this app recorded with NO account is
+		// reachable only through apps.owner_org_id (RepointOrgNullAccountEvents),
+		// which the re-key below rewrites. Moving the app would either hand
+		// the backlog to an org that never incurred it or strand it where no
+		// sweep can bill it. Neither is this RPC's money outcome to choose.
+		backlog, err := qtx.AppHasUnbilledUsageBacklog(ctx, p.AppID.String())
+		if err != nil {
+			return err
+		}
+		if backlog {
+			outcome = TransferUnbilledBacklog
+			return nil
 		}
 
 		// 🔴 THE MONEY DECISION. Creation proration, custom-domain activation

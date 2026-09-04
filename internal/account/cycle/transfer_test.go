@@ -87,6 +87,9 @@ func TestTransferAppMapsStoreOutcomesToWireCodes(t *testing.T) {
 		// forfeits instead and this outcome never surfaces.)
 		{"one-time charge pending", cycle.TransferChargesPending, billing.CodeConflict, "app_transfer_charges_pending"},
 		{"period closed under the move", cycle.TransferPeriodClosed, billing.CodeConflict, "app_transfer_period_closed"},
+		// The backlog refusal: NULL-account usage for this app is reachable
+		// only through the roster column the transfer rewrites.
+		{"unbilled backlog", cycle.TransferUnbilledBacklog, billing.CodeConflict, "app_transfer_unbilled_backlog"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
