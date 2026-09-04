@@ -626,13 +626,17 @@ func TestTransferAppFromNoPayerForfeitsTheCreationWindow(t *testing.T) {
 	// Timers synthesized fresh, on the new account, anchored at the transfer
 	// instant — exactly what attachOrgBilling does at designation.
 	var timers int
+	require.NoError(t, f.pool.QueryRow(ctx, `
+		SELECT count(*) FROM ms_billing.app_module_overage_timers
+		WHERE app_id = $1 AND account_id = $2 AND removed_at IS NULL`,
+		f.appID.String(), f.newAcct.String()).Scan(&timers))
+	require.Equal(t, 2, timers, "the app's modules were not timed on the new account")
 	var installedAt, graceExpiresAt time.Time
 	require.NoError(t, f.pool.QueryRow(ctx, `
-		SELECT count(*), min(installed_at), min(grace_expires_at)
+		SELECT min(installed_at), min(grace_expires_at)
 		FROM ms_billing.app_module_overage_timers
 		WHERE app_id = $1 AND account_id = $2 AND removed_at IS NULL`,
-		f.appID.String(), f.newAcct.String()).Scan(&timers, &installedAt, &graceExpiresAt))
-	require.Equal(t, 2, timers, "the app's modules were not timed on the new account")
+		f.appID.String(), f.newAcct.String()).Scan(&installedAt, &graceExpiresAt))
 	requireSameInstant(t, f.now, installedAt, "timer installed_at")
 	requireSameInstant(t, f.now.AddDate(0, 0, 3), graceExpiresAt, "timer grace_expires_at")
 
