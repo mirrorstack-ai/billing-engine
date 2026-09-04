@@ -149,7 +149,7 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 	// and api-platform matches on the CODE. Documented on the RPC contract.
 	switch outcome {
 	case TransferAppUnknown:
-		return nil, billing.NotFound("app_unknown: no billing mirror for this app")
+		return nil, billing.NotFound("app_unknown: no live billing mirror for this app")
 	case TransferRequestConflict:
 		return nil, billing.Conflict("app_transfer_conflict: this request_id already transferred a different app or target")
 	case TransferPeriodClosed:

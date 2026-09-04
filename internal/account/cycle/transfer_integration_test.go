@@ -4,6 +4,7 @@ package cycle_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
@@ -284,6 +286,44 @@ func TestTransferAppIsIdempotentOnRequestID(t *testing.T) {
 	_, err = svc.TransferApp(ctx, req)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "app_transfer_conflict")
+}
+
+// A soft-deleted app is NOT_FOUND, not transferable. It is already out of
+// every future base fee (D1e), so there is nothing to move, and re-keying its
+// row would hand the new account whatever the deletion left on it. The live
+// control below the deletion is what makes the refusal a refusal and not a
+// broken lookup.
+//
+// Mutation: drop `AND deleted_at IS NULL` from LockAppForTransfer and the
+// deleted app transfers.
+func TestTransferAppRefusesADeletedApp(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	_, err := f.pool.Exec(ctx,
+		`UPDATE ms_billing.apps SET deleted_at = $2 WHERE app_id = $1`,
+		f.appID.String(), mustTime(t, "2026-08-10T00:00:00Z"))
+	require.NoError(t, err)
+	before := f.rosterAccount(t)
+
+	_, err = transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeKeep,
+		RequestID:   uuid.New(),
+	})
+
+	require.Error(t, err)
+	var be *billing.Error
+	require.True(t, errors.As(err, &be), "not a billing.Error: %v", err)
+	require.Equal(t, billing.CodeNotFound, be.Code)
+	require.Contains(t, err.Error(), "app_unknown")
+	require.Equal(t, before, f.rosterAccount(t), "a deleted app's roster row was re-keyed")
+
+	var events int
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.app_transfer_events WHERE app_id = $1`,
+		f.appID.String()).Scan(&events))
+	require.Equal(t, 0, events, "a refused transfer wrote a ledger row")
 }
 
 // 🔴 THE SPLIT GUARD. Before migration 071 nothing tied apps.account_id to the

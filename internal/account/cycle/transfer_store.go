@@ -42,7 +42,8 @@ const (
 	// TransferRequestConflict — this request_id was used for a DIFFERENT
 	// target. Never a second transfer.
 	TransferRequestConflict
-	// TransferAppUnknown — no ms_billing.apps row.
+	// TransferAppUnknown — no LIVE ms_billing.apps row: never mirrored, or
+	// soft-deleted. Both are NOT_FOUND to the caller.
 	TransferAppUnknown
 	// TransferChargesPending — a mid-period one-time charge is still owed for
 	// this app; re-keying now would bill it to the new account.

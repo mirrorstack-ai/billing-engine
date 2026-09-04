@@ -140,6 +140,7 @@ const lockAppForTransfer = `-- name: LockAppForTransfer :one
 SELECT app_id, account_id, owner_org_id
 FROM ms_billing.apps
 WHERE app_id = $1
+  AND deleted_at IS NULL
 FOR UPDATE
 `
 
@@ -153,6 +154,13 @@ type LockAppForTransferRow struct {
 // current attribution. Everything the transfer decides is read here, under the
 // lock, so a concurrent RegisterApp/SyncAppModules or a second TransferApp
 // cannot interleave between the read and the writes.
+//
+// deleted_at IS NULL, as every LIVE-roster read in apps.sql spells it: a
+// soft-deleted app has nothing left to transfer — it is already out of every
+// future base fee (D1e) — and re-keying its row would hand the NEW account
+// whatever the deletion left behind on it. No row ⇒ NOT_FOUND, the same answer
+// as an app this service never mirrored, because to the caller both are "no
+// billing here to move".
 func (q *Queries) LockAppForTransfer(ctx context.Context, appID string) (LockAppForTransferRow, error) {
 	row := q.db.QueryRow(ctx, lockAppForTransfer, appID)
 	var i LockAppForTransferRow
