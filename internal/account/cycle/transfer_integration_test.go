@@ -16,6 +16,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
+	"github.com/mirrorstack-ai/billing-engine/internal/meteringlock"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
@@ -1102,6 +1103,159 @@ func TestTransferAppToTheCurrentAccountIsANoOp(t *testing.T) {
 	require.NoError(t, f.pool.QueryRow(ctx,
 		`SELECT proration_skipped_at FROM ms_billing.apps WHERE app_id = $1`, f.appID.String()).Scan(&skippedAt))
 	require.NotNil(t, skippedAt, "control: the real transfer forfeits the unactivated account's proration")
+}
+
+// 🔴 THE CLOSED-WINDOW REFUSAL, ON A REAL billing_periods ROW. A move
+// re-attributes rows into the open window of both accounts; if the cycle
+// Lambda has already begun closing that window on either side ('closing',
+// then 'invoiced'), the rows would be counted by the old rollup before the
+// move and the new one after, or land in a period whose invoice is issued.
+// anyPeriodClosed reads ClosedBillingPeriodEndAtStart for each account's
+// window after the barrier; until now nothing seeded such a row, so the
+// refusal was reached only through the unit test's outcome→code map. Each
+// account, each status; the control clears the row and the same request
+// (new key) moves the event.
+//
+// Mutation: make anyPeriodClosed return false and every case here transfers.
+func TestTransferAppRefusesWhileAPeriodIsClosed(t *testing.T) {
+	periodStart, periodEnd := "2026-08-04T00:00:00Z", "2026-09-04T00:00:00Z"
+	for _, side := range []string{"old", "new"} {
+		for _, status := range []string{"closing", "invoiced"} {
+			t.Run(side+" account "+status, func(t *testing.T) {
+				ctx := context.Background()
+				f := seedTransferFixture(t)
+				seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+				event := uuid.New()
+				_, err := f.pool.Exec(ctx, `
+					INSERT INTO ms_billing.usage_events
+					    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+					VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 1, $5)`,
+					event.String(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(), mustTime(t, "2026-08-10T10:00:00Z"))
+				require.NoError(t, err)
+				account := f.oldAcct
+				if side == "new" {
+					account = f.newAcct
+				}
+				// Both accounts anchor on day 4, so [08-04, 09-04) is the window
+				// containing f.now on either side.
+				_, err = f.pool.Exec(ctx, `
+					INSERT INTO ms_billing.billing_periods (account_id, period_start, period_end, status)
+					VALUES ($1, $2, $3, $4::ms_billing.billing_period_status)`,
+					account.String(), mustTime(t, periodStart), mustTime(t, periodEnd), status)
+				require.NoError(t, err)
+				before := f.rosterAccount(t)
+				svc := transferSvc(t, f)
+				req := cycle.TransferAppRequest{
+					AppID:       f.appID,
+					OwnerUserID: f.newOwner,
+					Mode:        cycle.TransferModeMove,
+					RequestID:   uuid.New(),
+				}
+
+				_, err = svc.TransferApp(ctx, req)
+
+				require.Error(t, err)
+				var be *billing.Error
+				require.True(t, errors.As(err, &be), "not a billing.Error: %v", err)
+				require.Equal(t, billing.CodeConflict, be.Code)
+				require.Contains(t, err.Error(), "app_transfer_period_closed")
+				require.Equal(t, before, f.rosterAccount(t), "roster changed despite the refusal")
+				_, found := f.ledgerRow(t, req.RequestID)
+				require.False(t, found, "a refused transfer wrote a ledger row")
+				var onOld int
+				require.NoError(t, f.pool.QueryRow(ctx,
+					`SELECT count(*) FROM ms_billing.usage_events WHERE event_id = $1 AND account_id = $2`,
+					event.String(), f.oldAcct.String()).Scan(&onOld))
+				require.Equal(t, 1, onOld, "usage moved into a closed period")
+
+				// The control: the period row was the only thing in the way. An
+				// 'open' row is the rollup's ordinary state and must not refuse.
+				_, err = f.pool.Exec(ctx,
+					`UPDATE ms_billing.billing_periods SET status = 'open' WHERE account_id = $1 AND period_start = $2`,
+					account.String(), mustTime(t, periodStart))
+				require.NoError(t, err)
+				req.RequestID = uuid.New()
+				resp, err := svc.TransferApp(ctx, req)
+				require.NoError(t, err)
+				require.Equal(t, f.newAcct, resp.AccountID)
+				require.Equal(t, int64(1), resp.MovedEventCount)
+			})
+		}
+	}
+}
+
+// 🔴 THE PERIOD BARRIER IS TAKEN, AND IT WAITS. The rollup holds the exclusive
+// period advisory lock (meteringlock.AdvisorySQL on PeriodKey) while it
+// snapshots a window; ingest and the org repoint sweep take it shared, and so
+// must a transfer that moves rows across that window. A second connection
+// holds the old account's period key exclusively; the transfer must park on
+// the shared acquisition (pg_stat_activity) and complete only after the
+// release. Without the barrier it would finish while the lock is held —
+// which is exactly the interleaving that double-counts moved rows.
+//
+// Mutation: drop the SharedAdvisorySQL Exec from barrierBothAccounts and the
+// transfer returns while the holder still has the lock.
+func TestTransferAppWaitsForThePeriodBarrier(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.usage_events
+		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 1, $5)`,
+		uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(), mustTime(t, "2026-08-10T10:00:00Z"))
+	require.NoError(t, err)
+
+	holder, err := f.pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer holder.Release()
+	rollup, err := holder.Begin(ctx)
+	require.NoError(t, err)
+	defer rollup.Rollback(ctx) //nolint:errcheck // a no-op after the commit below
+	// The rollup's own lock: exclusive, on the old account's open window.
+	_, err = rollup.Exec(ctx, meteringlock.AdvisorySQL, meteringlock.PeriodKey(f.oldAcct, mustTime(t, "2026-08-04T00:00:00Z")))
+	require.NoError(t, err)
+
+	svc := transferSvc(t, f)
+	req := cycle.TransferAppRequest{AppID: f.appID, OwnerUserID: f.newOwner, Mode: cycle.TransferModeMove, RequestID: uuid.New()}
+	type outcome struct {
+		resp *cycle.TransferAppResponse
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		resp, err := svc.TransferApp(ctx, req)
+		done <- outcome{resp: resp, err: err}
+	}()
+
+	var probeErr error
+	require.Eventually(t, func() bool {
+		var waiting bool
+		probeErr = f.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND wait_event_type = 'Lock'
+				  AND query ILIKE '%pg_advisory_xact_lock_shared%'
+			)`).Scan(&waiting)
+		return probeErr == nil && waiting
+	}, 5*time.Second, 10*time.Millisecond, "the transfer must park on the shared period barrier while the rollup holds it")
+	require.NoError(t, probeErr)
+	select {
+	case got := <-done:
+		require.Failf(t, "the transfer did not take the period barrier", "returned %+v / %v while the rollup held the lock", got.resp, got.err)
+	default:
+	}
+
+	require.NoError(t, rollup.Commit(ctx))
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "the transfer did not return after the barrier was released")
+	}
+	require.NoError(t, got.err)
+	require.Equal(t, int64(1), got.resp.MovedEventCount)
 }
 
 // api-platform fires this post-commit with retry, so a replay must return the
