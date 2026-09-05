@@ -123,9 +123,12 @@ func (f transferForfeit) any() bool {
 //     in THIS transaction (reconcileModuleTimersToTargetTx).
 //  2. the apps row FOR UPDATE — serializes two concurrent transfers of the same
 //     app, pins the from-account the event records, and is the row the
-//     creation-proration sweep locks too (ChargeProrationLocked), so that
-//     sweep cannot slip between the pending-charge read and the forfeit or
-//     the re-key.
+//     creation-proration sweep locks too on BOTH rails (ChargeProrationLocked /
+//     FreezeCombinedProrationAttempt on Stripe, DrawCreationProrationFromWallet
+//     on the wallet), so that sweep cannot slip between the pending-charge
+//     read and the forfeit or the re-key — and, having waited, re-reads the
+//     skip marker and the account under this lock rather than resuming on
+//     what it classified before.
 //  3. both accounts' activation rows FOR SHARE, then the period barrier, in
 //     sorted account order (barrierBothAccounts) — BEFORE the refuse/forfeit
 //     classification reads the old account's activation, mode and card, so
@@ -142,21 +145,39 @@ func (f transferForfeit) any() bool {
 //
 // 40P01 = RETRY, NOT A MONEY FAULT. Steps 1–2 (advisory → apps row) are the
 // order every timer-set writer takes, and step 3 follows the rollup's own
-// order (account row → period barrier). One writer inverts it:
-// FreezeCombinedProrationAttempt, with the credit rail on, takes the OLD
-// account's row FOR UPDATE (LockWalletAccount) BEFORE the advisory lock, so a
-// freeze and a transfer of the same app can close a lock cycle — the freezer
-// holding the account row and waiting on the advisory, this transaction
-// holding the advisory and waiting on the account row (FOR SHARE, step 3).
-// Postgres detects it and aborts one side with 40P01. Nothing is lost when
-// it is this side: every write here is inside the one transaction, so the
-// abort rolls back to "no transfer happened", the ledger has no row, and
-// api-platform — which retries the call — replays it after the freeze has
-// committed and either refuses (charges pending, in flight) or proceeds. A
-// deadlock error out of this function is therefore a retry, never a
-// half-applied money state. Re-ordering the freezer to match would move the
-// wallet-mode lock behind the timer lock for every proration writer; not
-// done here.
+// order (account row → period barrier). Three writers invert some part of
+// it, and each can close a lock cycle with a transfer of the same app or
+// out of the same account:
+//
+//   - FreezeCombinedProrationAttempt, with the credit rail on, takes the OLD
+//     account's row FOR UPDATE (LockWalletAccount) BEFORE the advisory lock:
+//     the freezer holds the account row and waits on the advisory, this
+//     transaction holds the advisory and waits on the account row (FOR
+//     SHARE, step 3).
+//   - DrawModuleOverageFromWallet takes the timer row FOR UPDATE and THEN the
+//     account row FOR UPDATE (LockWalletAccount); this transaction holds the
+//     account row FOR SHARE (step 3) and then updates the timer row (the
+//     forfeit or the re-key, step 4). A transfer out of a credits-mode
+//     account while the overage sweep draws one of the app's timers.
+//   - FinalizeOrgDeletionBilling takes the org's lifecycle advisory lock
+//     EXCLUSIVELY and then the org's accounts FOR UPDATE; this transaction
+//     holds an org account FOR SHARE (step 3) and then, inside the 052
+//     guards the forfeit and re-key UPDATEs and the terminal zero sample
+//     fire, takes that org's lifecycle lock SHARED. A transfer out of an org
+//     account concurrent with that org's finalization.
+//
+// Postgres detects each cycle and aborts one side with 40P01. Nothing is
+// lost when it is this side: every write here is inside the one transaction,
+// so the abort rolls back to "no transfer happened", the ledger has no row,
+// and api-platform — which retries the call — replays it after the other
+// writer has committed and either refuses (charges pending, in flight; the
+// app retired → NOT_FOUND) or proceeds (the timer settled → not pending).
+// When it is the other side, that writer's own transaction rolls back whole
+// and its sweep retries. A deadlock error out of this function is therefore
+// a retry, never a half-applied money state. Re-ordering the freezer to match
+// would move the wallet-mode lock behind the timer lock for every proration
+// writer; the other two are the orders their own callers depend on; none is
+// re-ordered here. Ingest already shares the third inversion.
 //
 // EVERY REFUSAL IS DECIDED BEFORE THE FIRST WRITE. The transaction commits on
 // a refusal too (pgx.BeginFunc commits a nil return), so a write that
