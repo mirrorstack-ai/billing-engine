@@ -1254,6 +1254,82 @@ func TestTransferAppRepointsAUserRosteredAppsNullAccountUsage(t *testing.T) {
 	require.Equal(t, resp.AccountID, again.AccountID)
 }
 
+// 🔴 A MOVE INTO AN UNACTIVATED TARGET IS REFUSED. The rows a move
+// re-attributes leave the old account's open period, which its funded
+// boundary would have billed, for an account the cycle rolls up but never
+// hands to the charge phase; once the calendar month holding them closes,
+// activation re-windows v2 observations only and the first charged run
+// starts past that month, so nothing ever bills them — a self-service
+// un-charge of the whole open period's usage. The refusal is decided under
+// the target's activation lock and before any write: the rows stay on the
+// old account, the roster does not move, no ledger row is written. keep to
+// the SAME unfunded target is the control and succeeds — nothing moves, and
+// an unfunded destination is otherwise allowed (host decision 2026-09-05,
+// APP-TRANSFER-SPEC §2.1).
+//
+// Mutation: drop the activated_at read and the move lands the rows on the
+// unactivated account with MovedEventCount 2.
+func TestTransferAppRefusesAMoveIntoAnUnfundedTarget(t *testing.T) {
+	ctx := context.Background()
+	// Old account activated (its boundary would bill the rows); target never
+	// activated (activated_at NULL).
+	f := seedTransferFixtureWith(t, transferSeed{oldActivated: mustTime(t, "2026-05-04T00:00:00Z")})
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+	var targetActivated *time.Time
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT activated_at FROM ms_billing.accounts WHERE id = $1`, f.newAcct.String()).Scan(&targetActivated))
+	require.Nil(t, targetActivated, "fixture error: the target must be unactivated for this test to be about the funding refusal")
+	for _, at := range []string{"2026-08-05T10:00:00Z", "2026-08-10T10:00:00Z"} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.usage_events
+			    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+			VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 1, $5)`,
+			uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(), mustTime(t, at))
+		require.NoError(t, err)
+	}
+	onOld := func() int {
+		var n int
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT count(*) FROM ms_billing.usage_events WHERE app_id = $1 AND account_id = $2`,
+			f.appID.String(), f.oldAcct.String()).Scan(&n))
+		return n
+	}
+	before := f.rosterAccount(t)
+	svc := transferSvc(t, f)
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeMove,
+		RequestID:   uuid.New(),
+	}
+
+	_, err := svc.TransferApp(ctx, req)
+
+	require.Error(t, err)
+	var be *billing.Error
+	require.True(t, errors.As(err, &be), "not a billing.Error: %v", err)
+	require.Equal(t, billing.CodeConflict, be.Code)
+	require.Contains(t, err.Error(), "app_transfer_target_unfunded")
+	require.Equal(t, 2, onOld(), "the refused move re-attributed rows")
+	require.Equal(t, before, f.rosterAccount(t), "roster changed despite the refusal")
+	_, found := f.ledgerRow(t, req.RequestID)
+	require.False(t, found, "a refused transfer wrote a ledger row")
+
+	// The control: keep, same unfunded target, same fixture — allowed. The
+	// re-key happens and nothing moves, which is what keep means.
+	req.Mode = cycle.TransferModeKeep
+	req.RequestID = uuid.New()
+	resp, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, f.newAcct, resp.AccountID)
+	require.Equal(t, int64(0), resp.MovedEventCount)
+	require.Equal(t, 2, onOld(), "keep moved rows")
+	require.Equal(t, f.newAcct.String(), f.rosterAccount(t))
+	// The unactivated target's window is the default-anchored one.
+	requireSameInstant(t, mustTime(t, "2026-08-01T00:00:00Z"), resp.OpenPeriod.Start, "open_period.start")
+	requireSameInstant(t, mustTime(t, "2026-09-01T00:00:00Z"), resp.RecurringFrom, "recurring_from")
+}
+
 // 🔴 A TRANSFER TO THE ACCOUNT THAT ALREADY HOLDS THE APP CHANGES NOTHING.
 // Run as an ordinary transfer against one account it would under-bill that
 // account three ways: forfeit a proration it still owes to itself, "move"

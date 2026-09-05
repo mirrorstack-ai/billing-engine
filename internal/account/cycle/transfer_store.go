@@ -74,6 +74,12 @@ const (
 	// org funds. A USER-rostered app's NULL rows are not this: they are the
 	// target's, and the transfer repoints them (repointNullAccountUsage).
 	TransferUnbilledBacklog
+	// TransferTargetUnfunded — mode=move into a target account that has never
+	// activated. The moved rows would leave the old account's charged open
+	// period for an account the cycle rolls up but never hands to the charge
+	// phase, and once the calendar month holding them closes nothing bills
+	// them to anyone. keep to the same target is fine: nothing moves.
+	TransferTargetUnfunded
 )
 
 // TransferForfeitReason is WHY a transfer forfeited the old account's
@@ -338,6 +344,34 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		if closed {
 			outcome = TransferPeriodClosed
 			return nil
+		}
+
+		// 🔴 A MOVE NEEDS A FUNDED DESTINATION. The rows a move re-attributes
+		// leave the OLD account's open period — which its funded boundary
+		// would have billed — for the target's. An UNACTIVATED target is
+		// rolled up but never handed to the charge phase (runUnactivatedRollup
+		// closes its calendar month rollup-only), activation re-windows v2
+		// observations alone, and the first charged run starts at or after
+		// the period the unactivated rollup already closed. So usage moved
+		// into an unactivated account is un-charged: gone from the old bill,
+		// never on the new one. Refused, under the target's activation lock
+		// (taken by the barrier above), so a card-bind cannot commit between
+		// this read and the move it would have licensed. keep is not touched:
+		// it moves nothing, and an unfunded destination is otherwise allowed
+		// (transferTargetAccount). Host decision 2026-09-05, §2.1; api-platform
+		// pre-checks the target's standing at create and accept so this is
+		// the authority's answer, not the customer's first notice.
+		if p.Mode == TransferModeMove {
+			targetActivated, aErr := qtx.AccountActivatedAt(ctx, p.ToAccount.String())
+			if aErr != nil {
+				// ErrNoRows included: the target was ensured by the service
+				// and locked by the barrier; a missing row here is a bug.
+				return fmt.Errorf("transfer target account %s: %w", p.ToAccount, aErr)
+			}
+			if !targetActivated.Valid {
+				outcome = TransferTargetUnfunded
+				return nil
+			}
 		}
 
 		// 🔴 THE MONEY DECISION. Creation proration, custom-domain activation

@@ -90,6 +90,10 @@ func TestTransferAppMapsStoreOutcomesToWireCodes(t *testing.T) {
 		// The backlog refusal: NULL-account usage for this app is reachable
 		// only through the roster column the transfer rewrites.
 		{"unbilled backlog", cycle.TransferUnbilledBacklog, billing.CodeConflict, "app_transfer_unbilled_backlog"},
+		// The funded-destination refusal: a move into an account that has
+		// never activated would leave the moved usage un-charged by anyone.
+		// Declared like every other app_transfer_* token — CONFLICT, prefix.
+		{"move into an unfunded target", cycle.TransferTargetUnfunded, billing.CodeConflict, "app_transfer_target_unfunded"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

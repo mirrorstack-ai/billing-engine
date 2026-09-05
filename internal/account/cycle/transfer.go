@@ -98,6 +98,22 @@ type TransferAppResponse struct {
 	// no anchor yet either: the boundary reported here is computed on the
 	// default anchor (transferWindows), and activation sets the anchor its
 	// boundaries actually run on.
+	//
+	// 🔴 THAT ACCEPTANCE IS FOR mode="keep". A move into an UNACTIVATED
+	// target is refused (CONFLICT, prefix app_transfer_target_unfunded: "move
+	// needs a funded billing account; keep is available"). The recurring gap
+	// above is one whole unit at most and is reported; a move's usage would
+	// be lost outright: the rows leave the old account's open period, which
+	// its funded boundary would have billed, for an account the cycle rolls
+	// up but never hands to the charge phase — and once the calendar month
+	// holding them closes (the unactivated rollup), activation re-windows v2
+	// observations only and the first charged run starts past that month, so
+	// nothing ever bills them. The check runs inside the transfer transaction
+	// under the target's activation lock, after the same-account no-op (which
+	// moves nothing) and before any write. Host decision 2026-09-05 (§2.1):
+	// api-platform refuses the same at create and at accept from the target's
+	// standing, and the console offers keep only for an unfunded target, so
+	// this refusal is the money authority's backstop, not the first notice.
 	RecurringFrom time.Time `json:"recurring_from"`
 }
 
@@ -161,6 +177,10 @@ const (
 // roster column this transfer rewrites, so moving the app would bill it to
 // the wrong org or strand it; app_transfer_unbilled_backlog until the old org
 // funds it.
+//
+// WHAT ALSO BLOCKS IT: a move into a target that has never activated
+// (app_transfer_target_unfunded). Usage moved there is un-charged — see
+// TransferAppResponse.RecurringFrom. keep to the same target is allowed.
 //
 // WHAT DOES NOT BLOCK IT, AND COMES ACROSS INSTEAD: a USER-rostered app's
 // NULL-account rows. api-platform re-seats the app's payer before it calls
@@ -235,6 +255,8 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 		return nil, billing.Conflict("app_transfer_charges_pending: a one-time charge for this app is still settling on its current account; retry after the sweeps run")
 	case TransferUnbilledBacklog:
 		return nil, billing.Conflict("app_transfer_unbilled_backlog: this app has usage recorded before its organization designated funding; that backlog must be attached to the current organization's account before the app can move")
+	case TransferTargetUnfunded:
+		return nil, billing.Conflict("app_transfer_target_unfunded: move needs a funded billing account; keep is available")
 	}
 	return resp, nil
 }
@@ -249,6 +271,9 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 // refusal here would strand it on an owner who has asked to stop paying for it.
 // The owner's decision (2026-09-04) is that an unfunded destination is allowed —
 // the account simply reads blocked and the existing serving-block does its job.
+// The one thing an unfunded destination may not receive is a MOVE of usage,
+// and that is the store's refusal under the target's lock, not a gate here
+// (TransferAppResponse.RecurringFrom says why).
 //
 // It is a separate function rather than a flag on fundedOwnerAccount because
 // that function has exactly one caller and four tests pinning its refusals;
