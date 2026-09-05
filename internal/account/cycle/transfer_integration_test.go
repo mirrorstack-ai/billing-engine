@@ -1405,27 +1405,61 @@ func TestSplitAppAttributionIsRefused(t *testing.T) {
 	require.Contains(t, err.Error(), "split app billing attribution")
 }
 
-// 🔴 THE ROLLUP BUCKETS ON COALESCE(billable_at, recorded_at), NOT occurred_at.
-// occurred_at is NULL for every infra.* and platform.* event and for every
-// legacy/v1 observation, and `NULL >= $1` is NULL — so a move filtered on
-// occurred_at silently moves NONE of them, and the OLD account stays invoiced
-// for the app's egress, AI and GPU across the whole open period.
+// 🔴 THE ROLLUP BUCKETS ON COALESCE(billable_at, recorded_at), NOT occurred_at
+// AND NOT recorded_at. The move filters on that same expression, and each of
+// the three row shapes below kills one way of getting it wrong:
 //
-// Mutation: put occurred_at back in MoveAppOpenUsage and this fails at 0.
-func TestTransferAppMovesUsageWithNoOccurredAt(t *testing.T) {
+//	v1 / infra shape — occurred_at NULL, billable_at NULL, recorded_at 08-05
+//	  inside the window. MOVES. An occurred_at filter reads NULL >= $1 as
+//	  NULL and moves none of the app's egress, AI or GPU usage.
+//	late_open shape (usage/service.go) — v2, occurred_at = billable_at 08-02
+//	  BEFORE the window, recorded_at 08-10 inside it. STAYS: the rollup
+//	  buckets it in [07-04, 08-04), which the old account has already
+//	  closed. A recorded_at filter moves it into the target's closed
+//	  [07-04, 08-04) — usage from before the target owned the app, billed
+//	  to the target or stranded — while the old account's period loses a row
+//	  it recorded.
+//	first_funded shape (RewindowAccountV2UsageAtActivation,
+//	  RepointOrgNullAccountEvents) — v2, occurred_at 07-20 before the old
+//	  account's activation, billable_at clamped to the window start 08-04,
+//	  recorded_at 07-20. MOVES: billable_at is where the bill reads it. An
+//	  occurred_at filter leaves it, and so does a recorded_at filter.
+//
+// Mutation: filter MoveAppOpenUsage on occurred_at — the count reads 0; on
+// recorded_at — the count reads 2 and the late_open row is on the target.
+func TestTransferAppMovesOnTheRollupsWindowExpression(t *testing.T) {
 	ctx := context.Background()
 	f := seedTransferFixture(t)
 	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
 
-	// occurred_at omitted (NULL), recorded_at inside the window — the shape
-	// every infra.*/platform.* event has.
+	infra, lateOpen, firstFunded := uuid.New(), uuid.New(), uuid.New()
+	// The v1 / infra shape: occurred_at omitted (NULL), recorded_at only.
 	_, err := f.pool.Exec(ctx, `
 		INSERT INTO ms_billing.usage_events
 		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
 		VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 5, $5)`,
-		uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(),
+		infra.String(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(),
 		mustTime(t, "2026-08-05T10:00:00Z"))
 	require.NoError(t, err)
+	// The two v2 shapes, with the columns 055 requires of a v2 row.
+	for _, ev := range []struct {
+		id                                 uuid.UUID
+		occurredAt, billableAt, recordedAt string
+		policy                             string
+	}{
+		{lateOpen, "2026-08-02T10:00:00Z", "2026-08-02T10:00:00Z", "2026-08-10T10:00:00Z", "late_open"},
+		{firstFunded, "2026-07-20T10:00:00Z", "2026-08-04T00:00:00Z", "2026-07-20T10:00:00Z", "first_funded"},
+	} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.usage_events
+			    (event_id, account_id, app_id, module_id, metric, kind, value,
+			     observation_version, occurred_at, billable_at, recorded_at, occurrence_policy, payload_fingerprint)
+			VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 5,
+			        2, $5, $6, $7, $8, sha256(convert_to($1, 'UTF8')))`,
+			ev.id.String(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(),
+			mustTime(t, ev.occurredAt), mustTime(t, ev.billableAt), mustTime(t, ev.recordedAt), ev.policy)
+		require.NoError(t, err)
+	}
 
 	resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
 		AppID:       f.appID,
@@ -1434,8 +1468,18 @@ func TestTransferAppMovesUsageWithNoOccurredAt(t *testing.T) {
 		RequestID:   uuid.New(),
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(1), resp.MovedEventCount,
-		"an event with NULL occurred_at did not move; the filter is not the rollup's expression")
+	require.Equal(t, int64(2), resp.MovedEventCount,
+		"exactly the infra row and the first_funded row move; the filter is not the rollup's expression")
+
+	accountOf := func(id uuid.UUID) string {
+		var got string
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT account_id::text FROM ms_billing.usage_events WHERE event_id = $1`, id.String()).Scan(&got))
+		return got
+	}
+	require.Equal(t, f.newAcct.String(), accountOf(infra), "an event with NULL occurred_at did not move")
+	require.Equal(t, f.newAcct.String(), accountOf(firstFunded), "a first_funded row (billable_at inside the window) did not move")
+	require.Equal(t, f.oldAcct.String(), accountOf(lateOpen), "a late_open row (billable_at before the window) was moved on its recorded_at")
 }
 
 // 🔴 THE max() TERM, actually exercised. With the TARGET's open period starting
@@ -1505,6 +1549,71 @@ func TestTransferAppMoveLeavesUsageOlderThanTheTargetPeriod(t *testing.T) {
 		"the 08-06 event was backdated into a period the target has already billed")
 	require.Equal(t, f.newAcct.String(), accountOf(moves),
 		"the 08-12 event is inside both open periods and should have moved")
+}
+
+// 🔴 THE max() TERM, THE OTHER WAY ROUND. The test above has the target's
+// period start later than the old account's, where toWindow.Start IS the
+// max — so a mutant that returns toWindow.Start unconditionally passes it.
+// Here the OLD account's period starts later, so the max is fromWindow.Start,
+// and an event inside the old account's ALREADY-CLOSED previous period must
+// stay: moving it would hand the target usage the old account's issued
+// invoice already billed — billed twice.
+//
+// The arithmetic, from the one pinned now = 2026-08-15:
+//
+//	old activated 05-10 → anchor day 10 → open period [08-10, 09-10);
+//	                       its previous period [07-10, 08-10) closed at 08-10
+//	new activated 05-04 → anchor day 4  → open period [08-04, 09-04)
+//	move window = [max(08-10, 08-04), now) = [08-10, 08-15T12:00)
+//	08-06 ∈ the old account's closed period → stays
+//	08-12 ≥ 08-10                            → moves
+//
+// Mutation: return toWindow.Start from moveWindowStart and the window opens
+// at 08-04, so both events move and the count reads 2.
+func TestTransferAppMoveLeavesUsageInTheOldAccountsClosedPeriod(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixtureAnchored(t,
+		mustTime(t, "2026-05-10T00:00:00Z"),
+		mustTime(t, "2026-05-04T00:00:00Z"))
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+
+	stays := uuid.New()
+	moves := uuid.New()
+	for _, ev := range []struct {
+		id uuid.UUID
+		at string
+	}{{stays, "2026-08-06T10:00:00Z"}, {moves, "2026-08-12T10:00:00Z"}} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.usage_events
+			    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+			VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 2, $5)`,
+			ev.id.String(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(), mustTime(t, ev.at))
+		require.NoError(t, err)
+	}
+
+	resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeMove,
+		RequestID:   uuid.New(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, f.newAcct, resp.AccountID)
+	require.Equal(t, int64(1), resp.MovedEventCount,
+		"exactly the 08-12 event should move: 08-06 is inside the old account's closed period [07-10, 08-10)")
+
+	accountOf := func(id uuid.UUID) string {
+		var got string
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT account_id::text FROM ms_billing.usage_events WHERE event_id = $1`, id.String()).Scan(&got))
+		return got
+	}
+	require.Equal(t, f.oldAcct.String(), accountOf(stays),
+		"the 08-06 event was moved out of a period the old account has already invoiced")
+	require.Equal(t, f.newAcct.String(), accountOf(moves))
+	// The answer is the TARGET's window, whichever side the max() came from.
+	requireSameInstant(t, mustTime(t, "2026-08-04T00:00:00Z"), resp.OpenPeriod.Start, "open_period.start")
+	requireSameInstant(t, mustTime(t, "2026-09-04T00:00:00Z"), resp.RecurringFrom, "recurring_from")
 }
 
 // 🔴 A REPLAY IS VERBATIM, ACROSS A BOUNDARY. api-platform fires TransferApp
