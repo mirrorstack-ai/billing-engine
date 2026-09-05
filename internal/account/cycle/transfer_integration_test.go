@@ -1720,6 +1720,108 @@ func TestTransferAppReKeysLiveTimersAndDomainsWithTheRoster(t *testing.T) {
 	require.Nil(t, row.forfeitReason)
 }
 
+// 🔴 A SETTLED CHILD FOLLOWS ITS APP PAST A RETIRED FUNDER (migration 072).
+// 052's child guards fire on every update of a live timer or domain and
+// assert that the row's HISTORICAL charge_funding_account_id still names an
+// active organization. RekeyAppTimers / RekeyAppDomains update every live
+// child, settled ones included (the split guard requires it), so an app that
+// once had a charge settled by org O could never be transferred again once O
+// was deleted: every later transfer aborted in the guard, permanently. 072
+// lets an already-resolved row change account_id ALONE, asserting the
+// account it now bills to and the app's owner org — never the historical
+// funder — and leaves every other write on the 052 path.
+//
+// Shape: org O's self-funded app with a charged live timer and a charged live
+// domain (funder = O's account) → transferred to a user → O retired →
+// transferred again. The control is the assertion 072 keeps: re-keying the
+// settled row INTO the retired org's account is still refused.
+//
+// Mutation: put the 052 bodies back (072.down) and the second transfer fails
+// with "organization billing principal … is retired".
+func TestTransferAppReKeysASettledChildPastARetiredFunder(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	orgID, orgAcct := uuid.New(), uuid.New()
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.accounts (id, owner_kind, owner_org_id, activated_at)
+		VALUES ($1, 'org', $2, $3)`, orgAcct.String(), orgID.String(), mustTime(t, "2026-05-04T00:00:00Z"))
+	require.NoError(t, err)
+	_, err = f.pool.Exec(ctx,
+		`UPDATE ms_billing.apps SET account_id = $2, owner_org_id = $3 WHERE app_id = $1`,
+		f.appID.String(), orgAcct.String(), orgID.String())
+	require.NoError(t, err)
+	// The funder pin a real arm writes: O's own authorization (052 creates it
+	// on the account insert).
+	var generation string
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT generation::text FROM ms_billing.account_funding_authorizations WHERE account_id = $1`,
+		orgAcct.String()).Scan(&generation))
+	installed, armed, charged := mustTime(t, "2026-07-01T00:00:00Z"), mustTime(t, "2026-07-04T00:00:00Z"), mustTime(t, "2026-07-04T00:00:00Z")
+	timerID, domainID := uuid.New(), uuid.New()
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.app_module_overage_timers
+		    (id, account_id, app_id, installed_at, grace_expires_at, grace_resolved, grace_charged_at,
+		     charge_attempted_at, charge_funding_account_id, charge_funding_generation)
+		VALUES ($1, $2, $3, $4, $4::timestamptz + interval '3 days', true, $5, $6, $2, $7)`,
+		timerID.String(), orgAcct.String(), f.appID.String(), installed, charged, armed, generation)
+	require.NoError(t, err)
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.app_custom_domains
+		    (id, account_id, app_id, hostname, activated_at, charge_resolved, charged_at,
+		     charge_attempted_at, charge_funding_account_id, charge_funding_generation)
+		VALUES ($1, $2, $3, 'settled.example.test', $4, true, $5, $6, $2, $7)`,
+		domainID.String(), orgAcct.String(), f.appID.String(), installed, charged, armed, generation)
+	require.NoError(t, err)
+
+	svc := transferSvc(t, f)
+	first, err := svc.TransferApp(ctx, cycle.TransferAppRequest{
+		AppID: f.appID, OwnerUserID: f.oldOwner, Mode: cycle.TransferModeKeep, RequestID: uuid.New(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, f.oldAcct, first.AccountID)
+
+	// O is retired. The tombstone is what every 052 assertion reads.
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.org_deletion_finalizations (org_id, operation_id, finalized_at)
+		VALUES ($1, $2, $3)`, orgID.String(), uuid.NewString(), mustTime(t, "2026-08-01T00:00:00Z"))
+	require.NoError(t, err)
+
+	second, err := svc.TransferApp(ctx, cycle.TransferAppRequest{
+		AppID: f.appID, OwnerUserID: f.newOwner, Mode: cycle.TransferModeKeep, RequestID: uuid.New(),
+	})
+	require.NoError(t, err, "a settled child funded by a since-retired org blocked the transfer")
+	require.Equal(t, f.newAcct, second.AccountID)
+
+	accountOf := func(table string, id uuid.UUID) string {
+		var got string
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT account_id::text FROM ms_billing.`+table+` WHERE id = $1`, id.String()).Scan(&got))
+		return got
+	}
+	require.Equal(t, f.newAcct.String(), f.rosterAccount(t))
+	require.Equal(t, f.newAcct.String(), accountOf("app_module_overage_timers", timerID))
+	require.Equal(t, f.newAcct.String(), accountOf("app_custom_domains", domainID))
+	// The history is untouched: the row still says who settled it.
+	var funder string
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT charge_funding_account_id::text FROM ms_billing.app_module_overage_timers WHERE id = $1`,
+		timerID.String()).Scan(&funder))
+	require.Equal(t, orgAcct.String(), funder)
+
+	// The control: what 072 still asserts. A settled row re-keyed INTO the
+	// retired org's account is refused by the same guard, on the same path.
+	_, err = f.pool.Exec(ctx,
+		`UPDATE ms_billing.app_module_overage_timers SET account_id = $2 WHERE id = $1`,
+		timerID.String(), orgAcct.String())
+	require.Error(t, err, "control: a settled row was re-keyed into a retired org")
+	require.Contains(t, err.Error(), "is retired")
+	_, err = f.pool.Exec(ctx,
+		`UPDATE ms_billing.app_custom_domains SET account_id = $2 WHERE id = $1`,
+		domainID.String(), orgAcct.String())
+	require.Error(t, err, "control: a settled domain was re-keyed into a retired org")
+	require.Contains(t, err.Error(), "is retired")
+}
+
 // advanceBaseLine returns the amount of the ONE "advance:base" line the
 // boundary proposed, or 0 when it proposed no such line. A boundary that
 // proposes nothing at all (p.groups empty) is the zero-skip: no base, no
