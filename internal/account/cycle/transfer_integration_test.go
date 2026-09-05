@@ -692,6 +692,82 @@ func TestTransferForfeitFencesTheWalletProrationDraw(t *testing.T) {
 	require.Equal(t, ref, *invoice)
 }
 
+// 🔴 A SEALED PROPOSAL IS NOT PENDING. On the intent rail a creation
+// proration is proposed, not collected: FreezeCombinedProrationAttempt writes
+// the header and stamps apps.proration_attempted_at, and
+// MarkCombinedProrationProposed resolves the header with the intent's
+// reference — while apps.proration_invoice_id stays NULL, because the
+// intent rail owns the charge from there. Read on the app columns alone that
+// is "pending AND in flight", so a transfer would refuse — and the sweep can
+// never clear it: ChargeCreationProration on that app reports the attempt as
+// disagreeing with its unarmed guard on every run and the guard is never
+// armed. The owner's transfer would be refused forever. The NOT EXISTS
+// resolved-attempt clauses in AppUnresolvedOneTimeCharges are what make a
+// sealed proposal count as resolved; the control is the same header left
+// unresolved, which IS in flight and must refuse.
+//
+// Mutation: drop the resolved-attempt clauses and the sealed case refuses
+// with app_transfer_charges_pending.
+func TestTransferAppTreatsASealedProposalAsResolved(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sealed bool
+	}{{"proposal sealed", true}, {"attempt unresolved", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := seedTransferFixture(t)
+			// Settleable — activated, arrears, carded — so the ONLY thing that
+			// decides refuse-versus-proceed is how the attempt reads.
+			f.giveOldAccountACard(t)
+			f.owePendingProration(t)
+			store := cycle.NewStore(f.pool)
+			shape := combinedAttemptShape(f.appID, f.oldAcct)
+			shape.Snapshot.ModuleCount = 0
+			_, claim, err := store.FreezeCombinedProrationAttempt(ctx, f.appID, mustTime(t, "2026-06-05T00:00:00Z"), shape, false)
+			require.NoError(t, err)
+			require.Equal(t, cycle.StripeRailClaimed, claim, "fixture error: the attempt was not frozen")
+			if tc.sealed {
+				require.NoError(t, store.MarkCombinedProrationProposed(ctx, f.appID,
+					mustTime(t, "2026-06-05T00:01:00Z"), "intent:"+uuid.NewString()))
+			}
+			var attemptedAt, invoice *string
+			require.NoError(t, f.pool.QueryRow(ctx,
+				`SELECT proration_attempted_at::text, proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`,
+				f.appID.String()).Scan(&attemptedAt, &invoice))
+			require.NotNil(t, attemptedAt, "fixture error: the legacy attempt marker is not set")
+			require.Nil(t, invoice, "fixture error: the guard must be unarmed — the intent rail owns the charge")
+
+			req := cycle.TransferAppRequest{
+				AppID:       f.appID,
+				OwnerUserID: f.newOwner,
+				Mode:        cycle.TransferModeKeep,
+				RequestID:   uuid.New(),
+			}
+			resp, err := transferSvc(t, f).TransferApp(ctx, req)
+
+			if !tc.sealed {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "app_transfer_charges_pending", "control: an unresolved attempt is in flight and must refuse")
+				require.Equal(t, f.oldAcct.String(), f.rosterAccount(t))
+				return
+			}
+			require.NoError(t, err, "a sealed proposal was read as a pending charge; this transfer could never succeed")
+			require.Equal(t, f.newAcct, resp.AccountID)
+			require.Equal(t, f.newAcct.String(), f.rosterAccount(t))
+			row, found := f.ledgerRow(t, req.RequestID)
+			require.True(t, found)
+			require.False(t, row.forfeitedProration, "a sealed proposal was forfeited; the intent rail owns it")
+			require.Nil(t, row.forfeitReason)
+			var skippedAt *time.Time
+			require.NoError(t, f.pool.QueryRow(ctx,
+				`SELECT proration_skipped_at, proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`,
+				f.appID.String()).Scan(&skippedAt, &invoice))
+			require.Nil(t, skippedAt)
+			require.Nil(t, invoice)
+		})
+	}
+}
+
 // The forfeit is a money decision that must survive a replay: the ledger says
 // what the FIRST call forfeited, and a retry neither forfeits again (nothing
 // is pending any more) nor reports otherwise.
