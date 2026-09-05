@@ -65,8 +65,8 @@ type AppTransferEventByRequestRow struct {
 // A hit means this transfer already happened: the caller gets the STORED
 // result — every field of it, the window and recurring_from included, so a
 // retry that lands after a boundary answers with the same dates the first
-// call did — and a different target for the same key is a conflict rather
-// than a second transfer.
+// call did — and a different app, target or mode for the same key is a
+// conflict rather than a second transfer.
 func (q *Queries) AppTransferEventByRequest(ctx context.Context, requestID string) (AppTransferEventByRequestRow, error) {
 	row := q.db.QueryRow(ctx, appTransferEventByRequest, requestID)
 	var i AppTransferEventByRequestRow

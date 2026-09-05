@@ -41,7 +41,7 @@ const (
 	// this account; the response carries the STORED result.
 	TransferAlreadyApplied
 	// TransferRequestConflict — this request_id was used for a DIFFERENT
-	// target. Never a second transfer.
+	// app, target or mode. Never a second transfer.
 	TransferRequestConflict
 	// TransferAppUnknown — no LIVE ms_billing.apps row: never mirrored, or
 	// soft-deleted. Both are NOT_FOUND to the caller.
@@ -185,7 +185,11 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			if parseErr != nil {
 				return parseErr
 			}
-			if priorTo != p.ToAccount || priorApp != p.AppID {
+			// A different target, app OR mode is a different request under a
+			// reused key. Mode included: the two modes bill different accounts,
+			// and answering a move with the stored result of a keep would tell
+			// the caller its usage moved when it did not.
+			if priorTo != p.ToAccount || priorApp != p.AppID || prior.Mode != p.Mode {
 				outcome = TransferRequestConflict
 				return nil
 			}

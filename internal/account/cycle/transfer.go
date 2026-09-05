@@ -37,8 +37,8 @@ type TransferAppRequest struct {
 
 	// RequestID is api-platform's transfer id, used as the idempotency key. A
 	// replay with the same RequestID returns the stored result; the same
-	// RequestID against a different target is a CONFLICT, never a second
-	// transfer.
+	// RequestID against a different app, target or mode is a CONFLICT, never
+	// a second transfer.
 	RequestID uuid.UUID `json:"request_id"`
 }
 
@@ -200,7 +200,7 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 	case TransferAppUnknown:
 		return nil, billing.NotFound("app_unknown: no live billing mirror for this app")
 	case TransferRequestConflict:
-		return nil, billing.Conflict("app_transfer_conflict: this request_id already transferred a different app or target")
+		return nil, billing.Conflict("app_transfer_conflict: this request_id already transferred a different app, target or mode")
 	case TransferPeriodClosed:
 		return nil, billing.Conflict("app_transfer_period_closed: a billing period for one of these accounts closed while the transfer ran; retry")
 	case TransferChargesPending:

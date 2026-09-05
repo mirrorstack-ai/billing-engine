@@ -967,6 +967,19 @@ func TestTransferAppIsIdempotentOnRequestID(t *testing.T) {
 	_, err = svc.TransferApp(ctx, req)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "app_transfer_conflict")
+
+	// Same key, same target, different MODE ⇒ conflict too. The two modes
+	// bill different accounts; answering a move with a keep's stored result
+	// would tell the caller its usage moved when nothing did.
+	req.OwnerUserID = f.newOwner
+	req.Mode = cycle.TransferModeMove
+	_, err = svc.TransferApp(ctx, req)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "app_transfer_conflict", "a replay with a different mode was answered as applied")
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.app_transfer_events WHERE request_id = $1`,
+		req.RequestID.String()).Scan(&events))
+	require.Equal(t, 1, events)
 }
 
 // A soft-deleted app is NOT_FOUND, not transferable. It is already out of

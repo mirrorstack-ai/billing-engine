@@ -140,7 +140,7 @@ CREATE INDEX IF NOT EXISTS app_transfer_events_app_at_idx
     ON ms_billing.app_transfer_events (app_id, at DESC);
 
 COMMENT ON TABLE ms_billing.app_transfer_events IS
-    'One row per accepted app billing-account transfer. request_id is the caller''s idempotency key; a replay returns the stored result and a different target for the same key is a conflict. Append-only.';
+    'One row per accepted app billing-account transfer. request_id is the caller''s idempotency key; a replay returns the stored result and a different app, target or mode for the same key is a conflict. Append-only.';
 
 -- Append-only, for UPDATE and DELETE alike — the 064/065/066 convention, and
 -- for the same reason. A row here is the answer a replay returns and the only
