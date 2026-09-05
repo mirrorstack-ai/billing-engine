@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS ms_billing.app_transfer_events (
 
     -- NULL when the app was an UNBILLED org roster row (account_id NULL).
     -- "Transferred from no payer" is a real state and is not the same as
-    -- "transferred from an unknown payer".
+    -- "transferred from an unknown payer". EQUAL to to_account when the
+    -- target already held the app: TransferApp answers that as a no-op —
+    -- nothing forfeited, moved or cut — and records it here so the replay
+    -- is verbatim. Deliberately no CHECK (from_account <> to_account).
     from_account      UUID NULL,
     to_account        UUID NOT NULL,
 
