@@ -57,6 +57,25 @@ type RemoveDomainResponse struct {
 // hostname, then reads it back so a duplicate or concurrent registration sees
 // the row that actually won. The app must already exist in the billing mirror;
 // its account_id is the domain's account attribution.
+//
+// AGAINST A CONCURRENT TransferApp, THIS IS FENCED BY THE SCHEMA, NOT BY A
+// LOCK. The account_id written here is read off the app row WITHOUT a lock
+// (AppMirror), and this path takes neither the per-app timer advisory lock nor
+// the apps row that TransferApp serializes on. Two things make a stale read
+// unable to reach disk as a split attribution:
+//
+//   - the FK app_custom_domains.app_id → apps(app_id) takes FOR KEY SHARE on
+//     the app row at INSERT, which conflicts with the transfer's FOR UPDATE.
+//     Whichever gets the row first, the other waits: an insert that wins is
+//     visible to RekeyAppDomains and is re-keyed with the roster; an insert
+//     that waits resumes after the transfer committed;
+//   - the resumed insert then carries the OLD account_id, and 071's deferred
+//     INSERT constraint trigger (app_custom_domains_attribution_agrees) reads
+//     the roster at COMMIT and refuses it — "split app billing attribution" —
+//     so the registration fails and api-platform's retry re-reads the roster.
+//
+// So the invariant holds without this path knowing about transfers; the cost
+// is one refused registration in the race, which is retried, not a bill.
 func (s *Service) RegisterDomain(ctx context.Context, req RegisterDomainRequest) (*RegisterDomainResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")

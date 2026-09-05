@@ -358,6 +358,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.RegisterApp(ctx, req)
 
+	case "TransferApp":
+		var req cycle.TransferAppRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.TransferApp(ctx, req)
+
 	case "SyncAppModules":
 		var req cycle.SyncAppModulesRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -770,6 +777,12 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// Control-plane calls from api-platform → the internal secret + this
 		// route group, same as the other billing writes.
 		r.Post("/v1/billing.RegisterApp", makeHTTPHandler(d, "RegisterApp"))
+		// TransferApp moves an app's billing account to another owner. Same
+		// group, same wrapper, therefore the SAME auth and the same
+		// {ok, response|error} envelope as RegisterApp — api-platform's client
+		// unwraps them identically, and placement is what guarantees that
+		// rather than anything re-implemented here.
+		r.Post("/v1/billing.TransferApp", makeHTTPHandler(d, "TransferApp"))
 		r.Post("/v1/billing.SyncAppModules", makeHTTPHandler(d, "SyncAppModules"))
 		r.Post("/v1/billing.RegisterDomain", makeHTTPHandler(d, "RegisterDomain"))
 		r.Post("/v1/billing.RemoveDomain", makeHTTPHandler(d, "RemoveDomain"))

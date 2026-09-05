@@ -317,6 +317,18 @@ type Store interface {
 	// get-or-create, namespace 'lbto'). No Stripe Customer is created here.
 	EnsureOrgAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, error)
 
+	// EnsureUserAccount is the user twin of EnsureOrgAccount: resolve the
+	// user's billing account, creating the row if none exists. Used ONLY by
+	// TransferApp, which may not refuse an unfunded destination — see
+	// Service.transferTargetAccount for why that is deliberately not
+	// fundedOwnerAccount.
+	EnsureUserAccount(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
+
+	// TransferApp re-points one app's billing account in a single transaction.
+	// The outcome discriminates the refusals so the store never builds a wire
+	// error (same shape as FinalizeOrgDeletionBilling).
+	TransferApp(ctx context.Context, p TransferAppParams) (*TransferAppResponse, TransferOutcome, error)
+
 	// AccountIDByUser resolves a user's EXISTING billing account (Nil, false
 	// when none). The sponsor-designation lookup: a sponsor must already have
 	// an account with a usable default PM — designation never creates one.
@@ -447,7 +459,11 @@ type Store interface {
 	// DrawCreationProrationFromWallet settles ONE app's creation proration through
 	// the universal credit wallet (migration 048, billing-engine #99) ATOMICALLY:
 	// under the app row lock it re-verifies the row is still chargeable (deleted_at
-	// IS NULL AND proration_invoice_id IS NULL), draws charge.AmountMicros from the
+	// IS NULL, proration_invoice_id IS NULL, proration_skipped_at IS NULL, and
+	// account_id still the account charge.AccountID was derived for — a
+	// committed app transfer changes the last two, and the draw returns
+	// ProrationWalletLockedStale rather than debit the new owner's wallet for
+	// the old owner's window), draws charge.AmountMicros from the
 	// append-only credit ledger (per-app idempotency keys, credits-mode unsecured
 	// remainder), and — ONLY when the wallet FULLY covers the amount — freezes the
 	// base snapshot(s) and arms the one-shot guard (with charge.Ref), all in a
@@ -2527,6 +2543,18 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 	if row.ProrationInvoiceID.Valid {
 		return ProrationLockedAlreadyCharged, row.ProrationInvoiceID.String, nil
 	}
+	if row.ProrationSkippedAt.Valid {
+		// 🔴 THE PERMANENT SKIP MARKER IS TERMINAL FOR THIS RAIL TOO. The caller
+		// read it unlocked (ChargeCreationProration returns before reaching
+		// here when it is set); it can arm between that read and this lock —
+		// an app transfer forfeiting the proration (ForfeitAppProrationOnTransfer)
+		// holds this same row FOR UPDATE and commits the marker together with
+		// the re-key. A draw that ignored it would debit the NEW account's
+		// wallet for the OLD account's creation window and arm the guard on a
+		// row that says the charge was forfeited. FreezeCombinedProrationAttempt
+		// makes this exact check for the Stripe rail.
+		return ProrationWalletLockedStale, "", nil
+	}
 	if row.ProrationAttemptedAt.Valid {
 		// A prior attempt already reached the Stripe leg (stamped attempted before its
 		// network call). Never draw the wallet beside money that may have moved — defer to
@@ -2534,6 +2562,14 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 		return ProrationWalletDeferToStripe, "", nil
 	}
 	accountID := uuidFromPg(row.AccountID)
+	if accountID == uuid.Nil || (pc.AccountID != uuid.Nil && accountID != pc.AccountID) {
+		// The amount and the window were derived for pc.AccountID (its anchor,
+		// its wallet). The locked row names another account — the app moved
+		// while this draw waited — so the charge in hand is not this
+		// account's to pay. Same refusal FreezeCombinedProrationAttempt makes
+		// ("app account changed"); no draw, the next sweep re-derives.
+		return ProrationWalletLockedStale, "", nil
+	}
 
 	// Phase 2: allocate the draw under the wallet account + ledger locks. The
 	// account FOR UPDATE also serializes concurrent child ledger INSERTs through
@@ -3226,11 +3262,26 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 		return err
 	}
 	defer deferredRollback(ctx, tx)
-	qtx := s.q.WithTx(tx)
 
 	if err := lockModuleTimers(ctx, tx, appID); err != nil {
 		return err
 	}
+	if err := reconcileModuleTimersToTargetTx(ctx, s.q.WithTx(tx), appID, installedAt, graceExpiresAt, removedAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// reconcileModuleTimersToTargetTx is the body of ReconcileModuleTimersToTarget
+// for a caller that ALREADY holds the per-app module-timer advisory lock in
+// its own transaction. TransferApp is that caller: it takes the lock first
+// (LOCK ORDER, transfer_store.go) and must synthesize an unbilled org app's
+// first timers inside the same transaction as the re-key — a separate
+// ReconcileModuleTimersToTarget call would block on the lock the transfer
+// itself holds, and a post-commit call would leave a crash window in which the
+// app has an account and no timers. The advisory lock is xact-scoped, so the
+// precondition cannot be checked here; the two callers are the guarantee.
+func reconcileModuleTimersToTargetTx(ctx context.Context, qtx *db.Queries, appID uuid.UUID, installedAt, graceExpiresAt, removedAt time.Time) error {
 	row, err := qtx.SelectAppMirror(ctx, appID.String())
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil // no roster row — nothing to reconcile against
@@ -3255,7 +3306,7 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 		// the designation instant (prospective billing, org-billing D1). Shrinks
 		// and removals below still run (they key on app_id only).
 		if !row.AccountID.Valid {
-			return tx.Commit(ctx)
+			return nil
 		}
 		if err := qtx.InsertModuleOverageTimers(ctx, db.InsertModuleOverageTimersParams{
 			AccountID:      uuidFromPg(row.AccountID).String(),
@@ -3275,7 +3326,7 @@ func (s *pgxStore) ReconcileModuleTimersToTarget(ctx context.Context, appID uuid
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // MarkAppDeletedAndRemoveTimers — the deletion write and the timer soft-remove

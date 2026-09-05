@@ -1,0 +1,295 @@
+package cycle
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+)
+
+// TransferAppRequest moves an app's billing account to another owner.
+//
+// Flat snake_case with the owner fields as a XOR pair, matching
+// RegisterAppRequest — api-platform already mirrors that shape, and the RPC
+// surface here is `POST /v1/billing.TransferApp` with the app id in the BODY.
+// This service serves no REST path parameters.
+type TransferAppRequest struct {
+	// AppID is the platform app id (ms_apps.id), as mirrored by RegisterApp.
+	AppID uuid.UUID `json:"app_id"`
+
+	// Exactly one of these is non-zero: the owner the billing account moves TO.
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+
+	// Mode decides what happens to USAGE only, and is never defaulted —
+	// omitting it is INVALID_INPUT rather than a silent "keep", because the
+	// two modes bill different accounts and a caller that forgot the field has
+	// not chosen.
+	//
+	//   keep — no event moves. The old account keeps everything it recorded.
+	//   move — this app's not-yet-invoiced usage in the overlapping open window
+	//          is re-attributed to the new account.
+	//
+	// The account re-key itself is NOT conditional on mode: see TransferApp.
+	Mode string `json:"mode"`
+
+	// RequestID is api-platform's transfer id, used as the idempotency key. A
+	// replay with the same RequestID returns the stored result; the same
+	// RequestID against a different app, target or mode is a CONFLICT, never
+	// a second transfer.
+	RequestID uuid.UUID `json:"request_id"`
+}
+
+// TransferAppResponse reports what the transfer did.
+//
+// Every instant is a time.Time and marshals as an RFC3339 UTC timestamp —
+// api-platform decodes the whole response into typed fields, so a bare date
+// string here would fail its decode AFTER the money had already moved.
+type TransferAppResponse struct {
+	// AccountID is the app's billing account after the transfer.
+	AccountID uuid.UUID `json:"account_id"`
+
+	// MovedEventCount is how many usage/infra events were re-attributed.
+	// Always 0 for mode="keep". On a replay this is the STORED count, not a
+	// recount — the second caller must see what the first one did.
+	MovedEventCount int64 `json:"moved_event_count"`
+
+	// RepointedEventCount is how many of the app's NULL-account events the
+	// transfer handed to the new account — usage a USER-rostered app recorded
+	// after api-platform re-seated its payer to the new owner but before this
+	// call created that owner's billing account (ingest stamps the payer; a
+	// payer with no account row lands the event with no account). Rows inside
+	// the new account's open window are its own and come across in BOTH
+	// modes; older ones stay unbilled (D1d). Always 0 for an org-rostered
+	// app, whose NULL rows refuse the transfer instead. Stored on the ledger
+	// and, like MovedEventCount, returned verbatim on a replay.
+	RepointedEventCount int64 `json:"repointed_event_count"`
+
+	// OpenPeriod is the TARGET account's open window: the period the app now
+	// bills in. On a replay this, like RecurringFrom, is the STORED window
+	// from the first call, not one recomputed from the replay's clock.
+	OpenPeriod TransferPeriod `json:"open_period"`
+
+	// RecurringFrom is the new account's next anchored boundary — the first
+	// boundary at which this app's recurring fees bill to the new account.
+	//
+	// It is NOT the transfer instant, and the gap is not a rounding error.
+	// Recurring fees are PREPAID at the boundary that OPENS a period
+	// (charge.go: boundaryTotal = arrears + advanceBase + advanceOverage +
+	// advanceDomains, where the advance legs cover the period that is just
+	// starting). So the period containing this transfer was already paid for by
+	// the OLD account and cannot move: no refund, no proration, matching this
+	// schema's prospective-removal posture. Because periods are anchored PER
+	// ACCOUNT, the two boundaries differ, leaving at most one whole unit of gap
+	// or overlap in recurring coverage. Accepted for v1 and surfaced here so
+	// the console can tell the customer the date rather than let them discover
+	// it on a bill.
+	//
+	// For an UNFUNDED destination it is a date, not a promise of a charge. An
+	// unfunded owner is accepted on purpose (transferTargetAccount), but the
+	// cycle charges activated accounts only (cmd/billing-cycle runCycle;
+	// an unactivated account is rolled up, never charged), and a boundary on a
+	// prepaid or card-less account is skipped and retained for the next run
+	// (skipped_prepaid / skipped_no_pm, charge.go). So recurring_from names the
+	// first boundary that WOULD bill the app to the new account; the first that
+	// DOES is the first one after that account funds. An unactivated target has
+	// no anchor yet either: the boundary reported here is computed on the
+	// default anchor (transferWindows), and activation sets the anchor its
+	// boundaries actually run on.
+	//
+	// 🔴 THAT ACCEPTANCE IS FOR mode="keep". A move into an UNACTIVATED
+	// target is refused (CONFLICT, prefix app_transfer_target_unfunded: "move
+	// needs a funded billing account; keep is available"). The recurring gap
+	// above is one whole unit at most and is reported; a move's usage would
+	// be lost outright: the rows leave the old account's open period, which
+	// its funded boundary would have billed, for an account the cycle rolls
+	// up but never hands to the charge phase — and once the calendar month
+	// holding them closes (the unactivated rollup), activation re-windows v2
+	// observations only and the first charged run starts past that month, so
+	// nothing ever bills them. The check runs inside the transfer transaction
+	// under the target's activation lock, after the same-account no-op (which
+	// moves nothing) and before any write. Host decision 2026-09-05 (§2.1):
+	// api-platform refuses the same at create and at accept from the target's
+	// standing, and the console offers keep only for an unfunded target, so
+	// this refusal is the money authority's backstop, not the first notice.
+	RecurringFrom time.Time `json:"recurring_from"`
+}
+
+// TransferPeriod is a half-open [start, end) billing window.
+type TransferPeriod struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+// Transfer modes. Closed set; anything else is INVALID_INPUT.
+const (
+	TransferModeKeep = "keep"
+	TransferModeMove = "move"
+)
+
+// TransferApp re-points an app's billing account to another owner.
+//
+// WHAT ALWAYS HAPPENS, in both modes and in ONE transaction: ms_billing.apps
+// (account_id + the owner columns) and the app's live app_module_overage_timers
+// and app_custom_domains rows all move to the new account. That is unconditional
+// because the expensive direction is being LATE, not early: an app whose roster
+// row still names the old account at the next boundary makes that account prepay
+// another whole period of base, module-overage and domain fees for an app it no
+// longer owns — against a schema that never credits an already-charged period.
+//
+// WHAT MODE DECIDES: usage only. See TransferAppRequest.Mode.
+//
+// WHAT ALSO ALWAYS HAPPENS, for LEVEL meters: every time_weighted stream the
+// old account still holds for the app is cut with a zero-level sample at the
+// hand-off (the transfer instant; the move window's start in move mode). The
+// rollup holds a stream's last sample until period end, so without the cut the
+// old account would keep billing the level it last saw across a stretch the
+// new account also bills. Peak is not cut: the old period keeps the peak it
+// reached, and the new account's first sample back-filling to its own period
+// start is the rollup's ordinary mid-period-start rule, not a transfer rule
+// (app_transfer.sql, TerminateAppLevelStreamsOnTransfer).
+//
+// WHAT NEVER HAPPENS: an issued or closed invoice is never touched, and no
+// usage is re-attributed into a period the target account has already closed
+// (INV-011 — a transfer may not rewrite a fact that has already been billed).
+//
+// WHAT NEVER TRAVELS: a one-time charge the OLD account still owes for the app
+// — its creation proration, a domain activation, a module's grace overage.
+// Each is billed by its sweep to whoever the row names WHEN THE SWEEP RUNS, so
+// re-keying with one outstanding would bill the new owner for a window it did
+// not own. If the old account can settle it soon (activated, arrears, a usable
+// card — or, for the proration and timer legs, activated and in credits mode
+// with the wallet rail enforced, since those legs draw the wallet ahead of
+// the card and mode gates) or already has an attempt in flight, the transfer
+// REFUSES with app_transfer_charges_pending and the caller retries after the
+// sweep. If it cannot — never activated, prepaid, no card, or no account at all — the
+// charge is FORFEITED inside the transfer transaction and recorded on the
+// ledger row (forfeited_* / forfeit_reason, migration 071): nobody is ever
+// billed for it, which is the D1d no-retroactive-catch-up posture applied at
+// the instant the app leaves. The refusal is BOUNDED on purpose: an
+// unconditional one would have made a never-funded personal account unable to
+// hand its app to an org, ever (transfer_store.go, transferChargeDisposition).
+//
+// WHAT BLOCKS IT: usage an ORG-rostered app recorded with no account at all
+// (the lazy org backlog). The repoint sweep finds that backlog through the
+// roster column this transfer rewrites, so moving the app would bill it to
+// the wrong org or strand it; app_transfer_unbilled_backlog until the old org
+// funds it.
+//
+// WHAT ALSO BLOCKS IT: a move into a target that has never activated
+// (app_transfer_target_unfunded). Usage moved there is un-charged — see
+// TransferAppResponse.RecurringFrom. keep to the same target is allowed.
+//
+// WHAT DOES NOT BLOCK IT, AND COMES ACROSS INSTEAD: a USER-rostered app's
+// NULL-account rows. api-platform re-seats the app's payer before it calls
+// this RPC, ingest stamps the primary payer on every event, and a payer that
+// has no billing account yet lands the event with none — a row no sweep can
+// ever reach, because the org sweep is scoped by owner_org_id. Refusing on
+// it would refuse on every retry, forever, for a target that has never paid.
+// Those rows were stamped for the target, so the transfer takes them: the
+// ones inside the target's open window are repointed to the target's account
+// with the org sweep's clamp, in both modes, and counted as
+// RepointedEventCount; older ones are left unbilled, as usage recorded for a
+// payer with no account always is (D1d). Host decision 2026-09-05,
+// APP-TRANSFER-SPEC §2.1 — the org-rostered refusal is unchanged.
+//
+// WHAT IS A NO-OP: a transfer to the owner whose account already holds the
+// app. Nothing is forfeited, moved or cut — run as a real transfer against one
+// account each of those would under-bill it — and only the ledger row is
+// written, so the answer is the account's window and the replay is verbatim.
+// api-platform refuses the same principal on its own payer table; this is the
+// money authority's answer when the two tables have drifted.
+//
+// Idempotency: the (request_id) row in app_transfer_events is the record. A
+// replay returns it verbatim — the count, the window and recurring_from are
+// all read from the row, none recomputed — and the same request_id aimed at
+// a different target is a conflict.
+func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*TransferAppResponse, error) {
+	if req.AppID == uuid.Nil {
+		return nil, billing.InvalidInput("app_id required")
+	}
+	if req.RequestID == uuid.Nil {
+		return nil, billing.InvalidInput("request_id required")
+	}
+	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
+	}
+	if req.OwnerUserID != uuid.Nil && req.OwnerOrgID != uuid.Nil {
+		return nil, billing.InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
+	}
+	if req.Mode != TransferModeKeep && req.Mode != TransferModeMove {
+		return nil, billing.InvalidInput(`mode must be "keep" or "move"`)
+	}
+
+	target, err := s.transferTargetAccount(ctx, req.OwnerUserID, req.OwnerOrgID)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, outcome, err := s.store.TransferApp(ctx, TransferAppParams{
+		AppID:            req.AppID,
+		RequestID:        req.RequestID,
+		ToAccount:        target,
+		OwnerUserID:      req.OwnerUserID,
+		OwnerOrgID:       req.OwnerOrgID,
+		Mode:             req.Mode,
+		At:               s.nowFn().UTC(),
+		CreditWalletRail: s.creditWalletRailEnabled,
+	})
+	if err != nil {
+		return nil, billing.Internal("app transfer failed", err)
+	}
+
+	// billing.Code is a CLOSED set, so the token travels as a message prefix
+	// and api-platform matches on the CODE. Documented on the RPC contract.
+	switch outcome {
+	case TransferAppUnknown:
+		return nil, billing.NotFound("app_unknown: no live billing mirror for this app")
+	case TransferRequestConflict:
+		return nil, billing.Conflict("app_transfer_conflict: this request_id already transferred a different app, target or mode")
+	case TransferPeriodClosed:
+		return nil, billing.Conflict("app_transfer_period_closed: a billing period for one of these accounts closed while the transfer ran; retry")
+	case TransferChargesPending:
+		return nil, billing.Conflict("app_transfer_charges_pending: a one-time charge for this app is still settling on its current account; retry after the sweeps run")
+	case TransferUnbilledBacklog:
+		return nil, billing.Conflict("app_transfer_unbilled_backlog: this app has usage recorded before its organization designated funding; that backlog must be attached to the current organization's account before the app can move")
+	case TransferTargetUnfunded:
+		return nil, billing.Conflict("app_transfer_target_unfunded: move needs a funded billing account; keep is available")
+	}
+	return resp, nil
+}
+
+// transferTargetAccount resolves — and creates if absent — the billing account
+// of the owner an app is being transferred TO.
+//
+// 🔴 THIS IS DELIBERATELY NOT fundedOwnerAccount, AND MUST NOT BECOME IT.
+// That function refuses an owner with no account, no activation, or no usable
+// card, because refusing to CREATE an app is cheap and reversible. Refusing to
+// TRANSFER one is not: the app already exists and is already accruing, so a
+// refusal here would strand it on an owner who has asked to stop paying for it.
+// The owner's decision (2026-09-04) is that an unfunded destination is allowed —
+// the account simply reads blocked and the existing serving-block does its job.
+// The one thing an unfunded destination may not receive is a MOVE of usage,
+// and that is the store's refusal under the target's lock, not a gate here
+// (TransferAppResponse.RecurringFrom says why).
+//
+// It is a separate function rather than a flag on fundedOwnerAccount because
+// that function has exactly one caller and four tests pinning its refusals;
+// parameterising it would put the app-CREATION funding gate one boolean away
+// from being switched off by a future caller.
+func (s *Service) transferTargetAccount(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (uuid.UUID, error) {
+	if ownerOrgID != uuid.Nil {
+		id, err := s.store.EnsureOrgAccount(ctx, ownerOrgID)
+		if err != nil {
+			return uuid.Nil, billing.Internal("org account resolution failed", err)
+		}
+		return id, nil
+	}
+	id, err := s.store.EnsureUserAccount(ctx, ownerUserID)
+	if err != nil {
+		return uuid.Nil, billing.Internal("owner account resolution failed", err)
+	}
+	return id, nil
+}

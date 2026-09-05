@@ -2081,6 +2081,53 @@ marked and the rest is left open rather than rounded up.
     the notice owed before the first boundary that charges it. Until it ships,
     the bill still carries the line and the markup. See
     [`SECURITY.md`](../SECURITY.md#known-current-gaps).
+
+    **The transfer half is settled, and it ships as migration 071 plus the
+    `TransferApp` RPC (2026-09-04).** An app's billing account may be moved to
+    another owner. The re-key itself — the roster row and the live domain and
+    overage-timer rows — happens at acceptance, unconditionally: recurring fees
+    are PREPAID by the boundary that opens a period, so an app still on the old
+    roster at the next boundary would make that account prepay a further period
+    for an app it no longer owns, against a schema that never credits a period
+    already charged. The period containing the transfer therefore stays with
+    the OLD account (no refund, no day-proration — the whole-unit rule the
+    recurring fees already use) and the new account's first recurring charge
+    for the app falls at its own next boundary, which the RPC reports as
+    `recurring_from`.
+
+    The caller's `mode` decides USAGE only. `keep`: every recorded event stays
+    with the account that recorded it. `move`: the app's not-yet-invoiced usage
+    in the window both open periods share is re-attributed to the new account —
+    and only into an ACTIVATED account, because usage moved into one the cycle
+    never charges would be billed to nobody (`app_transfer_target_unfunded`;
+    `keep` to the same account is allowed). In both modes a time-weighted
+    (level) stream is cut on the old account at the hand-off, so the old
+    account's integral stops where the new account's begins, and in both modes
+    a user-rostered app's usage recorded with no account inside the new
+    account's open window — stamped for the new payer before its account
+    existed — follows the app to that account (older such rows stay unbilled,
+    D1d); an org-rostered app's no-account backlog refuses the transfer instead
+    (`app_transfer_unbilled_backlog`).
+
+    The rule that bounds it: **backdated re-attribution is permitted only within
+    the OPEN period; an issued or closed invoice never moves.** That is what
+    keeps this compatible with INV-006 and INV-011 — a transfer cannot rewrite a
+    fact that has already been billed, so no obligation is reassigned after the
+    fact. One-time charges the old account still owes for the app (creation
+    proration, a domain activation, a module's grace overage) never travel: the
+    transfer refuses while the old account is about to settle one, and forfeits
+    it — nobody is billed — when that account never could.
+
+    🔴 **This settles the payer-transfer question only. The
+    infrastructure-pricing migration described above — the new price, re-price
+    at the next boundary versus grandfather, and the notice owed — remains
+    open**, and nothing in this wave touches it. The two subjects share a number
+    and not a decision.
+
+    Note what is deliberately NOT claimed: this is a field update, not the
+    typed payer cutoff §5's `BillingResponsibilityTransfer` describes. Every original instant is preserved and every transfer is recorded
+    in `ms_billing.app_transfer_events`, so a typed cutoff can still be
+    reconstructed from what this RPC did — but it has not been built.
 16. **Consent authority, and reads you can verify yourself.** Whether
     billing-engine must be able to distrust `api-platform` about who accepted a
     charge, and about who may read the evidence.
