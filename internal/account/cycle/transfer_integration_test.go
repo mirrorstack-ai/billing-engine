@@ -2196,6 +2196,26 @@ func TestTransferAppReKeysASettledChildPastARetiredFunder(t *testing.T) {
 		domainID.String(), orgAcct.String())
 	require.Error(t, err, "control: a settled domain was re-keyed into a retired org")
 	require.Contains(t, err.Error(), "is retired")
+
+	// The mutant, run rather than described: 072's down restores the 052
+	// bodies, and the same transfer aborts in the guard; the up restores it.
+	_, err = f.pool.Exec(ctx, migrationSQL(t, "072_rekey_settled_children_past_retired_funder.down.sql"))
+	require.NoError(t, err)
+	_, err = svc.TransferApp(ctx, cycle.TransferAppRequest{
+		AppID: f.appID, OwnerUserID: f.oldOwner, Mode: cycle.TransferModeKeep, RequestID: uuid.New(),
+	})
+	require.Error(t, err, "under the 052 bodies the settled child's retired funder must still block the transfer — or this test is not testing 072")
+	require.Contains(t, err.Error(), "is retired")
+	require.Equal(t, f.newAcct.String(), f.rosterAccount(t), "an aborted transfer re-keyed the roster")
+	_, err = f.pool.Exec(ctx, migrationSQL(t, "072_rekey_settled_children_past_retired_funder.up.sql"))
+	require.NoError(t, err)
+	third, err := svc.TransferApp(ctx, cycle.TransferAppRequest{
+		AppID: f.appID, OwnerUserID: f.oldOwner, Mode: cycle.TransferModeKeep, RequestID: uuid.New(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, f.oldAcct, third.AccountID)
+	require.Equal(t, f.oldAcct.String(), accountOf("app_module_overage_timers", timerID))
+	require.Equal(t, f.oldAcct.String(), accountOf("app_custom_domains", domainID))
 }
 
 // advanceBaseLine returns the amount of the ONE "advance:base" line the
