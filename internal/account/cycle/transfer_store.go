@@ -215,6 +215,27 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			fromAccount = app.AccountID.Bytes
 		}
 
+		// 🔴 A TRANSFER TO THE ACCOUNT THAT ALREADY HOLDS THE APP IS A NO-OP,
+		// and it has to be recognised as one HERE, because every step below
+		// assumes from ≠ to. Run against one account they under-bill it: the
+		// forfeit resolves charges the account still owes to itself, the move
+		// "re-attributes" every open-window row from the account to the same
+		// account and reports them as moved, and the level cut plants a
+		// zero-level sample on the account that keeps the stream, so its
+		// rollup bills that level as 0 from the hand-off until the next real
+		// sample. api-platform refuses the same principal on its own payer
+		// table (§1.2), so this input reaches billing-engine only when the two
+		// tables have drifted — and billing-engine is the money authority for
+		// it. Nothing is written but the ledger row, so a replay is verbatim.
+		if fromAccount != uuid.Nil && fromAccount == p.ToAccount {
+			resp, err = s.recordSameAccountTransfer(ctx, tx, qtx, p)
+			if err != nil {
+				return err
+			}
+			outcome = TransferApplied
+			return nil
+		}
+
 		// 🔴 THE BACKLOG REFUSAL. Usage this app recorded with NO account is
 		// reachable only through apps.owner_org_id (RepointOrgNullAccountEvents),
 		// which the re-key below rewrites. Moving the app would either hand
@@ -421,6 +442,44 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		return nil, TransferApplied, err
 	}
 	return resp, outcome, nil
+}
+
+// recordSameAccountTransfer answers a transfer whose target already holds the
+// app: the target's window and next boundary, exactly as a real transfer
+// answers them, written to the ledger so a replay returns the same dates.
+// The roster, the children, the usage and the level streams are all left
+// exactly as they are — the account the caller named is the account they
+// already bill to. Reads the target's anchor under its activation lock (step
+// 3 of the LOCK ORDER, one account) so the window cannot change under the
+// insert.
+func (s *pgxStore) recordSameAccountTransfer(ctx context.Context, tx pgx.Tx, qtx *db.Queries, p TransferAppParams) (*TransferAppResponse, error) {
+	if err := s.barrierBothAccounts(ctx, tx, qtx, uuid.Nil, p.ToAccount, p.At); err != nil {
+		return nil, err
+	}
+	window, from, err := s.transferWindows(ctx, qtx, p.ToAccount, p.At)
+	if err != nil {
+		return nil, err
+	}
+	if err := qtx.InsertAppTransferEvent(ctx, db.InsertAppTransferEventParams{
+		RequestID:       p.RequestID.String(),
+		AppID:           p.AppID.String(),
+		FromAccount:     pgtype.UUID{Bytes: p.ToAccount, Valid: true},
+		ToAccount:       p.ToAccount.String(),
+		Mode:            p.Mode,
+		MovedEventCount: 0,
+		At:              p.At,
+		OpenPeriodStart: window.Start,
+		OpenPeriodEnd:   window.End,
+		RecurringFrom:   from,
+	}); err != nil {
+		return nil, err
+	}
+	return &TransferAppResponse{
+		AccountID:       p.ToAccount,
+		MovedEventCount: 0,
+		OpenPeriod:      window,
+		RecurringFrom:   from,
+	}, nil
 }
 
 // transferChargeDisposition decides what happens to the one-time charges the

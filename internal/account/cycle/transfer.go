@@ -148,6 +148,13 @@ const (
 // this transfer rewrites, so moving the app would bill it to the wrong org or
 // strand it; app_transfer_unbilled_backlog until the old org funds it.
 //
+// WHAT IS A NO-OP: a transfer to the owner whose account already holds the
+// app. Nothing is forfeited, moved or cut — run as a real transfer against one
+// account each of those would under-bill it — and only the ledger row is
+// written, so the answer is the account's window and the replay is verbatim.
+// api-platform refuses the same principal on its own payer table; this is the
+// money authority's answer when the two tables have drifted.
+//
 // Idempotency: the (request_id) row in app_transfer_events is the record. A
 // replay returns it verbatim — the count, the window and recurring_from are
 // all read from the row, none recomputed — and the same request_id aimed at

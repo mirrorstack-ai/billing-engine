@@ -846,6 +846,93 @@ func TestTransferAppRefusesWhileAnUnbilledBacklogExists(t *testing.T) {
 	require.Equal(t, f.newAcct, resp.AccountID)
 }
 
+// 🔴 A TRANSFER TO THE ACCOUNT THAT ALREADY HOLDS THE APP CHANGES NOTHING.
+// Run as an ordinary transfer against one account it would under-bill that
+// account three ways: forfeit a proration it still owes to itself, "move"
+// every open-window row from the account to the same account and report
+// them as moved, and plant a zero-level sample on the account that keeps
+// the stream, so its rollup bills the level as 0 from the hand-off until the
+// next real sample. api-platform refuses the same principal on its own payer
+// table; this is what billing-engine answers when the two tables have
+// drifted. The fixture is arranged so every one of the three writes WOULD
+// fire under the mutant: an unactivated old account owing its proration
+// (forfeit), open-window count events (move), a gauge stream (cut).
+//
+// Mutation: drop the from == to guard and proration_skipped_at is armed,
+// MovedEventCount reads 2 and a zero sample appears on the account.
+func TestTransferAppToTheCurrentAccountIsANoOp(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixtureWith(t, transferSeed{newActivated: mustTime(t, "2026-05-04T00:00:00Z")})
+	f.owePendingProration(t)
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+	seedMetricDef(t, f.pool, f.moduleID, "storage.gib_hours", usage.KindTimeWeighted, 1_000)
+	for _, at := range []string{"2026-08-05T10:00:00Z", "2026-08-10T10:00:00Z"} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.usage_events
+			    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+			VALUES ($1, $2, $3, $4, 'orders.placed', 'count', 1, $5)`,
+			uuid.NewString(), f.oldAcct.String(), f.appID.String(), f.moduleID.String(), mustTime(t, at))
+		require.NoError(t, err)
+	}
+	f.gaugeSample(t, f.oldAcct, "storage.gib_hours", 10, "2026-08-10T00:00:00Z")
+
+	svc := transferSvc(t, f)
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.oldOwner, // the account that already holds the app
+		Mode:        cycle.TransferModeMove,
+		RequestID:   uuid.New(),
+	}
+	resp, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, f.oldAcct, resp.AccountID)
+	require.Equal(t, int64(0), resp.MovedEventCount, "rows were counted as moved from the account to itself")
+	// The unactivated account's window is the default-anchored one.
+	requireSameInstant(t, mustTime(t, "2026-08-01T00:00:00Z"), resp.OpenPeriod.Start, "open_period.start")
+	requireSameInstant(t, mustTime(t, "2026-09-01T00:00:00Z"), resp.RecurringFrom, "recurring_from")
+
+	require.Equal(t, f.oldAcct.String(), f.rosterAccount(t))
+	var skippedAt *time.Time
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT proration_skipped_at FROM ms_billing.apps WHERE app_id = $1`, f.appID.String()).Scan(&skippedAt))
+	require.Nil(t, skippedAt, "the account's own pending proration was forfeited by a transfer to itself")
+	require.Equal(t, 0, f.terminalSamples(t, f.oldAcct, req.RequestID, f.now),
+		"a zero-level sample was planted on the account that keeps the stream")
+	var onOld int
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.usage_events WHERE app_id = $1 AND account_id = $2`,
+		f.appID.String(), f.oldAcct.String()).Scan(&onOld))
+	require.Equal(t, 3, onOld)
+
+	// Recorded, so a replay answers the same dates, and recorded as what it
+	// was: from and to the same account, nothing moved, nothing forfeited.
+	row, found := f.ledgerRow(t, req.RequestID)
+	require.True(t, found, "a no-op transfer must still be recorded for its replay")
+	require.NotNil(t, row.fromAccount)
+	require.Equal(t, f.oldAcct.String(), *row.fromAccount)
+	require.False(t, row.forfeitedProration)
+	require.Nil(t, row.forfeitReason)
+	again, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resp.AccountID, again.AccountID)
+	require.Equal(t, resp.MovedEventCount, again.MovedEventCount)
+	requireSameInstant(t, resp.OpenPeriod.Start, again.OpenPeriod.Start, "replayed open_period.start")
+	requireSameInstant(t, resp.OpenPeriod.End, again.OpenPeriod.End, "replayed open_period.end")
+	requireSameInstant(t, resp.RecurringFrom, again.RecurringFrom, "replayed recurring_from")
+
+	// The control: the same fixture transferred to the OTHER account does
+	// all three things — so the assertions above are about the guard.
+	req.OwnerUserID = f.newOwner
+	req.RequestID = uuid.New()
+	moved, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, f.newAcct, moved.AccountID)
+	require.Equal(t, int64(3), moved.MovedEventCount, "control: the real transfer moves the open-window rows")
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT proration_skipped_at FROM ms_billing.apps WHERE app_id = $1`, f.appID.String()).Scan(&skippedAt))
+	require.NotNil(t, skippedAt, "control: the real transfer forfeits the unactivated account's proration")
+}
+
 // api-platform fires this post-commit with retry, so a replay must return the
 // FIRST result rather than transfer again.
 func TestTransferAppIsIdempotentOnRequestID(t *testing.T) {
