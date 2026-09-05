@@ -133,9 +133,11 @@ const (
 // Each is billed by its sweep to whoever the row names WHEN THE SWEEP RUNS, so
 // re-keying with one outstanding would bill the new owner for a window it did
 // not own. If the old account can settle it soon (activated, arrears, a usable
-// card) or already has an attempt in flight, the transfer REFUSES with
-// app_transfer_charges_pending and the caller retries after the sweep. If it
-// cannot — never activated, prepaid, no card, or no account at all — the
+// card — or, for the proration and timer legs, activated and in credits mode
+// with the wallet rail enforced, since those legs draw the wallet ahead of
+// the card and mode gates) or already has an attempt in flight, the transfer
+// REFUSES with app_transfer_charges_pending and the caller retries after the
+// sweep. If it cannot — never activated, prepaid, no card, or no account at all — the
 // charge is FORFEITED inside the transfer transaction and recorded on the
 // ledger row (forfeited_* / forfeit_reason, migration 071): nobody is ever
 // billed for it, which is the D1d no-retroactive-catch-up posture applied at
@@ -182,13 +184,14 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 	}
 
 	resp, outcome, err := s.store.TransferApp(ctx, TransferAppParams{
-		AppID:       req.AppID,
-		RequestID:   req.RequestID,
-		ToAccount:   target,
-		OwnerUserID: req.OwnerUserID,
-		OwnerOrgID:  req.OwnerOrgID,
-		Mode:        req.Mode,
-		At:          s.nowFn().UTC(),
+		AppID:            req.AppID,
+		RequestID:        req.RequestID,
+		ToAccount:        target,
+		OwnerUserID:      req.OwnerUserID,
+		OwnerOrgID:       req.OwnerOrgID,
+		Mode:             req.Mode,
+		At:               s.nowFn().UTC(),
+		CreditWalletRail: s.creditWalletRailEnabled,
 	})
 	if err != nil {
 		return nil, billing.Internal("app transfer failed", err)

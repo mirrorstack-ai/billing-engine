@@ -629,6 +629,7 @@ func (q *Queries) TerminateAppLevelStreamsOnTransfer(ctx context.Context, arg Te
 const transferSourceSettlement = `-- name: TransferSourceSettlement :one
 SELECT (a.activated_at IS NOT NULL)::bool AS activated,
        (a.usage_billing_mode = 'arrears')::bool AS arrears,
+       (a.billing_mode = 'credits')::bool AS credits,
        EXISTS (
            SELECT 1
            FROM ms_billing.payment_methods_mirror payment_method
@@ -648,13 +649,14 @@ WHERE a.id = $1::uuid
 type TransferSourceSettlementRow struct {
 	Activated              bool `json:"activated"`
 	Arrears                bool `json:"arrears"`
+	Credits                bool `json:"credits"`
 	HasUsablePaymentMethod bool `json:"has_usable_payment_method"`
 }
 
 // TransferSourceSettlement reads whether the OLD account could settle its
 // unresolved one-time charges SOON, which decides refuse-versus-forfeit.
 //
-// The three facts are exactly the gates the charge legs apply before they
+// The facts are exactly the gates the charge legs apply before they
 // collect, read from the same rows: activation (the D1d gate,
 // ChargeCreationProration / DomainsPendingCharge / ModuleOverageTimersPastGrace
 // all skip an unactivated account), collection mode (offSessionChargePermitted:
@@ -666,6 +668,17 @@ type TransferSourceSettlementRow struct {
 // sweep collects and the transfer refuses; any false ⇒ the sweep would skip
 // transiently, on every run, for as long as the account stays so — the
 // forever-blocked transfer the bounded rule exists to prevent.
+//
+// credits is the FOURTH gate, and it sits in FRONT of the mode and card
+// gates on two of the three legs: a credits-mode account (billing_mode,
+// migration 048) settles its creation proration and its module overage from
+// the credit wallet BEFORE offSessionChargePermitted and the PM gate are
+// asked (proration.go / overage.go, the wallet blocks), and credits mode
+// always covers through its unsecured remainder. So with the wallet rail
+// enabled for the account, activated + credits ⇒ those two legs collect on
+// the next sweep whatever the card or the collection mode say. The store
+// reads the rail state (rollout, per account) and combines it with this
+// column; the domain leg has no wallet block and keeps the three gates.
 // The LEFT JOIN keeps the row for an account with no authorization row (the
 // 052 trigger creates one on every account insert, so this is belt and
 // braces): no funder ⇒ no usable card.
@@ -678,6 +691,11 @@ type TransferSourceSettlementRow struct {
 func (q *Queries) TransferSourceSettlement(ctx context.Context, accountID string) (TransferSourceSettlementRow, error) {
 	row := q.db.QueryRow(ctx, transferSourceSettlement, accountID)
 	var i TransferSourceSettlementRow
-	err := row.Scan(&i.Activated, &i.Arrears, &i.HasUsablePaymentMethod)
+	err := row.Scan(
+		&i.Activated,
+		&i.Arrears,
+		&i.Credits,
+		&i.HasUsablePaymentMethod,
+	)
 	return i, err
 }

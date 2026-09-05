@@ -169,3 +169,29 @@ func TestTransferAppReturnsTheStoreResultVerbatim(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, stored, got)
 }
+
+// 🔴 The wallet rail reaches the store as the service's OWN predicate, never
+// as a copied flag: creditWalletRailEnabled is the schema flag AND the
+// per-account rollout decision, and the refuse/forfeit classification has to
+// ask exactly what the proration and overage legs ask. With no rollout
+// controller installed the answer is the schema flag, which is what these
+// two cases read.
+func TestTransferAppPassesTheWalletRailPredicate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+	}{{"rail off", false}, {"rail on", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, store := transferService(t)
+			svc = svc.WithCreditWallet(tc.enabled)
+
+			_, err := svc.TransferApp(context.Background(), validTransfer())
+			require.NoError(t, err)
+
+			require.Len(t, store.transferCalls, 1)
+			rail := store.transferCalls[0].CreditWalletRail
+			require.NotNil(t, rail, "the store was not handed the wallet rail predicate")
+			require.Equal(t, tc.enabled, rail(uuid.New()))
+		})
+	}
+}

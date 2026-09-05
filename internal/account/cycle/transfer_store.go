@@ -27,6 +27,15 @@ type TransferAppParams struct {
 	OwnerOrgID  uuid.UUID
 	Mode        string
 	At          time.Time
+
+	// CreditWalletRail reports whether the credit-wallet rail is ENFORCED for
+	// an account (Service.creditWalletRailEnabled: the schema flag and the
+	// per-account rollout decision). The refuse/forfeit classification needs
+	// it because a credits-mode account settles its creation proration and
+	// module overage from the wallet ahead of the card and collection-mode
+	// gates — but only when this says the rail is on. nil means off, which
+	// is the exact legacy path.
+	CreditWalletRail func(account uuid.UUID) bool
 }
 
 // TransferOutcome discriminates the store's non-error refusals, so the service
@@ -304,7 +313,7 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		if err != nil {
 			return err
 		}
-		forfeit, refuse, err := s.transferChargeDisposition(ctx, qtx, fromAccount, charges)
+		forfeit, refuse, err := s.transferChargeDisposition(ctx, qtx, p, fromAccount, charges)
 		if err != nil {
 			return err
 		}
@@ -501,6 +510,14 @@ func (s *pgxStore) recordSameAccountTransfer(ctx context.Context, tx pgx.Tx, qtx
 //     arrears AND a usable card on its funder (TransferSourceSettlement — the
 //     three gates the legs themselves apply). The next sweep collects, and the
 //     caller retries after it.
+//   - REFUSE, likewise, when the old account is in CREDITS mode with the
+//     wallet rail enforced for it and the proration or a timer is pending:
+//     those two legs draw the wallet BEFORE they ask about the card or the
+//     collection mode (proration.go / overage.go), and credits mode always
+//     covers through its unsecured remainder, so "no card" and "prepaid"
+//     are not states the sweep skips them in. Forfeiting there would throw
+//     away a charge the wallet was one sweep from paying. Domains have no
+//     wallet leg and keep the three gates.
 //   - REFUSE, unconditionally, when a charge is already IN FLIGHT: armed at the
 //     provider (charge_attempted_at) or frozen into an unresolved combined
 //     attempt. Money may have moved; forfeiting it would leave a collected
@@ -519,7 +536,7 @@ func (s *pgxStore) recordSameAccountTransfer(ctx context.Context, tx pgx.Tx, qtx
 // The reason is the FIRST failing gate in the legs' own order (activation,
 // then mode, then card), which is also the order in which an account acquires
 // them.
-func (s *pgxStore) transferChargeDisposition(ctx context.Context, qtx *db.Queries, from uuid.UUID, charges db.AppUnresolvedOneTimeChargesRow) (transferForfeit, bool, error) {
+func (s *pgxStore) transferChargeDisposition(ctx context.Context, qtx *db.Queries, p TransferAppParams, from uuid.UUID, charges db.AppUnresolvedOneTimeChargesRow) (transferForfeit, bool, error) {
 	pending := charges.ProrationPending || charges.DomainPending > 0 || charges.TimerPending > 0
 	if !pending {
 		return transferForfeit{}, false, nil
@@ -543,6 +560,13 @@ func (s *pgxStore) transferChargeDisposition(ctx context.Context, qtx *db.Querie
 		// ErrNoRows included: the roster row's account_id is a hard FK, so a
 		// missing accounts row under the app lock is a code bug, not a skip.
 		return transferForfeit{}, false, fmt.Errorf("transfer source account %s: %w", from, err)
+	}
+	// The wallet gate, ahead of the mode and card gates exactly as the legs
+	// order them: an activated credits-mode account with the rail enforced
+	// settles its proration and its timers from the wallet on the next sweep.
+	walletSettles := src.Activated && src.Credits && p.CreditWalletRail != nil && p.CreditWalletRail(from)
+	if walletSettles && (charges.ProrationPending || charges.TimerPending > 0) {
+		return transferForfeit{}, true, nil
 	}
 	switch {
 	case !src.Activated:

@@ -520,6 +520,75 @@ func TestTransferAppForfeitsWhatTheOldAccountCannotSettle(t *testing.T) {
 	}
 }
 
+// 🔴 THE WALLET IS A WAY TO SETTLE, AND IT COMES BEFORE THE CARD. A
+// credits-mode account (billing_mode, 048) settles its creation proration
+// and its module overage from the credit wallet BEFORE the collection-mode
+// and payment-method gates are asked (proration.go / overage.go), and credits
+// mode always covers through its unsecured remainder. Classified on
+// activation / arrears / card alone, such an account with no card reads
+// "cannot settle" and the transfer forfeits a charge the next sweep would
+// have drawn from the wallet. With the rail enforced for the account the
+// transfer must REFUSE for those two legs; the domain leg has no wallet
+// block and keeps the three gates; and with the rail off the exact legacy
+// classification applies — the control that makes the refusals above the
+// rail's doing and not the mode column's.
+//
+// Mutation: drop the wallet gate from transferChargeDisposition and the two
+// rail-on cases forfeit with no_payment_method and return 200.
+func TestTransferAppRefusesWhenTheWalletWouldSettle(t *testing.T) {
+	activated := mustTime(t, "2026-05-04T00:00:00Z")
+	cases := []struct {
+		name   string
+		rail   bool
+		seed   func(*testing.T, *transferFixture)
+		refuse bool
+	}{
+		{"creation proration pending, rail enforced", true, func(t *testing.T, f *transferFixture) { f.owePendingProration(t) }, true},
+		{"module grace pending, rail enforced", true, func(t *testing.T, f *transferFixture) { f.oweModuleGrace(t, false) }, true},
+		{"domain activation pending, rail enforced", true, func(t *testing.T, f *transferFixture) { f.oweDomainActivation(t, false) }, false},
+		{"creation proration pending, rail off", false, func(t *testing.T, f *transferFixture) { f.owePendingProration(t) }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := seedTransferFixtureAnchored(t, activated, activated)
+			// Credits mode, activated, arrears, and deliberately NO card.
+			_, err := f.pool.Exec(ctx,
+				`UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`, f.oldAcct.String())
+			require.NoError(t, err)
+			tc.seed(t, f)
+			before := f.rosterAccount(t)
+			req := cycle.TransferAppRequest{
+				AppID:       f.appID,
+				OwnerUserID: f.newOwner,
+				Mode:        cycle.TransferModeKeep,
+				RequestID:   uuid.New(),
+			}
+
+			resp, err := transferSvc(t, f).WithCreditWallet(tc.rail).TransferApp(ctx, req)
+
+			if tc.refuse {
+				require.Error(t, err)
+				var be *billing.Error
+				require.True(t, errors.As(err, &be), "not a billing.Error: %v", err)
+				require.Equal(t, billing.CodeConflict, be.Code)
+				require.Contains(t, err.Error(), "app_transfer_charges_pending",
+					"a charge the wallet would settle on the next sweep was forfeited")
+				require.Equal(t, before, f.rosterAccount(t), "roster changed despite the refusal")
+				_, found := f.ledgerRow(t, req.RequestID)
+				require.False(t, found, "a refused transfer wrote a ledger row")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, f.newAcct, resp.AccountID)
+			row, found := f.ledgerRow(t, req.RequestID)
+			require.True(t, found)
+			require.NotNil(t, row.forfeitReason, "nothing was forfeited")
+			require.Equal(t, "no_payment_method", *row.forfeitReason)
+		})
+	}
+}
+
 // The forfeit is a money decision that must survive a replay: the ledger says
 // what the FIRST call forfeited, and a retry neither forfeits again (nothing
 // is pending any more) nor reports otherwise.
