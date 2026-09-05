@@ -1243,3 +1243,190 @@ func TestTransferAppCutsLevelStreamsOnTheOldAccount(t *testing.T) {
 		require.Equal(t, "6480", old.BillableQuantity, "control: uncut, the old account bills across the window the new account already bills")
 	})
 }
+
+// 🔴 THE THREE ATTRIBUTION COLUMNS MOVE TOGETHER, AND THE GUARD LETS THEM.
+// apps.account_id is duplicated onto every live timer and domain, and 071's
+// three deferred constraint triggers refuse a COMMIT in which they disagree.
+// Every other test here transfers an app with no live children, so the
+// triggers have only ever been exercised by the split-insert refusal. This
+// one transfers an app carrying a SETTLED live timer and a SETTLED live
+// domain — settled so nothing is pending, forfeited or refused, and the
+// re-key is the only thing that happens to them — and reads all three back
+// after the commit. A REMOVED timer and domain are the control for the
+// live-only rule: their charges resolved against the account that owned
+// them, and the guard ignores them, so they stay.
+//
+// Mutation: drop RekeyAppTimers (or RekeyAppDomains) and the commit is refused
+// by the guard; drop the guard too and the row below reads the old account.
+func TestTransferAppReKeysLiveTimersAndDomainsWithTheRoster(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	installed := mustTime(t, "2026-07-01T00:00:00Z")
+	charged := mustTime(t, "2026-07-04T00:00:00Z")
+	removed := mustTime(t, "2026-08-01T00:00:00Z")
+
+	liveTimer, removedTimer := uuid.New(), uuid.New()
+	for _, tm := range []struct {
+		id        uuid.UUID
+		removedAt *time.Time
+	}{{liveTimer, nil}, {removedTimer, &removed}} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.app_module_overage_timers
+			    (id, account_id, app_id, installed_at, grace_expires_at, grace_resolved, grace_charged_at, removed_at)
+			VALUES ($1, $2, $3, $4, $4::timestamptz + interval '3 days', true, $5, $6)`,
+			tm.id.String(), f.oldAcct.String(), f.appID.String(), installed, charged, tm.removedAt)
+		require.NoError(t, err)
+	}
+	liveDomain, removedDomain := uuid.New(), uuid.New()
+	for _, d := range []struct {
+		id        uuid.UUID
+		hostname  string
+		removedAt *time.Time
+	}{{liveDomain, "live.example.test", nil}, {removedDomain, "gone.example.test", &removed}} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.app_custom_domains
+			    (id, account_id, app_id, hostname, activated_at, charge_resolved, charged_at, removed_at)
+			VALUES ($1, $2, $3, $4, $5, true, $6, $7)`,
+			d.id.String(), f.oldAcct.String(), f.appID.String(), d.hostname, installed, charged, d.removedAt)
+		require.NoError(t, err)
+	}
+
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeKeep,
+		RequestID:   uuid.New(),
+	}
+	resp, err := transferSvc(t, f).TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, f.newAcct, resp.AccountID)
+
+	// Read through the pool, after TransferApp returned: this is the committed
+	// state, which is the only state the deferred triggers ever judge.
+	accountOf := func(table string, id uuid.UUID) string {
+		var got string
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT account_id::text FROM ms_billing.`+table+` WHERE id = $1`, id.String()).Scan(&got))
+		return got
+	}
+	require.Equal(t, f.newAcct.String(), f.rosterAccount(t))
+	require.Equal(t, f.newAcct.String(), accountOf("app_module_overage_timers", liveTimer), "the live timer did not follow the roster")
+	require.Equal(t, f.newAcct.String(), accountOf("app_custom_domains", liveDomain), "the live domain did not follow the roster")
+	require.Equal(t, f.oldAcct.String(), accountOf("app_module_overage_timers", removedTimer), "a removed timer must stay with the account that owned it")
+	require.Equal(t, f.oldAcct.String(), accountOf("app_custom_domains", removedDomain), "a removed domain must stay with the account that owned it")
+
+	// The invariant the guard enforces, asked directly of the committed rows.
+	var split int
+	require.NoError(t, f.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM ms_billing.app_module_overage_timers t
+		        JOIN ms_billing.apps a USING (app_id)
+		        WHERE a.app_id = $1 AND t.removed_at IS NULL AND t.account_id IS DISTINCT FROM a.account_id)
+		     + (SELECT count(*) FROM ms_billing.app_custom_domains d
+		        JOIN ms_billing.apps a USING (app_id)
+		        WHERE a.app_id = $1 AND d.removed_at IS NULL AND d.account_id IS DISTINCT FROM a.account_id)`,
+		f.appID.String()).Scan(&split))
+	require.Equal(t, 0, split, "a live child disagrees with the roster after commit")
+
+	// Settled rows are not pending, so nothing was forfeited or refused.
+	row, found := f.ledgerRow(t, req.RequestID)
+	require.True(t, found)
+	require.False(t, row.forfeitedProration)
+	require.Equal(t, int64(0), row.forfeitedDomains)
+	require.Equal(t, int64(0), row.forfeitedTimers)
+	require.Nil(t, row.forfeitReason)
+}
+
+// advanceBaseLine returns the amount of the ONE "advance:base" line the
+// boundary proposed, or 0 when it proposed no such line. A boundary that
+// proposes nothing at all (p.groups empty) is the zero-skip: no base, no
+// arrears, no domains.
+func advanceBaseLine(t *testing.T, p *capturingProposer) int64 {
+	t.Helper()
+	if len(p.groups) == 0 {
+		return 0
+	}
+	require.Len(t, p.groups, 1, "the boundary did not propose exactly one group")
+	var amount int64
+	var lines int
+	for _, c := range p.groups[0] {
+		for _, l := range c.Lines {
+			if l.SourceRef == "advance:base" {
+				amount += l.AmountMicros
+				lines++
+			}
+		}
+	}
+	require.LessOrEqual(t, lines, 1, "more than one advance:base line in one boundary")
+	return amount
+}
+
+// 🔴 THE MONEY MEETS THE CYCLE. Every other successful transfer here lands on
+// a target no boundary would ever charge, so no assertion in this file had put
+// the re-key in front of the charge leg. This one funds BOTH accounts, runs
+// the boundary that closes their (equal-anchor) period on each, and reads the
+// advance base each one proposed: the old account must NOT bill the app's
+// next-period base, the new account MUST — at the boundary recurring_from
+// named.
+//
+// The control is a second app that STAYS on the old account: the old
+// account's boundary bills exactly one base, so "the transferred app is not
+// there" is read off a boundary that demonstrably reached the base leg, not
+// off a zero-skip that never asked. Same fixture, same instant, same code
+// path on both accounts.
+//
+// Mutation: drop RekeyAppRoster and the old account bills two bases while the
+// new bills none.
+func TestTransferAppMovesTheAdvanceBaseToTheNewAccountsBoundary(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	installStandardPaymentMethod(t, f.pool, f.oldAcct, "cus_transfer_old_"+f.oldAcct.String())
+	installStandardPaymentMethod(t, f.pool, f.newAcct, "cus_transfer_new_"+f.newAcct.String())
+
+	// The staying app: same shape as the fixture's, on the old account.
+	staying := uuid.New()
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO ms_billing.apps (
+		    app_id, account_id, module_count, created_module_count, created_at,
+		    proration_invoice_id
+		) VALUES ($1, $2, 0, 0, $3, 'in_settled_staying')`,
+		staying.String(), f.oldAcct.String(), mustTime(t, "2026-06-01T00:00:00Z"))
+	require.NoError(t, err)
+
+	resp, err := transferSvc(t, f).TransferApp(ctx, cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeKeep,
+		RequestID:   uuid.New(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, f.newAcct, resp.AccountID)
+
+	// Both accounts anchor on day 4; the period containing the transfer is
+	// [08-04, 09-04) and the boundary that closes it — and prepays the next
+	// period's base — is the one the RPC named.
+	periodStart, periodEnd := mustTime(t, "2026-08-04T00:00:00Z"), mustTime(t, "2026-09-04T00:00:00Z")
+	requireSameInstant(t, periodEnd, resp.RecurringFrom, "recurring_from must be the boundary run below")
+
+	runBoundary := func(t *testing.T, account uuid.UUID) (*cycle.ChargeSummary, *capturingProposer) {
+		t.Helper()
+		svc, p := boundarySvcProposing(cycle.NewStore(f.pool), newFakeStripe())
+		summary, err := svc.WithCreditWallet(false).
+			WithNow(func() time.Time { return periodEnd }).
+			RunBillingCycle(ctx, account, periodStart, periodEnd, 0)
+		require.NoError(t, err)
+		require.True(t, summary.FirstRun)
+		return summary, p
+	}
+
+	oldRun, oldProposer := runBoundary(t, f.oldAcct)
+	require.EqualValues(t, usage.BaseFeeMicros, oldRun.AdvanceBaseMicros,
+		"the old account's boundary must bill exactly the staying app's base — not the transferred app's")
+	require.EqualValues(t, usage.BaseFeeMicros, advanceBaseLine(t, oldProposer))
+	require.Equal(t, cycle.RunStatusProposed, oldRun.Status)
+
+	newRun, newProposer := runBoundary(t, f.newAcct)
+	require.EqualValues(t, usage.BaseFeeMicros, newRun.AdvanceBaseMicros,
+		"the new account's boundary must bill the transferred app's next-period base")
+	require.EqualValues(t, usage.BaseFeeMicros, advanceBaseLine(t, newProposer))
+	require.Equal(t, cycle.RunStatusProposed, newRun.Status)
+}

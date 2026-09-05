@@ -75,6 +75,18 @@ type TransferAppResponse struct {
 	// or overlap in recurring coverage. Accepted for v1 and surfaced here so
 	// the console can tell the customer the date rather than let them discover
 	// it on a bill.
+	//
+	// For an UNFUNDED destination it is a date, not a promise of a charge. An
+	// unfunded owner is accepted on purpose (transferTargetAccount), but the
+	// cycle charges activated accounts only (cmd/billing-cycle runCycle;
+	// an unactivated account is rolled up, never charged), and a boundary on a
+	// prepaid or card-less account is skipped and retained for the next run
+	// (skipped_prepaid / skipped_no_pm, charge.go). So recurring_from names the
+	// first boundary that WOULD bill the app to the new account; the first that
+	// DOES is the first one after that account funds. An unactivated target has
+	// no anchor yet either: the boundary reported here is computed on the
+	// default anchor (transferWindows), and activation sets the anchor its
+	// boundaries actually run on.
 	RecurringFrom time.Time `json:"recurring_from"`
 }
 
