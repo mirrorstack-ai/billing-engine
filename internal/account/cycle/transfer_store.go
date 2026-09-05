@@ -128,6 +128,24 @@ func (f transferForfeit) any() bool {
 //     The 052 lifecycle guards these UPDATEs fire take SHARED org-lifecycle
 //     advisory locks; only FinalizeOrgDeletion takes them exclusively.
 //
+// 40P01 = RETRY, NOT A MONEY FAULT. Steps 1–2 (advisory → apps row) are the
+// order every timer-set writer takes, and step 3 follows the rollup's own
+// order (account row → period barrier). One writer inverts it:
+// FreezeCombinedProrationAttempt, with the credit rail on, takes the OLD
+// account's row FOR UPDATE (LockWalletAccount) BEFORE the advisory lock, so a
+// freeze and a transfer of the same app can close a lock cycle — the freezer
+// holding the account row and waiting on the advisory, this transaction
+// holding the advisory and waiting on the account row (FOR SHARE, step 3).
+// Postgres detects it and aborts one side with 40P01. Nothing is lost when
+// it is this side: every write here is inside the one transaction, so the
+// abort rolls back to "no transfer happened", the ledger has no row, and
+// api-platform — which retries the call — replays it after the freeze has
+// committed and either refuses (charges pending, in flight) or proceeds. A
+// deadlock error out of this function is therefore a retry, never a
+// half-applied money state. Re-ordering the freezer to match would move the
+// wallet-mode lock behind the timer lock for every proration writer; not
+// done here.
+//
 // EVERY REFUSAL IS DECIDED BEFORE THE FIRST WRITE. The transaction commits on
 // a refusal too (pgx.BeginFunc commits a nil return), so a write that
 // preceded a refusal would land without the transfer it belonged to.
