@@ -187,6 +187,12 @@ SELECT
 -- The LEFT JOIN keeps the row for an account with no authorization row (the
 -- 052 trigger creates one on every account insert, so this is belt and
 -- braces): no funder ⇒ no usable card.
+--
+-- Read UNDER the account's activation row lock (LockUsageAccountActivation,
+-- FOR SHARE, taken by barrierBothAccounts before this runs). Activation is
+-- the one fact here with a FOR UPDATE writer (ActivateAccountIfUnset), and a
+-- plain read that preceded the lock could classify an account as
+-- "unactivated, forfeit" one statement before its card-bind committed.
 -- name: TransferSourceSettlement :one
 SELECT (a.activated_at IS NOT NULL)::bool AS activated,
        (a.usage_billing_mode = 'arrears')::bool AS arrears,

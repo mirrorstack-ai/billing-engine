@@ -546,6 +546,119 @@ func TestTransferAppForfeitIsRecordedOnce(t *testing.T) {
 	require.Equal(t, 1, rows)
 }
 
+// 🔴 THE CLASSIFICATION IS READ UNDER THE ACCOUNT LOCK. Refuse-versus-forfeit
+// reads the old account's activation, mode and card (TransferSourceSettlement).
+// Activation has a FOR UPDATE writer — ActivateAccountIfUnset, the card-bind
+// webhook — and a plain read that ran BEFORE the transfer took the account's
+// activation row FOR SHARE could classify the account as "unactivated,
+// forfeit" one statement before the activation committed: the ledger would
+// record a reason that was false when the forfeit was written, and a charge
+// the now-activated account would have paid at its next sweep is billed to
+// nobody.
+//
+// A second connection holds the activation uncommitted; the transfer must
+// park on the activation row (FOR SHARE behind FOR UPDATE) BEFORE deciding,
+// and once the activation commits it sees an activated, arrears, carded
+// account with a pending domain charge — and REFUSES.
+//
+// Mutation: read the classification before barrierBothAccounts and the
+// transfer forfeits with reason "unactivated" and returns 200.
+func TestTransferAppClassifiesUnderTheAccountLock(t *testing.T) {
+	ctx := context.Background()
+	activated := mustTime(t, "2026-05-04T00:00:00Z")
+	// Old account UNACTIVATED at seed time, but with the card that makes it
+	// settleable the instant it activates.
+	f := seedTransferFixtureWith(t, transferSeed{newActivated: activated})
+	f.giveOldAccountACard(t)
+	domainID := f.oweDomainActivation(t, false)
+
+	holder, err := f.pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer holder.Release()
+	activation, err := holder.Begin(ctx)
+	require.NoError(t, err)
+	defer activation.Rollback(ctx) //nolint:errcheck // a no-op after the commit below
+	// The row lock the webhook takes, held open.
+	tag, err := activation.Exec(ctx,
+		`UPDATE ms_billing.accounts SET activated_at = $2 WHERE id = $1 AND activated_at IS NULL`,
+		f.oldAcct.String(), activated)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, tag.RowsAffected(), "fixture error: the old account was already activated")
+
+	svc := transferSvc(t, f)
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeKeep,
+		RequestID:   uuid.New(),
+	}
+	type outcome struct {
+		resp *cycle.TransferAppResponse
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		resp, err := svc.TransferApp(ctx, req)
+		done <- outcome{resp: resp, err: err}
+	}()
+
+	// The transfer must be waiting on the activation row — that wait IS the
+	// property under test. A transfer that decided first would not wait here
+	// (a plain SELECT never blocks on a row lock) and would already be
+	// parked further down, or finished.
+	var probeErr error
+	require.Eventually(t, func() bool {
+		var waiting bool
+		probeErr = f.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND wait_event_type = 'Lock'
+				  AND query ILIKE '%activated_at%'
+				  AND query ILIKE '%FOR SHARE%'
+			)`).Scan(&waiting)
+		return probeErr == nil && waiting
+	}, 5*time.Second, 10*time.Millisecond, "the transfer must park on the activation row lock before it classifies")
+	require.NoError(t, probeErr)
+	select {
+	case got := <-done:
+		require.Failf(t, "the transfer did not wait for the activation lock", "returned %+v / %v", got.resp, got.err)
+	default:
+	}
+
+	require.NoError(t, activation.Commit(ctx))
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "the transfer did not return after the activation committed")
+	}
+
+	require.Error(t, got.err)
+	var be *billing.Error
+	require.True(t, errors.As(got.err, &be), "not a billing.Error: %v", got.err)
+	require.Equal(t, billing.CodeConflict, be.Code)
+	require.Contains(t, got.err.Error(), "app_transfer_charges_pending",
+		"the classification read the pre-activation row: the activated, carded account was forfeited instead of refused")
+
+	// Nothing forfeited, nothing re-keyed, no ledger row: the refusal is whole.
+	require.Equal(t, f.oldAcct.String(), f.rosterAccount(t))
+	_, found := f.ledgerRow(t, req.RequestID)
+	require.False(t, found, "a refused transfer wrote a ledger row")
+	var resolved bool
+	var forfeitedBy *string
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT charge_resolved, charge_forfeited_by::text FROM ms_billing.app_custom_domains WHERE id = $1`,
+		domainID.String()).Scan(&resolved, &forfeitedBy))
+	require.False(t, resolved, "the domain activation charge was forfeited under an activation that had already committed")
+	require.Nil(t, forfeitedBy)
+	// And the account the sweep will bill is the activated one.
+	var activatedAt *time.Time
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT activated_at FROM ms_billing.accounts WHERE id = $1`, f.oldAcct.String()).Scan(&activatedAt))
+	require.NotNil(t, activatedAt)
+}
+
 // The control for the three refusals above: with everything settled the SAME
 // call succeeds. Without it, a guard that refused unconditionally would pass
 // all three refusal tests.

@@ -118,7 +118,10 @@ func (f transferForfeit) any() bool {
 //     sweep cannot slip between the pending-charge read and the forfeit or
 //     the re-key.
 //  3. both accounts' activation rows FOR SHARE, then the period barrier, in
-//     sorted account order (barrierBothAccounts).
+//     sorted account order (barrierBothAccounts) — BEFORE the refuse/forfeit
+//     classification reads the old account's activation, mode and card, so
+//     ActivateAccountIfUnset (accounts FOR UPDATE) cannot commit between that
+//     read and the forfeit it decided.
 //  4. the domain and timer rows, by the forfeit UPDATEs first and the re-key
 //     UPDATEs second — same transaction, same order every time. The domain and
 //     timer sweeps lock ONLY their own rows (ArmDomainStripeCharge,
@@ -226,24 +229,6 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			return nil
 		}
 
-		// 🔴 THE MONEY DECISION. Creation proration, custom-domain activation
-		// and per-module grace overage each charge whoever the row points at
-		// WHEN THE SWEEP RUNS, so none of them may travel with the re-key.
-		// Whether that means REFUSE (the old account settles it first) or
-		// FORFEIT (it never will) is decided here, before any write.
-		charges, err := qtx.AppUnresolvedOneTimeCharges(ctx, p.AppID.String())
-		if err != nil {
-			return err
-		}
-		forfeit, refuse, err := s.transferChargeDisposition(ctx, qtx, fromAccount, charges)
-		if err != nil {
-			return err
-		}
-		if refuse {
-			outcome = TransferChargesPending
-			return nil
-		}
-
 		// 🔴 THE PERIOD BARRIER. Ingest (usage/store.go) and the org repoint
 		// sweep (RepointOrgNullAccountEvents) both take it; a writer that moves
 		// usage between accounts and does NOT is racing the cycle Lambda. A
@@ -256,6 +241,17 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		// otherwise take the same two locks in opposite orders and deadlock.
 		// Postgres would abort one with 40P01, which is survivable but is a
 		// self-inflicted retry storm on the money path.
+		//
+		// 🔴 TAKEN BEFORE THE MONEY DECISION BELOW, NOT AFTER. The activation
+		// row FOR SHARE is what fences ActivateAccountIfUnset (accounts FOR
+		// UPDATE, the card-bind webhook and the sponsor designation) and every
+		// other UPDATE of the accounts row, and the refuse-versus-forfeit
+		// classification reads activation, collection mode and the funder's
+		// card off that row. Read before the lock, an activation that commits
+		// in between leaves the ledger saying "forfeited: unactivated" about an
+		// account whose next sweep would have collected — nobody is ever
+		// billed for a charge the account owed. Read under the lock, the
+		// classification and the writes see one account state.
 		if err := s.barrierBothAccounts(ctx, tx, qtx, fromAccount, p.ToAccount, p.At); err != nil {
 			return err
 		}
@@ -270,6 +266,25 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		}
 		if closed {
 			outcome = TransferPeriodClosed
+			return nil
+		}
+
+		// 🔴 THE MONEY DECISION. Creation proration, custom-domain activation
+		// and per-module grace overage each charge whoever the row points at
+		// WHEN THE SWEEP RUNS, so none of them may travel with the re-key.
+		// Whether that means REFUSE (the old account settles it first) or
+		// FORFEIT (it never will) is decided here — under the account lock
+		// above, before any write.
+		charges, err := qtx.AppUnresolvedOneTimeCharges(ctx, p.AppID.String())
+		if err != nil {
+			return err
+		}
+		forfeit, refuse, err := s.transferChargeDisposition(ctx, qtx, fromAccount, charges)
+		if err != nil {
+			return err
+		}
+		if refuse {
+			outcome = TransferChargesPending
 			return nil
 		}
 

@@ -669,6 +669,12 @@ type TransferSourceSettlementRow struct {
 // The LEFT JOIN keeps the row for an account with no authorization row (the
 // 052 trigger creates one on every account insert, so this is belt and
 // braces): no funder ⇒ no usable card.
+//
+// Read UNDER the account's activation row lock (LockUsageAccountActivation,
+// FOR SHARE, taken by barrierBothAccounts before this runs). Activation is
+// the one fact here with a FOR UPDATE writer (ActivateAccountIfUnset), and a
+// plain read that preceded the lock could classify an account as
+// "unactivated, forfeit" one statement before its card-bind committed.
 func (q *Queries) TransferSourceSettlement(ctx context.Context, accountID string) (TransferSourceSettlementRow, error) {
 	row := q.db.QueryRow(ctx, transferSourceSettlement, accountID)
 	var i TransferSourceSettlementRow
