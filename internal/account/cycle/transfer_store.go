@@ -66,11 +66,13 @@ const (
 	// been closed or invoiced for one of the accounts. Refusing is the only
 	// safe answer: writing there backdates across a billed period.
 	TransferPeriodClosed
-	// TransferUnbilledBacklog — the app still has usage recorded with NO
-	// account (the lazy org backlog, migration 041). The repoint sweep finds
-	// that backlog through apps.owner_org_id, which this transfer rewrites:
-	// re-key and the backlog is either billed to an org that never saw it or
-	// stranded where no sweep can reach it. Refused until the old org funds.
+	// TransferUnbilledBacklog — an ORG-rostered app still has usage recorded
+	// with NO account (the lazy org backlog, migration 041). The repoint
+	// sweep finds that backlog through apps.owner_org_id, which this transfer
+	// rewrites: re-key and the backlog is either billed to an org that never
+	// saw it or stranded where no sweep can reach it. Refused until the old
+	// org funds. A USER-rostered app's NULL rows are not this: they are the
+	// target's, and the transfer repoints them (repointNullAccountUsage).
 	TransferUnbilledBacklog
 )
 
@@ -142,6 +144,14 @@ func (f transferForfeit) any() bool {
 //     marker in their WHERE and the store aborting on a row-count shortfall.
 //     The 052 lifecycle guards these UPDATEs fire take SHARED org-lifecycle
 //     advisory locks; only FinalizeOrgDeletion takes them exclusively.
+//  5. the app's NULL-account usage rows, by the user-rostered repoint
+//     (repointNullAccountUsage) — after the barrier, because the window it
+//     filters on is the target's and is read under the target's activation
+//     lock, and before the roster re-key, so the roster it was decided on is
+//     the one still on the row. These rows have no other writer to order
+//     against: ingest only INSERTs (under its per-event advisory), and the
+//     org repoint sweep is scoped by owner_org_id, which is NULL for every
+//     app this step runs on.
 //
 // 40P01 = RETRY, NOT A MONEY FAULT. Steps 1–2 (advisory → apps row) are the
 // order every timer-set writer takes, and step 3 follows the rollup's own
@@ -225,10 +235,11 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			}
 			outcome = TransferAlreadyApplied
 			resp = &TransferAppResponse{
-				AccountID:       p.ToAccount,
-				MovedEventCount: prior.MovedEventCount,
-				OpenPeriod:      TransferPeriod{Start: prior.OpenPeriodStart, End: prior.OpenPeriodEnd},
-				RecurringFrom:   prior.RecurringFrom,
+				AccountID:           p.ToAccount,
+				MovedEventCount:     prior.MovedEventCount,
+				RepointedEventCount: prior.RepointedEventCount,
+				OpenPeriod:          TransferPeriod{Start: prior.OpenPeriodStart, End: prior.OpenPeriodEnd},
+				RecurringFrom:       prior.RecurringFrom,
 			}
 			return nil
 		case !errors.Is(err, pgx.ErrNoRows):
@@ -270,11 +281,16 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			return nil
 		}
 
-		// 🔴 THE BACKLOG REFUSAL. Usage this app recorded with NO account is
-		// reachable only through apps.owner_org_id (RepointOrgNullAccountEvents),
-		// which the re-key below rewrites. Moving the app would either hand
-		// the backlog to an org that never incurred it or strand it where no
-		// sweep can bill it. Neither is this RPC's money outcome to choose.
+		// 🔴 THE BACKLOG REFUSAL, FOR AN ORG-ROSTERED APP. Usage an org app
+		// recorded with NO account is reachable only through apps.owner_org_id
+		// (RepointOrgNullAccountEvents), which the re-key below rewrites.
+		// Moving the app would either hand the backlog to an org that never
+		// incurred it or strand it where no sweep can bill it. Neither is this
+		// RPC's money outcome to choose. The predicate is org-rostered only:
+		// a USER-rostered app's NULL rows are the target's own, stamped by
+		// api-platform's payer re-seat before this call created the target's
+		// account, and they are repointed below (repointNullAccountUsage)
+		// rather than refused on — a refusal there could never clear.
 		backlog, err := qtx.AppHasUnbilledUsageBacklog(ctx, p.AppID.String())
 		if err != nil {
 			return err
@@ -347,6 +363,13 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		// and the forfeit goes first so the rows are resolved while they still
 		// name the account that owed them.
 		if err := s.forfeitTransferCharges(ctx, qtx, p, forfeit); err != nil {
+			return err
+		}
+
+		// Then the NULL-account rows a USER-rostered app holds for the target
+		// — before the re-key, on the roster this transaction locked.
+		repointed, err := s.repointNullAccountUsage(ctx, qtx, p, app.OwnerOrgID.Valid)
+		if err != nil {
 			return err
 		}
 
@@ -451,6 +474,7 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			ToAccount:            p.ToAccount.String(),
 			Mode:                 p.Mode,
 			MovedEventCount:      moved,
+			RepointedEventCount:  repointed,
 			At:                   p.At,
 			OpenPeriodStart:      window.Start,
 			OpenPeriodEnd:        window.End,
@@ -465,10 +489,11 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 
 		outcome = TransferApplied
 		resp = &TransferAppResponse{
-			AccountID:       p.ToAccount,
-			MovedEventCount: moved,
-			OpenPeriod:      window,
-			RecurringFrom:   from,
+			AccountID:           p.ToAccount,
+			MovedEventCount:     moved,
+			RepointedEventCount: repointed,
+			OpenPeriod:          window,
+			RecurringFrom:       from,
 		}
 		return nil
 	})
@@ -656,6 +681,39 @@ func (s *pgxStore) forfeitTransferCharges(ctx context.Context, qtx *db.Queries, 
 		}
 	}
 	return nil
+}
+
+// repointNullAccountUsage hands a USER-rostered app's NULL-account usage
+// inside the target's open window to the target account, and returns how
+// many rows it took — the ledger's repointed_event_count. An ORG-rostered
+// app (orgRostered) holds no such rows by the time this runs: the backlog
+// refusal above already returned on them, and the sweep that owns an org's
+// backlog is RepointOrgNullAccountEvents, not this. The decision is keyed on
+// the roster row this transaction locked FOR UPDATE, so an ingest that
+// stamps a row between the refusal read and this write cannot flip it.
+//
+// The window start is the target's — the instant the ledger will store as
+// open_period_start — read under the target's activation lock (taken by
+// barrierBothAccounts), so the anchor this filters on is the one the row
+// bills under. The SET is the org sweep's, verbatim; the WHERE's window term
+// is the host's rule: rows inside the target's open window are the target's
+// (api-platform stamped them for it), rows older than that were recorded for
+// a payer with no account and stay unbilled (D1d, no retroactive catch-up).
+// Both modes: these rows never belonged to the old account, so the mode —
+// which decides the OLD account's usage — does not reach them.
+func (s *pgxStore) repointNullAccountUsage(ctx context.Context, qtx *db.Queries, p TransferAppParams, orgRostered bool) (int64, error) {
+	if orgRostered {
+		return 0, nil
+	}
+	window, _, err := s.transferWindows(ctx, qtx, p.ToAccount, p.At)
+	if err != nil {
+		return 0, err
+	}
+	return qtx.RepointAppNullAccountEventsOnTransfer(ctx, db.RepointAppNullAccountEventsOnTransferParams{
+		AccountID:   p.ToAccount.String(),
+		WindowStart: window.Start,
+		AppID:       p.AppID.String(),
+	})
 }
 
 // transferWindows returns the TARGET account's open period and the boundary at

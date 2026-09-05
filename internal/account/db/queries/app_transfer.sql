@@ -5,8 +5,8 @@
 -- call did — and a different app, target or mode for the same key is a
 -- conflict rather than a second transfer.
 -- name: AppTransferEventByRequest :one
-SELECT request_id, app_id, from_account, to_account, mode, moved_event_count, at,
-       open_period_start, open_period_end, recurring_from
+SELECT request_id, app_id, from_account, to_account, mode, moved_event_count,
+       repointed_event_count, at, open_period_start, open_period_end, recurring_from
 FROM ms_billing.app_transfer_events
 WHERE request_id = $1;
 
@@ -18,8 +18,9 @@ WHERE request_id = $1;
 INSERT INTO ms_billing.app_transfer_events (
     request_id, app_id, from_account, to_account, mode, moved_event_count, at,
     open_period_start, open_period_end, recurring_from,
-    forfeited_proration, forfeited_domain_count, forfeited_timer_count, forfeit_reason
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14);
+    forfeited_proration, forfeited_domain_count, forfeited_timer_count, forfeit_reason,
+    repointed_event_count
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);
 
 -- LockAppForTransfer takes the app's roster row FOR UPDATE and returns its
 -- current attribution. Everything the transfer decides is read here, under the
@@ -39,8 +40,8 @@ WHERE app_id = $1
   AND deleted_at IS NULL
 FOR UPDATE;
 
--- AppHasUnbilledUsageBacklog reports whether this app still has usage
--- recorded with NO account — the lazy, never-billed backlog an org app
+-- AppHasUnbilledUsageBacklog reports whether this ORG-rostered app still has
+-- usage recorded with NO account — the lazy, never-billed backlog an org app
 -- accrues before its org designates funding (migration 041).
 --
 -- 🔴 THE TRANSFER REFUSES WHILE ONE EXISTS. The org repoint sweep
@@ -53,12 +54,87 @@ FOR UPDATE;
 -- the transfer waits for that: CONFLICT app_transfer_unbilled_backlog.
 -- Keyed on app_id (the app's own events), not owner_org_id — an org's OTHER
 -- apps' backlog is not this transfer's concern.
+--
+-- 🔴 ORG-ROSTERED APPS ONLY (the roster predicate; host decision 2026-09-05,
+-- APP-TRANSFER-SPEC §2.1). A USER-rostered app (owner_org_id NULL) can hold
+-- NULL-account rows too, and they are a different thing: api-platform
+-- re-seats the app's payer BEFORE calling this RPC, ingest stamps the
+-- primary payer on every event, and a payer with no accounts row yet lands
+-- the event with account_id NULL (usage/service.go, infra.go — the user
+-- branch has no roster guard). No sweep ever reaches those rows — the org
+-- sweep is scoped by owner_org_id — so refusing on them would refuse
+-- FOREVER, on every retry, for an app whose target has never paid. They
+-- were stamped for the target, so the transfer takes them instead:
+-- RepointAppNullAccountEventsOnTransfer hands the rows inside the target's
+-- open window to the target's account, and older rows are left where they
+-- are, unbilled, exactly as usage recorded for a payer with no account
+-- always is (D1d). Neither is a refusal, so this predicate must not see
+-- them. The roster row it joins is the one the transfer holds FOR UPDATE
+-- (LockAppForTransfer), so the answer cannot flip under the transaction.
 -- name: AppHasUnbilledUsageBacklog :one
 SELECT EXISTS (
-    SELECT 1 FROM ms_billing.usage_events e
+    SELECT 1
+    FROM ms_billing.usage_events e
+    JOIN ms_billing.apps a ON a.app_id = e.app_id
     WHERE e.app_id = @app_id::uuid
       AND e.account_id IS NULL
+      AND a.owner_org_id IS NOT NULL
 )::bool AS has_backlog;
+
+-- RepointAppNullAccountEventsOnTransfer hands a USER-rostered app's
+-- NULL-account usage inside the target's open window to the target account —
+-- the rows api-platform's payer re-seat stamped for the target before this
+-- RPC created the target's accounts row (see AppHasUnbilledUsageBacklog for
+-- why they exist and why no sweep can reach them). Runs in BOTH modes:
+-- these rows never belonged to the old account, so mode — which decides the
+-- old account's usage only — has no say over them.
+--
+-- The SET is RepointOrgNullAccountEvents' (org.sql), verbatim: the same
+-- clamp of billable_at to the window start, the same first_funded policy
+-- for a v2 observation that occurred before it, the same repointed_from /
+-- recorded_at treatment — a repointed row is shaped exactly as the org
+-- sweep shapes one, so the rollup and every audit read see one kind of
+-- repointed row. Under THIS query's window filter the clamp can bind only
+-- on a row whose billable_at was NULL (a pre-055 row: ingest has written
+-- billable_at on every row since, and it is occurred_at or recorded_at,
+-- which the filter already bounds), so on an ingest-written row it sets
+-- what is already there; it is not a second rule.
+--
+-- The WHERE differs from the org sweep in ONE term, and that term is the
+-- decision: >= @window_start. The org sweep takes every NULL row and clamps
+-- the old ones INTO the first funded period (decision 1, migration 041 —
+-- the org designated funding, so its backlog bills). A transfer target did
+-- not: a NULL row older than its open window was recorded for a payer that
+-- had no account when the usage happened, and D1d never catches that up.
+-- Those rows stay NULL and unbilled, and AppHasUnbilledUsageBacklog does
+-- not refuse on them.
+--
+-- @window_start is the TARGET's open-window start at the transfer instant —
+-- the same instant the ledger stores as open_period_start — read under the
+-- target's activation lock (barrierBothAccounts) so the anchor cannot move
+-- between the read and this write. No org_deletion_finalizations guard: the
+-- roster's owner_org_id is NULL by this query's premise, so there is no org
+-- whose retirement could bear on the rows. :execrows — the count is the
+-- ledger's repointed_event_count and the response's.
+-- name: RepointAppNullAccountEventsOnTransfer :execrows
+UPDATE ms_billing.usage_events
+SET account_id              = @account_id::uuid,
+    billable_at             = GREATEST(
+        COALESCE(occurred_at, recorded_at),
+        @window_start::timestamptz
+    ),
+    occurrence_policy       = CASE
+        WHEN observation_version = 2
+         AND occurred_at < @window_start::timestamptz
+        THEN 'first_funded'
+        ELSE occurrence_policy
+    END,
+    repointed_from          = CASE WHEN recorded_at < @window_start::timestamptz
+                                   THEN recorded_at ELSE repointed_from END,
+    recorded_at             = GREATEST(recorded_at, @window_start::timestamptz)
+WHERE account_id IS NULL
+  AND app_id = @app_id::uuid
+  AND COALESCE(billable_at, recorded_at) >= @window_start::timestamptz;
 
 -- AppUnresolvedOneTimeCharges classifies every MID-PERIOD ONE-TIME charge
 -- still owed for this app by whoever owns it now, so the transfer can decide

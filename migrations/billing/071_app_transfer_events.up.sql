@@ -60,6 +60,24 @@ CREATE TABLE IF NOT EXISTS ms_billing.app_transfer_events (
     -- the number a replay returns verbatim rather than recounting.
     moved_event_count BIGINT NOT NULL DEFAULT 0 CHECK (moved_event_count >= 0),
 
+    -- Rows the transfer REPOINTED from NO account to the target: usage a
+    -- USER-rostered app (owner_org_id NULL) recorded with account_id NULL
+    -- inside the target's open window. api-platform re-seats the app's payer
+    -- BEFORE this RPC runs, ingest stamps the primary payer on every event,
+    -- and a payer that has no accounts row yet lands the event with a NULL
+    -- account_id — a row the org repoint sweep can never reach, because it
+    -- is scoped by owner_org_id. Those rows were stamped for the target, so
+    -- the transfer hands them to the target's account (created by this same
+    -- call), in BOTH modes; NULL rows older than the target's open window
+    -- are left alone, unbilled — recorded for a payer that had no account,
+    -- the D1d no-retroactive-catch-up posture. Independent of mode and of
+    -- moved_event_count: these rows never belonged to the old account.
+    -- Counted here for the same reason moved_event_count is: the replay
+    -- returns the stored number, never a recount (host decision 2026-09-05,
+    -- APP-TRANSFER-SPEC §2.1). An ORG-rostered app's NULL rows refuse the
+    -- transfer instead (app_transfer_unbilled_backlog), so this is 0 there.
+    repointed_event_count BIGINT NOT NULL DEFAULT 0 CHECK (repointed_event_count >= 0),
+
     -- The transfer instant (service clock, UTC) — the upper bound of the
     -- re-attribution window.
     at                TIMESTAMPTZ NOT NULL,

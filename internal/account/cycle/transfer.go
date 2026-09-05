@@ -56,6 +56,17 @@ type TransferAppResponse struct {
 	// recount — the second caller must see what the first one did.
 	MovedEventCount int64 `json:"moved_event_count"`
 
+	// RepointedEventCount is how many of the app's NULL-account events the
+	// transfer handed to the new account — usage a USER-rostered app recorded
+	// after api-platform re-seated its payer to the new owner but before this
+	// call created that owner's billing account (ingest stamps the payer; a
+	// payer with no account row lands the event with no account). Rows inside
+	// the new account's open window are its own and come across in BOTH
+	// modes; older ones stay unbilled (D1d). Always 0 for an org-rostered
+	// app, whose NULL rows refuse the transfer instead. Stored on the ledger
+	// and, like MovedEventCount, returned verbatim on a replay.
+	RepointedEventCount int64 `json:"repointed_event_count"`
+
 	// OpenPeriod is the TARGET account's open window: the period the app now
 	// bills in. On a replay this, like RecurringFrom, is the STORED window
 	// from the first call, not one recomputed from the replay's clock.
@@ -145,10 +156,24 @@ const (
 // unconditional one would have made a never-funded personal account unable to
 // hand its app to an org, ever (transfer_store.go, transferChargeDisposition).
 //
-// WHAT BLOCKS IT: usage the app recorded with no account at all (the lazy org
-// backlog). The repoint sweep finds that backlog through the roster column
-// this transfer rewrites, so moving the app would bill it to the wrong org or
-// strand it; app_transfer_unbilled_backlog until the old org funds it.
+// WHAT BLOCKS IT: usage an ORG-rostered app recorded with no account at all
+// (the lazy org backlog). The repoint sweep finds that backlog through the
+// roster column this transfer rewrites, so moving the app would bill it to
+// the wrong org or strand it; app_transfer_unbilled_backlog until the old org
+// funds it.
+//
+// WHAT DOES NOT BLOCK IT, AND COMES ACROSS INSTEAD: a USER-rostered app's
+// NULL-account rows. api-platform re-seats the app's payer before it calls
+// this RPC, ingest stamps the primary payer on every event, and a payer that
+// has no billing account yet lands the event with none — a row no sweep can
+// ever reach, because the org sweep is scoped by owner_org_id. Refusing on
+// it would refuse on every retry, forever, for a target that has never paid.
+// Those rows were stamped for the target, so the transfer takes them: the
+// ones inside the target's open window are repointed to the target's account
+// with the org sweep's clamp, in both modes, and counted as
+// RepointedEventCount; older ones are left unbilled, as usage recorded for a
+// payer with no account always is (D1d). Host decision 2026-09-05,
+// APP-TRANSFER-SPEC §2.1 — the org-rostered refusal is unchanged.
 //
 // WHAT IS A NO-OP: a transfer to the owner whose account already holds the
 // app. Nothing is forfeited, moved or cut — run as a real transfer against one

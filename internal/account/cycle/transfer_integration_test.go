@@ -254,6 +254,7 @@ type transferLedgerRow struct {
 	forfeitedDomains   int64
 	forfeitedTimers    int64
 	forfeitReason      *string
+	repointedEvents    int64
 }
 
 func (f *transferFixture) ledgerRow(t *testing.T, requestID uuid.UUID) (transferLedgerRow, bool) {
@@ -261,10 +262,10 @@ func (f *transferFixture) ledgerRow(t *testing.T, requestID uuid.UUID) (transfer
 	var row transferLedgerRow
 	err := f.pool.QueryRow(context.Background(), `
 		SELECT from_account::text, forfeited_proration, forfeited_domain_count,
-		       forfeited_timer_count, forfeit_reason
+		       forfeited_timer_count, forfeit_reason, repointed_event_count
 		FROM ms_billing.app_transfer_events WHERE request_id = $1`, requestID.String()).
 		Scan(&row.fromAccount, &row.forfeitedProration, &row.forfeitedDomains,
-			&row.forfeitedTimers, &row.forfeitReason)
+			&row.forfeitedTimers, &row.forfeitReason, &row.repointedEvents)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return transferLedgerRow{}, false
 	}
@@ -1081,22 +1082,34 @@ func TestTransferAppFromNoPayerForfeitsTheCreationWindow(t *testing.T) {
 	require.Equal(t, 0, unguarded.Skipped)
 }
 
-// 🔴 THE BACKLOG REFUSAL. Usage recorded with NO account is the lazy org
-// backlog; the repoint sweep (RepointOrgNullAccountEvents) reaches it only
-// through apps.owner_org_id, which the transfer rewrites. Moving the app
-// would either bill org A's never-billed backlog to org B — all of it — or,
-// for a user target, strand it where no sweep can ever find it. The transfer
-// refuses until the backlog is attached; the control deletes the one event
-// and the same transfer succeeds.
-//
-// Mutation: drop AppHasUnbilledUsageBacklog from the store and the first call
+// 🔴 THE BACKLOG REFUSAL, FOR AN ORG-ROSTERED APP. Usage an org app recorded
+// with NO account is the lazy org backlog; the repoint sweep
+// (RepointOrgNullAccountEvents) reaches it only through apps.owner_org_id,
+// which the transfer rewrites. Moving the app would either bill org A's
+// never-billed backlog to org B — all of it — or, for a user target, strand
+// it where no sweep can ever find it. The transfer refuses until the backlog
+// is attached; the control deletes the one event and the same transfer
 // succeeds.
+//
+// The roster carries an org on purpose: the SAME NULL row on a USER-rostered
+// app is the target's own usage and is repointed, not refused — that is the
+// next test, and the two are each other's control. The row here sits inside
+// the target's open window, exactly where the user-rostered repoint would
+// take it, so the refusal is provably the roster's doing and not the row's
+// age.
+//
+// Mutation: drop AppHasUnbilledUsageBacklog from the store, or its roster
+// predicate, and the first call succeeds.
 func TestTransferAppRefusesWhileAnUnbilledBacklogExists(t *testing.T) {
 	ctx := context.Background()
 	f := seedTransferFixture(t)
 	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+	_, err := f.pool.Exec(ctx,
+		`UPDATE ms_billing.apps SET owner_org_id = $2 WHERE app_id = $1`,
+		f.appID.String(), uuid.NewString())
+	require.NoError(t, err)
 	backlog := uuid.New()
-	_, err := f.pool.Exec(ctx, `
+	_, err = f.pool.Exec(ctx, `
 		INSERT INTO ms_billing.usage_events
 		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
 		VALUES ($1, NULL, $2, $3, 'orders.placed', 'count', 1, $4)`,
@@ -1129,6 +1142,116 @@ func TestTransferAppRefusesWhileAnUnbilledBacklogExists(t *testing.T) {
 	resp, err := svc.TransferApp(ctx, req)
 	require.NoError(t, err)
 	require.Equal(t, f.newAcct, resp.AccountID)
+	require.Equal(t, int64(0), resp.RepointedEventCount, "an org-rostered app has nothing for the repoint to take")
+}
+
+// 🔴 A USER-ROSTERED APP'S NULL-ACCOUNT ROWS ARE THE TARGET'S, NOT A REFUSAL.
+// api-platform re-seats the app's payer BEFORE calling TransferApp, ingest
+// stamps the primary payer on every event, and a payer with no accounts row
+// yet lands the event with account_id NULL — a row the org repoint sweep
+// can never reach (it is scoped by owner_org_id, NULL here). Refusing on it
+// would refuse on every retry, forever, for a target that has never paid:
+// the transfer would never converge and the app would stay split between
+// the old roster and the new payer. So, on the roster the transaction
+// locked, the rows inside the TARGET's open window are handed to the target
+// with the org sweep's clamp and counted on the ledger; rows older than the
+// window were recorded for a payer with no account and stay unbilled (D1d).
+// Host decision 2026-09-05 (APP-TRANSFER-SPEC §2.1).
+//
+// The arithmetic, from the one pinned now = 2026-08-15: the target activated
+// 05-04, so its open window is [08-04, 09-04). The 08-05 row is inside it and
+// comes across; the 08-02 row is before it and is left exactly as seeded.
+// keep mode, deliberately: the repoint is not the move's business (these rows
+// never belonged to the old account), so moved_event_count stays 0 under the
+// ledger's keep-moves-nothing CHECK while repointed_event_count reads 1.
+//
+// Mutations: drop the repoint and the 08-05 row keeps its NULL account; drop
+// the roster predicate from AppHasUnbilledUsageBacklog and the call refuses;
+// drop the window term from the repoint's WHERE and the 08-02 row moves too
+// (count 2); recompute the count on replay and the replay reads 0.
+func TestTransferAppRepointsAUserRosteredAppsNullAccountUsage(t *testing.T) {
+	ctx := context.Background()
+	f := seedTransferFixture(t)
+	seedMetricDef(t, f.pool, f.moduleID, "orders.placed", "count", 1_000)
+	var rosterOrg *string
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT owner_org_id::text FROM ms_billing.apps WHERE app_id = $1`, f.appID.String()).Scan(&rosterOrg))
+	require.Nil(t, rosterOrg, "fixture error: the app must be user-rostered for this test to be about the user-rostered rule")
+
+	inWindow, older := uuid.New(), uuid.New()
+	for _, ev := range []struct {
+		id         uuid.UUID
+		recordedAt string
+	}{{inWindow, "2026-08-05T10:00:00Z"}, {older, "2026-08-02T10:00:00Z"}} {
+		// The infra / v1 shape the blocker names: occurred_at NULL, and
+		// billable_at NULL as well (a pre-055 row), so the clamp has a value
+		// to set rather than one to leave.
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO ms_billing.usage_events
+			    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+			VALUES ($1, NULL, $2, $3, 'orders.placed', 'count', 1, $4)`,
+			ev.id.String(), f.appID.String(), f.moduleID.String(), mustTime(t, ev.recordedAt))
+		require.NoError(t, err)
+	}
+
+	svc := transferSvc(t, f)
+	req := cycle.TransferAppRequest{
+		AppID:       f.appID,
+		OwnerUserID: f.newOwner,
+		Mode:        cycle.TransferModeKeep,
+		RequestID:   uuid.New(),
+	}
+	resp, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, f.newAcct, resp.AccountID)
+	require.Equal(t, int64(0), resp.MovedEventCount, "keep moves nothing; the repoint is not a move")
+	require.Equal(t, int64(1), resp.RepointedEventCount, "exactly the row inside the target's window is repointed")
+	requireSameInstant(t, mustTime(t, "2026-08-04T00:00:00Z"), resp.OpenPeriod.Start, "open_period.start")
+
+	type usageRow struct {
+		account    *string
+		billableAt *time.Time
+		recordedAt time.Time
+		policy     string
+	}
+	readRow := func(id uuid.UUID) usageRow {
+		var row usageRow
+		require.NoError(t, f.pool.QueryRow(ctx, `
+			SELECT account_id::text, billable_at, recorded_at, occurrence_policy
+			FROM ms_billing.usage_events WHERE event_id = $1`, id.String()).
+			Scan(&row.account, &row.billableAt, &row.recordedAt, &row.policy))
+		return row
+	}
+	got := readRow(inWindow)
+	require.NotNil(t, got.account, "the in-window row still has no account; the target's own usage is stranded")
+	require.Equal(t, f.newAcct.String(), *got.account)
+	require.NotNil(t, got.billableAt, "the repoint did not set billable_at")
+	// The org sweep's clamp: GREATEST(COALESCE(occurred_at, recorded_at),
+	// window start) — the row's own instant, which is inside the window.
+	requireSameInstant(t, mustTime(t, "2026-08-05T10:00:00Z"), *got.billableAt, "billable_at")
+	requireSameInstant(t, mustTime(t, "2026-08-05T10:00:00Z"), got.recordedAt, "recorded_at")
+	require.Equal(t, "v1_ingest_time", got.policy, "a v1 row's policy is not the v2 first_funded arm's to change")
+
+	left := readRow(older)
+	require.Nil(t, left.account, "a NULL row older than the target's window was repointed; D1d does not catch up usage recorded for a payer with no account")
+	require.Nil(t, left.billableAt, "the older row was touched")
+	requireSameInstant(t, mustTime(t, "2026-08-02T10:00:00Z"), left.recordedAt, "older row recorded_at")
+
+	row, found := f.ledgerRow(t, req.RequestID)
+	require.True(t, found)
+	require.Equal(t, int64(1), row.repointedEvents, "the ledger does not count the repoint")
+	require.False(t, row.forfeitedProration)
+	require.Nil(t, row.forfeitReason)
+	require.Equal(t, f.newAcct.String(), f.rosterAccount(t))
+
+	// The replay returns the STORED count. The rows are no longer NULL, so a
+	// recount would read 0 — which is exactly how a recomputing replay would
+	// show itself here.
+	again, err := svc.TransferApp(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), again.RepointedEventCount, "the replay recounted instead of returning the ledger's number")
+	require.Equal(t, resp.MovedEventCount, again.MovedEventCount)
+	require.Equal(t, resp.AccountID, again.AccountID)
 }
 
 // 🔴 A TRANSFER TO THE ACCOUNT THAT ALREADY HOLDS THE APP CHANGES NOTHING.

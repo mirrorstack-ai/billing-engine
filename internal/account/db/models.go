@@ -468,6 +468,7 @@ type MsBillingAppTransferEvent struct {
 	ToAccount            string      `json:"to_account"`
 	Mode                 string      `json:"mode"`
 	MovedEventCount      int64       `json:"moved_event_count"`
+	RepointedEventCount  int64       `json:"repointed_event_count"`
 	At                   time.Time   `json:"at"`
 	OpenPeriodStart      time.Time   `json:"open_period_start"`
 	OpenPeriodEnd        time.Time   `json:"open_period_end"`
