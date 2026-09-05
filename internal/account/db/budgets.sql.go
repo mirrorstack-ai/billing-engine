@@ -50,6 +50,7 @@ WITH base_events AS (
     WHERE app_id = $1
       AND COALESCE(billable_at, recorded_at) >= $2
       AND COALESCE(billable_at, recorded_at) <  $3
+      AND dev_served = false
 ),
 billable_events AS (
     SELECT module_id, metric, model, module_version, value AS billable_value
@@ -82,6 +83,14 @@ type AppPeriodSpendMicrosParams struct {
 // Returns a NUMERIC the caller decodes with microsFromNumeric (the same
 // single-rounding-point helper CurrentPeriodUsage uses). This is the SAME
 // spend window GetUsageSummary shows the user (current calendar month).
+//
+// 🔴 dev_served EVENTS ARE EXCLUDED (migration 073). A budget is a statement
+// about MONEY THE APP WILL BE ASKED FOR, and tunnel-served usage is never
+// charged, so counting it would burn a production budget — and fire the
+// threshold alerts an owner reads as "we are overspending" — because a
+// developer spent an afternoon exercising a paid meter on a laptop. The
+// exclusion is here rather than in the ingest hook so it also holds for the
+// periodic re-evaluation, which never sees an individual event.
 func (q *Queries) AppPeriodSpendMicros(ctx context.Context, arg AppPeriodSpendMicrosParams) (pgtype.Numeric, error) {
 	row := q.db.QueryRow(ctx, appPeriodSpendMicros, arg.AppID, arg.BillableAt, arg.BillableAt_2)
 	var total_raw_cost_micros pgtype.Numeric

@@ -449,6 +449,12 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		Model:              req.Model,         // empty for non-AI metrics → NULL usage_events.model
 		ModuleVersion:      req.ModuleVersion, // empty → NULL usage_events.module_version
 		OccurrencePolicy:   OccurrencePolicyV1IngestTime,
+		// DevServed is deliberately absent (false). Platform infra is metered at
+		// the platform's OWN chokepoints — CDN egress, SSR compute, the agent's
+		// token spend — which the platform incurs and pays for whether the
+		// module answering was a tunnel or a Lambda. Only the module's own SDK
+		// meter can be tunnel-served, and that arrives on RecordUsage. A
+		// reserved metric is therefore always chargeable infra (migration 073).
 	}
 	event.PayloadFingerprint = observationFingerprint(event)
 	recorded, err := s.store.InsertUsageEvent(ctx, event)

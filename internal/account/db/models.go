@@ -869,6 +869,8 @@ type MsBillingUsageAggregate struct {
 	ActiveSeconds     pgtype.Numeric      `json:"active_seconds"`
 	PeriodDays        pgtype.Numeric      `json:"period_days"`
 	AggregationKey    pgtype.Text         `json:"aggregation_key"`
+	// Migration 073: this billable line is tunnel-served developer usage. charged_micros IS computed and snapshotted (the console shows it), but the row is excluded from every money sum: arrears, settlement income, budgets, backlog disclosure, invoice reconciliation.
+	DevServed bool `json:"dev_served"`
 }
 
 type MsBillingUsageEvent struct {
@@ -892,6 +894,8 @@ type MsBillingUsageEvent struct {
 	AggregationKey     pgtype.Text         `json:"aggregation_key"`
 	PayloadFingerprint []byte              `json:"payload_fingerprint"`
 	OccurrencePolicy   string              `json:"occurrence_policy"`
+	// Migration 073: the event was authenticated by a module live-tunnel session secret, not its deployed credential. Recorded and priced, never charged. A property of the fact, immutable like the rest of the row.
+	DevServed bool `json:"dev_served"`
 }
 
 type MsBillingUsageObservationRejection struct {

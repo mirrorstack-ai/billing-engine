@@ -74,6 +74,13 @@ type Period struct {
 // Only periods with a recorded charge are returned: a period with
 // nothing charged has nothing to disagree about, and including them
 // would inflate the "compared" count with rows that can only agree.
+//
+// dev_served rows are excluded (migration 073), here and in FactsFor,
+// and the two exclusions have to move together. This tool exists to
+// compare what the legacy rollup CHARGED against what the intent rater
+// derives; tunnel-served usage is charged by neither, so leaving it in
+// the legacy side alone would manufacture a discrepancy on every module
+// a developer tunnelled — noise in exactly the signal the tool is for.
 func (s *Source) ClosedPeriods(ctx context.Context, limit int) ([]Period, error) {
 	rows, err := s.q.Query(ctx, `
 		SELECT p.id::text, p.account_id::text, p.period_start, p.period_end,
@@ -82,6 +89,7 @@ func (s *Source) ClosedPeriods(ctx context.Context, limit int) ([]Period, error)
 		  FROM ms_billing.billing_periods p
 		  JOIN ms_billing.usage_aggregates ua ON ua.period_id = p.id
 		 WHERE p.period_end < now()
+		   AND ua.dev_served = false
 		 GROUP BY p.id, p.account_id, p.period_start, p.period_end
 		HAVING COALESCE(SUM(ua.charged_micros), 0) > 0
 		 ORDER BY p.period_end DESC
@@ -114,6 +122,7 @@ func (s *Source) FactsFor(ctx context.Context, p Period) ([]intent.UsageFact, er
 		SELECT metric, module_id::text, module_version, billable_quantity
 		  FROM ms_billing.usage_aggregates
 		 WHERE period_id = $1
+		   AND dev_served = false
 		 ORDER BY module_id, metric`, p.PeriodID)
 	if err != nil {
 		return nil, fmt.Errorf("read usage for period %s: %w", p.PeriodID, err)

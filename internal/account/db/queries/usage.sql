@@ -208,11 +208,19 @@ WHERE module_id = $1 AND metric = $2;
 -- (migration 018) — NULL for every non-AI event. module_version is the
 -- per-event attribution dimension (migration 023, purely reporting — it
 -- never affects price) — NULL for every event that carries no version.
+-- dev_served is the migration-073 tunnel flag: true when api-platform
+-- authenticated the call with the module's LIVE TUNNEL SESSION secret rather
+-- than its deployed credential. It is a property of the FACT and is stored
+-- here so it survives to the aggregate unchanged; false (the wire default) is
+-- ordinary chargeable usage. The ON CONFLICT (event_id) DO NOTHING idempotency
+-- is UNTOUCHED — dev_served rides along on the insert and, exactly like every
+-- other column, a deduped retry never rewrites it.
 -- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
-    billable_at, aggregation_key, payload_fingerprint, occurrence_policy
+    billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
+    dev_served
 ) VALUES (
     @event_id::text, sqlc.narg(account_id)::uuid, @app_id::uuid,
     @module_id::uuid, @metric::text, @kind::ms_billing.metric_kind,
@@ -221,7 +229,8 @@ INSERT INTO ms_billing.usage_events (
     sqlc.narg(subject)::text, sqlc.narg(metadata)::json,
     sqlc.narg(occurred_at)::timestamptz, @billable_at::timestamptz,
     sqlc.narg(aggregation_key)::text,
-    @payload_fingerprint::bytea, @occurrence_policy::text
+    @payload_fingerprint::bytea, @occurrence_policy::text,
+    @dev_served::boolean
 )
 ON CONFLICT (event_id) DO NOTHING;
 
@@ -350,10 +359,14 @@ DO UPDATE SET visibility = EXCLUDED.visibility;
 -- markup); COALESCE to 'private' matches the settlement default (design
 -- §7-B: never under-collect on a lagging publish) for a module with no
 -- visibility row yet.
+-- dev_served (migration 073) is a GROUP BY dimension and a returned column, not
+-- a filter: this summary is a DISPLAY read, and a developer testing a paid
+-- meter has to be able to see what it would have cost. The consumer splits the
+-- two sections on the flag; nothing here sums them together.
 -- name: CurrentPeriodUsageSummary :many
 WITH base_events AS (
     SELECT
-        app_id, module_id, metric, kind, aggregation_key, subject,
+        app_id, module_id, metric, kind, aggregation_key, subject, dev_served,
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
         value
@@ -364,23 +377,24 @@ WITH base_events AS (
 ),
 billable_events AS (
     -- Every legacy/non-keyed row keeps the exact coarse live behavior.
-    SELECT app_id, module_id, metric, kind, model, module_version, value AS billable_value
+    SELECT app_id, module_id, metric, kind, model, module_version, dev_served, value AS billable_value
     FROM base_events
     WHERE aggregation_key IS DISTINCT FROM 'subject'
     UNION ALL
     -- Keyed peak is exact even before rollup: one MAX per authoritative
     -- subject inside the existing app/model/version bill-line dimensions.
     SELECT
-        app_id, module_id, metric, kind, model, module_version,
+        app_id, module_id, metric, kind, model, module_version, dev_served,
         MAX(value)::numeric AS billable_value
     FROM base_events
     WHERE aggregation_key = 'subject'
-    GROUP BY app_id, module_id, metric, kind, model, module_version, subject
+    GROUP BY app_id, module_id, metric, kind, model, module_version, dev_served, subject
 )
 SELECT
     e.module_id                                         AS module_id,
     e.metric                                            AS metric,
     e.kind                                              AS kind,
+    e.dev_served                                        AS dev_served,
     COALESCE(SUM(e.billable_value), 0)::numeric         AS total_quantity,
     COALESCE(MAX(md.unit_price_micros), 0)::bigint      AS unit_price_micros,
     COALESCE(
@@ -404,8 +418,8 @@ LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric
 LEFT JOIN ms_billing.module_visibility mv
     ON mv.module_id = e.module_id
-GROUP BY e.module_id, e.metric, e.kind
-ORDER BY e.metric;
+GROUP BY e.module_id, e.metric, e.kind, e.dev_served
+ORDER BY e.metric, e.dev_served;
 
 -- UsageHistoryForAccount is the multi-month trend-chart read: it reads the
 -- IMMUTABLE billable record (usage_aggregates, written by cmd/billing-cycle's
@@ -454,6 +468,13 @@ LEFT JOIN ms_billing.module_visibility mv
 WHERE ua.account_id = $1
   AND bp.period_start >= $2
   AND bp.period_start <  $3
+  -- dev_served rows are EXCLUDED (migration 073). Every period this reads is
+  -- CLOSED and invoiced, so each of its numbers has an invoice to agree with;
+  -- folding in usage that was never billed would make the trend chart disagree
+  -- with the customer's own receipts, every month a developer used a tunnel.
+  -- The current period's dev/deployed split is a live read
+  -- (AppBillLines / AppUsageSummary), not a historical one.
+  AND ua.dev_served = false
 GROUP BY bp.period_start, bp.period_end, ua.module_id, ua.metric, ua.kind
 ORDER BY bp.period_start ASC, ua.metric ASC;
 
@@ -482,6 +503,11 @@ JOIN ms_billing.billing_periods bp
 WHERE ua.account_id = $1
   AND bp.period_start = $2
   AND ($3::boolean = false OR ua.module_id = $4)
+  -- dev_served rows are EXCLUDED (migration 073): this is a per-version
+  -- COST/INCOME breakdown, and a version's cost is what it actually cost.
+  -- A tunnel-served row would raise a version's apparent spend by an amount
+  -- that appears on no invoice.
+  AND ua.dev_served = false
 GROUP BY ua.module_version
 ORDER BY ua.module_version;
 
@@ -531,6 +557,12 @@ WITH rolled AS (
         ua.kind                                            AS kind,
         ua.model                                           AS model,
         ua.module_version                                  AS module_version,
+        -- dev_served (migration 073) is a LINE DIMENSION here, never a filter:
+        -- the console renders tunnel-served usage as its own section, priced,
+        -- with the money total taken from the non-dev lines only. It is part of
+        -- the aggregate's idempotency key, so this GROUP BY still resolves one
+        -- source row per output row.
+        ua.dev_served                                      AS dev_served,
         COALESCE(SUM(ua.billable_quantity), 0)::numeric    AS billable_quantity,
         COALESCE(MAX(ua.unit_price_micros), 0)::bigint     AS unit_price_micros,
         COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros,
@@ -549,11 +581,11 @@ WITH rolled AS (
     WHERE ua.account_id   = @account_id::uuid
       AND ua.app_id       = @app_id::uuid
       AND bp.period_start = @period_start::timestamptz
-    GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
+    GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version, ua.dev_served
 ),
 live_base AS (
     SELECT
-        module_id, metric, kind, aggregation_key, subject,
+        module_id, metric, kind, aggregation_key, subject, dev_served,
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
         value
@@ -564,16 +596,16 @@ live_base AS (
       AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz
 ),
 live_values AS (
-    SELECT module_id, metric, kind, model, module_version, value AS billable_value
+    SELECT module_id, metric, kind, model, module_version, dev_served, value AS billable_value
     FROM live_base
     WHERE aggregation_key IS DISTINCT FROM 'subject'
     UNION ALL
     SELECT
-        module_id, metric, kind, model, module_version,
+        module_id, metric, kind, model, module_version, dev_served,
         MAX(value)::numeric AS billable_value
     FROM live_base
     WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, kind, model, module_version, subject
+    GROUP BY module_id, metric, kind, model, module_version, dev_served, subject
 ),
 live AS (
     SELECT
@@ -582,6 +614,7 @@ live AS (
         e.kind                                             AS kind,
         e.model                                             AS model,
         e.module_version                                    AS module_version,
+        e.dev_served                                        AS dev_served,
         COALESCE(SUM(e.billable_value), 0)::numeric         AS billable_quantity,
         COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
         COALESCE(
@@ -597,21 +630,21 @@ live AS (
     FROM live_values e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
-    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version
+    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version, e.dev_served
 )
 SELECT
-    module_id, metric, kind, model, module_version,
+    module_id, metric, kind, model, module_version, dev_served,
     billable_quantity, unit_price_micros, charged_micros,
     active_seconds, period_days
 FROM rolled
 UNION ALL
 SELECT
-    module_id, metric, kind, model, module_version,
+    module_id, metric, kind, model, module_version, dev_served,
     billable_quantity, unit_price_micros, charged_micros,
     active_seconds, period_days
 FROM live
 WHERE NOT EXISTS (SELECT 1 FROM rolled)
-ORDER BY module_id, metric, model, module_version;
+ORDER BY module_id, metric, model, module_version, dev_served;
 
 -- AppBillLines is the FULL per-app bill's line source — the read behind
 -- GetAppBill (the app-owner's 最終費用 bill for ONE app in ONE period). It is
@@ -653,6 +686,12 @@ WITH rolled AS (
         ua.kind                                            AS kind,
         ua.model                                           AS model,
         ua.module_version                                  AS module_version,
+        -- dev_served (migration 073) is a LINE DIMENSION here, never a filter:
+        -- the console renders tunnel-served usage as its own section, priced,
+        -- with the money total taken from the non-dev lines only. It is part of
+        -- the aggregate's idempotency key, so this GROUP BY still resolves one
+        -- source row per output row.
+        ua.dev_served                                      AS dev_served,
         COALESCE(SUM(ua.billable_quantity), 0)::numeric    AS billable_quantity,
         COALESCE(MAX(ua.unit_price_micros), 0)::bigint     AS unit_price_micros,
         COALESCE(SUM(ua.charged_micros), 0)::numeric       AS charged_micros,
@@ -671,11 +710,11 @@ WITH rolled AS (
     WHERE ua.account_id   = @account_id::uuid
       AND ua.app_id       = @app_id::uuid
       AND bp.period_start = @period_start::timestamptz
-    GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version
+    GROUP BY ua.module_id, ua.metric, ua.kind, ua.model, ua.module_version, ua.dev_served
 ),
 live_base AS (
     SELECT
-        module_id, metric, kind, aggregation_key, subject,
+        module_id, metric, kind, aggregation_key, subject, dev_served,
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
         value
@@ -686,16 +725,16 @@ live_base AS (
       AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz
 ),
 live_values AS (
-    SELECT module_id, metric, kind, model, module_version, value AS billable_value
+    SELECT module_id, metric, kind, model, module_version, dev_served, value AS billable_value
     FROM live_base
     WHERE aggregation_key IS DISTINCT FROM 'subject'
     UNION ALL
     SELECT
-        module_id, metric, kind, model, module_version,
+        module_id, metric, kind, model, module_version, dev_served,
         MAX(value)::numeric AS billable_value
     FROM live_base
     WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, kind, model, module_version, subject
+    GROUP BY module_id, metric, kind, model, module_version, dev_served, subject
 ),
 live AS (
     SELECT
@@ -704,6 +743,7 @@ live AS (
         e.kind                                             AS kind,
         e.model                                             AS model,
         e.module_version                                    AS module_version,
+        e.dev_served                                        AS dev_served,
         COALESCE(SUM(e.billable_value), 0)::numeric         AS billable_quantity,
         COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
         -- Custom metric → qty × price (identity 1×). Reserved infra.* / platform.*
@@ -724,21 +764,21 @@ live AS (
     FROM live_values e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
-    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version
+    GROUP BY e.module_id, e.metric, e.kind, e.model, e.module_version, e.dev_served
 )
 SELECT
-    module_id, metric, kind, model, module_version,
+    module_id, metric, kind, model, module_version, dev_served,
     billable_quantity, unit_price_micros, charged_micros,
     active_seconds, period_days
 FROM rolled
 UNION ALL
 SELECT
-    module_id, metric, kind, model, module_version,
+    module_id, metric, kind, model, module_version, dev_served,
     billable_quantity, unit_price_micros, charged_micros,
     active_seconds, period_days
 FROM live
 WHERE NOT EXISTS (SELECT 1 FROM rolled)
-ORDER BY module_id, metric, model, module_version;
+ORDER BY module_id, metric, model, module_version, dev_served;
 
 -- AppInfraBillLines is the per-metric 基礎設施 (infrastructure) RESIDUAL breakdown
 -- for the app-owner bill — the CATALOG-ANCHORED read behind GetAppBill's InfraLines.
@@ -791,6 +831,13 @@ WITH rolled AS (
       AND bp.period_start = @period_start::timestamptz
       AND (ua.metric LIKE 'infra.%' OR ua.metric LIKE 'platform.%')
       AND ua.module_id = '00000000-0000-0000-0000-000000000000'
+      -- dev_served EXCLUDED (migration 073). Reserved metrics are metered at
+      -- the PLATFORM's own chokepoints (RecordInfraUsage, which never sets the
+      -- flag), so this filter should match everything — it is a floor, not a
+      -- behaviour: it means a stray dev_served infra row, however it got here,
+      -- can never enter infra_total_micros, which is a reconciliation scalar
+      -- the app bill's total is built from.
+      AND ua.dev_served = false
     GROUP BY ua.metric
 ),
 live AS (
@@ -807,6 +854,7 @@ live AS (
       AND COALESCE(e.billable_at, e.recorded_at) <  @period_end::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
       AND e.module_id = '00000000-0000-0000-0000-000000000000'
+      AND e.dev_served = false -- see the rolled branch above (migration 073)
     GROUP BY e.metric
 ),
 usage AS (
@@ -875,6 +923,11 @@ WITH rolled AS (
       AND bp.period_start = @period_start::timestamptz
       AND (ua.metric LIKE 'infra.%' OR ua.metric LIKE 'platform.%')
       AND ua.module_id <> '00000000-0000-0000-0000-000000000000'
+      -- dev_served EXCLUDED (migration 073), same floor as AppInfraBillLines:
+      -- Σ(this query) + Σ(AppInfraBillLines) IS infra_total_micros, so a stray
+      -- flagged row here would break that reconciliation identity as well as
+      -- charging a tunnel.
+      AND ua.dev_served = false
     GROUP BY ua.module_id, ua.module_version, ua.metric
 ),
 live AS (
@@ -898,6 +951,7 @@ live AS (
       AND COALESCE(e.billable_at, e.recorded_at) <  @period_end::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
       AND e.module_id <> '00000000-0000-0000-0000-000000000000'
+      AND e.dev_served = false -- see the rolled branch above (migration 073)
     GROUP BY e.module_id, COALESCE(e.module_version, ''), e.metric
 ),
 usage AS (

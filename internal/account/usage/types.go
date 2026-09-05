@@ -114,6 +114,30 @@ type RecordUsageRequest struct {
 	// before this PR, and any module that doesn't report a version) → stored
 	// as a NULL usage_events.module_version.
 	ModuleVersion string `json:"module_version,omitempty"`
+
+	// DevServed marks usage a DEVELOPER TUNNEL produced (migration 073).
+	// api-platform sets it true when the metered call was authenticated by the
+	// module's LIVE TUNNEL SESSION secret rather than by its deployed
+	// credential — the one place in the system that can tell a laptop from a
+	// deployed Lambda, because the SDK meter cannot and must not.
+	//
+	// ABSENT == false == CHARGED, i.e. exactly today's behaviour, so a sender
+	// that has not been updated keeps working unchanged. A true event is
+	// recorded, priced and displayed like any other (a developer testing a
+	// paid meter needs to see what it would have cost) and contributes ZERO to
+	// every sum that takes money or reconciles an invoice.
+	//
+	// It is a property of the FACT: it is persisted on the event, survives to
+	// the aggregate, and is never re-derived from the module's current state —
+	// a module deployed for three weeks and tunnelled for the last one has
+	// both kinds of usage in one period and owes the deployed part.
+	//
+	// 🔴 DELIBERATELY NOT PART OF observationFingerprint. The fingerprint is
+	// the canonical MODULE-REPORTED payload; dev_served is a platform-side
+	// transport property the module never sees. Adding a field to that hash
+	// would also change the digest of every event already stored, turning
+	// ordinary at-least-once retries into event-id conflicts.
+	DevServed bool `json:"dev_served,omitempty"`
 }
 
 // RecordUsageResponse reports whether the event was newly recorded.
@@ -160,6 +184,12 @@ type MetricUsage struct {
 	ModuleID uuid.UUID `json:"module_id"`
 	Metric   string    `json:"metric"`
 	Kind     Kind      `json:"kind"`
+	// DevServed marks the row as usage a developer's DEV TUNNEL produced
+	// (migration 073) — priced like any other row, charged never. The query
+	// groups by it, so one (module, metric, kind) may appear TWICE in Metrics:
+	// once deployed, once tunnelled. A consumer that sums this slice without
+	// reading the flag is summing money it must not ask for.
+	DevServed bool `json:"dev_served,omitempty"`
 	// Quantity is a DISPLAY value (the running metered amount), not a
 	// billing-critical field — money is carried only in the *_micros int64
 	// fields below. Float is deliberate here and must not be widened into a
@@ -285,6 +315,15 @@ type AppMetricUsage struct {
 	// render per-version sub-lines (data exists).
 	Model         string `json:"model,omitempty"`
 	ModuleVersion string `json:"module_version,omitempty"`
+	// DevServed marks the line as usage a developer's DEV TUNNEL produced
+	// (migration 073). ChargedMicros below is a REAL price — what the metered
+	// usage would have cost, which is the whole point of showing the line — but
+	// the line is NOT in ModuleUsageTotalMicros and nothing collects it. A
+	// consumer MUST render the two kinds as separate sections; summing
+	// ModuleUsage[].ChargedMicros indiscriminately re-introduces exactly the
+	// charge this flag exists to prevent (use ModuleUsageTotalMicros /
+	// ModuleUsageDevServedMicros, which are computed here).
+	DevServed bool `json:"dev_served,omitempty"`
 	// BillableQuantity is a DISPLAY value (the running / rolled-up metered
 	// amount), not a money field — money is carried only in the *_micros int64
 	// fields. Float is deliberate and must not be widened into a money path.
@@ -444,9 +483,20 @@ type GetAppBillResponse struct {
 	// NO markup. EXCLUDES the reserved infra.* / platform.* metrics (those roll
 	// into InfraTotalMicros). Empty slice (never nil) when the app has no module
 	// usage this period.
+	// Since migration 073 it ALSO carries the dev_served lines — usage a
+	// developer's dev tunnel produced, priced but never charged — flagged by
+	// AppMetricUsage.DevServed so the console can render them as their own
+	// section.
 	ModuleUsage []AppMetricUsage `json:"module_usage"`
-	// ModuleUsageTotalMicros is Σ ModuleUsage[].ChargedMicros.
+	// ModuleUsageTotalMicros is Σ ModuleUsage[].ChargedMicros over the
+	// NON-dev_served lines — the collectable module-usage total, and the term
+	// that enters TotalMicros.
 	ModuleUsageTotalMicros int64 `json:"module_usage_total_micros"`
+	// ModuleUsageDevServedMicros is Σ ModuleUsage[].ChargedMicros over the
+	// dev_served lines: what the developer's tunnel testing WOULD have cost.
+	// It is reported, never billed, and is deliberately NOT part of
+	// ModuleUsageTotalMicros or TotalMicros — the two never add together.
+	ModuleUsageDevServedMicros int64 `json:"module_usage_dev_served_micros"`
 
 	// InfraTotalMicros is 基礎設施 — the platform-infra plane charge (reserved
 	// infra.* / platform.* metrics priced at the 1.2× infra markup) for this
@@ -485,6 +535,7 @@ type GetAppBillResponse struct {
 	PaasCreditMicros int64 `json:"paas_credit_micros"`
 
 	// TotalMicros is 最終費用 = BaseFee + ModuleUsageTotal + InfraTotal − PaasCredit.
+	// ModuleUsageDevServedMicros is NOT a term: it is priced display, not debt.
 	TotalMicros int64 `json:"total_micros"`
 }
 

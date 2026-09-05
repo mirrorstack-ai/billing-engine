@@ -53,6 +53,13 @@ WHERE account_id = @account_id::uuid
 -- blending versions into one row. COALESCE(…, '') keys an event that carries
 -- neither dimension (NULL model / NULL module_version) under a stable empty
 -- string.
+--
+-- dev_served (migration 073) is grouped too, and it is NOT a variant of the
+-- dimensions above: it does not select a price, it selects whether the line is
+-- COLLECTABLE AT ALL. A module tunnelled for part of a period has both kinds
+-- of usage of the same metric in that one period, and folding them together
+-- would either charge the tunnel usage or waive the deployed usage. Two rows,
+-- both priced, only one billed downstream.
 -- name: RollupSumKinds :many
 SELECT
     app_id                         AS app_id,
@@ -62,6 +69,7 @@ SELECT
     NULL::text                     AS aggregation_key,
     COALESCE(model, '')            AS model,
     COALESCE(module_version, '')   AS module_version,
+    dev_served                     AS dev_served,
     COALESCE(SUM(value), 0)::numeric AS billable_quantity
 FROM ms_billing.usage_events
 WHERE account_id = $1
@@ -72,7 +80,7 @@ WHERE account_id = $1
   -- anchor. include_v2 is true only for an activated, anchor-consistent window.
   AND (sqlc.arg(include_v2)::boolean OR observation_version <> 2)
   AND kind IN ('count', 'sum')
-GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, '');
+GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_version, ''), dev_served;
 
 -- RollupPeakKind aggregates the peak kind PER VERSION (usage-time-pricing
 -- Phase 1, docs-temp/usage-time-pricing/design.md — supersedes the
@@ -123,12 +131,22 @@ GROUP BY app_id, module_id, metric, kind, COALESCE(model, ''), COALESCE(module_v
 -- model stays in the GROUP BY (it prices infra.ai.* lines); module_version
 -- is ALSO now a pricing key via metric_version_prices (migration 044),
 -- version-first-resolved in Go (cycle.MetricPriceMicros).
+--
+-- dev_served (migration 073) is treated EXACTLY like module_version and for
+-- the same structural reason: OUT of the LEAD/ROW_NUMBER PARTITION BY, back in
+-- the OUTER GROUP BY. Out of the partition because a tunnel taking over from a
+-- deployed module is a HANDOFF, not a second concurrent stream — the tunnel's
+-- first sample must terminate the deployed segment at the true instant, or the
+-- deployed level bleeds to period_end and is charged for a week it did not
+-- serve. In the outer group because the two halves are separately billable:
+-- one is collected, the other is only displayed.
 -- name: RollupPeakKind :many
 WITH raw_events AS (
     SELECT
         app_id, module_id, metric, kind,
         COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
+        dev_served,
         value, COALESCE(billable_at, recorded_at) AS observation_at, event_id,
         sqlc.arg(period_start)::timestamptz AS period_start
     FROM ms_billing.usage_events
@@ -141,7 +159,7 @@ WITH raw_events AS (
 ),
 windowed AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version, value, observation_at, period_start,
+        app_id, module_id, metric, kind, model, module_version, dev_served, value, observation_at, period_start,
         LEAD(observation_at, 1, sqlc.arg(period_end)::timestamptz)
             OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end,
         -- row_num identifies the EARLIEST-observed row of the WHOLE (app,
@@ -166,13 +184,14 @@ SELECT
     NULL::text AS aggregation_key,
     model,
     module_version,
+    dev_served,
     COALESCE(MAX(value), 0)::numeric AS billable_quantity,
     COALESCE(SUM(
         EXTRACT(EPOCH FROM (segment_end - observation_at))
         + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (observation_at - period_start)) ELSE 0 END
     ), 0)::numeric AS active_seconds
 FROM windowed
-GROUP BY app_id, module_id, metric, kind, model, module_version;
+GROUP BY app_id, module_id, metric, kind, model, module_version, dev_served;
 
 -- RollupKeyedPeakKind implements aggregation_key="subject": inside an
 -- account's period, each authoritative subject contributes its own MAX(value),
@@ -185,6 +204,11 @@ GROUP BY app_id, module_id, metric, kind, model, module_version;
 -- no arrival-order-dependent "latest wins" reassignment can move usage between
 -- prices. Keyed peak is a cardinality-style quantity and receives no
 -- level-window proration.
+--
+-- dev_served (migration 073) joins that scope at BOTH levels: one subject's
+-- tunnel-served peak and its deployed peak are different facts, so they are
+-- summed into different lines. Collapsing them would let a developer's local
+-- test raise the subject maximum that the customer is billed for.
 -- name: RollupKeyedPeakKind :many
 WITH eligible AS (
     SELECT
@@ -194,6 +218,7 @@ WITH eligible AS (
         subject,
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
+        dev_served,
         value
     FROM ms_billing.usage_events
     WHERE account_id = @account_id::uuid
@@ -205,10 +230,10 @@ WITH eligible AS (
 ),
 subject_peaks AS (
     SELECT
-        app_id, module_id, metric, subject, model, module_version,
+        app_id, module_id, metric, subject, model, module_version, dev_served,
         MAX(value)::numeric AS subject_peak
     FROM eligible
-    GROUP BY app_id, module_id, metric, subject, model, module_version
+    GROUP BY app_id, module_id, metric, subject, model, module_version, dev_served
 )
 SELECT
     p.app_id,
@@ -218,9 +243,10 @@ SELECT
     'subject'::text AS aggregation_key,
     p.model,
     p.module_version,
+    p.dev_served,
     COALESCE(SUM(p.subject_peak), 0)::numeric AS billable_quantity
 FROM subject_peaks p
-GROUP BY p.app_id, p.module_id, p.metric, p.model, p.module_version;
+GROUP BY p.app_id, p.module_id, p.metric, p.model, p.module_version, p.dev_served;
 
 -- RollupTimeWeightedKind integrates the step function under the ordered
 -- samples PER VERSION (usage-time-pricing Phase 1 — supersedes #58's
@@ -261,12 +287,20 @@ GROUP BY p.app_id, p.module_id, p.metric, p.model, p.module_version;
 -- single-version period trivially reproduces the pre-this-PR number (there
 -- is only one version's I_v to sum) — the load-bearing no-regression
 -- invariant.
+--
+-- dev_served (migration 073) sits exactly where module_version sits: OUT of the
+-- LEAD's PARTITION BY so a tunnel's first sample terminates the deployed
+-- module's last segment at the true handoff (otherwise the deployed level's
+-- integral keeps accruing through a week it did not serve, and the customer
+-- pays for it), and IN the outer GROUP BY so the tunnel's own integral becomes
+-- its own displayed, never-collected line.
 -- name: RollupTimeWeightedKind :many
 WITH raw_events AS (
     SELECT
         app_id, module_id, metric, kind,
         COALESCE(model, '')          AS model,
         COALESCE(module_version, '') AS module_version,
+        dev_served,
         value, COALESCE(billable_at, recorded_at) AS observation_at, event_id
     FROM ms_billing.usage_events
     WHERE account_id = $1
@@ -277,14 +311,14 @@ WITH raw_events AS (
 ),
 windowed AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version, value, observation_at,
+        app_id, module_id, metric, kind, model, module_version, dev_served, value, observation_at,
         LEAD(observation_at, 1, $3::timestamptz)
             OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end
     FROM raw_events
 ),
 segments AS (
     SELECT
-        app_id, module_id, metric, kind, model, module_version,
+        app_id, module_id, metric, kind, model, module_version, dev_served,
         EXTRACT(EPOCH FROM (segment_end - observation_at)) AS duration_seconds,
         value * EXTRACT(EPOCH FROM (segment_end - observation_at)) / 3600.0 AS segment_byte_hours
     FROM windowed
@@ -297,10 +331,11 @@ SELECT
     NULL::text AS aggregation_key,
     model,
     module_version,
+    dev_served,
     COALESCE(SUM(segment_byte_hours), 0)::numeric AS billable_quantity,
     COALESCE(SUM(duration_seconds), 0)::numeric   AS active_seconds
 FROM segments
-GROUP BY app_id, module_id, metric, kind, model, module_version;
+GROUP BY app_id, module_id, metric, kind, model, module_version, dev_served;
 
 -- LookupMetricPrice returns the per-unit customer price for a (module, metric)
 -- at rollup time, to snapshot onto the aggregate. NULL price → unpriced
@@ -365,10 +400,19 @@ WHERE metric = $1 AND model = $2;
 -- (count/sum — proration never applies), populated for peak/time_weighted so
 -- a closed invoice can re-derive the exact per-version window fraction
 -- without re-reading usage_events.
+-- dev_served (migration 073) is part of the idempotency key for the same
+-- reason model and module_version are, and with more at stake: it is what
+-- separates a collectable line from a displayed-only one. Without it in the
+-- conflict target, a module tunnelled mid-period upserts its tunnel row over
+-- its deployed row (or the reverse, depending on which kind the rollup emitted
+-- last) — one silently overwriting the other, with no error and no duplicate
+-- to notice. charged_micros IS still computed and stored for a dev_served row:
+-- that is the figure the console shows a developer, and it is excluded from
+-- money by the readers, never by writing a zero here.
 -- name: UpsertUsageAggregate :exec
 INSERT INTO ms_billing.usage_aggregates (
     period_id, account_id, app_id, module_id, metric, model, module_version, kind,
-    aggregation_key,
+    aggregation_key, dev_served,
     billable_quantity, unit_price_micros,
     customer_markup_num, customer_markup_den,
     raw_cost_micros, charged_micros, active_seconds, period_days, rolled_up_at
@@ -376,6 +420,7 @@ INSERT INTO ms_billing.usage_aggregates (
     @period_id::uuid, @account_id::uuid, @app_id::uuid, @module_id::uuid,
     @metric::text, @model::text, @module_version::text,
     @kind::ms_billing.metric_kind, sqlc.narg(aggregation_key)::text,
+    @dev_served::boolean,
     @billable_quantity::numeric, @unit_price_micros::bigint,
     @customer_markup_num::integer, @customer_markup_den::integer,
     @raw_cost_micros::bigint, @charged_micros::bigint,
@@ -383,7 +428,7 @@ INSERT INTO ms_billing.usage_aggregates (
 )
 ON CONFLICT (
     period_id, app_id, module_id, metric, model, module_version,
-    COALESCE(aggregation_key, '')
+    COALESCE(aggregation_key, ''), dev_served
 )
 DO UPDATE SET
     billable_quantity   = EXCLUDED.billable_quantity,
@@ -419,12 +464,21 @@ DO UPDATE SET
 --
 -- Developer COGS belongs in developer_settlements.infra_micros, NOT here as
 -- negative income. Keep the prefixes in sync with usage.reservedMetricPrefixes.
+--
+-- 🔴 dev_served ROWS ARE EXCLUDED (migration 073). Settlement income is money:
+-- platform_take and developer_owed are derived from it, and the developer is
+-- accrued a share of it. Nobody paid for tunnel-served usage, so counting it
+-- would accrue a payable against revenue that does not exist — and it would
+-- pay the developer for calling their own module on their own laptop. The row
+-- still carries a real charged_micros for display; this query is where the
+-- money reading stops.
 -- name: ModuleIncomeForPeriod :many
 SELECT
     module_id                              AS module_id,
     COALESCE(SUM(charged_micros), 0)::bigint AS income_micros
 FROM ms_billing.usage_aggregates
 WHERE period_id = $1
+  AND dev_served = false
   AND module_id <> '00000000-0000-0000-0000-000000000000'::uuid
   AND metric NOT LIKE 'infra.%'
   AND metric NOT LIKE 'platform.%'

@@ -432,9 +432,17 @@ func (s *Service) observeWalletMutation(ctx context.Context, accountID uuid.UUID
 //     plane logic is implemented),
 //  4. snapshots unit_price + the markup multiplier + raw_cost + charged onto
 //     usage_aggregates via an idempotent upsert keyed (period, app, module,
-//     metric) — a re-run upserts the identical row, never duplicates.
+//     metric, model, module_version, aggregation_key, dev_served) — a re-run
+//     upserts the identical row, never duplicates.
 //
 // Money is integer micro-dollars, round-half-up; quantity stays NUMERIC.
+//
+// dev_served (migration 073): the rollup SELECTs group by it, so a module
+// tunnelled for part of the period yields TWO rows for one metric. Both are
+// priced identically — the developer is shown what the tunnel testing would
+// have cost — but only the non-dev_served charge lands in
+// RollupSummary.TotalChargedMicros, the figure the charge leg bills. The
+// tunnel's total is reported separately as DevServedChargedMicros.
 func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (*RollupSummary, error) {
 	if accountID == uuid.Nil {
 		return nil, billing.InvalidInput("account_id required")
@@ -540,11 +548,16 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		}
 
 		agg := MetricAggregate{
-			AppID:            raw.AppID,
-			ModuleID:         raw.ModuleID,
-			Metric:           raw.Metric,
-			Model:            raw.Model,
-			ModuleVersion:    raw.ModuleVersion,
+			AppID:         raw.AppID,
+			ModuleID:      raw.ModuleID,
+			Metric:        raw.Metric,
+			Model:         raw.Model,
+			ModuleVersion: raw.ModuleVersion,
+			// Migration 073. Priced above like every other row — deliberately
+			// NOT branched on before pricing: the console needs the real
+			// number, and a zero written here would have to be reconciled with
+			// the displayed one forever. The exclusion happens at the SUM.
+			DevServed:        raw.DevServed,
 			Kind:             raw.Kind,
 			AggregationKey:   raw.AggregationKey,
 			BillableQuantity: raw.BillableQuantity,
@@ -568,9 +581,23 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			return nil, billing.Internal("upsert usage aggregate failed", err)
 		}
 		summary.Aggregates = append(summary.Aggregates, agg)
+		// 🔴 THE ONE SUM THAT DECIDES WHETHER THE PERIOD IS COLLECTABLE. A
+		// dev_served line is priced and stored, and it accrues to the SEPARATE
+		// DevServedChargedMicros — never to TotalChargedMicros, which is what
+		// the arrears leg bills. The two totals are kept apart here (rather
+		// than filtered by a later reader) so that anything summing this
+		// struct's one obvious field cannot bill a tunnel by accident.
+		//
 		// Guard the cross-metric sum: each charged is non-negative + int64, so a
 		// wrap shows as the sum going DOWN. Per-metric overflow is already caught
 		// in chargedMicros; this catches the (impossible-at-real-scale) total.
+		if raw.DevServed {
+			if summary.DevServedChargedMicros+charged < summary.DevServedChargedMicros {
+				return nil, billing.Internal("period dev-served charged total overflows int64 micros", nil)
+			}
+			summary.DevServedChargedMicros += charged
+			continue
+		}
 		if summary.TotalChargedMicros+charged < summary.TotalChargedMicros {
 			return nil, billing.Internal("period charged total overflows int64 micros", nil)
 		}

@@ -19,8 +19,14 @@ import (
 
 // --- in-memory Store fake -------------------------------------------------
 
+// aggKey mirrors the DB's usage_aggregates idempotency key. 🔴 It MUST carry
+// every column the real unique index carries — devServed included (migration
+// 073) — or the fake silently collapses two rows the database keeps apart, and
+// the mixed dev/deployed test passes against a store that cannot reproduce the
+// bug it exists to catch.
 type aggKey struct {
 	period, app, module, metric, model, moduleVersion string
+	devServed                                         bool
 }
 
 type fakeStore struct {
@@ -471,7 +477,7 @@ func (f *fakeStore) UpsertUsageAggregate(_ context.Context, periodID, _ uuid.UUI
 	if f.errUpsert != nil {
 		return f.errUpsert
 	}
-	f.aggregates[aggKey{periodID.String(), agg.AppID.String(), agg.ModuleID.String(), agg.Metric, agg.Model, agg.ModuleVersion}] = agg
+	f.aggregates[aggKey{periodID.String(), agg.AppID.String(), agg.ModuleID.String(), agg.Metric, agg.Model, agg.ModuleVersion, agg.DevServed}] = agg
 	return nil
 }
 
