@@ -459,7 +459,7 @@ type MsBillingAppModuleOverageTimer struct {
 	GraceForfeitedBy pgtype.UUID `json:"grace_forfeited_by"`
 }
 
-// One row per accepted app billing-account transfer. request_id is the caller's idempotency key; a replay returns the stored result and a different target for the same key is a conflict. Append-only.
+// One row per accepted app billing-account transfer. request_id is the caller's idempotency key; a replay returns the stored result and a different app, target or mode for the same key is a conflict. Append-only.
 type MsBillingAppTransferEvent struct {
 	ID                   string      `json:"id"`
 	RequestID            string      `json:"request_id"`
