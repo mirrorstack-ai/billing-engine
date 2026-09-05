@@ -166,19 +166,43 @@ func (f *transferFixture) owePendingProration(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// armedAt is the arm marker in the shape the arm statements write it
+// (ArmDomainStripeCharge / ArmModuleTimerStripeCharge): the instant AND the
+// funding pin — the old account's current funding authorization, which is
+// what the arm resolves and what 052's *_attempt_funding_check requires
+// alongside charge_attempted_at. An "armed" row with no pin is not a state
+// the writers can produce, and the CHECK refuses it at insert.
+type armedAt struct {
+	at             *time.Time
+	fundingAccount *string
+	generation     *string
+}
+
+func (f *transferFixture) armed(t *testing.T, attempted bool, at string) armedAt {
+	t.Helper()
+	if !attempted {
+		return armedAt{}
+	}
+	instant := mustTime(t, at)
+	var fundingAccount, generation string
+	require.NoError(t, f.pool.QueryRow(context.Background(), `
+		SELECT funding_account_id::text, generation::text
+		FROM ms_billing.account_funding_authorizations WHERE account_id = $1`, f.oldAcct.String()).
+		Scan(&fundingAccount, &generation), "fixture error: the old account has no funding authorization (052 creates one on insert)")
+	return armedAt{at: &instant, fundingAccount: &fundingAccount, generation: &generation}
+}
+
 func (f *transferFixture) oweDomainActivation(t *testing.T, attempted bool) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	var attemptedAt *time.Time
-	if attempted {
-		at := mustTime(t, "2026-08-02T00:00:00Z")
-		attemptedAt = &at
-	}
+	arm := f.armed(t, attempted, "2026-08-02T00:00:00Z")
 	_, err := f.pool.Exec(context.Background(), `
 		INSERT INTO ms_billing.app_custom_domains
-		    (id, account_id, app_id, hostname, activated_at, charge_resolved, charge_attempted_at)
-		VALUES ($1, $2, $3, 'example.test', $4, false, $5)`,
-		id.String(), f.oldAcct.String(), f.appID.String(), mustTime(t, "2026-08-01T00:00:00Z"), attemptedAt)
+		    (id, account_id, app_id, hostname, activated_at, charge_resolved,
+		     charge_attempted_at, charge_funding_account_id, charge_funding_generation)
+		VALUES ($1, $2, $3, 'example.test', $4, false, $5, $6, $7)`,
+		id.String(), f.oldAcct.String(), f.appID.String(), mustTime(t, "2026-08-01T00:00:00Z"),
+		arm.at, arm.fundingAccount, arm.generation)
 	require.NoError(t, err)
 	return id
 }
@@ -186,19 +210,17 @@ func (f *transferFixture) oweDomainActivation(t *testing.T, attempted bool) uuid
 func (f *transferFixture) oweModuleGrace(t *testing.T, attempted bool) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	var attemptedAt *time.Time
-	if attempted {
-		at := mustTime(t, "2026-08-05T00:00:00Z")
-		attemptedAt = &at
-	}
+	arm := f.armed(t, attempted, "2026-08-05T00:00:00Z")
 	// Columns per migration 033: there is no module_id (one row per install
 	// EVENT, not per module identity) and grace_expires_at is NOT NULL. Same
 	// shape as org_deletion_integration_test.
 	_, err := f.pool.Exec(context.Background(), `
 		INSERT INTO ms_billing.app_module_overage_timers
-		    (id, account_id, app_id, installed_at, grace_expires_at, grace_resolved, charge_attempted_at)
-		VALUES ($1, $2, $3, $4::timestamptz, $4::timestamptz + interval '3 days', false, $5)`,
-		id.String(), f.oldAcct.String(), f.appID.String(), mustTime(t, "2026-08-01T00:00:00Z"), attemptedAt)
+		    (id, account_id, app_id, installed_at, grace_expires_at, grace_resolved,
+		     charge_attempted_at, charge_funding_account_id, charge_funding_generation)
+		VALUES ($1, $2, $3, $4::timestamptz, $4::timestamptz + interval '3 days', false, $5, $6, $7)`,
+		id.String(), f.oldAcct.String(), f.appID.String(), mustTime(t, "2026-08-01T00:00:00Z"),
+		arm.at, arm.fundingAccount, arm.generation)
 	require.NoError(t, err)
 	return id
 }
