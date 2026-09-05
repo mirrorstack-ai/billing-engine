@@ -620,11 +620,12 @@ const terminateAppLevelStreamsOnTransfer = `-- name: TerminateAppLevelStreamsOnT
 INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value,
     recorded_at, billable_at, model, module_version,
-    observation_version, occurrence_policy, metadata
+    observation_version, occurrence_policy, metadata, dev_served
 )
 SELECT
     'app_transfer:' || $1::text || ':' || stream.module_id::text
-        || ':' || stream.metric || ':' || COALESCE(stream.model, ''),
+        || ':' || stream.metric || ':' || COALESCE(stream.model, '')
+        || CASE WHEN stream.dev_served THEN ':dev' ELSE '' END,
     $2::uuid,
     $3::uuid,
     stream.module_id,
@@ -637,17 +638,18 @@ SELECT
     stream.module_version,
     1::smallint,
     'v1_ingest_time',
-    json_build_object('synthesized_by', 'app_transfer', 'request_id', $1::text)
+    json_build_object('synthesized_by', 'app_transfer', 'request_id', $1::text),
+    stream.dev_served
 FROM (
-    SELECT DISTINCT ON (module_id, metric, COALESCE(model, ''))
-        module_id, metric, model, module_version
+    SELECT DISTINCT ON (module_id, metric, COALESCE(model, ''), dev_served)
+        module_id, metric, model, module_version, dev_served
     FROM ms_billing.usage_events
     WHERE app_id = $3::uuid
       AND account_id = $2::uuid
       AND kind = 'time_weighted'
       AND COALESCE(billable_at, recorded_at) >= $5::timestamptz
       AND COALESCE(billable_at, recorded_at) <  $4::timestamptz
-    ORDER BY module_id, metric, COALESCE(model, ''),
+    ORDER BY module_id, metric, COALESCE(model, ''), dev_served,
              COALESCE(billable_at, recorded_at) DESC, event_id DESC
 ) stream
 `
@@ -707,6 +709,13 @@ type TerminateAppLevelStreamsOnTransferParams struct {
 // reads the instant directly, value 0, kind time_weighted, a deterministic
 // event_id naming the transfer and the stream, and the request_id in
 // metadata so an auditor reading a zero can see who wrote it. :execrows.
+// dev_served (migration 073) is part of the stream identity here, because the
+// rollup now groups by it: a tunnel-served time_weighted gauge is its own
+// integral, and terminating it with a dev_served = false zero would leave the
+// tunnel's stream running to period_end while inventing a stray charged line.
+// The event_id gains a ':dev' suffix ONLY for the dev stream, so every id this
+// query has ever minted for ordinary usage is byte-identical and a retried
+// transfer stays idempotent against terminators written before 073.
 func (q *Queries) TerminateAppLevelStreamsOnTransfer(ctx context.Context, arg TerminateAppLevelStreamsOnTransferParams) (int64, error) {
 	result, err := q.db.Exec(ctx, terminateAppLevelStreamsOnTransfer,
 		arg.RequestID,

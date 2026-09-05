@@ -94,6 +94,15 @@ type MetricAggregate struct {
 	ModuleVersion  string
 	Kind           Kind
 	AggregationKey AggregationKey
+	// DevServed marks a line the developer's dev tunnel produced (migration
+	// 073). It is part of the usage_aggregates idempotency key — a module
+	// tunnelled mid-period has BOTH kinds of usage of one metric in one
+	// period, and without this in the key one upsert silently overwrites the
+	// other. ChargedMicros below IS computed and stored for such a row (the
+	// console shows the developer what the test would have cost); it is
+	// excluded from every money sum instead of being zeroed here, so the
+	// display figure and the collectable figure never have to be reconciled.
+	DevServed bool
 
 	// BillableQuantity is the per-kind aggregate (count/sum → SUM, peak → MAX,
 	// time_weighted → integral). Carried as the exact NUMERIC string so the
@@ -122,12 +131,25 @@ type MetricAggregate struct {
 
 // RollupSummary reports what a RollupPeriod call wrote: the period it targeted
 // and the per-metric aggregates it upserted (idempotent — a re-run upserts the
-// identical set). TotalChargedMicros is the sum of every aggregate's
-// charged_micros (the customer-billable total for the period).
+// identical set).
+//
+// 🔴 TotalChargedMicros IS THE COLLECTABLE TOTAL, NOT Σ Aggregates[].Charged.
+// Every aggregate is priced, dev_served ones included, but a dev_served line is
+// never collected (migration 073), so it accrues to DevServedChargedMicros
+// instead. A caller wanting "what the period actually costs the customer" wants
+// TotalChargedMicros; a caller wanting "what the developer's tunnel testing
+// would have cost" wants DevServedChargedMicros; nothing wants their sum.
 type RollupSummary struct {
-	PeriodID           uuid.UUID
-	Aggregates         []MetricAggregate
+	PeriodID   uuid.UUID
+	Aggregates []MetricAggregate
+	// TotalChargedMicros is Σ charged_micros over the NON-dev_served
+	// aggregates — the customer-billable total for the period.
 	TotalChargedMicros int64
+	// DevServedChargedMicros is Σ charged_micros over the dev_served
+	// aggregates — priced and displayed, collected never. It is reported
+	// separately so a rollup can never accidentally add it to the bill by
+	// summing one field.
+	DevServedChargedMicros int64
 }
 
 // ModuleSettlement is one accrued developer-settlement line — the in-memory

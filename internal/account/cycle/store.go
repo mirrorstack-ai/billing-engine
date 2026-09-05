@@ -127,12 +127,14 @@ type Store interface {
 	MetricPriceMicros(ctx context.Context, moduleID uuid.UUID, metric, model, moduleVersion string) (micros int64, priced bool, err error)
 
 	// UpsertUsageAggregate writes one snapshotted billable record idempotently
-	// on (period_id, app_id, module_id, metric). A re-run upserts the identical
-	// row.
+	// on (period_id, app_id, module_id, metric, model, module_version,
+	// aggregation_key, dev_served). A re-run upserts the identical row.
 	UpsertUsageAggregate(ctx context.Context, periodID, accountID uuid.UUID, agg MetricAggregate) error
 
 	// ModuleIncome returns Σ charged_micros per module across the period's
 	// usage_aggregates — the settlement income input, keyed by module.
+	// dev_served rows are excluded in SQL: no one paid for tunnel-served usage,
+	// so accruing a developer share of it would pay out against no revenue.
 	ModuleIncome(ctx context.Context, periodID uuid.UUID) ([]ModuleIncome, error)
 
 	// ModuleVisibility returns a module's developer margin-share class. found=
@@ -168,6 +170,8 @@ type Store interface {
 
 	// PeriodChargedTotal returns Σ usage_aggregates.charged_micros for the
 	// account's period window — the arrears input before allowance-netting.
+	// dev_served rows are excluded in SQL: they are priced but never collected
+	// (migration 073).
 	PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
 
 	// WalletCreditState is the cheap pre-boundary probe used to preserve the
@@ -998,6 +1002,14 @@ type RawAggregate struct {
 	ModuleVersion    string
 	BillableQuantity string
 	ActiveSeconds    string
+	// DevServed is migration 073's tunnel dimension, grouped by every rollup
+	// SELECT alongside (app, module, metric, model, module_version): true rows
+	// are usage a developer's dev tunnel produced. They are priced here exactly
+	// like any other row — the console shows a developer what their test would
+	// have cost — and excluded from every money sum downstream. It is a
+	// GROUPING key, not a price key, which is why one module can appear twice
+	// in this slice for one metric in one period.
+	DevServed bool
 }
 
 // ModuleIncome pairs a module with its period income (Σ charged_micros).
@@ -1095,7 +1107,7 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 	// renders "" in that case (NOT "0" — numericString's NULL rendering — because
 	// "no window data" and "a genuinely zero-length window" must stay
 	// distinguishable downstream in cycle/money.go's proration).
-	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, aggregationKey, model, moduleVersion string, qty, activeSeconds pgtype.Numeric) error {
+	appendRow := func(appID, moduleID, metric string, kind db.MsBillingMetricKind, aggregationKey, model, moduleVersion string, devServed bool, qty, activeSeconds pgtype.Numeric) error {
 		app, err := uuid.Parse(appID)
 		if err != nil {
 			return err
@@ -1116,28 +1128,29 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 			AggregationKey:   AggregationKey(aggregationKey),
 			Model:            model,         // "" for non-AI rows (COALESCE(model, ''))
 			ModuleVersion:    moduleVersion, // "" for version-less rows (COALESCE(module_version, ''))
+			DevServed:        devServed,     // migration 073 — priced, never charged
 			BillableQuantity: numericString(qty),
 			ActiveSeconds:    as,
 		})
 		return nil
 	}
 	for _, r := range sumRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.BillableQuantity, pgtype.Numeric{}); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, pgtype.Numeric{}); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range peakRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, r.ActiveSeconds); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range keyedPeakRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey, r.Model, r.ModuleVersion, r.BillableQuantity, pgtype.Numeric{}); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, pgtype.Numeric{}); err != nil {
 			return nil, err
 		}
 	}
 	for _, r := range twRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.BillableQuantity, r.ActiveSeconds); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey.String, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, r.ActiveSeconds); err != nil {
 			return nil, err
 		}
 	}
@@ -1302,6 +1315,7 @@ func (s *pgxStore) UpsertUsageAggregate(ctx context.Context, periodID, accountID
 		ModuleVersion:    agg.ModuleVersion,
 		Kind:             db.MsBillingMetricKind(agg.Kind),
 		AggregationKey:   nullableAggregationKey(agg.AggregationKey),
+		DevServed:        agg.DevServed,
 		BillableQuantity: qty,
 		UnitPriceMicros:  agg.UnitPriceMicros,
 		// Never caller-supplied: MarkupNum/Den are one of two compile-time
