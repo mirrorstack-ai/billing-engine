@@ -358,9 +358,12 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 		// (taken by the barrier above), so a card-bind cannot commit between
 		// this read and the move it would have licensed. keep is not touched:
 		// it moves nothing, and an unfunded destination is otherwise allowed
-		// (transferTargetAccount). Host decision 2026-09-05, §2.1; api-platform
-		// pre-checks the target's standing at create and accept so this is
-		// the authority's answer, not the customer's first notice.
+		// (transferTargetAccount). Unconditional on the source: a NULL-source
+		// move has no rows to move, but api-platform's pre-check is keyed on
+		// the target alone and the two answers must agree. Host decision
+		// 2026-09-05, §2.1; api-platform pre-checks the target's standing at
+		// create and accept so this is the authority's answer, not the
+		// customer's first notice.
 		if p.Mode == TransferModeMove {
 			targetActivated, aErr := qtx.AccountActivatedAt(ctx, p.ToAccount.String())
 			if aErr != nil {
@@ -720,11 +723,14 @@ func (s *pgxStore) forfeitTransferCharges(ctx context.Context, qtx *db.Queries, 
 // repointNullAccountUsage hands a USER-rostered app's NULL-account usage
 // inside the target's open window to the target account, and returns how
 // many rows it took — the ledger's repointed_event_count. An ORG-rostered
-// app (orgRostered) holds no such rows by the time this runs: the backlog
-// refusal above already returned on them, and the sweep that owns an org's
-// backlog is RepointOrgNullAccountEvents, not this. The decision is keyed on
-// the roster row this transaction locked FOR UPDATE, so an ingest that
-// stamps a row between the refusal read and this write cannot flip it.
+// app (orgRostered) is skipped: its NULL rows are the backlog refusal's,
+// which already returned on them above, and a row that lands in that
+// refusal's known race window (an ingest whose resolution preceded this
+// commit) is the org sweep's to bill through the rewritten owner_org_id —
+// RepointOrgNullAccountEvents — never the target's. The decision is keyed
+// on the roster row this transaction locked FOR UPDATE, so nothing that
+// commits between the refusal read and this write can flip which rule
+// applies.
 //
 // The window start is the target's — the instant the ledger will store as
 // open_period_start — read under the target's activation lock (taken by

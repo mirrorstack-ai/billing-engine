@@ -2097,10 +2097,17 @@ marked and the rest is left open rather than rounded up.
 
     The caller's `mode` decides USAGE only. `keep`: every recorded event stays
     with the account that recorded it. `move`: the app's not-yet-invoiced usage
-    in the window both open periods share is re-attributed to the new account.
-    In both modes a time-weighted (level) stream is cut on the old account at
-    the hand-off, so the old account's integral stops where the new account's
-    begins.
+    in the window both open periods share is re-attributed to the new account —
+    and only into an ACTIVATED account, because usage moved into one the cycle
+    never charges would be billed to nobody (`app_transfer_target_unfunded`;
+    `keep` to the same account is allowed). In both modes a time-weighted
+    (level) stream is cut on the old account at the hand-off, so the old
+    account's integral stops where the new account's begins, and in both modes
+    a user-rostered app's usage recorded with no account inside the new
+    account's open window — stamped for the new payer before its account
+    existed — follows the app to that account (older such rows stay unbilled,
+    D1d); an org-rostered app's no-account backlog refuses the transfer instead
+    (`app_transfer_unbilled_backlog`).
 
     The rule that bounds it: **backdated re-attribution is permitted only within
     the OPEN period; an issued or closed invoice never moves.** That is what
