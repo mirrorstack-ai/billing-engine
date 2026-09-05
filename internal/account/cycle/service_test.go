@@ -1490,8 +1490,14 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 	if app.ProrationInvoiceID != "" {
 		return cycle.ProrationLockedAlreadyCharged, app.ProrationInvoiceID, nil
 	}
+	if app.ProrationSkipped {
+		return cycle.ProrationWalletLockedStale, "", nil
+	}
 	if app.ProrationAttempted {
 		return cycle.ProrationWalletDeferToStripe, "", nil
+	}
+	if app.AccountID == uuid.Nil || (pc.AccountID != uuid.Nil && app.AccountID != pc.AccountID) {
+		return cycle.ProrationWalletLockedStale, "", nil
 	}
 	if f.walletMode != cycle.CreditBillingModeCredits {
 		return cycle.ProrationWalletDeferToStripe, "", nil

@@ -589,6 +589,108 @@ func TestTransferAppRefusesWhenTheWalletWouldSettle(t *testing.T) {
 	}
 }
 
+// 🔴 THE WALLET DRAW HONOURS A COMMITTED TRANSFER. The creation-proration
+// wallet leg classifies the app UNLOCKED, then DrawCreationProrationFromWallet
+// takes the app row FOR UPDATE — the same row TransferApp holds. A transfer
+// that commits while the draw waits leaves two things behind: the forfeit's
+// proration_skipped_at, and RekeyAppRoster's new account_id. A draw that
+// re-read only deleted / invoice / attempted, and took the account to debit
+// from the RE-READ row, would resume, pass, and debit the NEW account's
+// wallet for the OLD account's creation window — arming proration_invoice_id
+// on a row whose skip marker says the charge was forfeited. This calls the
+// draw directly in the state the resumed draw sees.
+//
+// Three calls: after the forfeiting transfer the skip marker alone must stop
+// it; with the marker cleared the account mismatch alone must stop it; and
+// with the charge pinned to the account that now holds the app it draws —
+// the control that shows the two refusals were the guards and not the mode
+// or the balance.
+//
+// Mutation: drop the proration_skipped_at re-check and the first draw debits
+// the new account; drop the account check and the second does.
+func TestTransferForfeitFencesTheWalletProrationDraw(t *testing.T) {
+	ctx := context.Background()
+	// Old account unactivated (the transfer forfeits), target activated, in
+	// credits mode, with a grant that covers any draw.
+	f := seedTransferFixtureWith(t, transferSeed{newActivated: mustTime(t, "2026-05-04T00:00:00Z")})
+	f.owePendingProration(t)
+	_, err := f.pool.Exec(ctx,
+		`UPDATE ms_billing.accounts SET billing_mode = 'credits' WHERE id = $1`, f.newAcct.String())
+	require.NoError(t, err)
+	insertWalletEntry(t, f.pool, f.newAcct, uuid.New(), 50_000_000, "grant", "settled", nil, mustTime(t, "2026-06-01T00:00:00Z"))
+
+	req := cycle.TransferAppRequest{AppID: f.appID, OwnerUserID: f.newOwner, Mode: cycle.TransferModeKeep, RequestID: uuid.New()}
+	_, err = transferSvc(t, f).TransferApp(ctx, req)
+	require.NoError(t, err)
+	row, found := f.ledgerRow(t, req.RequestID)
+	require.True(t, found)
+	require.True(t, row.forfeitedProration, "fixture error: the transfer did not forfeit the proration")
+	require.Equal(t, f.newAcct.String(), f.rosterAccount(t))
+
+	store := cycle.NewStore(f.pool)
+	ref := "wallet:app-proration:" + f.appID.String()
+	charge := func(account uuid.UUID) cycle.ProrationWalletCharge {
+		return cycle.ProrationWalletCharge{
+			Ref:          ref,
+			AccountID:    account,
+			AmountMicros: 12_345_678,
+			Snapshot: cycle.AppBaseSnapshot{
+				AppID:       f.appID,
+				PeriodStart: mustTime(t, "2026-06-01T00:00:00Z"),
+				PeriodEnd:   mustTime(t, "2026-07-01T00:00:00Z"),
+				BaseMicros:  12_345_678,
+			},
+		}
+	}
+	drawsOnNew := func() int {
+		var n int
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT count(*) FROM ms_billing.credit_ledger WHERE account_id = $1 AND type = 'usage_draw'`,
+			f.newAcct.String()).Scan(&n))
+		return n
+	}
+	guard := func() (skippedAt *time.Time, invoice *string) {
+		require.NoError(t, f.pool.QueryRow(ctx,
+			`SELECT proration_skipped_at, proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`,
+			f.appID.String()).Scan(&skippedAt, &invoice))
+		return skippedAt, invoice
+	}
+
+	// 1. The draw the transfer overtook: computed for the OLD account, and the
+	//    row now carries the forfeit's skip marker.
+	outcome, armed, err := store.DrawCreationProrationFromWallet(ctx, f.appID, charge(f.oldAcct))
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationWalletLockedStale, outcome, "a forfeited proration was drawn from the new account's wallet")
+	require.Empty(t, armed)
+	require.Equal(t, 0, drawsOnNew(), "the new account's wallet paid the old account's creation window")
+	skippedAt, invoice := guard()
+	require.NotNil(t, skippedAt)
+	require.Nil(t, invoice, "the guard was armed on a forfeited row")
+
+	// 2. The marker alone is not the fence: clear it and the account check
+	//    must still refuse a charge derived for the account that no longer
+	//    holds the app.
+	_, err = f.pool.Exec(ctx, `UPDATE ms_billing.apps SET proration_skipped_at = NULL WHERE app_id = $1`, f.appID.String())
+	require.NoError(t, err)
+	outcome, _, err = store.DrawCreationProrationFromWallet(ctx, f.appID, charge(f.oldAcct))
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationWalletLockedStale, outcome, "a charge derived for the old account was drawn after the app moved")
+	require.Equal(t, 0, drawsOnNew())
+	_, invoice = guard()
+	require.Nil(t, invoice)
+
+	// 3. The control: the same charge pinned to the account that holds the
+	//    app draws and arms — so the two refusals above were the guards.
+	outcome, armed, err = store.DrawCreationProrationFromWallet(ctx, f.appID, charge(f.newAcct))
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationLockedCharged, outcome)
+	require.Equal(t, ref, armed)
+	require.Positive(t, drawsOnNew(), "control: the pinned draw did not debit the wallet")
+	_, invoice = guard()
+	require.NotNil(t, invoice)
+	require.Equal(t, ref, *invoice)
+}
+
 // The forfeit is a money decision that must survive a replay: the ledger says
 // what the FIRST call forfeited, and a retry neither forfeits again (nothing
 // is pending any more) nor reports otherwise.

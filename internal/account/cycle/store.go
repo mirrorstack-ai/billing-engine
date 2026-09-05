@@ -459,7 +459,11 @@ type Store interface {
 	// DrawCreationProrationFromWallet settles ONE app's creation proration through
 	// the universal credit wallet (migration 048, billing-engine #99) ATOMICALLY:
 	// under the app row lock it re-verifies the row is still chargeable (deleted_at
-	// IS NULL AND proration_invoice_id IS NULL), draws charge.AmountMicros from the
+	// IS NULL, proration_invoice_id IS NULL, proration_skipped_at IS NULL, and
+	// account_id still the account charge.AccountID was derived for — a
+	// committed app transfer changes the last two, and the draw returns
+	// ProrationWalletLockedStale rather than debit the new owner's wallet for
+	// the old owner's window), draws charge.AmountMicros from the
 	// append-only credit ledger (per-app idempotency keys, credits-mode unsecured
 	// remainder), and — ONLY when the wallet FULLY covers the amount — freezes the
 	// base snapshot(s) and arms the one-shot guard (with charge.Ref), all in a
@@ -2539,6 +2543,18 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 	if row.ProrationInvoiceID.Valid {
 		return ProrationLockedAlreadyCharged, row.ProrationInvoiceID.String, nil
 	}
+	if row.ProrationSkippedAt.Valid {
+		// 🔴 THE PERMANENT SKIP MARKER IS TERMINAL FOR THIS RAIL TOO. The caller
+		// read it unlocked (ChargeCreationProration returns before reaching
+		// here when it is set); it can arm between that read and this lock —
+		// an app transfer forfeiting the proration (ForfeitAppProrationOnTransfer)
+		// holds this same row FOR UPDATE and commits the marker together with
+		// the re-key. A draw that ignored it would debit the NEW account's
+		// wallet for the OLD account's creation window and arm the guard on a
+		// row that says the charge was forfeited. FreezeCombinedProrationAttempt
+		// makes this exact check for the Stripe rail.
+		return ProrationWalletLockedStale, "", nil
+	}
 	if row.ProrationAttemptedAt.Valid {
 		// A prior attempt already reached the Stripe leg (stamped attempted before its
 		// network call). Never draw the wallet beside money that may have moved — defer to
@@ -2546,6 +2562,14 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 		return ProrationWalletDeferToStripe, "", nil
 	}
 	accountID := uuidFromPg(row.AccountID)
+	if accountID == uuid.Nil || (pc.AccountID != uuid.Nil && accountID != pc.AccountID) {
+		// The amount and the window were derived for pc.AccountID (its anchor,
+		// its wallet). The locked row names another account — the app moved
+		// while this draw waited — so the charge in hand is not this
+		// account's to pay. Same refusal FreezeCombinedProrationAttempt makes
+		// ("app account changed"); no draw, the next sweep re-derives.
+		return ProrationWalletLockedStale, "", nil
+	}
 
 	// Phase 2: allocate the draw under the wallet account + ledger locks. The
 	// account FOR UPDATE also serializes concurrent child ledger INSERTs through

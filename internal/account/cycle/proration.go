@@ -115,6 +115,12 @@ const (
 	// proration_skipped_at marker is armed so the app never resurfaces on a
 	// later sweep.
 	ProrationStatusPeriodClosed ProrationStatus = "skipped_period_closed"
+	// ProrationStatusWalletStale (credit mode): the wallet draw found, under
+	// the app row lock, that the row no longer describes the charge it was
+	// handed — the skip marker armed or the account changed while it waited,
+	// which is what a concurrent app transfer leaves behind. Nothing drawn,
+	// nothing armed; the next sweep reads the row as it now is.
+	ProrationStatusWalletStale ProrationStatus = "skipped_wallet_stale"
 )
 
 // ProrationResult reports what ChargeCreationProration did. ProrationInvoiceID is
@@ -166,6 +172,15 @@ const (
 	// longer credits. The wallet performs no draw and defers the full charge to
 	// the Stripe rail.
 	ProrationWalletDeferToStripe
+	// ProrationWalletLockedStale (credit mode): the locked app row no longer
+	// describes the charge that was computed — its permanent skip marker is
+	// armed, or its account is not the one the amount was derived for. Both
+	// are what an app transfer leaves behind when it commits while this draw
+	// waits on the row lock (transfer_store.go: the forfeit arms
+	// proration_skipped_at and RekeyAppRoster moves account_id). NOTHING was
+	// drawn and the guard is unarmed; the next sweep re-derives from the row
+	// as it now is, which for a forfeited app means it is no longer listed.
+	ProrationWalletLockedStale
 )
 
 // ProrationCharge is the persistence payload the charge callback returns from
@@ -215,6 +230,13 @@ type ModuleTimerCharge struct {
 type ProrationWalletCharge struct {
 	// Ref arms apps.proration_invoice_id in place of a Stripe invoice id.
 	Ref string
+	// AccountID is the account the amount and the window were DERIVED for —
+	// the one whose anchor and wallet the caller classified on. The store
+	// refuses to draw when the locked row names a different account: the
+	// amount would be another account's creation window, debited from a
+	// wallet that was never classified for it. Zero disables the check (a
+	// caller that has no account to pin), never a wildcard the store fills.
+	AccountID uuid.UUID
 	// AmountMicros is the prorated creation base only.
 	AmountMicros int64
 	Snapshot     AppBaseSnapshot
@@ -1133,6 +1155,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 
 	outcome, armedRef, err := s.store.DrawCreationProrationFromWallet(ctx, app.AppID, ProrationWalletCharge{
 		Ref:              ref,
+		AccountID:        app.AccountID,
 		AmountMicros:     amountMicros,
 		Snapshot:         snapshot,
 		StraddleSnapshot: straddleSnapshot,
@@ -1161,6 +1184,8 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusWalletUnsettled}, false, nil
 	case ProrationWalletDeferToStripe:
 		return nil, true, nil
+	case ProrationWalletLockedStale:
+		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusWalletStale}, false, nil
 	case ProrationLockedAlreadyCharged:
 		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusAlreadyCharged, ProrationInvoiceID: armedRef}, false, nil
 	case ProrationLockedDeleted:
