@@ -311,6 +311,7 @@ WITH base_events AS (
         e.value
     FROM ms_billing.usage_events e
     WHERE e.account_id IS NULL
+      AND e.dev_served = false
       AND e.app_id IN (SELECT app_id FROM ms_billing.apps WHERE owner_org_id = $1)
 ),
 billable_events AS (
@@ -346,6 +347,12 @@ LEFT JOIN ms_billing.metric_definitions md
 // for reserved infra.*/platform.*). It is the DISCLOSURE estimate shown
 // before the sponsor confirms — the authoritative charge happens later,
 // through the normal rollup, once the sweep re-points the events.
+//
+// 🔴 dev_served EVENTS ARE EXCLUDED (migration 073). This figure is shown to a
+// sponsor as "what you are about to take on", immediately before they agree to
+// fund it. Tunnel-served usage will never be charged to anyone, so including it
+// would quote a backlog the authoritative rollup then declines to bill —
+// a disclosure that disagrees with the invoice in the direction of alarm.
 func (q *Queries) OrgUnbilledBacklogMicros(ctx context.Context, ownerOrgID pgtype.UUID) (pgtype.Numeric, error) {
 	row := q.db.QueryRow(ctx, orgUnbilledBacklogMicros, ownerOrgID)
 	var backlog_micros pgtype.Numeric

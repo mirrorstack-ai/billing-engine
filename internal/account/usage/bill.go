@@ -292,11 +292,14 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		ModuleOverageMicros:    moduleOverage,
 		ModuleUsage:            parts.ModuleUsage,
 		ModuleUsageTotalMicros: parts.ModuleUsageTotalMicros,
-		InfraTotalMicros:       parts.InfraTotalMicros,
-		InfraLines:             parts.InfraLines,
-		ModuleInfraLines:       parts.ModuleInfraLines,
-		PaasCreditMicros:       paasCredit,
-		TotalMicros:            total,
+		// Reported, never added: TotalMicros above is BaseFee + the NON-dev
+		// module usage + Infra − PaasCredit (migration 073).
+		ModuleUsageDevServedMicros: parts.ModuleUsageDevServedMicros,
+		InfraTotalMicros:           parts.InfraTotalMicros,
+		InfraLines:                 parts.InfraLines,
+		ModuleInfraLines:           parts.ModuleInfraLines,
+		PaasCreditMicros:           paasCredit,
+		TotalMicros:                total,
 	}, nil
 }
 
@@ -350,10 +353,16 @@ type appBillParts struct {
 	// InstalledModuleCount is the billing mirror's authoritative live snapshot.
 	// It includes installed-but-idle modules, unlike the usage-ledger lines.
 	InstalledModuleCount int
-	// ModuleUsage are the non-reserved 模組使用量 lines; ModuleUsageTotalMicros
+	// ModuleUsage are the non-reserved 模組使用量 lines, dev_served ones
+	// included and flagged; ModuleUsageTotalMicros is the NON-dev total (the
+	// one that enters the bill) and ModuleUsageDevServedMicros is the priced
+	// tunnel figure that never does. ModuleUsageTotalMicros
 	// is Σ their ChargedMicros.
 	ModuleUsage            []AppMetricUsage
 	ModuleUsageTotalMicros int64
+	// ModuleUsageDevServedMicros is Σ of the dev_served lines' charges
+	// (migration 073): priced, displayed, and never a term in any total.
+	ModuleUsageDevServedMicros int64
 	// InfraTotalMicros is 基礎設施 = Σ InfraLines + Σ ModuleInfraLines (the
 	// 1.2× infra markup already applied once, in SQL).
 	InfraTotalMicros int64
@@ -455,10 +464,18 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	moduleUsage := make([]AppMetricUsage, 0, len(lines))
 	modelBuckets := make(map[string]AgentModelUsage)
 	var moduleUsageTotal int64
+	var moduleUsageDevServed int64
 	for _, r := range lines {
 		reserved := isReservedMetric(r.Metric)
 		reservedRealModule := reserved && r.ModuleID != PlatformInfraModuleID()
-		if r.Model != "" && !reservedRealModule {
+		// 🔴 A dev_served line (migration 073) is DISPLAYED, never SPENT. It is
+		// kept out of the per-model rollup for the same reason it is kept out
+		// of the total: ModelLines is a breakdown OF the charged bill, clamped
+		// to moduleUsageTotal+infraTotal below, so letting tunnel usage accrue
+		// there would either inflate the agent-model display past what was
+		// billed or be silently trimmed by the clamp — both of which report a
+		// number no invoice contains.
+		if r.Model != "" && !reservedRealModule && !r.DevServed {
 			modelLine := modelBuckets[r.Model]
 			modelLine.Model = r.Model
 			modelLine.BillableQuantity += r.BillableQuantity
@@ -478,12 +495,21 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 			Kind:             r.Kind,
 			Model:            r.Model,
 			ModuleVersion:    r.ModuleVersion,
+			DevServed:        r.DevServed,
 			BillableQuantity: r.BillableQuantity,
 			UnitPriceMicros:  r.UnitPriceMicros,
 			ChargedMicros:    r.ChargedMicros,
 			ActiveSeconds:    r.ActiveSeconds,
 			PeriodDays:       r.PeriodDays,
 		})
+		// 🔴 THE SPLIT THAT KEEPS A DEV TUNNEL OFF THE BILL. The LINE is
+		// emitted either way, carrying its real ChargedMicros — a developer
+		// testing a paid meter has to see what it would have cost. Only the
+		// TOTAL forks, and only the non-dev total reaches TotalMicros.
+		if r.DevServed {
+			moduleUsageDevServed += r.ChargedMicros
+			continue
+		}
 		moduleUsageTotal += r.ChargedMicros
 	}
 	modelLines := make([]AgentModelUsage, 0, len(modelBuckets))
@@ -604,16 +630,17 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	modelLines = clampModelChargesToTotal(modelLines, moduleUsageTotal+infraTotal)
 
 	return &appBillParts{
-		BaseFeeMicros:          baseFee,
-		InstalledModuleCount:   mirror.ModuleCount,
-		ModuleUsage:            moduleUsage,
-		ModuleUsageTotalMicros: moduleUsageTotal,
-		InfraTotalMicros:       infraTotal,
-		InfraLines:             infraLines,
-		ModuleInfraLines:       moduleInfraLines,
-		ModelLines:             modelLines,
-		Name:                   mirror.Name, // "" when not mirrored / pre-037
-		IsDeleted:              mirrored && mirror.Deleted,
+		BaseFeeMicros:              baseFee,
+		InstalledModuleCount:       mirror.ModuleCount,
+		ModuleUsage:                moduleUsage,
+		ModuleUsageTotalMicros:     moduleUsageTotal,
+		ModuleUsageDevServedMicros: moduleUsageDevServed,
+		InfraTotalMicros:           infraTotal,
+		InfraLines:                 infraLines,
+		ModuleInfraLines:           moduleInfraLines,
+		ModelLines:                 modelLines,
+		Name:                       mirror.Name, // "" when not mirrored / pre-037
+		IsDeleted:                  mirrored && mirror.Deleted,
 	}, nil
 }
 

@@ -83,6 +83,7 @@ LEFT JOIN ms_billing.billing_runs br
       AND br.period_end   = bp.period_end
 WHERE bp.period_start = $1
   AND bp.period_end   = $2
+  AND ua.dev_served   = false
   AND (br.id IS NULL OR br.status <> 'invoiced')
   AND NOT EXISTS (
       SELECT 1 FROM ms_billing.org_deletion_finalizations f
@@ -126,6 +127,12 @@ type AccountsWithUnbilledUsageParams struct {
 // the metered usage; prepaid only postpones the off-session collection, it does
 // not waive the debt. Forgiveness would require an explicit credit, which v1 does
 // not do.
+//
+// dev_served aggregates do NOT surface an account here (migration 073). An
+// account whose only usage that period was a developer's tunnel owes nothing,
+// and admitting it would open a billing_run and attempt a $0 collection for a
+// period that was never billable. Its deployed usage, if any, still surfaces
+// it on its own non-dev rows.
 func (q *Queries) AccountsWithUnbilledUsage(ctx context.Context, arg AccountsWithUnbilledUsageParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, accountsWithUnbilledUsage, arg.PeriodStart, arg.PeriodEnd)
 	if err != nil {
@@ -613,6 +620,7 @@ JOIN ms_billing.billing_periods bp ON bp.id = ua.period_id
 WHERE ua.account_id   = $1
   AND bp.period_start = $2
   AND bp.period_end   = $3
+  AND ua.dev_served   = false
 `
 
 type PeriodChargedTotalParams struct {
@@ -625,6 +633,12 @@ type PeriodChargedTotalParams struct {
 // for a period window — the customer-billable arrears total (before
 // allowance-netting, which the Go service applies). Joins billing_periods so
 // the window is matched on the period row, not a raw usage_aggregates column.
+//
+// 🔴 dev_served ROWS ARE EXCLUDED (migration 073). This number IS the arrears
+// leg: it becomes an invoice line and a card charge. A dev_served aggregate
+// carries a real charged_micros — that is what the console shows a developer
+// their tunnel testing would have cost — and it is the one number in this file
+// that must never reach it.
 func (q *Queries) PeriodChargedTotal(ctx context.Context, arg PeriodChargedTotalParams) (int64, error) {
 	row := q.db.QueryRow(ctx, periodChargedTotal, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
 	var total_micros int64

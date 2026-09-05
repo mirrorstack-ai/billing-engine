@@ -584,9 +584,13 @@ type UsageEvent struct {
 type MetricUsageRaw struct {
 	// ModuleID is the module that emitted the metric (the query now groups by
 	// it, widened from PR #3's (metric, kind) only — see CurrentPeriodUsage).
-	ModuleID        uuid.UUID
-	Metric          string
-	Kind            Kind
+	ModuleID uuid.UUID
+	Metric   string
+	Kind     Kind
+	// DevServed splits the row off as developer-tunnel usage (migration 073):
+	// priced like any other row, charged never. The query groups by it, so one
+	// (module, metric, kind) can legitimately appear twice here.
+	DevServed       bool
 	Quantity        float64
 	UnitPriceMicros int64
 	RawCostMicros   int64
@@ -649,8 +653,14 @@ type AppMetricUsageRaw struct {
 	// row. ModuleVersion is the version-attribution dimension (migration 023),
 	// '' for a version-less row. Both are carried so the UI can split per-model
 	// / per-version sub-lines.
-	Model            string
-	ModuleVersion    string
+	Model         string
+	ModuleVersion string
+	// DevServed marks a line produced by the developer's dev tunnel (migration
+	// 073). ChargedMicros on such a line is REAL — it is what the metered usage
+	// would have cost — and it is excluded from every money total by the
+	// caller. It is a returned dimension rather than a filter so the console can
+	// render the two sections side by side.
+	DevServed        bool
 	BillableQuantity float64
 	UnitPriceMicros  int64
 	ChargedMicros    int64
@@ -1778,6 +1788,7 @@ func (s *pgxStore) CurrentPeriodUsage(ctx context.Context, accountID uuid.UUID, 
 			ModuleID:        moduleID,
 			Metric:          r.Metric,
 			Kind:            Kind(r.Kind),
+			DevServed:       r.DevServed,
 			Quantity:        qty,
 			UnitPriceMicros: r.UnitPriceMicros,
 			RawCostMicros:   rawCost,
@@ -1875,7 +1886,7 @@ func (s *pgxStore) AppUsage(ctx context.Context, accountID, appID uuid.UUID, per
 	}
 	out := make([]AppMetricUsageRaw, 0, len(rows))
 	for _, r := range rows {
-		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros, r.ActiveSeconds, r.PeriodDays)
+		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros, r.ActiveSeconds, r.PeriodDays)
 		if err != nil {
 			return nil, err
 		}
@@ -1900,7 +1911,7 @@ func (s *pgxStore) AppBill(ctx context.Context, accountID, appID uuid.UUID, peri
 	}
 	out := make([]AppMetricUsageRaw, 0, len(rows))
 	for _, r := range rows {
-		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros, r.ActiveSeconds, r.PeriodDays)
+		line, err := appMetricUsageRaw(r.ModuleID, r.Metric, r.Kind, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, r.ChargedMicros, r.UnitPriceMicros, r.ActiveSeconds, r.PeriodDays)
 		if err != nil {
 			return nil, err
 		}
@@ -2113,7 +2124,7 @@ func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit 
 // no-op on the already-integer rolled branch, the single rounding point on the
 // live SUM(value × unit_price [× markup]) branch), and module_id parsed from its
 // text form. Shared by AppUsage + AppBill (identical generated row shapes).
-func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, quantity, charged pgtype.Numeric, unitPriceMicros int64, activeSeconds, periodDays pgtype.Numeric) (AppMetricUsageRaw, error) {
+func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, model, moduleVersion string, devServed bool, quantity, charged pgtype.Numeric, unitPriceMicros int64, activeSeconds, periodDays pgtype.Numeric) (AppMetricUsageRaw, error) {
 	qty, err := floatFromNumeric(quantity)
 	if err != nil {
 		return AppMetricUsageRaw{}, fmt.Errorf("decode billable_quantity for metric %q: %w", metric, err)
@@ -2140,6 +2151,7 @@ func appMetricUsageRaw(moduleID, metric string, kind db.MsBillingMetricKind, mod
 		Kind:             Kind(kind),
 		Model:            model,
 		ModuleVersion:    moduleVersion,
+		DevServed:        devServed,
 		BillableQuantity: qty,
 		UnitPriceMicros:  unitPriceMicros,
 		ChargedMicros:    chargedMicros,

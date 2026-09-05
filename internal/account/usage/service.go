@@ -460,6 +460,7 @@ func (s *Service) GetUsageSummary(ctx context.Context, req GetUsageSummaryReques
 			ModuleID:        r.ModuleID,
 			Metric:          r.Metric,
 			Kind:            r.Kind,
+			DevServed:       r.DevServed,
 			Quantity:        r.Quantity,
 			UnitPriceMicros: r.UnitPriceMicros,
 			RawCostMicros:   r.RawCostMicros,
@@ -610,6 +611,10 @@ func (s *Service) GetVersionBreakdown(ctx context.Context, req GetVersionBreakdo
 // the same fast path GetUsageSummary uses). The app owner pays the DECLARED
 // price per metered unit with NO customer markup by visibility, so ChargedMicros
 // = raw cost here. No billing account yet → an empty Metrics slice + nil error.
+//
+// A line the developer's dev tunnel produced comes back flagged DevServed
+// (migration 073), priced like any other and collected never — so a consumer
+// must split on that flag rather than summing Metrics[].ChargedMicros.
 func (s *Service) GetAppUsageSummary(ctx context.Context, req GetAppUsageSummaryRequest) (*GetAppUsageSummaryResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -647,11 +652,15 @@ func (s *Service) GetAppUsageSummary(ctx context.Context, req GetAppUsageSummary
 	metrics := make([]AppMetricUsage, 0, len(rows))
 	for _, r := range rows {
 		metrics = append(metrics, AppMetricUsage{
-			ModuleID:         r.ModuleID,
-			Metric:           r.Metric,
-			Kind:             r.Kind,
-			Model:            r.Model,
-			ModuleVersion:    r.ModuleVersion,
+			ModuleID:      r.ModuleID,
+			Metric:        r.Metric,
+			Kind:          r.Kind,
+			Model:         r.Model,
+			ModuleVersion: r.ModuleVersion,
+			// Migration 073: a tunnel-served line is returned with its real
+			// charge and this flag. This response carries no total of its own,
+			// so the flag IS the whole contract here — the console splits on it.
+			DevServed:        r.DevServed,
 			BillableQuantity: r.BillableQuantity,
 			UnitPriceMicros:  r.UnitPriceMicros,
 			ChargedMicros:    r.ChargedMicros,

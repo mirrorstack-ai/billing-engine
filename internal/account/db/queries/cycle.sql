@@ -112,6 +112,12 @@ WHERE account_id  IS NOT NULL
 -- the metered usage; prepaid only postpones the off-session collection, it does
 -- not waive the debt. Forgiveness would require an explicit credit, which v1 does
 -- not do.
+--
+-- dev_served aggregates do NOT surface an account here (migration 073). An
+-- account whose only usage that period was a developer's tunnel owes nothing,
+-- and admitting it would open a billing_run and attempt a $0 collection for a
+-- period that was never billable. Its deployed usage, if any, still surfaces
+-- it on its own non-dev rows.
 -- name: AccountsWithUnbilledUsage :many
 SELECT DISTINCT ua.account_id AS account_id
 FROM ms_billing.usage_aggregates ua
@@ -123,6 +129,7 @@ LEFT JOIN ms_billing.billing_runs br
       AND br.period_end   = bp.period_end
 WHERE bp.period_start = $1
   AND bp.period_end   = $2
+  AND ua.dev_served   = false
   AND (br.id IS NULL OR br.status <> 'invoiced')
   AND NOT EXISTS (
       SELECT 1 FROM ms_billing.org_deletion_finalizations f
@@ -133,13 +140,20 @@ WHERE bp.period_start = $1
 -- for a period window — the customer-billable arrears total (before
 -- allowance-netting, which the Go service applies). Joins billing_periods so
 -- the window is matched on the period row, not a raw usage_aggregates column.
+--
+-- 🔴 dev_served ROWS ARE EXCLUDED (migration 073). This number IS the arrears
+-- leg: it becomes an invoice line and a card charge. A dev_served aggregate
+-- carries a real charged_micros — that is what the console shows a developer
+-- their tunnel testing would have cost — and it is the one number in this file
+-- that must never reach it.
 -- name: PeriodChargedTotal :one
 SELECT COALESCE(SUM(ua.charged_micros), 0)::bigint AS total_micros
 FROM ms_billing.usage_aggregates ua
 JOIN ms_billing.billing_periods bp ON bp.id = ua.period_id
 WHERE ua.account_id   = $1
   AND bp.period_start = $2
-  AND bp.period_end   = $3;
+  AND bp.period_end   = $3
+  AND ua.dev_served   = false;
 
 -- InsertBillingRun is the FIRST idempotency layer: one run row per
 -- (account, period window). It inserts a 'pending' row; on conflict it RECLAIMS
