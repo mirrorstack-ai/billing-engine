@@ -1040,7 +1040,8 @@ const insertUsageEvent = `-- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
-    billable_at, aggregation_key, payload_fingerprint, occurrence_policy
+    billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
+    dev_served
 ) VALUES (
     $1::text, $2::uuid, $3::uuid,
     $4::uuid, $5::text, $6::ms_billing.metric_kind,
@@ -1049,7 +1050,8 @@ INSERT INTO ms_billing.usage_events (
     $12::text, $13::json,
     $14::timestamptz, $15::timestamptz,
     $16::text,
-    $17::bytea, $18::text
+    $17::bytea, $18::text,
+    $19::boolean
 )
 ON CONFLICT (event_id) DO NOTHING
 `
@@ -1073,6 +1075,7 @@ type InsertUsageEventParams struct {
 	AggregationKey     pgtype.Text         `json:"aggregation_key"`
 	PayloadFingerprint []byte              `json:"payload_fingerprint"`
 	OccurrencePolicy   string              `json:"occurrence_policy"`
+	DevServed          bool                `json:"dev_served"`
 }
 
 // InsertUsageEvent writes one raw metered fact, idempotent on event_id.
@@ -1084,6 +1087,13 @@ type InsertUsageEventParams struct {
 // (migration 018) — NULL for every non-AI event. module_version is the
 // per-event attribution dimension (migration 023, purely reporting — it
 // never affects price) — NULL for every event that carries no version.
+// dev_served is the migration-073 tunnel flag: true when api-platform
+// authenticated the call with the module's LIVE TUNNEL SESSION secret rather
+// than its deployed credential. It is a property of the FACT and is stored
+// here so it survives to the aggregate unchanged; false (the wire default) is
+// ordinary chargeable usage. The ON CONFLICT (event_id) DO NOTHING idempotency
+// is UNTOUCHED — dev_served rides along on the insert and, exactly like every
+// other column, a deduped retry never rewrites it.
 func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertUsageEvent,
 		arg.EventID,
@@ -1104,6 +1114,7 @@ func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventPara
 		arg.AggregationKey,
 		arg.PayloadFingerprint,
 		arg.OccurrencePolicy,
+		arg.DevServed,
 	)
 	if err != nil {
 		return 0, err

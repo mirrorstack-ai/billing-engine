@@ -208,11 +208,19 @@ WHERE module_id = $1 AND metric = $2;
 -- (migration 018) — NULL for every non-AI event. module_version is the
 -- per-event attribution dimension (migration 023, purely reporting — it
 -- never affects price) — NULL for every event that carries no version.
+-- dev_served is the migration-073 tunnel flag: true when api-platform
+-- authenticated the call with the module's LIVE TUNNEL SESSION secret rather
+-- than its deployed credential. It is a property of the FACT and is stored
+-- here so it survives to the aggregate unchanged; false (the wire default) is
+-- ordinary chargeable usage. The ON CONFLICT (event_id) DO NOTHING idempotency
+-- is UNTOUCHED — dev_served rides along on the insert and, exactly like every
+-- other column, a deduped retry never rewrites it.
 -- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
-    billable_at, aggregation_key, payload_fingerprint, occurrence_policy
+    billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
+    dev_served
 ) VALUES (
     @event_id::text, sqlc.narg(account_id)::uuid, @app_id::uuid,
     @module_id::uuid, @metric::text, @kind::ms_billing.metric_kind,
@@ -221,7 +229,8 @@ INSERT INTO ms_billing.usage_events (
     sqlc.narg(subject)::text, sqlc.narg(metadata)::json,
     sqlc.narg(occurred_at)::timestamptz, @billable_at::timestamptz,
     sqlc.narg(aggregation_key)::text,
-    @payload_fingerprint::bytea, @occurrence_policy::text
+    @payload_fingerprint::bytea, @occurrence_policy::text,
+    @dev_served::boolean
 )
 ON CONFLICT (event_id) DO NOTHING;
 

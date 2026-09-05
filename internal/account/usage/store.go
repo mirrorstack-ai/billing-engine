@@ -570,6 +570,11 @@ type UsageEvent struct {
 	OwnerOrgID         uuid.UUID
 	Model              string
 	ModuleVersion      string
+	// DevServed is the migration-073 tunnel flag, carried verbatim from the
+	// RecordUsageRequest (or false on every platform-measured path). See
+	// RecordUsageRequest.DevServed for why it is stored on the fact and why it
+	// is excluded from the payload fingerprint.
+	DevServed bool
 }
 
 // MetricUsageRaw is one grouped row from the live current-period query.
@@ -972,6 +977,7 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 		AggregationKey:     nullableAggregationKey(ev.AggregationKey),
 		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
 		OccurrencePolicy:   string(ev.OccurrencePolicy),
+		DevServed:          ev.DevServed,
 	})
 	if err != nil {
 		return false, err
@@ -1221,6 +1227,7 @@ func (s *pgxStore) InsertUsageObservation(
 		AggregationKey:     nullableAggregationKey(ev.AggregationKey),
 		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
 		OccurrencePolicy:   string(ev.OccurrencePolicy),
+		DevServed:          ev.DevServed,
 	})
 	if err != nil {
 		return false, 0, err

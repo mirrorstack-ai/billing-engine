@@ -114,6 +114,30 @@ type RecordUsageRequest struct {
 	// before this PR, and any module that doesn't report a version) → stored
 	// as a NULL usage_events.module_version.
 	ModuleVersion string `json:"module_version,omitempty"`
+
+	// DevServed marks usage a DEVELOPER TUNNEL produced (migration 073).
+	// api-platform sets it true when the metered call was authenticated by the
+	// module's LIVE TUNNEL SESSION secret rather than by its deployed
+	// credential — the one place in the system that can tell a laptop from a
+	// deployed Lambda, because the SDK meter cannot and must not.
+	//
+	// ABSENT == false == CHARGED, i.e. exactly today's behaviour, so a sender
+	// that has not been updated keeps working unchanged. A true event is
+	// recorded, priced and displayed like any other (a developer testing a
+	// paid meter needs to see what it would have cost) and contributes ZERO to
+	// every sum that takes money or reconciles an invoice.
+	//
+	// It is a property of the FACT: it is persisted on the event, survives to
+	// the aggregate, and is never re-derived from the module's current state —
+	// a module deployed for three weeks and tunnelled for the last one has
+	// both kinds of usage in one period and owes the deployed part.
+	//
+	// 🔴 DELIBERATELY NOT PART OF observationFingerprint. The fingerprint is
+	// the canonical MODULE-REPORTED payload; dev_served is a platform-side
+	// transport property the module never sees. Adding a field to that hash
+	// would also change the digest of every event already stored, turning
+	// ordinary at-least-once retries into event-id conflicts.
+	DevServed bool `json:"dev_served,omitempty"`
 }
 
 // RecordUsageResponse reports whether the event was newly recorded.

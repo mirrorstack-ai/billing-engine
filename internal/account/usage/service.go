@@ -88,6 +88,12 @@ func (s *Service) WithCreditEvaluator(e credit.UsageEvaluator) *Service {
 //  4. resolves the owner's billing account (Nil = lazy, recorded NULL),
 //  5. inserts ON CONFLICT(event_id) DO NOTHING (idempotent retry).
 //
+// The request's dev_served flag (migration 073) is carried onto the row
+// verbatim: this ingress cannot tell a tunnel from a Lambda, only api-platform
+// can. A dev_served event is stored, rolled up and priced like any other and
+// charged never, so the one ingest-path behaviour it changes is the disposable
+// wallet estimate, which is skipped for it (see below).
+//
 // A deduped retry returns Recorded=false with a nil error — the fact is
 // already stored; callers must treat false as success.
 func (s *Service) RecordUsage(ctx context.Context, req RecordUsageRequest) (*RecordUsageResponse, error) {
@@ -176,6 +182,11 @@ func (s *Service) recordUsage(ctx context.Context, req RecordUsageRequest, timin
 		OwnerUserID:        req.OwnerUserID,
 		OwnerOrgID:         req.OwnerOrgID,
 		ModuleVersion:      req.ModuleVersion,
+		// Carried VERBATIM from the request (migration 073). This ingress does
+		// not — and cannot — decide whether a module was tunnel-served: only
+		// api-platform sees which credential authenticated the call. Absent is
+		// false is chargeable, today's behaviour.
+		DevServed: req.DevServed,
 	}
 	event.PayloadFingerprint = observationFingerprint(event)
 	accepted, err := s.store.CheckUsageEventID(ctx, req.EventID, event.PayloadFingerprint)
@@ -353,7 +364,14 @@ func (s *Service) recordUsage(ctx context.Context, req RecordUsageRequest, timin
 					"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
 			}
 		}
-		if s.credit != nil && accountID != uuid.Nil {
+		// 🔴 The disposable wallet is MONEY. A tunnel-served event is never
+		// charged, so it must never estimate a debit, never draw down a
+		// balance and never trigger an auto-top-up — the developer would be
+		// buying credit to pay for usage that will be waived at rollup. The
+		// budget hook above still fires: it RE-READS the app's spend from SQL
+		// (AppPeriodSpendMicros, which excludes dev_served rows), so it stays
+		// correct on its own and a dev event simply moves nothing.
+		if s.credit != nil && accountID != uuid.Nil && !req.DevServed {
 			delta, err := approximateUsageChargeMicros(req.Metric, billableDelta, def)
 			if err != nil {
 				slog.Error("credit estimate pricing failed (usage still recorded)",
