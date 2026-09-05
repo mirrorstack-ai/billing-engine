@@ -110,9 +110,20 @@ func TestMigration023_UpDownUp_RoundTrips(t *testing.T) {
 	require.Len(t, resp.Aggregates, 2, "pre-down: two version-split rows exist")
 
 	// --- down: descendants first, then collapse the version-split rows ---
-	// Migration 055's aggregate identity includes module_version. A historical
-	// migration cannot know about a future dependent index, so a realistic
-	// rollback unwinds 055 before 023 rather than leaving a half-new schema.
+	// Migration 055's aggregate identity includes module_version, and 073's
+	// includes 055's aggregation_key. A historical migration cannot know about a
+	// future dependent index, so a realistic rollback unwinds 073, then 055,
+	// then 023, rather than leaving a half-new schema.
+	//
+	// 🔴 073 MUST come off first, and not only for tidiness. 055.down drops
+	// usage_aggregates.aggregation_key, which SILENTLY cascade-drops 073's
+	// unique index (it is defined over COALESCE(aggregation_key, '')) while
+	// leaving the dev_served COLUMN — and every UpsertUsageAggregate names
+	// dev_served in its ON CONFLICT target, so the re-applied stack below would
+	// fail with "no unique or exclusion constraint matching the ON CONFLICT
+	// specification" on a schema that looks complete.
+	_, err = pool.Exec(ctx, migrationSQL(t, "073_dev_served_usage.down.sql"))
+	require.NoError(t, err)
 	_, err = pool.Exec(ctx, migrationSQL(t, "055_keyed_meter_observations.down.sql"))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, migrationSQL(t, "023_usage_module_version.down.sql"))
@@ -137,10 +148,12 @@ func TestMigration023_UpDownUp_RoundTrips(t *testing.T) {
 	require.EqualValues(t, 500_000, raw, "no money lost on down: 200_000 + 300_000")
 	require.EqualValues(t, 500_000, charged)
 
-	// --- up again: re-apply 023 and then its 055 descendant cleanly ---
+	// --- up again: re-apply 023, then its 055 and 073 descendants, cleanly ---
 	_, err = pool.Exec(ctx, migrationSQL(t, "023_usage_module_version.up.sql"))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, migrationSQL(t, "055_keyed_meter_observations.up.sql"))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, migrationSQL(t, "073_dev_served_usage.up.sql"))
 	require.NoError(t, err)
 
 	require.True(t, columnExists(t, pool, "usage_events", "module_version"))

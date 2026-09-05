@@ -34,6 +34,14 @@ func TestMigration055_UpDownUp_RoundTrips(t *testing.T) {
 		        'users.active', 'peak', 1, now(), 2, now(), now(), 'on_time')`)
 	require.Error(t, err, "every v2 row must carry its canonical fingerprint")
 
+	// 073's aggregate uniqueness index is defined over 055's aggregation_key, so
+	// it comes off first — otherwise 055.down cascade-drops it while leaving the
+	// dev_served column, and the re-applied stack ends up with an ON CONFLICT
+	// target no index matches. Descendants first, exactly as in the 023 test.
+	_, err = pool.Exec(ctx, migrationSQL(t, "073_dev_served_usage.down.sql"))
+	require.NoError(t, err)
+	require.False(t, columnExists(t, pool, "usage_aggregates", "dev_served"))
+
 	// Once the keyed contract is used, rollback must fail before silently
 	// reinterpreting or dropping billable state.
 	_, err = pool.Exec(ctx, `
@@ -114,6 +122,12 @@ func TestMigration055_UpDownUp_RoundTrips(t *testing.T) {
 		"2026-03-01": "invoiced", // terminal run
 		"2026-04-01": "open",     // no durable rollup/charge state
 	}, gotStatuses)
+
+	// Re-apply the 073 descendant so the round trip lands back on the real
+	// current schema rather than a 055-shaped one.
+	_, err = pool.Exec(ctx, migrationSQL(t, "073_dev_served_usage.up.sql"))
+	require.NoError(t, err)
+	require.True(t, columnExists(t, pool, "usage_aggregates", "dev_served"))
 
 	// Catalog owns the keyed mode: only peak + subject is admitted.
 	_, err = pool.Exec(ctx, `
