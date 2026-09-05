@@ -158,6 +158,25 @@ func (f *transferFixture) giveOldAccountACard(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// fundOldAccountThrough re-points the old account's funding authorization at
+// another account — the shape a sponsor designation leaves (052: the funder
+// is what every arm resolves and what TransferSourceSettlement must read the
+// card off). carded says whether that sponsor holds a usable card.
+func (f *transferFixture) fundOldAccountThrough(t *testing.T, carded bool) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	sponsor := seedAccount(t, f.pool)
+	if carded {
+		installStandardPaymentMethod(t, f.pool, sponsor, "cus_transfer_sponsor_"+sponsor.String())
+	}
+	_, err := f.pool.Exec(ctx, `
+		UPDATE ms_billing.account_funding_authorizations
+		SET funding_account_id = $2, generation = gen_random_uuid(), updated_at = now()
+		WHERE account_id = $1`, f.oldAcct.String(), sponsor.String())
+	require.NoError(t, err)
+	return sponsor
+}
+
 // The three unsettled things a transfer has to decide about, each seeded on
 // the OLD account in the shape its own leg would find it. Every one is past
 // its grace / eligible at f.now, so a sweep at f.now lists it.
@@ -350,6 +369,15 @@ func TestTransferAppRefusesWhileAOneTimeChargeIsPending(t *testing.T) {
 		{"module grace unresolved, old account can settle", true, func(t *testing.T, f *transferFixture) {
 			f.oweModuleGrace(t, false)
 		}},
+		// 🔴 THE CARD IS READ OFF THE FUNDER. The old account itself has no
+		// card; its sponsor does, and ArmDomainStripeCharge would arm against
+		// the sponsor's card on the next sweep — so this settles and refuses.
+		// A join on the account's own payment methods reads "no card" here
+		// and forfeits a charge the sponsor was about to pay.
+		{"domain activation unresolved, the SPONSOR can settle", false, func(t *testing.T, f *transferFixture) {
+			f.fundOldAccountThrough(t, true)
+			f.oweDomainActivation(t, false)
+		}},
 		// In flight: the arm marker is set, so money may already have moved
 		// at the provider. No card on the old account — a forfeit here would
 		// leave a possibly-collected charge with no mirror, so the refusal
@@ -448,6 +476,15 @@ func TestTransferAppForfeitsWhatTheOldAccountCannotSettle(t *testing.T) {
 			}, "prepaid", [3]int{1, 1, 1}},
 		{"no usable card on the old account", transferSeed{oldActivated: activated, newActivated: activated},
 			nil, "no_payment_method", [3]int{1, 1, 1}},
+		// The mirror of the sponsor refusal above: the old account HAS a card,
+		// but its funder is a cardless sponsor, and the legs arm against the
+		// funder — so nothing would collect, and this forfeits. A join on the
+		// account's own card would refuse forever.
+		{"carded old account funded through a cardless sponsor", transferSeed{oldActivated: activated, newActivated: activated},
+			func(t *testing.T, f *transferFixture) {
+				f.giveOldAccountACard(t)
+				f.fundOldAccountThrough(t, false)
+			}, "no_payment_method", [3]int{1, 1, 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
