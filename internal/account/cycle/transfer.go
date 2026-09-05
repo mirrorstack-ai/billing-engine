@@ -102,6 +102,16 @@ const (
 //
 // WHAT MODE DECIDES: usage only. See TransferAppRequest.Mode.
 //
+// WHAT ALSO ALWAYS HAPPENS, for LEVEL meters: every time_weighted stream the
+// old account still holds for the app is cut with a zero-level sample at the
+// hand-off (the transfer instant; the move window's start in move mode). The
+// rollup holds a stream's last sample until period end, so without the cut the
+// old account would keep billing the level it last saw across a stretch the
+// new account also bills. Peak is not cut: the old period keeps the peak it
+// reached, and the new account's first sample back-filling to its own period
+// start is the rollup's ordinary mid-period-start rule, not a transfer rule
+// (app_transfer.sql, TerminateAppLevelStreamsOnTransfer).
+//
 // WHAT NEVER HAPPENS: an issued or closed invoice is never touched, and no
 // usage is re-attributed into a period the target account has already closed
 // (INV-011 — a transfer may not rewrite a fact that has already been billed).

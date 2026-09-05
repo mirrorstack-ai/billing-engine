@@ -521,6 +521,111 @@ func (q *Queries) RekeyAppTimers(ctx context.Context, arg RekeyAppTimersParams) 
 	return result.RowsAffected(), nil
 }
 
+const terminateAppLevelStreamsOnTransfer = `-- name: TerminateAppLevelStreamsOnTransfer :execrows
+INSERT INTO ms_billing.usage_events (
+    event_id, account_id, app_id, module_id, metric, kind, value,
+    recorded_at, billable_at, model, module_version,
+    observation_version, occurrence_policy, metadata
+)
+SELECT
+    'app_transfer:' || $1::text || ':' || stream.module_id::text
+        || ':' || stream.metric || ':' || COALESCE(stream.model, ''),
+    $2::uuid,
+    $3::uuid,
+    stream.module_id,
+    stream.metric,
+    'time_weighted'::ms_billing.metric_kind,
+    0::numeric,
+    $4::timestamptz,
+    $4::timestamptz,
+    stream.model,
+    stream.module_version,
+    1::smallint,
+    'v1_ingest_time',
+    json_build_object('synthesized_by', 'app_transfer', 'request_id', $1::text)
+FROM (
+    SELECT DISTINCT ON (module_id, metric, COALESCE(model, ''))
+        module_id, metric, model, module_version
+    FROM ms_billing.usage_events
+    WHERE app_id = $3::uuid
+      AND account_id = $2::uuid
+      AND kind = 'time_weighted'
+      AND COALESCE(billable_at, recorded_at) >= $5::timestamptz
+      AND COALESCE(billable_at, recorded_at) <  $4::timestamptz
+    ORDER BY module_id, metric, COALESCE(model, ''),
+             COALESCE(billable_at, recorded_at) DESC, event_id DESC
+) stream
+`
+
+type TerminateAppLevelStreamsOnTransferParams struct {
+	RequestID   string    `json:"request_id"`
+	AccountID   string    `json:"account_id"`
+	AppID       string    `json:"app_id"`
+	At          time.Time `json:"at"`
+	PeriodStart time.Time `json:"period_start"`
+}
+
+// TerminateAppLevelStreamsOnTransfer closes every LEVEL stream the OLD
+// account is still holding for this app, by writing one zero-level sample
+// per stream at the instant its attribution ends.
+//
+// 🔴 WHY A SAMPLE, AND WHY ZERO. A time_weighted gauge is not a fact per
+// event: the rollup integrates a STEP FUNCTION under the samples, holding
+// each level until the next sample — or, for the stream's LAST sample in a
+// period, until PERIOD END (rollup.sql RollupTimeWeightedKind, the LEAD
+// default). After a transfer the old account's rollup still sees its last
+// sample, still extends it to period end, and bills the level for a stretch
+// the app spent on the NEW account — which bills the same stretch from its
+// own samples. Both modes: keep leaves every sample where it was; move
+// re-attributes the open window and the old account's last sample BEFORE that
+// window still extends across it. A zero-level sample at the hand-off is the
+// one write that makes the rollup's own arithmetic stop the old integral
+// there, without teaching the rollup about transfers.
+//
+// WHICH INSTANT. @at is where the old account's attribution of the stream
+// ENDS, and the store passes it: the transfer instant in keep mode, the move
+// window's start in move mode (every sample from there was just moved).
+// Writing it at the transfer instant in move mode would leave the old
+// account holding its last level across the very window the new account now
+// bills from moved samples. The old account's rollup reads it because it
+// lies inside [@period_start, its period end), where @period_start is the
+// OLD account's open-period start.
+//
+// WHICH STREAMS. Exactly the rollup's partition — (app, module, metric,
+// COALESCE(model, ”)) — restricted to kind time_weighted, and only where the
+// old account still holds a sample in [@period_start, @at): a stream with
+// nothing left there contributes nothing to the old integral, so there is
+// nothing to stop. The sample carries the LAST held sample's module_version so
+// its zero-level tail groups under the version that was running (the
+// rollup groups the integral per version); it adds 0 × duration to that
+// version's billable_quantity and only extends its active_seconds, which for
+// time_weighted is a reproducibility snapshot and never a multiplier.
+//
+// WHAT THIS IS NOT. Peak is left alone: MAX ignores a zero, and the old
+// period keeps its peak because a peak is a peak — the level WAS reached in
+// that period. The new account's first sample being back-filled to ITS period
+// start (RollupPeakKind row_num = 1) is the rollup's pre-existing semantics
+// for any stream that begins mid-period, not a transfer artefact.
+//
+// Shape: observation_version 1 (always in the rollup, whatever the account's
+// activation state), billable_at explicit so the rollup's window expression
+// reads the instant directly, value 0, kind time_weighted, a deterministic
+// event_id naming the transfer and the stream, and the request_id in
+// metadata so an auditor reading a zero can see who wrote it. :execrows.
+func (q *Queries) TerminateAppLevelStreamsOnTransfer(ctx context.Context, arg TerminateAppLevelStreamsOnTransferParams) (int64, error) {
+	result, err := q.db.Exec(ctx, terminateAppLevelStreamsOnTransfer,
+		arg.RequestID,
+		arg.AccountID,
+		arg.AppID,
+		arg.At,
+		arg.PeriodStart,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const transferSourceSettlement = `-- name: TransferSourceSettlement :one
 SELECT (a.activated_at IS NOT NULL)::bool AS activated,
        (a.usage_billing_mode = 'arrears')::bool AS arrears,

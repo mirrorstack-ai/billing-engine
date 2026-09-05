@@ -286,7 +286,13 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			return err
 		}
 
+		// handoff is the instant the OLD account's attribution of this app's
+		// usage ENDS: the transfer instant — unless a move pulls the open
+		// window forward, in which case it is that window's start, because
+		// every sample from there on has just been handed to the new account.
+		// It is where the level streams below are cut.
 		var moved int64
+		handoff := p.At
 		if p.Mode == TransferModeMove && fromAccount != uuid.Nil {
 			start, mErr := s.moveWindowStart(ctx, qtx, fromAccount, p.ToAccount, p.At)
 			if mErr != nil {
@@ -303,6 +309,20 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 				return uErr
 			}
 			moved = n
+			handoff = start
+		}
+
+		// 🔴 THE LEVEL STREAMS ARE CUT, IN BOTH MODES. A time_weighted gauge
+		// is integrated as a step function, and the rollup holds a stream's
+		// LAST sample in a period until PERIOD END. Left alone, the old
+		// account's rollup would keep billing the level it last saw across the
+		// rest of its period — the same stretch the new account bills from its
+		// own samples. One zero-level sample per stream at the hand-off makes
+		// the old integral stop there. After the move, so the query sees what
+		// the old account still holds; under the period barrier taken above,
+		// so the rollup cannot be closing the period the sample lands in.
+		if _, err := s.terminateLevelStreams(ctx, qtx, p, fromAccount, handoff); err != nil {
+			return err
 		}
 
 		// An unbilled org roster row had no account to tier on, so it holds
@@ -537,6 +557,36 @@ func (s *pgxStore) moveWindowStart(ctx context.Context, qtx *db.Queries, from, t
 		return toWindow.Start, nil
 	}
 	return fromWindow.Start, nil
+}
+
+// terminateLevelStreams writes the terminal zero-level sample for every
+// time_weighted stream the OLD account still holds for this app inside its
+// open period, at handoff — the instant its attribution of the stream ends.
+// The arithmetic, the choice of instant and what is deliberately left alone
+// (peak) are on TerminateAppLevelStreamsOnTransfer in app_transfer.sql.
+//
+// The range is [old open-period start, handoff): a stream with no sample left
+// there contributes nothing to the old account's integral and needs no
+// terminal. A zero from-account (an unbilled org roster row) holds no stream
+// at all — its usage is the NULL-account backlog this transfer refused on.
+//
+// Returns the number of streams cut; the rows name the transfer themselves
+// (event_id and metadata), so the ledger carries no separate count.
+func (s *pgxStore) terminateLevelStreams(ctx context.Context, qtx *db.Queries, p TransferAppParams, from uuid.UUID, handoff time.Time) (int64, error) {
+	if from == uuid.Nil {
+		return 0, nil
+	}
+	fromWindow, _, err := s.transferWindows(ctx, qtx, from, p.At)
+	if err != nil {
+		return 0, err
+	}
+	return qtx.TerminateAppLevelStreamsOnTransfer(ctx, db.TerminateAppLevelStreamsOnTransferParams{
+		RequestID:   p.RequestID.String(),
+		AccountID:   from.String(),
+		AppID:       p.AppID.String(),
+		At:          handoff,
+		PeriodStart: fromWindow.Start,
+	})
 }
 
 // EnsureUserAccount is the user twin of EnsureOrgAccount: the same

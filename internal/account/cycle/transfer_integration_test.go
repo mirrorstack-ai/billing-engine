@@ -15,6 +15,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
 
@@ -1037,4 +1038,208 @@ func TestTransferAppReplayReturnsTheStoredWindowAcrossABoundary(t *testing.T) {
 	requireSameInstant(t, first.OpenPeriod.Start, storedStart, "ledger open_period_start")
 	requireSameInstant(t, first.OpenPeriod.End, storedEnd, "ledger open_period_end")
 	requireSameInstant(t, first.RecurringFrom, storedFrom, "ledger recurring_from")
+}
+
+// gaugeSample records one level of a time_weighted meter for the app, in the
+// v1 shape (recorded_at only) every legacy and infra writer produces.
+func (f *transferFixture) gaugeSample(t *testing.T, account uuid.UUID, metric string, level int, at string) {
+	t.Helper()
+	_, err := f.pool.Exec(context.Background(), `
+		INSERT INTO ms_billing.usage_events
+		    (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, 'time_weighted', $6, $7)`,
+		uuid.NewString(), account.String(), f.appID.String(), f.moduleID.String(), metric, level, mustTime(t, at))
+	require.NoError(t, err)
+}
+
+// terminalSamples reads what the transfer synthesized on an account for the
+// app: the zero-level rows named after the transfer (event_id prefix). Every
+// row's request_id, instant and value are checked here so a test can assert on
+// the count alone.
+func (f *transferFixture) terminalSamples(t *testing.T, account, requestID uuid.UUID, wantAt time.Time) int {
+	t.Helper()
+	rows, err := f.pool.Query(context.Background(), `
+		SELECT value::text, recorded_at, billable_at, kind::text, metadata->>'request_id'
+		FROM ms_billing.usage_events
+		WHERE app_id = $1 AND account_id = $2 AND event_id LIKE 'app_transfer:%'`,
+		f.appID.String(), account.String())
+	require.NoError(t, err)
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var value, kind, reqID string
+		var recordedAt, billableAt time.Time
+		require.NoError(t, rows.Scan(&value, &recordedAt, &billableAt, &kind, &reqID))
+		require.Equal(t, "0", value, "a terminal sample must be a zero level")
+		require.Equal(t, "time_weighted", kind)
+		require.Equal(t, requestID.String(), reqID, "the terminal sample does not name the transfer that wrote it")
+		requireSameInstant(t, wantAt, recordedAt, "terminal sample recorded_at")
+		requireSameInstant(t, wantAt, billableAt, "terminal sample billable_at")
+		n++
+	}
+	require.NoError(t, rows.Err())
+	return n
+}
+
+// levelAggregate returns the one rolled-up aggregate for a metric, or fails.
+// found=false is the "no row" the rollup produces for a period with no
+// samples of the stream at all — a distinct outcome the move-mode case below
+// asserts on.
+func levelAggregate(t *testing.T, aggs []cycle.MetricAggregate, metric string) (cycle.MetricAggregate, bool) {
+	t.Helper()
+	var out []cycle.MetricAggregate
+	for _, a := range aggs {
+		if a.Metric == metric {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return cycle.MetricAggregate{}, false
+	}
+	require.Len(t, out, 1, "more than one aggregate for %s", metric)
+	return out[0], true
+}
+
+// 🔴 LEVEL METERS ARE CUT AT THE HAND-OFF. The rollup integrates a
+// time_weighted gauge as a step function and holds a stream's LAST sample in
+// a period until PERIOD END. After a transfer the old account's rollup still
+// sees its last sample and still extends it to period end — billing the level
+// for the rest of the period, which the new account also bills from its own
+// samples. The fix is a zero-level sample on the old account at the instant
+// its attribution of the stream ends; the number below is the old account's
+// rollup integral, read through the same RollupPeriod the cycle runs.
+//
+// The arithmetic, all from the one pinned now = 2026-08-15T12:00Z, a level of
+// 10 sampled hourly, period [08-04, 09-04) for both equal-anchor cases:
+//
+//	old holds 00:00 … 11:00 (12 samples), transfer at 12:00
+//	  cut     → 12 segments × 1h × 10 = 120 unit-hours; active from 00:00 to
+//	            period end = 20 days = 1,728,000 s (the zero tail counts in the
+//	            snapshot, never in the integral)
+//	  uncut   → 00:00 held to 09-04 = 480h × 10 = 4800 — the double-bill
+//	new holds 13:00, 14:00 after the transfer
+//	  keep    → 13:00 held to 09-04 = 467h × 10 = 4670
+//	  old+new → 4790 = 10 × 479h: the stream once, minus the one-hour gap
+//	            [12:00, 13:00) that nobody bills — the same class of loss as a
+//	            stream that begins mid-period
+//	move, equal anchors → every old sample moves; old holds nothing, no cut;
+//	  new integrates 00:00 … 14:00 to period end = 480h × 10 = 4800, once
+//	move, old anchor day 4 / new anchor day 10 → move window [08-10, now):
+//	  old keeps 08-08 (before the window) and is cut at 08-10 = 48h × 10 = 480;
+//	  uncut it would hold 08-08 to 09-04 = 648h × 10 = 6480, across the whole
+//	  window the new account bills; new integrates the moved 08-12 sample to
+//	  09-10 = 696h × 10 = 6960
+//
+// Mutation: drop the terminateLevelStreams call and every "cut" number reads
+// as its "uncut" control; cut at p.At instead of the move window's start and
+// the anchored move case reads 10 × (08-08 → 08-15T12:00) = 1800, not 480.
+func TestTransferAppCutsLevelStreamsOnTheOldAccount(t *testing.T) {
+	const metric = "storage.gib_hours"
+	periodStart, periodEnd := mustTime(t, "2026-08-04T00:00:00Z"), mustTime(t, "2026-09-04T00:00:00Z")
+
+	rollup := func(t *testing.T, f *transferFixture, account uuid.UUID, start, end time.Time) (cycle.MetricAggregate, bool) {
+		t.Helper()
+		resp, err := transferSvc(t, f).RollupPeriod(context.Background(), account, start, end)
+		require.NoError(t, err)
+		return levelAggregate(t, resp.Aggregates, metric)
+	}
+	seedHourly := func(t *testing.T, f *transferFixture) {
+		t.Helper()
+		seedMetricDef(t, f.pool, f.moduleID, metric, usage.KindTimeWeighted, 1_000)
+		for h := 0; h < 12; h++ {
+			f.gaugeSample(t, f.oldAcct, metric, 10, time.Date(2026, time.August, 15, h, 0, 0, 0, time.UTC).Format(time.RFC3339))
+		}
+		// The stream continues on the new account after the transfer.
+		f.gaugeSample(t, f.newAcct, metric, 10, "2026-08-15T13:00:00Z")
+		f.gaugeSample(t, f.newAcct, metric, 10, "2026-08-15T14:00:00Z")
+	}
+	uncut := func(t *testing.T, f *transferFixture, requestID uuid.UUID) {
+		t.Helper()
+		_, err := f.pool.Exec(context.Background(),
+			`DELETE FROM ms_billing.usage_events WHERE app_id = $1 AND event_id LIKE 'app_transfer:' || $2 || '%'`,
+			f.appID.String(), requestID.String())
+		require.NoError(t, err)
+	}
+
+	t.Run("keep", func(t *testing.T) {
+		f := seedTransferFixture(t)
+		seedHourly(t, f)
+		req := cycle.TransferAppRequest{AppID: f.appID, OwnerUserID: f.newOwner, Mode: cycle.TransferModeKeep, RequestID: uuid.New()}
+		_, err := transferSvc(t, f).TransferApp(context.Background(), req)
+		require.NoError(t, err)
+
+		require.Equal(t, 1, f.terminalSamples(t, f.oldAcct, req.RequestID, f.now), "one stream, one terminal sample, at the transfer instant")
+		require.Equal(t, 0, f.terminalSamples(t, f.newAcct, req.RequestID, f.now), "the new account's stream is not cut")
+
+		old, found := rollup(t, f, f.oldAcct, periodStart, periodEnd)
+		require.True(t, found)
+		require.Equal(t, "120", old.BillableQuantity, "the old account's integral must stop at the transfer instant")
+		require.NotNil(t, old.ActiveSeconds)
+		require.Equal(t, "1728000", *old.ActiveSeconds, "the zero tail extends the snapshot window to period end; it is not a multiplier")
+
+		newAgg, found := rollup(t, f, f.newAcct, periodStart, periodEnd)
+		require.True(t, found)
+		require.Equal(t, "4670", newAgg.BillableQuantity, "the new account integrates from its own first sample")
+		// 120 + 4670: the stream billed once, minus the hand-off hour.
+		require.EqualValues(t, 120_000+4_670_000, old.ChargedMicros+newAgg.ChargedMicros)
+
+		// The control: without the terminal sample the old account holds its
+		// last level to period end — the double-bill this fix exists for.
+		uncut(t, f, req.RequestID)
+		old, found = rollup(t, f, f.oldAcct, periodStart, periodEnd)
+		require.True(t, found)
+		require.Equal(t, "4800", old.BillableQuantity, "control: uncut, the old account bills the level to period end")
+	})
+
+	t.Run("move, equal anchors", func(t *testing.T) {
+		f := seedTransferFixture(t)
+		seedHourly(t, f)
+		req := cycle.TransferAppRequest{AppID: f.appID, OwnerUserID: f.newOwner, Mode: cycle.TransferModeMove, RequestID: uuid.New()}
+		resp, err := transferSvc(t, f).TransferApp(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, int64(12), resp.MovedEventCount)
+
+		// Every old sample moved; there is no stream left on the old account
+		// to cut, and a lone zero would have manufactured an aggregate row for
+		// a period with no usage.
+		require.Equal(t, 0, f.terminalSamples(t, f.oldAcct, req.RequestID, f.now))
+		_, found := rollup(t, f, f.oldAcct, periodStart, periodEnd)
+		require.False(t, found, "the old account has no usage of this stream left in the period")
+
+		newAgg, found := rollup(t, f, f.newAcct, periodStart, periodEnd)
+		require.True(t, found)
+		require.Equal(t, "4800", newAgg.BillableQuantity, "the whole stream, once, on the new account")
+	})
+
+	t.Run("move, old anchor earlier than the target's", func(t *testing.T) {
+		f := seedTransferFixtureAnchored(t,
+			mustTime(t, "2026-05-04T00:00:00Z"),
+			mustTime(t, "2026-05-10T00:00:00Z"))
+		seedMetricDef(t, f.pool, f.moduleID, metric, usage.KindTimeWeighted, 1_000)
+		f.gaugeSample(t, f.oldAcct, metric, 10, "2026-08-08T00:00:00Z") // before the move window: stays
+		f.gaugeSample(t, f.oldAcct, metric, 10, "2026-08-12T00:00:00Z") // inside it: moves
+		windowStart := mustTime(t, "2026-08-10T00:00:00Z")
+
+		req := cycle.TransferAppRequest{AppID: f.appID, OwnerUserID: f.newOwner, Mode: cycle.TransferModeMove, RequestID: uuid.New()}
+		resp, err := transferSvc(t, f).TransferApp(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), resp.MovedEventCount)
+
+		// The cut is at the move window's START, not the transfer instant:
+		// everything from 08-10 on was just handed to the new account.
+		require.Equal(t, 1, f.terminalSamples(t, f.oldAcct, req.RequestID, windowStart))
+
+		old, found := rollup(t, f, f.oldAcct, periodStart, periodEnd)
+		require.True(t, found)
+		require.Equal(t, "480", old.BillableQuantity, "the old account's integral must stop where the move window opens")
+
+		newAgg, found := rollup(t, f, f.newAcct, windowStart, mustTime(t, "2026-09-10T00:00:00Z"))
+		require.True(t, found)
+		require.Equal(t, "6960", newAgg.BillableQuantity, "the moved sample is held on the new account to ITS period end")
+
+		uncut(t, f, req.RequestID)
+		old, found = rollup(t, f, f.oldAcct, periodStart, periodEnd)
+		require.True(t, found)
+		require.Equal(t, "6480", old.BillableQuantity, "control: uncut, the old account bills across the window the new account already bills")
+	})
 }
