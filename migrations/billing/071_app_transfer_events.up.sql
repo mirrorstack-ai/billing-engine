@@ -285,6 +285,41 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- 🔴 MEASURE WHAT THE GUARD IS ABOUT TO POLICE, BEFORE INSTALLING IT. The
+-- function above scans EVERY live child of the app that fired it, not only
+-- the row that changed, so a split that already exists on this database
+-- would surface later as a COMMIT-time refusal on some UNRELATED write for
+-- that app — RegisterDomain, a timer reconcile, this RPC's own re-key — and
+-- read as that write's fault. No writer in this repository has ever set a
+-- child's account_id to anything but the roster's, so the expected number is
+-- 0; a non-zero here is the signal to repair by hand before the first such
+-- write, and it is raised as a WARNING rather than an exception so the
+-- migration lands and the guard protects everything else meanwhile.
+DO $$
+DECLARE
+    n BIGINT;
+BEGIN
+    SELECT (SELECT count(*)
+              FROM ms_billing.app_module_overage_timers t
+              JOIN ms_billing.apps a USING (app_id)
+             WHERE t.removed_at IS NULL
+               AND a.account_id IS NOT NULL
+               AND t.account_id IS DISTINCT FROM a.account_id)
+         + (SELECT count(*)
+              FROM ms_billing.app_custom_domains d
+              JOIN ms_billing.apps a USING (app_id)
+             WHERE d.removed_at IS NULL
+               AND a.account_id IS NOT NULL
+               AND d.account_id IS DISTINCT FROM a.account_id)
+      INTO n;
+    IF n > 0 THEN
+        RAISE WARNING 'migration 071: % live timer/domain row(s) already disagree with their app roster account; the split guard installed below will refuse the next commit that touches any of those apps until they are repaired', n;
+    ELSE
+        RAISE NOTICE 'migration 071: no live timer/domain row disagrees with its app roster account; installing the split guard over a consistent state';
+    END IF;
+END
+$$;
+
 DROP TRIGGER IF EXISTS apps_attribution_agrees ON ms_billing.apps;
 CREATE CONSTRAINT TRIGGER apps_attribution_agrees
     AFTER UPDATE OF account_id ON ms_billing.apps
