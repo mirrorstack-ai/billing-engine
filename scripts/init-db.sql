@@ -117,3 +117,4 @@
 \i migrations/billing/070_g5g_task_gpu_price.up.sql
 \i migrations/billing/071_app_transfer_events.up.sql
 \i migrations/billing/072_rekey_settled_children_past_retired_funder.up.sql
+\i migrations/billing/073_dev_served_usage.up.sql
