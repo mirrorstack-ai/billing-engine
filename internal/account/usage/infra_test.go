@@ -689,3 +689,48 @@ func TestRecordInfraUsage_RejectsModelOnUndimensionedHeavyTaskMetrics(t *testing
 		})
 	}
 }
+
+func TestRecordInfraUsage_CarriesDevServedFromTheProducer(t *testing.T) {
+	// The dev-usage waiver was unreachable for an app whose modules declare no
+	// custom meters. RecordUsage (the custom-meter plane) set dev_served from
+	// the ingress plane and worked; this plane forced it false, and
+	// infra.compute.walltime.ms is where such an app's ENTIRE bill lives. So
+	// every module could be tunnel-served for a whole period and the dev-usage
+	// section still totalled zero — the only events that could ever be marked
+	// were events the app never emits.
+	//
+	// Owner's ruling 2026-09-06: a dev tunnel must not charge. dispatch asserts
+	// the flag from the forward path that actually ran (serveTunnel /
+	// serveTunnelRelay true, serveLambda false); this plane must carry it.
+	store := newFakeStore()
+	req := validInfra()
+	req.DevServed = true
+	store.accounts[req.OwnerUserID] = uuid.New()
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+
+	ev := store.events[req.EventID]
+	require.True(t, ev.DevServed,
+		"a tunnel-forward infra event must be flagged; the charging queries filter on dev_served = false")
+	// RECORDED, not dropped. A waiver that stopped recording would hide the
+	// usage rather than decline to charge for it, and the console's dev-usage
+	// section exists precisely to show what was not charged.
+	require.Equal(t, req.Value, ev.Value, "the measurement is kept in full")
+	require.Equal(t, req.Metric, ev.Metric)
+}
+
+func TestRecordInfraUsage_DefaultsDevServedFalse(t *testing.T) {
+	// The control: a producer that says nothing still records chargeable infra.
+	// Without this, the test above would pass on an implementation that flagged
+	// every infra event and waived the entire platform's compute bill.
+	store := newFakeStore()
+	req := validInfra()
+	store.accounts[req.OwnerUserID] = uuid.New()
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.False(t, store.events[req.EventID].DevServed,
+		"platform-incurred infra stays chargeable unless the producer marks the forward")
+}

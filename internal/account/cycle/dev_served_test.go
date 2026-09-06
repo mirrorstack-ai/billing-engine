@@ -91,9 +91,14 @@ func TestRollupPeriod_MixedDevAndDeployedSameMetricAreTwoAggregateRows(t *testin
 func TestRollupPeriod_DevServedInfraMetricStillPricesOnTheInfraPlane(t *testing.T) {
 	// dev_served changes WHO PAYS, never HOW A LINE IS PRICED. A reserved
 	// metric keeps its 12/10 plane and its loud missing-price guard; only the
-	// destination of its charge changes. (Platform infra is never flagged in
-	// practice — RecordInfraUsage does not set it — so this pins the pricing
-	// path's independence rather than a reachable production shape.)
+	// destination of its charge changes.
+	//
+	// This WAS an unreachable shape — RecordInfraUsage forced the flag false,
+	// so no infra event could carry it. It is reachable now: dispatch marks
+	// infra.compute.walltime.ms recorded on a tunnel forward, and the owner's
+	// 2026-09-06 ruling is that a dev tunnel must not charge. The assertions
+	// below were already correct for that world and are unchanged; only this
+	// note about reachability was wrong.
 	store := newFakeStore()
 	app, mod := uuid.New(), uuid.New()
 	store.raws = []cycle.RawAggregate{rawAggDev(app, mod, "infra.compute.ms", usage.KindSum, "100")}

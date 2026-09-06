@@ -298,6 +298,19 @@ type RecordInfraUsageRequest struct {
 	// as a NULL usage_events.module_version.
 	ModuleVersion string `json:"module_version,omitempty"`
 
+	// DevServed marks compute the platform spent forwarding to a module being
+	// served from a DEVELOPER'S TUNNEL rather than from its deployed function.
+	//
+	// Platform-asserted from the producer's forward path (dispatch knows which
+	// of serveTunnel / serveLambda ran), never an SDK hint — the same rule as
+	// RecordUsageRequest.DevServed on the custom-meter plane.
+	//
+	// A flagged event is RECORDED in full and EXCLUDED from every charging
+	// query (the `dev_served = false` filters already in AppInfraBillLines and
+	// its per-module sibling), so the usage stays visible under
+	// 測試模組使用量 and is never billed.
+	DevServed bool `json:"dev_served,omitempty"`
+
 	// Value is the platform-MEASURED quantity (ms / bytes). Authoritative and
 	// non-zeroable — it comes from the platform's chokepoint, never an SDK hint.
 	//
@@ -449,12 +462,27 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		Model:              req.Model,         // empty for non-AI metrics → NULL usage_events.model
 		ModuleVersion:      req.ModuleVersion, // empty → NULL usage_events.module_version
 		OccurrencePolicy:   OccurrencePolicyV1IngestTime,
-		// DevServed is deliberately absent (false). Platform infra is metered at
-		// the platform's OWN chokepoints — CDN egress, SSR compute, the agent's
-		// token spend — which the platform incurs and pays for whether the
-		// module answering was a tunnel or a Lambda. Only the module's own SDK
-		// meter can be tunnel-served, and that arrives on RecordUsage. A
-		// reserved metric is therefore always chargeable infra (migration 073).
+		// DevServed is now carried through rather than forced false.
+		//
+		// The previous rule — "a reserved metric is always chargeable infra" —
+		// held for the platform's OWN chokepoints (CDN egress, SSR compute, the
+		// agent's token spend), which the platform pays for whichever way a
+		// module answered. It did NOT hold for infra.compute.walltime.ms on a
+		// tunnel forward, where the metered wall-clock is dispatch waiting on a
+		// developer's laptop: charging it bills a developer in proportion to how
+		// slow their own machine is, and it is the metric that carries an entire
+		// app's bill when its modules declare no custom meters.
+		//
+		// That made the dev-usage waiver unreachable for such an app: every
+		// module could be tunnel-served all period and 測試模組使用量 still
+		// totalled zero, because the only events that could ever be marked were
+		// events the app never emits. Owner's ruling 2026-09-06: a dev tunnel
+		// must not charge.
+		//
+		// The charging queries already exclude flagged rows, so this field is
+		// the whole of the change: the event is still recorded in full and now
+		// declines to be billed.
+		DevServed:          req.DevServed,
 	}
 	event.PayloadFingerprint = observationFingerprint(event)
 	recorded, err := s.store.InsertUsageEvent(ctx, event)
