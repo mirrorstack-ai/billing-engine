@@ -80,7 +80,7 @@ func (stubUsageStore) AppInfraBill(context.Context, uuid.UUID, uuid.UUID, time.T
 	return nil, nil
 }
 
-func (stubUsageStore) AppModuleInfraBill(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time) ([]usage.AppModuleInfraUsage, error) {
+func (stubUsageStore) AppModuleInfraBill(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time, bool) ([]usage.AppModuleInfraUsage, error) {
 	return nil, nil
 }
 func (stubUsageStore) ListBillingPeriods(context.Context, uuid.UUID, time.Time) ([]usage.BillingPeriodRaw, error) {

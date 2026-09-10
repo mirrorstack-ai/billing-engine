@@ -151,7 +151,7 @@ func (f *fakeStore) AppBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time) (
 func (f *fakeStore) AppInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time) ([]usage.AppInfraUsage, error) {
 	return nil, nil
 }
-func (f *fakeStore) AppModuleInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time) ([]usage.AppModuleInfraUsage, error) {
+func (f *fakeStore) AppModuleInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time, _ bool) ([]usage.AppModuleInfraUsage, error) {
 	return nil, nil
 }
 func (f *fakeStore) ListBillingPeriods(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.BillingPeriodRaw, error) {
