@@ -292,6 +292,64 @@ func moduleInfraLine(mod uuid.UUID, metric, version string, defaultPrice int64, 
 
 func i64(v int64) *int64 { return &v }
 
+func TestGetAppBill_DevServedInfraIsReportedAndNeverCharged(t *testing.T) {
+	// 🔴 THE CONDITION THE HOST SET: a new display line must not silently join a
+	// total. ModuleInfraDevServedLines carries platform compute a developer's
+	// tunnel burned — recorded, priced on exactly the same basis as the charged
+	// half, and a term of NOTHING. If it ever reaches InfraTotalMicros, the
+	// platform bills a developer for testing on their own laptop and the
+	// reconciliation identity (infra_total == Σ module_infra + Σ residual) breaks
+	// in the same stroke.
+	//
+	// The dev-served row here is deliberately LARGER than everything charged, so
+	// a leak cannot hide inside a rounding-sized difference.
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+
+	modA, modB := uuid.New(), uuid.New()
+	store.appInfraBillRows = []usage.AppInfraUsage{
+		appInfraLine("infra.ai.input.tokens", "ai", 1000, 0.008, 8),
+	}
+	store.appModuleInfraBillRows = []usage.AppModuleInfraUsage{
+		moduleInfraLine(modA, "infra.compute.walltime.ms", "", 20, nil, 100, 24),
+	}
+	store.moduleInfraDevServed = []usage.AppModuleInfraUsage{
+		moduleInfraLine(modB, "infra.compute.walltime.ms", "", 20, nil, 9_000, 2_160_000),
+	}
+
+	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
+	require.NoError(t, err)
+
+	// Reported, in full, with its money intact — that is the point of the field.
+	require.Len(t, resp.ModuleInfraDevServedLines, 1)
+	require.EqualValues(t, 2_160_000, resp.ModuleInfraDevServedLines[0].ChargedMicros,
+		"what the tunnel's compute WOULD have cost, priced like any other line")
+	require.Equal(t, modB, resp.ModuleInfraDevServedLines[0].ModuleID)
+
+	// And a term of nothing. 8 (residual) + 24 (modA) = 32, with 2,160,000
+	// deliberately excluded.
+	require.EqualValues(t, 32, resp.InfraTotalMicros, "dev-served infra is NOT in the infra total")
+	var sum int64
+	for _, l := range resp.InfraLines {
+		sum += l.ChargedMicros
+	}
+	for _, l := range resp.ModuleInfraLines {
+		sum += l.ChargedMicros
+	}
+	require.Equal(t, resp.InfraTotalMicros, sum,
+		"infra_total == Σ module_infra + Σ residual, with the dev-served half outside it")
+
+	// The bill's own total is likewise untouched by it.
+	require.EqualValues(t, resp.BaseFeeMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros-resp.PaasCreditMicros,
+		resp.TotalMicros, "total_micros never absorbs the dev-served infra")
+
+	// The charged half must not contain the dev-served module, and vice versa —
+	// otherwise both assertions above could pass on the same rows twice.
+	require.Len(t, resp.ModuleInfraLines, 1)
+	require.Equal(t, modA, resp.ModuleInfraLines[0].ModuleID)
+}
+
 func TestGetAppBill_ModuleInfraLinesReconcileWithResidual(t *testing.T) {
 	// The per-module split is a pure DISPLAY re-partition of the same infra total:
 	// InfraTotalMicros == Σ module_infra_lines.charged + Σ infra_lines.charged. Both

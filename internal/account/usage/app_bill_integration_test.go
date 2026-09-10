@@ -266,7 +266,7 @@ func TestAppModuleInfraBill_Integration_DualPriceSentinelFallback(t *testing.T) 
 	appSeedEvent(t, pool, acct, app, sentinel, metric, usage.KindSum, 5, "2026-06-05T00:00:00Z", "", "")
 
 	lines, err := store.AppModuleInfraBill(ctx, acct, app,
-		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd), false)
 	require.NoError(t, err)
 	require.Len(t, lines, 3, "only the three ATTRIBUTED modules; the sentinel event is residual")
 
@@ -309,6 +309,68 @@ func TestAppModuleInfraBill_Integration_DualPriceSentinelFallback(t *testing.T) 
 	require.EqualValues(t, 120, resLine.ChargedMicros, "residual: 5 × 20 × 1.2")
 }
 
+// TestAppModuleInfraBill_Integration_DevServedPartition: the dev_served parameter
+// SELECTS A PARTITION rather than filtering one, and the two halves are disjoint.
+//
+// 🔴 THE FAILURE THIS GUARDS IS A SILENT BILLING CHANGE. api-platform stamps
+// DevServed at the tunnel forward path, so a flagged row leaking into the charged
+// half bills a developer for testing on their own laptop AND breaks the identity
+// infra_total_micros == Σ(module infra) + Σ(residual). The reverse leak is milder
+// but still wrong: charged compute showing up under 測試模組使用量 tells a reader
+// money is waived when it is not.
+//
+// A negative control is built in: the same module incurs BOTH kinds on the same
+// metric, so a query that ignored the parameter would return two rows to each
+// call and fail both length assertions rather than passing vacuously.
+func TestAppModuleInfraBill_Integration_DevServedPartition(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	app := uuid.New()
+	mod := uuid.New()
+	metric := "infra.compute.walltime.ms"
+
+	// Pin the SENTINEL default so the two halves can be compared on exact money.
+	_, err := pool.Exec(ctx,
+		`UPDATE ms_billing.metric_definitions SET unit_price_micros = 100, active = true
+		 WHERE module_id = $1 AND metric = $2`,
+		usage.PlatformInfraModuleID().String(), metric)
+	require.NoError(t, err)
+
+	// 10 units deployed + 4 units tunnelled: same module, same metric, same period.
+	appSeedEvent(t, pool, acct, app, mod, metric, usage.KindSum, 10, "2026-06-05T00:00:00Z", "", "")
+	_, err = pool.Exec(ctx,
+		`INSERT INTO ms_billing.usage_events
+		   (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at, dev_served)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)`,
+		uuid.NewString(), acct.String(), app.String(), mod.String(), metric,
+		string(usage.KindSum), 4, "2026-06-06T00:00:00Z")
+	require.NoError(t, err)
+
+	charged, err := store.AppModuleInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd), false)
+	require.NoError(t, err)
+	require.Len(t, charged, 1, "the tunnel's row must not appear in the charged half")
+	require.EqualValues(t, 10, charged[0].BillableQuantity, "deployed units only")
+	// 10 × 100 raw → ×12/10 markup = 1200.
+	require.EqualValues(t, 1200, charged[0].ChargedMicros)
+
+	devServed, err := store.AppModuleInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd), true)
+	require.NoError(t, err)
+	require.Len(t, devServed, 1, "the deployed row must not appear in the display half")
+	require.EqualValues(t, 4, devServed[0].BillableQuantity, "tunnelled units only")
+	// Priced on exactly the same basis as the charged half — that is the whole
+	// reason this is one parameterized query and not a copy. 4 × 100 × 12/10.
+	require.EqualValues(t, 480, devServed[0].ChargedMicros,
+		"the display half must price identically to the charged half")
+
+	// And the halves are disjoint: neither contains the other's quantity.
+	require.NotEqual(t, charged[0].BillableQuantity, devServed[0].BillableQuantity)
+}
+
 // TestAppModuleInfraBill_Integration_RolledFrozen: once rolled up, the per-module read
 // serves the FROZEN usage_aggregates.charged_micros (the override price + 1.2× already
 // snapshotted at rollup), suppressing the in-window live events; the display prices
@@ -339,7 +401,7 @@ func TestAppModuleInfraBill_Integration_RolledFrozen(t *testing.T) {
 		100, 5, 500, 600)
 
 	lines, err := store.AppModuleInfraBill(ctx, acct, app,
-		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd))
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd), false)
 	require.NoError(t, err)
 	require.Len(t, lines, 1, "rolled branch wins; live events suppressed")
 	require.EqualValues(t, 100, lines[0].BillableQuantity, "frozen quantity, not the live 999")

@@ -298,6 +298,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		InfraTotalMicros:           parts.InfraTotalMicros,
 		InfraLines:                 parts.InfraLines,
 		ModuleInfraLines:           parts.ModuleInfraLines,
+		ModuleInfraDevServedLines:  parts.ModuleInfraDevServedLines,
 		PaasCreditMicros:           paasCredit,
 		TotalMicros:                total,
 	}, nil
@@ -368,6 +369,10 @@ type appBillParts struct {
 	InfraTotalMicros int64
 	InfraLines       []AppInfraUsage
 	ModuleInfraLines []AppModuleInfraUsage
+	// ModuleInfraDevServedLines is the tunnel-burned half of the same per-module
+	// infra read: priced, displayed, and — like ModuleUsageDevServedMicros — never
+	// a term in InfraTotalMicros or any other total.
+	ModuleInfraDevServedLines []AppModuleInfraUsage
 	// ModelLines is the display-only per-model rollup of every non-reserved line
 	// carrying a model plus reserved model lines attributed to the platform-infra
 	// sentinel. Reserved lines attributed to real modules are excluded because
@@ -545,9 +550,29 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	// slice otherwise so the wire never carries null.
 	moduleInfraLines := []AppModuleInfraUsage{}
 	if found {
-		moduleInfraLines, err = s.store.AppModuleInfraBill(ctx, accountID, appID, periodStart, periodEnd)
+		moduleInfraLines, err = s.store.AppModuleInfraBill(ctx, accountID, appID, periodStart, periodEnd, false)
 		if err != nil {
 			return nil, billing.Internal("app module infra bill query failed", err)
+		}
+	}
+
+	// 基礎設施 a DEV TUNNEL burned — the same read, other partition.
+	//
+	// 🔴 RECORDED, DISPLAYED, NEVER CHARGED, AND A TERM OF NO TOTAL. It is not
+	// summed into infraTotal below and must never be: api-platform flags these
+	// events at the forward path (RecordInfraUsageRequest.DevServed) precisely so
+	// they leave the charge, and the charging queries filter on the same column.
+	//
+	// It exists because leaving the charge is not the same as leaving the bill.
+	// Without this read a developer's tunnel would burn platform compute that is
+	// recorded, priced, and visible NOWHERE — the console's 測試模組使用量 card
+	// would show a module's meters with no sign of the compute behind them. Same
+	// posture ModuleUsageDevServedMicros already holds for the custom meters.
+	moduleInfraDevServed := []AppModuleInfraUsage{}
+	if found {
+		moduleInfraDevServed, err = s.store.AppModuleInfraBill(ctx, accountID, appID, periodStart, periodEnd, true)
+		if err != nil {
+			return nil, billing.Internal("app module dev-served infra bill query failed", err)
 		}
 	}
 
@@ -638,6 +663,7 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		InfraTotalMicros:           infraTotal,
 		InfraLines:                 infraLines,
 		ModuleInfraLines:           moduleInfraLines,
+		ModuleInfraDevServedLines:  moduleInfraDevServed,
 		ModelLines:                 modelLines,
 		Name:                       mirror.Name, // "" when not mirrored / pre-037
 		IsDeleted:                  mirrored && mirror.Deleted,

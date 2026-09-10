@@ -198,7 +198,12 @@ type Store interface {
 	// ChargedMicros carries the ×1.2 infra markup applied ONCE in SQL. Rolled-up-else-live
 	// / uninstall-safe exactly like AppInfraBill. Together with AppInfraBill it partitions
 	// the reserved namespace with no overlap (residual = sentinel, module = non-sentinel).
-	AppModuleInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppModuleInfraUsage, error)
+	// devServed SELECTS THE PARTITION, it does not filter one. false is the
+	// CHARGED half (a term of InfraTotalMicros); true is the DISPLAY half — the
+	// platform compute a developer's tunnel burned, which is a term of no total.
+	// Both halves price identically because they are one query; see the
+	// AppModuleInfraBillLines header.
+	AppModuleInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time, devServed bool) ([]AppModuleInfraUsage, error)
 
 	// ListBillingPeriods returns an account's real billing_periods rows
 	// newest-first (the closed periods behind the web 週期 selector).
@@ -1969,12 +1974,13 @@ func (s *pgxStore) AppInfraBill(ctx context.Context, accountID, appID uuid.UUID,
 // is decoded half-up through the shared micros decoder (the single per-line rounding
 // point on the live SUM(value × price) × 12/10 branch; a no-op on the already-integer
 // rolled branch); default_unit_price_micros is the raw SENTINEL COGS (pre-markup).
-func (s *pgxStore) AppModuleInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time) ([]AppModuleInfraUsage, error) {
+func (s *pgxStore) AppModuleInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time, devServed bool) ([]AppModuleInfraUsage, error) {
 	rows, err := s.q.AppModuleInfraBillLines(ctx, db.AppModuleInfraBillLinesParams{
 		AccountID:   accountID.String(),
 		AppID:       appID.String(),
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
+		DevServed:   devServed,
 	})
 	if err != nil {
 		return nil, err

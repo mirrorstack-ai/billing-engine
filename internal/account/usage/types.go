@@ -526,6 +526,25 @@ type GetAppBillResponse struct {
 	// no module incurred attributed infra this period.
 	ModuleInfraLines []AppModuleInfraUsage `json:"module_infra_lines"`
 
+	// ModuleInfraDevServedLines is the per-MODULE 基礎設施 a DEV TUNNEL burned:
+	// the same dual-priced read as ModuleInfraLines, other side of the dev_served
+	// partition (migration 073).
+	//
+	// 🔴 PRICED, DISPLAYED, NEVER CHARGED, AND A TERM OF NO TOTAL. It is excluded
+	// from InfraTotalMicros and from TotalMicros, so the reconciliation identity
+	// above is unaffected: InfraTotalMicros is still exactly
+	// Σ ModuleInfraLines[].ChargedMicros + Σ InfraLines[].ChargedMicros. Adding
+	// this slice to either would charge a developer for testing on their laptop.
+	// Its ChargedMicros is "what this compute WOULD have cost" — the same reading
+	// ModuleUsageDevServedMicros carries on the custom-meter plane.
+	//
+	// It exists because leaving the CHARGE is not the same as leaving the BILL.
+	// api-platform stamps DevServed at the tunnel forward path, so this usage
+	// correctly stops being billed — and would otherwise stop being visible in
+	// the same release, leaving recorded platform compute that no surface can
+	// show. Empty slice (never nil) when no tunnel incurred infra this period.
+	ModuleInfraDevServedLines []AppModuleInfraUsage `json:"module_infra_dev_served_lines"`
+
 	// PaasCreditMicros is PaaS 額度 — the infra credit EARNED ONLY through an active
 	// SaaS subscription (PaasCreditPct% of InfraTotalMicros). A NON-NEGATIVE
 	// magnitude SUBTRACTED in TotalMicros. v1 has NO subscription system, so it is

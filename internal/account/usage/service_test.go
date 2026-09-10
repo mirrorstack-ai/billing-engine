@@ -137,6 +137,8 @@ type fakeStore struct {
 	errAppBill            error
 	errAppInfraBill       error
 	errAppModuleInfraBill error
+	// moduleInfraDevServed is what the devServed=true partition returns.
+	moduleInfraDevServed []usage.AppModuleInfraUsage
 	errPeriodList         error
 	errPeriodWindow       error
 	errAnchor             error
@@ -771,7 +773,12 @@ func (f *fakeStore) AppInfraBill(_ context.Context, accountID, appID uuid.UUID, 
 	return f.appInfraBillRows, nil
 }
 
-func (f *fakeStore) AppModuleInfraBill(_ context.Context, accountID, appID uuid.UUID, _, _ time.Time) ([]usage.AppModuleInfraUsage, error) {
+func (f *fakeStore) AppModuleInfraBill(_ context.Context, accountID, appID uuid.UUID, _, _ time.Time, devServed bool) ([]usage.AppModuleInfraUsage, error) {
+	if devServed {
+		// The DISPLAY partition. Kept separate so a test asserting the charged
+		// half can never be satisfied by dev-served rows, and vice versa.
+		return f.moduleInfraDevServed, f.errAppModuleInfraBill
+	}
 	f.appModuleInfraBillCalled = true
 	f.gotAppModuleInfraBillAccountID = accountID
 	f.gotAppModuleInfraBillAppID = appID

@@ -484,11 +484,11 @@ WITH rolled AS (
       AND bp.period_start = $3::timestamptz
       AND (ua.metric LIKE 'infra.%' OR ua.metric LIKE 'platform.%')
       AND ua.module_id <> '00000000-0000-0000-0000-000000000000'
-      -- dev_served EXCLUDED (migration 073), same floor as AppInfraBillLines:
-      -- Σ(this query) + Σ(AppInfraBillLines) IS infra_total_micros, so a stray
-      -- flagged row here would break that reconciliation identity as well as
-      -- charging a tunnel.
-      AND ua.dev_served = false
+      -- dev_served is the PARTITION SELECTOR here, not a filter (see the header).
+      -- @dev_served = false is the CHARGED read: Σ(that read) + Σ(AppInfraBillLines)
+      -- IS infra_total_micros, so a flagged row must never enter it. @dev_served =
+      -- true is the DISPLAY read, which is a term of no total at all.
+      AND ua.dev_served = $4::boolean
     GROUP BY ua.module_id, ua.module_version, ua.metric
 ),
 live AS (
@@ -509,10 +509,10 @@ live AS (
     WHERE e.account_id  = $1::uuid
       AND e.app_id      = $2::uuid
       AND COALESCE(e.billable_at, e.recorded_at) >= $3::timestamptz
-      AND COALESCE(e.billable_at, e.recorded_at) <  $4::timestamptz
+      AND COALESCE(e.billable_at, e.recorded_at) <  $5::timestamptz
       AND (e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%')
       AND e.module_id <> '00000000-0000-0000-0000-000000000000'
-      AND e.dev_served = false -- see the rolled branch above (migration 073)
+      AND e.dev_served = $4::boolean -- see the rolled branch above
     GROUP BY e.module_id, COALESCE(e.module_version, ''), e.metric
 ),
 usage AS (
@@ -544,6 +544,7 @@ type AppModuleInfraBillLinesParams struct {
 	AccountID   string    `json:"account_id"`
 	AppID       string    `json:"app_id"`
 	PeriodStart time.Time `json:"period_start"`
+	DevServed   bool      `json:"dev_served"`
 	PeriodEnd   time.Time `json:"period_end"`
 }
 
@@ -562,7 +563,27 @@ type AppModuleInfraBillLinesRow struct {
 
 // AppModuleInfraBillLines is the per-MODULE 基礎設施 (infrastructure) breakdown for
 // the app-owner bill — decision 19's dual-price, sentinel-fallback read behind
-// GetAppBill's ModuleInfraLines. Unlike the app-level RESIDUAL (AppInfraBillLines,
+// GetAppBill's ModuleInfraLines.
+//
+// 🔴 @dev_served SELECTS A PARTITION; IT IS NOT AN OPTIONAL FILTER. The two calls
+// read disjoint halves of the same ledger and NEITHER may be dropped:
+//   - false → ModuleInfraLines. The CHARGED half. Σ(this) + Σ(AppInfraBillLines)
+//     == infra_total_micros; a dev_served row leaking in charges a tunnel AND
+//     breaks that reconciliation identity.
+//   - true  → ModuleInfraDevServedLines. The DISPLAY half: platform compute that
+//     a developer's tunnel burned. Recorded in full, priced, charged NEVER, and a
+//     term of NO total — exactly the posture ModuleUsageDevServedMicros already
+//     holds on the custom-meter plane (migration 073).
+//
+// ONE parameterized query rather than two, deliberately. The halves must price
+// identically — same dual-price chain, same 12/10 markup, same rolled-else-live
+// gate — or the console reports a tunnel's estimate on a different basis from the
+// bill it sits next to. A copied query can drift on any of those; a parameter
+// cannot. Why the display half exists at all: api-platform sets
+// RecordInfraUsageRequest.DevServed on every tunnel forward path
+// (dev_tunnel.go:1202/1238, dev_tunnel_relay.go:185), so the moment that reaches
+// production this usage stops being charged and, without this read, stops being
+// VISIBLE in the same release — recorded money nobody can see. Unlike the app-level RESIDUAL (AppInfraBillLines,
 // catalog-anchored, sentinel-attributed), this is USAGE-anchored and returns ONE row
 // per (module_id, module_version, metric) for reserved infra.* / platform.* usage
 // ATTRIBUTED to a REAL incurring module (module_id <> the all-zero sentinel) — so only
@@ -597,6 +618,7 @@ func (q *Queries) AppModuleInfraBillLines(ctx context.Context, arg AppModuleInfr
 		arg.AccountID,
 		arg.AppID,
 		arg.PeriodStart,
+		arg.DevServed,
 		arg.PeriodEnd,
 	)
 	if err != nil {
