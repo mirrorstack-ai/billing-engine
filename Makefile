@@ -72,3 +72,16 @@ dev-egress-sync:
 # pending design doc §3 Decision B / §7 Open Question 1b).
 dev-ssr-compute-sync:
 	cd cmd/infra-ssr-compute-sync && go run .
+
+# Run the object-storage sampler once locally (per-module storage metering).
+# Lists the module-storage bucket under "apps/", sums live object bytes per
+# (app_id, module_id) — the prefix api-platform's storagecreds.Prefix mints and
+# its IAM session policy fences — and records the GiB LEVEL at each closed hour
+# instant in the lookback via RecordInfraUsage (idempotent on a deterministic
+# event_id), then exits. The rollup integrates that level into GiB-hours; the
+# binary must never pre-integrate. Requires DATABASE_URL (+ optional DB_AUTH)
+# and MODULE_STORAGE_BUCKET — AWS auth resolves through the ambient SDK
+# credential chain, like the SSR puller and unlike the CF one.
+# Prod runs the same binary on an EventBridge schedule.
+dev-storage-sync:
+	cd cmd/infra-storage-sync && go run .

@@ -48,6 +48,7 @@ jobs:
             billing-cycle:billing-cycle \
             infra-egress-sync:billing-egress-sync \
             infra-ssr-compute-sync:billing-infra-ssr-compute-sync \
+            infra-storage-sync:billing-infra-storage-sync \
             intent-executor:billing-intent-executor \
             intent-shadow:billing-intent-shadow
           do
