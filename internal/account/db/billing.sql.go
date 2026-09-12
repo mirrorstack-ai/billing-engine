@@ -132,7 +132,8 @@ func (q *Queries) InsertUserAccount(ctx context.Context, ownerUserID pgtype.UUID
 }
 
 const listPaymentMethods = `-- name: ListPaymentMethods :many
-SELECT id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default
+SELECT id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default,
+       COALESCE(card_country, '')::text AS card_country
 FROM ms_billing.payment_methods_mirror
 WHERE account_id = $1 AND deleted_at IS NULL
 ORDER BY attached_at DESC
@@ -146,6 +147,7 @@ type ListPaymentMethodsRow struct {
 	ExpMonth              int32  `json:"exp_month"`
 	ExpYear               int32  `json:"exp_year"`
 	IsDefault             bool   `json:"is_default"`
+	CardCountry           string `json:"card_country"`
 }
 
 // ListPaymentMethods returns active payment methods for an account,
@@ -167,6 +169,7 @@ func (q *Queries) ListPaymentMethods(ctx context.Context, accountID string) ([]L
 			&i.ExpMonth,
 			&i.ExpYear,
 			&i.IsDefault,
+			&i.CardCountry,
 		); err != nil {
 			return nil, err
 		}
@@ -312,6 +315,30 @@ func (q *Queries) ServiceBlockSignals(ctx context.Context, id string) (ServiceBl
 	var i ServiceBlockSignalsRow
 	err := row.Scan(&i.UsableCardCount, &i.FailedChargeStreak, &i.FirstChargeStatus)
 	return i, err
+}
+
+const setPaymentMethodCardCountry = `-- name: SetPaymentMethodCardCountry :execrows
+UPDATE ms_billing.payment_methods_mirror
+SET card_country = $2
+WHERE stripe_payment_method_id = $1
+  AND deleted_at IS NULL
+  AND card_country IS NULL
+`
+
+type SetPaymentMethodCardCountryParams struct {
+	StripePaymentMethodID string      `json:"stripe_payment_method_id"`
+	CardCountry           pgtype.Text `json:"card_country"`
+}
+
+// Backfill for mirror rows attached before migration 074: fills the issuing
+// country ONCE (only while NULL) so a later, authoritative webhook value is
+// never overwritten by a lazy read-path fill.
+func (q *Queries) SetPaymentMethodCardCountry(ctx context.Context, arg SetPaymentMethodCardCountryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setPaymentMethodCardCountry, arg.StripePaymentMethodID, arg.CardCountry)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setStripeCustomer = `-- name: SetStripeCustomer :execrows

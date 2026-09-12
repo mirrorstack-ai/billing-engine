@@ -33,6 +33,10 @@ func (stubUsageStore) UpsertMetricVersionPrices(context.Context, []usage.MetricV
 func (stubUsageStore) SyncInfraPriceOverrides(context.Context, uuid.UUID, bool, []usage.InfraPriceOverride) error {
 	return nil
 }
+func (s *stubUsageStore) DefaultCardCountry(context.Context, uuid.UUID) (string, bool, error) {
+	return "", false, nil // no default card on file → tax not configured (migration 074)
+}
+
 func (s *stubUsageStore) InsertUsageEvent(_ context.Context, e usage.UsageEvent) (bool, error) {
 	s.last = &e
 	return true, nil

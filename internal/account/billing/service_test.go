@@ -23,6 +23,7 @@ import (
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
+	cardCountries map[string]string // stripe pm id → country written by SetPaymentMethodCardCountry
 	// org distributor links (migration 053): customer org -> distributor org,
 	// plus each link's provenance.
 	orgDistributors       map[uuid.UUID]uuid.UUID
@@ -478,6 +479,14 @@ func (s *fakeStore) HasUnpaidInvoice(_ context.Context, accountID uuid.UUID) (bo
 	return s.hasUnpaidInvoice[accountID], nil
 }
 
+func (s *fakeStore) SetPaymentMethodCardCountry(_ context.Context, stripePaymentMethodID, country string) error {
+	if s.cardCountries == nil {
+		s.cardCountries = map[string]string{}
+	}
+	s.cardCountries[stripePaymentMethodID] = country
+	return nil
+}
+
 func (s *fakeStore) ListPaymentMethods(_ context.Context, accountID uuid.UUID) ([]billing.PaymentMethod, error) {
 	if s.errListPaymentMethods != nil {
 		return nil, s.errListPaymentMethods
@@ -866,6 +875,8 @@ func (s *fakeStore) putCreditPurchaseRecord(purchase billing.CreditPurchaseRow) 
 // --- in-memory Stripe Client fake ----------------------------------------
 
 type fakeStripe struct {
+	cardCountry              string   // returned by PaymentMethodCardCountry for every pm
+	cardCountryReads         []string // pm ids asked
 	createdCustomers         []string
 	createdCustomerEmails    []string
 	updatedEmails            []string // "customerID=email" per UpdateCustomerEmail call
@@ -962,6 +973,11 @@ func (f *fakeStripe) CreateCheckoutSession(_ context.Context, _, _ string) (*str
 
 func (f *fakeStripe) RetrieveCharge(_ context.Context, _ string) (billingstripe.ChargeCardRef, error) {
 	return billingstripe.ChargeCardRef{}, nil // unused by the billing service
+}
+
+func (f *fakeStripe) PaymentMethodCardCountry(_ context.Context, stripePaymentMethodID string) (string, error) {
+	f.cardCountryReads = append(f.cardCountryReads, stripePaymentMethodID)
+	return f.cardCountry, nil
 }
 
 func (f *fakeStripe) DetachPaymentMethod(_ context.Context, stripePaymentMethodID string) error {

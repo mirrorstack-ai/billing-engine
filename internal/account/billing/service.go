@@ -389,7 +389,44 @@ func (s *Service) GetPaymentMethods(ctx context.Context, req GetPaymentMethodsRe
 	if err != nil {
 		return nil, Internal("list payment methods failed", err)
 	}
+	s.backfillCardCountries(ctx, methods)
 	return &GetPaymentMethodsResponse{PaymentMethods: methods}, nil
+}
+
+// backfillCardCountries fills card_country (migration 074) for mirror rows
+// attached before the column existed: one Stripe read per unfilled row, then
+// the value is durable and the read never asks again. The bill read's
+// tax ESTIMATE keys on the default card's issuing country (core-v2#250), so
+// without this fill every pre-074 account would read as "tax not configured"
+// until its owner re-attached a card.
+//
+// Every failure is logged and swallowed: listing payment methods must never
+// depend on Stripe being reachable, and a missing country is a legitimate,
+// explicit state (not_configured), not an error.
+func (s *Service) backfillCardCountries(ctx context.Context, methods []PaymentMethod) {
+	if s.stripe == nil {
+		return
+	}
+	for i := range methods {
+		if methods[i].CardCountry != "" {
+			continue
+		}
+		country, err := s.stripe.PaymentMethodCardCountry(ctx, methods[i].StripePaymentMethodID)
+		if err != nil {
+			slog.WarnContext(ctx, "card country backfill: stripe read failed",
+				"payment_method_id", methods[i].ID, "error", err)
+			continue
+		}
+		if country == "" {
+			continue
+		}
+		if err := s.store.SetPaymentMethodCardCountry(ctx, methods[i].StripePaymentMethodID, country); err != nil {
+			slog.WarnContext(ctx, "card country backfill: store write failed",
+				"payment_method_id", methods[i].ID, "error", err)
+			continue
+		}
+		methods[i].CardCountry = country
+	}
 }
 
 // GetServiceStatus is the read behind the platform's service-block gate: it

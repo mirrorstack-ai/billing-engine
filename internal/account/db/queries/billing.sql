@@ -78,10 +78,21 @@ SELECT EXISTS (
 -- ListPaymentMethods returns active payment methods for an account,
 -- newest-first.
 -- name: ListPaymentMethods :many
-SELECT id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default
+SELECT id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default,
+       COALESCE(card_country, '')::text AS card_country
 FROM ms_billing.payment_methods_mirror
 WHERE account_id = $1 AND deleted_at IS NULL
 ORDER BY attached_at DESC;
+
+-- name: SetPaymentMethodCardCountry :execrows
+-- Backfill for mirror rows attached before migration 074: fills the issuing
+-- country ONCE (only while NULL) so a later, authoritative webhook value is
+-- never overwritten by a lazy read-path fill.
+UPDATE ms_billing.payment_methods_mirror
+SET card_country = $2
+WHERE stripe_payment_method_id = $1
+  AND deleted_at IS NULL
+  AND card_country IS NULL;
 
 -- AccountHasUnpaidInvoice is the delinquency predicate for Ensure: true when the
 -- account has at least one invoice in an unpaid, collection-relevant state.

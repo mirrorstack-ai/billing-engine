@@ -29,6 +29,7 @@ func TestEveryMethodIsClassified(t *testing.T) {
 	}{
 		// Reads.
 		{"GetCustomer", EffectRead, func(r *Recorder) { r.GetCustomer(ctx, "cus_1") }},
+		{"PaymentMethodCardCountry", EffectRead, func(r *Recorder) { r.PaymentMethodCardCountry(ctx, "pm_1") }},
 		{"GetInvoice", EffectRead, func(r *Recorder) { r.GetInvoice(ctx, "in_1") }},
 		{"FindInvoiceByRef", EffectRead, func(r *Recorder) { r.FindInvoiceByRef(ctx, "cus_1", "run:1") }},
 		{"ListInvoiceItems", EffectRead, func(r *Recorder) { r.ListInvoiceItems(ctx, "in_1") }},

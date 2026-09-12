@@ -104,6 +104,11 @@ type Store interface {
 	// (user or org), or (Nil, false) when none exists yet. Read-only;
 	// missing-account is a normal lazy-state outcome, not an error.
 	AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, bool, error)
+	// DefaultCardCountry is the payer's tax-jurisdiction signal for the bill
+	// read's ESTIMATED tax line (migration 074): the default active card's
+	// issuing country. found=false when there is no default card or its
+	// country was never recorded — the caller reports not_configured.
+	DefaultCardCountry(ctx context.Context, accountID uuid.UUID) (country string, found bool, err error)
 
 	// AppOwnerOrg returns the roster row's owning org for the unresolved-org
 	// ingest guard. found=false means no billing roster row exists; a present
@@ -2396,4 +2401,16 @@ func roundRatHalfUp(r *big.Rat) (int64, error) {
 		return 0, fmt.Errorf("money value %s overflows int64 micros", q.String())
 	}
 	return q.Int64(), nil
+}
+
+// DefaultCardCountry implements Store (migration 074).
+func (s *pgxStore) DefaultCardCountry(ctx context.Context, accountID uuid.UUID) (string, bool, error) {
+	country, err := s.q.DefaultPaymentMethodCardCountry(ctx, accountID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return country, country != "", nil
 }

@@ -249,6 +249,10 @@ func (f *fakeStripe) UpdateCustomerEmail(context.Context, string, string) error 
 func (f *fakeStripe) CreateCheckoutSession(context.Context, string, string) (*stripego.CheckoutSession, error) {
 	panic("CreateCheckoutSession must not be called by the charge cycle")
 }
+func (f *fakeStripe) PaymentMethodCardCountry(context.Context, string) (string, error) {
+	return "", nil
+}
+
 func (f *fakeStripe) DetachPaymentMethod(context.Context, string) error {
 	panic("DetachPaymentMethod must not be called by the charge cycle")
 }

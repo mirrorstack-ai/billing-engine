@@ -196,6 +196,9 @@ type InsertPaymentMethodParams struct {
 	ExpMonth              int
 	ExpYear               int
 	Fingerprint           string
+	// CardCountry is the card's issuing country (ISO 3166-1 alpha-2, "" for a
+	// non-card method) — the tax-estimate jurisdiction signal (migration 074).
+	CardCountry string
 }
 
 // Router is the entry point exposed to cmd/account-webhook. It owns

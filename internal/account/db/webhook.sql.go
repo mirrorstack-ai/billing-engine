@@ -213,7 +213,7 @@ WITH acct AS MATERIALIZED (
     WHERE account.stripe_customer_id = $1
 ), inserted AS (
     INSERT INTO ms_billing.payment_methods_mirror
-        (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default, fingerprint)
+        (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year, is_default, fingerprint, card_country)
     SELECT acct.id, $2, $3, $4, $5, $6,
         -- ADVISORY first-card default (see header). Authoritative default is
         -- set by customer.updated → SetDefaultPaymentMethodByCustomer.
@@ -221,7 +221,10 @@ WITH acct AS MATERIALIZED (
             SELECT 1 FROM ms_billing.payment_methods_mirror p
             WHERE p.account_id = acct.id AND p.deleted_at IS NULL
         ),
-        NULLIF($7, '')
+        NULLIF($7, ''),
+        -- Issuing country (migration 074) — the tax-estimate jurisdiction
+        -- signal; '' (non-card / unknown) becomes NULL = not configured.
+        NULLIF($8, '')
     FROM acct
     WHERE acct.billing_active
       AND NOT EXISTS (
@@ -260,6 +263,7 @@ type InsertPaymentMethodParams struct {
 	ExpMonth              int32       `json:"exp_month"`
 	ExpYear               int32       `json:"exp_year"`
 	Column7               interface{} `json:"column_7"`
+	Column8               interface{} `json:"column_8"`
 }
 
 type InsertPaymentMethodRow struct {
@@ -295,6 +299,7 @@ func (q *Queries) InsertPaymentMethod(ctx context.Context, arg InsertPaymentMeth
 		arg.ExpMonth,
 		arg.ExpYear,
 		arg.Column7,
+		arg.Column8,
 	)
 	var i InsertPaymentMethodRow
 	err := row.Scan(&i.AccountFound, &i.Retired, &i.BecameDefault)

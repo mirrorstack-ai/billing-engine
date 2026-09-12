@@ -1412,3 +1412,69 @@ func TestGetAccountBill_InternalOnEnumerationErrors(t *testing.T) {
 		})
 	}
 }
+
+// --- tax estimate (core-v2#250) ------------------------------------------------------
+
+func TestGetAccountBill_TaxEstimateForATWCardIsFivePercentOfTheNetProjection(t *testing.T) {
+	store := newFakeStore()
+	owner, acct := uuid.New(), uuid.New()
+	store.accounts[owner] = acct
+	store.cardCountries = map[uuid.UUID]string{acct: "TW"}
+	pid := mirrorPeriod(store)
+	app := seqUUID(1)
+	store.appMirrors[app] = usage.AppMirrorInfo{ModuleCount: 0, CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.NotZero(t, resp.ProjectedTotalMicros, "fixture must carry a non-zero net projection")
+	require.Equal(t, usage.TaxStatusEstimated, resp.Tax.Status)
+	require.Equal(t, "TW", resp.Tax.Jurisdiction)
+	require.EqualValues(t, 500, resp.Tax.RateBps)
+	require.NotEmpty(t, resp.Tax.RuleRevision)
+	require.Equal(t, resp.ProjectedTotalMicros, resp.Tax.TaxableMicros, "the estimate keys on the NET projection")
+	// One live app at the flat $20 base → $1.00 of 營業稅.
+	require.EqualValues(t, usage.BaseFeeMicros, resp.ProjectedTotalMicros)
+	require.EqualValues(t, 1_000_000, resp.Tax.TaxMicros)
+}
+
+func TestGetAccountBill_TaxIsNotConfiguredWithoutAJurisdictionNeverASilentZero(t *testing.T) {
+	store := newFakeStore()
+	owner, acct := uuid.New(), uuid.New()
+	store.accounts[owner] = acct // no cardCountries entry → jurisdiction unknown
+	pid := mirrorPeriod(store)
+	app := seqUUID(1)
+	store.appMirrors[app] = usage.AppMirrorInfo{ModuleCount: 0, CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, usage.TaxStatusNotConfigured, resp.Tax.Status)
+	require.Empty(t, resp.Tax.Jurisdiction)
+	require.Zero(t, resp.Tax.RateBps)
+	require.Zero(t, resp.Tax.TaxMicros)
+	// The basis is still reported so the UI can print 小計（未稅） either way.
+	require.Equal(t, resp.ProjectedTotalMicros, resp.Tax.TaxableMicros)
+	require.NotZero(t, resp.Tax.TaxableMicros)
+}
+
+func TestGetAccountBill_TaxIsNotConfiguredForAJurisdictionWithoutARule(t *testing.T) {
+	store := newFakeStore()
+	owner, acct := uuid.New(), uuid.New()
+	store.accounts[owner] = acct
+	store.cardCountries = map[uuid.UUID]string{acct: "US"} // Stripe Tax not wired yet
+	pid := mirrorPeriod(store)
+	store.appMirrors[seqUUID(1)] = usage.AppMirrorInfo{ModuleCount: 0, CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
+		OwnerUserID: owner, PeriodID: pid.String(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, usage.TaxStatusNotConfigured, resp.Tax.Status)
+	require.Equal(t, "US", resp.Tax.Jurisdiction, "the jurisdiction is reported even when no rule applies")
+	require.Zero(t, resp.Tax.TaxMicros)
+}

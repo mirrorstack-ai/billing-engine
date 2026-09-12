@@ -170,6 +170,13 @@ func (r *Recorder) GetCustomer(_ context.Context, id string) (*stripego.Customer
 	return stub[*stripego.Customer](r, "GetCustomer"), nil
 }
 
+func (r *Recorder) PaymentMethodCardCountry(_ context.Context, pmID string) (string, error) {
+	if err := r.record("PaymentMethodCardCountry", EffectRead, pmID, "", 0); err != nil {
+		return "", err
+	}
+	return stub[string](r, "PaymentMethodCardCountry"), nil
+}
+
 func (r *Recorder) GetInvoice(_ context.Context, id string) (billingstripe.Invoice, error) {
 	if err := r.record("GetInvoice", EffectRead, id, "", 0); err != nil {
 		return billingstripe.Invoice{}, err
