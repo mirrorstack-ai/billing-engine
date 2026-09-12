@@ -380,6 +380,9 @@ type AppRecurringFeeShare struct {
 	Activated         bool
 	OverModuleCount   int
 	CustomDomainCount int
+	// Plan is the app's billing plan (migration 075); an activated app's
+	// projected base is its plan's base fee.
+	Plan Plan
 }
 
 // RecurringFeeCounts is the activation-gated CURRENT forecast input. Counts
@@ -500,6 +503,8 @@ type AppMirrorInfo struct {
 	Name        string // frozen display name (migration 037); "" when NULL
 	Deleted     bool
 	DeletedAt   time.Time
+	// Plan is the app's billing plan (migration 075).
+	Plan Plan
 }
 
 // MetricDefinition is the catalog projection the ingest path resolves
@@ -1355,6 +1360,7 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInf
 		Name:        row.Name.String, // "" when NULL (pre-037 / unnamed)
 		Deleted:     row.DeletedAt.Valid,
 		DeletedAt:   row.DeletedAt.Time,
+		Plan:        Plan(row.Plan),
 	}, true, nil
 }
 
@@ -1684,6 +1690,7 @@ func (s *pgxStore) ActivatedRecurringFeeShares(ctx context.Context, accountID uu
 			Activated:         row.Activated,
 			OverModuleCount:   int(row.OverModuleCount),
 			CustomDomainCount: int(row.CustomDomainCount),
+			Plan:              Plan(row.Plan),
 		})
 	}
 	return shares, nil

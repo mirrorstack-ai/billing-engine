@@ -373,6 +373,7 @@ type MsBillingApp struct {
 	// App display name, frozen from RegisterApp's payload and updated by SyncAppModules while the app is live (gated on deleted_at IS NULL); NEVER cleared on delete — this is what lets a deleted app's historical bill still show its name. NULL for pre-037 rows / callers that omit it.
 	Name       pgtype.Text `json:"name"`
 	OwnerOrgID pgtype.UUID `json:"owner_org_id"`
+	Plan       string      `json:"plan"`
 }
 
 type MsBillingAppBaseSnapshot struct {

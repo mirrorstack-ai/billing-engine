@@ -30,7 +30,7 @@ ON CONFLICT (app_id) DO NOTHING;
 -- GetAppBill still displays the spent creation-period base).
 -- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
 FROM ms_billing.apps
 WHERE app_id = $1;
 
@@ -44,7 +44,7 @@ WHERE app_id = $1;
 -- read, never for the duration of a Stripe HTTP call.
 -- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE;
@@ -362,3 +362,13 @@ WHERE account_id = @account_id::uuid
   AND deleted_at IS NULL
   AND created_at > @grace_cutoff::timestamptz
 ORDER BY created_at;
+
+-- SetAppPlan moves a LIVE app onto a billing plan (core-v2#1412, migration 075).
+-- A deleted row is frozen like SetAppModuleCount's (no future base, so no plan to
+-- move), which is why the caller reads rows affected: 0 means deleted or never
+-- registered, never a silent success.
+-- name: SetAppPlan :execrows
+UPDATE ms_billing.apps
+SET plan = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL;

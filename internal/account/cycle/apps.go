@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
 
 // maxModuleCount bounds the installed-module count BOTH mirror RPCs accept.
@@ -350,4 +351,75 @@ func (s *Service) fundedOwnerAccount(ctx context.Context, ownerUserID, ownerOrgI
 		return uuid.Nil, billing.PaymentRequired("no usable payment card on file: add a card before creating an app")
 	}
 	return accountID, nil
+}
+
+// GetAppPlanRequest is the payload of GetAppPlan.
+type GetAppPlanRequest struct {
+	AppID uuid.UUID `json:"app_id"`
+}
+
+// AppPlanResponse is GetAppPlan's and SetAppPlan's answer: the app's plan and
+// what it includes, so api-platform enforces its gates from the one copy of the
+// terms (usage/plans.go) instead of keeping its own.
+type AppPlanResponse struct {
+	AppID uuid.UUID       `json:"app_id"`
+	Terms usage.PlanTerms `json:"terms"`
+}
+
+// GetAppPlan reads an app's plan (core-v2#1412). An app the roster has not
+// mirrored yet (RegisterApp is fire-and-forget) reads as usage.DefaultPlan, the
+// plan migration 075 gives every row.
+func (s *Service) GetAppPlan(ctx context.Context, req GetAppPlanRequest) (*AppPlanResponse, error) {
+	if req.AppID == uuid.Nil {
+		return nil, billing.InvalidInput("app_id required")
+	}
+	app, found, err := s.store.AppMirror(ctx, req.AppID)
+	if err != nil {
+		return nil, billing.Internal("app mirror lookup failed", err)
+	}
+	plan := usage.DefaultPlan
+	if found && app.Plan != "" {
+		plan = app.Plan
+	}
+	return &AppPlanResponse{AppID: req.AppID, Terms: usage.TermsFor(plan)}, nil
+}
+
+// SetAppPlanRequest is the payload of SetAppPlan.
+type SetAppPlanRequest struct {
+	AppID uuid.UUID `json:"app_id"`
+	Plan  string    `json:"plan"`
+}
+
+// SetAppPlan moves a live app onto a plan (core-v2#1412). api-platform calls it
+// from its change-plan endpoint, after owner/admin authorization and step-up.
+//
+// 🔴 ONLY `pro` IS ACCEPTED, AND THE REFUSAL IS DELIBERATE — do not "fix" it
+// from the caller's side. The charge legs still bill every app the flat
+// usage.BaseFeeMicros (nine sites across cycle/charge.go and cycle/proration.go)
+// while both bill reads already price each app from its plan. Accepting `free`
+// or `business` here would show a Free app $0 and a Business app $50 while the
+// invoice charged each $20 — a bill that lies. billing-engine#202's charge-leg
+// change (PR-2, owner-reviewed) makes those legs plan-aware and removes this
+// refusal in the same change, together with Free's personal-only and
+// card-on-file rules.
+func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPlanResponse, error) {
+	if req.AppID == uuid.Nil {
+		return nil, billing.InvalidInput("app_id required")
+	}
+	plan, ok := usage.ParsePlan(req.Plan)
+	if !ok {
+		return nil, billing.InvalidInput("plan must be one of free, pro, business")
+	}
+	if plan != usage.PlanPro {
+		return nil, billing.PlanNotAvailable("plan " + string(plan) +
+			" is not available yet: the charge legs do not bill it (billing-engine#202)")
+	}
+	moved, err := s.store.SetAppPlan(ctx, req.AppID, plan)
+	if err != nil {
+		return nil, billing.Internal("set app plan failed", err)
+	}
+	if !moved {
+		return nil, billing.NotFound("app not registered or deleted")
+	}
+	return &AppPlanResponse{AppID: req.AppID, Terms: usage.TermsFor(plan)}, nil
 }

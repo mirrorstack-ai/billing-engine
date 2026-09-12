@@ -503,6 +503,10 @@ type Store interface {
 	// D1e: no future base, so no tier to move).
 	SetAppModuleCount(ctx context.Context, appID uuid.UUID, moduleCount int) error
 
+	// SetAppPlan moves a LIVE app onto a plan (migration 075) and reports whether
+	// a row moved: false = deleted or never registered.
+	SetAppPlan(ctx context.Context, appID uuid.UUID, plan usage.Plan) (bool, error)
+
 	// MarkAppDeleted soft-deletes the roster row out of future advance base
 	// fees. Idempotent — the first deletion instant is kept.
 	MarkAppDeleted(ctx context.Context, appID uuid.UUID) error
@@ -822,6 +826,8 @@ type AppMirror struct {
 	ModuleCount        int
 	CreatedModuleCount int
 	CreatedAt          time.Time
+	// Plan is the app's billing plan (migration 075).
+	Plan usage.Plan
 	// Name: the frozen app display name (migration 037) — "" when NULL. Written
 	// by RegisterApp / SyncAppModules (freeze-on-delete) so a deleted app's bill
 	// still shows its last-known name.
@@ -2148,6 +2154,7 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 		ModuleCount:        int(row.ModuleCount),
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
+		Plan:               usage.Plan(row.Plan),
 		Name:               row.Name.String,               // "" when NULL (pre-037 / unnamed)
 		ProrationInvoiceID: row.ProrationInvoiceID.String, // "" when NULL (guard unarmed)
 		ProrationSkipped:   row.ProrationSkippedAt.Valid,
@@ -2231,6 +2238,7 @@ func (s *pgxStore) lockAndReadChargeableApp(ctx context.Context, appID uuid.UUID
 		ModuleCount:        int(row.ModuleCount),
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
+		Plan:               usage.Plan(row.Plan),
 		Name:               row.Name.String,
 		ProrationAttempted: row.ProrationAttemptedAt.Valid,
 	}
@@ -2734,6 +2742,14 @@ func (s *pgxStore) SetAppProrationSkipped(ctx context.Context, appID uuid.UUID) 
 	// an error: the marker is a one-shot, first-write-wins terminal state.
 	_, err := s.q.SetAppProrationSkipped(ctx, appID.String())
 	return err
+}
+
+func (s *pgxStore) SetAppPlan(ctx context.Context, appID uuid.UUID, plan usage.Plan) (bool, error) {
+	n, err := s.q.SetAppPlan(ctx, db.SetAppPlanParams{AppID: appID.String(), Plan: string(plan)})
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 func (s *pgxStore) SetAppModuleCount(ctx context.Context, appID uuid.UUID, moduleCount int) error {

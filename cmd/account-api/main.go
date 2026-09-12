@@ -372,6 +372,20 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.SyncAppModules(ctx, req)
 
+	case "GetAppPlan":
+		var req cycle.GetAppPlanRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.GetAppPlan(ctx, req)
+
+	case "SetAppPlan":
+		var req cycle.SetAppPlanRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.SetAppPlan(ctx, req)
+
 	case "RegisterDomain":
 		var req cycle.RegisterDomainRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -484,6 +498,8 @@ func httpStatusForError(err error) int {
 			return http.StatusConflict
 		case billing.CodePaymentRequired:
 			return http.StatusPaymentRequired
+		case billing.CodePlanNotAvailable:
+			return http.StatusConflict
 		case billing.CodeNotFound:
 			return http.StatusNotFound
 		case billing.CodeStripeError:
@@ -777,6 +793,11 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// Control-plane calls from api-platform → the internal secret + this
 		// route group, same as the other billing writes.
 		r.Post("/v1/billing.RegisterApp", makeHTTPHandler(d, "RegisterApp"))
+		// Per-app plan (core-v2#1412): api-platform reads an app's plan and terms
+		// for its gates, and moves an app between plans from its change-plan
+		// endpoint. Same group, same wrapper, same envelope as the mirror RPCs.
+		r.Post("/v1/billing.GetAppPlan", makeHTTPHandler(d, "GetAppPlan"))
+		r.Post("/v1/billing.SetAppPlan", makeHTTPHandler(d, "SetAppPlan"))
 		// TransferApp moves an app's billing account to another owner. Same
 		// group, same wrapper, therefore the SAME auth and the same
 		// {ok, response|error} envelope as RegisterApp — api-platform's client

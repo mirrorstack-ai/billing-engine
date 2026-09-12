@@ -274,7 +274,7 @@ func TestGetAccountBill_AgentModelsDecomposeModelCarryingLines(t *testing.T) {
 	require.EqualValues(t, 2500, resp.Agent.TotalMicros)
 
 	require.Equal(t, []usage.AccountAppBill{{
-		AppID:         app,
+		AppID: app, Plan: usage.PlanPro,
 		BaseFeeMicros: usage.BaseFeeMicros,
 		// The live app owns the whole next-period recurring base here: it is
 		// activated, and the account carries no overage or domain surcharges.

@@ -419,7 +419,7 @@ func (q *Queries) SelectAppBaseSnapshot(ctx context.Context, arg SelectAppBaseSn
 
 const selectAppMirror = `-- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
 FROM ms_billing.apps
 WHERE app_id = $1
 `
@@ -435,6 +435,7 @@ type SelectAppMirrorRow struct {
 	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+	Plan                 string             `json:"plan"`
 }
 
 // SelectAppMirror reads one roster row (deleted or not — the caller decides
@@ -454,13 +455,14 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 		&i.ProrationSkippedAt,
 		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
+		&i.Plan,
 	)
 	return i, err
 }
 
 const selectAppMirrorForUpdate = `-- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE
@@ -477,6 +479,7 @@ type SelectAppMirrorForUpdateRow struct {
 	ProrationSkippedAt   pgtype.Timestamptz `json:"proration_skipped_at"`
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+	Plan                 string             `json:"plan"`
 }
 
 // SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
@@ -501,6 +504,7 @@ func (q *Queries) SelectAppMirrorForUpdate(ctx context.Context, appID string) (S
 		&i.ProrationSkippedAt,
 		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
+		&i.Plan,
 	)
 	return i, err
 }
@@ -548,6 +552,30 @@ type SetAppNameParams struct {
 // a documented no-op (0 rows), keeping the last-known name for the bill.
 func (q *Queries) SetAppName(ctx context.Context, arg SetAppNameParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setAppName, arg.AppID, arg.Name)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setAppPlan = `-- name: SetAppPlan :execrows
+UPDATE ms_billing.apps
+SET plan = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL
+`
+
+type SetAppPlanParams struct {
+	AppID string `json:"app_id"`
+	Plan  string `json:"plan"`
+}
+
+// SetAppPlan moves a LIVE app onto a billing plan (core-v2#1412, migration 075).
+// A deleted row is frozen like SetAppModuleCount's (no future base, so no plan to
+// move), which is why the caller reads rows affected: 0 means deleted or never
+// registered, never a silent success.
+func (q *Queries) SetAppPlan(ctx context.Context, arg SetAppPlanParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setAppPlan, arg.AppID, arg.Plan)
 	if err != nil {
 		return 0, err
 	}

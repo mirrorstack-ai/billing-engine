@@ -23,27 +23,20 @@ import (
 // this ships. The billed STRUCTURE + the mechanism (tiering, infra split, credit
 // offset) is the deliverable, NOT these specific numbers. Keep them in ONE place.
 //
-// They are also PLAN-AWARE: a Pro org plan may change the base fee (see
-// resolveBaseFeeMicros). The PaaS credit is gated separately on an ACTIVE SaaS
-// subscription (see paasCreditMicros) — not on the plan, and never default-on.
-// There is deliberately NO full plan/subscription system here (design: do not
-// build one) — just the const seam + a TODO. All money is integer micro-dollars
-// (1e-6 USD); NEVER float for money.
+// They are also PLAN-AWARE: every app is priced from its own plan (plans.go,
+// core-v2#1412), and resolveBaseFeeMicros reads the base fee from it. The PaaS
+// credit is gated separately on an ACTIVE SaaS subscription (see
+// paasCreditMicros) — not on the plan, and never default-on. All money is
+// integer micro-dollars (1e-6 USD); NEVER float for money.
 // ============================================================================
 
 const (
 	// BaseFeeMicros is 基本費用 — the fixed per-app/period platform base fee on the
-	// DEFAULT plan. It BUNDLES the PaaS infra credit (surfaced as PaasCreditMicros).
+	// Pro plan (DefaultPlan, plans.go). It BUNDLES the PaaS infra credit (surfaced as PaasCreditMicros).
 	// It is FLAT per app: the IncludedModules allowance + the ModuleOverageFeeMicros
 	// surcharge are ACCOUNT-WIDE POOLED (migration 032 — see AccountOverageMicros),
 	// NOT folded into this per-app fee. Tunable. Default $20.
 	BaseFeeMicros int64 = 20_000_000 // $20.00
-
-	// ProBaseFeeMicros is the base fee on the Pro org plan. TODO(plan): wire a real
-	// plan resolver (ms_account.orgs / a subscription row) into resolveBaseFeeMicros;
-	// v1 has no plan system so this const is the seam, not yet reached. Placeholder
-	// value — tune with the real Pro plan.
-	ProBaseFeeMicros int64 = 50_000_000 // $50.00 (placeholder)
 
 	// IncludedModules is the ACCOUNT-WIDE POOL of installed modules the base fee
 	// bundles before the per-module surcharge kicks in (migration 032 — ONE pool
@@ -118,29 +111,10 @@ const (
 	GraceDays = 3
 )
 
-// Plan is the account/org billing plan. v1 has NO real plan system — this is the
-// plan-aware SEAM the bill's base fee + PaaS credit hang off. TODO(plan): resolve
-// the real plan (ms_account.orgs / a subscription row) instead of always using
-// planDefault.
-type Plan string
-
-const (
-	// PlanDefault is the only plan v1 resolves. resolveBaseFeeMicros returns
-	// BaseFeeMicros for it.
-	PlanDefault Plan = "default"
-	// PlanPro is the Pro org plan hook: resolveBaseFeeMicros returns ProBaseFeeMicros
-	// for it. Not reached until a real plan resolver exists.
-	PlanPro Plan = "pro"
-)
-
-// resolveBaseFeeMicros returns the plan-aware base fee (before the per-module
-// surcharge). TODO(plan): a Pro plan returns ProBaseFeeMicros; with no plan
-// system yet every account is on PlanDefault → BaseFeeMicros.
+// resolveBaseFeeMicros returns an app's recurring base fee (before the
+// per-module surcharge) from its plan's terms (plans.go).
 func resolveBaseFeeMicros(plan Plan) int64 {
-	if plan == PlanPro {
-		return ProBaseFeeMicros
-	}
-	return BaseFeeMicros
+	return TermsFor(plan).BaseFeeMicros
 }
 
 // paasCreditMicros returns the PaaS infra credit that offsets the InfraTotal:
@@ -229,16 +203,12 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		return nil, billing.Internal("account lookup failed", err)
 	}
 
-	// TODO(plan): resolve the real account/org plan. v1 has no plan system, so the
-	// base fee is the default-plan fee and the PaaS credit applies by default.
-	plan := PlanDefault
-
 	periodID, periodStart, periodEnd, err := s.resolveBillPeriod(ctx, accountID, found, req.PeriodID)
 	if err != nil {
 		return nil, err
 	}
 
-	parts, err := s.computeAppBill(ctx, accountID, found, plan, req.AppID, periodStart, periodEnd)
+	parts, err := s.computeAppBill(ctx, accountID, found, req.AppID, periodStart, periodEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -289,6 +259,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		PeriodEnd:              periodEnd,
 		BaseFeeMicros:          baseFee,
 		InstalledModuleCount:   parts.InstalledModuleCount,
+		Plan:                   TermsFor(parts.Plan),
 		ModuleOverageMicros:    moduleOverage,
 		ModuleUsage:            parts.ModuleUsage,
 		ModuleUsageTotalMicros: parts.ModuleUsageTotalMicros,
@@ -354,6 +325,8 @@ type appBillParts struct {
 	// InstalledModuleCount is the billing mirror's authoritative live snapshot.
 	// It includes installed-but-idle modules, unlike the usage-ledger lines.
 	InstalledModuleCount int
+	// Plan is the app's billing plan: the mirror's, else DefaultPlan.
+	Plan Plan
 	// ModuleUsage are the non-reserved 模組使用量 lines, dev_served ones
 	// included and flagged; ModuleUsageTotalMicros is the NON-dev total (the
 	// one that enters the bill) and ModuleUsageDevServedMicros is the priced
@@ -444,7 +417,7 @@ func clampModelChargesToTotal(lines []AgentModelUsage, limit int64) []AgentModel
 // usage-proxy fallbacks). found=false (no billing account yet) yields the
 // base-fee-only bill: no usage/module-infra reads, but the catalog-anchored
 // infra residual still renders every declared metric at $0.
-func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found bool, plan Plan, appID uuid.UUID, periodStart, periodEnd time.Time) (*appBillParts, error) {
+func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found bool, appID uuid.UUID, periodStart, periodEnd time.Time) (*appBillParts, error) {
 	// Read the usage lines (empty when no billing account exists yet — the bill is
 	// then base-fee-only).
 	var lines []AppMetricUsageRaw
@@ -611,6 +584,12 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	if err != nil {
 		return nil, billing.Internal("app mirror lookup failed", err)
 	}
+	// The app's own plan prices its base (core-v2#1412). An app the roster has
+	// not mirrored yet is on DefaultPlan, the plan migration 075 gives every row.
+	plan := DefaultPlan
+	if mirrored && mirror.Plan != "" {
+		plan = mirror.Plan
+	}
 	var baseFee int64
 	snap, snapped, err := s.store.AppBaseSnapshot(ctx, appID, periodStart)
 	if err != nil {
@@ -666,6 +645,7 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		ModuleInfraDevServedLines:  moduleInfraDevServed,
 		ModelLines:                 modelLines,
 		Name:                       mirror.Name, // "" when not mirrored / pre-037
+		Plan:                       plan,
 		IsDeleted:                  mirrored && mirror.Deleted,
 	}, nil
 }

@@ -454,7 +454,7 @@ func (f *fakeStore) ActivatedRecurringFeeShares(_ context.Context, _ uuid.UUID, 
 
 	shares := make([]usage.AppRecurringFeeShare, 0, len(liveIDs))
 	for i, appID := range liveIDs {
-		share := usage.AppRecurringFeeShare{AppID: appID, Activated: i < counts.Apps}
+		share := usage.AppRecurringFeeShare{AppID: appID, Activated: i < counts.Apps, Plan: f.appMirrors[appID].Plan}
 		// Surcharges concentrate on the first live app — the account totals are
 		// what these tests assert, and the allocator's own spreading behaviour is
 		// covered directly in projected_base_alloc_test.go.

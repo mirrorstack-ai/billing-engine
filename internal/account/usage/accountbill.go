@@ -31,9 +31,8 @@ import (
 // favor of proxying this once the /bill route lands (DESIGN.md D3). There is
 // deliberately NO subscriptions table / plan CRUD in this wave; when paid
 // plans land, these swap to a real subscription read behind the same wire
-// shape (AccountPlan). Distinct from the Plan/PlanDefault BASE-FEE seam in
-// bill.go: that resolves what an app's base fee is, this is what the plan
-// card displays.
+// shape (AccountPlan). Distinct from the per-app Plan in plans.go: that
+// resolves what an app's base fee is, this is what the plan card displays.
 const (
 	// PlanStubName is the human label of the only tier v1 has.
 	PlanStubName = "Hobby"
@@ -113,10 +112,6 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		return nil, billing.Internal("account lookup failed", err)
 	}
 
-	// TODO(plan): resolve the real account/org plan (shared with GetAppBill's
-	// base-fee seam). v1 has no plan system → PlanDefault.
-	plan := PlanDefault
-
 	periodID, periodStart, periodEnd, err := s.resolveBillPeriod(ctx, accountID, found, periodRef)
 	if err != nil {
 		return nil, err
@@ -164,7 +159,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			return nil, billing.Internal("activated recurring fee shares failed", err)
 		}
 	}
-	projectedBaseByApp := projectedBaseFeeByApp(recurringShares, resolveBaseFeeMicros(plan))
+	projectedBaseByApp := projectedBaseFeeByApp(recurringShares)
 
 	usageApps, err := s.store.AppIDsWithUsage(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
@@ -195,7 +190,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	apps := make([]AccountAppBill, 0, len(appIDs))
 	var baseFeeTotal, moduleUsageTotal, infraTotal int64
 	for _, appID := range appIDs {
-		parts, err := s.computeAppBill(ctx, accountID, found, plan, appID, periodStart, periodEnd)
+		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd)
 		if err != nil {
 			return nil, err
 		}
@@ -215,6 +210,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			AppID:             appID,
 			Name:              parts.Name,
 			IsDeleted:         parts.IsDeleted,
+			Plan:              parts.Plan,
 			BaseFeeMicros:     parts.BaseFeeMicros,
 			ModuleUsageMicros: parts.ModuleUsageTotalMicros,
 			InfraMicros:       parts.InfraTotalMicros,
@@ -234,7 +230,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	// as an app, but its resolved app base fee is DISCARDED — agent activity is
 	// not an app and never incurs a base fee. Runs unconditionally like the app
 	// loop above: a lazy (!found) owner already returned a zero-Agent bill.
-	agentParts, err := s.computeAppBill(ctx, accountID, found, plan, uuid.Nil, periodStart, periodEnd)
+	agentParts, err := s.computeAppBill(ctx, accountID, found, uuid.Nil, periodStart, periodEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -292,13 +288,12 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + customDomains + agent.TotalMicros - paasCredit,
 	}
 
-	var liveAppCount int64
+	var projectedBaseFeeTotal int64
 	for _, app := range response.Apps {
 		if !app.IsDeleted {
-			liveAppCount++
+			projectedBaseFeeTotal += resolveBaseFeeMicros(app.Plan)
 		}
 	}
-	projectedBaseFeeTotal := liveAppCount * resolveBaseFeeMicros(plan)
 	projectedRecurringSurcharges := accountOverage + customDomains
 	if periodID == "" {
 		// Modules are a RECURRING leg → whole blocks, matching the boundary
@@ -309,7 +304,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// built from, so this total and Σ Apps[].ProjectedBaseFeeMicros are one
 		// row set added up two ways — they cannot drift into disagreement.
 		counts := RecurringFeeCountsOf(recurringShares)
-		projectedBaseFeeTotal = int64(counts.Apps)*resolveBaseFeeMicros(plan) +
+		projectedBaseFeeTotal = activatedBaseMicros(recurringShares) +
 			ModuleBlockMicros(int64(counts.ModuleOverages)) +
 			int64(counts.CustomDomains)*DomainFeeMicros
 		// The current-period base line is the complete activation-gated recurring
@@ -321,7 +316,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// every live app carries exactly the plan base and nothing else.
 		for i := range response.Apps {
 			if !response.Apps[i].IsDeleted {
-				response.Apps[i].ProjectedBaseFeeMicros = resolveBaseFeeMicros(plan)
+				response.Apps[i].ProjectedBaseFeeMicros = resolveBaseFeeMicros(response.Apps[i].Plan)
 			}
 		}
 	}
