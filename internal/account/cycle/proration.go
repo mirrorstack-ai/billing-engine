@@ -771,12 +771,14 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 // together with the exact timer IDs; every retry then consumes the persisted
 // winner rather than re-running this math or reading a mutable app name.
 func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (CombinedProrationChargeShape, error) {
+	// The app's own plan base (migration 075, core-v2#1412) prices its creation charge.
+	planBase := usage.TermsFor(app.Plan).BaseFeeMicros
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(
 		app.CreatedAt.UTC(),
 		billingperiod.AnchorDay(activatedAt),
 	)
 	creationPeriodMicros := usage.ProratedBaseMicros(
-		usage.BaseFeeMicros,
+		planBase,
 		app.CreatedAt,
 		periodStart,
 		periodEnd,
@@ -789,12 +791,12 @@ func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (Combine
 			billingperiod.AnchorDay(activatedAt),
 		)
 	}
-	baseMicros := usage.CreationChargeBaseMicros(app.CreatedAt, periodStart, periodEnd)
+	baseMicros := usage.CreationChargeBaseMicros(planBase, app.CreatedAt, periodStart, periodEnd)
 	coverageStart := usage.ProrationCoverageStart(app.CreatedAt, periodStart)
 	creationPeriodClosed := !activatedAt.Before(periodEnd)
 	if creationPeriodClosed {
 		creationPeriodMicros = 0
-		baseMicros = usage.BaseFeeMicros
+		baseMicros = planBase
 		coverageStart = periodEnd
 	}
 	baseCents, err := centsFromMicros(baseMicros)
@@ -839,7 +841,7 @@ func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (Combine
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	} else if straddle {
 		straddleSnapshot = &AppBaseSnapshot{
@@ -847,7 +849,7 @@ func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (Combine
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	}
 	label := appLineLabel(app.Name, app.AppID)
@@ -1090,10 +1092,12 @@ func (s *Service) adoptFinalizedProrationInvoice(
 // the activation anchor are immutable, so this pricing is deterministic across
 // retries.
 func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app AppMirror, activatedAt time.Time) (*ProrationResult, bool, error) {
+	// The app's own plan base (migration 075, core-v2#1412) prices its creation charge.
+	planBase := usage.TermsFor(app.Plan).BaseFeeMicros
 	// Window = the anchored period CONTAINING created_at (ADR 0005), derived from
 	// created_at never from now — identical to the Stripe callback.
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
-	creationPeriodMicros := usage.ProratedBaseMicros(usage.BaseFeeMicros, app.CreatedAt, periodStart, periodEnd)
+	creationPeriodMicros := usage.ProratedBaseMicros(planBase, app.CreatedAt, periodStart, periodEnd)
 
 	// Coverage end = the END of the period the creation grace elapses into (the
 	// coverage contract, review 2026-07-06) — the creation period itself unless the
@@ -1103,7 +1107,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 	if straddle {
 		_, coverageEnd = billingperiod.AnchoredPeriodWindow(moduleGraceExpiry(app.CreatedAt.UTC()), billingperiod.AnchorDay(activatedAt))
 	}
-	prorated := usage.CreationChargeBaseMicros(app.CreatedAt, periodStart, periodEnd)
+	prorated := usage.CreationChargeBaseMicros(planBase, app.CreatedAt, periodStart, periodEnd)
 	// D1d straddle narrowing (wave 2, D4): only reachable here for a grace that
 	// straddles into a post-activation period (the outer period-closed gate
 	// permanently skips every other closed case) — forgive the creation period,
@@ -1111,7 +1115,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 	creationPeriodClosed := !activatedAt.Before(periodEnd)
 	if creationPeriodClosed {
 		creationPeriodMicros = 0
-		prorated = usage.BaseFeeMicros
+		prorated = planBase
 	}
 
 	amountMicros := prorated
@@ -1139,7 +1143,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	} else if straddle {
 		straddleSnapshot = &AppBaseSnapshot{
@@ -1147,7 +1151,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	}
 

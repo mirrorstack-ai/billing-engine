@@ -435,6 +435,8 @@ type PendingNewCreationChargeRaw struct {
 	CreatedAt          time.Time
 	Name               string
 	CreatedModuleCount int
+	// Plan prices the pending creation charge (migration 075).
+	Plan Plan
 }
 
 // PendingAddonChargeRaw is one decoded PendingAddonModuleCharges row: an app
@@ -1527,6 +1529,7 @@ func (s *pgxStore) PendingNewCreationCharges(ctx context.Context, accountID uuid
 			CreatedAt:          r.CreatedAt,
 			Name:               r.Name.String, // "" when NULL (pre-037 / unnamed)
 			CreatedModuleCount: int(r.CreatedModuleCount),
+			Plan:               Plan(r.Plan),
 		})
 	}
 	return out, nil

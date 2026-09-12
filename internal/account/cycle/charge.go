@@ -274,8 +274,8 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// SEPARATELY below (the advance-overage / Leg 2 precharge), not folded into an
 	// app's base — it rides per-module-instance grace timers (migration 033).
 	var advanceBase int64
-	for range apps {
-		advanceBase += usage.BaseFeeMicros
+	for _, a := range apps {
+		advanceBase += usage.TermsFor(a.Plan).BaseFeeMicros // each app's own plan base (core-v2#1412)
 	}
 
 	// ADVANCE OVERAGE leg (scenario 6, Leg 2): the NEW period's $5-per-block
@@ -449,7 +449,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 					PeriodStart: periodEnd,
 					PeriodEnd:   walletPeriodEnd,
 					ModuleCount: a.ModuleCount,
-					BaseMicros:  usage.BaseFeeMicros,
+					BaseMicros:  usage.TermsFor(a.Plan).BaseFeeMicros,
 				}); err != nil {
 					return nil, billing.Internal("advance base snapshot insert failed", err)
 				}
@@ -855,7 +855,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			PeriodStart: periodEnd, // the new period opens where the closed one ends
 			PeriodEnd:   newPeriodEnd,
 			ModuleCount: a.ModuleCount,
-			BaseMicros:  usage.BaseFeeMicros, // FLAT per-app base (module overage rides per-module timers, migration 033)
+			BaseMicros:  usage.TermsFor(a.Plan).BaseFeeMicros, // the app's plan base; module overage rides per-module timers (migration 033)
 		}); err != nil {
 			return nil, billing.Internal("advance base snapshot insert failed", err)
 		}

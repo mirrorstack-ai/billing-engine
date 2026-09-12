@@ -618,7 +618,7 @@ func TestChargeCreationProration_ChargesExactlyThePreviewedAmount(t *testing.T) 
 			store.activation[acct] = time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
 
 			sc := newFakeStripe()
-			previewMicros := usage.CreationChargeBaseMicros(tt.createdAt, periodStart, periodEnd)
+			previewMicros := usage.CreationChargeBaseMicros(usage.BaseFeeMicros, tt.createdAt, periodStart, periodEnd)
 			require.EqualValues(t, tt.wantPreviewMicros, previewMicros)
 			// centsFromMicros is package-private; for these non-negative amounts,
 			// adding half a cent before division is its exact round-half-up rule.

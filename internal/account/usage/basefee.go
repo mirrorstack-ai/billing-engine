@@ -84,10 +84,12 @@ func GraceExpiry(t time.Time) time.Time {
 // period). The preview (ListNewCreationCharges pending rows) and the charge
 // callback both price through THIS function, so they agree to the micro by
 // construction.
-func CreationChargeBaseMicros(createdAt, periodStart, periodEnd time.Time) int64 {
-	m := ProratedBaseMicros(BaseFeeMicros, createdAt, periodStart, periodEnd)
+//
+// baseFeeMicros is the app's plan base (TermsFor(plan).BaseFeeMicros).
+func CreationChargeBaseMicros(baseFeeMicros int64, createdAt, periodStart, periodEnd time.Time) int64 {
+	m := ProratedBaseMicros(baseFeeMicros, createdAt, periodStart, periodEnd)
 	if !GraceExpiry(createdAt.UTC()).Before(periodEnd) {
-		m += BaseFeeMicros
+		m += baseFeeMicros
 	}
 	return m
 }

@@ -168,7 +168,7 @@ WHERE app_id = $1
 -- UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
 -- by an hour around DST and double-bill or gap a whole period.
 -- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count
+SELECT app_id, module_count, plan
 FROM ms_billing.apps
 WHERE account_id = @account_id::uuid
   AND deleted_at IS NULL
@@ -352,7 +352,7 @@ ORDER BY i.created_at DESC, a.app_id;
 -- account-level FIFO rank that can shift before it fires, so unlike the
 -- created_at-anchored base that dollar amount is not deterministic here.
 -- name: PendingNewCreationCharges :many
-SELECT app_id, name, created_module_count, created_at
+SELECT app_id, name, created_module_count, created_at, plan
 FROM ms_billing.apps
 WHERE account_id = @account_id::uuid
   AND created_at >= @period_start::timestamptz

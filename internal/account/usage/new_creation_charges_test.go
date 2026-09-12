@@ -236,7 +236,7 @@ func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	require.Len(t, resp.Charges, 1)
 	require.True(t, usage.GraceExpiry(createdAt).Before(periodEnd), "fixture must stay within one period")
 	c := resp.Charges[0]
-	expected := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	expected := usage.CreationChargeBaseMicros(usage.BaseFeeMicros, createdAt, periodStart, periodEnd)
 	expectedAddon := int64(5) * usage.CreationChargeOverageMicros(createdAt, periodStart, periodEnd)
 	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
 	require.Equal(t, "Draft App", c.Name)
@@ -275,7 +275,7 @@ func TestListNewCreationCharges_PendingProjectedAddonStraddle(t *testing.T) {
 	require.False(t, usage.GraceExpiry(createdAt).Before(periodEnd), "fixture must exercise the straddle top-up")
 
 	c := resp.Charges[0]
-	expectedBase := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	expectedBase := usage.CreationChargeBaseMicros(usage.BaseFeeMicros, createdAt, periodStart, periodEnd)
 	perTimer := usage.CreationChargeOverageMicros(createdAt, periodStart, periodEnd)
 	require.Equal(t, usage.NewCreationChargeStatusPending, c.Status)
 	require.EqualValues(t, expectedBase, c.AmountMicros, "amount remains base-only")
@@ -352,7 +352,7 @@ func TestListNewCreationCharges_CurrentWindowSettledAndPending(t *testing.T) {
 
 	require.Equal(t, appPending, resp.Charges[1].AppID)
 	require.Equal(t, usage.NewCreationChargeStatusPending, resp.Charges[1].Status)
-	expected := usage.CreationChargeBaseMicros(pendingCreatedAt, periodStart, periodEnd)
+	expected := usage.CreationChargeBaseMicros(usage.BaseFeeMicros, pendingCreatedAt, periodStart, periodEnd)
 	require.EqualValues(t, expected, resp.Charges[1].AmountMicros, "pending previews the sweep's exact base amount")
 	require.EqualValues(t, expected, resp.Charges[1].BaseFeeMicros)
 	require.NotEqualValues(t, usage.BaseFeeMicros, resp.Charges[1].AmountMicros, "mid-period fixture must discriminate from the old flat preview")
@@ -389,7 +389,7 @@ func TestListNewCreationCharges_PendingPreviewEqualsSweepCharge(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.Charges, 1)
 
-	expected := usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd)
+	expected := usage.CreationChargeBaseMicros(usage.BaseFeeMicros, createdAt, periodStart, periodEnd)
 	require.EqualValues(t, 16_129_032, expected, "25/31 of $20, rounded half-up in micros")
 	require.Equal(t, appID, resp.Charges[0].AppID)
 	require.EqualValues(t, expected, resp.Charges[0].AmountMicros)

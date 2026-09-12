@@ -473,7 +473,7 @@ type GetAppBillResponse struct {
 	// InstalledModuleCount is the billing mirror's authoritative live install
 	// snapshot, including installed modules with no metered usage this period.
 	InstalledModuleCount int `json:"installed_module_count"`
-	// Plan is the app\'s plan and what it includes (core-v2#1412), so a caller
+	// Plan is the app's plan and what it includes (core-v2#1412), so a caller
 	// can draw usage against the included amounts. Charged amounts only.
 	Plan PlanTerms `json:"plan"`
 	// ModuleOverageMicros is the current-period subset of BaseFeeMicros attributed
@@ -623,7 +623,7 @@ type AccountAppBill struct {
 	// it to show this app's charges in a dialog rather than linking to the
 	// (now-gone) app page.
 	IsDeleted bool `json:"is_deleted"`
-	// Plan is the app\'s billing plan (migration 075).
+	// Plan is the app's billing plan (migration 075).
 	Plan Plan `json:"plan"`
 	// BaseFeeMicros is this app's 基本費用 for the period, resolved SNAPSHOT-
 	// FIRST exactly like GetAppBill (charged periods show what was invoiced;

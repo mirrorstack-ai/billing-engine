@@ -29,7 +29,7 @@ import (
 // the SAME usage helper the leg uses.
 func creationBaseMicros(store *fakeStore, acct uuid.UUID, created time.Time) int64 {
 	ps, pe := billingperiod.AnchoredPeriodWindow(created.UTC(), billingperiod.AnchorDay(store.activation[acct]))
-	return usage.CreationChargeBaseMicros(created, ps, pe)
+	return usage.CreationChargeBaseMicros(usage.BaseFeeMicros, created, ps, pe)
 }
 
 type walletCoordinatorSnapshots struct {

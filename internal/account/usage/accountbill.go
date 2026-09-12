@@ -397,9 +397,21 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 	}
 
 	var total int64
+	// Each app's plan base (migration 075), read once per app. An unmirrored app
+	// reads as the zero Plan, which prices at the default plan.
+	appBase := make(map[uuid.UUID]int64)
 	for _, charge := range charges {
+		base, ok := appBase[charge.AppID]
+		if !ok {
+			mirror, _, err := s.store.AppMirror(ctx, charge.AppID)
+			if err != nil {
+				return 0, billing.Internal("unresolved one-time charge plan lookup failed", err)
+			}
+			base = resolveBaseFeeMicros(mirror.Plan)
+			appBase[charge.AppID] = base
+		}
 		increment, err := unresolvedOneTimeChargeIncrementMicros(
-			charge, projectedPeriodStart,
+			charge, base, projectedPeriodStart,
 		)
 		if err != nil {
 			return 0, err
@@ -413,7 +425,9 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 }
 
 // unresolvedOneTimeChargeIncrementMicros mirrors the immutable D1d charge shape
-// shared by creation base and module-timer grace legs:
+// shared by creation base and module-timer grace legs. appBaseMicros is the
+// app's plan base: the creation-base unit, and the full-period base a frozen
+// attempt's snapshot is compared with.
 //   - charge day → its anchored period end, prorated at the unit fee;
 //   - plus one full unit when grace straddles into the following period;
 //   - if activation closed the first period, forgive it and retain only a
@@ -436,12 +450,13 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 // cross-charge view this per-charge function does not have.
 func unresolvedOneTimeChargeIncrementMicros(
 	charge UnresolvedOneTimeChargeRaw,
+	appBaseMicros int64,
 	projectedPeriodStart time.Time,
 ) (int64, error) {
 	var unitMicros int64
 	switch charge.Kind {
 	case UnresolvedOneTimeChargeCreationBase:
-		unitMicros = BaseFeeMicros
+		unitMicros = appBaseMicros
 	case UnresolvedOneTimeChargeModuleTimer:
 		unitMicros = ModuleOverageFeeMicros
 	default:
@@ -475,13 +490,13 @@ func unresolvedOneTimeChargeIncrementMicros(
 					charge.FrozenStraddleBaseMicros <= 0 {
 					return 0, billing.Internal("frozen one-time charge straddle snapshot is invalid", nil)
 				}
-				if charge.FrozenStraddleBaseMicros == BaseFeeMicros {
+				if charge.FrozenStraddleBaseMicros == appBaseMicros {
 					fullPeriodStart = charge.FrozenStraddlePeriodStart
 					fullPeriodEnd = charge.FrozenStraddlePeriodEnd
 					fullPeriodFound = true
 				}
 			}
-			if !fullPeriodFound && charge.FrozenSnapshotBaseMicros == BaseFeeMicros {
+			if !fullPeriodFound && charge.FrozenSnapshotBaseMicros == appBaseMicros {
 				fullPeriodStart = charge.FrozenSnapshotPeriodStart
 				fullPeriodEnd = charge.FrozenSnapshotPeriodEnd
 				fullPeriodFound = true

@@ -1609,7 +1609,7 @@ func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID
 		// and its creation charge covers through the grace-elapsed period).
 		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) &&
 			app.CreatedAt.AddDate(0, 0, graceDays).Before(createdBefore) {
-			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount})
+			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: app.Plan})
 		}
 	}
 	return apps, nil

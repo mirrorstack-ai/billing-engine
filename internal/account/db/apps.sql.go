@@ -151,7 +151,7 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 }
 
 const liveAppModuleCountsCreatedBefore = `-- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count
+SELECT app_id, module_count, plan
 FROM ms_billing.apps
 WHERE account_id = $1::uuid
   AND deleted_at IS NULL
@@ -168,6 +168,7 @@ type LiveAppModuleCountsCreatedBeforeParams struct {
 type LiveAppModuleCountsCreatedBeforeRow struct {
 	AppID       string `json:"app_id"`
 	ModuleCount int32  `json:"module_count"`
+	Plan        string `json:"plan"`
 }
 
 // LiveAppModuleCountsCreatedBefore returns (app_id, module_count) for every
@@ -209,7 +210,7 @@ func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg Live
 	items := []LiveAppModuleCountsCreatedBeforeRow{}
 	for rows.Next() {
 		var i LiveAppModuleCountsCreatedBeforeRow
-		if err := rows.Scan(&i.AppID, &i.ModuleCount); err != nil {
+		if err := rows.Scan(&i.AppID, &i.ModuleCount, &i.Plan); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -309,7 +310,7 @@ func (q *Queries) MirroredAppIDsOverlappingWindow(ctx context.Context, arg Mirro
 }
 
 const pendingNewCreationCharges = `-- name: PendingNewCreationCharges :many
-SELECT app_id, name, created_module_count, created_at
+SELECT app_id, name, created_module_count, created_at, plan
 FROM ms_billing.apps
 WHERE account_id = $1::uuid
   AND created_at >= $2::timestamptz
@@ -333,6 +334,7 @@ type PendingNewCreationChargesRow struct {
 	Name               pgtype.Text `json:"name"`
 	CreatedModuleCount int32       `json:"created_module_count"`
 	CreatedAt          time.Time   `json:"created_at"`
+	Plan               string      `json:"plan"`
 }
 
 // PendingNewCreationCharges is the PENDING half of the ListNewCreationCharges read: apps
@@ -376,6 +378,7 @@ func (q *Queries) PendingNewCreationCharges(ctx context.Context, arg PendingNewC
 			&i.Name,
 			&i.CreatedModuleCount,
 			&i.CreatedAt,
+			&i.Plan,
 		); err != nil {
 			return nil, err
 		}

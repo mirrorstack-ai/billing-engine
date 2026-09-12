@@ -37,9 +37,9 @@ func registeredPlanApp(t *testing.T) (*fakeStore, *cycle.Service, uuid.UUID) {
 	return store, svc, appID
 }
 
-// TestSetAppPlan_OnlyProUntilTheChargeLegsArePlanAware pins the deliberate
-// refusal: free and business are refused until the charge legs bill them.
-func TestSetAppPlan_OnlyProUntilTheChargeLegsArePlanAware(t *testing.T) {
+// TestSetAppPlan_OnlyProUntilPlanChangesAreBilled pins the deliberate
+// refusal: free and business are refused until a plan change is billed.
+func TestSetAppPlan_OnlyProUntilPlanChangesAreBilled(t *testing.T) {
 	store, svc, appID := registeredPlanApp(t)
 
 	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})

@@ -325,6 +325,7 @@ func (f *fakeStore) PendingNewCreationCharges(_ context.Context, _ uuid.UUID, st
 			CreatedAt:          m.CreatedAt,
 			Name:               m.Name,
 			CreatedModuleCount: m.ModuleCount,
+			Plan:               m.Plan,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
