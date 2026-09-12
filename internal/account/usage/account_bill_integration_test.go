@@ -165,13 +165,12 @@ func TestActivatedRecurringFeeSharesAndSettledDomains_Integration(t *testing.T) 
 	require.NotContains(t, byApp, pendingApp,
 		"an app with no activation and no surcharge owns none of the recurring base")
 	require.Equal(t, usage.AppRecurringFeeShare{
-		AppID: chargedApp, Activated: true, OverModuleCount: 3, CustomDomainCount: 2,
-	}, byApp[chargedApp],
+		AppID: chargedApp, Activated: true, OverModuleCount: 3, CustomDomainCount: 2, Plan: usage.PlanPro}, byApp[chargedApp],
 		"the charged app owns every over-timer the boundary bills (2 charged + 1 "+
 			"D1d-forgiven) and every live domain it bills (1 charged + 1 never-charged)")
-	require.Equal(t, usage.AppRecurringFeeShare{AppID: legacyApp, Activated: true}, byApp[legacyApp],
+	require.Equal(t, usage.AppRecurringFeeShare{AppID: legacyApp, Activated: true, Plan: usage.PlanPro}, byApp[legacyApp],
 		"a legacy advance snapshot activates the base fee and nothing else")
-	require.Equal(t, usage.AppRecurringFeeShare{AppID: skippedApp, Activated: true}, byApp[skippedApp],
+	require.Equal(t, usage.AppRecurringFeeShare{AppID: skippedApp, Activated: true, Plan: usage.PlanPro}, byApp[skippedApp],
 		"a D1d-skipped app never gets an invoice id, and the boundary bills it anyway")
 
 	// The account line is these rows summed — the identity the per-app bill
