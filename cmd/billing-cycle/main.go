@@ -377,7 +377,57 @@ func buildService() *cycle.Service {
 		svc.WithBoundaryEstimateReconciler(coordinator).
 			WithWalletMutationObserver(coordinator)
 	}
-	return withIntentCutover(svc, pool, os.Getenv(intentCutoverEnv))
+	svc = withIntentCutover(svc, pool, os.Getenv(intentCutoverEnv))
+	if err := cutoverWiringDecision(svc.IntentProposerArmed()); err != nil {
+		slog.Error("this worker cannot bill anyone: every charge leg proposes and no proposer is installed; refusing to start",
+			"env", intentCutoverEnv,
+			"needs", intentCutoverArmed,
+			"why", "no charge leg has a collector left (boundary, domain, module overage, "+
+				"creation proration); an unarmed worker bills nobody",
+			"incident", "core-v2#1400 — unarmed, the boundary leg panicked on 100% of runs from the 2026-09-10 anchor",
+			"error", err.Error())
+		os.Exit(1)
+	}
+	return svc
+}
+
+// errNoProposerNoCollector is the refusal a worker makes when it is wired to
+// bill nobody.
+var errNoProposerNoCollector = errors.New(
+	"no intent proposer installed and no legacy collector remains")
+
+// cutoverWiringDecision is the second half of the owner's 2026-09-12 decision
+// on core-v2#1400, as a pure function so it is tested rather than reasoned
+// about — the same shape, and for the same reason, as intentCutoverDecision.
+//
+// 🔴 REFUSE AT DEPLOY, NOT AT THE PERIOD BOUNDARY.
+//
+// withIntentCutover's contract used to be "arm the seam, or leave the service
+// on the legacy collecting path". There is no legacy collecting path left: the
+// boundary, domain, overage and creation-proration legs each deleted theirs, so
+// an unarmed worker is not the old behaviour — it is a billing worker that
+// cannot bill, and every leg says so only when a candidate reaches it.
+//
+// That difference is a month wide. The legs are swept daily, but a boundary
+// falls due once per account per period, so this deployment ran green from the
+// cutover until the 2026-09-10 anchor and then failed on 100% of runs for two
+// days before anyone read it. One log line at deploy is the same information,
+// a month earlier, addressed to the person who can act on it.
+//
+// It refuses rather than degrading for the reason errUnrecognisedCutoverFlag
+// gives: a wrong belief about whether money is moving is worse than a worker
+// that will not start. Arming the flag is a money-rail decision with its own
+// unmet preconditions (an evidence signing key, and cmd/intent-executor still
+// refusing to start while legacy money paths remain) — this refusal states the
+// requirement, and deliberately does not satisfy it.
+//
+// The legacy standing-restamp mode returns before buildService and is
+// unaffected: it moves no money and needs no proposer.
+func cutoverWiringDecision(proposerArmed bool) error {
+	if proposerArmed {
+		return nil
+	}
+	return errNoProposerNoCollector
 }
 
 // intentCutoverEnv arms the intent cutover for every leg that has one.
@@ -391,8 +441,11 @@ const (
 	intentCutoverArmed = "propose-do-not-collect"
 )
 
-// withIntentCutover attaches the proposer seam, or leaves the service on
-// the legacy collecting path.
+// withIntentCutover attaches the proposer seam.
+//
+// It returns the service unchanged when the flag is unset, which is NOT
+// "the legacy collecting path" any more — no leg has one. buildService
+// refuses to start on that service; see cutoverWiringDecision.
 //
 // 🔴 Arming this STOPS THIS WORKER COLLECTING FOR NEW CHARGES. A
 // cut-over leg derives the same amount, seals it as an intent, stores it

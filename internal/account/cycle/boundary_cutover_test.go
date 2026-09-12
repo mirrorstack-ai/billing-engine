@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
@@ -125,4 +126,47 @@ func TestAFailedProposalLeavesTheRunUnfinished(t *testing.T) {
 		"a proposal failure gave the run a terminal status. Nothing reached a provider, so "+
 			"there is nothing to reconcile and the run must stay pending and retryable — "+
 			"marking it failed strands a boundary that never charged anyone.")
+}
+
+// 🔴 UNARMED, THE BOUNDARY REFUSES — IT DOES NOT PANIC.
+//
+// This is the case the deleted TestWithoutAProposerTheBoundaryStillCharges used
+// to watch, and the gap its deletion left. The collector it described is gone,
+// so "no proposer" stopped meaning "the old behaviour" and started meaning a nil
+// interface in a money path — which is what production was wired as
+// (BILLING_CYCLE_INTENT_CUTOVER has never been set), and what panicked on 100%
+// of runs from the 2026-09-10 anchor for two days (core-v2#1400).
+//
+// A panic is not a refusal: it takes every account queued behind this one in the
+// batch, and it is indistinguishable in the console from the worker being
+// broken. So the properties pinned here are the three that make the refusal
+// survivable — a typed error, nothing at Stripe, and NO terminal mark, leaving
+// the run pending for the reclaim that runs once a proposer is wired.
+func TestAnUnarmedBoundaryRefusesInsteadOfPanicking(t *testing.T) {
+	store := newFakeStore()
+	store.chargedTotal = 1_000_000
+	store.hasPM = true
+	store.stripeCustomer = "cus_boundary_unarmed"
+	seedApp(store, chargeAccount, 0, false)
+	sc := newFakeStripe()
+
+	// No WithIntentProposer — exactly how cmd/billing-cycle is deployed today.
+	svc := cycle.NewService(store, sc)
+
+	resp, err := svc.RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+	require.Error(t, err, "an unarmed boundary reported success; it can bill nobody")
+	require.Nil(t, resp)
+	requireCode(t, err, billing.CodeInternal)
+
+	require.Empty(t, sc.itemCalls,
+		"an unarmed boundary fell back to charging the customer — the fallback this wave deleted")
+
+	// 🔴 The same property TestAFailedProposalLeavesTheRunUnfinished asserts, and
+	// asserted the same way: an empty map read through a range loop passes
+	// whatever the code does. A refusal must reach NO terminal mark at all, or a
+	// boundary that never charged anybody is written off as failed or invoiced.
+	require.Empty(t, store.markedRuns,
+		"a refusal to propose gave the run a terminal status. Nothing reached a provider and "+
+			"nothing was billed, so the run must stay pending and re-runnable for the reclaim "+
+			"that follows a proposer being wired.")
 }

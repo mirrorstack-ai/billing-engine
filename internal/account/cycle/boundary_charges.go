@@ -251,11 +251,28 @@ func boundaryArrearsRef(accountID string) string { return "arrears:" + accountID
 // cmd/billing-cycle cannot charge anyone, which is a stronger statement than
 // any check over its call graph could make.
 //
-// A service with no proposer therefore reaches ProposeGroup on a nil interface
-// and panics. That is deliberate in the sense that it is not papered over: the
-// alternative — returning early, or "just this once" charging — is the
-// fallback this wave exists to remove. Wiring the cycle without a proposer is a
-// deployment that cannot bill, and it must fail where it happens.
+// A service with no proposer therefore cannot bill a boundary by any route, and
+// it REFUSES rather than falling back — returning early, or charging "just this
+// once", is the fallback this wave exists to remove.
+//
+// 🔴 WHAT IT MUST NOT DO IS PANIC, AND IT DID. Production's
+// mirrorstack-billing-cycle has never carried BILLING_CYCLE_INTENT_CUTOVER, so
+// cmd/billing-cycle never attached a proposer (main.go:380), and from the
+// 2026-09-10 period boundary ProposeGroup nil-dereferenced on 100% of runs
+// (core-v2#1400). A panic is the worst of the three answers: it takes the whole
+// batch — every account queued behind the first — and leaves a stack trace
+// where a billing decision should be.
+//
+// So the refusal below is a clean billing.Internal, the same shape every other
+// cut-over leg already used (domain_charges.go:97, overage.go:780,
+// proration_charges.go:138). It reaches no terminal mark, so the run stays
+// PENDING and the next reclaim finishes it once a proposer is wired; the freeze
+// taken above is what makes that reclaim seal the same cents this attempt
+// committed to.
+//
+// The deployment-level answer is the one that makes this branch unreachable:
+// cmd/billing-cycle refuses to START unarmed (its cutoverWiringDecision), so an
+// operator is told once, at deploy, rather than by a daily panic a month later.
 //
 // The run is marked 'proposed': terminal for this worker, and deliberately
 // neither 'invoiced' (no invoice exists, no money moved) nor 'failed'. Both
@@ -314,6 +331,13 @@ func (s *Service) proposeBoundary(
 		}
 		summary.Status = RunStatusInvoiced
 		return summary, nil
+	}
+
+	// Fail closed rather than dereference nil in a money path — see above.
+	if s.proposer == nil {
+		return nil, billing.Internal(
+			"the period boundary has no intent proposer installed and its legacy collect path "+
+				"is deleted; this deployment cannot bill a boundary", nil)
 	}
 
 	sealed, err := s.proposer.ProposeGroup(ctx, charges)

@@ -13,9 +13,13 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 )
 
-// The three states of the flag. The default matters most: a worker with
-// no flag set must collect exactly as it did before, because that is
-// what every deployed worker looks like today.
+// The three states of the flag.
+//
+// The default no longer means "collect exactly as before": no leg has a
+// collector left, so an unset flag arms nothing and buildService then
+// refuses to start on it — see TestAnUnarmedWorkerRefusesToStart. What
+// this function still owns is the refusal of a flag that is neither,
+// which is why a truthy-looking value is an error and not a default.
 func TestIntentCutoverDecision(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -23,7 +27,7 @@ func TestIntentCutoverDecision(t *testing.T) {
 		arm     bool
 		wantErr bool
 	}{
-		{"unset stays on the legacy collecting path", "", false, false},
+		{"unset arms nothing (and the worker then refuses to start)", "", false, false},
 		{"the exact armed value arms", intentCutoverArmed, true, false},
 		{"a truthy-looking value is refused, not accepted", "true", false, true},
 		{"1 is refused", "1", false, true},
@@ -89,4 +93,41 @@ func (nilSaver) SaveIntentGroupWithEvidence(
 	context.Context, string, []intent.ChargeIntent, *evidence.Recorder, []evidence.Event,
 ) error {
 	return nil
+}
+
+// 🔴 A WORKER THAT CAN BILL NOBODY MUST NOT START.
+//
+// The second half of the owner's 2026-09-12 decision on core-v2#1400. The first
+// half is in the leg (boundary_charges.go): refuse cleanly instead of
+// nil-dereferencing. This half is why that refusal should never be reached on a
+// deployed worker — an unarmed billing-cycle bills nothing, and it should say so
+// once, at deploy, rather than a month later when the first period boundary
+// falls due and every run fails.
+//
+// The predicate is taken from the SERVICE, not from a bool this test invented:
+// IntentProposerArmed is the same field every leg's nil guard reads, so a wiring
+// change that stops attaching the proposer moves this test too. A test that
+// passed its own `false` would pin the policy while the seam drifted underneath
+// it — which is exactly how WithIntentProposer spent two legs with no caller.
+func TestAnUnarmedWorkerRefusesToStart(t *testing.T) {
+	svc := cycle.NewService(nil, nil)
+
+	err := cutoverWiringDecision(svc.IntentProposerArmed())
+	if err == nil {
+		t.Fatal("a service with no proposer was allowed to start. Every charge leg proposes " +
+			"and none has a collector, so this worker would run its whole schedule, bill " +
+			"nobody, and refuse one boundary at a time")
+	}
+	if !errors.Is(err, errNoProposerNoCollector) {
+		t.Fatalf("got %v, want errNoProposerNoCollector", err)
+	}
+
+	p, perr := proposer.New(nilSaver{}, evidencetest.Recorder(t), func() time.Time { return evidencetest.At })
+	if perr != nil {
+		t.Fatalf("proposer.New: %v", perr)
+	}
+	if err := cutoverWiringDecision(svc.WithIntentProposer(p).IntentProposerArmed()); err != nil {
+		t.Fatalf("an armed worker was refused a start: %v. The refusal must gate the unwired "+
+			"case only — gating the wired one stops billing entirely", err)
+	}
 }
