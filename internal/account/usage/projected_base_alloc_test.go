@@ -98,7 +98,7 @@ func TestProjectedBaseFeeByAppSumsToAccountTotal(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			want := accountProjectedBase(tc.shares, BaseFeeMicros)
-			got := sumAllocated(projectedBaseFeeByApp(tc.shares, BaseFeeMicros))
+			got := sumAllocated(projectedBaseFeeByApp(tc.shares))
 			if got != want {
 				t.Fatalf("allocated %d micros, account line is %d", got, want)
 			}
@@ -113,7 +113,7 @@ func TestProjectedBaseFeeByAppPricesTheOwnerAccount(t *testing.T) {
 	byApp := projectedBaseFeeByApp([]AppRecurringFeeShare{
 		{AppID: owner, Activated: true, OverModuleCount: 8, CustomDomainCount: 1},
 		{AppID: idle, Activated: true},
-	}, BaseFeeMicros)
+	})
 
 	// 13 installed − 5 included = 8 over → ceil(8/5) = 2 blocks = $10.
 	const want = BaseFeeMicros + 2*ModuleBlockFeeMicros + DomainFeeMicros
@@ -135,7 +135,7 @@ func TestProjectedBaseFeeByAppDistributesRatherThanRecomputesBlocks(t *testing.T
 	byApp := projectedBaseFeeByApp([]AppRecurringFeeShare{
 		{AppID: first, OverModuleCount: 2},
 		{AppID: second, OverModuleCount: 2},
-	}, BaseFeeMicros)
+	})
 
 	// 4 over → ONE block ($5) for the account. Per-app ceil() would bill $5 each.
 	if got := byApp[first] + byApp[second]; got != ModuleBlockFeeMicros {
@@ -155,9 +155,9 @@ func TestProjectedBaseFeeByAppIsDeterministic(t *testing.T) {
 		{AppID: appIDAt(2), Activated: true, OverModuleCount: 1},
 		{AppID: appIDAt(3), Activated: true, OverModuleCount: 1},
 	}
-	first := projectedBaseFeeByApp(shares, BaseFeeMicros)
+	first := projectedBaseFeeByApp(shares)
 	for i := 0; i < 50; i++ {
-		again := projectedBaseFeeByApp(shares, BaseFeeMicros)
+		again := projectedBaseFeeByApp(shares)
 		for appID, micros := range first {
 			if again[appID] != micros {
 				t.Fatalf("run %d moved %s from %d to %d", i, appID, micros, again[appID])

@@ -35,6 +35,10 @@ const (
 	// unfunded creates; PayInvoice for a pay attempt with no usable default
 	// card. api-platform surfaces it as HTTP 402.
 	CodePaymentRequired Code = "PAYMENT_REQUIRED"
+	// CodePlanNotAvailable refuses a billing plan the engine cannot yet bill
+	// correctly: SetAppPlan returns it for `free` / `business` until the charge
+	// legs are plan-aware (billing-engine#202 PR-2). See cycle.SetAppPlan.
+	CodePlanNotAvailable Code = "PLAN_NOT_AVAILABLE"
 )
 
 // Error is the typed error returned by every service method. The RPC
@@ -95,6 +99,12 @@ func PaymentRequired(msg string) *Error {
 // code lets clients distinguish it from invalid input and transient internals.
 func Unavailable(msg string) *Error {
 	return &Error{Code: CodeUnavailable, Message: msg}
+}
+
+// PlanNotAvailable refuses a plan the engine cannot yet bill correctly (see
+// CodePlanNotAvailable). Not retryable with the same payload.
+func PlanNotAvailable(msg string) *Error {
+	return &Error{Code: CodePlanNotAvailable, Message: msg}
 }
 
 func StripeError(msg string, wrapped error) *Error {

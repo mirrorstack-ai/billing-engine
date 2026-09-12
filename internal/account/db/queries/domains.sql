@@ -269,10 +269,15 @@ SELECT universe.app_id,
            WHERE activated_apps.app_id = universe.app_id
        ) AS activated,
        COALESCE(over_timers.over_count, 0)::bigint AS over_module_count,
-       COALESCE(live_domains.domain_count, 0)::bigint AS custom_domain_count
+       COALESCE(live_domains.domain_count, 0)::bigint AS custom_domain_count,
+       -- The app's billing plan (migration 075), so each activated app's base is
+       -- priced from its own plan. Every universe app has a roster row; the
+       -- COALESCE keeps a missing one on the default plan, never on free.
+       COALESCE(app.plan, 'pro')::text AS plan
 FROM app_universe universe
 LEFT JOIN over_timers ON over_timers.app_id = universe.app_id
 LEFT JOIN live_domains ON live_domains.app_id = universe.app_id
+LEFT JOIN ms_billing.apps app ON app.app_id = universe.app_id
 ORDER BY universe.app_id;
 
 -- SettledDomainCreationCharges feeds 本期新建立 with custom-domain activation

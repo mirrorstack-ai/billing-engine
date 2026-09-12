@@ -126,6 +126,7 @@ type fakeStore struct {
 	// the PRIMARY KEY, with the source recorded so tests can assert which
 	// charge leg wrote (and kept) each row.
 	apps                      map[uuid.UUID]cycle.AppMirror
+	errSetPlan                error
 	combinedProrationAttempts map[uuid.UUID]cycle.CombinedProrationAttempt
 	accountsByUser            map[uuid.UUID]uuid.UUID
 	activation                map[uuid.UUID]time.Time
@@ -1349,6 +1350,19 @@ func (f *fakeStore) SetAppModuleCount(_ context.Context, appID uuid.UUID, module
 		f.apps[appID] = app
 	}
 	return nil
+}
+
+func (f *fakeStore) SetAppPlan(_ context.Context, appID uuid.UUID, plan usage.Plan) (bool, error) {
+	if f.errSetPlan != nil {
+		return false, f.errSetPlan
+	}
+	app, ok := f.apps[appID]
+	if !ok || app.Deleted {
+		return false, nil // WHERE deleted_at IS NULL: a deleted or absent row never moves
+	}
+	app.Plan = plan
+	f.apps[appID] = app
+	return true, nil
 }
 
 func (f *fakeStore) MarkAppDeleted(_ context.Context, appID uuid.UUID) error {
