@@ -17,12 +17,13 @@ import (
 // starting with Get or List" — would classify a hypothetical
 // GetOrCreateCustomer as harmless.
 var knownReads = map[string]bool{
-	"GetCustomer":         true,
-	"GetInvoice":          true,
-	"FindInvoiceByRef":    true,
-	"ListInvoiceItems":    true,
-	"ListInvoicePayments": true,
-	"RetrieveCharge":      true,
+	"GetCustomer":              true,
+	"PaymentMethodCardCountry": true, // card issuing country → tax-estimate jurisdiction (migration 074)
+	"GetInvoice":               true,
+	"FindInvoiceByRef":         true,
+	"ListInvoiceItems":         true,
+	"ListInvoicePayments":      true,
+	"RetrieveCharge":           true,
 }
 
 // TestEveryProviderMethodIsClassified ties providerEffects to the

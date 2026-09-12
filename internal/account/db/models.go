@@ -847,6 +847,7 @@ type MsBillingPaymentMethodsMirror struct {
 	FraudReason pgtype.Text `json:"fraud_reason"`
 	// Audit: when fraud_blocked was set. NULL until flagged.
 	FraudFlaggedAt pgtype.Timestamptz `json:"fraud_flagged_at"`
+	CardCountry    pgtype.Text        `json:"card_country"`
 }
 
 type MsBillingUsageAggregate struct {

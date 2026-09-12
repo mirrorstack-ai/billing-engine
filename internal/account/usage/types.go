@@ -754,6 +754,13 @@ type GetAccountBillResponse struct {
 	// already present in the recurring next-period forecast is counted once.
 	ProjectedTotalMicros int64 `json:"projected_total_micros"`
 
+	// Tax is the ESTIMATED tax line for the period (core-v2#250: every price
+	// above is NET; tax is a separate itemized line at invoice time). Always
+	// emitted; Status says whether the figure is an estimate or the payer's
+	// jurisdiction is unknown (then TaxMicros is 0 and the UI must say so
+	// rather than print $0.00 as a fact).
+	Tax AccountBillTax `json:"tax"`
+
 	// unresolvedOneTimeMicros is the non-wire seam for other usage-package
 	// projections that must consume the same authoritative one-time exposure
 	// without copying its SQL or reverse-engineering ProjectedTotalMicros.
@@ -919,4 +926,33 @@ type SetInfraPriceOverridesRequest struct {
 type SetInfraPriceOverridesResponse struct {
 	Synced    int  `json:"synced"`
 	AbsorbAll bool `json:"absorb_all,omitempty"`
+}
+
+// AccountBillTax is GetAccountBill's ESTIMATED tax line (core-v2#250).
+//
+// The invoice is where tax becomes a fact (Stripe Tax on the Stripe rail,
+// ezPay 未稅/稅額/含稅 on the NewebPay rail); the bill read only forecasts it
+// from the payer's jurisdiction and the net projection, so the UI can show
+// 小計（未稅）→ 稅額（預估）→ 合計 before the invoice exists.
+type AccountBillTax struct {
+	// Status is TaxStatusEstimated when a rule applied, TaxStatusNotConfigured
+	// when the payer's jurisdiction is unknown or has no rule yet. Never a
+	// silent 0: not_configured is an explicit state the UI renders as such.
+	Status string `json:"status"`
+	// Jurisdiction is the ISO 3166-1 alpha-2 country the estimate keyed on
+	// ("" when unknown).
+	Jurisdiction string `json:"jurisdiction"`
+	// RateBps is the applied rate in basis points (500 = 5%); 0 when not
+	// configured.
+	RateBps int64 `json:"rate_bps"`
+	// RuleRevision names the rule the estimate came from, so a displayed figure
+	// can be traced to a decision ("" when not configured).
+	RuleRevision string `json:"rule_revision"`
+	// TaxableMicros is the NET basis the estimate applied to: the period-end
+	// projection (ProjectedTotalMicros), clamped at 0. Reported even when not
+	// configured so the UI can print the 小計 line either way.
+	TaxableMicros int64 `json:"taxable_micros"`
+	// TaxMicros is the estimated tax (integer micro-USD, half-up); 0 when not
+	// configured.
+	TaxMicros int64 `json:"tax_micros"`
 }

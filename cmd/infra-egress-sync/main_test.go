@@ -77,6 +77,10 @@ func (f *fakeStore) InsertUsageObservation(ctx context.Context, ev usage.UsageEv
 	return true, ev.Value, nil
 }
 
+func (f *fakeStore) DefaultCardCountry(context.Context, uuid.UUID) (string, bool, error) {
+	return "", false, nil // no default card on file → tax not configured (migration 074)
+}
+
 func (f *fakeStore) AccountByOwner(_ context.Context, _ usage.Owner) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil // egress rows carry no owner → lazy event
 }

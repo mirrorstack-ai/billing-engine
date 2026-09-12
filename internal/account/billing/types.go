@@ -547,6 +547,9 @@ type PaymentMethod struct {
 	ExpMonth              int       `json:"exp_month"`
 	ExpYear               int       `json:"exp_year"`
 	IsDefault             bool      `json:"is_default"`
+	// CardCountry is the card's issuing country (ISO 3166-1 alpha-2), "" when
+	// unknown — the tax-estimate jurisdiction signal (migration 074).
+	CardCountry string `json:"card_country"`
 }
 
 // SetOrgDistributorRequest binds customer org C to distributor org B

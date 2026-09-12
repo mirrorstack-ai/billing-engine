@@ -208,6 +208,23 @@ func (c *realClient) DetachPaymentMethod(ctx context.Context, stripePaymentMetho
 	return err
 }
 
+// PaymentMethodCardCountry implements Client: the card's issuing country as
+// Stripe reports it (payment_method.card.country). It is the payer-jurisdiction
+// signal behind the bill read's ESTIMATED tax line (migration 074,
+// core-v2#250) until Stripe Tax is wired. A non-card method reports "".
+func (c *realClient) PaymentMethodCardCountry(ctx context.Context, stripePaymentMethodID string) (string, error) {
+	params := &stripego.PaymentMethodParams{}
+	params.Context = ctx
+	pm, err := c.sc.PaymentMethods.Get(stripePaymentMethodID, params)
+	if err != nil {
+		return "", err
+	}
+	if pm == nil || pm.Card == nil {
+		return "", nil
+	}
+	return pm.Card.Country, nil
+}
+
 // RetrieveCharge fetches a charge and projects the card-identifying fields the
 // fraud webhook resolves against. payment_method (a plain string id) and
 // payment_method_details.card.fingerprint ride the default charge retrieve, so

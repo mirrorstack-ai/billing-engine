@@ -98,6 +98,10 @@ func (r *Router) handlePaymentMethodAttached(ctx context.Context, event stripego
 		// the resolver compares this against existing active mirror rows
 		// on the same account to set status='duplicate'.
 		Fingerprint: pm.Card.Fingerprint,
+		// Issuing country → payment_methods_mirror.card_country (migration
+		// 074): the payer-jurisdiction signal behind the bill read's ESTIMATED
+		// tax line (core-v2#250). "" (unknown) is stored as NULL.
+		CardCountry: pm.Card.Country,
 	}
 	found, becameDefault, retired, err := r.store.InsertPaymentMethod(ctx, pm.Customer.ID, params)
 	if err != nil {

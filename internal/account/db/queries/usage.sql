@@ -1085,3 +1085,15 @@ WHERE app_id = $1
       SELECT 1 FROM ms_billing.org_deletion_finalizations f
       WHERE f.org_id = ms_billing.apps.owner_org_id
   );
+
+-- name: DefaultPaymentMethodCardCountry :one
+-- The payer's tax-jurisdiction signal for GetAccountBill's ESTIMATED tax line
+-- (migration 074, core-v2#250): the default active card's issuing country.
+-- '' when the default card's country was never recorded; no row when the
+-- account has no default card at all. Either way the bill read reports the
+-- line as not_configured — never a silent 0.
+SELECT COALESCE(card_country, '')::text AS card_country
+FROM ms_billing.payment_methods_mirror
+WHERE account_id = $1 AND deleted_at IS NULL AND is_default
+ORDER BY attached_at DESC
+LIMIT 1;

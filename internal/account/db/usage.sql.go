@@ -1026,6 +1026,26 @@ func (q *Queries) CurrentPeriodUsageSummary(ctx context.Context, arg CurrentPeri
 	return items, nil
 }
 
+const defaultPaymentMethodCardCountry = `-- name: DefaultPaymentMethodCardCountry :one
+SELECT COALESCE(card_country, '')::text AS card_country
+FROM ms_billing.payment_methods_mirror
+WHERE account_id = $1 AND deleted_at IS NULL AND is_default
+ORDER BY attached_at DESC
+LIMIT 1
+`
+
+// The payer's tax-jurisdiction signal for GetAccountBill's ESTIMATED tax line
+// (migration 074, core-v2#250): the default active card's issuing country.
+// ” when the default card's country was never recorded; no row when the
+// account has no default card at all. Either way the bill read reports the
+// line as not_configured — never a silent 0.
+func (q *Queries) DefaultPaymentMethodCardCountry(ctx context.Context, accountID string) (string, error) {
+	row := q.db.QueryRow(ctx, defaultPaymentMethodCardCountry, accountID)
+	var card_country string
+	err := row.Scan(&card_country)
+	return card_country, err
+}
+
 const deleteInfraPriceOverridesNotIn = `-- name: DeleteInfraPriceOverridesNotIn :execrows
 DELETE FROM ms_billing.metric_definitions
 WHERE module_id = $1::uuid

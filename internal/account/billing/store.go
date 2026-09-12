@@ -57,6 +57,11 @@ type Store interface {
 	// methods for an account, newest-first. Empty slice (not nil) when
 	// none exist.
 	ListPaymentMethods(ctx context.Context, accountID uuid.UUID) ([]PaymentMethod, error)
+	// SetPaymentMethodCardCountry fills card_country (migration 074) for a
+	// mirror row that still has none — the read-path backfill for cards
+	// attached before the column existed. A row that already carries a
+	// country is left untouched (the webhook value is authoritative).
+	SetPaymentMethodCardCountry(ctx context.Context, stripePaymentMethodID, country string) error
 
 	// ServiceBlockSignals reads, in one round-trip, the three inputs the
 	// service-block eligibility gate reasons over for an account: the usable
@@ -401,6 +406,7 @@ func (s *pgxStore) ListPaymentMethods(ctx context.Context, accountID uuid.UUID) 
 			Brand:                 r.Brand,
 			Last4:                 r.Last4,
 			ExpMonth:              int(r.ExpMonth),
+			CardCountry:           r.CardCountry,
 			ExpYear:               int(r.ExpYear),
 			IsDefault:             r.IsDefault,
 		})
@@ -1335,4 +1341,13 @@ func uuidFromPgtype(id pgtype.UUID) uuid.UUID {
 		return uuid.Nil
 	}
 	return uuid.UUID(id.Bytes)
+}
+
+// SetPaymentMethodCardCountry implements Store (migration 074 backfill).
+func (s *pgxStore) SetPaymentMethodCardCountry(ctx context.Context, stripePaymentMethodID, country string) error {
+	_, err := s.q.SetPaymentMethodCardCountry(ctx, db.SetPaymentMethodCardCountryParams{
+		StripePaymentMethodID: stripePaymentMethodID,
+		CardCountry:           pgtype.Text{String: country, Valid: country != ""},
+	})
+	return err
 }

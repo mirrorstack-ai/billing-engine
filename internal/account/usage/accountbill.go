@@ -351,6 +351,9 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		paasCredit,
 		unresolvedOneTimeTotal,
 	)
+	// The tax ESTIMATE rides the same NET projection the card's grand total
+	// shows (core-v2#250: prices are net, tax is its own line).
+	response.Tax = s.taxEstimate(ctx, accountID, found, response.ProjectedTotalMicros)
 
 	return response, nil
 }

@@ -116,6 +116,8 @@ func (s *pgxStore) InsertPaymentMethod(ctx context.Context, stripeCustomerID str
 		//nolint:gosec // card expiry from the provider
 		ExpYear: int32(pm.ExpYear),
 		Column7: pm.Fingerprint,
+		// Column8 is NULLIF($8,'') card_country (migration 074).
+		Column8: pm.CardCountry,
 	})
 	if err != nil {
 		return false, false, false, err

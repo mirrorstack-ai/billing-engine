@@ -26,6 +26,7 @@ func inf() float64 { return math.Inf(1) }
 // --- in-memory Store fake -------------------------------------------------
 
 type fakeStore struct {
+	cardCountries          map[uuid.UUID]string                // accountID → default card issuing country (migration 074); absent → not configured
 	defs                   map[string]usage.MetricDefinition   // key: module/metric
 	modelPrices            map[string]usage.ModelPrice         // key: metric/model
 	versionPrices          map[string]usage.MetricVersionPrice // key: module/metric/version (migration 044)
@@ -139,10 +140,10 @@ type fakeStore struct {
 	errAppModuleInfraBill error
 	// moduleInfraDevServed is what the devServed=true partition returns.
 	moduleInfraDevServed []usage.AppModuleInfraUsage
-	errPeriodList         error
-	errPeriodWindow       error
-	errAnchor             error
-	errListInvoices       error
+	errPeriodList        error
+	errPeriodWindow      error
+	errAnchor            error
+	errListInvoices      error
 
 	// captured ListInvoices call args, so a test can assert the clamped
 	// page+1 limit and the decoded cursor reached the store unchanged.
@@ -701,6 +702,11 @@ func (f *fakeStore) AccountByOwner(_ context.Context, owner usage.Owner) (uuid.U
 	}
 	id, ok := f.accounts[owner.UserID]
 	return id, ok, nil
+}
+
+func (f *fakeStore) DefaultCardCountry(_ context.Context, accountID uuid.UUID) (string, bool, error) {
+	country, ok := f.cardCountries[accountID]
+	return country, ok && country != "", nil
 }
 
 func (f *fakeStore) AppOwnerOrg(_ context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {

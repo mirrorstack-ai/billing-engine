@@ -46,6 +46,10 @@ type Client interface {
 	// DetachPaymentMethod detaches a saved card from its Customer. The
 	// resulting payment_method.detached webhook soft-deletes the mirror row.
 	DetachPaymentMethod(ctx context.Context, stripePaymentMethodID string) error
+	// PaymentMethodCardCountry returns a card payment method's issuing country
+	// (ISO 3166-1 alpha-2), "" for a non-card method. Read-only; the bill
+	// read's tax-estimate jurisdiction signal (migration 074, core-v2#250).
+	PaymentMethodCardCountry(ctx context.Context, stripePaymentMethodID string) (string, error)
 
 	// SetDefaultPaymentMethod points the Customer's invoice-settings
 	// default at the given payment method. The resulting customer.updated
