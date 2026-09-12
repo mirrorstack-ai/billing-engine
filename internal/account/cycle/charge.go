@@ -33,7 +33,7 @@ import (
 //     LIVE ms_billing.apps rows (deleted_at IS NULL — a deleted app stops
 //     accruing base, D1e, though its usage arrears above still bill) that
 //     EXISTED BEFORE the new period opened (created_at < the closed window's
-//     period_end) of the FLAT BaseFeeMicros. An app created INSIDE the new
+//     period_end) of each app's own plan base. An app created INSIDE the new
 //     period is excluded — RegisterApp's creation-proration leg already charged
 //     its new-period base (full or prorated); it joins the advance leg at the
 //     NEXT boundary. module_count is snapshotted AT CHARGE TIME. 🔴 The
@@ -270,7 +270,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("live app roster read failed", err)
 	}
-	// Each live app contributes ONLY its FLAT base. Module overage is billed
+	// Each live app contributes ONLY its plan's flat base. Module overage is billed
 	// SEPARATELY below (the advance-overage / Leg 2 precharge), not folded into an
 	// app's base — it rides per-module-instance grace timers (migration 033).
 	var advanceBase int64
@@ -645,7 +645,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	//     model, whose freeze migration 033 dropped).
 	//   - Fresh: the cents==0 sub-half-cent short-circuit applies (never call
 	//     Stripe for $0 — an advance base/overage, when present, is always ≥ $5
-	//     (a whole block, or the $20 base; leg 2 never prorates)
+	//     (a whole block, or a paid plan's full base; leg 2 never prorates)
 	//     and can never round to 0; nothing was ever put through Stripe for this
 	//     run), then freeze BEFORE the first Stripe call. The freeze is
 	//     first-write-wins AND returns the SURVIVING row value (H6): a concurrent

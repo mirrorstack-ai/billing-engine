@@ -472,6 +472,9 @@ type UnresolvedOneTimeChargeRaw struct {
 	GraceExpiresAt        time.Time
 	ActivatedAt           time.Time
 	CountsTowardRecurring bool
+	// Plan is the app's plan on a creation-base row (migration 075), which
+	// prices its unit; "" on a module-timer row, whose unit is the module fee.
+	Plan Plan
 
 	// Frozen identifies a migration-050 combined Stripe attempt. Its raw amount
 	// and coverage snapshots are immutable first-write-wins data; callers must
@@ -1603,6 +1606,7 @@ func (s *pgxStore) UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.
 			GraceExpiresAt:            r.GraceExpiresAt,
 			ActivatedAt:               r.ActivatedAt,
 			CountsTowardRecurring:     r.CountsTowardRecurring,
+			Plan:                      Plan(r.Plan),
 			Frozen:                    r.Frozen,
 			FrozenAmountMicros:        r.FrozenAmountMicros,
 			FrozenSnapshotPeriodStart: r.FrozenSnapshotPeriodStart,

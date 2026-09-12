@@ -11,19 +11,23 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
 
-// Per-app plans on the bill reads (core-v2#1412, billing-engine#202 PR-1): each
-// app is priced from its OWN plan, and the bill says which plan and what it
+// Per-app plans on the bill reads (core-v2#1412, billing-engine#202): each app
+// is priced from its OWN plan, and the bill says which plan and what it
 // includes.
 
+// planBases is each plan's monthly base, written out rather than read from
+// usage.TermsFor so a test fails when a price moves.
+var planBases = []struct {
+	plan usage.Plan
+	base int64
+}{
+	{usage.PlanFree, 0},
+	{usage.PlanPro, 20_000_000},
+	{usage.PlanBusiness, 50_000_000},
+}
+
 func TestGetAppBill_BaseFeeFollowsTheAppsPlan(t *testing.T) {
-	for _, tc := range []struct {
-		plan usage.Plan
-		want int64
-	}{
-		{usage.PlanFree, 0},
-		{usage.PlanPro, 20_000_000},
-		{usage.PlanBusiness, 50_000_000},
-	} {
+	for _, tc := range planBases {
 		t.Run(string(tc.plan), func(t *testing.T) {
 			store := newFakeStore()
 			owner := uuid.New()
@@ -33,7 +37,7 @@ func TestGetAppBill_BaseFeeFollowsTheAppsPlan(t *testing.T) {
 
 			resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: appID})
 			require.NoError(t, err)
-			require.Equal(t, tc.want, resp.BaseFeeMicros, "the base fee is the app's own plan's")
+			require.Equal(t, tc.base, resp.BaseFeeMicros, "the base fee is the app's own plan's")
 			require.Equal(t, usage.TermsFor(tc.plan), resp.Plan, "the bill names the plan and what it includes")
 		})
 	}
@@ -78,14 +82,7 @@ func TestGetAccountBill_EachAppCarriesItsOwnPlan(t *testing.T) {
 func TestGetAccountBill_UnresolvedCreationChargeIsPricedAtTheAppsPlan(t *testing.T) {
 	// Period Jul 11 - Aug 11 (31 days); created Jul 25, so 17 days remain and
 	// the 3-day grace does not straddle into the next period.
-	for _, tc := range []struct {
-		plan usage.Plan
-		base int64
-	}{
-		{usage.PlanFree, 0},
-		{usage.PlanPro, 20_000_000},
-		{usage.PlanBusiness, 50_000_000},
-	} {
+	for _, tc := range planBases {
 		t.Run(string(tc.plan), func(t *testing.T) {
 			store := newFakeStore()
 			owner, accountID := uuid.New(), uuid.New()
@@ -101,6 +98,7 @@ func TestGetAccountBill_UnresolvedCreationChargeIsPricedAtTheAppsPlan(t *testing
 				ChargeAt:       createdAt,
 				GraceExpiresAt: usage.GraceExpiry(createdAt),
 				ActivatedAt:    time.Date(2026, 6, 11, 9, 0, 0, 0, time.UTC),
+				Plan:           tc.plan,
 			}}
 			store.activatedRecurring = &usage.RecurringFeeCounts{}
 
@@ -116,14 +114,7 @@ func TestGetAccountBill_UnresolvedCreationChargeIsPricedAtTheAppsPlan(t *testing
 
 func TestListNewCreationCharges_PendingPreviewIsTheAppsPlanBase(t *testing.T) {
 	// Period Jul 11 - Aug 11 (31 days); created Jul 18, so 24 days remain.
-	for _, tc := range []struct {
-		plan usage.Plan
-		base int64
-	}{
-		{usage.PlanFree, 0},
-		{usage.PlanPro, 20_000_000},
-		{usage.PlanBusiness, 50_000_000},
-	} {
+	for _, tc := range planBases {
 		t.Run(string(tc.plan), func(t *testing.T) {
 			store := newFakeStore()
 			owner, accountID := uuid.New(), uuid.New()
@@ -162,6 +153,7 @@ func TestGetAccountBill_FrozenAttemptDeductsTheAppsOwnPlanUnit(t *testing.T) {
 		GraceExpiresAt:            time.Date(2026, 6, 5, 0, 0, 0, 0, time.UTC),
 		ActivatedAt:               activatedAt,
 		CountsTowardRecurring:     true,
+		Plan:                      usage.PlanBusiness,
 		Frozen:                    true,
 		FrozenAmountMicros:        partial + 50_000_000,
 		FrozenSnapshotPeriodStart: time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC),

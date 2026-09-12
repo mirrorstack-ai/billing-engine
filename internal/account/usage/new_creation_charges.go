@@ -288,7 +288,7 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			// anchor day; the sweep anchors from created_at with that same day, so
 			// an in-window created_at resolves to these identical bounds.
 			eta := GraceExpiry(r.CreatedAt)
-			projected := CreationChargeBaseMicros(TermsFor(r.Plan).BaseFeeMicros, r.CreatedAt, periodStart, periodEnd)
+			projected := CreationChargeBaseMicros(resolveBaseFeeMicros(r.Plan), r.CreatedAt, periodStart, periodEnd)
 			overCount, err := s.store.CoCreatedOverModuleTimerCount(ctx, accountID, r.AppID, r.CreatedAt, IncludedModules)
 			if err != nil {
 				return nil, billing.Internal("co-created over-module timer count query failed", err)

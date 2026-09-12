@@ -743,7 +743,8 @@ dynamic_creations AS (
                    FROM ms_billing.app_combined_proration_attempts any_attempt
                    WHERE any_attempt.app_id = app.app_id
                )
-           ) AS ownership_unknown
+           ) AS ownership_unknown,
+           app.plan
     FROM ms_billing.apps app
     JOIN ms_billing.accounts account ON account.id = app.account_id
     WHERE app.account_id = $1::uuid
@@ -788,7 +789,8 @@ dynamic_timers AS (
                SELECT 1
                FROM ms_billing.app_combined_proration_attempt_timers any_owned
                WHERE any_owned.timer_id = timer.id
-           ) AS ownership_unknown
+           ) AS ownership_unknown,
+           ''::text AS plan
     FROM ms_billing.app_module_overage_timers timer
     JOIN ms_billing.accounts account ON account.id = timer.account_id
     LEFT JOIN live_timer_ranks rank ON rank.id = timer.id
@@ -833,7 +835,8 @@ frozen_bases AS (
            (frozen.straddle_period_start IS NOT NULL) AS frozen_has_straddle,
            frozen.timer_count AS frozen_declared_timer_count,
            frozen.actual_timer_count AS frozen_actual_timer_count,
-           false AS ownership_unknown
+           false AS ownership_unknown,
+           app.plan
     FROM frozen_headers frozen
     JOIN ms_billing.apps app ON app.app_id = frozen.app_id
     JOIN ms_billing.accounts account ON account.id = frozen.account_id
@@ -857,7 +860,8 @@ frozen_timers AS (
            (frozen.straddle_period_start IS NOT NULL) AS frozen_has_straddle,
            frozen.timer_count AS frozen_declared_timer_count,
            frozen.actual_timer_count AS frozen_actual_timer_count,
-           false AS ownership_unknown
+           false AS ownership_unknown,
+           ''::text AS plan
     FROM frozen_headers frozen
     JOIN ms_billing.app_combined_proration_attempt_timers child
       ON child.app_id = frozen.app_id
@@ -876,7 +880,7 @@ all_charges AS (
            frozen_straddle_base_micros,
            frozen_has_straddle,
            frozen_declared_timer_count, frozen_actual_timer_count,
-           ownership_unknown
+           ownership_unknown, plan
     FROM dynamic_creations
     UNION ALL
     SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
@@ -888,7 +892,7 @@ all_charges AS (
            frozen_straddle_base_micros,
            frozen_has_straddle,
            frozen_declared_timer_count, frozen_actual_timer_count,
-           ownership_unknown
+           ownership_unknown, plan
     FROM dynamic_timers
     UNION ALL
     SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
@@ -900,7 +904,7 @@ all_charges AS (
            frozen_straddle_base_micros,
            frozen_has_straddle,
            frozen_declared_timer_count, frozen_actual_timer_count,
-           ownership_unknown
+           ownership_unknown, plan
     FROM frozen_bases
     UNION ALL
     SELECT charge_kind, charge_id, app_id, charge_at, grace_expires_at,
@@ -912,7 +916,7 @@ all_charges AS (
            frozen_straddle_base_micros,
            frozen_has_straddle,
            frozen_declared_timer_count, frozen_actual_timer_count,
-           ownership_unknown
+           ownership_unknown, plan
     FROM frozen_timers
 )
 SELECT charge_kind::text,
@@ -939,7 +943,8 @@ SELECT charge_kind::text,
        frozen_has_straddle::boolean,
        frozen_declared_timer_count::int,
        frozen_actual_timer_count::bigint,
-       ownership_unknown::boolean
+       ownership_unknown::boolean,
+       plan::text
 FROM all_charges
 ORDER BY charge_at, charge_kind, charge_id
 `
@@ -970,6 +975,7 @@ type UnresolvedOneTimeChargesRow struct {
 	FrozenDeclaredTimerCount  int32     `json:"frozen_declared_timer_count"`
 	FrozenActualTimerCount    int64     `json:"frozen_actual_timer_count"`
 	OwnershipUnknown          bool      `json:"ownership_unknown"`
+	Plan                      string    `json:"plan"`
 }
 
 // UnresolvedOneTimeCharges is GetAccountBill's authoritative one-time
@@ -993,6 +999,9 @@ type UnresolvedOneTimeChargesRow struct {
 // removes it here and admits it to ActivatedRecurringFeeCounts. Declared/actual
 // child counts are repeated on every frozen row (including the base), making
 // incomplete ownership loud.
+// Creation-base rows carry the app's plan (apps.plan, migration 075), so the
+// forecast prices each creation at its own plan base. Module-timer rows carry
+// ”: their unit is the module fee, and none counts toward recurring.
 func (q *Queries) UnresolvedOneTimeCharges(ctx context.Context, arg UnresolvedOneTimeChargesParams) ([]UnresolvedOneTimeChargesRow, error) {
 	rows, err := q.db.Query(ctx, unresolvedOneTimeCharges, arg.AccountID, arg.GraceHours, arg.IncludedModules)
 	if err != nil {
@@ -1022,6 +1031,7 @@ func (q *Queries) UnresolvedOneTimeCharges(ctx context.Context, arg UnresolvedOn
 			&i.FrozenDeclaredTimerCount,
 			&i.FrozenActualTimerCount,
 			&i.OwnershipUnknown,
+			&i.Plan,
 		); err != nil {
 			return nil, err
 		}

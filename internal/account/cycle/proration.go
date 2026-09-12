@@ -84,9 +84,10 @@ const (
 	// boundary spine applies). Transient like no-PM: re-attempted once a
 	// webhook-driven relax flips the account back to arrears.
 	ProrationStatusPrepaid ProrationStatus = "skipped_prepaid"
-	// ProrationStatusNoCharge: the proration rounded to 0 cents (effectively
-	// unreachable for a real survived app whose base is ≥ $20) → nothing to
-	// invoice, guard left unarmed.
+	// ProrationStatusNoCharge: the proration rounded to 0 cents — a Free app,
+	// whose plan base is $0 → nothing to invoice, guard left unarmed. Before Free
+	// can be chosen, billing-engine#202 must arm the guard here too: the sweep
+	// re-selects an unarmed app, and co-created timers defer to its attempt.
 	ProrationStatusNoCharge ProrationStatus = "no_charge"
 
 	// ProrationStatusProposed: the intent cutover was armed, so this
@@ -250,9 +251,9 @@ type ProrationWalletCharge struct {
 // invokes per pending app. It is idempotent (the one-shot proration_invoice_id
 // guard) and race-safe against a concurrent soft-delete (the FOR UPDATE section).
 //
-// The amount is the FLAT per-app base, prorated to the creation window:
+// The amount is the app's plan base, prorated to the creation window:
 //
-//	ProratedBaseMicros(BaseFeeMicros, created_at,
+//	ProratedBaseMicros(TermsFor(plan).BaseFeeMicros, created_at,
 //	                   the anchored period CONTAINING created_at)
 //
 // anchored to the TRUE created_at (NOT now), so the app pays only for the whole
@@ -1120,8 +1121,8 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 
 	amountMicros := prorated
 	if amountMicros <= 0 {
-		// Rounds to nothing (unreachable for a survived app whose base ≥ $20) —
-		// nothing to draw, guard stays unarmed.
+		// A Free app's $0 plan base — nothing to draw, guard stays unarmed (see
+		// ProrationStatusNoCharge).
 		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, false, nil
 	}
 

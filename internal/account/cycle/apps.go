@@ -221,7 +221,7 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 // presumably removed what they added most recently); a delete soft-removes ALL
 // the app's still-live timers. A removed timer never charges (matching the
 // delete-in-grace = never-charged posture), and no refund is issued for a timer
-// already charged this period (D1e). The per-app FLAT base still takes effect at
+// already charged this period (D1e). The per-app plan base still takes effect at
 // the NEXT boundary (no mid-period base micro-invoice / refund).
 func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest) (*SyncAppModulesResponse, error) {
 	if req.AppID == uuid.Nil {

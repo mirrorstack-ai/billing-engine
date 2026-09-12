@@ -143,9 +143,9 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	}
 
 	// The next-period recurring base, decomposed by owning app. Only the CURRENT
-	// live window forecasts one (a frozen window's projection is the flat per-app
+	// live window forecasts one (a frozen window's projection is each app's plan
 	// base and nothing else), so a historical bill reads no shares and allocates
-	// the flat fee directly below.
+	// that base directly below.
 	var recurringShares []AppRecurringFeeShare
 	if periodID == "" {
 		store, ok := s.store.(interface {
@@ -397,21 +397,9 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 	}
 
 	var total int64
-	// Each app's plan base (migration 075), read once per app. An unmirrored app
-	// reads as the zero Plan, which prices at the default plan.
-	appBase := make(map[uuid.UUID]int64)
 	for _, charge := range charges {
-		base, ok := appBase[charge.AppID]
-		if !ok {
-			mirror, _, err := s.store.AppMirror(ctx, charge.AppID)
-			if err != nil {
-				return 0, billing.Internal("unresolved one-time charge plan lookup failed", err)
-			}
-			base = resolveBaseFeeMicros(mirror.Plan)
-			appBase[charge.AppID] = base
-		}
 		increment, err := unresolvedOneTimeChargeIncrementMicros(
-			charge, base, projectedPeriodStart,
+			charge, projectedPeriodStart,
 		)
 		if err != nil {
 			return 0, err
@@ -425,9 +413,9 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 }
 
 // unresolvedOneTimeChargeIncrementMicros mirrors the immutable D1d charge shape
-// shared by creation base and module-timer grace legs. appBaseMicros is the
-// app's plan base: the creation-base unit, and the full-period base a frozen
-// attempt's snapshot is compared with.
+// shared by creation base and module-timer grace legs. A creation-base row
+// prices at its app's plan base (charge.Plan), which is also the full-period
+// base a frozen attempt's snapshot is compared with.
 //   - charge day → its anchored period end, prorated at the unit fee;
 //   - plus one full unit when grace straddles into the following period;
 //   - if activation closed the first period, forgive it and retain only a
@@ -450,9 +438,9 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 // cross-charge view this per-charge function does not have.
 func unresolvedOneTimeChargeIncrementMicros(
 	charge UnresolvedOneTimeChargeRaw,
-	appBaseMicros int64,
 	projectedPeriodStart time.Time,
 ) (int64, error) {
+	appBaseMicros := resolveBaseFeeMicros(charge.Plan)
 	var unitMicros int64
 	switch charge.Kind {
 	case UnresolvedOneTimeChargeCreationBase:

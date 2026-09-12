@@ -14,13 +14,13 @@ const microsPerCent = 10_000
 // spec 2026-07-05, DESIGN.md "Base fee — v2: creation grace + per-module overage
 // timers"). Both consumers — the display read (GetAppBill / GetAccountBill, this
 // package) and the charge spine (cycle: the creation/combined charge, the
-// boundary advance leg, the per-module grace sweep) — compute the per-app FLAT
+// boundary advance leg, the per-module grace sweep) — compute each app's plan
 // base and the account overage through these functions, so the bill page, the
 // invoice, and the mirror can never disagree by construction. All money is
 // integer micro-dollars; the arithmetic here is pure int64 (no big.Rat needed:
 // the operands are bounded — see ProratedBaseMicros).
 //
-// The flat $20/app base is per-app; the $5-per-block-of-5 surcharge applies to the
+// The base is per app, from its plan (TermsFor); the $5-per-block-of-5 surcharge applies to the
 // account's over-count, max(0, live module count − IncludedModules). Under the
 // per-module-instance model (migration 033) the charge legs tier per install
 // TIMER (each on its own grace), while the DISPLAY reads the live timer count

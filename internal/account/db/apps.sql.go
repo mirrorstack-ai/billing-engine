@@ -171,10 +171,11 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 	Plan        string `json:"plan"`
 }
 
-// LiveAppModuleCountsCreatedBefore returns (app_id, module_count) for every
+// LiveAppModuleCountsCreatedBefore returns (app_id, module_count, plan) for every
 // LIVE (deleted_at IS NULL) app on the account that has JOINED the advance
 // base mechanism by the cutoff — the boundary charge's advance-base input:
-// advance base = Σ (BaseFee + Overage × max(0, module_count − included)).
+// advance base = Σ each app's plan base (module overage rides per-install
+// timers, migration 033).
 // The cutoff is the NEW period's start (the closed window's period_end). Two
 // conditions, mirroring the module-timer coverage contract (review 2026-07-06):
 //   - created_at < @created_before — an app created INSIDE the new period is
