@@ -74,6 +74,8 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.compute.walltime.ms    additive dispatch wall-time ms (fallback) → sum
 //	infra.egress.bytes           additive CDN/egress bytes (retired)       → sum
 //	infra.egress.cdn.bytes       static CDN egress (per-GiB, migration 078) → sum
+//	infra.cdn.request.count      CDN requests, all tiers (per-1k, 080)      → count
+//	infra.cdn.r2.read.count      R2-tier reads (per-1k, migration 080)      → count
 //	infra.ai.input.tokens        additive provider INPUT tokens            → sum
 //	infra.ai.output.tokens       additive provider OUTPUT tokens           → sum
 //	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens        → sum
@@ -147,6 +149,16 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// NAMED bytes but priced/emitted PER GiB (rule 5; the per-byte COGS
 		// floors) → producer value = bytes/1024^3, exactly as the SSR hop.
 		return KindSum, true
+	case "infra.cdn.request.count":
+		// Every metered request at the CDN edge for a deploy, all cache tiers
+		// (migration 080; cdn-worker#58 double2). count; priced per 1k → producer
+		// value = requests/1000 (rule 5; 0.3 µ$/request floors).
+		return KindCount, true
+	case "infra.cdn.r2.read.count":
+		// Requests a deploy served from the R2 tier — one class-B read each
+		// (migration 080; cdn-worker#58 blob4 = r2-hit). count; per 1k →
+		// producer value = reads/1000.
+		return KindCount, true
 	case "infra.ai.input.tokens":
 		return KindSum, true
 	case "infra.ai.output.tokens":

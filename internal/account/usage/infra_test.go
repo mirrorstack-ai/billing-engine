@@ -510,6 +510,8 @@ func TestRecordInfraUsage_AcceptsSSRComputeMetrics(t *testing.T) {
 		{"infra.compute.ssr.request.count", usage.KindCount},
 		{"infra.compute.ssr.egress.bytes", usage.KindSum},
 		{"infra.egress.cdn.bytes", usage.KindSum},
+		{"infra.cdn.request.count", usage.KindCount},
+		{"infra.cdn.r2.read.count", usage.KindCount},
 	} {
 		t.Run(tc.metric, func(t *testing.T) {
 			store := newFakeStore()

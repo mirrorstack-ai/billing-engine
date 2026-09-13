@@ -114,6 +114,12 @@ const (
 
 // resolveBaseFeeMicros returns an app's recurring base fee (before the
 // per-module surcharge) from its plan's terms (plans.go).
+// deployDisplayGroup is the catalog display_group (migration 079) whose lines
+// sum into 部署用量: a deploy's own CDN egress, CDN requests, R2 reads and SSR
+// compute — a category, not a key list, so the plan's 用量額度 offsets
+// whatever the catalog puts here.
+const deployDisplayGroup = "deploy"
+
 func resolveBaseFeeMicros(plan Plan) int64 {
 	return TermsFor(plan).BaseFeeMicros
 }
@@ -268,6 +274,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		// module usage + Infra − PaasCredit (migration 073).
 		ModuleUsageDevServedMicros: parts.ModuleUsageDevServedMicros,
 		InfraTotalMicros:           parts.InfraTotalMicros,
+		DeployUsageMicros:          parts.DeployUsageMicros,
 		InfraLines:                 parts.InfraLines,
 		ModuleInfraLines:           parts.ModuleInfraLines,
 		ModuleInfraDevServedLines:  parts.ModuleInfraDevServedLines,
@@ -341,8 +348,12 @@ type appBillParts struct {
 	// InfraTotalMicros is 基礎設施 = Σ InfraLines + Σ ModuleInfraLines (the
 	// 1.2× infra markup already applied once, in SQL).
 	InfraTotalMicros int64
-	InfraLines       []AppInfraUsage
-	ModuleInfraLines []AppModuleInfraUsage
+	// DeployUsageMicros is the 'deploy' display-group subset of InfraLines
+	// (migration 079/080) — 部署用量 as one number. Group is the catalog's
+	// display_group, so a new deploy-side metric joins by its row alone.
+	DeployUsageMicros int64
+	InfraLines        []AppInfraUsage
+	ModuleInfraLines  []AppModuleInfraUsage
 	// ModuleInfraDevServedLines is the tunnel-burned half of the same per-module
 	// infra read: priced, displayed, and — like ModuleUsageDevServedMicros — never
 	// a term in InfraTotalMicros or any other total.
@@ -554,9 +565,12 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	// pure display re-partition of the same infra total (attributed → moduleInfraLines,
 	// unattributable → infraLines), so it is Σ of BOTH so that base fee / PaaS credit /
 	// TotalMicros math downstream is unchanged.
-	var infraTotal int64
+	var infraTotal, deployUsage int64
 	for _, l := range infraLines {
 		infraTotal += l.ChargedMicros
+		if l.Group == deployDisplayGroup {
+			deployUsage += l.ChargedMicros
+		}
 	}
 	for _, l := range moduleInfraLines {
 		infraTotal += l.ChargedMicros
@@ -641,6 +655,7 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		ModuleUsageTotalMicros:     moduleUsageTotal,
 		ModuleUsageDevServedMicros: moduleUsageDevServed,
 		InfraTotalMicros:           infraTotal,
+		DeployUsageMicros:          deployUsage,
 		InfraLines:                 infraLines,
 		ModuleInfraLines:           moduleInfraLines,
 		ModuleInfraDevServedLines:  moduleInfraDevServed,

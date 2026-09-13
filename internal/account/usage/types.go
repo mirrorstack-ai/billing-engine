@@ -507,6 +507,16 @@ type GetAppBillResponse struct {
 	// breakdown is InfraLines (kept as this scalar for back-compat).
 	InfraTotalMicros int64 `json:"infra_total_micros"`
 
+	// DeployUsageMicros is 部署用量: the deploy-side infrastructure of a
+	// custom-hosted app's own deployment traffic — Σ InfraLines[] whose
+	// Group is 'deploy' (migration 079/080: CDN egress, CDN requests, R2
+	// reads, SSR compute). A SUBSET of InfraTotalMicros, never a term added
+	// to it; the console's 部署用量 line reads this and computes nothing
+	// itself, so the console and the ledger read ONE number (core-v2#1412,
+	// owner 2026-09-13). The plan's 用量額度 offsets this group plus module
+	// usage as a category.
+	DeployUsageMicros int64 `json:"deploy_usage_micros"`
+
 	// InfraLines is the per-metric 基礎設施 RESIDUAL breakdown: one line for EVERY
 	// active declared infra metric (the platform-infra sentinel catalog rows),
 	// including the ones with zero usage this period (0 quantity / $0), so "show
@@ -650,6 +660,9 @@ type AccountAppBill struct {
 	// InfraMicros is the app's 基礎設施 total (residual + per-module attributed,
 	// the 1.2× infra markup applied once, in SQL).
 	InfraMicros int64 `json:"infra_micros"`
+	// DeployUsageMicros is this app's 部署用量 — the 'deploy' display-group
+	// subset of InfraMicros (see GetAppBillResponse.DeployUsageMicros).
+	DeployUsageMicros int64 `json:"deploy_usage_micros"`
 	// TotalMicros = BaseFee + ModuleUsage + Infra for THIS app, PRE-CREDIT: the
 	// account-level agent bucket, overage, and PaaS credit are never allocated
 	// back per-app, so Σ apps[].total_micros == BaseFeeTotalMicros +
@@ -714,6 +727,9 @@ type GetAccountBillResponse struct {
 	BaseFeeTotalMicros     int64 `json:"base_fee_total_micros"`
 	ModuleUsageTotalMicros int64 `json:"module_usage_total_micros"`
 	InfraTotalMicros       int64 `json:"infra_total_micros"`
+	// DeployUsageTotalMicros is Σ Apps[].DeployUsageMicros — the 'deploy'
+	// display-group subset of InfraTotalMicros, never added to it.
+	DeployUsageTotalMicros int64 `json:"deploy_usage_total_micros"`
 
 	// AccountOverageMicros is the account's module overage for the period
 	// (migration 033): $5 × ceil(max(0, Σ live-app module_count − IncludedModules) / 5),

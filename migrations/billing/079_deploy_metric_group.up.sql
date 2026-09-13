@@ -1,0 +1,13 @@
+-- 079: the 'deploy' display group (core-v2#1412 Option B2, billing-engine#212).
+--
+-- The console's 部署用量 line and the ledger must read ONE number: the
+-- deploy-side infrastructure of a custom-hosted app's own deployment traffic
+-- — CDN egress, CDN requests, R2 reads, SSR compute — nothing platform-side
+-- (owner 2026-09-13, final scope on core-v2#1412). That number is a GROUP of
+-- catalog rows, not a fixed key list, so the plan's 用量額度 offsets a category
+-- and a new deploy-side metric joins it by its catalog row alone.
+--
+-- Its own file, and only this statement: adding an enum value cannot be used
+-- in the same transaction that adds it. Migration 080 seeds the rows and
+-- regroups the existing deploy-side keys under it.
+ALTER TYPE ms_billing.metric_group ADD VALUE IF NOT EXISTS 'deploy';

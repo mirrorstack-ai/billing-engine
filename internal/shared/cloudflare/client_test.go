@@ -163,3 +163,36 @@ func TestQueryEgressWindow_Non200IsFatal(t *testing.T) {
 	require.ErrorContains(t, err, "status 500")
 	require.ErrorContains(t, err, "upstream boom")
 }
+
+func TestQueryRequestWindow_ParsesTierAndStageGroups(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		_, _ = w.Write([]byte(`{"meta":[],"data":[
+			{"app_id":"app-a","module_id":"","tier":"edge-hit","stage":"prod","requests":120},
+			{"app_id":"app-a","module_id":"","tier":"r2-hit","stage":"prod","requests":30},
+			{"app_id":"app-b","module_id":"","tier":"","stage":"","requests":0}
+		],"rows":3}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	start := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	rows, err := c.QueryRequestWindow(context.Background(), "cdn_egress", start, start.Add(time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, []RequestRow{
+		{AppID: "app-a", ModuleID: "", Tier: "edge-hit", Stage: "prod", Requests: 120},
+		{AppID: "app-a", ModuleID: "", Tier: "r2-hit", Stage: "prod", Requests: 30},
+		{AppID: "app-b", ModuleID: "", Tier: "", Stage: "", Requests: 0},
+	}, rows)
+	// double2 weighted by the sampling interval, grouped by the two new blobs.
+	require.Contains(t, gotBody, "SUM(_sample_interval * double2)")
+	require.Contains(t, gotBody, "blob4 AS tier")
+	require.Contains(t, gotBody, "blob5 AS stage")
+	require.Contains(t, gotBody, "GROUP BY blob1, blob2, blob4, blob5")
+	require.NotContains(t, gotBody, "Z')")
+
+	_, err = c.QueryRequestWindow(context.Background(), "bad name", start, start.Add(time.Hour))
+	require.Error(t, err, "the dataset name is interpolated into raw SQL and must be validated")
+}

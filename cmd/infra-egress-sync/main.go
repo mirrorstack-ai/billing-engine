@@ -104,6 +104,26 @@ const ssrEgressMetric = "infra.compute.ssr.egress.bytes"
 // cdn_egress dataset — the shared contract with cdn-worker PR #16.
 const ssrModuleIDSentinel = "ssr"
 
+// cdnRequestMetric and cdnR2ReadMetric are the two counts the second pull
+// per window records (migration 080, billing-engine#212) from cdn-worker#58's
+// double2 (one request) and blob4 (tier): every metered request for a deploy,
+// and the subset the R2 tier served (one class-B read each). Both are priced
+// per 1k, so the producer value is count / requestsPerUnit (rule 5).
+const cdnRequestMetric = "infra.cdn.request.count"
+const cdnR2ReadMetric = "infra.cdn.r2.read.count"
+
+// requestsPerUnit is the billing unit of both request counts: 1,000.
+const requestsPerUnit = 1000
+
+// r2HitTier is cdn-worker's blob4 value for a request served from R2
+// (EgressTier::R2Hit.as_str()) — the shared contract with cdn-worker#58.
+const r2HitTier = "r2-hit"
+
+// billedStage is the only blob5 value whose requests are billed. Dev and prod
+// share one dataset; cdn-worker's wrangler.dev.toml stamps "dev", and rows from
+// before cdn-worker#58 carry "" — neither is production traffic.
+const billedStage = "prod"
+
 // bytesPerGiB converts raw bytes to GiB (2^30 bytes) — the unit
 // infra.compute.ssr.egress.bytes is priced in (migration 046), matching every
 // other platform-infra `.bytes` metric's GiB-basis convention
@@ -261,14 +281,20 @@ func handler(svc *usage.Service, cf cloudflare.AnalyticsQuerier) func(context.Co
 
 // syncResult tallies one sweep for logging / exit code.
 type syncResult struct {
-	Windows   int   // closed hour windows queried
-	Rows      int   // total (app, module) rows returned across windows
-	Recorded  int   // events newly inserted
-	Deduped   int   // events that hit ON CONFLICT (already recorded)
-	Skipped   int   // rows skipped for an empty / unparseable app_id
-	RowErrors int   // per-row RecordInfraUsage errors (logged, non-fatal)
-	Failed    bool  // a CF query error aborted a window (run exits non-zero)
-	Err       error // the first fatal (CF query) error, for the Lambda return
+	Windows   int // closed hour windows queried
+	Rows      int // total (app, module) rows returned across windows
+	Recorded  int // events newly inserted
+	Deduped   int // events that hit ON CONFLICT (already recorded)
+	Skipped   int // rows skipped for an empty / unparseable app_id
+	RowErrors int // per-row RecordInfraUsage errors (logged, non-fatal)
+	// The request pass (billing-engine#212): rows of the second query, the
+	// (app, module) request events recorded, and the rows dropped for a
+	// non-prod stage (or an empty one — pre-cdn-worker#58 rows).
+	RequestRows     int
+	RequestRecorded int
+	RequestSkipped  int
+	Failed          bool  // a CF query error aborted a window (run exits non-zero)
+	Err             error // the first fatal (CF query) error, for the Lambda return
 }
 
 // syncEgress sweeps the last lookbackHours CLOSED hour windows ending at the top
@@ -340,8 +366,98 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 				res.Deduped++
 			}
 		}
+
+		// THE REQUEST PASS (billing-engine#212). A second query over the same
+		// closed window, grouped by tier and stage; a query error is fatal for
+		// the same reason as above. Rows are folded per (app, module) in Go
+		// so each metric stays ONE event per (app, module, window) — the same
+		// id shape as the byte event, and idempotent the same way.
+		requestRows, err := cf.QueryRequestWindow(ctx, egressDataset, w.start, w.end)
+		if err != nil {
+			slog.ErrorContext(ctx, "cloudflare request query failed",
+				"window_start", w.start, "window_end", w.end, "error", err)
+			res.Failed = true
+			res.Err = err
+			return res
+		}
+		syncRequestRows(ctx, svc, w, requestRows, &res)
 	}
 	return res
+}
+
+// requestKey is one (app, module) group of the request pass.
+type requestKey struct {
+	appID    uuid.UUID
+	moduleID string
+}
+
+// requestTotals is what one (app, module) owes the two counts: every request,
+// and the R2-tier subset.
+type requestTotals struct {
+	requests float64
+	r2Reads  float64
+}
+
+// syncRequestRows folds one window's request rows per (app, module) and
+// records infra.cdn.request.count and, when any, infra.cdn.r2.read.count —
+// each as count / requestsPerUnit. Rows outside billedStage, with an
+// unparseable app_id, or with no requests are skipped (counted, at debug).
+func syncRequestRows(ctx context.Context, svc *usage.Service, w hourWindow, rows []cloudflare.RequestRow, res *syncResult) {
+	totals := map[requestKey]*requestTotals{}
+	order := []requestKey{}
+	for _, row := range rows {
+		res.RequestRows++
+		if row.Stage != billedStage || row.Requests <= 0 {
+			res.RequestSkipped++
+			continue
+		}
+		appID, err := uuid.Parse(row.AppID)
+		if err != nil || appID == uuid.Nil {
+			res.RequestSkipped++
+			slog.DebugContext(ctx, "skipping request row with unparseable app_id",
+				"app_id", row.AppID, "module_id", row.ModuleID, "window_start", w.start)
+			continue
+		}
+		key := requestKey{appID: appID, moduleID: row.ModuleID}
+		t, ok := totals[key]
+		if !ok {
+			t = &requestTotals{}
+			totals[key] = t
+			order = append(order, key)
+		}
+		t.requests += row.Requests
+		if row.Tier == r2HitTier {
+			t.r2Reads += row.Requests
+		}
+	}
+	for _, key := range order {
+		t := totals[key]
+		record := func(metric string, count float64) {
+			resp, err := svc.RecordInfraUsage(ctx, usage.RecordInfraUsageRequest{
+				EventID:    egressEventID(metric, key.appID, key.moduleID, w.start),
+				AppID:      key.appID,
+				Metric:     metric,
+				Value:      count / requestsPerUnit,
+				RecordedAt: w.start,
+			})
+			if err != nil {
+				res.RowErrors++
+				slog.ErrorContext(ctx, "record infra request count failed",
+					"app_id", key.appID, "module_id", key.moduleID, "metric", metric,
+					"window_start", w.start, "count", count, "error", err)
+				return
+			}
+			if resp.Recorded {
+				res.RequestRecorded++
+			} else {
+				res.Deduped++
+			}
+		}
+		record(cdnRequestMetric, t.requests)
+		if t.r2Reads > 0 {
+			record(cdnR2ReadMetric, t.r2Reads)
+		}
+	}
 }
 
 // egressMetricAndValue decides, from a single row's blob2 (module_id) alone,
@@ -406,5 +522,7 @@ func logResult(ctx context.Context, msg string, res syncResult) {
 		"windows", res.Windows, "rows", res.Rows,
 		"recorded", res.Recorded, "deduped", res.Deduped,
 		"skipped", res.Skipped, "row_errors", res.RowErrors,
+		"request_rows", res.RequestRows, "request_recorded", res.RequestRecorded,
+		"request_skipped", res.RequestSkipped,
 		"failed", res.Failed)
 }

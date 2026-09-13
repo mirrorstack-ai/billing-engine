@@ -26,6 +26,18 @@ type fakeCF struct {
 	err         error
 	queried     []hourWindow
 	dataset     string
+	// requestsByStart feeds QueryRequestWindow (billing-engine#212); a
+	// window absent here answers with no rows, like a dataset with no
+	// double2 yet.
+	requestsByStart map[time.Time][]cloudflare.RequestRow
+	requestErr      error
+}
+
+func (f *fakeCF) QueryRequestWindow(_ context.Context, _ string, start, _ time.Time) ([]cloudflare.RequestRow, error) {
+	if f.requestErr != nil {
+		return nil, f.requestErr
+	}
+	return f.requestsByStart[start], nil
 }
 
 func (f *fakeCF) QueryEgressWindow(_ context.Context, datasetName string, start, end time.Time) ([]cloudflare.EgressRow, error) {
@@ -447,4 +459,68 @@ func TestClosedHourWindows(t *testing.T) {
 	for i := 1; i < len(got); i++ {
 		require.True(t, got[i].start.Equal(got[i-1].end), "windows must be contiguous")
 	}
+}
+
+// --- The request pass (billing-engine#212, cdn-worker#58) -------------------
+
+// Requests fold per (app, module) across tiers into ONE infra.cdn.request.count
+// event, the r2-hit subset into ONE infra.cdn.r2.read.count event, both in
+// units of 1k; rows outside the prod stage (dev, or "" from before the worker
+// carried a stage) are dropped, and a group with no R2 reads records no
+// R2 event at all.
+func TestSyncEgress_RequestPassFoldsTiersPerAppAndBillsPer1k(t *testing.T) {
+	app := uuid.New()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	cf := &fakeCF{
+		rowsByStart: map[time.Time][]cloudflare.EgressRow{},
+		requestsByStart: map[time.Time][]cloudflare.RequestRow{
+			win: {
+				{AppID: app.String(), ModuleID: "", Tier: "edge-hit", Stage: "prod", Requests: 1500},
+				{AppID: app.String(), ModuleID: "", Tier: "r2-hit", Stage: "prod", Requests: 400},
+				{AppID: app.String(), ModuleID: "", Tier: "s3-origin", Stage: "prod", Requests: 100},
+				{AppID: app.String(), ModuleID: "", Tier: "edge-hit", Stage: "dev", Requests: 9999}, // dev: never billed
+				{AppID: app.String(), ModuleID: "", Tier: "", Stage: "", Requests: 0},               // pre-#58 row
+				{AppID: "not-a-uuid", ModuleID: "", Tier: "edge-hit", Stage: "prod", Requests: 7},   // unattributable
+			},
+		},
+	}
+	store := newFakeStore()
+
+	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.False(t, res.Failed)
+	require.Equal(t, 6, res.RequestRows)
+	require.Equal(t, 3, res.RequestSkipped, "dev, pre-#58 and unattributable rows")
+	require.Equal(t, 2, res.RequestRecorded, "one request event + one R2 event")
+	require.Equal(t, 2, len(store.events))
+
+	req := store.events[egressEventID(cdnRequestMetric, app, "", win)]
+	require.Equal(t, cdnRequestMetric, req.Metric)
+	require.Equal(t, usage.KindCount, req.Kind)
+	require.InDelta(t, 2.0, req.Value, 1e-9, "(1500 + 400 + 100) / 1000 — all tiers, prod only")
+	require.True(t, win.Equal(req.RecordedAt))
+
+	r2 := store.events[egressEventID(cdnR2ReadMetric, app, "", win)]
+	require.Equal(t, cdnR2ReadMetric, r2.Metric)
+	require.InDelta(t, 0.4, r2.Value, 1e-9, "400 / 1000 — the r2-hit rows only")
+
+	// Idempotent: the same window again dedupes both.
+	again := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.Equal(t, 0, again.RequestRecorded)
+	require.Equal(t, 2, again.Deduped)
+	require.Equal(t, 2, len(store.events))
+
+	// No R2 reads → no R2 event, and a request query error is fatal.
+	store2 := newFakeStore()
+	cf2 := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{}, requestsByStart: map[time.Time][]cloudflare.RequestRow{
+		win: {{AppID: app.String(), ModuleID: "m", Tier: "edge-hit", Stage: "prod", Requests: 250}},
+	}}
+	res2 := syncEgress(context.Background(), newSvc(store2), cf2, at)
+	require.Equal(t, 1, res2.RequestRecorded)
+	_, hasR2 := store2.events[egressEventID(cdnR2ReadMetric, app, "m", win)]
+	require.False(t, hasR2)
+	require.InDelta(t, 0.25, store2.events[egressEventID(cdnRequestMetric, app, "m", win)].Value, 1e-9)
+
+	cf3 := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{}, requestErr: errors.New("cf down")}
+	res3 := syncEgress(context.Background(), newSvc(newFakeStore()), cf3, at)
+	require.True(t, res3.Failed, "a request query failure aborts the sweep like an egress one")
 }
