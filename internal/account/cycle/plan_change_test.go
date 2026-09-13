@@ -463,8 +463,15 @@ func TestSetAppPlan_DowngradeWaitsForTheBoundaryAndCanBeCancelled(t *testing.T) 
 	require.Equal(t, resp.Change.ID, again.Change.ID)
 	require.Len(t, store.planChanges, 1)
 
-	// Upgrading back before the boundary cancels it, free of charge.
-	back, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	// Asking for the current plan WITHOUT naming the scheduled change is a
+	// no-op (a stale retry of an earlier "pro" request must not undo a newer
+	// downgrade): still scheduled. Naming it cancels it, free of charge.
+	noop, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	require.NoError(t, err)
+	require.Nil(t, noop.Change)
+	require.NotNil(t, noop.PendingChange, "the downgrade survives an unnamed request for the current plan")
+	require.Equal(t, cycle.PlanChangeScheduled, store.planChanges[resp.Change.ID].Status)
+	back, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro", CancelChangeID: resp.Change.ID})
 	require.NoError(t, err)
 	require.Equal(t, cycle.PlanChangeCancelled, back.Change.Status)
 	require.Nil(t, back.PendingChange)
@@ -525,13 +532,14 @@ func TestRunBillingCycle_BillsMembersAboveThePlansIncludedCount(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, cycle.RunStatusProposed, sum.Status)
 	require.EqualValues(t, 20_000_000, sum.AdvanceBaseMicros)
-	require.EqualValues(t, 4_000_000, sum.AdvanceMembersMicros)
+	require.EqualValues(t, 4_000_000, sum.MembersMicros)
 	require.Len(t, p.groups, 1)
 	var members int64
 	for _, c := range p.groups[0] {
 		for _, l := range c.Lines {
-			if l.SourceRef == "advance:members" {
+			if l.SourceRef == "members:closed" {
 				members += l.AmountMicros
+				require.Contains(t, l.Description, "closed period", "the line names the period it is for")
 			}
 		}
 	}
@@ -605,30 +613,74 @@ func TestChargeCreationProration_NothingToBillIsTerminalOnBothRails(t *testing.T
 	}
 }
 
-// A Free app WITH a co-created over-module timer has something to bill: the
-// timer line seals, the base line is simply absent, and the terminal is the
-// ordinary proposed stamp — the roster's included pool is 5, so the sixth
-// co-created module is over.
-func TestChargeCreationProration_FreeAppWithOverModulesSealsTheTimerLinesOnly(t *testing.T) {
-	store := newFakeStore()
-	user, _ := registeredAccount(store)
-	svc, p := planSvc(store, pcChangeAt)
-	appID := uuid.New()
-	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
-		OwnerUserID: user, AppID: appID, CreatedAt: pcCreated, Plan: "free", ModuleCount: 6,
-	})
-	require.NoError(t, err)
+// A Free app WITH a co-created over-module timer: the $0 base is TERMINAL on
+// both rails before any gate — the skip marker is armed, nothing is sealed by
+// the creation leg — and the marker is what hands the timer to the standalone
+// overage sweep (Leg 1), which prices it on its own intent. Before round 3 the
+// Stripe rail routed this shape into a freeze that refuses a $0 base and the
+// wallet rail returned unarmed, so the timer was deferred forever (round-2
+// review, #1 and #3).
+func TestChargeCreationProration_FreeAppWithOverModulesArmsTheSkipAndLeg1BillsTheTimer(t *testing.T) {
+	for _, credits := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stripe", true: "wallet"}[credits], func(t *testing.T) {
+			store := newFakeStore()
+			user, acct := registeredAccount(store)
+			if credits {
+				store.walletMode = cycle.CreditBillingModeCredits
+				seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
+			}
+			svc, p := planSvc(store, pcChangeAt)
+			if credits {
+				svc = svc.WithCreditWallet(true)
+			}
+			appID := uuid.New()
+			_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{
+				OwnerUserID: user, AppID: appID, CreatedAt: pcCreated, Plan: "free", ModuleCount: 6,
+			})
+			require.NoError(t, err)
+			over, err := store.CoCreatedOverModuleTimers(context.Background(), acct, appID, pcCreated, usage.IncludedModules)
+			require.NoError(t, err)
+			require.Len(t, over, 1, "the sixth co-created module is over the pool of 5")
+			timer := store.timers[over[0]]
+			cand := cycle.ModuleOverageCandidate{
+				ID: over[0], AccountID: acct, AppID: appID, InstalledAt: timer.installedAt,
+				GraceExpiresAt: timer.graceExpiresAt, ActivatedAt: store.activation[acct],
+			}
 
-	res, err := svc.ChargeCreationProration(context.Background(), appID)
-	require.NoError(t, err)
-	require.Equal(t, cycle.ProrationStatusProposed, res.Status)
-	require.Len(t, p.charges, 1)
-	for _, l := range p.charges[0].Lines {
-		require.NotEqual(t, "base", l.SourceRef, "a $0 base contributes no line")
+			// While the creation leg has not judged the window, Leg 1 defers.
+			res1, err := svc.ChargeModuleOverage(context.Background(), cand, pcChangeAt)
+			require.NoError(t, err)
+			require.Equal(t, cycle.ModuleOverageDeferredToCombined, res1.Status)
+
+			res, err := svc.ChargeCreationProration(context.Background(), appID)
+			require.NoError(t, err)
+			require.Equal(t, cycle.ProrationStatusNoCharge, res.Status)
+			require.Empty(t, p.charges, "the creation leg seals nothing for a $0 base")
+			require.True(t, store.apps[appID].ProrationSkipped, "the skip marker is armed on the "+map[bool]string{false: "stripe", true: "wallet"}[credits]+" rail")
+			require.False(t, store.apps[appID].ProrationAttempted, "never frozen")
+			require.Empty(t, store.apps[appID].ProrationInvoiceID)
+
+			// Now Leg 1 owns the timer and bills it on its own.
+			res1, err = svc.ChargeModuleOverage(context.Background(), cand, pcChangeAt)
+			require.NoError(t, err)
+			require.NotEqual(t, cycle.ModuleOverageDeferredToCombined, res1.Status, "the marker released the timer to Leg 1")
+			if credits {
+				require.Equal(t, cycle.ModuleOverageWalletCharged, res1.Status)
+			} else {
+				require.Equal(t, cycle.ModuleOverageProposed, res1.Status)
+				require.Len(t, p.charges, 1, "one timer line sealed by Leg 1")
+			}
+			require.Positive(t, res1.ChargedCents)
+
+			// A later upgrade is CHARGED (the marker says the window is judged),
+			// never folded to $0.
+			svc.WithNow(func() time.Time { return pcChangeAt.Add(48 * time.Hour) })
+			resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+			require.NoError(t, err)
+			require.False(t, resp.Change.FoldedIntoCreation)
+			require.Positive(t, resp.Change.AmountMicros)
+		})
 	}
-	require.Len(t, p.charges[0].Lines, 1, "one over-module timer line")
-	require.False(t, store.apps[appID].ProrationSkipped)
-	require.Contains(t, store.apps[appID].ProrationInvoiceID, "intent:")
 }
 
 // --- Round 2: the #208 review findings, each pinned -------------------------
@@ -936,7 +988,7 @@ func TestRunBillingCycle_BillsMembersOnThePeriodsHighWaterMark(t *testing.T) {
 	boundary, _ := chargeSvcProposing(store, newFakeStripe())
 	sum, err := boundary.RunBillingCycle(context.Background(), acct, pcPeriodSt, pcPeriodEd, 0)
 	require.NoError(t, err)
-	require.EqualValues(t, 10_000_000, sum.AdvanceMembersMicros, "(15 − 10) × $2, the mark inside the period")
+	require.EqualValues(t, 10_000_000, sum.MembersMicros, "(15 − 10) × $2, the mark inside the period")
 
 	// The count in force when the period opened counts even with no change
 	// inside it.
@@ -948,7 +1000,7 @@ func TestRunBillingCycle_BillsMembersOnThePeriodsHighWaterMark(t *testing.T) {
 	boundary2, _ := chargeSvcProposing(store2, newFakeStripe())
 	sum, err = boundary2.RunBillingCycle(context.Background(), acct2, pcPeriodSt, pcPeriodEd, 0)
 	require.NoError(t, err)
-	require.EqualValues(t, 6_000_000, sum.AdvanceMembersMicros, "(13 − 10) × $2 from the count in force")
+	require.EqualValues(t, 6_000_000, sum.MembersMicros, "(13 − 10) × $2 from the count in force")
 }
 
 // M15: the store refuses a short wallet with no card remainder, writing
@@ -992,20 +1044,18 @@ func TestChargeCreationProration_StalePlanUnderTheFreezeIsNotFrozen(t *testing.T
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	svc, p := planSvc(store, pcChangeAt.Add(24*time.Hour))
-	// Six CO-CREATED modules: one is over the pool of 5, so the window has
-	// something to bill and the pre-gate terminal does not fire on it.
-	appID := uuid.New()
-	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{OwnerUserID: user, AppID: appID, CreatedAt: pcCreated, Plan: "free", ModuleCount: 6})
-	require.NoError(t, err)
-	// Between the sweep's derivation (Free) and its freeze, an upgrade folds in.
+	appID := registerOnPlan(t, svc, user, usage.PlanPro, 0)
+	// Between the sweep's derivation (Pro) and its freeze, a downgrade the
+	// boundary applied moves the row: the shape prices a plan the locked row
+	// no longer carries.
 	store.beforeCombinedFreeze = func(f *fakeStore, id uuid.UUID) {
 		app := f.apps[id]
-		app.Plan = usage.PlanPro
+		app.Plan = usage.PlanFree
 		f.apps[id] = app
 		f.planChanges[uuid.New()] = cycle.PlanChange{
-			ID: uuid.New(), AppID: id, AccountID: app.AccountID, FromPlan: usage.PlanFree, ToPlan: usage.PlanPro,
-			Kind: cycle.PlanChangeUpgrade, RequestedAt: pcChangeAt, EffectiveAt: pcChangeAt, FoldedIntoCreation: true,
-			Status: cycle.PlanChangeSettled, WalletDecided: true,
+			ID: uuid.New(), AppID: id, AccountID: app.AccountID, FromPlan: usage.PlanPro, ToPlan: usage.PlanFree,
+			Kind: cycle.PlanChangeDowngrade, RequestedAt: pcChangeAt, EffectiveAt: pcPeriodEd,
+			PeriodStart: pcPeriodSt, PeriodEnd: pcPeriodEd, Status: cycle.PlanChangeApplied,
 		}
 	}
 	res, err := svc.ChargeCreationProration(context.Background(), appID)
@@ -1014,8 +1064,8 @@ func TestChargeCreationProration_StalePlanUnderTheFreezeIsNotFrozen(t *testing.T
 	require.Empty(t, p.charges)
 	require.False(t, store.apps[appID].ProrationAttempted, "not frozen at the stale price")
 
-	// The next sweep prices the folded split: 20e6 × 15/30 = 1000 cents base
-	// plus the timer line.
+	// The next sweep prices the ledger: the creation period at Pro from the
+	// 10th, 20e6 × 24/30 = $16.00, and nothing after the boundary.
 	res, err = svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
 	require.Equal(t, cycle.ProrationStatusProposed, res.Status)
@@ -1026,5 +1076,317 @@ func TestChargeCreationProration_StalePlanUnderTheFreezeIsNotFrozen(t *testing.T
 			base = l.AmountMicros
 		}
 	}
-	require.EqualValues(t, 10_000_000, base)
+	require.EqualValues(t, 16_000_000, base)
+}
+
+// --- Round 3: the second review's findings, each pinned ---------------------
+
+// (#2) An upgrade requested in the gap between a period end and the cron
+// that closes it charges (new − old) for the new period on its own row, and
+// the boundary run prices its advance base at the plan IN FORCE AT THE
+// BOUNDARY (from the ledger) — the old one — so the new base is never billed
+// twice. The same derivation on a reclaim gives the same figure.
+func TestRunBillingCycle_AdvanceBaseIsThePlanAtTheBoundaryNotTheLivePlan(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	svc, p := planSvc(store, pcChangeAt)
+	appID := registerOnPlan(t, svc, user, usage.PlanFree, 0)
+	armCreationCharge(store, appID)
+
+	gap := pcPeriodEd.Add(time.Hour) // Jul 4 01:00: the boundary passed, the cron has not run
+	svc.WithNow(func() time.Time { return gap })
+	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	require.NoError(t, err)
+	require.Equal(t, cycle.PlanChangeSettled, resp.Change.Status)
+	require.EqualValues(t, 20_000_000, resp.Change.AmountMicros, "(20 − 0) × 31/31: the whole new period, on this row")
+	require.Len(t, p.charges, 1)
+	require.Equal(t, usage.PlanPro, store.apps[appID].Plan)
+
+	boundary, bp := chargeSvcProposing(store, newFakeStripe())
+	sum, err := boundary.RunBillingCycle(context.Background(), acct, pcPeriodSt, pcPeriodEd, 0)
+	require.NoError(t, err)
+	require.True(t, sum.FirstRun)
+	require.Zero(t, sum.AdvanceBaseMicros, "at the boundary the app was on Free; the upgrade row priced the new base")
+	var forward int64
+	for _, g := range bp.groups {
+		for _, c := range g {
+			forward += c.TotalMicros()
+		}
+	}
+	require.Zero(t, forward, "nothing else sealed for the new period")
+	require.EqualValues(t, 20_000_000, p.charges[0].TotalMicros(), "$20 for the new period, once")
+}
+
+// (#5) The fold is decided by the WINDOW, not the markers alone: an upgrade
+// requested after the window the creation charge covers is a priced delta
+// even while that charge is still unbilled — and the creation charge then
+// prices its own window (at Free: $0, the terminal skip), never a wedge and
+// never an unpriced delta.
+func TestSetAppPlan_UpgradeAfterTheCoverageWindowIsChargedWhileTheCreationChargeIsUnbilled(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	late := pcPeriodEd.Add(24 * time.Hour) // Jul 5: the creation window (Jun 4–Jul 4) has closed
+	svc, p := planSvc(store, late)
+	appID := registerOnPlan(t, svc, user, usage.PlanFree, 0) // created Jun 10, grace to Jun 13: no straddle
+	require.Empty(t, store.apps[appID].ProrationInvoiceID, "the creation charge has not run")
+
+	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	require.NoError(t, err)
+	require.False(t, resp.Change.FoldedIntoCreation, "outside the coverage window: charged")
+	nextEnd := pcPeriodEd.AddDate(0, 1, 0)
+	want := usage.ProratedSegmentMicros(usage.TermsFor(usage.PlanPro).BaseFeeMicros, late, nextEnd, pcPeriodEd, nextEnd)
+	require.EqualValues(t, want, resp.Change.AmountMicros, "(20 − 0) × the remaining days of the CURRENT period")
+	require.Equal(t, cycle.PlanChangeSettled, resp.Change.Status)
+	require.Len(t, p.charges, 1)
+
+	// The creation sweep prices the window from the created plan: Free, $0,
+	// terminal — the upgrade's days are not its to price.
+	res, err := svc.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusNoCharge, res.Status)
+	require.True(t, store.apps[appID].ProrationSkipped)
+	require.Len(t, p.charges, 1, "nothing more sealed")
+}
+
+// (#4, #8, #13, #20) The members fee is the CLOSED period's, on its
+// high-water count, at the plan in force DURING the period: a Free app one
+// over its 3 pays $2 (a DefaultPlan mutant pays $0); a Pro app whose
+// downgrade applies at this boundary is priced at Pro's 10 for the period it
+// ran on Pro, not Free's 3; an app deleted inside the period still owes it.
+func TestRunBillingCycle_MembersArePricedOnTheClosedPeriodsPlanAndCount(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	svc, _ := planSvc(store, pcChangeAt)
+	free := registerOnPlan(t, svc, user, usage.PlanFree, 4)
+	armCreationCharge(store, free)
+	pro := registerOnPlan(t, svc, user, usage.PlanPro, 12)
+	armCreationCharge(store, pro)
+	_, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: pro, Plan: "free"})
+	require.NoError(t, err)
+	gone := registerOnPlan(t, svc, user, usage.PlanPro, 20)
+	armCreationCharge(store, gone)
+	_, err = svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: gone, Deleted: true})
+	require.NoError(t, err)
+
+	boundary, bp := chargeSvcProposing(store, newFakeStripe())
+	sum, err := boundary.RunBillingCycle(context.Background(), acct, pcPeriodSt, pcPeriodEd, 0)
+	require.NoError(t, err)
+	require.Equal(t, usage.PlanFree, store.apps[pro].Plan, "the downgrade applied at the boundary")
+	require.EqualValues(t, 2_000_000+4_000_000+20_000_000, sum.MembersMicros,
+		"Free 4 → (4−3)×$2; Pro 12 for the closed period → (12−10)×$2; deleted Pro 20 → (20−10)×$2")
+	require.Zero(t, sum.AdvanceBaseMicros, "the new period: Free, Free (applied), and the deleted app is off the roster")
+	var line int64
+	for _, c := range bp.groups[0] {
+		for _, l := range c.Lines {
+			if l.SourceRef == "members:closed" {
+				line += l.AmountMicros
+			}
+		}
+	}
+	require.EqualValues(t, sum.MembersMicros, line)
+
+	// A boundary whose ONLY charge is the members fee still seals: the fee
+	// is part of the boundary total the zero-skip and the wallet draw see,
+	// not only of the disclosure lines.
+	store2 := newFakeStore()
+	user2, acct2 := registeredAccount(store2)
+	svc2, _ := planSvc(store2, pcChangeAt)
+	only := registerOnPlan(t, svc2, user2, usage.PlanFree, 4)
+	armCreationCharge(store2, only)
+	boundary2, bp2 := chargeSvcProposing(store2, newFakeStripe())
+	sum, err = boundary2.RunBillingCycle(context.Background(), acct2, pcPeriodSt, pcPeriodEd, 0)
+	require.NoError(t, err)
+	require.Equal(t, cycle.RunStatusProposed, sum.Status, "$2 of members is a charge, not a zero boundary")
+	require.EqualValues(t, 2_000_000, proposedMicros(t, bp2))
+}
+
+// (#10/#12) A deleted app's due downgrade is cancelled, never applied: the
+// row's plan stays what the app was on, the ledger chain stays consistent,
+// and the creation charge an app deleted AFTER its grace still owes prices
+// its Pro days instead of erroring on every sweep.
+func TestApplyDuePlanChanges_CancelsADeletedAppsDowngradeInsteadOfApplyingIt(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	svc, _ := planSvc(store, pcChangeAt)
+	appID := registerOnPlan(t, svc, user, usage.PlanPro, 0)
+	_, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "free"})
+	require.NoError(t, err)
+	_, err = svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: appID, Deleted: true}) // Jun 19: after the grace (Jun 13)
+	require.NoError(t, err)
+
+	applied, cancelled, err := svc.ApplyDuePlanChanges(context.Background(), pcPeriodEd)
+	require.NoError(t, err)
+	require.Zero(t, applied)
+	require.Equal(t, 1, cancelled)
+	require.Equal(t, cycle.PlanChangeCancelled, onlyPlanChange(t, store, appID).Status)
+	require.Equal(t, usage.PlanPro, store.apps[appID].Plan, "frozen with the row")
+
+	late := cycle.NewService(store, newFakeStripe()).WithNow(func() time.Time { return pcPeriodEd.Add(24 * time.Hour) })
+	p := &capturingProposer{}
+	late = late.WithIntentProposer(p)
+	res, err := late.ChargeCreationProration(context.Background(), appID)
+	require.NoError(t, err)
+	require.Equal(t, cycle.ProrationStatusProposed, res.Status, "the owed Pro days are priced; no chain error")
+	require.EqualValues(t, 1600, sealedProrationCents(t, p), "20e6 × 24/30")
+}
+
+// crashedAfterSeal opens a Free → Pro upgrade whose card intent sealed but
+// whose settle failed — the row is pending with no card_ref while the sealed
+// document lives on. Returns the first document's digest.
+func crashedAfterSeal(t *testing.T) (*fakeStore, *cycle.Service, *capturingProposer, uuid.UUID, string) {
+	t.Helper()
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	svc, p := planSvc(store, pcChangeAt)
+	appID := registerOnPlan(t, svc, user, usage.PlanFree, 0)
+	armCreationCharge(store, appID)
+	store.errSettlePlanCard = errors.New("connection dropped after the seal")
+	_, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	requirePlanErrCode(t, err, billing.CodeInternal)
+	change := onlyPlanChange(t, store, appID)
+	require.Equal(t, cycle.PlanChangePending, change.Status)
+	require.Empty(t, change.CardRef)
+	require.False(t, change.CardWindowStart.IsZero(), "the window anchor was stored before the seal")
+	require.Len(t, p.charges, 1)
+	first, err := p.Digest(context.Background(), p.charges[0])
+	require.NoError(t, err)
+	store.errSettlePlanCard = nil
+	return store, svc, p, appID, first
+}
+
+// (#15) Seal succeeded, settle failed: the next sweep re-proposes the SAME
+// document — identical lines, allocation and window, so the same digest —
+// and the row settles with it.
+func TestSweepPendingPlanChanges_SealSucceededSettleFailedReplaysTheSameDigest(t *testing.T) {
+	store, svc, p, appID, first := crashedAfterSeal(t)
+
+	sweep, err := svc.SweepPendingPlanChanges(context.Background(), pcChangeAt.Add(time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, &cycle.SweepPlanChangesResult{Pending: 1, Settled: 1}, sweep)
+	require.Len(t, p.charges, 2, "proposed again …")
+	require.Equal(t, p.charges[0], p.charges[1], "… as the same charge: lines, wallet allocation, execution window")
+	second, err := p.Digest(context.Background(), p.charges[1])
+	require.NoError(t, err)
+	require.Equal(t, first, second, "one digest for one upgrade")
+	change := onlyPlanChange(t, store, appID)
+	require.Equal(t, cycle.PlanChangeSettled, change.Status)
+	require.Equal(t, "intent:"+first, change.CardRef)
+}
+
+// (#7) A stored window that has closed is NOT re-anchored while the document
+// sealed under it may have been collected: collected → the row settles with
+// it, no second seal; still in flight → wait; absent or dead → re-anchor and
+// seal afresh.
+func TestSettlePlanChange_NeverReSealsAfterTheFirstDocumentWasCollected(t *testing.T) {
+	late := pcChangeAt.AddDate(0, 0, 40) // the 30-day window anchored at the request has closed
+
+	t.Run("collected: settle with the first document", func(t *testing.T) {
+		store, svc, p, appID, first := crashedAfterSeal(t)
+		p.states = map[string]string{first: "succeeded"}
+		svc.WithNow(func() time.Time { return late })
+		sweep, err := svc.SweepPendingPlanChanges(context.Background(), late)
+		require.NoError(t, err)
+		require.Equal(t, &cycle.SweepPlanChangesResult{Pending: 1, Settled: 1}, sweep)
+		require.Len(t, p.charges, 1, "no second document for a collected charge")
+		change := onlyPlanChange(t, store, appID)
+		require.Equal(t, cycle.PlanChangeSettled, change.Status)
+		require.Equal(t, "intent:"+first, change.CardRef)
+	})
+
+	t.Run("in flight: wait", func(t *testing.T) {
+		store, svc, p, appID, first := crashedAfterSeal(t)
+		p.states = map[string]string{first: "provider_in_progress"}
+		svc.WithNow(func() time.Time { return late })
+		sweep, err := svc.SweepPendingPlanChanges(context.Background(), late)
+		require.NoError(t, err)
+		require.Equal(t, &cycle.SweepPlanChangesResult{Pending: 1, Skipped: 1}, sweep)
+		require.Len(t, p.charges, 1)
+		require.Equal(t, cycle.PlanChangePending, onlyPlanChange(t, store, appID).Status)
+	})
+
+	for state, label := range map[string]string{"": "absent", "expired": "dead"} {
+		t.Run(label+": re-anchor and seal afresh", func(t *testing.T) {
+			store, svc, p, appID, first := crashedAfterSeal(t)
+			if state != "" {
+				p.states = map[string]string{first: state}
+			}
+			svc.WithNow(func() time.Time { return late })
+			sweep, err := svc.SweepPendingPlanChanges(context.Background(), late)
+			require.NoError(t, err)
+			require.Equal(t, &cycle.SweepPlanChangesResult{Pending: 1, Settled: 1}, sweep)
+			require.Len(t, p.charges, 2)
+			require.True(t, p.charges[1].ExecuteNotBefore.Equal(late), "re-anchored at the seal instant")
+			second, err := p.Digest(context.Background(), p.charges[1])
+			require.NoError(t, err)
+			require.NotEqual(t, first, second)
+			change := onlyPlanChange(t, store, appID)
+			require.Equal(t, cycle.PlanChangeSettled, change.Status)
+			require.Equal(t, "intent:"+second, change.CardRef)
+		})
+	}
+}
+
+// (#16) The card vanished after the wallet draw: the row stays pending with
+// the draw retained (never reversed), the sweep counts it skipped, the
+// direct retry says PaymentRequired, and once a card is back the remainder
+// seals with the SAME allocation.
+func TestSetAppPlan_CardVanishedAfterTheWalletDrawStaysPendingAndKeepsTheDraw(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	store.walletMode = cycle.CreditBillingModeCredits
+	seedWalletSource(store, "grant", 3_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
+	svc, p := planSvc(store, pcChangeAt)
+	svc = svc.WithCreditWallet(true)
+	appID := registerOnPlan(t, svc, user, usage.PlanFree, 0)
+	armCreationCharge(store, appID)
+
+	p.err = errors.New("intent store unavailable")
+	_, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	requirePlanErrCode(t, err, billing.CodeInternal)
+	change := onlyPlanChange(t, store, appID)
+	require.EqualValues(t, 3_000_000, change.WalletMicros)
+	p.err = nil
+	store.hasPM = false // the card is gone before the remainder seals
+
+	sweep, err := svc.SweepPendingPlanChanges(context.Background(), pcChangeAt.Add(time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, &cycle.SweepPlanChangesResult{Pending: 1, Skipped: 1}, sweep)
+	require.Empty(t, p.charges)
+	change = onlyPlanChange(t, store, appID)
+	require.Equal(t, cycle.PlanChangePending, change.Status)
+	require.EqualValues(t, 3_000_000, change.WalletMicros, "the draw is retained, never reversed")
+	require.EqualValues(t, 3_000_000, store.planChangeDraws[change.ID])
+	_, err = svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	requirePlanErrCode(t, err, billing.CodePaymentRequired)
+	require.Equal(t, usage.PlanPro, store.apps[appID].Plan, "the plan is in force throughout")
+
+	store.hasPM = true
+	sweep, err = svc.SweepPendingPlanChanges(context.Background(), pcChangeAt.Add(2*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, &cycle.SweepPlanChangesResult{Pending: 1, Settled: 1}, sweep)
+	require.Len(t, p.charges, 1)
+	require.EqualValues(t, 3_000_000, p.charges[0].WalletAllocationMicros, "the same allocation")
+	require.EqualValues(t, 10_000_000, p.charges[0].TotalMicros())
+	require.EqualValues(t, 3_000_000, store.planChangeDraws[change.ID], "drawn once")
+}
+
+// (#22) Withdrawing a downgrade the boundary applied between the read and
+// the cancel is a visible Conflict, not a stale "you are on Pro, nothing
+// pending" — a retry of which would become a charged upgrade.
+func TestSetAppPlan_CancelRacingTheBoundaryApplyIsAConflict(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	svc, p := planSvc(store, pcChangeAt)
+	appID := registerOnPlan(t, svc, user, usage.PlanPro, 0)
+	armCreationCharge(store, appID)
+	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "free"})
+	require.NoError(t, err)
+	store.beforeCancelScheduled = func(f *fakeStore, id uuid.UUID) {
+		f.applyDue(func(c cycle.PlanChange) bool { return c.AppID == id }, pcPeriodEd)
+	}
+	_, err = svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro", CancelChangeID: resp.Change.ID})
+	requirePlanErrCode(t, err, billing.CodeConflict)
+	require.Equal(t, usage.PlanFree, store.apps[appID].Plan)
+	require.Equal(t, cycle.PlanChangeApplied, onlyPlanChange(t, store, appID).Status)
+	require.Empty(t, p.charges)
 }

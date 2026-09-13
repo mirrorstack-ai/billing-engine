@@ -97,9 +97,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// A DOWNGRADE TAKES EFFECT AT THE BOUNDARY (migration 076, owner
 	// 2026-09-12): every scheduled downgrade of this account whose boundary
 	// is this one — or an earlier one a late cron never reached — moves the
-	// app onto its plan NOW, before the roster is read, so the advance base
-	// below is the plan in force at the boundary. Ahead of the idempotency
-	// gate on purpose: the plan must move whether or not this run collects.
+	// app onto its plan NOW and closes its row. Ahead of the idempotency gate
+	// on purpose: the plan must move whether or not this run collects. The
+	// figures below do NOT depend on this ordering: the roster's plan and the
+	// members' plan are both derived from the ledger for their own instant
+	// (the boundary; the closed period), so a reclaim after the flip prices
+	// the same.
 	if _, err := s.store.ApplyDuePlanChanges(ctx, accountID, periodEnd); err != nil {
 		return nil, billing.Internal("apply due plan changes failed", err)
 	}
@@ -280,26 +283,33 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	if err != nil {
 		return nil, billing.Internal("live app roster read failed", err)
 	}
-	// Each live app contributes ONLY its plan's flat base. Module overage is billed
+	// Each live app contributes ONLY its plan's flat base — the plan in force
+	// AT THE BOUNDARY (AppModuleCount.Plan, from the ledger), so an upgrade
+	// requested after the boundary, which charged its own delta for the new
+	// period, is not billed the new base here as well. Module overage is billed
 	// SEPARATELY below (the advance-overage / Leg 2 precharge), not folded into an
 	// app's base — it rides per-module-instance grace timers (migration 033).
-	// ADVANCE MEMBERS leg (migration 077, owner 2026-09-13): every member past
-	// the plan's included count is one $2 fee, billed on the CLOSED period's
-	// HIGH-WATER MARK — the greater of the count in force when it opened and
-	// the highest count recorded inside it — never on a point-in-time count.
-	// Read-only and deterministic across a reclaim; no boundary mutation.
+	var advanceBase int64
+	for _, a := range apps {
+		advanceBase += usage.TermsFor(a.Plan).BaseFeeMicros // each app's own plan base (core-v2#1412)
+	}
+	// MEMBERS leg (migration 077, owner 2026-09-13): the CLOSED period's
+	// extra-member fee — every member past the included count of the plan
+	// the app was on DURING that period is one $2 fee, on the period's
+	// HIGH-WATER MARK (the greater of the count in force when it opened and
+	// the highest count recorded inside it), never on a point-in-time count.
+	// Billed in arrears on this boundary, over every app that held members in
+	// the period (deleted inside it, or still in its creation grace,
+	// included — the roster above is the ADVANCE base's list, not this
+	// leg's). Read-only and derived per period, so a reclaim after the
+	// boundary apply moved the app prices the same (review round 2, #4/#20).
 	memberHWM, err := s.store.MemberHighWater(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("member high-water read failed", err)
 	}
-	var advanceBase, advanceMembers int64
-	for _, a := range apps {
-		advanceBase += usage.TermsFor(a.Plan).BaseFeeMicros // each app's own plan base (core-v2#1412)
-		hwm, known := memberHWM[a.AppID]
-		if !known {
-			hwm = a.MemberCount
-		}
-		advanceMembers += usage.ExtraMembersMicros(a.Plan, hwm)
+	var members int64
+	for _, m := range memberHWM {
+		members += usage.ExtraMembersMicros(m.Plan, m.Count)
 	}
 
 	// ADVANCE OVERAGE leg (scenario 6, Leg 2): the NEW period's $5-per-block
@@ -340,19 +350,23 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	}
 	advanceDomains := usage.DomainFeeMicros * int64(domainCount)
 
-	// The whole boundary invoice: closed period's netted usage arrears + the new
-	// period's advance base + module overage + custom domains + extra members.
-	// The allowance nets USAGE only; all recurring account fees ride on top.
-	boundaryTotal := arrears + advanceBase + advanceOverage + advanceDomains + advanceMembers
-	withBase := advanceBase+advanceOverage+advanceDomains+advanceMembers > 0
+	// The whole boundary invoice: closed period's netted usage arrears + its
+	// extra-member fee + the new period's advance base + module overage +
+	// custom domains. The allowance nets USAGE only; all recurring account
+	// fees ride on top.
+	boundaryTotal := arrears + members + advanceBase + advanceOverage + advanceDomains
+	// withBase: the charge covers the NEW period too (the legacy mirror's line
+	// period runs to its end). The members fee is the CLOSED period's, so it
+	// does not extend the coverage — only the three advance components do.
+	withBase := advanceBase+advanceOverage+advanceDomains > 0
 
 	summary := &ChargeSummary{
 		FirstRun:             true,
 		ArrearsMicros:        arrears,
+		MembersMicros:        members,
 		AdvanceBaseMicros:    advanceBase,
 		AdvanceOverageMicros: advanceOverage,
 		AdvanceDomainsMicros: advanceDomains,
-		AdvanceMembersMicros: advanceMembers,
 	}
 
 	// UNIVERSAL WALLET DRAWDOWN. The true boundary total is now fixed, so the
@@ -765,7 +779,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			AdvanceBaseMicros:    summary.AdvanceBaseMicros,
 			AdvanceOverageMicros: summary.AdvanceOverageMicros,
 			AdvanceDomainsMicros: summary.AdvanceDomainsMicros,
-			AdvanceMembersMicros: summary.AdvanceMembersMicros,
+			MembersMicros:        summary.MembersMicros,
 			WalletDrawnMicros:    summary.WalletDrawnMicros,
 			// 🔴 The frozen figure, when a prior attempt committed to one.
 			//

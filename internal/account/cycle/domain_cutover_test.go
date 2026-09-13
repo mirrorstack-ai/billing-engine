@@ -23,6 +23,41 @@ type capturingProposer struct {
 	// distinction the boundary's single rounding depends on.
 	groups [][]proposer.Charge
 	err    error
+	// states is what IntentState answers per digest (unset = never stored);
+	// a test sets a digest to "succeeded" to stand for a collected document.
+	states map[string]string
+}
+
+func (p *capturingProposer) seal(c proposer.Charge) (intent.ChargeIntent, error) {
+	return intent.Seal(intent.Draft{
+		Payer:                 intent.Subject{Kind: "user", ID: "owner-of-" + c.AccountID},
+		Currency:              c.Currency,
+		Lines:                 chargeLines(c),
+		Kind:                  c.Kind,
+		PriceBookRevision:     c.PriceBookRevision,
+		TermsRevision:         c.TermsRevision,
+		Tax:                   c.Tax,
+		AuthorizationID:       c.AuthorizationID,
+		NoticePolicy:          c.NoticePolicy,
+		ExecuteNotBefore:      c.ExecuteNotBefore,
+		ExecuteNotAfter:       c.ExecuteNotAfter,
+		SourceFactKeys:        chargeFacts(c),
+		SelectedRail:          "stripe",
+		RoutingPolicyRevision: "routing-2026-08",
+	})
+}
+
+func (p *capturingProposer) Digest(_ context.Context, c proposer.Charge) (string, error) {
+	sealed, err := p.seal(c)
+	if err != nil {
+		return "", err
+	}
+	return sealed.Digest(), nil
+}
+
+func (p *capturingProposer) IntentState(_ context.Context, digest string) (string, bool, error) {
+	state, ok := p.states[digest]
+	return state, ok, nil
 }
 
 // ProposeGroup seals a set that must settle together. It records the SET, not
@@ -49,22 +84,7 @@ func (p *capturingProposer) Propose(_ context.Context, c proposer.Charge) (inten
 		return intent.ChargeIntent{}, p.err
 	}
 	p.charges = append(p.charges, c)
-	return intent.Seal(intent.Draft{
-		Payer:                 intent.Subject{Kind: "user", ID: "owner-of-" + c.AccountID},
-		Currency:              c.Currency,
-		Lines:                 chargeLines(c),
-		Kind:                  c.Kind,
-		PriceBookRevision:     c.PriceBookRevision,
-		TermsRevision:         c.TermsRevision,
-		Tax:                   c.Tax,
-		AuthorizationID:       c.AuthorizationID,
-		NoticePolicy:          c.NoticePolicy,
-		ExecuteNotBefore:      c.ExecuteNotBefore,
-		ExecuteNotAfter:       c.ExecuteNotAfter,
-		SourceFactKeys:        chargeFacts(c),
-		SelectedRail:          "stripe",
-		RoutingPolicyRevision: "routing-2026-08",
-	})
+	return p.seal(c)
 }
 
 // seedDomain registers a chargeable domain in the fake store and

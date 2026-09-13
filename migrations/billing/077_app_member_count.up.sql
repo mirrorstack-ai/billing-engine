@@ -4,12 +4,14 @@
 --
 -- The plan includes a number of members (usage.PlanTerms.MembersIncluded —
 -- 3 / 10 / 25); every member past it costs usage.ExtraMemberFeeMicros per
--- period, billed by the boundary leg for the NEW period from the count in
--- force at the boundary, exactly as the advance base reads the plan in force
--- there. This column is that count: a LIVE snapshot api-platform keeps current
+-- period, billed IN ARREARS by the boundary leg for the period that just
+-- CLOSED, against the plan the app was on during that period (from the
+-- plan-change ledger, migration 076 — never the plan a boundary downgrade has
+-- just moved it to). This column is the LIVE count api-platform keeps current
 -- through RegisterApp (the count at creation) and SyncAppModules (every
 -- member add / remove), the same fire-and-forget-with-retry seam module_count
--- rides. Money never lives here; the price is a reviewed Go constant.
+-- rides; the fee is priced from the history table below, not from it. Money
+-- never lives here; the price is a reviewed Go constant.
 --
 -- 🔴 BILLED ON THE HIGH-WATER MARK (owner 2026-09-13): the fee for a period
 -- is charged on the MAXIMUM member count seen during it, not the count at

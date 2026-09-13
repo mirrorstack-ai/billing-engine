@@ -51,6 +51,7 @@ func upgradeParams(appID, acct uuid.UUID, amount int64, wallet *cycle.PlanChange
 		Kind: cycle.PlanChangeUpgrade, RequestedAt: pcReq,
 		Folded:        &cycle.PlanChangeShape{EffectiveAt: pcReq, PeriodStart: pcStart, PeriodEnd: pcEnd},
 		Charged:       &cycle.PlanChangeShape{EffectiveAt: pcReq, PeriodStart: pcStart, PeriodEnd: pcEnd, AmountMicros: amount},
+		FoldUntil:     pcEnd, // the request (pcReq) is inside the creation coverage window
 		Wallet:        wallet,
 		ChargeAllowed: true,
 	}
@@ -84,6 +85,43 @@ func TestMigration076_OpenPlanChangeDecidesFoldOrChargeUnderTheLock(t *testing.T
 	require.Equal(t, "pro", row.Plan, "the flip commits with the row")
 	require.Equal(t, "free", row.CreatedPlan, "the created plan never moves")
 	require.EqualValues(t, 12, row.MemberCount, "migration 077's count reads back")
+
+	// Creation unbilled but the request lands AFTER the window the creation
+	// charge covers → charged, not folded (round-2 review, #5): the creation
+	// charge prices its own window, this row prices the delta.
+	lateWindow := seedPlanChangeApp(t, pool, acct, usage.PlanFree, false)
+	pl := upgradeParams(lateWindow, acct, 10_000_000, &cycle.PlanChangeWalletParams{Credits: false, AllowRemainder: true})
+	pl.FoldUntil = pcReq.Add(-time.Hour)
+	change, outcome, err = store.OpenPlanChange(ctx, pl)
+	require.NoError(t, err)
+	require.Equal(t, cycle.PlanChangeOpened, outcome)
+	require.False(t, change.FoldedIntoCreation, "outside the coverage window: a priced delta")
+	require.Equal(t, cycle.PlanChangePending, change.Status)
+	require.EqualValues(t, 10_000_000, change.AmountMicros)
+
+	// The roster prices the advance base at the plan IN FORCE AT THE
+	// BOUNDARY, from the ledger: a change effective after the boundary
+	// carries the boundary plan as its from_plan (round-2 review, #2).
+	boundary := time.Now().UTC()
+	rosterPlan := func(id uuid.UUID) string {
+		apps, err := store.LiveAppsCreatedBefore(ctx, acct, boundary, usage.GraceDays)
+		require.NoError(t, err)
+		for _, a := range apps {
+			if a.AppID == id {
+				return string(a.Plan)
+			}
+		}
+		t.Fatalf("app %s not on the roster", id)
+		return ""
+	}
+	require.Equal(t, "pro", rosterPlan(unbilled), "no change after the boundary: the live plan")
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET effective_at = $2, requested_at = $2 WHERE app_id = $1`,
+		unbilled.String(), boundary.Add(time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, "free", rosterPlan(unbilled), "an upgrade effective after the boundary: the plan it moved FROM")
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET status = 'cancelled' WHERE app_id = $1`, unbilled.String())
+	require.NoError(t, err)
+	require.Equal(t, "pro", rosterPlan(unbilled), "a cancelled row is not a change")
 
 	// Creation billed → the charged shape, pending, wallet decided (0: not a
 	// credits account).
@@ -324,6 +362,81 @@ func TestMigration076_DowngradeAppliesAtTheBoundaryCancelsBeforeAndRespectsTheCa
 	row, err = q.SelectAppMirror(ctx, pro1.String())
 	require.NoError(t, err)
 	require.Equal(t, "pro", row.Plan)
+
+	// (d) A deleted app's due downgrade is CANCELLED, never applied: its plan
+	// is frozen with the row, and an 'applied' row it never moved to would
+	// break the creation-charge chain (round-2 review, #10).
+	acct3 := seedAccount(t, pool)
+	gone := seedPlanChangeApp(t, pool, acct3, usage.PlanPro, false)
+	goneChange, outcome, err := store.OpenPlanChange(ctx, downgradeParams(gone, acct3))
+	require.NoError(t, err)
+	require.Equal(t, cycle.PlanChangeOpened, outcome)
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET deleted_at = now() WHERE app_id = $1`, gone.String())
+	require.NoError(t, err)
+	applied, cancelledN, err = store.ApplyAllDuePlanChanges(ctx, pcEnd)
+	require.NoError(t, err)
+	require.Zero(t, applied)
+	require.Equal(t, 1, cancelledN)
+	row, err = q.SelectAppMirror(ctx, gone.String())
+	require.NoError(t, err)
+	require.Equal(t, "pro", row.Plan, "frozen with the row")
+	var status string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT status FROM ms_billing.app_plan_changes WHERE id = $1`, goneChange.ID.String()).Scan(&status))
+	require.Equal(t, "cancelled", status)
+	effective, err := store.EffectivePlanChanges(ctx, gone)
+	require.NoError(t, err)
+	require.Empty(t, effective, "the chain still ends on the plan the row carries")
+}
+
+// (e) The org Free cap's REAL SQL: CountOrgPlanCommitments under the org-keyed
+// advisory lock, one Free app per org, counting scheduled downgrades, never a
+// cancelled row, and never another org's or a user's apps (round-2 review,
+// #9 — before this the rule lived only in the Go fake).
+func TestMigration076_OrgFreeCapIsOnePerOrgInSQL(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+	acct := seedAccount(t, pool)
+	org, otherOrg := uuid.New(), uuid.New()
+	created := time.Now().UTC().AddDate(0, 0, -10)
+
+	first := uuid.New()
+	full, err := store.InsertFreeAppMirror(ctx, first, acct, org, 0, 0, created, "")
+	require.NoError(t, err)
+	require.False(t, full, "the org's one Free slot")
+	full, err = store.InsertFreeAppMirror(ctx, uuid.New(), acct, org, 0, 0, created, "")
+	require.NoError(t, err)
+	require.True(t, full, "a second org Free app is refused by the SQL count")
+	full, err = store.InsertFreeAppMirror(ctx, uuid.New(), acct, otherOrg, 0, 0, created, "")
+	require.NoError(t, err)
+	require.False(t, full, "another org has its own slot")
+	full, err = store.InsertFreeAppMirror(ctx, uuid.New(), acct, uuid.Nil, 0, 0, created, "")
+	require.NoError(t, err)
+	require.False(t, full, "the user's own cap (3) is separate from the org's")
+
+	// A Pro org app cannot schedule a downgrade to Free while the slot is
+	// taken; once it is free, the scheduled row itself takes the slot.
+	pro := uuid.New()
+	require.NoError(t, store.InsertAppMirror(ctx, pro, acct, org, 1, 0, created, "", usage.PlanPro))
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET proration_invoice_id = 'intent:test' WHERE app_id = $1`, pro.String())
+	require.NoError(t, err)
+	_, outcome, err := store.OpenPlanChange(ctx, downgradeParams(pro, acct))
+	require.NoError(t, err)
+	require.Equal(t, cycle.PlanChangeCapReached, outcome, "the org's Free slot is taken")
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET deleted_at = now() WHERE app_id = $1`, first.String())
+	require.NoError(t, err)
+	_, outcome, err = store.OpenPlanChange(ctx, downgradeParams(pro, acct))
+	require.NoError(t, err)
+	require.Equal(t, cycle.PlanChangeOpened, outcome, "a deleted app frees the slot")
+	full, err = store.InsertFreeAppMirror(ctx, uuid.New(), acct, org, 0, 0, created, "")
+	require.NoError(t, err)
+	require.True(t, full, "the scheduled downgrade counts against the org slot")
+	cancelled, err := store.CancelScheduledPlanChange(ctx, pro, time.Now())
+	require.NoError(t, err)
+	require.True(t, cancelled)
+	full, err = store.InsertFreeAppMirror(ctx, uuid.New(), acct, org, 0, 0, created, "")
+	require.NoError(t, err)
+	require.False(t, full, "a cancelled row does not count")
 }
 
 func TestMigration077_MemberHistoryAndHighWater(t *testing.T) {
@@ -338,12 +451,67 @@ func TestMigration077_MemberHistoryAndHighWater(t *testing.T) {
 	require.NoError(t, store.SetAppMemberCount(ctx, appID, 11, pcStart.AddDate(0, 0, 21)))
 	require.NoError(t, store.SetAppMemberCount(ctx, appID, 20, pcEnd.AddDate(0, 0, 1))) // next period
 
-	hwm, err := store.MemberHighWater(ctx, acct, pcStart, pcEnd)
+	hwmFor := func(rows []cycle.MemberHighWater, id uuid.UUID) (cycle.MemberHighWater, bool) {
+		for _, r := range rows {
+			if r.AppID == id {
+				return r, true
+			}
+		}
+		return cycle.MemberHighWater{}, false
+	}
+	marks, err := store.MemberHighWater(ctx, acct, pcStart, pcEnd)
 	require.NoError(t, err)
-	require.Equal(t, 15, hwm[appID], "the mark inside the period, not the count at the boundary (11) nor after it (20)")
-	hwm, err = store.MemberHighWater(ctx, acct, pcEnd, pcEnd.AddDate(0, 1, 0))
+	hwm, ok := hwmFor(marks, appID)
+	require.True(t, ok)
+	require.Equal(t, 15, hwm.Count, "the mark inside the period, not the count at the boundary (11) nor after it (20)")
+	require.Equal(t, usage.PlanPro, hwm.Plan)
+	marks, err = store.MemberHighWater(ctx, acct, pcEnd, pcEnd.AddDate(0, 1, 0))
 	require.NoError(t, err)
-	require.Equal(t, 20, hwm[appID], "the next period: the count in force at its start (11) vs the 20 recorded inside")
+	hwm, _ = hwmFor(marks, appID)
+	require.Equal(t, 20, hwm.Count, "the next period: the count in force at its start (11) vs the 20 recorded inside")
+
+	// The plan returned is the plan in force DURING the period: a downgrade
+	// applied at this boundary (effective_at = period_end, apps.plan now
+	// free) still prices the closed period at pro — the same on a reclaim.
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.app_plan_changes
+		(app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, amount_micros, status, settled_at)
+		VALUES ($1, $2, 'pro', 'free', 'downgrade', $3, $4, $3, $4, 0, 'applied', $4)`,
+		appID.String(), acct.String(), pcStart, pcEnd)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET plan = 'free' WHERE app_id = $1`, appID.String())
+	require.NoError(t, err)
+	marks, err = store.MemberHighWater(ctx, acct, pcStart, pcEnd)
+	require.NoError(t, err)
+	hwm, _ = hwmFor(marks, appID)
+	require.Equal(t, usage.PlanPro, hwm.Plan, "the closed period's plan, not the one the boundary moved the app to")
+	marks, err = store.MemberHighWater(ctx, acct, pcEnd, pcEnd.AddDate(0, 1, 0))
+	require.NoError(t, err)
+	hwm, _ = hwmFor(marks, appID)
+	require.Equal(t, usage.PlanFree, hwm.Plan, "the next period runs on free")
+
+	// An app deleted INSIDE the period held members in it and is a row; one
+	// deleted before it opened is not; one created inside it (in grace at
+	// the boundary) is.
+	gone := uuid.New()
+	require.NoError(t, store.InsertAppMirror(ctx, gone, acct, uuid.Nil, 0, 20, pcStart.AddDate(0, 0, 2), "", usage.PlanPro))
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET deleted_at = $2 WHERE app_id = $1`, gone.String(), pcStart.AddDate(0, 0, 20))
+	require.NoError(t, err)
+	before := uuid.New()
+	require.NoError(t, store.InsertAppMirror(ctx, before, acct, uuid.Nil, 0, 20, pcStart.AddDate(0, 0, -20), "", usage.PlanPro))
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET deleted_at = $2 WHERE app_id = $1`, before.String(), pcStart.AddDate(0, 0, -1))
+	require.NoError(t, err)
+	young := uuid.New()
+	require.NoError(t, store.InsertAppMirror(ctx, young, acct, uuid.Nil, 0, 14, pcEnd.AddDate(0, 0, -1), "", usage.PlanPro))
+	marks, err = store.MemberHighWater(ctx, acct, pcStart, pcEnd)
+	require.NoError(t, err)
+	hwm, ok = hwmFor(marks, gone)
+	require.True(t, ok, "deleted inside the period: its members were held in it")
+	require.Equal(t, 20, hwm.Count)
+	_, ok = hwmFor(marks, before)
+	require.False(t, ok, "deleted before the period opened")
+	hwm, ok = hwmFor(marks, young)
+	require.True(t, ok, "created inside the period, still in grace at the boundary")
+	require.Equal(t, 14, hwm.Count)
 
 	var rows int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM ms_billing.app_member_counts WHERE app_id = $1`, appID.String()).Scan(&rows))
@@ -419,4 +587,48 @@ func TestTransferApp_HonoursThePlanLedgerAndTheFreeCap(t *testing.T) {
 		require.Equal(t, billing.CodePlanLimit, be.Code)
 		require.Equal(t, f.oldAcct.String(), f.rosterAccount(t), "not moved")
 	})
+}
+
+// (f) MarkCombinedProrationProposed on the real store arms the APP row with
+// the same reference it resolves the header to, in one transaction — for a
+// nothing-to-bill ("none:") resolution and a sealed intent alike. Before
+// round 3 it resolved the header only: AppsPendingProration re-selected the
+// app every sweep and the freeze's recovery refused the resolved header whose
+// app row carried no marker (round-2 review, #6).
+func TestMigration076_ProposedMarkArmsTheAppRowWithTheHeader(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+	for _, ref := range []string{"none:app-proration:", "intent:"} {
+		accountID, appID, createdAt := seedCombinedAttemptApp(t, pool, store, 7)
+		shape := combinedAttemptShape(appID, accountID)
+		attemptedAt := createdAt.AddDate(0, 0, usage.GraceDays)
+		_, outcome, err := store.FreezeCombinedProrationAttempt(ctx, appID, attemptedAt, shape, false)
+		require.NoError(t, err)
+		require.Equal(t, cycle.StripeRailClaimed, outcome)
+		pending, err := store.AppsPendingProration(ctx, attemptedAt.Add(time.Hour))
+		require.NoError(t, err)
+		require.Contains(t, pending, appID, "frozen, unresolved: still the sweep's")
+
+		ref := ref + appID.String()
+		require.NoError(t, store.MarkCombinedProrationProposed(ctx, appID, attemptedAt.Add(time.Minute), ref))
+		var stamped string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`, appID.String()).Scan(&stamped))
+		require.Equal(t, ref, stamped, "the app row carries the header's reference")
+		attempt, found, err := store.CombinedProrationAttempt(ctx, appID)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, ref, attempt.ResolvedInvoiceID)
+		pending, err = store.AppsPendingProration(ctx, attemptedAt.Add(time.Hour))
+		require.NoError(t, err)
+		require.NotContains(t, pending, appID, "terminal: never re-swept")
+
+		// A retry (a crash between the commit and the caller's own bookkeeping)
+		// is idempotent, and the freeze's recovery agrees with the marker.
+		require.NoError(t, store.MarkCombinedProrationProposed(ctx, appID, attemptedAt.Add(2*time.Minute), ref))
+		recovered, outcome, err := store.FreezeCombinedProrationAttempt(ctx, appID, attemptedAt.Add(time.Hour), shape, false)
+		require.NoError(t, err, "a resolved header with a matching app marker is a clean recovery")
+		require.Equal(t, cycle.StripeRailClaimed, outcome)
+		require.Equal(t, ref, recovered.ResolvedInvoiceID)
+	}
 }

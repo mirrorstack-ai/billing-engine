@@ -177,7 +177,8 @@ func (f *fakeStore) OpenPlanChange(_ context.Context, p cycle.OpenPlanChangePara
 	folded := false
 	status := cycle.PlanChangeScheduled
 	if p.Kind == cycle.PlanChangeUpgrade {
-		folded = app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.ProrationAttempted
+		unbilled := app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.ProrationAttempted
+		folded = unbilled && !p.FoldUntil.IsZero() && p.RequestedAt.Before(p.FoldUntil)
 		if folded {
 			shape = p.Folded
 		} else {
@@ -302,6 +303,11 @@ func (f *fakeStore) SettlePlanChangeCard(_ context.Context, id uuid.UUID, cardMi
 }
 
 func (f *fakeStore) CancelScheduledPlanChange(_ context.Context, appID uuid.UUID, at time.Time) (bool, error) {
+	if f.beforeCancelScheduled != nil {
+		hook := f.beforeCancelScheduled
+		f.beforeCancelScheduled = nil
+		hook(f, appID)
+	}
 	for id, c := range f.planChanges {
 		if c.AppID == appID && c.Status == cycle.PlanChangeScheduled {
 			c.Status, c.SettledAt = cycle.PlanChangeCancelled, at.UTC()
@@ -326,16 +332,17 @@ func (f *fakeStore) applyDue(filter func(cycle.PlanChange) bool, dueAt time.Time
 	})
 	for _, id := range ids {
 		c := f.planChanges[id]
-		if app, ok := f.apps[c.AppID]; ok && !app.Deleted {
-			if f.capReached(c.AccountID, app.OwnerOrgID, c.ToPlan, c.AppID) {
-				c.Status, c.SettledAt = cycle.PlanChangeCancelled, dueAt.UTC()
-				f.planChanges[id] = c
-				cancelled++
-				continue
-			}
-			app.Plan = c.ToPlan
-			f.apps[c.AppID] = app
+		app, ok := f.apps[c.AppID]
+		// A deleted app's downgrade is cancelled, never applied (its plan is
+		// frozen with the row); so is one whose destination cap is full.
+		if !ok || app.Deleted || f.capReached(c.AccountID, app.OwnerOrgID, c.ToPlan, c.AppID) {
+			c.Status, c.SettledAt = cycle.PlanChangeCancelled, dueAt.UTC()
+			f.planChanges[id] = c
+			cancelled++
+			continue
 		}
+		app.Plan = c.ToPlan
+		f.apps[c.AppID] = app
 		c.Status, c.SettledAt = cycle.PlanChangeApplied, dueAt.UTC()
 		f.planChanges[id] = c
 		applied++
@@ -378,12 +385,51 @@ func (f *fakeStore) SetAppMemberCount(_ context.Context, appID uuid.UUID, member
 	return nil
 }
 
-// MemberHighWater mirrors MemberHighWaterForAccount: per live app,
-// max(count in force at period start, max count recorded inside the period).
-func (f *fakeStore) MemberHighWater(_ context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (map[uuid.UUID]int, error) {
-	out := map[uuid.UUID]int{}
-	for _, app := range f.apps {
-		if app.AccountID != accountID || app.Deleted {
+// planAtInstant mirrors the ledger derivation the SQL does: the plan an app
+// was on just before `at` is the from_plan of the earliest effective change
+// (pending/settled/applied) at or after `at` — strictly after when
+// `exclusive` — else the row's plan.
+func (f *fakeStore) planAtInstant(app cycle.AppMirror, at time.Time, exclusive bool) usage.Plan {
+	plan := fakeEffectivePlan(app)
+	var earliest *cycle.PlanChange
+	for id := range f.planChanges {
+		c := f.planChanges[id]
+		if c.AppID != app.AppID {
+			continue
+		}
+		switch c.Status {
+		case cycle.PlanChangePending, cycle.PlanChangeSettled, cycle.PlanChangeApplied:
+		default:
+			continue
+		}
+		if c.EffectiveAt.Before(at) || (exclusive && c.EffectiveAt.Equal(at)) {
+			continue
+		}
+		if earliest == nil || c.EffectiveAt.Before(earliest.EffectiveAt) {
+			cc := c
+			earliest = &cc
+		}
+	}
+	if earliest != nil {
+		plan = earliest.FromPlan
+	}
+	return plan
+}
+
+// MemberHighWater mirrors MemberHighWaterForAccount: per app that held
+// members in the period (live, or deleted inside it; created before it
+// ended), max(count in force at period start, max count recorded inside the
+// period), with the plan in force during the period.
+func (f *fakeStore) MemberHighWater(_ context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]cycle.MemberHighWater, error) {
+	var out []cycle.MemberHighWater
+	ids := make([]uuid.UUID, 0, len(f.apps))
+	for id := range f.apps {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+	for _, id := range ids {
+		app := f.apps[id]
+		if app.AccountID != accountID || !app.CreatedAt.Before(periodEnd) || (app.Deleted && app.DeletedAt.Before(periodStart)) {
 			continue
 		}
 		history := append([]fakeMemberCount(nil), f.memberHistory[app.AppID]...)
@@ -407,7 +453,7 @@ func (f *fakeStore) MemberHighWater(_ context.Context, accountID uuid.UUID, peri
 		if inside > hwm {
 			hwm = inside
 		}
-		out[app.AppID] = hwm
+		out = append(out, cycle.MemberHighWater{AppID: app.AppID, Plan: f.planAtInstant(app, periodEnd, false), Count: hwm})
 	}
 	return out, nil
 }

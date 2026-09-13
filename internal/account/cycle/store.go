@@ -514,10 +514,12 @@ type Store interface {
 	// module count, and gets no history row.
 	SetAppMemberCount(ctx context.Context, appID uuid.UUID, memberCount int, at time.Time) error
 
-	// MemberHighWater returns, per live app on the account, the period's
-	// high-water member count: max(count in force at period start, max count
-	// recorded inside the period). The boundary's members input.
-	MemberHighWater(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (map[uuid.UUID]int, error)
+	// MemberHighWater returns, per app that held members on the account
+	// during [periodStart, periodEnd), the period's high-water member count —
+	// max(count in force at period start, max count recorded inside the
+	// period) — with the plan in force during the period. The boundary's
+	// members input; read-only and the same on a reclaim.
+	MemberHighWater(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]MemberHighWater, error)
 
 	// InsertFreeAppMirror registers a NEW app on Free under the owner's cap
 	// lock; capReached=true inserted nothing. An already-mirrored app is the
@@ -582,7 +584,8 @@ type Store interface {
 	// LiveAppsCreatedBefore returns every LIVE (deleted_at IS NULL) app on the
 	// account that has JOINED the advance-base mechanism by createdBefore (the
 	// NEW period's start, i.e. the closed window's period_end), with its
-	// module_count — the boundary charge's advance-base input. An app is
+	// module_count and the plan in force AT createdBefore (AppModuleCount.Plan)
+	// — the boundary charge's advance-base input. An app is
 	// excluded when created inside the new period (its creation-proration leg
 	// owns that period's base) OR when its creation grace (graceDays) had not
 	// yet elapsed by createdBefore (it hasn't survived grace — deleted-in-grace
@@ -859,12 +862,28 @@ type ModuleOverageCandidate struct {
 type AppModuleCount struct {
 	AppID       uuid.UUID
 	ModuleCount int
-	// Plan prices the app's advance base (migration 075, core-v2#1412).
+	// Plan prices the app's advance base (migration 075, core-v2#1412). It is
+	// the plan IN FORCE AT THE BOUNDARY the roster was read for, derived from
+	// the plan-change ledger (migration 076), not the row's live plan: an
+	// upgrade requested after the boundary has charged its own (new − old)
+	// delta for the new period, so the advance base stays at the old plan —
+	// and a reclaim of the run derives the same figure however late it runs.
 	Plan usage.Plan
-	// MemberCount prices the app's advance members (migration 077): every
-	// member past the plan's included count is one usage.ExtraMemberFeeMicros
-	// for the new period.
+	// MemberCount is the row's live member count (migration 077) — display
+	// only here; the members fee is priced from MemberHighWater.
 	MemberCount int
+}
+
+// MemberHighWater is one app's members input for a closed period (migration
+// 077): the period's high-water member count and the plan in force DURING the
+// period (from the ledger, so a reclaim after the boundary apply flipped the
+// row still prices the closed period at the plan it ran on). Every app that
+// held members in the period is a row — live or deleted inside it, in or out
+// of its creation grace — so no period's members escape the fee.
+type MemberHighWater struct {
+	AppID uuid.UUID
+	Plan  usage.Plan
+	Count int
 }
 
 // AppBaseSnapshot is the in-memory form of a ms_billing.app_base_snapshots
@@ -4239,9 +4258,19 @@ func centsNumeric(cents int64) (pgtype.Numeric, error) {
 // indistinguishable is one where a later reconciler cannot tell which rail
 // settled it.
 //
-// It resolves the HEADER only. persistProrationCharge also mirrors invoice
-// children and timer charges, and there are none here — no invoice exists, and
-// stamping timers as charged would claim money moved.
+// It resolves the HEADER and arms the app's one-shot guard with the same
+// reference, in one transaction and in that order (the migration-050 trigger
+// refuses the app write while the header is unresolved). persistProrationCharge
+// also mirrors invoice children and timer charges, and there are none here —
+// no invoice exists, and stamping timers as charged would claim money moved.
+//
+// 🔴 BOTH ROWS, OR THE APP IS RE-SWEPT FOREVER. AppsPendingProration selects on
+// the app's proration_invoice_id / proration_skipped_at alone, and the freeze's
+// recovery refuses a resolved header whose app row carries no matching marker
+// — so a header resolved without the app stamp is an app that errors on every
+// later sweep and defers its co-created timers for good. That was the case
+// for the nothing-to-bill ("none:") resolution (review round 2, #6), and the
+// same statement pair closes it for a sealed intent.
 func (s *pgxStore) MarkCombinedProrationProposed(
 	ctx context.Context,
 	appID uuid.UUID,
@@ -4251,7 +4280,13 @@ func (s *pgxStore) MarkCombinedProrationProposed(
 	if intentReference == "" {
 		return errors.New("cycle: a proposed proration needs its intent reference")
 	}
-	resolved, err := s.q.ResolveCombinedProrationAttempt(ctx, db.ResolveCombinedProrationAttemptParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+	resolved, err := qtx.ResolveCombinedProrationAttempt(ctx, db.ResolveCombinedProrationAttemptParams{
 		ResolvedAt:        at.UTC(),
 		ResolvedInvoiceID: pgtype.Text{String: intentReference, Valid: true},
 		AppID:             appID.String(),
@@ -4263,5 +4298,13 @@ func (s *pgxStore) MarkCombinedProrationProposed(
 		return fmt.Errorf(
 			"combined proration attempt %s could not resolve to intent %s", appID, intentReference)
 	}
-	return nil
+	// First-write-wins (WHERE proration_invoice_id IS NULL): a retry after a
+	// crash between the two commits finds the guard already armed with this
+	// reference and affects 0 rows, which is the idempotent case, not an error.
+	if _, err := qtx.SetAppProrationInvoice(ctx, db.SetAppProrationInvoiceParams{
+		AppID: appID.String(), ProrationInvoiceID: pgtype.Text{String: intentReference, Valid: true},
+	}); err != nil {
+		return fmt.Errorf("arm app proration guard with intent %s: %w", intentReference, err)
+	}
+	return tx.Commit(ctx)
 }

@@ -172,11 +172,19 @@ func (s *pgxStore) OpenPlanChange(ctx context.Context, p OpenPlanChangeParams) (
 	folded := false
 	status := PlanChangeScheduled
 	if p.Kind == PlanChangeUpgrade {
-		// 🔴 THE FOLD DECISION, FROM THE LOCKED ROW. The creation window is
-		// still unbilled while all three markers are NULL — not "inside the
-		// grace": the sweep can run days after it, and until it has, the
-		// creation charge is the one charge pricing these days.
-		folded = !row.ProrationInvoiceID.Valid && !row.ProrationSkippedAt.Valid && !row.ProrationAttemptedAt.Valid
+		// 🔴 THE FOLD DECISION, FROM THE LOCKED ROW AND THE WINDOW. An upgrade
+		// folds when the creation charge will price its days: the creation
+		// window is still unbilled (all three markers NULL — not "inside the
+		// grace": the sweep can run days after it) AND the change lands inside
+		// the window that charge covers (the creation period, plus the
+		// straddled one when the grace crosses the boundary — p.FoldUntil).
+		// A change after that window is a priced delta even while the
+		// creation charge is still unbilled: the creation charge prices its
+		// own window by segment, and the delta prices the rest (review round
+		// 2, #5 — a marker-only fold settled such an upgrade at $0 and nobody
+		// priced the delta days).
+		unbilled := !row.ProrationInvoiceID.Valid && !row.ProrationSkippedAt.Valid && !row.ProrationAttemptedAt.Valid
+		folded = unbilled && !p.FoldUntil.IsZero() && p.RequestedAt.Before(p.FoldUntil)
 		if folded {
 			shape = p.Folded
 		} else {
@@ -501,12 +509,13 @@ func (s *pgxStore) CancelScheduledPlanChange(ctx context.Context, appID uuid.UUI
 	return n == 1, nil
 }
 
-// applyDueRows moves each due downgrade onto its plan — unless the
-// destination plan's per-owner cap is full at the boundary, in which case the
-// row is cancelled with a logged reason (a scheduled downgrade is a
-// commitment counted against the cap, so this is only reachable when a
-// concurrent commitment slipped past, or the cap itself moved). Each row's
-// flip and close are one statement pair inside the caller's transaction.
+// applyDueRows moves each due downgrade onto its plan — unless the app is
+// deleted, or the destination plan's per-owner cap is full at the boundary,
+// in which case the row is cancelled with a logged reason (a scheduled
+// downgrade is a commitment counted against the cap, so the cap case is only
+// reachable when a concurrent commitment slipped past, or the cap itself
+// moved). Each row's flip and close are one statement pair inside the
+// caller's transaction.
 func applyDueRows(ctx context.Context, qtx *db.Queries, rows []db.MsBillingAppPlanChange, dueAt time.Time) (applied, cancelled int, err error) {
 	for _, row := range rows {
 		app, err := qtx.SelectAppMirrorForUpdate(ctx, row.AppID)
@@ -521,27 +530,33 @@ func applyDueRows(ctx context.Context, qtx *db.Queries, rows []db.MsBillingAppPl
 		if perr != nil {
 			return applied, cancelled, perr
 		}
+		// A deleted app's plan is frozen with the row, so its downgrade is
+		// CANCELLED, never marked applied: an 'applied' row whose to_plan the
+		// app never moved to breaks the creation-charge plan chain, and an app
+		// deleted after its grace still owes that charge (review round 2, #10).
 		live := err == nil && !app.DeletedAt.Valid
-		if live {
-			full, cerr := capReached(ctx, qtx, accountID, uuidFromPg(app.OwnerOrgID), usage.Plan(row.ToPlan), appID)
+		reason := ""
+		if !live {
+			reason = "the app is deleted"
+		} else if full, cerr := capReached(ctx, qtx, accountID, uuidFromPg(app.OwnerOrgID), usage.Plan(row.ToPlan), appID); cerr != nil {
+			return applied, cancelled, cerr
+		} else if full {
+			reason = "the destination plan's cap is full"
+		}
+		if reason != "" {
+			n, cerr := qtx.CancelPlanChangeByID(ctx, db.CancelPlanChangeByIDParams{CancelledAt: dueAt.UTC(), ID: row.ID})
 			if cerr != nil {
 				return applied, cancelled, cerr
 			}
-			if full {
-				n, cerr := qtx.CancelPlanChangeByID(ctx, db.CancelPlanChangeByIDParams{CancelledAt: dueAt.UTC(), ID: row.ID})
-				if cerr != nil {
-					return applied, cancelled, cerr
-				}
-				if n == 1 {
-					slog.WarnContext(ctx, "scheduled plan change cancelled at the boundary: the destination plan's cap is full",
-						"plan_change_id", row.ID, "app_id", row.AppID, "to_plan", row.ToPlan)
-					cancelled++
-				}
-				continue
+			if n == 1 {
+				slog.WarnContext(ctx, "scheduled plan change cancelled at the boundary: "+reason,
+					"plan_change_id", row.ID, "app_id", row.AppID, "to_plan", row.ToPlan)
+				cancelled++
 			}
-			if _, err := qtx.SetAppPlan(ctx, db.SetAppPlanParams{AppID: row.AppID, Plan: row.ToPlan}); err != nil {
-				return applied, cancelled, err
-			}
+			continue
+		}
+		if _, err := qtx.SetAppPlan(ctx, db.SetAppPlanParams{AppID: row.AppID, Plan: row.ToPlan}); err != nil {
+			return applied, cancelled, err
 		}
 		n, err := qtx.MarkPlanChangeApplied(ctx, db.MarkPlanChangeAppliedParams{AppliedAt: dueAt.UTC(), ID: row.ID})
 		if err != nil {
@@ -693,20 +708,20 @@ func (s *pgxStore) SetAppMemberCount(ctx context.Context, appID uuid.UUID, membe
 // MemberHighWater returns, per live app on the account, the period's
 // high-water member count (owner 2026-09-13): the greater of the count in
 // force when the period opened and the highest count recorded inside it.
-func (s *pgxStore) MemberHighWater(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (map[uuid.UUID]int, error) {
+func (s *pgxStore) MemberHighWater(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]MemberHighWater, error) {
 	rows, err := s.q.MemberHighWaterForAccount(ctx, db.MemberHighWaterForAccountParams{
-		PeriodStart: periodStart.UTC(), PeriodEnd: periodEnd.UTC(), AccountID: accountID.String(),
+		PeriodEnd: periodEnd.UTC(), PeriodStart: periodStart.UTC(), AccountID: accountID.String(),
 	})
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[uuid.UUID]int, len(rows))
+	out := make([]MemberHighWater, 0, len(rows))
 	for _, r := range rows {
 		id, err := uuid.Parse(r.AppID)
 		if err != nil {
 			return nil, err
 		}
-		out[id] = int(r.MemberHwm)
+		out = append(out, MemberHighWater{AppID: id, Plan: usage.Plan(r.Plan), Count: int(r.MemberHwm)})
 	}
 	return out, nil
 }

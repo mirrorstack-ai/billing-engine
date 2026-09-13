@@ -55,6 +55,9 @@ type fakeStore struct {
 	// FreezeCombinedProrationAttempt.
 	beforePlanChangeOpen func(f *fakeStore, appID uuid.UUID)
 	beforeCombinedFreeze func(f *fakeStore, appID uuid.UUID)
+	// beforeCancelScheduled runs once inside CancelScheduledPlanChange, before
+	// the UPDATE — the boundary apply racing a cancel.
+	beforeCancelScheduled func(f *fakeStore, appID uuid.UUID)
 	// rollup inputs
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
@@ -1643,7 +1646,14 @@ func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID
 		// and its creation charge covers through the grace-elapsed period).
 		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) &&
 			app.CreatedAt.AddDate(0, 0, graceDays).Before(createdBefore) {
-			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: app.Plan, MemberCount: app.MemberCount})
+			// The plan IN FORCE AT THE BOUNDARY, from the ledger (a change
+			// effective strictly after it carries the boundary plan as its
+			// from_plan), mirroring LiveAppModuleCountsCreatedBefore.
+			plan := f.planAtInstant(app, createdBefore, true)
+			if app.Plan == "" && plan == usage.DefaultPlan {
+				plan = app.Plan // an unset fake plan stays unset, as before
+			}
+			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: plan, MemberCount: app.MemberCount})
 		}
 	}
 	return apps, nil

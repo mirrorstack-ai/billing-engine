@@ -156,12 +156,16 @@ type OpenPlanChangeParams struct {
 	RequestedAt time.Time
 	// Downgrade is the scheduled shape (EffectiveAt = the boundary, amount 0).
 	Downgrade *PlanChangeShape
-	// Folded is the upgrade's shape when the creation window is still
-	// unbilled (amount 0, the creation period); Charged when it is billed
-	// (the prorated delta, the current period). The store picks from the
-	// locked markers.
-	Folded  *PlanChangeShape
-	Charged *PlanChangeShape
+	// Folded is the upgrade's shape when the creation charge will price its
+	// days (amount 0, the creation period); Charged when this row prices
+	// them (the prorated delta, the current period). The store picks: folded
+	// iff the locked creation markers are all NULL AND RequestedAt is before
+	// FoldUntil — the end of the window the creation charge covers (the
+	// creation period, or the straddled period when the grace crosses the
+	// boundary; creationCoverageEnd). Zero FoldUntil never folds.
+	Folded    *PlanChangeShape
+	Charged   *PlanChangeShape
+	FoldUntil time.Time
 	// Wallet is the wallet leg for a charged upgrade with money; nil = card
 	// only.
 	Wallet *PlanChangeWalletParams
@@ -269,6 +273,12 @@ type AppPlanResponse struct {
 type SetAppPlanRequest struct {
 	AppID uuid.UUID `json:"app_id"`
 	Plan  string    `json:"plan"`
+	// CancelChangeID names the scheduled downgrade a request for the CURRENT
+	// plan withdraws (its id is the response's pending_change.id). Without
+	// it such a request is a no-op: a fire-and-forget retry of an earlier
+	// upgrade whose response was lost is otherwise indistinguishable from
+	// "keep my plan", and silently undid a newer downgrade.
+	CancelChangeID uuid.UUID `json:"cancel_change_id,omitempty"`
 }
 
 // effectivePlan is the plan an AppMirror row prices at: its column, or
@@ -342,9 +352,10 @@ func (s *Service) planResponse(ctx context.Context, app AppMirror, change *PlanC
 //
 // Outcomes, in the order they are decided:
 //
-//   - the requested plan is the current one: a scheduled downgrade is
-//     cancelled (owner: upgrading back before the boundary cancels it, no
-//     charge); otherwise a no-op that returns the terms;
+//   - the requested plan is the current one: a scheduled downgrade the
+//     request NAMES (CancelChangeID) is cancelled (owner: upgrading back
+//     before the boundary cancels it, no charge); otherwise a no-op that
+//     returns the terms and the pending change;
 //   - `free` checks the card half of the Free rules (freeEligible); the cap
 //     half is the store's, under the owner lock;
 //   - a lower rank is a downgrade, scheduled for the period boundary;
@@ -399,16 +410,21 @@ func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPl
 
 	current := effectivePlan(app)
 	if plan == current {
-		if hasOpen && open.Status == PlanChangeScheduled {
+		if hasOpen && open.Status == PlanChangeScheduled && req.CancelChangeID == open.ID {
 			cancelled, err := s.store.CancelScheduledPlanChange(ctx, app.AppID, now)
 			if err != nil {
 				return nil, billing.Internal("cancel scheduled plan change failed", err)
 			}
-			if cancelled {
-				open.Status = PlanChangeCancelled
-				open.SettledAt = now
-				return s.planResponse(ctx, app, &open)
+			if !cancelled {
+				// The boundary applied it between the unlocked read above
+				// and this UPDATE (0 rows: no longer scheduled). Saying "you
+				// are on the old plan, nothing pending" would be false, and a
+				// retry would become a charged upgrade; make the race visible.
+				return nil, billing.Conflict("the scheduled downgrade was applied at the boundary before it could be withdrawn; re-read the plan")
 			}
+			open.Status = PlanChangeCancelled
+			open.SettledAt = now
+			return s.planResponse(ctx, app, &open)
 		}
 		return s.planResponse(ctx, app, nil)
 	}
@@ -496,10 +512,17 @@ func (s *Service) scheduleDowngrade(
 }
 
 // upgradeNow moves the app up the ladder at once. Both shapes are derived
-// here — folded (the creation window is still unbilled: charge nothing, let
-// the creation charge price the days) and charged (the prorated difference,
-// collected now) — and the STORE picks one under the app lock from the row's
-// creation markers, never from this function's unlocked read of them.
+// here — folded (the creation charge will price the days: charge nothing)
+// and charged (the prorated difference, collected now) — and the STORE picks
+// one under the app lock from the row's creation markers and the creation
+// coverage window, never from this function's unlocked read of them.
+//
+// The delta is priced against the anchored period containing `now`, and the
+// boundary that opens that period prices its advance base at the plan in
+// force AT the boundary (the roster derives it from this ledger, not from the
+// live row) — so an upgrade requested in the gap between a period end and
+// the cron that closes it charges (new − old) here and the old base there,
+// never the new base twice (review round 2, #2).
 //
 // Every gate runs BEFORE the open, and the store refuses a charged decision
 // the gates did not pass (ChargeAllowed): the refusal the owner allowed ("no
@@ -516,7 +539,7 @@ func (s *Service) upgradeNow(
 		// current one. Unreachable while business is refused (the only
 		// downgrade is pro → free and the only upgrade from pro is business);
 		// refused rather than silently stacked when the ladder grows.
-		return nil, billing.Conflict("a downgrade is scheduled; cancel it by asking for the current plan first")
+		return nil, billing.Conflict("a downgrade is scheduled; withdraw it first by asking for the current plan with cancel_change_id set to it")
 	}
 	activatedAt, activated, err := s.store.AccountActivation(ctx, app.AccountID)
 	if err != nil {
@@ -528,6 +551,10 @@ func (s *Service) upgradeNow(
 	anchorDay := billingperiod.AnchorDay(activatedAt)
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(now, anchorDay)
 	creationStart, creationEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), anchorDay)
+	// The window the creation charge prices (creation period + straddle): a
+	// change inside it folds; one after it is a priced delta even while the
+	// creation charge is still unbilled.
+	foldUntil := creationCoverageEnd(app.CreatedAt.UTC(), activatedAt)
 
 	// The difference between the bases for the remaining days, the change day
 	// inclusive at the NEW plan (split by day, like the fold).
@@ -540,7 +567,7 @@ func (s *Service) upgradeNow(
 
 	// The unlocked HINT of which shape applies — only to pick the refusal
 	// message when the gates fail. The store decides for real.
-	expectFold := app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.ProrationAttempted
+	expectFold := app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.ProrationAttempted && now.Before(foldUntil)
 
 	// Gates for the CHARGED shape, all before the write. H10: a prepaid
 	// account is never charged off-session by any leg, and an upgrade's charge
@@ -584,7 +611,7 @@ func (s *Service) upgradeNow(
 	change, outcome, err := s.store.OpenPlanChange(ctx, OpenPlanChangeParams{
 		AppID: app.AppID, AccountID: app.AccountID, FromPlan: from, ToPlan: to,
 		Kind: PlanChangeUpgrade, RequestedAt: now,
-		Folded: folded, Charged: charged, Wallet: wallet, ChargeAllowed: chargeAllowed,
+		Folded: folded, Charged: charged, FoldUntil: foldUntil, Wallet: wallet, ChargeAllowed: chargeAllowed,
 	})
 	if err != nil {
 		return nil, billing.Internal("open plan change failed", err)
@@ -634,6 +661,9 @@ func (s *Service) upgradeNow(
 //     or the first seal instant if the window since closed) and the line's
 //     label carries the app id only, so a retry after a crash — or after a
 //     rename — seals the same digest, and the row settles with its reference.
+//     A stored window that has closed is re-anchored only once the document
+//     sealed under it is known to be absent or dead — never while it may
+//     have been collected.
 //
 // A row left pending — the card vanished between the gate and the seal, the
 // account went prepaid, or the proposal failed — is finished by
@@ -710,22 +740,50 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 		}
 		// The window anchor: the request instant, unless the window that
 		// would open there has already closed — then this seal instant.
-		// Stored, so a retry seals the same digest; re-anchored only when
-		// the stored window itself has closed (a failed seal's leftover, or a
-		// document that is dead anyway), never to seal what cannot collect.
+		// Stored, so a retry seals the same digest.
 		anchor := change.RequestedAt
 		if !now.Before(change.RequestedAt.Add(executionWindow)) {
 			anchor = now
 		}
-		windowStart, err := s.store.EnsurePlanChangeCardWindow(ctx, change.ID, anchor, now.Add(-executionWindow))
-		if err != nil {
-			return change, billing.Internal("plan change card window anchor failed", err)
+		// 🔴 NEVER RE-SEAL WHAT MAY HAVE BEEN COLLECTED. A stored window that
+		// has closed is not, by itself, a dead document: a crash between the
+		// seal and the settle below leaves this row without its card_ref
+		// while the sealed document lives on, and the executor collects it —
+		// re-anchoring on the window alone then sealed a SECOND document for
+		// one upgrade (review round 2, #7). So the stored window's digest is
+		// re-derived (a seal-only derivation, nothing stored) and its state
+		// asked before anything is anchored: collected → this row settles
+		// with it; still in flight → wait; absent or dead → re-anchor.
+		reanchorBefore := time.Time{} // a stored anchor is kept …
+		if !change.CardWindowStart.IsZero() && !now.Before(change.CardWindowStart.Add(executionWindow)) {
+			priorDigest, err := s.proposer.Digest(ctx, planChangeCharge(change, sealMicros, change.CardWindowStart))
+			if err != nil {
+				return change, billing.Internal("derive the prior plan change intent digest failed", err)
+			}
+			state, found, err := s.proposer.IntentState(ctx, priorDigest)
+			if err != nil {
+				return change, billing.Internal("prior plan change intent state lookup failed", err)
+			}
+			switch {
+			case found && intentCollected(state):
+				cardRef = "intent:" + priorDigest
+			case found && !intentDead(state):
+				return change, billing.PaymentRequired("the upgrade's earlier charge document is still being collected; retried next sweep")
+			default:
+				reanchorBefore = now.Add(-executionWindow) // … unless its document is absent or dead
+			}
 		}
-		sealed, err := s.proposer.Propose(ctx, planChangeCharge(change, sealMicros, windowStart))
-		if err != nil {
-			return change, billing.Internal("propose plan change intent failed", err)
+		if cardRef == "" {
+			windowStart, err := s.store.EnsurePlanChangeCardWindow(ctx, change.ID, anchor, reanchorBefore)
+			if err != nil {
+				return change, billing.Internal("plan change card window anchor failed", err)
+			}
+			sealed, err := s.proposer.Propose(ctx, planChangeCharge(change, sealMicros, windowStart))
+			if err != nil {
+				return change, billing.Internal("propose plan change intent failed", err)
+			}
+			cardRef = "intent:" + sealed.Digest()
 		}
-		cardRef = "intent:" + sealed.Digest()
 	}
 	if _, err := s.store.SettlePlanChangeCard(ctx, change.ID, sealMicros, cardRef, now); err != nil {
 		return change, billing.Internal("settle plan change failed", err)
@@ -755,6 +813,20 @@ func upgradeDeltaMicros(from, to usage.Plan, at, periodStart, periodEnd time.Tim
 		return 0, fmt.Errorf("upgrade %s → %s has a negative base difference %d", from, to, delta)
 	}
 	return usage.ProratedSegmentMicros(delta, at, periodEnd, periodStart, periodEnd), nil
+}
+
+// intentCollected / intentDead read the intent lifecycle (migration 054's
+// state vocabulary) for the re-seal guard above: 'succeeded' is money moved;
+// 'voided', 'canceled' and 'expired' are documents that never will; every
+// other state is a document still in flight.
+func intentCollected(state string) bool { return state == "succeeded" }
+
+func intentDead(state string) bool {
+	switch state {
+	case "voided", "canceled", "expired":
+		return true
+	}
+	return false
 }
 
 // planChangeCharge is the upgrade's card leg as one sealed charge: one line

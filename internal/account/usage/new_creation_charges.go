@@ -288,6 +288,13 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			// anchor day; the sweep anchors from created_at with that same day, so
 			// an in-window created_at resolves to these identical bounds.
 			eta := GraceExpiry(r.CreatedAt)
+			// Display only: priced from the app's LIVE plan over the whole
+			// window. The charge itself prices the window by segment from
+			// apps.created_plan through the plan-change ledger (migration
+			// 076), so after a folded upgrade or a boundary downgrade inside
+			// the window this preview can differ from the sealed amount until
+			// the sweep runs; billing-engine#202 PR-2c prices it from the
+			// ledger. No money moves on this figure.
 			projected := CreationChargeBaseMicros(resolveBaseFeeMicros(r.Plan), r.CreatedAt, periodStart, periodEnd)
 			overCount, err := s.store.CoCreatedOverModuleTimerCount(ctx, accountID, r.AppID, r.CreatedAt, IncludedModules)
 			if err != nil {

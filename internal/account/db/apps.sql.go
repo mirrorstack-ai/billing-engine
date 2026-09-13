@@ -237,25 +237,30 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 }
 
 const liveAppModuleCountsCreatedBefore = `-- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count, plan, member_count
-FROM ms_billing.apps
-WHERE account_id = $1::uuid
-  AND deleted_at IS NULL
-  AND created_at < $2::timestamptz
-  AND created_at + make_interval(hours => $3::int) < $2::timestamptz
+SELECT a.app_id, a.module_count, a.member_count,
+       COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
+                 WHERE c.app_id = a.app_id
+                   AND c.status IN ('pending', 'settled', 'applied')
+                   AND c.effective_at > $1::timestamptz
+                 ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan
+FROM ms_billing.apps a
+WHERE a.account_id = $2::uuid
+  AND a.deleted_at IS NULL
+  AND a.created_at < $1::timestamptz
+  AND a.created_at + make_interval(hours => $3::int) < $1::timestamptz
 `
 
 type LiveAppModuleCountsCreatedBeforeParams struct {
-	AccountID     string    `json:"account_id"`
 	CreatedBefore time.Time `json:"created_before"`
+	AccountID     string    `json:"account_id"`
 	GraceHours    int32     `json:"grace_hours"`
 }
 
 type LiveAppModuleCountsCreatedBeforeRow struct {
 	AppID       string `json:"app_id"`
 	ModuleCount int32  `json:"module_count"`
-	Plan        string `json:"plan"`
 	MemberCount int32  `json:"member_count"`
+	Plan        string `json:"plan"`
 }
 
 // LiveAppModuleCountsCreatedBefore returns (app_id, module_count, plan) for every
@@ -291,8 +296,18 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 // by an hour around DST and double-bill or gap a whole period.
 // member_count (migration 077) feeds the advance-members component: every
 // member past the plan's included count is one $2 line for the new period.
+// The plan column returned is the plan IN FORCE AT THE BOUNDARY INSTANT
+// (created_before), not the row's live plan: the earliest ledger change that
+// took effect strictly after the boundary carries, as its from_plan, the plan
+// the app was on at the boundary (migration 076 — every change flips
+// apps.plan in the transaction that writes its row, so the chain is exact).
+// An upgrade requested in the gap between the boundary and the cron that
+// closes it has already charged (new − old) for the new period on its own
+// row; pricing this advance base at the live plan would bill the new base a
+// second time — and a reclaim of a failed run days later must derive the
+// SAME figure the first attempt did, whatever the plan has become since.
 func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg LiveAppModuleCountsCreatedBeforeParams) ([]LiveAppModuleCountsCreatedBeforeRow, error) {
-	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedBefore, arg.GraceHours)
+	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.CreatedBefore, arg.AccountID, arg.GraceHours)
 	if err != nil {
 		return nil, err
 	}
@@ -303,8 +318,8 @@ func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg Live
 		if err := rows.Scan(
 			&i.AppID,
 			&i.ModuleCount,
-			&i.Plan,
 			&i.MemberCount,
+			&i.Plan,
 		); err != nil {
 			return nil, err
 		}
@@ -371,41 +386,50 @@ func (q *Queries) MarkAppProrationAttempted(ctx context.Context, arg MarkAppPror
 
 const memberHighWaterForAccount = `-- name: MemberHighWaterForAccount :many
 SELECT a.app_id,
+       COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
+                 WHERE c.app_id = a.app_id
+                   AND c.status IN ('pending', 'settled', 'applied')
+                   AND c.effective_at >= $1::timestamptz
+                 ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan,
        GREATEST(
            COALESCE((SELECT c.count FROM ms_billing.app_member_counts c
-                     WHERE c.app_id = a.app_id AND c.recorded_at < $1::timestamptz
+                     WHERE c.app_id = a.app_id AND c.recorded_at < $2::timestamptz
                      ORDER BY c.recorded_at DESC, c.id DESC LIMIT 1), 0),
            COALESCE((SELECT MAX(c.count) FROM ms_billing.app_member_counts c
                      WHERE c.app_id = a.app_id
-                       AND c.recorded_at >= $1::timestamptz
-                       AND c.recorded_at < $2::timestamptz), 0)
+                       AND c.recorded_at >= $2::timestamptz
+                       AND c.recorded_at < $1::timestamptz), 0)
        )::int AS member_hwm
 FROM ms_billing.apps a
 WHERE a.account_id = $3::uuid
-  AND a.deleted_at IS NULL
+  AND a.created_at < $1::timestamptz
+  AND (a.deleted_at IS NULL OR a.deleted_at >= $2::timestamptz)
 `
 
 type MemberHighWaterForAccountParams struct {
-	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
+	PeriodStart time.Time `json:"period_start"`
 	AccountID   string    `json:"account_id"`
 }
 
 type MemberHighWaterForAccountRow struct {
 	AppID     string `json:"app_id"`
+	Plan      string `json:"plan"`
 	MemberHwm int32  `json:"member_hwm"`
 }
 
-// MemberHighWaterForAccount is the boundary's members input (owner
-// 2026-09-13: the fee bills on the HIGH-WATER MARK): for every live app on the
-// account, the greater of the count in force when the period opened (the
-// latest history row before @period_start; 0 when none — the app did not
-// exist yet, and every app has a row at its created_at since 077's backfill)
-// and the highest count recorded inside [@period_start, @period_end).
-// Read-only and deterministic: a reclaimed run derives the same figure, and
-// nothing here mutates at the boundary.
+// MemberHighWaterForAccount is the boundary's members input (migration 077,
+// owner 2026-09-13): per app that HELD members during the closed period
+// [period_start, period_end) — live, or deleted inside it, created before it
+// ended, in or out of its creation grace — the period's high-water mark:
+// max(count in force when the period opened, max count recorded inside it).
+// The plan returned is the plan IN FORCE DURING THE PERIOD: the earliest
+// ledger change effective at or after period_end (a downgrade the boundary
+// applies has effective_at = period_end) carries the period's plan as its
+// from_plan; otherwise the row's plan. So a reclaim after the boundary apply
+// flipped the row still prices the closed period at the plan it ran on.
 func (q *Queries) MemberHighWaterForAccount(ctx context.Context, arg MemberHighWaterForAccountParams) ([]MemberHighWaterForAccountRow, error) {
-	rows, err := q.db.Query(ctx, memberHighWaterForAccount, arg.PeriodStart, arg.PeriodEnd, arg.AccountID)
+	rows, err := q.db.Query(ctx, memberHighWaterForAccount, arg.PeriodEnd, arg.PeriodStart, arg.AccountID)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +437,7 @@ func (q *Queries) MemberHighWaterForAccount(ctx context.Context, arg MemberHighW
 	items := []MemberHighWaterForAccountRow{}
 	for rows.Next() {
 		var i MemberHighWaterForAccountRow
-		if err := rows.Scan(&i.AppID, &i.MemberHwm); err != nil {
+		if err := rows.Scan(&i.AppID, &i.Plan, &i.MemberHwm); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
