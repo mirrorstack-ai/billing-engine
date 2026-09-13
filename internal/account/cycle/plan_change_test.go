@@ -1273,10 +1273,12 @@ func TestSweepPendingPlanChanges_SealSucceededSettleFailedReplaysTheSameDigest(t
 	require.Equal(t, "intent:"+first, change.CardRef)
 }
 
-// (#7) A stored window that has closed is NOT re-anchored while the document
-// sealed under it may have been collected: collected → the row settles with
-// it, no second seal; still in flight → wait; absent or dead → re-anchor and
-// seal afresh.
+// (#7, round-3 #3) A stored window that has closed is re-anchored only when
+// the document sealed under it was NOT collected: 'succeeded' → the row
+// settles with that document, no second seal; any other state, or no
+// document at all, is DEAD under a closed window (the executor's predicate
+// cannot run it, and nothing advances an intent to 'expired') → re-anchor
+// and seal afresh, once.
 func TestSettlePlanChange_NeverReSealsAfterTheFirstDocumentWasCollected(t *testing.T) {
 	late := pcChangeAt.AddDate(0, 0, 40) // the 30-day window anchored at the request has closed
 
@@ -1293,19 +1295,8 @@ func TestSettlePlanChange_NeverReSealsAfterTheFirstDocumentWasCollected(t *testi
 		require.Equal(t, "intent:"+first, change.CardRef)
 	})
 
-	t.Run("in flight: wait", func(t *testing.T) {
-		store, svc, p, appID, first := crashedAfterSeal(t)
-		p.states = map[string]string{first: "provider_in_progress"}
-		svc.WithNow(func() time.Time { return late })
-		sweep, err := svc.SweepPendingPlanChanges(context.Background(), late)
-		require.NoError(t, err)
-		require.Equal(t, &cycle.SweepPlanChangesResult{Pending: 1, Skipped: 1}, sweep)
-		require.Len(t, p.charges, 1)
-		require.Equal(t, cycle.PlanChangePending, onlyPlanChange(t, store, appID).Status)
-	})
-
-	for state, label := range map[string]string{"": "absent", "expired": "dead"} {
-		t.Run(label+": re-anchor and seal afresh", func(t *testing.T) {
+	for state, label := range map[string]string{"": "absent", "proposed": "never executed", "provider_in_progress": "stuck in flight", "voided": "voided"} {
+		t.Run(label+": dead under a closed window, re-anchor and seal afresh once", func(t *testing.T) {
 			store, svc, p, appID, first := crashedAfterSeal(t)
 			if state != "" {
 				p.states = map[string]string{first: state}
@@ -1322,6 +1313,11 @@ func TestSettlePlanChange_NeverReSealsAfterTheFirstDocumentWasCollected(t *testi
 			change := onlyPlanChange(t, store, appID)
 			require.Equal(t, cycle.PlanChangeSettled, change.Status)
 			require.Equal(t, "intent:"+second, change.CardRef)
+			// Once: a further sweep proposes nothing more.
+			sweep, err = svc.SweepPendingPlanChanges(context.Background(), late.Add(time.Hour))
+			require.NoError(t, err)
+			require.Equal(t, &cycle.SweepPlanChangesResult{}, sweep)
+			require.Len(t, p.charges, 2)
 		})
 	}
 }
@@ -1389,4 +1385,141 @@ func TestSetAppPlan_CancelRacingTheBoundaryApplyIsAConflict(t *testing.T) {
 	require.Equal(t, usage.PlanFree, store.apps[appID].Plan)
 	require.Equal(t, cycle.PlanChangeApplied, onlyPlanChange(t, store, appID).Status)
 	require.Empty(t, p.charges)
+}
+
+// --- Round 4: the third review's findings, each pinned ----------------------
+
+// (r3 #1) No proposer installed: a charged upgrade is refused CLOSED and
+// TRACELESS before the open — no row, no plan flip, no wallet draw — while a
+// fold (nothing to seal) still proceeds.
+func TestSetAppPlan_WithoutAProposerAChargedUpgradeIsRefusedBeforeTheOpen(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	store.walletMode = cycle.CreditBillingModeCredits
+	grant := seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
+	svc := cycle.NewService(store, newFakeStripe()).WithNow(func() time.Time { return pcChangeAt }).WithCreditWallet(true)
+	require.False(t, svc.IntentProposerArmed())
+	appID := registerOnPlan(t, svc, user, usage.PlanFree, 0)
+	armCreationCharge(store, appID)
+
+	_, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
+	requirePlanErrCode(t, err, billing.CodeInternal)
+	require.Empty(t, store.planChanges, "no row")
+	require.Equal(t, usage.PlanFree, store.apps[appID].Plan, "no flip")
+	require.EqualValues(t, 50_000_000, store.walletSources[grant].remaining, "no draw — even though the wallet could have covered it")
+	require.Empty(t, store.planChangeDraws)
+
+	// A fold has nothing to seal and proceeds without a proposer.
+	folded := registerOnPlan(t, svc, user, usage.PlanFree, 0)
+	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: folded, Plan: "pro"})
+	require.NoError(t, err)
+	require.True(t, resp.Change.FoldedIntoCreation)
+	require.Equal(t, usage.PlanPro, store.apps[folded].Plan)
+}
+
+// (r3 #4/#8) The $0-base terminal is plan-guarded: a fold committing between
+// the sweep's unlocked derivation and the skip write leaves the row unarmed
+// (the sweep reports it stale) and the next sweep prices the folded Pro days.
+func TestChargeCreationProration_ZeroBaseSkipIsNotArmedOverAConcurrentFold(t *testing.T) {
+	for _, credits := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stripe", true: "wallet"}[credits], func(t *testing.T) {
+			store := newFakeStore()
+			user, _ := registeredAccount(store)
+			if credits {
+				store.walletMode = cycle.CreditBillingModeCredits
+				seedWalletSource(store, "grant", 50_000_000, time.Time{}, timeUTC(2026, 5, 1, 0))
+			}
+			svc, p := planSvc(store, pcChangeAt)
+			if credits {
+				svc = svc.WithCreditWallet(true)
+			}
+			appID := registerOnPlan(t, svc, user, usage.PlanFree, 0)
+			// Between the derivation ($0 at Free) and the skip write, an
+			// upgrade folds in under the app lock: plan pro, row settled at
+			// $0 on the promise that the creation charge prices its days.
+			store.beforeSkipOnPlan = func(f *fakeStore, id uuid.UUID) {
+				_, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: id, Plan: "pro"})
+				require.NoError(t, err)
+			}
+			res, err := svc.ChargeCreationProration(context.Background(), appID)
+			require.NoError(t, err)
+			require.NotEqual(t, cycle.ProrationStatusNoCharge, res.Status, "the stale $0 must not be terminal")
+			require.False(t, store.apps[appID].ProrationSkipped, "nothing armed over the fold")
+			require.True(t, onlyPlanChange(t, store, appID).FoldedIntoCreation)
+
+			// The next sweep prices the fold: 20e6 × 15/30 = $10.00.
+			res, err = svc.ChargeCreationProration(context.Background(), appID)
+			require.NoError(t, err)
+			if credits {
+				require.Equal(t, cycle.ProrationStatusWalletCharged, res.Status)
+				require.EqualValues(t, 1000, res.ProrationCents)
+			} else {
+				require.Equal(t, cycle.ProrationStatusProposed, res.Status)
+				require.EqualValues(t, 1000, sealedProrationCents(t, p))
+			}
+		})
+	}
+}
+
+// (r3 #6) A cancel withdraws the row the request NAMED: the boundary applies
+// the named downgrade and a newer one is scheduled between the read and the
+// cancel → Conflict, and the newer downgrade is untouched.
+func TestSetAppPlan_CancelByTheNamedIdLeavesANewerDowngradeAlone(t *testing.T) {
+	store := newFakeStore()
+	user, _ := registeredAccount(store)
+	svc, p := planSvc(store, pcChangeAt)
+	appID := registerOnPlan(t, svc, user, usage.PlanPro, 0)
+	armCreationCharge(store, appID)
+	first, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "free"})
+	require.NoError(t, err)
+	var newer uuid.UUID
+	store.beforeCancelScheduled = func(f *fakeStore, id uuid.UUID) {
+		// The cron applies D1 … then cancels it at the cap and the owner
+		// (another tab) schedules D2 while D1's cancel request is in flight.
+		c := f.planChanges[first.Change.ID]
+		c.Status, c.SettledAt = cycle.PlanChangeCancelled, pcPeriodEd
+		f.planChanges[first.Change.ID] = c
+		newer = uuid.New()
+		f.planChanges[newer] = cycle.PlanChange{
+			ID: newer, AppID: id, AccountID: c.AccountID, FromPlan: usage.PlanPro, ToPlan: usage.PlanFree,
+			Kind: cycle.PlanChangeDowngrade, RequestedAt: pcChangeAt, EffectiveAt: pcPeriodEd.AddDate(0, 1, 0),
+			Status: cycle.PlanChangeScheduled,
+		}
+	}
+	_, err = svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro", CancelChangeID: first.Change.ID})
+	requirePlanErrCode(t, err, billing.CodeConflict)
+	require.Equal(t, cycle.PlanChangeScheduled, store.planChanges[newer].Status, "the newer downgrade survives a stale cancel")
+	require.Empty(t, p.charges)
+}
+
+// (r3 #5) The members' included count is the plan in force when the period
+// OPENED: a charged mid-period Free → Pro hop prices the closed period's
+// members at Free's 3, not Pro's 10 — a day's delta cannot buy a month's
+// allowance. (r3 #9) An upgrade effective exactly AT the boundary belongs to
+// the new period: its delta priced the whole period, so the boundary's
+// advance base stays at the old plan.
+func TestRunBillingCycle_MembersUseTheOpeningPlanAndABoundaryInstantUpgradeIsNotDoubleBilled(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	svc, p := planSvc(store, pcChangeAt)
+	hop := registerOnPlan(t, svc, user, usage.PlanFree, 12)
+	armCreationCharge(store, hop)
+	svc.WithNow(func() time.Time { return pcPeriodEd.Add(-time.Hour) }) // the last hour of the period
+	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: hop, Plan: "pro"})
+	require.NoError(t, err)
+	require.Positive(t, resp.Change.AmountMicros, "one day's delta")
+
+	instant := registerOnPlan(t, svc, user, usage.PlanFree, 0)
+	armCreationCharge(store, instant)
+	svc.WithNow(func() time.Time { return pcPeriodEd }) // exactly the boundary instant
+	resp, err = svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: instant, Plan: "pro"})
+	require.NoError(t, err)
+	require.EqualValues(t, 20_000_000, resp.Change.AmountMicros, "the whole NEW period on the upgrade row")
+	require.Len(t, p.charges, 2)
+
+	boundary, _ := chargeSvcProposing(store, newFakeStripe())
+	sum, err := boundary.RunBillingCycle(context.Background(), acct, pcPeriodSt, pcPeriodEd, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 18_000_000, sum.MembersMicros, "(12 − Free's 3) × $2 for the period that opened on Free")
+	require.EqualValues(t, 20_000_000, sum.AdvanceBaseMicros, "the hop app's new period at Pro; the boundary-instant app at Free (its row priced Pro)")
 }

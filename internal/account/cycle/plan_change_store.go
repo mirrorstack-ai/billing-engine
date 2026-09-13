@@ -499,73 +499,112 @@ func (s *pgxStore) SettlePlanChangeCard(ctx context.Context, id uuid.UUID, cardM
 	return n == 1, nil
 }
 
-func (s *pgxStore) CancelScheduledPlanChange(ctx context.Context, appID uuid.UUID, at time.Time) (bool, error) {
-	n, err := s.q.CancelScheduledPlanChange(ctx, db.CancelScheduledPlanChangeParams{
-		CancelledAt: at.UTC(), AppID: appID.String(),
-	})
+func (s *pgxStore) CancelScheduledPlanChangeByID(ctx context.Context, id uuid.UUID, at time.Time) (bool, error) {
+	n, err := s.q.CancelPlanChangeByID(ctx, db.CancelPlanChangeByIDParams{CancelledAt: at.UTC(), ID: id.String()})
 	if err != nil {
 		return false, err
 	}
 	return n == 1, nil
 }
 
-// applyDueRows moves each due downgrade onto its plan — unless the app is
-// deleted, or the destination plan's per-owner cap is full at the boundary,
-// in which case the row is cancelled with a logged reason (a scheduled
-// downgrade is a commitment counted against the cap, so the cap case is only
-// reachable when a concurrent commitment slipped past, or the cap itself
-// moved). Each row's flip and close are one statement pair inside the
-// caller's transaction.
-func applyDueRows(ctx context.Context, qtx *db.Queries, rows []db.MsBillingAppPlanChange, dueAt time.Time) (applied, cancelled int, err error) {
+// applyDueRow moves ONE due downgrade onto its plan in its own transaction —
+// the app row locked FIRST, then the ledger row, then the owner advisory lock
+// inside capReached: the order OpenPlanChange and TransferApp take, so the
+// apply cannot deadlock with an owner changing or moving an app at the same
+// instant (round-3 review, #7 — one global transaction over every due row
+// took the ledger rows first). The row is re-read under its lock: one that a
+// cancel or an earlier apply moved meanwhile is left alone. A deleted app's
+// row, or one whose destination cap is full at the boundary, is CANCELLED
+// with a logged reason, never applied (a scheduled downgrade is a commitment
+// counted against the cap, so the cap case is only reachable when a
+// concurrent commitment slipped past, or the cap itself moved; a deleted
+// app's plan is frozen with the row, and an 'applied' row it never moved to
+// would break the creation-charge plan chain).
+func (s *pgxStore) applyDueRow(ctx context.Context, due db.MsBillingAppPlanChange, dueAt time.Time) (applied, cancelled bool, err error) {
+	appID, err := uuid.Parse(due.AppID)
+	if err != nil {
+		return false, false, err
+	}
+	accountID, err := uuid.Parse(due.AccountID)
+	if err != nil {
+		return false, false, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	app, err := qtx.SelectAppMirrorForUpdate(ctx, due.AppID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, false, err
+	}
+	live := err == nil && !app.DeletedAt.Valid
+	row, err := qtx.LockPlanChange(ctx, due.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if row.Status != string(PlanChangeScheduled) || row.EffectiveAt.After(dueAt) {
+		return false, false, nil // moved meanwhile: cancelled, or already applied
+	}
+	reason := ""
+	if !live {
+		reason = "the app is deleted"
+	} else if full, cerr := capReached(ctx, qtx, accountID, uuidFromPg(app.OwnerOrgID), usage.Plan(row.ToPlan), appID); cerr != nil {
+		return false, false, cerr
+	} else if full {
+		reason = "the destination plan's cap is full"
+	}
+	if reason != "" {
+		n, cerr := qtx.CancelPlanChangeByID(ctx, db.CancelPlanChangeByIDParams{CancelledAt: dueAt.UTC(), ID: row.ID})
+		if cerr != nil {
+			return false, false, cerr
+		}
+		if n != 1 {
+			return false, false, fmt.Errorf("plan change %s: cancelling moved %d rows under the lock", row.ID, n)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, false, err
+		}
+		slog.WarnContext(ctx, "scheduled plan change cancelled at the boundary: "+reason,
+			"plan_change_id", row.ID, "app_id", row.AppID, "to_plan", row.ToPlan)
+		return false, true, nil
+	}
+	if _, err := qtx.SetAppPlan(ctx, db.SetAppPlanParams{AppID: row.AppID, Plan: row.ToPlan}); err != nil {
+		return false, false, err
+	}
+	n, err := qtx.MarkPlanChangeApplied(ctx, db.MarkPlanChangeAppliedParams{AppliedAt: dueAt.UTC(), ID: row.ID})
+	if err != nil {
+		return false, false, err
+	}
+	if n != 1 {
+		return false, false, fmt.Errorf("plan change %s: applying moved %d rows under the lock", row.ID, n)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, false, err
+	}
+	return true, false, nil
+}
+
+// applyDueRows applies each listed row in its own transaction (applyDueRow)
+// and tallies the outcomes; the list is a plain read, so a row can move
+// between the read and its lock and is then skipped, not misapplied.
+func (s *pgxStore) applyDueRows(ctx context.Context, rows []db.MsBillingAppPlanChange, dueAt time.Time) (applied, cancelled int, err error) {
 	for _, row := range rows {
-		app, err := qtx.SelectAppMirrorForUpdate(ctx, row.AppID)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return applied, cancelled, err
-		}
-		appID, perr := uuid.Parse(row.AppID)
-		if perr != nil {
-			return applied, cancelled, perr
-		}
-		accountID, perr := uuid.Parse(row.AccountID)
-		if perr != nil {
-			return applied, cancelled, perr
-		}
-		// A deleted app's plan is frozen with the row, so its downgrade is
-		// CANCELLED, never marked applied: an 'applied' row whose to_plan the
-		// app never moved to breaks the creation-charge plan chain, and an app
-		// deleted after its grace still owes that charge (review round 2, #10).
-		live := err == nil && !app.DeletedAt.Valid
-		reason := ""
-		if !live {
-			reason = "the app is deleted"
-		} else if full, cerr := capReached(ctx, qtx, accountID, uuidFromPg(app.OwnerOrgID), usage.Plan(row.ToPlan), appID); cerr != nil {
-			return applied, cancelled, cerr
-		} else if full {
-			reason = "the destination plan's cap is full"
-		}
-		if reason != "" {
-			n, cerr := qtx.CancelPlanChangeByID(ctx, db.CancelPlanChangeByIDParams{CancelledAt: dueAt.UTC(), ID: row.ID})
-			if cerr != nil {
-				return applied, cancelled, cerr
-			}
-			if n == 1 {
-				slog.WarnContext(ctx, "scheduled plan change cancelled at the boundary: "+reason,
-					"plan_change_id", row.ID, "app_id", row.AppID, "to_plan", row.ToPlan)
-				cancelled++
-			}
-			continue
-		}
-		if _, err := qtx.SetAppPlan(ctx, db.SetAppPlanParams{AppID: row.AppID, Plan: row.ToPlan}); err != nil {
-			return applied, cancelled, err
-		}
-		n, err := qtx.MarkPlanChangeApplied(ctx, db.MarkPlanChangeAppliedParams{AppliedAt: dueAt.UTC(), ID: row.ID})
+		a, c, err := s.applyDueRow(ctx, row, dueAt)
 		if err != nil {
 			return applied, cancelled, err
 		}
-		if n != 1 {
-			return applied, cancelled, fmt.Errorf("plan change %s: applying moved %d rows under the lock", row.ID, n)
+		if a {
+			applied++
 		}
-		applied++
+		if c {
+			cancelled++
+		}
 	}
 	return applied, cancelled, nil
 }
@@ -574,26 +613,14 @@ func applyDueRows(ctx context.Context, qtx *db.Queries, rows []db.MsBillingAppPl
 // its plan (the belt inside RunBillingCycle). Idempotent: an applied or
 // cancelled row drops out of the due list.
 func (s *pgxStore) ApplyDuePlanChanges(ctx context.Context, accountID uuid.UUID, dueAt time.Time) (int, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer deferredRollback(ctx, tx)
-	qtx := s.q.WithTx(tx)
-	due, err := qtx.DuePlanChangesForAccount(ctx, db.DuePlanChangesForAccountParams{
+	due, err := s.q.DuePlanChangesForAccount(ctx, db.DuePlanChangesForAccountParams{
 		AccountID: accountID.String(), DueAt: dueAt.UTC(),
 	})
 	if err != nil {
 		return 0, err
 	}
-	applied, _, err := applyDueRows(ctx, qtx, due, dueAt)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return applied, nil
+	applied, _, err := s.applyDueRows(ctx, due, dueAt)
+	return applied, err
 }
 
 // ApplyAllDuePlanChanges is the driver's global apply: every account's due
@@ -601,24 +628,11 @@ func (s *pgxStore) ApplyDuePlanChanges(ctx context.Context, accountID uuid.UUID,
 // whose only apps are still in their creation grace has no boundary run, and
 // its downgrade must not land a period late).
 func (s *pgxStore) ApplyAllDuePlanChanges(ctx context.Context, dueAt time.Time) (applied, cancelled int, err error) {
-	tx, err := s.pool.Begin(ctx)
+	due, err := s.q.DuePlanChangesAll(ctx, dueAt.UTC())
 	if err != nil {
 		return 0, 0, err
 	}
-	defer deferredRollback(ctx, tx)
-	qtx := s.q.WithTx(tx)
-	due, err := qtx.DuePlanChangesAll(ctx, dueAt.UTC())
-	if err != nil {
-		return 0, 0, err
-	}
-	applied, cancelled, err = applyDueRows(ctx, qtx, due, dueAt)
-	if err != nil {
-		return 0, 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, 0, err
-	}
-	return applied, cancelled, nil
+	return s.applyDueRows(ctx, due, dueAt)
 }
 
 // InsertFreeAppMirror registers a NEW app on the Free plan under the owner's

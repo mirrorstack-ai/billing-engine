@@ -411,7 +411,12 @@ func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPl
 	current := effectivePlan(app)
 	if plan == current {
 		if hasOpen && open.Status == PlanChangeScheduled && req.CancelChangeID == open.ID {
-			cancelled, err := s.store.CancelScheduledPlanChange(ctx, app.AppID, now)
+			// Cancelled BY THE ID THE REQUEST NAMED, never "whatever this app
+			// has scheduled now": between the unlocked read and the UPDATE
+			// the named row can be applied and a newer downgrade scheduled,
+			// and a by-app cancel would withdraw the newer one on the
+			// strength of a stale request.
+			cancelled, err := s.store.CancelScheduledPlanChangeByID(ctx, req.CancelChangeID, now)
 			if err != nil {
 				return nil, billing.Internal("cancel scheduled plan change failed", err)
 			}
@@ -575,7 +580,21 @@ func (s *Service) upgradeNow(
 	chargeAllowed := true
 	var wallet *PlanChangeWalletParams
 	var refusal error
-	if amount > 0 {
+	if amount > 0 && s.proposer == nil {
+		// 🔴 FAIL CLOSED, TRACELESS. A charged upgrade's card remainder is
+		// sealed through the intent proposer; with none installed the open
+		// would commit the row, flip the plan and draw the wallet, and then
+		// settlePlanChange would fail on every retry with the row pending
+		// forever (core-v2#1476: production account-api ran without one).
+		// So the charged shape is refused BEFORE the open — the store rolls
+		// back a charged decision when ChargeAllowed is false — and only a
+		// fold (nothing to seal) may proceed.
+		chargeAllowed = false
+		refusal = billing.Internal("no intent proposer is installed: a charged plan change cannot be sealed by this deployment (core-v2#1476)", nil)
+		if !expectFold {
+			return nil, refusal
+		}
+	} else if amount > 0 {
 		permitted, err := s.offSessionChargePermitted(ctx, app.AccountID)
 		if err != nil {
 			return nil, err
@@ -662,8 +681,8 @@ func (s *Service) upgradeNow(
 //     label carries the app id only, so a retry after a crash — or after a
 //     rename — seals the same digest, and the row settles with its reference.
 //     A stored window that has closed is re-anchored only once the document
-//     sealed under it is known to be absent or dead — never while it may
-//     have been collected.
+//     sealed under it is known not to have been collected — never after a
+//     'succeeded' state, which settles the row with that document instead.
 //
 // A row left pending — the card vanished between the gate and the seal, the
 // account went prepaid, or the proposal failed — is finished by
@@ -745,15 +764,18 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 		if !now.Before(change.RequestedAt.Add(executionWindow)) {
 			anchor = now
 		}
-		// 🔴 NEVER RE-SEAL WHAT MAY HAVE BEEN COLLECTED. A stored window that
-		// has closed is not, by itself, a dead document: a crash between the
+		// 🔴 NEVER RE-SEAL WHAT WAS COLLECTED. A stored window that has
+		// closed is not, by itself, a dead document: a crash between the
 		// seal and the settle below leaves this row without its card_ref
-		// while the sealed document lives on, and the executor collects it —
-		// re-anchoring on the window alone then sealed a SECOND document for
-		// one upgrade (review round 2, #7). So the stored window's digest is
-		// re-derived (a seal-only derivation, nothing stored) and its state
-		// asked before anything is anchored: collected → this row settles
-		// with it; still in flight → wait; absent or dead → re-anchor.
+		// while the sealed document lives on, and the executor may have
+		// collected it — re-anchoring on the window alone then sealed a
+		// SECOND document for one upgrade (review round 2, #7). So the stored
+		// window's digest is re-derived (a seal-only derivation, nothing
+		// stored) and its state asked before anything is anchored: collected
+		// ('succeeded') → this row settles with it, no seal. Anything else
+		// under a closed window is DEAD — the executor's predicate cannot run
+		// a document past its window, and nothing advances one to 'expired'
+		// — so it is re-anchored and sealed afresh, once (review round 3, #3).
 		reanchorBefore := time.Time{} // a stored anchor is kept …
 		if !change.CardWindowStart.IsZero() && !now.Before(change.CardWindowStart.Add(executionWindow)) {
 			priorDigest, err := s.proposer.Digest(ctx, planChangeCharge(change, sealMicros, change.CardWindowStart))
@@ -764,13 +786,10 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 			if err != nil {
 				return change, billing.Internal("prior plan change intent state lookup failed", err)
 			}
-			switch {
-			case found && intentCollected(state):
+			if found && intentCollected(state) {
 				cardRef = "intent:" + priorDigest
-			case found && !intentDead(state):
-				return change, billing.PaymentRequired("the upgrade's earlier charge document is still being collected; retried next sweep")
-			default:
-				reanchorBefore = now.Add(-executionWindow) // … unless its document is absent or dead
+			} else {
+				reanchorBefore = now.Add(-executionWindow) // … unless its document is dead
 			}
 		}
 		if cardRef == "" {
@@ -815,19 +834,10 @@ func upgradeDeltaMicros(from, to usage.Plan, at, periodStart, periodEnd time.Tim
 	return usage.ProratedSegmentMicros(delta, at, periodEnd, periodStart, periodEnd), nil
 }
 
-// intentCollected / intentDead read the intent lifecycle (migration 054's
-// state vocabulary) for the re-seal guard above: 'succeeded' is money moved;
-// 'voided', 'canceled' and 'expired' are documents that never will; every
-// other state is a document still in flight.
+// intentCollected reads the intent lifecycle (migration 054's state
+// vocabulary) for the re-seal guard above: 'succeeded' is money moved. Every
+// other state under a closed window is a document that never will.
 func intentCollected(state string) bool { return state == "succeeded" }
-
-func intentDead(state string) bool {
-	switch state {
-	case "voided", "canceled", "expired":
-		return true
-	}
-	return false
-}
 
 // planChangeCharge is the upgrade's card leg as one sealed charge: one line
 // for the gross (wallet draw + whole-cent remainder) with the draw stated as

@@ -51,6 +51,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/intentcutover"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
@@ -682,6 +683,23 @@ func buildDispatcher() *dispatcher {
 		WithCreditRollout(controller)
 	if coordinator != nil {
 		cycleSvc.WithWalletMutationObserver(coordinator)
+	}
+	// The intent proposer, under the ONE cutover contract shared with
+	// cmd/billing-cycle (internal/account/intentcutover, core-v2#1476):
+	// SetAppPlan seals a charged upgrade's card remainder through it. Unarmed,
+	// this API still serves every read and every uncharged change, and a
+	// change that would need a seal is refused CLOSED before anything is
+	// written (upgradeNow); a set flag whose preconditions fail refuses to
+	// start, exactly as the cycle worker does.
+	if p, armed, err := intentcutover.Arm(pool, os.Getenv, func() time.Time { return time.Now().UTC() }); err != nil {
+		slog.Error("intent cutover is misconfigured; refusing to start", "env", intentcutover.Env, "error", err.Error())
+		os.Exit(1)
+	} else if armed {
+		cycleSvc.WithIntentProposer(p)
+		slog.Warn("INTENT CUTOVER ARMED — plan changes seal intents instead of charging", "env", intentcutover.Env, "evidence_key", true)
+	} else {
+		slog.Warn("no intent proposer installed: a plan change that needs a sealed charge is refused closed (core-v2#1476)",
+			"env", intentcutover.Env, "needs", intentcutover.Armed)
 	}
 
 	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc}

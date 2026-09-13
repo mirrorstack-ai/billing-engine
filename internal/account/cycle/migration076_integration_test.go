@@ -119,8 +119,34 @@ func TestMigration076_OpenPlanChangeDecidesFoldOrChargeUnderTheLock(t *testing.T
 		unbilled.String(), boundary.Add(time.Hour))
 	require.NoError(t, err)
 	require.Equal(t, "free", rosterPlan(unbilled), "an upgrade effective after the boundary: the plan it moved FROM")
+	// TWO effective changes after the boundary: the EARLIEST wins (its
+	// from_plan is the boundary plan), whatever the later one says.
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.app_plan_changes
+		(app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, amount_micros, status, applied_at)
+		VALUES ($1, $2, 'pro', 'free', 'downgrade', $3, $3, $3, $3, 0, 'applied', $3)`,
+		unbilled.String(), acct.String(), boundary.Add(48*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, "free", rosterPlan(unbilled), "the earliest change after the boundary decides, not the later downgrade's from_plan")
+	_, err = pool.Exec(ctx, `DELETE FROM ms_billing.app_plan_changes WHERE app_id = $1 AND kind = 'downgrade'`, unbilled.String())
+	require.NoError(t, err)
+	// An UPGRADE effective exactly AT the boundary priced the whole new
+	// period on its own row → excluded, the base stays at its from_plan; a
+	// DOWNGRADE applied exactly at the boundary has taken effect for the new
+	// period → a.plan.
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET effective_at = $2, requested_at = $2 WHERE app_id = $1`,
+		unbilled.String(), boundary)
+	require.NoError(t, err)
+	require.Equal(t, "free", rosterPlan(unbilled), "an upgrade at the boundary instant: the plan it moved FROM")
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET kind = 'downgrade', from_plan = 'pro', to_plan = 'free', status = 'applied', applied_at = $2 WHERE app_id = $1`,
+		unbilled.String(), boundary)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET plan = 'free' WHERE app_id = $1`, unbilled.String())
+	require.NoError(t, err)
+	require.Equal(t, "free", rosterPlan(unbilled), "a downgrade applied at the boundary instant: the plan it moved TO")
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET kind = 'upgrade', from_plan = 'free', to_plan = 'pro', status = 'settled', applied_at = NULL, effective_at = $2, requested_at = $2 WHERE app_id = $1`,
 		unbilled.String(), boundary.Add(-time.Hour))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET plan = 'pro' WHERE app_id = $1`, unbilled.String())
 	require.NoError(t, err)
 	// Rows that have not taken effect (a scheduled downgrade) or never will
 	// (a cancelled one) are not changes, however their effective_at reads.
@@ -327,9 +353,12 @@ func TestMigration076_DowngradeAppliesAtTheBoundaryCancelsBeforeAndRespectsTheCa
 	n, err := store.ApplyDuePlanChanges(ctx, acct, pcEnd.Add(-time.Second))
 	require.NoError(t, err)
 	require.Zero(t, n)
-	cancelled, err := store.CancelScheduledPlanChange(ctx, appID, time.Now())
+	cancelled, err := store.CancelScheduledPlanChangeByID(ctx, change.ID, time.Now())
 	require.NoError(t, err)
 	require.True(t, cancelled)
+	cancelled, err = store.CancelScheduledPlanChangeByID(ctx, change.ID, time.Now())
+	require.NoError(t, err)
+	require.False(t, cancelled, "by the id it named, once")
 	n, err = store.ApplyDuePlanChanges(ctx, acct, pcEnd)
 	require.NoError(t, err)
 	require.Zero(t, n)
@@ -437,13 +466,13 @@ func TestMigration076_OrgFreeCapIsOnePerOrgInSQL(t *testing.T) {
 	require.Equal(t, cycle.PlanChangeCapReached, outcome, "the org's Free slot is taken")
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET deleted_at = now() WHERE app_id = $1`, first.String())
 	require.NoError(t, err)
-	_, outcome, err = store.OpenPlanChange(ctx, downgradeParams(pro, acct))
+	scheduled, outcome, err := store.OpenPlanChange(ctx, downgradeParams(pro, acct))
 	require.NoError(t, err)
 	require.Equal(t, cycle.PlanChangeOpened, outcome, "a deleted app frees the slot")
 	full, err = store.InsertFreeAppMirror(ctx, uuid.New(), acct, org, 0, 0, created, "")
 	require.NoError(t, err)
 	require.True(t, full, "the scheduled downgrade counts against the org slot")
-	cancelled, err := store.CancelScheduledPlanChange(ctx, pro, time.Now())
+	cancelled, err := store.CancelScheduledPlanChangeByID(ctx, scheduled.ID, time.Now())
 	require.NoError(t, err)
 	require.True(t, cancelled)
 	full, err = store.InsertFreeAppMirror(ctx, uuid.New(), acct, org, 0, 0, created, "")
@@ -697,4 +726,60 @@ func TestMigration081_BackfillsTheProrationGuardFromResolvedHeaders(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, pool.QueryRow(ctx, `SELECT proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`, appID.String()).Scan(&guard))
 	require.Equal(t, ref, *guard)
+}
+
+// (r3 #5) MemberHighWaterForAccount's plan is the plan in force when the
+// period OPENED: an upgrade inside the period leaves the closed period at
+// the opening plan; one effective exactly at period_start is in force.
+// (r3 #4) SetAppProrationSkippedOnPlan arms only while the row carries the
+// priced plan and no marker.
+func TestMigration077_MembersPlanIsTheOpeningPlanAndTheSkipIsPlanGuarded(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+	acct := seedAccount(t, pool)
+	appID := uuid.New()
+	require.NoError(t, store.InsertAppMirror(ctx, appID, acct, uuid.Nil, 0, 12, pcStart.AddDate(0, 0, -20), "", usage.PlanPro))
+	_, err := pool.Exec(ctx, `UPDATE ms_billing.apps SET plan = 'free', created_plan = 'free' WHERE app_id = $1`, appID.String())
+	require.NoError(t, err)
+	planFor := func(ps, pe time.Time) usage.Plan {
+		rows, err := store.MemberHighWater(ctx, acct, ps, pe)
+		require.NoError(t, err)
+		for _, r := range rows {
+			if r.AppID == appID {
+				return r.Plan
+			}
+		}
+		t.Fatalf("app %s has no members row", appID)
+		return ""
+	}
+	require.Equal(t, usage.PlanFree, planFor(pcStart, pcEnd))
+	// A charged upgrade on the last day of the period.
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.app_plan_changes
+		(app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, amount_micros, wallet_decided_at, status, settled_at)
+		VALUES ($1, $2, 'free', 'pro', 'upgrade', $3, $3, $4, $5, 645161, $3, 'settled', $3)`,
+		appID.String(), acct.String(), pcEnd.Add(-time.Hour), pcStart, pcEnd)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET plan = 'pro' WHERE app_id = $1`, appID.String())
+	require.NoError(t, err)
+	require.Equal(t, usage.PlanFree, planFor(pcStart, pcEnd), "the closed period opened on Free: its included count is Free's")
+	require.Equal(t, usage.PlanPro, planFor(pcEnd, pcEnd.AddDate(0, 1, 0)), "the next period opens on Pro")
+	// Effective exactly at the period start: in force for that period.
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET effective_at = $2, requested_at = $2 WHERE app_id = $1`, appID.String(), pcStart)
+	require.NoError(t, err)
+	require.Equal(t, usage.PlanPro, planFor(pcStart, pcEnd))
+
+	// The plan-guarded skip.
+	armed, err := store.SkipCreationProrationOnPlan(ctx, appID, usage.PlanFree)
+	require.NoError(t, err)
+	require.False(t, armed, "the row is on pro: a derivation priced at free is stale")
+	armed, err = store.SkipCreationProrationOnPlan(ctx, appID, usage.PlanPro)
+	require.NoError(t, err)
+	require.True(t, armed)
+	armed, err = store.SkipCreationProrationOnPlan(ctx, appID, usage.PlanPro)
+	require.NoError(t, err)
+	require.False(t, armed, "once")
+	var skipped *time.Time
+	require.NoError(t, pool.QueryRow(ctx, `SELECT proration_skipped_at FROM ms_billing.apps WHERE app_id = $1`, appID.String()).Scan(&skipped))
+	require.NotNil(t, skipped)
 }

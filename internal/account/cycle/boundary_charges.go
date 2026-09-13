@@ -35,9 +35,11 @@ type boundaryComponents struct {
 	AdvanceBaseMicros    int64
 	AdvanceOverageMicros int64
 	AdvanceDomainsMicros int64
-	// AdvanceMembersMicros is the extra app members' fee for the next period
-	// (migration 077) — the fourth recurring component, folded into the same
-	// platform_base kind for the same reason as domains.
+	// MembersMicros is the extra app members' fee for the CLOSED period, in
+	// arrears (migration 077): the period's high-water count against the
+	// plan in force when it opened. The fourth line of the platform_base
+	// kind (a per-unit platform fee like domains), and the one that looks
+	// back — it is not part of the next period's coverage.
 	MembersMicros int64
 	// WalletDrawnMicros is the stored-value credit already allocated to this
 	// boundary. The collector subtracted it from the total it sent; the split

@@ -75,8 +75,7 @@ SELECT *
 FROM ms_billing.app_plan_changes
 WHERE status = 'scheduled'
   AND effective_at <= @due_at::timestamptz
-ORDER BY effective_at, id
-FOR UPDATE;
+ORDER BY effective_at, id;
 
 -- CancelPlanChangeByID withdraws one scheduled downgrade by id — the apply's
 -- refusal when the destination plan's cap is full at the boundary.
@@ -150,8 +149,7 @@ FROM ms_billing.app_plan_changes
 WHERE account_id = @account_id::uuid
   AND status = 'scheduled'
   AND effective_at <= @due_at::timestamptz
-ORDER BY effective_at, id
-FOR UPDATE;
+ORDER BY effective_at, id;
 
 -- MarkPlanChangeApplied closes a due downgrade after apps.plan moved.
 -- name: MarkPlanChangeApplied :execrows

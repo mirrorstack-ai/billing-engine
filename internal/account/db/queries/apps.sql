@@ -107,6 +107,23 @@ WHERE app_id = $1
   AND proration_skipped_at IS NULL
   AND proration_invoice_id IS NULL;
 
+-- SetAppProrationSkippedOnPlan arms the permanent skip marker for a window
+-- priced at $0 — ONLY while the row still carries the plan the derivation
+-- priced and none of the three creation markers (billing-engine#208 round 4).
+-- The derivation runs on an unlocked read; a plan-change fold committing
+-- between that read and this write (under the app lock, flipping apps.plan)
+-- would otherwise be made terminal at $0 and its days priced by nobody. The
+-- row-level UPDATE re-evaluates the predicate under the row lock, so 0 rows
+-- means "the row moved: re-derive next sweep". :execrows for that reason.
+-- name: SetAppProrationSkippedOnPlan :execrows
+UPDATE ms_billing.apps
+SET proration_skipped_at = now()
+WHERE app_id = $1
+  AND plan = $2
+  AND proration_skipped_at IS NULL
+  AND proration_invoice_id IS NULL
+  AND proration_attempted_at IS NULL;
+
 -- MarkAppProrationAttempted stamps the recovery marker (036) BEFORE a
 -- creation-proration charge attempt's first Stripe call. First-write-wins
 -- (the FIRST attempt instant is the durable one); never cleared.
@@ -176,24 +193,32 @@ WHERE app_id = $1
 -- timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
 -- UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
 -- by an hour around DST and double-bill or gap a whole period.
--- member_count (migration 077) feeds the advance-members component: every
--- member past the plan's included count is one $2 line for the new period.
--- The plan column returned is the plan IN FORCE AT THE BOUNDARY INSTANT
--- (created_before), not the row's live plan: the earliest ledger change that
--- took effect strictly after the boundary carries, as its from_plan, the plan
--- the app was on at the boundary (migration 076 — every change flips
--- apps.plan in the transaction that writes its row, so the chain is exact).
--- An upgrade requested in the gap between the boundary and the cron that
--- closes it has already charged (new − old) for the new period on its own
--- row; pricing this advance base at the live plan would bill the new base a
--- second time — and a reclaim of a failed run days later must derive the
--- SAME figure the first attempt did, whatever the plan has become since.
+-- member_count is deliberately NOT returned: the members fee (migration 077)
+-- is the CLOSED period's, priced in arrears from MemberHighWaterForAccount —
+-- nothing on this roster is an advance-members component.
+-- The plan column returned is the plan whose base the NEW period [boundary,
+-- next boundary) is owed at, not the row's live plan. From the ledger
+-- (migration 076 — every change flips apps.plan in the transaction that
+-- writes its row, so the chain is exact): the earliest effective change that
+-- does NOT price the new period carries, as its from_plan, the plan this
+-- roster bills. That is every change effective strictly after the boundary
+-- — and an UPGRADE effective exactly AT it, because upgradeNow's delta for
+-- an instant on the boundary covers the whole new period (its anchored
+-- period is half-open at the start). A downgrade applied at the boundary is
+-- the opposite case: it has taken effect for the new period, so it is not
+-- excluded and a.plan (the plan it moved to) is billed. An upgrade requested
+-- in the gap between the boundary and the cron that closes it has already
+-- charged (new − old) for the new period on its own row; pricing this base
+-- at the live plan would bill the new base a second time — and a reclaim of
+-- a failed run days later must derive the SAME figure the first attempt did,
+-- whatever the plan has become since.
 -- name: LiveAppModuleCountsCreatedBefore :many
-SELECT a.app_id, a.module_count, a.member_count,
+SELECT a.app_id, a.module_count,
        COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
                  WHERE c.app_id = a.app_id
                    AND c.status IN ('pending', 'settled', 'applied')
-                   AND c.effective_at > @created_before::timestamptz
+                   AND (c.effective_at > @created_before::timestamptz
+                        OR (c.effective_at = @created_before::timestamptz AND c.kind = 'upgrade'))
                  ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan
 FROM ms_billing.apps a
 WHERE a.account_id = @account_id::uuid
@@ -460,17 +485,21 @@ VALUES (@app_id::uuid, @count::int, @recorded_at::timestamptz);
 -- [period_start, period_end) — live, or deleted inside it, created before it
 -- ended, in or out of its creation grace — the period's high-water mark:
 -- max(count in force when the period opened, max count recorded inside it).
--- The plan returned is the plan IN FORCE DURING THE PERIOD: the earliest
--- ledger change effective at or after period_end (a downgrade the boundary
--- applies has effective_at = period_end) carries the period's plan as its
--- from_plan; otherwise the row's plan. So a reclaim after the boundary apply
--- flipped the row still prices the closed period at the plan it ran on.
+-- The plan returned is the plan IN FORCE WHEN THE PERIOD OPENED: the earliest
+-- ledger change effective strictly after period_start carries it as its
+-- from_plan (a change effective exactly at period_start — a downgrade the
+-- previous boundary applied, or an upgrade whose delta covered this whole
+-- period — is in force); otherwise the row's plan. Within a period plans only
+-- rise (a downgrade lands at a boundary), so pricing the included count at
+-- the opening plan means a last-day upgrade cannot buy the period's member
+-- allowance for one day's delta — and a reclaim after the boundary apply
+-- flipped the row still prices the closed period the same.
 -- name: MemberHighWaterForAccount :many
 SELECT a.app_id,
        COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
                  WHERE c.app_id = a.app_id
                    AND c.status IN ('pending', 'settled', 'applied')
-                   AND c.effective_at >= @period_end::timestamptz
+                   AND c.effective_at > @period_start::timestamptz
                  ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan,
        GREATEST(
            COALESCE((SELECT c.count FROM ms_billing.app_member_counts c

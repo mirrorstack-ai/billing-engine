@@ -499,6 +499,12 @@ type Store interface {
 	// on every sweep indefinitely). First-write-wins and a no-op if the app was
 	// somehow already charged in the meantime — never an error.
 	SetAppProrationSkipped(ctx context.Context, appID uuid.UUID) error
+	// SkipCreationProrationOnPlan arms the permanent skip marker for a $0
+	// window ONLY while the row still carries `plan` (the plan the caller's
+	// unlocked derivation priced) and none of the three creation markers;
+	// false = the row moved (a fold committed, or a marker was armed), nothing
+	// written, re-derive next sweep.
+	SkipCreationProrationOnPlan(ctx context.Context, appID uuid.UUID, plan usage.Plan) (bool, error)
 
 	// SetAppModuleCount snapshots a new installed-module count. A deleted
 	// app's count is frozen (the UPDATE's WHERE deleted_at IS NULL no-ops —
@@ -567,12 +573,14 @@ type Store interface {
 	// SettlePlanChangeCard records the sealed card remainder and settles the
 	// row; false when the row was no longer pending.
 	SettlePlanChangeCard(ctx context.Context, id uuid.UUID, cardMicros int64, cardRef string, at time.Time) (bool, error)
-	// CancelScheduledPlanChange withdraws the app's scheduled downgrade;
-	// false when none was scheduled.
-	CancelScheduledPlanChange(ctx context.Context, appID uuid.UUID, at time.Time) (bool, error)
+	// CancelScheduledPlanChangeByID withdraws the scheduled downgrade the
+	// caller NAMED; false when that row is no longer scheduled.
+	CancelScheduledPlanChangeByID(ctx context.Context, id uuid.UUID, at time.Time) (bool, error)
 	// ApplyDuePlanChanges moves every due scheduled downgrade of the account
 	// onto its plan and closes the rows (a row whose destination cap is full
-	// at the boundary is cancelled instead); returns how many it applied.
+	// at the boundary, or whose app is deleted, is cancelled instead), one
+	// transaction per row with the app row locked first — the lock order
+	// OpenPlanChange and TransferApp use; returns how many it applied.
 	ApplyDuePlanChanges(ctx context.Context, accountID uuid.UUID, dueAt time.Time) (int, error)
 	// ApplyAllDuePlanChanges is the driver's global apply over every account.
 	ApplyAllDuePlanChanges(ctx context.Context, dueAt time.Time) (applied, cancelled int, err error)
@@ -869,9 +877,6 @@ type AppModuleCount struct {
 	// delta for the new period, so the advance base stays at the old plan —
 	// and a reclaim of the run derives the same figure however late it runs.
 	Plan usage.Plan
-	// MemberCount is the row's live member count (migration 077) — display
-	// only here; the members fee is priced from MemberHighWater.
-	MemberCount int
 }
 
 // MemberHighWater is one app's members input for a closed period (migration
@@ -2858,6 +2863,14 @@ func (s *pgxStore) SetAppProrationInvoice(ctx context.Context, appID uuid.UUID, 
 	return err
 }
 
+func (s *pgxStore) SkipCreationProrationOnPlan(ctx context.Context, appID uuid.UUID, plan usage.Plan) (bool, error) {
+	n, err := s.q.SetAppProrationSkippedOnPlan(ctx, db.SetAppProrationSkippedOnPlanParams{AppID: appID.String(), Plan: string(plan)})
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 func (s *pgxStore) SetAppProrationSkipped(ctx context.Context, appID uuid.UUID) error {
 	// 0 rows = already marked, or already charged in the meantime — neither is
 	// an error: the marker is a one-shot, first-write-wins terminal state.
@@ -2906,7 +2919,7 @@ func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUI
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount), Plan: usage.Plan(r.Plan), MemberCount: int(r.MemberCount)})
+		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount), Plan: usage.Plan(r.Plan)})
 	}
 	return out, nil
 }

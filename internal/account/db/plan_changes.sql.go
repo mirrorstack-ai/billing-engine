@@ -97,7 +97,6 @@ FROM ms_billing.app_plan_changes
 WHERE status = 'scheduled'
   AND effective_at <= $1::timestamptz
 ORDER BY effective_at, id
-FOR UPDATE
 `
 
 // DuePlanChangesAll is the driver's global apply list: every scheduled
@@ -150,7 +149,6 @@ WHERE account_id = $1::uuid
   AND status = 'scheduled'
   AND effective_at <= $2::timestamptz
 ORDER BY effective_at, id
-FOR UPDATE
 `
 
 type DuePlanChangesForAccountParams struct {

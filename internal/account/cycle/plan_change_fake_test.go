@@ -302,20 +302,21 @@ func (f *fakeStore) SettlePlanChangeCard(_ context.Context, id uuid.UUID, cardMi
 	return true, nil
 }
 
-func (f *fakeStore) CancelScheduledPlanChange(_ context.Context, appID uuid.UUID, at time.Time) (bool, error) {
+func (f *fakeStore) CancelScheduledPlanChangeByID(_ context.Context, id uuid.UUID, at time.Time) (bool, error) {
 	if f.beforeCancelScheduled != nil {
 		hook := f.beforeCancelScheduled
 		f.beforeCancelScheduled = nil
-		hook(f, appID)
-	}
-	for id, c := range f.planChanges {
-		if c.AppID == appID && c.Status == cycle.PlanChangeScheduled {
-			c.Status, c.SettledAt = cycle.PlanChangeCancelled, at.UTC()
-			f.planChanges[id] = c
-			return true, nil
+		if c, ok := f.planChanges[id]; ok {
+			hook(f, c.AppID)
 		}
 	}
-	return false, nil
+	c, ok := f.planChanges[id]
+	if !ok || c.Status != cycle.PlanChangeScheduled {
+		return false, nil
+	}
+	c.Status, c.SettledAt = cycle.PlanChangeCancelled, at.UTC()
+	f.planChanges[id] = c
+	return true, nil
 }
 
 // applyDue mirrors applyDueRows: a due downgrade whose destination cap is
@@ -385,11 +386,13 @@ func (f *fakeStore) SetAppMemberCount(_ context.Context, appID uuid.UUID, member
 	return nil
 }
 
-// planAtInstant mirrors the ledger derivation the SQL does: the plan an app
-// was on just before `at` is the from_plan of the earliest effective change
-// (pending/settled/applied) at or after `at` — strictly after when
-// `exclusive` — else the row's plan.
-func (f *fakeStore) planAtInstant(app cycle.AppMirror, at time.Time, exclusive bool) usage.Plan {
+// planAtInstant mirrors the ledger derivations the SQL does: the plan an app
+// was on at `at` is the from_plan of the earliest effective change
+// (pending/settled/applied) strictly after `at` — and, when
+// `upgradeAtInstantExcluded` (the roster's rule), also of an UPGRADE effective
+// exactly at `at`, whose delta already priced the period opening there —
+// else the row's plan.
+func (f *fakeStore) planAtInstant(app cycle.AppMirror, at time.Time, upgradeAtInstantExcluded bool) usage.Plan {
 	plan := fakeEffectivePlan(app)
 	var earliest *cycle.PlanChange
 	for id := range f.planChanges {
@@ -402,7 +405,8 @@ func (f *fakeStore) planAtInstant(app cycle.AppMirror, at time.Time, exclusive b
 		default:
 			continue
 		}
-		if c.EffectiveAt.Before(at) || (exclusive && c.EffectiveAt.Equal(at)) {
+		after := c.EffectiveAt.After(at) || (upgradeAtInstantExcluded && c.EffectiveAt.Equal(at) && c.Kind == cycle.PlanChangeUpgrade)
+		if !after {
 			continue
 		}
 		if earliest == nil || c.EffectiveAt.Before(earliest.EffectiveAt) {
@@ -419,7 +423,7 @@ func (f *fakeStore) planAtInstant(app cycle.AppMirror, at time.Time, exclusive b
 // MemberHighWater mirrors MemberHighWaterForAccount: per app that held
 // members in the period (live, or deleted inside it; created before it
 // ended), max(count in force at period start, max count recorded inside the
-// period), with the plan in force during the period.
+// period), with the plan in force when the period OPENED.
 func (f *fakeStore) MemberHighWater(_ context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]cycle.MemberHighWater, error) {
 	var out []cycle.MemberHighWater
 	ids := make([]uuid.UUID, 0, len(f.apps))
@@ -453,7 +457,7 @@ func (f *fakeStore) MemberHighWater(_ context.Context, accountID uuid.UUID, peri
 		if inside > hwm {
 			hwm = inside
 		}
-		out = append(out, cycle.MemberHighWater{AppID: app.AppID, Plan: f.planAtInstant(app, periodEnd, false), Count: hwm})
+		out = append(out, cycle.MemberHighWater{AppID: app.AppID, Plan: f.planAtInstant(app, periodStart, false), Count: hwm})
 	}
 	return out, nil
 }

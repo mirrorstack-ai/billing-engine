@@ -125,6 +125,11 @@ const (
 	// which is what a concurrent app transfer leaves behind. Nothing drawn,
 	// nothing armed; the next sweep reads the row as it now is.
 	ProrationStatusWalletStale ProrationStatus = "skipped_wallet_stale"
+	// ProrationStatusStale: the $0-base terminal could not be armed because
+	// the app row moved between the unlocked derivation and the plan-guarded
+	// write (a plan-change fold committed under the app lock, or a concurrent
+	// sweep armed a marker). Nothing written; re-derived next sweep.
+	ProrationStatusStale ProrationStatus = "skipped_stale"
 )
 
 // ProrationResult reports what ChargeCreationProration did. ProrationInvoiceID is
@@ -418,8 +423,19 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, perr
 		}
 		if preview.BaseChargeCents == 0 {
-			if err := s.store.SetAppProrationSkipped(ctx, appID); err != nil {
+			// 🔴 PLAN-GUARDED, UNDER THE ROW LOCK. This derivation read the
+			// row unlocked; a fold (OpenPlanChange, under the app lock) can
+			// commit between that read and this write, flip apps.plan and
+			// settle its row at $0 on the promise that THIS charge prices its
+			// days. A plain skip would then make that promise terminal at
+			// $0. The write carries the plan it priced and the three markers,
+			// so the row having moved is 0 rows — re-derived next sweep.
+			armed, err := s.store.SkipCreationProrationOnPlan(ctx, appID, effectivePlan(app))
+			if err != nil {
 				return nil, billing.Internal("mark creation window nothing-to-bill failed", err)
+			}
+			if !armed {
+				return &ProrationResult{AppID: appID, Status: ProrationStatusStale}, nil
 			}
 			return &ProrationResult{AppID: appID, Status: ProrationStatusNoCharge}, nil
 		}
@@ -611,7 +627,11 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		// drops the app from AppsPendingProration and hands its timers to Leg
 		// 1; the freeze below never sees a $0 base (the store refuses one).
 		if candidate.BaseChargeCents == 0 {
-			if err := s.store.SetAppProrationSkipped(ctx, locked.AppID); err != nil {
+			// Plan-guarded like the pre-gate: the callback runs after the
+			// phase-1 lock is released, so the fold race is the same one.
+			// 0 rows is the StripeRailStale posture — nothing written,
+			// re-derived next sweep.
+			if _, err := s.store.SkipCreationProrationOnPlan(ctx, locked.AppID, candidate.PricedPlan); err != nil {
 				return nil, billing.Internal("mark creation window nothing-to-bill failed", err)
 			}
 			return nil, nil
@@ -1270,8 +1290,12 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 		// rail entered on a stale derivation (review round 2, #3 — an unarmed
 		// return here re-swept the app forever and folded every later upgrade
 		// to $0).
-		if err := s.store.SetAppProrationSkipped(ctx, app.AppID); err != nil {
+		armed, err := s.store.SkipCreationProrationOnPlan(ctx, app.AppID, effectivePlan(app))
+		if err != nil {
 			return nil, false, billing.Internal("mark creation window nothing-to-bill failed", err)
+		}
+		if !armed {
+			return &ProrationResult{AppID: app.AppID, Status: ProrationStatusWalletStale}, false, nil
 		}
 		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, false, nil
 	}

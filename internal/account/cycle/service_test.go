@@ -55,9 +55,12 @@ type fakeStore struct {
 	// FreezeCombinedProrationAttempt.
 	beforePlanChangeOpen func(f *fakeStore, appID uuid.UUID)
 	beforeCombinedFreeze func(f *fakeStore, appID uuid.UUID)
-	// beforeCancelScheduled runs once inside CancelScheduledPlanChange, before
-	// the UPDATE — the boundary apply racing a cancel.
+	// beforeCancelScheduled runs once inside CancelScheduledPlanChangeByID,
+	// before the UPDATE — the boundary apply racing a cancel.
 	beforeCancelScheduled func(f *fakeStore, appID uuid.UUID)
+	// beforeSkipOnPlan runs once inside SkipCreationProrationOnPlan, before
+	// the plan-guarded write — a fold racing the $0-base terminal.
+	beforeSkipOnPlan func(f *fakeStore, appID uuid.UUID)
 	// rollup inputs
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
@@ -1364,6 +1367,28 @@ func (f *fakeStore) SetAppProrationInvoice(_ context.Context, appID uuid.UUID, s
 	return nil
 }
 
+// SkipCreationProrationOnPlan mirrors SetAppProrationSkippedOnPlan: armed
+// only while the row carries `plan` and none of the three markers. The
+// beforeSkipOnPlan hook runs once before the check — a fold committing
+// between the caller's derivation and this write.
+func (f *fakeStore) SkipCreationProrationOnPlan(_ context.Context, appID uuid.UUID, plan usage.Plan) (bool, error) {
+	if f.errSetSkipped != nil {
+		return false, f.errSetSkipped
+	}
+	if f.beforeSkipOnPlan != nil {
+		hook := f.beforeSkipOnPlan
+		f.beforeSkipOnPlan = nil
+		hook(f, appID)
+	}
+	app, ok := f.apps[appID]
+	if !ok || fakeEffectivePlan(app) != plan || app.ProrationSkipped || app.ProrationInvoiceID != "" || app.ProrationAttempted {
+		return false, nil
+	}
+	app.ProrationSkipped = true
+	f.apps[appID] = app
+	return true, nil
+}
+
 func (f *fakeStore) SetAppProrationSkipped(_ context.Context, appID uuid.UUID) error {
 	if f.errSetSkipped != nil {
 		return f.errSetSkipped
@@ -1646,14 +1671,15 @@ func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID
 		// and its creation charge covers through the grace-elapsed period).
 		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) &&
 			app.CreatedAt.AddDate(0, 0, graceDays).Before(createdBefore) {
-			// The plan IN FORCE AT THE BOUNDARY, from the ledger (a change
-			// effective strictly after it carries the boundary plan as its
-			// from_plan), mirroring LiveAppModuleCountsCreatedBefore.
+			// The plan the NEW period's base is owed at, from the ledger (a
+			// change effective strictly after the boundary — or an upgrade
+			// exactly at it — carries it as its from_plan), mirroring
+			// LiveAppModuleCountsCreatedBefore.
 			plan := f.planAtInstant(app, createdBefore, true)
 			if app.Plan == "" && plan == usage.DefaultPlan {
 				plan = app.Plan // an unset fake plan stays unset, as before
 			}
-			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: plan, MemberCount: app.MemberCount})
+			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: plan})
 		}
 	}
 	return apps, nil
