@@ -205,18 +205,18 @@ func TestSyncEgress_AggregatesRowsIntoRecordInfraUsage(t *testing.T) {
 	require.Equal(t, 2, res.Recorded)
 	require.Equal(t, 2, len(store.events))
 
-	// Every event is the reserved egress metric, stamped under the infra
-	// sentinel module, with the byte SUM as the value and recorded_at = the
-	// window start (when the egress occurred), not now().
+	// Every event is the CDN egress metric (migration 078), stamped under the
+	// infra sentinel module, with the byte SUM in GiB as the value and
+	// recorded_at = the window start (when the egress occurred), not now().
 	for _, ev := range store.events {
-		require.Equal(t, egressMetric, ev.Metric)
+		require.Equal(t, cdnEgressMetric, ev.Metric)
 		require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
 		require.Equal(t, usage.KindSum, ev.Kind)
 		require.True(t, win.Equal(ev.RecordedAt), "recorded_at must be the window start")
 	}
 	// Values land on the right app.
-	require.Equal(t, float64(1024), store.events[egressEventID(egressMetric, app1, mod, win)].Value)
-	require.Equal(t, float64(2048), store.events[egressEventID(egressMetric, app2, "", win)].Value)
+	require.InDelta(t, 1024.0/bytesPerGiB, store.events[egressEventID(cdnEgressMetric, app1, mod, win)].Value, 1e-15)
+	require.InDelta(t, 2048.0/bytesPerGiB, store.events[egressEventID(cdnEgressMetric, app2, "", win)].Value, 1e-15)
 }
 
 func TestSyncEgress_DeterministicEventIDIsIdempotent(t *testing.T) {
@@ -294,7 +294,7 @@ func TestSyncEgress_SkipsUnparseableAppID(t *testing.T) {
 	require.Equal(t, 3, res.Skipped)
 	require.Equal(t, 1, res.Recorded)
 	require.Equal(t, 1, len(store.events))
-	require.Equal(t, float64(4), store.events[egressEventID(egressMetric, good, "m", win)].Value)
+	require.InDelta(t, 4.0/bytesPerGiB, store.events[egressEventID(cdnEgressMetric, good, "m", win)].Value, 1e-15)
 }
 
 func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
@@ -309,7 +309,7 @@ func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
 	}}
 	store := newFakeStore()
 	store.insertErr = errors.New("transient db error")
-	store.failEventID = egressEventID(egressMetric, bad, mod, win)
+	store.failEventID = egressEventID(cdnEgressMetric, bad, mod, win)
 
 	res := syncEgress(context.Background(), newSvc(store), cf, at)
 	// A per-row RecordInfraUsage error is logged + counted but never aborts the
@@ -318,7 +318,7 @@ func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
 	require.Equal(t, 1, res.RowErrors)
 	require.Equal(t, 1, res.Recorded)
 	require.Equal(t, 1, len(store.events))
-	require.Equal(t, float64(200), store.events[egressEventID(egressMetric, good, mod, win)].Value)
+	require.InDelta(t, 200.0/bytesPerGiB, store.events[egressEventID(cdnEgressMetric, good, mod, win)].Value, 1e-15)
 }
 
 func TestSyncEgress_CFQueryErrorFailsCleanly(t *testing.T) {
@@ -360,19 +360,20 @@ func TestSyncEgress_SSRRowRecordsUnderNewMetricInGiB(t *testing.T) {
 	require.True(t, win.Equal(ev.RecordedAt))
 }
 
-// TestSyncEgress_StaticFileRowsUnchanged is a REGRESSION guard: a row with
-// blob2="" and a row with a real module_id must keep recording under the
-// existing infra.egress.bytes metric with the RAW (unconverted) byte total —
-// exactly the pre-this-PR behavior — even in a window that ALSO contains an
-// SSR row. The SSR branch must never leak into the static-file path.
-func TestSyncEgress_StaticFileRowsUnchanged(t *testing.T) {
+// TestSyncEgress_StaticFileRowsRecordUnderTheCDNKeyInGiB pins migration 078:
+// a row with blob2="" and a row with a real module_id record under
+// infra.egress.cdn.bytes, converted to GiB, and NEVER under the retired
+// price-0 infra.egress.bytes — even in a window that also contains an SSR row,
+// which keeps its own key. A static row landing on the old key would be free;
+// a static row landing on the new key in raw bytes would be a 2^30 overcharge.
+func TestSyncEgress_StaticFileRowsRecordUnderTheCDNKeyInGiB(t *testing.T) {
 	appEmpty, appMod, appSSR := uuid.New(), uuid.New(), uuid.New()
 	mod := uuid.New().String()
 	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
 	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{
 		win: {
-			{AppID: appEmpty.String(), ModuleID: "", Bytes: 2048},
-			{AppID: appMod.String(), ModuleID: mod, Bytes: 4096},
+			{AppID: appEmpty.String(), ModuleID: "", Bytes: float64(2 * bytesPerGiB)},
+			{AppID: appMod.String(), ModuleID: mod, Bytes: float64(bytesPerGiB / 2)},
 			{AppID: appSSR.String(), ModuleID: ssrModuleIDSentinel, Bytes: float64(bytesPerGiB)},
 		},
 	}}
@@ -383,17 +384,21 @@ func TestSyncEgress_StaticFileRowsUnchanged(t *testing.T) {
 	require.Equal(t, 3, res.Recorded)
 	require.Equal(t, 3, len(store.events))
 
-	emptyEv := store.events[egressEventID(egressMetric, appEmpty, "", win)]
-	require.Equal(t, egressMetric, emptyEv.Metric)
-	require.Equal(t, float64(2048), emptyEv.Value, "static-file bytes must be RAW, unconverted")
+	emptyEv := store.events[egressEventID(cdnEgressMetric, appEmpty, "", win)]
+	require.Equal(t, cdnEgressMetric, emptyEv.Metric)
+	require.InDelta(t, 2.0, emptyEv.Value, 1e-9, "static-file bytes are GiB-converted")
 
-	modEv := store.events[egressEventID(egressMetric, appMod, mod, win)]
-	require.Equal(t, egressMetric, modEv.Metric)
-	require.Equal(t, float64(4096), modEv.Value, "static-file bytes must be RAW, unconverted")
+	modEv := store.events[egressEventID(cdnEgressMetric, appMod, mod, win)]
+	require.Equal(t, cdnEgressMetric, modEv.Metric)
+	require.InDelta(t, 0.5, modEv.Value, 1e-9, "static-file bytes are GiB-converted")
 
 	ssrEv := store.events[egressEventID(ssrEgressMetric, appSSR, ssrModuleIDSentinel, win)]
 	require.Equal(t, ssrEgressMetric, ssrEv.Metric)
-	require.InDelta(t, 1.0, ssrEv.Value, 1e-9, "ssr bytes must be GiB-converted")
+	require.InDelta(t, 1.0, ssrEv.Value, 1e-9, "ssr bytes keep their own key")
+
+	for _, ev := range store.events {
+		require.NotEqual(t, egressMetric, ev.Metric, "nothing records under the retired price-0 key any more")
+	}
 }
 
 // TestSyncEgress_SSRAndStaticEventIDsNeverCollide proves the idempotent
@@ -419,10 +424,10 @@ func TestSyncEgress_SSRAndStaticEventIDsNeverCollide(t *testing.T) {
 	require.Equal(t, 0, first.Deduped)
 	require.Equal(t, 2, len(store.events), "the static and ssr rows must record as TWO distinct events")
 
-	staticID := egressEventID(egressMetric, app, mod, win)
+	staticID := egressEventID(cdnEgressMetric, app, mod, win)
 	ssrID := egressEventID(ssrEgressMetric, app, ssrModuleIDSentinel, win)
 	require.NotEqual(t, staticID, ssrID)
-	require.Equal(t, float64(4096), store.events[staticID].Value)
+	require.InDelta(t, 4096.0/bytesPerGiB, store.events[staticID].Value, 1e-15)
 	require.InDelta(t, 1.0, store.events[ssrID].Value, 1e-9)
 
 	// Re-run the SAME window: both dedupe via ON CONFLICT, neither

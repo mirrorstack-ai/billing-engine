@@ -19,12 +19,12 @@
 // distinguishes them: blob2=="ssr" records under the NEW
 // infra.compute.ssr.egress.bytes metric (a real, non-trivial COGS — the SSR
 // Lambda's response leaves AWS's network to reach cdn-worker on Cloudflare's
-// network); every other row keeps recording under the existing
-// infra.egress.bytes metric EXACTLY as before (that metric is deliberately
-// zeroed for static-file egress by migration 019 — an accepted, separately
-// tracked gap this PR does not touch). The GROUPING/QUERY logic is unchanged;
-// only the metric name (and, for the ssr branch only, a GiB unit conversion —
-// see egressMetricAndValue) branches on blob2.
+// network); every other row — static-file egress — records under
+// infra.egress.cdn.bytes, priced per GiB by migration 078 (owner ruling
+// 2026-09-13: CDN egress is charged at the catalog rate). Before 078 those
+// rows went to the retired, price-0 infra.egress.bytes as raw bytes. The
+// GROUPING/QUERY logic is unchanged; only the metric name branches on blob2,
+// and BOTH branches now convert bytes to GiB (see egressMetricAndValue).
 //
 // Idempotency by construction: the event_id is a DETERMINISTIC hash of
 // (metric, app_id, module_id, window_start), so re-querying an already-ingested
@@ -78,12 +78,18 @@ import (
 // before ever renaming either side again.
 const egressDataset = "cdn_egress_prod"
 
-// egressMetric is the reserved platform-infra metric the puller records
-// static-file egress under (blob2 empty or a real module_id). RecordInfraUsage
-// resolves its kind (sum) + per-unit COGS from the platform-owned registry /
-// seeded catalog (migration 017; zeroed by migration 019 — a separate,
-// already-tracked gap).
+// egressMetric is the RETIRED reserved metric static-file egress recorded
+// under before migration 078 (raw bytes, priced 0 since 019). Nothing emits it
+// any more; it is kept so the historical event-id scheme stays documented and
+// so a reader of the catalog knows why the row still exists.
 const egressMetric = "infra.egress.bytes"
+
+// cdnEgressMetric is the reserved platform-infra metric the puller records
+// static-file egress under (blob2 empty or a real module_id) since migration
+// 078: priced per GiB at the catalog rate, so the producer converts bytes to
+// GiB exactly as the SSR branch does. RecordInfraUsage resolves its kind (sum)
+// from the platform-owned registry.
+const cdnEgressMetric = "infra.egress.cdn.bytes"
 
 // ssrEgressMetric is the reserved platform-infra metric the puller records
 // SSR-origin egress under — rows whose blob2 (module_id) dimension is exactly
@@ -339,21 +345,21 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 }
 
 // egressMetricAndValue decides, from a single row's blob2 (module_id) alone,
-// which reserved metric it records under and what value to emit — the
-// grouping/query logic upstream never changes.
+// which reserved metric it records under — the grouping/query logic upstream
+// never changes. Both branches emit GiB: the per-byte COGS floors to 0 at the
+// integer column (rule 5), so both keys are priced per GiB.
 //
 //   - blob2 == "ssr" (ssrModuleIDSentinel): SSR-origin egress (cdn-worker's
-//     meter_ssr_egress). Records under ssrEgressMetric, converted from raw
-//     bytes to GiB (migration 046 prices infra.compute.ssr.egress.bytes per
-//     GiB — the raw per-byte COGS floors to 0 at the integer column).
-//   - anything else (empty, or a real module_id): static-file egress, EXACTLY
-//     as before this PR — records under egressMetric with the raw byte total,
-//     unconverted.
+//     meter_ssr_egress) → ssrEgressMetric (migration 046).
+//   - anything else (empty, or a real module_id): static-file egress →
+//     cdnEgressMetric (migration 078). Before 078 this branch emitted raw
+//     bytes under the price-0 egressMetric; the value scaling moved here with
+//     the key, never applied to the old key.
 func egressMetricAndValue(moduleID string, bytesTotal float64) (metric string, value float64) {
 	if moduleID == ssrModuleIDSentinel {
 		return ssrEgressMetric, bytesTotal / bytesPerGiB
 	}
-	return egressMetric, bytesTotal
+	return cdnEgressMetric, bytesTotal / bytesPerGiB
 }
 
 // egressEventID is the DETERMINISTIC idempotency key for one (metric, app,
