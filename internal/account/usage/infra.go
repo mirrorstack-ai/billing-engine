@@ -73,6 +73,7 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //
 //	infra.compute.walltime.ms    additive dispatch wall-time ms (fallback) → sum
 //	infra.egress.bytes           additive CDN/egress bytes (retired)       → sum
+//	infra.egress.cdn.bytes       static CDN egress (per-GiB, migration 078) → sum
 //	infra.ai.input.tokens        additive provider INPUT tokens            → sum
 //	infra.ai.output.tokens       additive provider OUTPUT tokens           → sum
 //	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens        → sum
@@ -136,8 +137,15 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// Re-chartered fallback-only dispatch wall-time (design §1 / §2.1).
 		return KindSum, true
 	case "infra.egress.bytes":
-		// RETIRED flat egress, kept as an unpriced reporting parent (design §2.5);
-		// still ingested by cmd/infra-egress-sync, so it stays registered.
+		// RETIRED flat egress, kept as an unpriced reporting parent (design §2.5).
+		// cmd/infra-egress-sync stopped emitting it with migration 078 (static
+		// rows now record under infra.egress.cdn.bytes); it stays registered so
+		// the hours recorded before that cutover keep rolling up — to $0.
+		return KindSum, true
+	case "infra.egress.cdn.bytes":
+		// Static-file CDN egress (migration 078, owner ruling 2026-09-13). sum;
+		// NAMED bytes but priced/emitted PER GiB (rule 5; the per-byte COGS
+		// floors) → producer value = bytes/1024^3, exactly as the SSR hop.
 		return KindSum, true
 	case "infra.ai.input.tokens":
 		return KindSum, true
@@ -482,7 +490,7 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		// The charging queries already exclude flagged rows, so this field is
 		// the whole of the change: the event is still recorded in full and now
 		// declines to be billed.
-		DevServed:          req.DevServed,
+		DevServed: req.DevServed,
 	}
 	event.PayloadFingerprint = observationFingerprint(event)
 	recorded, err := s.store.InsertUsageEvent(ctx, event)
