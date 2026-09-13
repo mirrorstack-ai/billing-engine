@@ -119,9 +119,21 @@ func TestMigration076_OpenPlanChangeDecidesFoldOrChargeUnderTheLock(t *testing.T
 		unbilled.String(), boundary.Add(time.Hour))
 	require.NoError(t, err)
 	require.Equal(t, "free", rosterPlan(unbilled), "an upgrade effective after the boundary: the plan it moved FROM")
-	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET status = 'cancelled' WHERE app_id = $1`, unbilled.String())
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET effective_at = $2, requested_at = $2 WHERE app_id = $1`,
+		unbilled.String(), boundary.Add(-time.Hour))
 	require.NoError(t, err)
-	require.Equal(t, "pro", rosterPlan(unbilled), "a cancelled row is not a change")
+	// Rows that have not taken effect (a scheduled downgrade) or never will
+	// (a cancelled one) are not changes, however their effective_at reads.
+	for _, status := range []string{"scheduled", "cancelled"} {
+		_, err = pool.Exec(ctx, `INSERT INTO ms_billing.app_plan_changes
+			(app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, amount_micros, status)
+			VALUES ($1, $2, 'pro', 'free', 'downgrade', $3, $3, $3, $3, 0, $4)`,
+			unbilled.String(), acct.String(), boundary.Add(2*time.Hour), status)
+		require.NoError(t, err)
+		require.Equal(t, "pro", rosterPlan(unbilled), "a "+status+" row is not a change")
+		_, err = pool.Exec(ctx, `DELETE FROM ms_billing.app_plan_changes WHERE app_id = $1 AND status = $2`, unbilled.String(), status)
+		require.NoError(t, err)
+	}
 
 	// Creation billed → the charged shape, pending, wallet decided (0: not a
 	// credits account).
@@ -631,4 +643,58 @@ func TestMigration076_ProposedMarkArmsTheAppRowWithTheHeader(t *testing.T) {
 		require.Equal(t, cycle.StripeRailClaimed, outcome)
 		require.Equal(t, ref, recovered.ResolvedInvoiceID)
 	}
+}
+
+// (g) Migration 081 backfills the app guard for headers the intent rail
+// resolved BEFORE the store stamped both rows: those apps were re-selected by
+// every sweep and refused every time. An unresolved header and an app the
+// D1d gate skipped are left alone.
+func TestMigration081_BackfillsTheProrationGuardFromResolvedHeaders(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := cycle.NewStore(pool)
+	ctx := context.Background()
+
+	// The pre-081 state, by hand: header resolved, app guard NULL.
+	accountID, appID, createdAt := seedCombinedAttemptApp(t, pool, store, 7)
+	attemptedAt := createdAt.AddDate(0, 0, usage.GraceDays)
+	_, outcome, err := store.FreezeCombinedProrationAttempt(ctx, appID, attemptedAt, combinedAttemptShape(appID, accountID), false)
+	require.NoError(t, err)
+	require.Equal(t, cycle.StripeRailClaimed, outcome)
+	ref := "intent:" + uuid.NewString()
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_combined_proration_attempts SET resolved_at = $2, resolved_invoice_id = $3 WHERE app_id = $1`,
+		appID.String(), attemptedAt.Add(time.Minute), ref)
+	require.NoError(t, err)
+	pending, err := store.AppsPendingProration(ctx, attemptedAt.Add(time.Hour))
+	require.NoError(t, err)
+	require.Contains(t, pending, appID, "the pre-081 defect: resolved header, app still on the work list")
+
+	// Controls: an unresolved header, and a skipped app.
+	_, openApp, openCreated := seedCombinedAttemptApp(t, pool, store, 7)
+	_, outcome, err = store.FreezeCombinedProrationAttempt(ctx, openApp, openCreated.AddDate(0, 0, usage.GraceDays), combinedAttemptShape(openApp, func() uuid.UUID {
+		var acct string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT account_id FROM ms_billing.apps WHERE app_id = $1`, openApp.String()).Scan(&acct))
+		return uuid.MustParse(acct)
+	}()), false)
+	require.NoError(t, err)
+	require.Equal(t, cycle.StripeRailClaimed, outcome)
+
+	_, err = pool.Exec(ctx, migrationSQL(t, "081_app_proration_guard_backfill.up.sql"))
+	require.NoError(t, err)
+
+	var guard *string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`, appID.String()).Scan(&guard))
+	require.NotNil(t, guard)
+	require.Equal(t, ref, *guard, "armed with the header's reference")
+	pending, err = store.AppsPendingProration(ctx, attemptedAt.Add(time.Hour))
+	require.NoError(t, err)
+	require.NotContains(t, pending, appID, "off the work list")
+	require.Contains(t, pending, openApp, "an unresolved header is still the sweep's")
+	require.NoError(t, pool.QueryRow(ctx, `SELECT proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`, openApp.String()).Scan(&guard))
+	require.Nil(t, guard, "untouched")
+
+	// Idempotent: a second run changes nothing.
+	_, err = pool.Exec(ctx, migrationSQL(t, "081_app_proration_guard_backfill.up.sql"))
+	require.NoError(t, err)
+	require.NoError(t, pool.QueryRow(ctx, `SELECT proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`, appID.String()).Scan(&guard))
+	require.Equal(t, ref, *guard)
 }
