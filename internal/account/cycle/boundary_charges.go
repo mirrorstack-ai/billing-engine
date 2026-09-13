@@ -35,6 +35,10 @@ type boundaryComponents struct {
 	AdvanceBaseMicros    int64
 	AdvanceOverageMicros int64
 	AdvanceDomainsMicros int64
+	// AdvanceMembersMicros is the extra app members' fee for the next period
+	// (migration 077) — the fourth recurring component, folded into the same
+	// platform_base kind for the same reason as domains.
+	AdvanceMembersMicros int64
 	// WalletDrawnMicros is the stored-value credit already allocated to this
 	// boundary. The collector subtracted it from the total it sent; the split
 	// has to place it on the right intents instead.
@@ -48,7 +52,7 @@ type boundaryComponents struct {
 }
 
 func (b boundaryComponents) advanceMicros() int64 {
-	return b.AdvanceBaseMicros + b.AdvanceOverageMicros + b.AdvanceDomainsMicros
+	return b.AdvanceBaseMicros + b.AdvanceOverageMicros + b.AdvanceDomainsMicros + b.AdvanceMembersMicros
 }
 
 func (b boundaryComponents) grossMicros() int64 {
@@ -233,6 +237,13 @@ func advanceLines(b boundaryComponents) []proposer.ChargeLine {
 			Description:  "Custom domains — next period",
 			SourceRef:    "advance:domains",
 			AmountMicros: b.AdvanceDomainsMicros,
+		})
+	}
+	if b.AdvanceMembersMicros > 0 {
+		lines = append(lines, proposer.ChargeLine{
+			Description:  "App members above the plan's included count — next period",
+			SourceRef:    "advance:members",
+			AmountMicros: b.AdvanceMembersMicros,
 		})
 	}
 	return lines

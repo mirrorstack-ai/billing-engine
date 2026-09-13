@@ -35,6 +35,14 @@ type fakeStore struct {
 	orgDistributors       map[uuid.UUID]uuid.UUID
 	orgDistributorSources map[uuid.UUID]string
 	proposedProrations    []string
+	// planChanges is the migration-076 ledger; planChangeDraws the wallet
+	// micros drawn per change (the fake's credit_ledger subscription_draw rows).
+	planChanges        map[uuid.UUID]cycle.PlanChange
+	planChangeDraws    map[uuid.UUID]int64
+	errOpenPlanChange  error
+	errPlanChangeDraw  error
+	errSettlePlanCard  error
+	errApplyPlanChange error
 	// rollup inputs
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
@@ -376,6 +384,8 @@ func newFakeStore() *fakeStore {
 		creationDrawn:             map[uuid.UUID]int64{},
 		moduleOverageDrawn:        map[uuid.UUID]int64{},
 		apps:                      map[uuid.UUID]cycle.AppMirror{},
+		planChanges:               map[uuid.UUID]cycle.PlanChange{},
+		planChangeDraws:           map[uuid.UUID]int64{},
 		combinedProrationAttempts: map[uuid.UUID]cycle.CombinedProrationAttempt{},
 		accountsByUser:            map[uuid.UUID]uuid.UUID{},
 		activation:                map[uuid.UUID]time.Time{},
@@ -975,18 +985,24 @@ func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (t
 	return at, ok, nil
 }
 
-func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
+func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount, memberCount int, createdAt time.Time, name string, plan usage.Plan) error {
 	if f.errAppInsert != nil {
 		return f.errAppInsert
 	}
 	if _, exists := f.apps[appID]; exists {
 		return nil // ON CONFLICT (app_id) DO NOTHING — the FIRST registration wins
 	}
+	if plan == "" {
+		plan = usage.DefaultPlan // migration 075's column default
+	}
 	f.apps[appID] = cycle.AppMirror{
 		AppID: appID, AccountID: accountID, ModuleCount: moduleCount,
 		CreatedModuleCount: moduleCount, // frozen at insert, mirroring InsertAppMirror's $3/$3 write
 		CreatedAt:          createdAt,
 		Name:               name, // frozen on first registration (migration 037)
+		Plan:               plan,
+		OwnerOrgID:         ownerOrgID,
+		MemberCount:        memberCount, // migration 077
 	}
 	if ownerOrgID != uuid.Nil {
 		f.appOwnerOrg[appID] = ownerOrgID // owner_org_id stamp (migration 041); Nil = user-owned (NULL)
@@ -1516,6 +1532,9 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 	if app.ProrationAttempted {
 		return cycle.ProrationWalletDeferToStripe, "", nil
 	}
+	if pc.PricedPlan != "" && fakeEffectivePlan(app) != pc.PricedPlan {
+		return cycle.ProrationWalletLockedStale, "", nil // the plan moved under the lock (migration 076)
+	}
 	if app.AccountID == uuid.Nil || (pc.AccountID != uuid.Nil && app.AccountID != pc.AccountID) {
 		return cycle.ProrationWalletLockedStale, "", nil
 	}
@@ -1609,7 +1628,7 @@ func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID
 		// and its creation charge covers through the grace-elapsed period).
 		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) &&
 			app.CreatedAt.AddDate(0, 0, graceDays).Before(createdBefore) {
-			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: app.Plan})
+			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: app.Plan, MemberCount: app.MemberCount})
 		}
 	}
 	return apps, nil
@@ -1919,6 +1938,9 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 	if app.ProrationInvoiceID != "" || app.ProrationSkipped ||
 		(app.Deleted && app.DeletedAt.Before(app.CreatedAt.AddDate(0, 0, usage.GraceDays))) {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, nil
+	}
+	if shape.PricedPlan != "" && fakeEffectivePlan(app) != shape.PricedPlan {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, nil // the plan moved under the lock (migration 076)
 	}
 	if creditRailEnabled && f.walletMode == cycle.CreditBillingModeCredits {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailWalletRequired, nil

@@ -903,6 +903,56 @@ func (q *Queries) InsertPendingCreditPurchase(ctx context.Context, arg InsertPen
 	return i, err
 }
 
+const insertPlanChangeWalletDraw = `-- name: InsertPlanChangeWalletDraw :exec
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key,
+    source_credit_id
+) VALUES (
+    $1::uuid,
+    -$2::bigint,
+    'subscription_draw',
+    'settled',
+    $3::bigint,
+    'system',
+    $4::text,
+    $5::uuid
+)
+`
+
+type InsertPlanChangeWalletDrawParams struct {
+	AccountID          string `json:"account_id"`
+	AmountMicros       int64  `json:"amount_micros"`
+	BalanceAfterMicros int64  `json:"balance_after_micros"`
+	IdempotencyKey     string `json:"idempotency_key"`
+	SourceCreditID     string `json:"source_credit_id"`
+}
+
+// InsertPlanChangeWalletDraw appends one subscription_draw row for a plan
+// upgrade's immediate charge (migration 076). Per-CHANGE idempotency
+// (period_id is NULL): the deterministic change/source key is the sole guard,
+// as for a creation draw. subscription_draw, not usage_draw: the delta is the
+// plan's recurring fee for the remaining days, not metered usage, and the
+// WalletSpendableLots / WalletExpiredCreditBalance reads already count both.
+// Never an unsecured (NULL-source) row: the owner's rule for an upgrade is
+// "draw what the wallet holds, the remainder goes to the card", so a lot is
+// the only thing this draw may consume.
+func (q *Queries) InsertPlanChangeWalletDraw(ctx context.Context, arg InsertPlanChangeWalletDrawParams) error {
+	_, err := q.db.Exec(ctx, insertPlanChangeWalletDraw,
+		arg.AccountID,
+		arg.AmountMicros,
+		arg.BalanceAfterMicros,
+		arg.IdempotencyKey,
+		arg.SourceCreditID,
+	)
+	return err
+}
+
 const insertSettledCreditGrant = `-- name: InsertSettledCreditGrant :one
 INSERT INTO ms_billing.credit_ledger (
     account_id,

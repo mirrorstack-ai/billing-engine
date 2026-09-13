@@ -63,6 +63,59 @@ func (q *Queries) AppsPendingProration(ctx context.Context, arg AppsPendingProra
 	return items, nil
 }
 
+const countLiveOrgAppsOnPlan = `-- name: CountLiveOrgAppsOnPlan :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps
+WHERE owner_org_id = $1::uuid
+  AND plan = $2::text
+  AND deleted_at IS NULL
+  AND app_id <> $3::uuid
+`
+
+type CountLiveOrgAppsOnPlanParams struct {
+	OwnerOrgID  string `json:"owner_org_id"`
+	Plan        string `json:"plan"`
+	ExceptAppID string `json:"except_app_id"`
+}
+
+// CountLiveOrgAppsOnPlan is the org twin: one ORGANIZATION's live apps on a
+// plan, keyed by owner_org_id rather than the funding account (a sponsored
+// org's apps sit on the sponsor's account, and the cap is per org, not per
+// payer — usage.PlanTerms.MaxAppsPerOrg: 1 Free app per org).
+func (q *Queries) CountLiveOrgAppsOnPlan(ctx context.Context, arg CountLiveOrgAppsOnPlanParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countLiveOrgAppsOnPlan, arg.OwnerOrgID, arg.Plan, arg.ExceptAppID)
+	var live_count int64
+	err := row.Scan(&live_count)
+	return live_count, err
+}
+
+const countLiveUserAppsOnPlan = `-- name: CountLiveUserAppsOnPlan :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps
+WHERE account_id = $1::uuid
+  AND owner_org_id IS NULL
+  AND plan = $2::text
+  AND deleted_at IS NULL
+  AND app_id <> $3::uuid
+`
+
+type CountLiveUserAppsOnPlanParams struct {
+	AccountID   string `json:"account_id"`
+	Plan        string `json:"plan"`
+	ExceptAppID string `json:"except_app_id"`
+}
+
+// CountLiveUserAppsOnPlan counts one PERSONAL account's live apps on a plan
+// (owner_org_id IS NULL — a user-owned roster row), excluding @except_app_id
+// so a change of the app being asked about never counts itself. The Free cap
+// (usage.PlanTerms.MaxApps: 3 per personal account) is enforced against it.
+func (q *Queries) CountLiveUserAppsOnPlan(ctx context.Context, arg CountLiveUserAppsOnPlanParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countLiveUserAppsOnPlan, arg.AccountID, arg.Plan, arg.ExceptAppID)
+	var live_count int64
+	err := row.Scan(&live_count)
+	return live_count, err
+}
+
 const insertAdvanceBaseSnapshot = `-- name: InsertAdvanceBaseSnapshot :execrows
 INSERT INTO ms_billing.app_base_snapshots
     (app_id, period_start, period_end, module_count, base_micros, source)
@@ -100,8 +153,8 @@ func (q *Queries) InsertAdvanceBaseSnapshot(ctx context.Context, arg InsertAdvan
 
 const insertAppMirror = `-- name: InsertAppMirror :execrows
 
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id)
-VALUES ($1, $2, $3, $3, $4, $5, $6)
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id, member_count, plan)
+VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (app_id) DO NOTHING
 `
 
@@ -112,6 +165,8 @@ type InsertAppMirrorParams struct {
 	CreatedAt   time.Time   `json:"created_at"`
 	Name        pgtype.Text `json:"name"`
 	OwnerOrgID  pgtype.UUID `json:"owner_org_id"`
+	MemberCount int32       `json:"member_count"`
+	Plan        string      `json:"plan"`
 }
 
 // Queries backing the ms_billing.apps mirror (migration 027) — the base-fee
@@ -135,6 +190,10 @@ type InsertAppMirrorParams struct {
 // (an UNBILLED roster row, migration 041); owner_org_id ($6) is stamped on
 // every org-owned registration — funded or not — so the RepointOrgUsage sweep
 // can scope the org's NULL-account events through the roster.
+// member_count ($7, migration 077) is the live app-member count at creation
+// and plan ($8, migration 075) the plan the app is created ON — a creation
+// that chooses Free lands on it directly instead of registering on the default
+// and changing plan inside its grace. Both are validated by RegisterApp.
 func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertAppMirror,
 		arg.AppID,
@@ -143,6 +202,8 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 		arg.CreatedAt,
 		arg.Name,
 		arg.OwnerOrgID,
+		arg.MemberCount,
+		arg.Plan,
 	)
 	if err != nil {
 		return 0, err
@@ -151,7 +212,7 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 }
 
 const liveAppModuleCountsCreatedBefore = `-- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count, plan
+SELECT app_id, module_count, plan, member_count
 FROM ms_billing.apps
 WHERE account_id = $1::uuid
   AND deleted_at IS NULL
@@ -169,6 +230,7 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 	AppID       string `json:"app_id"`
 	ModuleCount int32  `json:"module_count"`
 	Plan        string `json:"plan"`
+	MemberCount int32  `json:"member_count"`
 }
 
 // LiveAppModuleCountsCreatedBefore returns (app_id, module_count, plan) for every
@@ -202,6 +264,8 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 // timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
 // UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
 // by an hour around DST and double-bill or gap a whole period.
+// member_count (migration 077) feeds the advance-members component: every
+// member past the plan's included count is one $2 line for the new period.
 func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg LiveAppModuleCountsCreatedBeforeParams) ([]LiveAppModuleCountsCreatedBeforeRow, error) {
 	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedBefore, arg.GraceHours)
 	if err != nil {
@@ -211,7 +275,12 @@ func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg Live
 	items := []LiveAppModuleCountsCreatedBeforeRow{}
 	for rows.Next() {
 		var i LiveAppModuleCountsCreatedBeforeRow
-		if err := rows.Scan(&i.AppID, &i.ModuleCount, &i.Plan); err != nil {
+		if err := rows.Scan(
+			&i.AppID,
+			&i.ModuleCount,
+			&i.Plan,
+			&i.MemberCount,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -423,7 +492,8 @@ func (q *Queries) SelectAppBaseSnapshot(ctx context.Context, arg SelectAppBaseSn
 
 const selectAppMirror = `-- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count
 FROM ms_billing.apps
 WHERE app_id = $1
 `
@@ -440,6 +510,8 @@ type SelectAppMirrorRow struct {
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 	Plan                 string             `json:"plan"`
+	OwnerOrgID           pgtype.UUID        `json:"owner_org_id"`
+	MemberCount          int32              `json:"member_count"`
 }
 
 // SelectAppMirror reads one roster row (deleted or not — the caller decides
@@ -460,13 +532,16 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
 		&i.Plan,
+		&i.OwnerOrgID,
+		&i.MemberCount,
 	)
 	return i, err
 }
 
 const selectAppMirrorForUpdate = `-- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE
@@ -484,6 +559,8 @@ type SelectAppMirrorForUpdateRow struct {
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 	Plan                 string             `json:"plan"`
+	OwnerOrgID           pgtype.UUID        `json:"owner_org_id"`
+	MemberCount          int32              `json:"member_count"`
 }
 
 // SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
@@ -509,8 +586,35 @@ func (q *Queries) SelectAppMirrorForUpdate(ctx context.Context, appID string) (S
 		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
 		&i.Plan,
+		&i.OwnerOrgID,
+		&i.MemberCount,
 	)
 	return i, err
+}
+
+const setAppMemberCount = `-- name: SetAppMemberCount :execrows
+UPDATE ms_billing.apps
+SET member_count = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL
+`
+
+type SetAppMemberCountParams struct {
+	AppID       string `json:"app_id"`
+	MemberCount int32  `json:"member_count"`
+}
+
+// SetAppMemberCount snapshots a new app-member count (SyncAppModules,
+// migration 077). WHERE deleted_at IS NULL freezes the count once deleted —
+// the same posture as SetAppModuleCount: a deleted app accrues no future
+// member fee, so there is no future count to move. :execrows; the service
+// resolves 0 rows through the SelectAppMirror existence check it already made.
+func (q *Queries) SetAppMemberCount(ctx context.Context, arg SetAppMemberCountParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setAppMemberCount, arg.AppID, arg.MemberCount)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setAppModuleCount = `-- name: SetAppModuleCount :execrows

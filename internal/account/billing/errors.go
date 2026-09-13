@@ -40,6 +40,13 @@ const (
 	// changes and the per-app module allowance are billed (billing-engine#202).
 	// See cycle.SetAppPlan.
 	CodePlanNotAvailable Code = "PLAN_NOT_AVAILABLE"
+	// CodePlanLimit refuses a plan the owner is not allowed MORE apps on:
+	// the Free cap (usage.PlanTerms.MaxApps per personal account,
+	// MaxAppsPerOrg per org, core-v2#1412) is reached. Distinct from
+	// CodePlanNotAvailable, which says the ENGINE cannot bill the plan yet;
+	// this one says the CUSTOMER has used the plan up. api-platform surfaces
+	// it as HTTP 409 plan_limit.
+	CodePlanLimit Code = "PLAN_LIMIT"
 )
 
 // Error is the typed error returned by every service method. The RPC
@@ -106,6 +113,13 @@ func Unavailable(msg string) *Error {
 // CodePlanNotAvailable). Not retryable with the same payload.
 func PlanNotAvailable(msg string) *Error {
 	return &Error{Code: CodePlanNotAvailable, Message: msg}
+}
+
+// PlanLimit refuses a plan whose per-owner app cap is reached (see
+// CodePlanLimit). Retryable only after an app on that plan is deleted or
+// moved.
+func PlanLimit(msg string) *Error {
+	return &Error{Code: CodePlanLimit, Message: msg}
 }
 
 func StripeError(msg string, wrapped error) *Error {

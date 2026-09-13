@@ -128,6 +128,7 @@ func main() {
 	sweepFailed := runProrationSweep(context.Background(), svc, at)
 	runOverageSweep(context.Background(), svc, at, &res)
 	runDomainSweep(context.Background(), svc, at, &res)
+	runPlanChangeSweep(context.Background(), svc, at, &res)
 	slog.Info("billing-cycle local run complete",
 		"as_of", res.AsOf,
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
@@ -581,6 +582,7 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 		runProrationSweep(ctx, svc, at.UTC())
 		runOverageSweep(ctx, svc, at.UTC(), &res)
 		runDomainSweep(ctx, svc, at.UTC(), &res)
+		runPlanChangeSweep(ctx, svc, at.UTC(), &res)
 		slog.InfoContext(ctx, "billing-cycle lambda run complete",
 			"as_of", res.AsOf,
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
@@ -627,6 +629,13 @@ type cycleResult struct {
 	DomainCharged    int // activation-period prorations invoiced this sweep
 	DomainSkipped    int // resolved without charge or transiently skipped
 	DomainFailed     int // per-domain errors (counted, never abort)
+
+	// Plan-change reconciler (migration 076): upgrades whose money steps did
+	// not all commit when they were requested.
+	PlanChangeCandidates int // pending upgrades this sweep evaluated
+	PlanChangeSettled    int // finished this sweep
+	PlanChangeSkipped    int // still pending (no usable card yet)
+	PlanChangeFailed     int // per-change errors (counted, never abort)
 }
 
 // runCycle closes every card-bound account's just-ended ANCHORED period as of
@@ -828,6 +837,27 @@ func runDomainSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *
 	slog.InfoContext(ctx, "custom-domain sweep complete",
 		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
 		"resolved", sweep.Resolved, "skipped", sweep.Skipped, "failed", sweep.Failed)
+}
+
+// runPlanChangeSweep finishes every pending plan upgrade after the other
+// sweeps: a crash between an upgrade's wallet draw and its card seal, or a
+// card that vanished in between, leaves a pending ledger row and this is
+// what completes it. Each change is independently resumable against its row.
+func runPlanChangeSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *cycleResult) {
+	sweep, err := svc.SweepPendingPlanChanges(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "plan-change sweep failed", "as_of", at, "error", err)
+		res.Failed++
+		return
+	}
+	res.PlanChangeCandidates = sweep.Pending
+	res.PlanChangeSettled = sweep.Settled
+	res.PlanChangeSkipped = sweep.Skipped
+	res.PlanChangeFailed = sweep.Failed
+	res.Failed += sweep.Failed
+	slog.InfoContext(ctx, "plan-change sweep complete",
+		"as_of", at, "pending", sweep.Pending, "settled", sweep.Settled,
+		"skipped", sweep.Skipped, "failed", sweep.Failed)
 }
 
 // tally classifies one account's charge summary for the run totals + a

@@ -59,6 +59,18 @@ type RegisterAppRequest struct {
 	// shows its name. Empty → NULL (the frontend falls back to its registry
 	// lookup). SyncAppModules updates it while the app is live.
 	Name string `json:"name,omitempty"`
+
+	// MemberCount is the app-member count at creation (migration 077, default
+	// 0). SyncAppModules keeps it current.
+	MemberCount int `json:"member_count,omitempty"`
+
+	// Plan is the plan the app is created ON (core-v2#1412): free | pro |
+	// business, empty = usage.DefaultPlan. A creation that chooses Free lands
+	// on it directly, under the same Free rules SetAppPlan applies (a usable
+	// card, the per-owner cap); business is refused like SetAppPlan refuses
+	// it. Only a genuinely NEW app_id reads it — a retry keeps the first
+	// registration's plan like every other frozen field.
+	Plan string `json:"plan,omitempty"`
 }
 
 // RegisterAppResponse reports the mirror write. RegisterApp charges nothing
@@ -85,12 +97,17 @@ type SyncAppModulesRequest struct {
 	// the app is LIVE (a no-op once deleted, freezing the last-known name). nil
 	// = no name change this sync (same nil-vs-value pattern as ModuleCount).
 	Name *string `json:"name,omitempty"`
+	// MemberCount, when non-nil, is a new app-member count (migration 077):
+	// api-platform sends it on every member add / remove. Same nil-vs-value
+	// pattern as ModuleCount; frozen once the app is deleted.
+	MemberCount *int `json:"member_count,omitempty"`
 }
 
 // SyncAppModulesResponse echoes the roster row's post-sync state.
 type SyncAppModulesResponse struct {
 	AppID       uuid.UUID `json:"app_id"`
 	ModuleCount int       `json:"module_count"`
+	MemberCount int       `json:"member_count"`
 	Deleted     bool      `json:"deleted"`
 	Name        string    `json:"name"`
 }
@@ -147,6 +164,24 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 	if req.ModuleCount > maxModuleCount {
 		return nil, billing.InvalidInput("module_count exceeds the maximum supported count (100000)")
 	}
+	if req.MemberCount < 0 {
+		return nil, billing.InvalidInput("member_count must be non-negative")
+	}
+	if req.MemberCount > maxModuleCount {
+		return nil, billing.InvalidInput("member_count exceeds the maximum supported count (100000)")
+	}
+	plan := usage.DefaultPlan
+	if req.Plan != "" {
+		p, ok := usage.ParsePlan(req.Plan)
+		if !ok {
+			return nil, billing.InvalidInput("plan must be one of free, pro, business")
+		}
+		if p == usage.PlanBusiness {
+			return nil, billing.PlanNotAvailable("plan business is not available yet: " +
+				"its per-app module allowance is not billed yet (billing-engine#202 PR-2c)")
+		}
+		plan = p
+	}
 
 	createdAt := req.CreatedAt
 	if createdAt.IsZero() {
@@ -166,8 +201,15 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		if err != nil {
 			return nil, err
 		}
+		if plan == usage.PlanFree {
+			// The card half of the Free rules is the funding gate above; the
+			// per-owner cap is the other half (core-v2#1412).
+			if err := s.freeEligible(ctx, accountID, req.OwnerOrgID, req.AppID); err != nil {
+				return nil, err
+			}
+		}
 
-		if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, createdAt, req.Name); err != nil {
+		if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, req.MemberCount, createdAt, req.Name, plan); err != nil {
 			return nil, billing.Internal("insert app mirror failed", err)
 		}
 
@@ -233,6 +275,12 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 	if req.ModuleCount != nil && *req.ModuleCount > maxModuleCount {
 		return nil, billing.InvalidInput("module_count exceeds the maximum supported count (100000)")
 	}
+	if req.MemberCount != nil && *req.MemberCount < 0 {
+		return nil, billing.InvalidInput("member_count must be non-negative")
+	}
+	if req.MemberCount != nil && *req.MemberCount > maxModuleCount {
+		return nil, billing.InvalidInput("member_count exceeds the maximum supported count (100000)")
+	}
 
 	app, found, err := s.store.AppMirror(ctx, req.AppID)
 	if err != nil {
@@ -277,6 +325,16 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 		}
 	}
 
+	// Member count (migration 077) — no-op once deleted, like the module count:
+	// a deleted app accrues no future member fee. No timer, no proration: the
+	// boundary leg reads the count in force at the boundary.
+	if req.MemberCount != nil && !app.Deleted {
+		if err := s.store.SetAppMemberCount(ctx, req.AppID, *req.MemberCount); err != nil {
+			return nil, billing.Internal("set app member count failed", err)
+		}
+		app.MemberCount = *req.MemberCount
+	}
+
 	// Rename — no-op once deleted (frozen name, D1e-style), the same gate as the
 	// count update above: a live app's bill tracks its current name; a deleted
 	// app keeps its last-known name for the historical bill (migration 037).
@@ -290,6 +348,7 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 	return &SyncAppModulesResponse{
 		AppID:       app.AppID,
 		ModuleCount: app.ModuleCount,
+		MemberCount: app.MemberCount,
 		Deleted:     app.Deleted,
 		Name:        app.Name,
 	}, nil
@@ -351,79 +410,4 @@ func (s *Service) fundedOwnerAccount(ctx context.Context, ownerUserID, ownerOrgI
 		return uuid.Nil, billing.PaymentRequired("no usable payment card on file: add a card before creating an app")
 	}
 	return accountID, nil
-}
-
-// GetAppPlanRequest is the payload of GetAppPlan.
-type GetAppPlanRequest struct {
-	AppID uuid.UUID `json:"app_id"`
-}
-
-// AppPlanResponse is GetAppPlan's and SetAppPlan's answer: the app's plan and
-// what it includes, so api-platform enforces its gates from the one copy of the
-// terms (usage/plans.go) instead of keeping its own.
-type AppPlanResponse struct {
-	AppID uuid.UUID       `json:"app_id"`
-	Terms usage.PlanTerms `json:"terms"`
-}
-
-// GetAppPlan reads an app's plan (core-v2#1412). An app the roster has not
-// mirrored yet (RegisterApp is fire-and-forget) reads as usage.DefaultPlan, the
-// plan migration 075 gives every row.
-func (s *Service) GetAppPlan(ctx context.Context, req GetAppPlanRequest) (*AppPlanResponse, error) {
-	if req.AppID == uuid.Nil {
-		return nil, billing.InvalidInput("app_id required")
-	}
-	app, found, err := s.store.AppMirror(ctx, req.AppID)
-	if err != nil {
-		return nil, billing.Internal("app mirror lookup failed", err)
-	}
-	plan := usage.DefaultPlan
-	if found && app.Plan != "" {
-		plan = app.Plan
-	}
-	return &AppPlanResponse{AppID: req.AppID, Terms: usage.TermsFor(plan)}, nil
-}
-
-// SetAppPlanRequest is the payload of SetAppPlan.
-type SetAppPlanRequest struct {
-	AppID uuid.UUID `json:"app_id"`
-	Plan  string    `json:"plan"`
-}
-
-// SetAppPlan moves a live app onto a plan (core-v2#1412). api-platform calls it
-// from its change-plan endpoint, after owner/admin authorization and step-up.
-//
-// 🔴 ONLY `pro` IS ACCEPTED, AND THE REFUSAL IS DELIBERATE — do not "fix" it
-// from the caller's side. Every base-fee leg now bills each app its own plan
-// base, but two things a plan change needs are not built yet:
-//   - billing the change itself: an upgrade charges the prorated difference
-//     for the rest of the period at once, and a downgrade waits for the next
-//     period boundary;
-//   - the per-app module allowance: the module legs still price the account
-//     pool of usage.IncludedModules, so a Business app would be billed module
-//     overage its plan includes.
-//
-// Accepting `free` or `business` before both land would bill the change wrong.
-// The follow-up PRs of billing-engine#202 remove this refusal, together with
-// Free's personal-only and card-on-file rules.
-func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPlanResponse, error) {
-	if req.AppID == uuid.Nil {
-		return nil, billing.InvalidInput("app_id required")
-	}
-	plan, ok := usage.ParsePlan(req.Plan)
-	if !ok {
-		return nil, billing.InvalidInput("plan must be one of free, pro, business")
-	}
-	if plan != usage.PlanPro {
-		return nil, billing.PlanNotAvailable("plan " + string(plan) +
-			" is not available yet: plan changes are not billed yet (billing-engine#202)")
-	}
-	moved, err := s.store.SetAppPlan(ctx, req.AppID, plan)
-	if err != nil {
-		return nil, billing.Internal("set app plan failed", err)
-	}
-	if !moved {
-		return nil, billing.NotFound("app not registered or deleted")
-	}
-	return &AppPlanResponse{AppID: req.AppID, Terms: usage.TermsFor(plan)}, nil
 }

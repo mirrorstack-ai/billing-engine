@@ -21,8 +21,12 @@
 -- (an UNBILLED roster row, migration 041); owner_org_id ($6) is stamped on
 -- every org-owned registration — funded or not — so the RepointOrgUsage sweep
 -- can scope the org's NULL-account events through the roster.
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id)
-VALUES ($1, $2, $3, $3, $4, $5, $6)
+-- member_count ($7, migration 077) is the live app-member count at creation
+-- and plan ($8, migration 075) the plan the app is created ON — a creation
+-- that chooses Free lands on it directly instead of registering on the default
+-- and changing plan inside its grace. Both are validated by RegisterApp.
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id, member_count, plan)
+VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (app_id) DO NOTHING;
 
 -- SelectAppMirror reads one roster row (deleted or not — the caller decides
@@ -30,7 +34,8 @@ ON CONFLICT (app_id) DO NOTHING;
 -- GetAppBill still displays the spent creation-period base).
 -- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count
 FROM ms_billing.apps
 WHERE app_id = $1;
 
@@ -44,7 +49,8 @@ WHERE app_id = $1;
 -- read, never for the duration of a Stripe HTTP call.
 -- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE;
@@ -168,8 +174,10 @@ WHERE app_id = $1
 -- timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
 -- UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
 -- by an hour around DST and double-bill or gap a whole period.
+-- member_count (migration 077) feeds the advance-members component: every
+-- member past the plan's included count is one $2 line for the new period.
 -- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count, plan
+SELECT app_id, module_count, plan, member_count
 FROM ms_billing.apps
 WHERE account_id = @account_id::uuid
   AND deleted_at IS NULL
@@ -373,3 +381,39 @@ UPDATE ms_billing.apps
 SET plan = $2
 WHERE app_id = $1
   AND deleted_at IS NULL;
+
+-- SetAppMemberCount snapshots a new app-member count (SyncAppModules,
+-- migration 077). WHERE deleted_at IS NULL freezes the count once deleted —
+-- the same posture as SetAppModuleCount: a deleted app accrues no future
+-- member fee, so there is no future count to move. :execrows; the service
+-- resolves 0 rows through the SelectAppMirror existence check it already made.
+-- name: SetAppMemberCount :execrows
+UPDATE ms_billing.apps
+SET member_count = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL;
+
+-- CountLiveUserAppsOnPlan counts one PERSONAL account's live apps on a plan
+-- (owner_org_id IS NULL — a user-owned roster row), excluding @except_app_id
+-- so a change of the app being asked about never counts itself. The Free cap
+-- (usage.PlanTerms.MaxApps: 3 per personal account) is enforced against it.
+-- name: CountLiveUserAppsOnPlan :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps
+WHERE account_id = @account_id::uuid
+  AND owner_org_id IS NULL
+  AND plan = @plan::text
+  AND deleted_at IS NULL
+  AND app_id <> @except_app_id::uuid;
+
+-- CountLiveOrgAppsOnPlan is the org twin: one ORGANIZATION's live apps on a
+-- plan, keyed by owner_org_id rather than the funding account (a sponsored
+-- org's apps sit on the sponsor's account, and the cap is per org, not per
+-- payer — usage.PlanTerms.MaxAppsPerOrg: 1 Free app per org).
+-- name: CountLiveOrgAppsOnPlan :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps
+WHERE owner_org_id = @owner_org_id::uuid
+  AND plan = @plan::text
+  AND deleted_at IS NULL
+  AND app_id <> @except_app_id::uuid;

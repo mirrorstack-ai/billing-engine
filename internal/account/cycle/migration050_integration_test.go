@@ -61,7 +61,7 @@ func seedCombinedAttemptApp(
 	appID := uuid.New()
 	createdAt := time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC)
 	require.NoError(t, store.InsertAppMirror(
-		ctx, appID, accountID, uuid.Nil, moduleCount, createdAt, "combined-attempt integration",
+		ctx, appID, accountID, uuid.Nil, moduleCount, 0, createdAt, "combined-attempt integration", "",
 	))
 	if moduleCount > 0 {
 		require.NoError(t, store.InsertModuleOverageTimers(
@@ -450,7 +450,7 @@ func TestCombinedProrationAttempt_Integration_MixedVersionTerminalWritesAreRejec
 	// unresolved marker exists when new code starts.
 	freshApp := uuid.New()
 	require.NoError(t, store.InsertAppMirror(
-		ctx, freshApp, accountID, uuid.Nil, 0, createdAt, "old-worker marker probe",
+		ctx, freshApp, accountID, uuid.Nil, 0, 0, createdAt, "old-worker marker probe", "",
 	))
 	_, err = pool.Exec(ctx, `
 		UPDATE ms_billing.apps

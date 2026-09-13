@@ -885,3 +885,33 @@ INSERT INTO ms_billing.credit_ledger (
 )
 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 RETURNING id, balance_after_micros;
+
+-- InsertPlanChangeWalletDraw appends one subscription_draw row for a plan
+-- upgrade's immediate charge (migration 076). Per-CHANGE idempotency
+-- (period_id is NULL): the deterministic change/source key is the sole guard,
+-- as for a creation draw. subscription_draw, not usage_draw: the delta is the
+-- plan's recurring fee for the remaining days, not metered usage, and the
+-- WalletSpendableLots / WalletExpiredCreditBalance reads already count both.
+-- Never an unsecured (NULL-source) row: the owner's rule for an upgrade is
+-- "draw what the wallet holds, the remainder goes to the card", so a lot is
+-- the only thing this draw may consume.
+-- name: InsertPlanChangeWalletDraw :exec
+INSERT INTO ms_billing.credit_ledger (
+    account_id,
+    amount_micros,
+    type,
+    status,
+    balance_after_micros,
+    actor,
+    idempotency_key,
+    source_credit_id
+) VALUES (
+    sqlc.arg(account_id)::uuid,
+    -sqlc.arg(amount_micros)::bigint,
+    'subscription_draw',
+    'settled',
+    sqlc.arg(balance_after_micros)::bigint,
+    'system',
+    sqlc.arg(idempotency_key)::text,
+    sqlc.arg(source_credit_id)::uuid
+);

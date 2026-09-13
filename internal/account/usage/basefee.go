@@ -178,6 +178,68 @@ func ProrationCoverageStart(createdAt, periodStart time.Time) time.Time {
 	return day
 }
 
+// BaseSegment is one stretch of a period during which ONE plan base was in
+// force, from From (inclusive) until the next segment's From or the period
+// end. A plan change inside the creation grace produces a second segment: the
+// owner's rule (2026-09-13, core-v2#1412) is that each day bills at the plan
+// actually in force that day — days before the change at the old plan, the
+// rest at the new — and the split is by DAY, so From is truncated to its UTC
+// date exactly as a creation instant is (ProrationCoverageStart).
+type BaseSegment struct {
+	From       time.Time
+	BaseMicros int64
+}
+
+// SegmentedProratedBaseMicros prices one period [periodStart, periodEnd) as
+// the sum of its segments, each prorated over the whole UTC days it was in
+// force, each rounded once (the same rounding as ProratedBaseMicros). For a
+// single segment it equals ProratedBaseMicros(segment.BaseMicros,
+// segment.From, periodStart, periodEnd) exactly, which is what keeps an app
+// that never changed plan billed to the micro as before — pinned by
+// TestSegmentedProrationIsProratedBaseForOneSegment.
+//
+// Segments must be in From order; a segment's From at or after the period end
+// contributes nothing, and one before the period start is clamped to it.
+func SegmentedProratedBaseMicros(segments []BaseSegment, periodStart, periodEnd time.Time) int64 {
+	var total int64
+	for i, seg := range segments {
+		end := periodEnd
+		if i+1 < len(segments) {
+			end = segments[i+1].From
+		}
+		total += ProratedSegmentMicros(seg.BaseMicros, seg.From, end, periodStart, periodEnd)
+	}
+	return total
+}
+
+// ProratedSegmentMicros prices baseMicros for the whole UTC days in
+// [from, to) ∩ [periodStart, periodEnd): base × days / period_days, integer
+// micros round-half-up — the ProratedBaseMicros formula with an explicit end.
+// Both instants are truncated to their UTC date (the from-day inclusive, the
+// to-day exclusive), so a change at 15:00 on the 19th bills the 19th at the
+// NEW plan. A segment covering the whole period is the full base, and an
+// empty one is 0. baseMicros must be non-negative: the rounding truncates
+// toward zero, which is half-up only for a non-negative dividend.
+func ProratedSegmentMicros(baseMicros int64, from, to, periodStart, periodEnd time.Time) int64 {
+	start := ProrationCoverageStart(from, periodStart)
+	end := ProrationCoverageStart(to, periodStart)
+	if end.After(periodEnd) {
+		end = periodEnd
+	}
+	if !start.Before(end) {
+		return 0
+	}
+	periodDays := wholeDaysUTC(periodStart, periodEnd)
+	if periodDays <= 0 {
+		return baseMicros // defensive: a malformed window never zero-divides
+	}
+	days := wholeDaysUTC(start, end)
+	if days >= periodDays {
+		return baseMicros
+	}
+	return (baseMicros*days + periodDays/2) / periodDays
+}
+
 // wholeDaysUTC counts the whole UTC days in [from, to). Both inputs are
 // midnight-UTC instants (anchored period boundaries / a truncated creation
 // date), so the division is exact — UTC has no DST to break the 24h day.

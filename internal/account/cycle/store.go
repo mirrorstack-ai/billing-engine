@@ -314,7 +314,9 @@ type Store interface {
 	// display name). name "" writes NULL. accountID uuid.Nil registers an
 	// UNBILLED org roster row (NULL account, migration 041); ownerOrgID is the
 	// org principal for org-owned apps (uuid.Nil = user-owned).
-	InsertAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount int, createdAt time.Time, name string) error
+	// memberCount (migration 077) and plan (migration 075) are frozen from the
+	// first registration like the rest; RegisterApp validates both.
+	InsertAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount, memberCount int, createdAt time.Time, name string, plan usage.Plan) error
 
 	// EnsureOrgAccount resolves the org's billing account, creating the row if
 	// none exists yet — the org twin of EnsureAccountForUser (advisory-locked
@@ -506,6 +508,50 @@ type Store interface {
 	// SetAppPlan moves a LIVE app onto a plan (migration 075) and reports whether
 	// a row moved: false = deleted or never registered.
 	SetAppPlan(ctx context.Context, appID uuid.UUID, plan usage.Plan) (bool, error)
+
+	// SetAppMemberCount snapshots a new app-member count (migration 077); a
+	// deleted app's count is frozen, like its module count.
+	SetAppMemberCount(ctx context.Context, appID uuid.UUID, memberCount int) error
+
+	// CountLiveAppsOnPlan counts the owner's live apps on a plan, excluding
+	// exceptAppID — the org's when ownerOrgID is set, else the personal
+	// account's user-owned rows. The Free cap is enforced against it.
+	CountLiveAppsOnPlan(ctx context.Context, accountID, ownerOrgID uuid.UUID, plan usage.Plan, exceptAppID uuid.UUID) (int, error)
+
+	// --- plan-change ledger (migration 076) --------------------------------
+
+	// OpenPlanChange inserts a change and, for an upgrade, flips apps.plan in
+	// the SAME transaction under the app row lock; the locked row is
+	// re-verified live and still on FromPlan (else PlanChangeAppStale), and an
+	// open change found under the lock is returned as PlanChangeExisting.
+	OpenPlanChange(ctx context.Context, p OpenPlanChangeParams) (PlanChange, OpenPlanChangeOutcome, error)
+	// OpenPlanChangeForApp reads the app's one open change (pending or
+	// scheduled), if any.
+	OpenPlanChangeForApp(ctx context.Context, appID uuid.UUID) (PlanChange, bool, error)
+	// PlanChange reads one row by id.
+	PlanChange(ctx context.Context, id uuid.UUID) (PlanChange, bool, error)
+	// PendingPlanChanges lists upgrades whose money steps did not all commit,
+	// requested at or before the instant — the reconciler's work list.
+	PendingPlanChanges(ctx context.Context, requestedBefore time.Time) ([]PlanChange, error)
+	// FoldedPlanChanges lists the app's in-grace upgrades in effect order —
+	// the segments the creation charge prices by day.
+	FoldedPlanChanges(ctx context.Context, appID uuid.UUID) ([]PlanChange, error)
+	// DrawPlanChangeFromWallet takes the wallet decision for a pending upgrade
+	// ONCE: in credits mode it draws from the spendable lots up to the amount
+	// (never an unsecured remainder), otherwise it records 0. With
+	// allowRemainder=false a wallet that cannot cover the amount is
+	// PlanChangeWalletShort and nothing is written. A row the wallet fully
+	// covers settles in the same transaction.
+	DrawPlanChangeFromWallet(ctx context.Context, change PlanChange, allowRemainder bool, at time.Time) (PlanChangeWalletOutcome, int64, error)
+	// SettlePlanChangeCard records the sealed card remainder and settles the
+	// row; false when the row was no longer pending.
+	SettlePlanChangeCard(ctx context.Context, id uuid.UUID, cardMicros int64, cardRef string, at time.Time) (bool, error)
+	// CancelScheduledPlanChange withdraws the app's scheduled downgrade;
+	// false when none was scheduled.
+	CancelScheduledPlanChange(ctx context.Context, appID uuid.UUID, at time.Time) (bool, error)
+	// ApplyDuePlanChanges moves every due scheduled downgrade of the account
+	// onto its plan and closes the rows; returns how many it applied.
+	ApplyDuePlanChanges(ctx context.Context, accountID uuid.UUID, dueAt time.Time) (int, error)
 
 	// MarkAppDeleted soft-deletes the roster row out of future advance base
 	// fees. Idempotent — the first deletion instant is kept.
@@ -793,6 +839,10 @@ type AppModuleCount struct {
 	ModuleCount int
 	// Plan prices the app's advance base (migration 075, core-v2#1412).
 	Plan usage.Plan
+	// MemberCount prices the app's advance members (migration 077): every
+	// member past the plan's included count is one usage.ExtraMemberFeeMicros
+	// for the new period.
+	MemberCount int
 }
 
 // AppBaseSnapshot is the in-memory form of a ms_billing.app_base_snapshots
@@ -830,6 +880,12 @@ type AppMirror struct {
 	CreatedAt          time.Time
 	// Plan is the app's billing plan (migration 075).
 	Plan usage.Plan
+	// OwnerOrgID is the org principal of an org-owned app (migration 041);
+	// uuid.Nil for a user-owned one. The Free cap is per org for the former
+	// and per personal account for the latter.
+	OwnerOrgID uuid.UUID
+	// MemberCount is the live app-member count (migration 077).
+	MemberCount int
 	// Name: the frozen app display name (migration 037) — "" when NULL. Written
 	// by RegisterApp / SyncAppModules (freeze-on-delete) so a deleted app's bill
 	// still shows its last-known name.
@@ -872,7 +928,14 @@ type FrozenBoundaryCharge struct {
 // Stripe's idempotent request body; raw micros independently feed strict
 // prospective-credit projections.
 type CombinedProrationChargeShape struct {
-	AccountID          uuid.UUID
+	AccountID uuid.UUID
+	// PricedPlan is the app's plan the shape was derived at (migration 075).
+	// It is NOT persisted with the attempt: it exists so the freeze can refuse
+	// a shape whose plan the locked row no longer carries — a plan change
+	// committed between the derivation and the freeze folds into the creation
+	// charge (migration 076), so the shape must be re-derived, never frozen.
+	// Empty disables the check (a legacy shape read back from the header).
+	PricedPlan         usage.Plan
 	Currency           string
 	BaseChargeMicros   int64
 	BaseChargeCents    int64
@@ -2111,17 +2174,22 @@ func (s *pgxStore) AccountActivation(ctx context.Context, accountID uuid.UUID) (
 	return at.Time, true, nil
 }
 
-func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
+func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount, memberCount int, createdAt time.Time, name string, plan usage.Plan) error {
 	// RowsAffected 0 = a retry hit ON CONFLICT DO NOTHING — success either way.
 	// accountID uuid.Nil → NULL: an UNBILLED org roster row awaiting funding
 	// designation (migration 041); ownerOrgID uuid.Nil → NULL for user-owned apps.
+	if plan == "" {
+		plan = usage.DefaultPlan
+	}
 	_, err := s.q.InsertAppMirror(ctx, db.InsertAppMirrorParams{
 		AppID:       appID.String(),
 		AccountID:   pgUUIDOrNull(accountID),
 		OwnerOrgID:  pgUUIDOrNull(ownerOrgID),
 		ModuleCount: int32(moduleCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
+		MemberCount: int32(memberCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
 		CreatedAt:   createdAt,
 		Name:        pgtype.Text{String: name, Valid: name != ""}, // NULL when the caller omits a name (frontend falls back)
+		Plan:        string(plan),
 	})
 	return err
 }
@@ -2157,6 +2225,8 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
 		Plan:               usage.Plan(row.Plan),
+		OwnerOrgID:         uuidFromPg(row.OwnerOrgID),
+		MemberCount:        int(row.MemberCount),
 		Name:               row.Name.String,               // "" when NULL (pre-037 / unnamed)
 		ProrationInvoiceID: row.ProrationInvoiceID.String, // "" when NULL (guard unarmed)
 		ProrationSkipped:   row.ProrationSkippedAt.Valid,
@@ -2585,6 +2655,12 @@ func (s *pgxStore) DrawCreationProrationFromWallet(ctx context.Context, appID uu
 		// the Stripe recovery path, which reconciles idempotently by ms_charge_ref.
 		return ProrationWalletDeferToStripe, "", nil
 	}
+	if pc.PricedPlan != "" && usage.Plan(row.Plan) != pc.PricedPlan {
+		// The plan moved between the caller's derivation and this lock (a
+		// folded upgrade, migration 076): the amount prices the wrong days at
+		// the wrong base. Nothing drawn; the next sweep re-derives.
+		return ProrationWalletLockedStale, "", nil
+	}
 	accountID := uuidFromPg(row.AccountID)
 	if accountID == uuid.Nil || (pc.AccountID != uuid.Nil && accountID != pc.AccountID) {
 		// The amount and the window were derived for pc.AccountID (its anchor,
@@ -2787,7 +2863,7 @@ func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUI
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount), Plan: usage.Plan(r.Plan)})
+		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount), Plan: usage.Plan(r.Plan), MemberCount: int(r.MemberCount)})
 	}
 	return out, nil
 }
@@ -3072,6 +3148,12 @@ func (s *pgxStore) FreezeCombinedProrationAttempt(
 	}
 	accountID := uuidFromPg(appRow.AccountID)
 	if accountID == uuid.Nil {
+		return CombinedProrationAttempt{}, StripeRailStale, nil
+	}
+	if shape.PricedPlan != "" && usage.Plan(appRow.Plan) != shape.PricedPlan {
+		// The plan moved between the caller's derivation and this lock (a
+		// folded upgrade, migration 076). The shape prices the wrong days at
+		// the wrong base; the next sweep re-derives from the ledger.
 		return CombinedProrationAttempt{}, StripeRailStale, nil
 	}
 	if creditRailEnabled && accountID != probedAccountID {

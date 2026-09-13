@@ -94,6 +94,16 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("RunBillingCycle requires a Stripe client", nil)
 	}
 
+	// A DOWNGRADE TAKES EFFECT AT THE BOUNDARY (migration 076, owner
+	// 2026-09-12): every scheduled downgrade of this account whose boundary
+	// is this one — or an earlier one a late cron never reached — moves the
+	// app onto its plan NOW, before the roster is read, so the advance base
+	// below is the plan in force at the boundary. Ahead of the idempotency
+	// gate on purpose: the plan must move whether or not this run collects.
+	if _, err := s.store.ApplyDuePlanChanges(ctx, accountID, periodEnd); err != nil {
+		return nil, billing.Internal("apply due plan changes failed", err)
+	}
+
 	runID, shouldCharge, reclaimed, err := s.store.InsertBillingRun(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("insert billing run failed", err)
@@ -273,9 +283,16 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// Each live app contributes ONLY its plan's flat base. Module overage is billed
 	// SEPARATELY below (the advance-overage / Leg 2 precharge), not folded into an
 	// app's base — it rides per-module-instance grace timers (migration 033).
-	var advanceBase int64
+	var advanceBase, advanceMembers int64
 	for _, a := range apps {
 		advanceBase += usage.TermsFor(a.Plan).BaseFeeMicros // each app's own plan base (core-v2#1412)
+		// ADVANCE MEMBERS leg (migration 077, owner 2026-09-13): every member
+		// past the plan's included count is one $2 fee for the NEW period,
+		// from the count in force at this boundary — the same read as the
+		// plan base, and the same per-unit shape as domains, without an
+		// activation-period proration: a member is counted from the first
+		// boundary after they were added.
+		advanceMembers += usage.ExtraMembersMicros(a.Plan, a.MemberCount)
 	}
 
 	// ADVANCE OVERAGE leg (scenario 6, Leg 2): the NEW period's $5-per-block
@@ -317,10 +334,10 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	advanceDomains := usage.DomainFeeMicros * int64(domainCount)
 
 	// The whole boundary invoice: closed period's netted usage arrears + the new
-	// period's advance base + module overage + custom domains. The allowance nets
-	// USAGE only; all recurring account fees ride on top.
-	boundaryTotal := arrears + advanceBase + advanceOverage + advanceDomains
-	withBase := advanceBase+advanceOverage+advanceDomains > 0
+	// period's advance base + module overage + custom domains + extra members.
+	// The allowance nets USAGE only; all recurring account fees ride on top.
+	boundaryTotal := arrears + advanceBase + advanceOverage + advanceDomains + advanceMembers
+	withBase := advanceBase+advanceOverage+advanceDomains+advanceMembers > 0
 
 	summary := &ChargeSummary{
 		FirstRun:             true,
@@ -328,6 +345,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		AdvanceBaseMicros:    advanceBase,
 		AdvanceOverageMicros: advanceOverage,
 		AdvanceDomainsMicros: advanceDomains,
+		AdvanceMembersMicros: advanceMembers,
 	}
 
 	// UNIVERSAL WALLET DRAWDOWN. The true boundary total is now fixed, so the
@@ -432,10 +450,15 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// 'invoiced' would bury that charge forever. Guard lost → error out; the run
 	// stays reclaimable and the next reclaim reconciles the frozen charge.
 	if stripeTotal == 0 && (!hasFrozen || frozen.Cents == 0) {
-		// A wallet-settled advance base is still a real billed base. Persist the
-		// same display snapshot the Stripe path would have written; a failure
-		// leaves the run reclaimable and the period draw is safely reused.
-		if (summary.WalletDrawnMicros > 0 || hasFrozen) && advanceBase > 0 {
+		// A wallet-settled advance base is still a real billed base, and so is
+		// a ZERO one: an all-Free roster reaches this zero-skip with live apps
+		// whose new-period base is $0, and "the snapshot freezes what was
+		// billed" holds only if the $0 is frozen too (the #207 review, carried
+		// to PR-2b — this used to gate on advanceBase > 0 and wrote nothing
+		// for such a roster). Persist the same display snapshot the Stripe
+		// path would have written for every live app; a failure leaves the
+		// run reclaimable and the period draw is safely reused.
+		if len(apps) > 0 {
 			anchorDay := billingperiod.AnchorDay(periodEnd)
 			if activatedAt, activated, err := s.store.AccountActivation(ctx, accountID); err != nil {
 				return nil, billing.Internal("account activation lookup failed", err)
@@ -646,7 +669,8 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	//   - Fresh: the cents==0 sub-half-cent short-circuit applies (never call
 	//     Stripe for $0 — an advance base/overage, when present, is always ≥ $5
 	//     (a whole block, or a paid plan's full base; leg 2 never prorates)
-	//     and can never round to 0; nothing was ever put through Stripe for this
+	//     and can never round to 0 — extra members and domains are whole
+	//     dollars too; nothing was ever put through Stripe for this
 	//     run), then freeze BEFORE the first Stripe call. The freeze is
 	//     first-write-wins AND returns the SURVIVING row value (H6): a concurrent
 	//     second daemon that reclaimed the same run and froze first wins, and
@@ -734,6 +758,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			AdvanceBaseMicros:    summary.AdvanceBaseMicros,
 			AdvanceOverageMicros: summary.AdvanceOverageMicros,
 			AdvanceDomainsMicros: summary.AdvanceDomainsMicros,
+			AdvanceMembersMicros: summary.AdvanceMembersMicros,
 			WalletDrawnMicros:    summary.WalletDrawnMicros,
 			// 🔴 The frozen figure, when a prior attempt committed to one.
 			//

@@ -482,7 +482,7 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		// The charging queries already exclude flagged rows, so this field is
 		// the whole of the change: the event is still recorded in full and now
 		// declines to be billed.
-		DevServed:          req.DevServed,
+		DevServed: req.DevServed,
 	}
 	event.PayloadFingerprint = observationFingerprint(event)
 	recorded, err := s.store.InsertUsageEvent(ctx, event)

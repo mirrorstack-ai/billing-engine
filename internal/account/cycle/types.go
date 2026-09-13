@@ -278,6 +278,11 @@ type ChargeSummary struct {
 	// SweepDomainCharges.
 	AdvanceDomainsMicros int64
 
+	// AdvanceMembersMicros is the NEW period's extra-member fee (migration
+	// 077): Σ over the roster of max(0, member_count − plan members included)
+	// × usage.ExtraMemberFeeMicros, from the counts in force at the boundary.
+	AdvanceMembersMicros int64
+
 	// WalletDrawnMicros is the portion of this boundary settled by the universal
 	// credit wallet before any collection/risk/payment-method gate. Credits-mode
 	// accounts debit the full boundary total (the wallet may go negative under
