@@ -382,7 +382,7 @@ func TestTransferApp_HonoursThePlanLedgerAndTheFreeCap(t *testing.T) {
 		require.True(t, errors.As(err, &be))
 		require.Equal(t, billing.CodeConflict, be.Code)
 		require.Contains(t, be.Message, "app_transfer_plan_change_pending")
-		require.Equal(t, f.oldAcct, f.rosterAccount(t), "not moved")
+		require.Equal(t, f.oldAcct.String(), f.rosterAccount(t), "not moved")
 	})
 
 	t.Run("scheduled downgrade is cancelled and reported", func(t *testing.T) {
@@ -401,7 +401,7 @@ func TestTransferApp_HonoursThePlanLedgerAndTheFreeCap(t *testing.T) {
 		var status string
 		require.NoError(t, f.pool.QueryRow(ctx, `SELECT status FROM ms_billing.app_plan_changes WHERE id = $1`, changeID).Scan(&status))
 		require.Equal(t, "cancelled", status)
-		require.Equal(t, f.newAcct, f.rosterAccount(t), "moved")
+		require.Equal(t, f.newAcct.String(), f.rosterAccount(t), "moved")
 	})
 
 	t.Run("free app needs a destination slot", func(t *testing.T) {
@@ -417,6 +417,6 @@ func TestTransferApp_HonoursThePlanLedgerAndTheFreeCap(t *testing.T) {
 		var be *billing.Error
 		require.True(t, errors.As(err, &be))
 		require.Equal(t, billing.CodePlanLimit, be.Code)
-		require.Equal(t, f.oldAcct, f.rosterAccount(t), "not moved")
+		require.Equal(t, f.oldAcct.String(), f.rosterAccount(t), "not moved")
 	})
 }
