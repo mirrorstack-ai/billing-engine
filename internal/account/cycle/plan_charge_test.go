@@ -27,11 +27,18 @@ var planBases = []struct {
 	{usage.PlanBusiness, 50_000_000},
 }
 
+// setPlan models an app CREATED on the plan: both the plan in force and the
+// created plan move, with no ledger row — exactly the state RegisterApp
+// leaves. (A change of plan after creation goes through SetAppPlan and writes
+// a ledger row; the creation charge chains from created_plan through those.)
 func setPlan(t *testing.T, store *fakeStore, appID uuid.UUID, plan usage.Plan) {
 	t.Helper()
 	moved, err := store.SetAppPlan(context.Background(), appID, plan)
 	require.NoError(t, err)
 	require.True(t, moved, "app %s is not a live mirrored app", appID)
+	app := store.apps[appID]
+	app.CreatedPlan = plan
+	store.apps[appID] = app
 }
 
 // seedPlannedApps seeds one live app per plan and returns each app's plan base.

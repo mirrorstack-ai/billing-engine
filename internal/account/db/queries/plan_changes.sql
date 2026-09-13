@@ -54,15 +54,54 @@ WHERE status = 'pending'
   AND requested_at <= @requested_before::timestamptz
 ORDER BY requested_at, id;
 
--- FoldedPlanChangesForApp lists the app's upgrades that were folded into its
--- creation charge, in effect order — the segments the creation charge prices
--- by day (usage.SegmentedProratedBaseMicros).
--- name: FoldedPlanChangesForApp :many
+-- EffectivePlanChangesForApp lists every change that has TAKEN EFFECT on the
+-- app — settled upgrades (folded or charged) and applied downgrades — in
+-- effect order: the segments the creation charge prices by day
+-- (usage.SegmentedProratedBaseMicros), chained from apps.created_plan.
+-- Pending upgrades are in force too (the plan flipped with the row) and are
+-- included; scheduled and cancelled downgrades never moved the plan and are
+-- not.
+-- name: EffectivePlanChangesForApp :many
 SELECT *
 FROM ms_billing.app_plan_changes
 WHERE app_id = $1
-  AND folded_into_creation
+  AND status IN ('pending', 'settled', 'applied')
 ORDER BY effective_at, id;
+
+-- DuePlanChangesAll is the driver's global apply list: every scheduled
+-- downgrade whose boundary has arrived, on any account, under a row lock.
+-- name: DuePlanChangesAll :many
+SELECT *
+FROM ms_billing.app_plan_changes
+WHERE status = 'scheduled'
+  AND effective_at <= @due_at::timestamptz
+ORDER BY effective_at, id
+FOR UPDATE;
+
+-- CancelPlanChangeByID withdraws one scheduled downgrade by id — the apply's
+-- refusal when the destination plan's cap is full at the boundary.
+-- name: CancelPlanChangeByID :execrows
+UPDATE ms_billing.app_plan_changes
+SET status     = 'cancelled',
+    settled_at = @cancelled_at::timestamptz
+WHERE id = @id::uuid
+  AND status = 'scheduled';
+
+-- SetPlanChangeCardWindow stores the card intent's window anchor and returns
+-- the surviving value, so every retry seals the same digest — unless the
+-- stored anchor's window has already CLOSED (stored < @reanchor_before, the
+-- seal instant minus the execution window): an anchor a failed seal left
+-- behind, or one whose sealed document is dead anyway, is replaced rather
+-- than reused to seal a document that could never be collected.
+-- name: SetPlanChangeCardWindow :one
+UPDATE ms_billing.app_plan_changes
+SET card_window_start = CASE
+    WHEN card_window_start IS NULL OR card_window_start < @reanchor_before::timestamptz
+    THEN @window_start::timestamptz
+    ELSE card_window_start
+END
+WHERE id = @id::uuid
+RETURNING card_window_start;
 
 -- DecidePlanChangeWallet records the wallet decision ONCE: what the wallet
 -- drew (0 when it held nothing, or the account is not in credits mode) and

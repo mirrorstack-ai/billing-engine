@@ -384,19 +384,49 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		}
 	}
 
-	// The app's plan history over its creation window (migration 076): an
-	// upgrade folded into this charge prices the days from its effect instant
-	// at the new base. Read AFTER the app row so a fold that commits between
-	// the two reads shows up as a chain the row does not end on — refused
-	// here, re-derived by the next sweep — never as a window priced at a base
-	// nobody was on.
-	folded, err := s.store.FoldedPlanChanges(ctx, appID)
+	// The app's plan history over its creation window (migrations 076/077):
+	// from the plan it was created on, each change that has taken effect
+	// prices the days from its effect instant at the new base. Read AFTER the
+	// app row so a change that commits between the two reads shows up as a
+	// chain the row does not end on — refused here, re-derived by the next
+	// sweep — never as a window priced at a base nobody was on.
+	effective, err := s.store.EffectivePlanChanges(ctx, appID)
 	if err != nil {
-		return nil, billing.Internal("folded plan changes lookup failed", err)
+		return nil, billing.Internal("plan changes lookup failed", err)
 	}
-	segments, err := creationBaseSegments(app, folded)
+	segments, err := creationBaseSegments(app, effective)
 	if err != nil {
 		return nil, billing.Internal("creation plan history is inconsistent; retried next sweep", err)
+	}
+
+	// 🔴 A WINDOW THAT CAN NEVER BILL IS TERMINAL BEFORE ANY GATE. A Free
+	// app's base is $0; if none of its co-created modules is over the pool
+	// either, nothing here will ever seal — and the gates below (prepaid,
+	// no-PM) would otherwise skip it TRANSIENTLY, forever, on an account with
+	// no card. Judge it now, from the same shape the callback derives, and
+	// arm the permanent skip. Only for a fresh attempt: an attempted app's
+	// frozen header owns its timer set and resolves through the callback.
+	if !app.ProrationAttempted {
+		preview, perr := combinedProrationChargeShape(app, activatedAt, segments)
+		if perr != nil {
+			return nil, perr
+		}
+		if preview.BaseChargeCents == 0 {
+			nothing := preview.ModuleChargeCents == 0
+			if !nothing {
+				timers, terr := s.store.CoCreatedOverModuleTimers(ctx, app.AccountID, appID, app.CreatedAt, usage.IncludedModules)
+				if terr != nil {
+					return nil, billing.Internal("co-created over-module timers lookup failed", terr)
+				}
+				nothing = len(timers) == 0
+			}
+			if nothing {
+				if err := s.store.SetAppProrationSkipped(ctx, appID); err != nil {
+					return nil, billing.Internal("mark creation window nothing-to-bill failed", err)
+				}
+				return &ProrationResult{AppID: appID, Status: ProrationStatusNoCharge}, nil
+			}
+		}
 	}
 
 	// CREDITS-MODE CREATION SETTLEMENT (billing-engine #99). A credits-mode account
@@ -818,30 +848,30 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 }
 
 // creationBaseSegments is the plan history of an app's creation window: its
-// base from created_at, then each upgrade folded into the creation charge
-// (migration 076) from its effect instant. One segment for an app that never
+// base from created_at on the plan it was CREATED on (apps.created_plan,
+// migration 077 — never apps.plan, which a boundary-applied downgrade can
+// move before a late sweep reaches the app), then every change that has
+// taken effect since (migration 076: folded and charged upgrades, applied
+// downgrades) from its effect instant. One segment for an app that never
 // changed plan, so the price is ProratedBaseMicros exactly as before.
 //
-// 🔴 THE LAST SEGMENT MUST BE THE PLAN THE ROW CARRIES. A fold flips apps.plan
-// in the same transaction that writes its row, so a mismatch means the row
-// moved between the two reads — the caller refuses and the next sweep
-// re-derives, rather than pricing days at a base nobody is on.
-func creationBaseSegments(app AppMirror, folded []PlanChange) ([]usage.BaseSegment, error) {
-	first := effectivePlan(app)
-	if len(folded) > 0 {
-		first = folded[0].FromPlan
-	}
+// 🔴 THE CHAIN MUST END ON THE PLAN THE ROW CARRIES. Every effective change
+// flips apps.plan in the same transaction that writes its row, so a mismatch
+// means the rows moved between the two reads — the caller refuses and the
+// next sweep re-derives, rather than pricing days at a base nobody is on.
+func creationBaseSegments(app AppMirror, effective []PlanChange) ([]usage.BaseSegment, error) {
+	first := createdPlan(app)
 	segments := []usage.BaseSegment{{From: app.CreatedAt.UTC(), BaseMicros: usage.TermsFor(first).BaseFeeMicros}}
 	last := first
-	for _, c := range folded {
+	for _, c := range effective {
 		if c.FromPlan != last {
-			return nil, fmt.Errorf("folded plan changes of app %s do not chain: %s → %s after %s", app.AppID, c.FromPlan, c.ToPlan, last)
+			return nil, fmt.Errorf("plan changes of app %s do not chain: %s → %s after %s", app.AppID, c.FromPlan, c.ToPlan, last)
 		}
 		segments = append(segments, usage.BaseSegment{From: c.EffectiveAt.UTC(), BaseMicros: usage.TermsFor(c.ToPlan).BaseFeeMicros})
 		last = c.ToPlan
 	}
 	if last != effectivePlan(app) {
-		return nil, fmt.Errorf("app %s is on plan %s but its folded changes end on %s", app.AppID, effectivePlan(app), last)
+		return nil, fmt.Errorf("app %s is on plan %s but its plan changes end on %s", app.AppID, effectivePlan(app), last)
 	}
 	return segments, nil
 }
@@ -1224,13 +1254,12 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 
 	amountMicros := prorated
 	if amountMicros <= 0 {
-		// A Free app's $0 plan base — nothing to draw. TERMINAL (migration
-		// 076): the skip marker is armed so the sweep stops re-selecting the
-		// app and Leg 1 charges its co-created timers on their own, which is
-		// this rail's split anyway (the wallet draws the base only).
-		if err := s.store.SetAppProrationSkipped(ctx, app.AppID); err != nil {
-			return nil, false, billing.Internal("mark creation window nothing-to-bill failed", err)
-		}
+		// A Free app's $0 plan base — nothing to draw on this rail. The
+		// TERMINAL for a window that can never bill is armed by
+		// ChargeCreationProration's pre-gate guard before either rail runs
+		// (a $0 base with no co-created over-module timer), so this branch is
+		// reached only when Leg 1 still has timers to charge on its own —
+		// which is this rail's split anyway (the wallet draws the base only).
 		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, false, nil
 	}
 

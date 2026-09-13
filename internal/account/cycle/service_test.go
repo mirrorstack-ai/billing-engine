@@ -43,6 +43,18 @@ type fakeStore struct {
 	errPlanChangeDraw  error
 	errSettlePlanCard  error
 	errApplyPlanChange error
+	// memberHistory is the migration-077 app_member_counts table.
+	memberHistory map[uuid.UUID][]fakeMemberCount
+	// walletNegativeAdjust models settled negative adjustments that lower the
+	// posted balance below Σ lot remainders (the balance cap a plan-change
+	// draw honours).
+	walletNegativeAdjust int64
+	// beforePlanChangeOpen runs once, inside OpenPlanChange before the locked
+	// read — a test's window for a state change the caller's unlocked read
+	// could not see. beforeCombinedFreeze does the same inside
+	// FreezeCombinedProrationAttempt.
+	beforePlanChangeOpen func(f *fakeStore, appID uuid.UUID)
+	beforeCombinedFreeze func(f *fakeStore, appID uuid.UUID)
 	// rollup inputs
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
@@ -386,6 +398,7 @@ func newFakeStore() *fakeStore {
 		apps:                      map[uuid.UUID]cycle.AppMirror{},
 		planChanges:               map[uuid.UUID]cycle.PlanChange{},
 		planChangeDraws:           map[uuid.UUID]int64{},
+		memberHistory:             map[uuid.UUID][]fakeMemberCount{},
 		combinedProrationAttempts: map[uuid.UUID]cycle.CombinedProrationAttempt{},
 		accountsByUser:            map[uuid.UUID]uuid.UUID{},
 		activation:                map[uuid.UUID]time.Time{},
@@ -1001,9 +1014,11 @@ func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID, ownerOr
 		CreatedAt:          createdAt,
 		Name:               name, // frozen on first registration (migration 037)
 		Plan:               plan,
+		CreatedPlan:        plan, // frozen at insert (migration 077)
 		OwnerOrgID:         ownerOrgID,
 		MemberCount:        memberCount, // migration 077
 	}
+	f.memberHistory[appID] = append(f.memberHistory[appID], fakeMemberCount{count: memberCount, at: createdAt.UTC()})
 	if ownerOrgID != uuid.Nil {
 		f.appOwnerOrg[appID] = ownerOrgID // owner_org_id stamp (migration 041); Nil = user-owned (NULL)
 	}
@@ -1919,6 +1934,11 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 ) (cycle.CombinedProrationAttempt, cycle.StripeRailClaimOutcome, error) {
 	if f.errFreezeCombined != nil {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, f.errFreezeCombined
+	}
+	if f.beforeCombinedFreeze != nil {
+		hook := f.beforeCombinedFreeze
+		f.beforeCombinedFreeze = nil
+		hook(f, appID)
 	}
 	if attempt, ok := f.combinedProrationAttempts[appID]; ok {
 		if attempt.ChargeFundingAccountID == uuid.Nil {

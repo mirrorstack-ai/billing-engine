@@ -283,16 +283,23 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// Each live app contributes ONLY its plan's flat base. Module overage is billed
 	// SEPARATELY below (the advance-overage / Leg 2 precharge), not folded into an
 	// app's base — it rides per-module-instance grace timers (migration 033).
+	// ADVANCE MEMBERS leg (migration 077, owner 2026-09-13): every member past
+	// the plan's included count is one $2 fee, billed on the CLOSED period's
+	// HIGH-WATER MARK — the greater of the count in force when it opened and
+	// the highest count recorded inside it — never on a point-in-time count.
+	// Read-only and deterministic across a reclaim; no boundary mutation.
+	memberHWM, err := s.store.MemberHighWater(ctx, accountID, periodStart, periodEnd)
+	if err != nil {
+		return nil, billing.Internal("member high-water read failed", err)
+	}
 	var advanceBase, advanceMembers int64
 	for _, a := range apps {
 		advanceBase += usage.TermsFor(a.Plan).BaseFeeMicros // each app's own plan base (core-v2#1412)
-		// ADVANCE MEMBERS leg (migration 077, owner 2026-09-13): every member
-		// past the plan's included count is one $2 fee for the NEW period,
-		// from the count in force at this boundary — the same read as the
-		// plan base, and the same per-unit shape as domains, without an
-		// activation-period proration: a member is counted from the first
-		// boundary after they were added.
-		advanceMembers += usage.ExtraMembersMicros(a.Plan, a.MemberCount)
+		hwm, known := memberHWM[a.AppID]
+		if !known {
+			hwm = a.MemberCount
+		}
+		advanceMembers += usage.ExtraMembersMicros(a.Plan, hwm)
 	}
 
 	// ADVANCE OVERAGE leg (scenario 6, Leg 2): the NEW period's $5-per-block

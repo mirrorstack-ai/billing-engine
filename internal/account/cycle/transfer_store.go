@@ -13,6 +13,7 @@ import (
 
 	billingaccount "github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	"github.com/mirrorstack-ai/billing-engine/internal/meteringlock"
 )
@@ -80,6 +81,15 @@ const (
 	// phase, and once the calendar month holding them closes nothing bills
 	// them to anyone. keep to the same target is fine: nothing moves.
 	TransferTargetUnfunded
+	// TransferPlanChangePending — an upgrade of this app is still being
+	// settled on the old account (migration 076, status pending). Its card
+	// remainder is sealed against the old payer; re-keying under it would
+	// leave a charge on one account for a plan another account holds.
+	// Refused until the reconciler settles it.
+	TransferPlanChangePending
+	// TransferPlanLimit — the app is on Free and the destination owner's Free
+	// cap (usage.PlanTerms.MaxAppsFor) is full, counted under the owner lock.
+	TransferPlanLimit
 )
 
 // TransferForfeitReason is WHY a transfer forfeited the old account's
@@ -377,6 +387,42 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 			}
 		}
 
+		// 🔴 THE PLAN LEDGER (migration 076). A PENDING upgrade is money being
+		// collected from the OLD payer for a plan the app holds — it does not
+		// travel, and it does not forfeit (the plan is in force; the charge is
+		// owed): refused until settled. A SCHEDULED downgrade is a free
+		// intention of the old owner: cancelled here, atomically with the
+		// re-key, and reported, so the new payer states its own. And a FREE
+		// app takes a slot of the destination owner's cap, counted under that
+		// owner's lock so a concurrent commitment cannot slip past.
+		var cancelledChange uuid.UUID
+		if open, oerr := qtx.OpenPlanChangeForApp(ctx, p.AppID.String()); oerr == nil {
+			switch PlanChangeStatus(open.Status) {
+			case PlanChangePending:
+				outcome = TransferPlanChangePending
+				return nil
+			case PlanChangeScheduled:
+				if _, cerr := qtx.CancelPlanChangeByID(ctx, db.CancelPlanChangeByIDParams{CancelledAt: p.At.UTC(), ID: open.ID}); cerr != nil {
+					return cerr
+				}
+				if id, perr := uuid.Parse(open.ID); perr == nil {
+					cancelledChange = id
+				}
+			}
+		} else if !errors.Is(oerr, pgx.ErrNoRows) {
+			return oerr
+		}
+		if usage.Plan(app.Plan) == usage.PlanFree {
+			full, cerr := capReached(ctx, qtx, p.ToAccount, p.OwnerOrgID, usage.PlanFree, p.AppID)
+			if cerr != nil {
+				return cerr
+			}
+			if full {
+				outcome = TransferPlanLimit
+				return nil
+			}
+		}
+
 		// 🔴 THE MONEY DECISION. Creation proration, custom-domain activation
 		// and per-module grace overage each charge whoever the row points at
 		// WHEN THE SWEEP RUNS, so none of them may travel with the re-key.
@@ -526,11 +572,12 @@ func (s *pgxStore) TransferApp(ctx context.Context, p TransferAppParams) (*Trans
 
 		outcome = TransferApplied
 		resp = &TransferAppResponse{
-			AccountID:           p.ToAccount,
-			MovedEventCount:     moved,
-			RepointedEventCount: repointed,
-			OpenPeriod:          window,
-			RecurringFrom:       from,
+			AccountID:             p.ToAccount,
+			MovedEventCount:       moved,
+			RepointedEventCount:   repointed,
+			OpenPeriod:            window,
+			RecurringFrom:         from,
+			CancelledPlanChangeID: cancelledChange,
 		}
 		return nil
 	})

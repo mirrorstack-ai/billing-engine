@@ -108,9 +108,12 @@ type PlanChange struct {
 	WalletDecided   bool
 	WalletDecidedAt time.Time
 	// CardRef is "intent:<digest>" once the card remainder is sealed.
-	CardRef   string
-	Status    PlanChangeStatus
-	SettledAt time.Time
+	CardRef string
+	// CardWindowStart is the card intent's execution-window anchor, stored at
+	// the first seal attempt; zero until then.
+	CardWindowStart time.Time
+	Status          PlanChangeStatus
+	SettledAt       time.Time
 }
 
 // IntentDigest is the sealed card intent's digest, or "" when no card leg was
@@ -123,9 +126,27 @@ func (c PlanChange) IntentDigest() string {
 	return ""
 }
 
+// PlanChangeShape is one priced shape of a change: when it takes effect, the
+// period it was priced against, and what it costs.
+type PlanChangeShape struct {
+	EffectiveAt  time.Time
+	PeriodStart  time.Time
+	PeriodEnd    time.Time
+	AmountMicros int64
+}
+
+// PlanChangeWalletParams is the wallet leg's input for a charged upgrade.
+type PlanChangeWalletParams struct {
+	// Credits: the account was classified credits-mode; the store draws the
+	// lots (and re-reads the mode under the lock).
+	Credits bool
+	// AllowRemainder: a usable card exists to take what the wallet does not
+	// hold. false + a short wallet = the whole open is rolled back.
+	AllowRemainder bool
+}
+
 // OpenPlanChangeParams is what the service derived for a new change. The
-// store opens it under the app row lock, in the same transaction that flips
-// apps.plan for an upgrade.
+// store decides the rest under the app row lock — see Store.OpenPlanChange.
 type OpenPlanChangeParams struct {
 	AppID       uuid.UUID
 	AccountID   uuid.UUID
@@ -133,16 +154,23 @@ type OpenPlanChangeParams struct {
 	ToPlan      usage.Plan
 	Kind        PlanChangeKind
 	RequestedAt time.Time
-	EffectiveAt time.Time
-	PeriodStart time.Time
-	PeriodEnd   time.Time
-	// Folded opens an in-grace upgrade: settled at 0 on insert.
-	Folded       bool
-	AmountMicros int64
-	// Status is the opening status: PlanChangePending for an upgrade with
-	// money to collect, PlanChangeSettled for one with none, PlanChangeScheduled
-	// for a downgrade.
-	Status PlanChangeStatus
+	// Downgrade is the scheduled shape (EffectiveAt = the boundary, amount 0).
+	Downgrade *PlanChangeShape
+	// Folded is the upgrade's shape when the creation window is still
+	// unbilled (amount 0, the creation period); Charged when it is billed
+	// (the prorated delta, the current period). The store picks from the
+	// locked markers.
+	Folded  *PlanChangeShape
+	Charged *PlanChangeShape
+	// Wallet is the wallet leg for a charged upgrade with money; nil = card
+	// only.
+	Wallet *PlanChangeWalletParams
+	// ChargeAllowed: the service's gates (H10 prepaid, a usable card or a
+	// covering wallet) passed for the CHARGED shape. When the store decides
+	// charged and this is false — the caller's unlocked read expected a fold
+	// — the open is rolled back as PlanChangeChargeRefused rather than
+	// leaving a flipped plan nobody can collect for.
+	ChargeAllowed bool
 }
 
 // OpenPlanChangeOutcome is the store's report from OpenPlanChange, decided
@@ -159,6 +187,16 @@ const (
 	// PlanChangeAppStale: the locked app row no longer matches the derivation
 	// (deleted, absent, or not on FromPlan any more). Nothing was written.
 	PlanChangeAppStale
+	// PlanChangeCapReached: the destination plan's per-owner cap is full
+	// (apps on it plus downgrades scheduled to it). Nothing was written.
+	PlanChangeCapReached
+	// PlanChangeOpenWalletShort: credits mode, the wallet cannot cover the
+	// amount and no card can take the remainder. The whole open was rolled
+	// back: no row, no flip, no draw.
+	PlanChangeOpenWalletShort
+	// PlanChangeChargeRefused: the store decided the upgrade must be charged
+	// but the caller's gates had not passed for that shape. Rolled back.
+	PlanChangeChargeRefused
 )
 
 // PlanChangeWalletOutcome is the store's report from DrawPlanChangeFromWallet.
@@ -243,6 +281,15 @@ func effectivePlan(app AppMirror) usage.Plan {
 	return app.Plan
 }
 
+// createdPlan is the plan an app was registered on (migration 077), or the
+// plan in force for a row the column has not reached.
+func createdPlan(app AppMirror) usage.Plan {
+	if app.CreatedPlan == "" {
+		return effectivePlan(app)
+	}
+	return app.CreatedPlan
+}
+
 // GetAppPlan reads an app's plan (core-v2#1412). An app the roster has not
 // mirrored yet (RegisterApp is fire-and-forget) reads as usage.DefaultPlan, the
 // plan migration 075 gives every row, with no pending change and no allowance
@@ -298,11 +345,13 @@ func (s *Service) planResponse(ctx context.Context, app AppMirror, change *PlanC
 //   - the requested plan is the current one: a scheduled downgrade is
 //     cancelled (owner: upgrading back before the boundary cancels it, no
 //     charge); otherwise a no-op that returns the terms;
-//   - `free` checks the Free rules (freeEligible);
+//   - `free` checks the card half of the Free rules (freeEligible); the cap
+//     half is the store's, under the owner lock;
 //   - a lower rank is a downgrade, scheduled for the period boundary;
 //   - a higher rank is an upgrade: folded into the creation charge while the
 //     app's creation period is still unbilled, otherwise charged its prorated
-//     difference at once (upgradeNow).
+//     difference at once (upgradeNow). Which of the two is decided by the
+//     store under the app lock, from the row's creation markers.
 func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPlanResponse, error) {
 	if req.AppID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
@@ -364,7 +413,7 @@ func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPl
 		return s.planResponse(ctx, app, nil)
 	}
 	if plan == usage.PlanFree {
-		if err := s.freeEligible(ctx, app.AccountID, app.OwnerOrgID, app.AppID); err != nil {
+		if err := s.freeEligible(ctx, app.AccountID); err != nil {
 			return nil, err
 		}
 	}
@@ -374,13 +423,15 @@ func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPl
 	return s.upgradeNow(ctx, app, current, plan, now, hasOpen)
 }
 
-// freeEligible is the Free gate: the payer keeps a usable non-fraud card on
-// its FUNDING account (the same predicate RegisterApp's create gate applies —
-// Free is cheaper to start, not card-less), and the owner is under the Free
-// cap — usage.PlanTerms.MaxApps for a personal account, MaxAppsPerOrg for an
-// org (owner 2026-09-13). exceptAppID is the app being asked about, so a
-// re-request for an app already on Free never counts itself.
-func (s *Service) freeEligible(ctx context.Context, accountID, ownerOrgID, exceptAppID uuid.UUID) error {
+// freeEligible is the card half of the Free gate: the payer keeps a usable
+// non-fraud card on its FUNDING account (the same predicate RegisterApp's
+// create gate applies — Free is cheaper to start, not card-less). The cap
+// half — usage.PlanTerms.MaxApps per personal account, MaxAppsPerOrg per org
+// (owner 2026-09-13), counting apps already Free AND downgrades scheduled to
+// Free — is the STORE's, taken under the owner lock inside the transaction
+// that commits the change (OpenPlanChange / InsertFreeAppMirror), so two
+// concurrent commitments cannot both take the last slot.
+func (s *Service) freeEligible(ctx context.Context, accountID uuid.UUID) error {
 	fundingID, err := s.store.ChargeFundingAccount(ctx, accountID)
 	if err != nil {
 		return billing.Internal("funding account lookup failed", err)
@@ -392,30 +443,23 @@ func (s *Service) freeEligible(ctx context.Context, accountID, ownerOrgID, excep
 	if cards < 1 {
 		return billing.PaymentRequired("no usable payment card on file: a Free app still needs a card on file")
 	}
-	terms := usage.TermsFor(usage.PlanFree)
-	orgOwned := ownerOrgID != uuid.Nil
-	limit := terms.MaxAppsFor(orgOwned)
-	if limit == usage.Unlimited {
-		return nil
-	}
-	n, err := s.store.CountLiveAppsOnPlan(ctx, accountID, ownerOrgID, usage.PlanFree, exceptAppID)
-	if err != nil {
-		return billing.Internal("live apps on plan count failed", err)
-	}
-	if n >= limit {
-		scope := "personal account"
-		if orgOwned {
-			scope = "organization"
-		}
-		return billing.PlanLimit(fmt.Sprintf("plan free allows at most %d app(s) per %s", limit, scope))
-	}
 	return nil
+}
+
+// planLimitError is the cap refusal, worded per owner kind.
+func planLimitError(plan usage.Plan, orgOwned bool) error {
+	terms := usage.TermsFor(plan)
+	scope := "personal account"
+	if orgOwned {
+		scope = "organization"
+	}
+	return billing.PlanLimit(fmt.Sprintf("plan %s allows at most %d app(s) per %s", plan, terms.MaxAppsFor(orgOwned), scope))
 }
 
 // scheduleDowngrade opens a downgrade for the boundary of the account's
 // current anchored period. Nothing is charged and the plan stays where it is
-// until ApplyDuePlanChanges moves it at that boundary. Idempotent: a repeat of
-// the same request returns the scheduled row.
+// until the apply moves it at that boundary. Idempotent: a repeat of the same
+// request returns the scheduled row.
 func (s *Service) scheduleDowngrade(
 	ctx context.Context, app AppMirror, from, to usage.Plan, now time.Time, open PlanChange, hasOpen bool,
 ) (*AppPlanResponse, error) {
@@ -436,28 +480,34 @@ func (s *Service) scheduleDowngrade(
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(now, billingperiod.AnchorDay(activatedAt))
 	change, outcome, err := s.store.OpenPlanChange(ctx, OpenPlanChangeParams{
 		AppID: app.AppID, AccountID: app.AccountID, FromPlan: from, ToPlan: to,
-		Kind: PlanChangeDowngrade, RequestedAt: now, EffectiveAt: periodEnd,
-		PeriodStart: periodStart, PeriodEnd: periodEnd, Status: PlanChangeScheduled,
+		Kind: PlanChangeDowngrade, RequestedAt: now,
+		Downgrade: &PlanChangeShape{EffectiveAt: periodEnd, PeriodStart: periodStart, PeriodEnd: periodEnd},
 	})
 	if err != nil {
 		return nil, billing.Internal("open plan change failed", err)
 	}
-	if outcome == PlanChangeAppStale {
+	switch outcome {
+	case PlanChangeAppStale:
 		return nil, billing.Conflict("the app changed while the plan change was being opened; retry")
+	case PlanChangeCapReached:
+		return nil, planLimitError(to, app.OwnerOrgID != uuid.Nil)
 	}
 	return s.planResponse(ctx, app, &change)
 }
 
-// upgradeNow moves the app up the ladder at once and charges the prorated
-// difference — or, while the creation period is still unbilled, records the
-// change for the creation charge to price by day and charges nothing here.
+// upgradeNow moves the app up the ladder at once. Both shapes are derived
+// here — folded (the creation window is still unbilled: charge nothing, let
+// the creation charge price the days) and charged (the prorated difference,
+// collected now) — and the STORE picks one under the app lock from the row's
+// creation markers, never from this function's unlocked read of them.
 //
-// Every gate runs BEFORE the row is opened and the plan flipped: the refusal
-// the owner allowed ("no usable card either") must leave no trace, and a plan
-// that flipped without the money being collectable would be exactly the
-// partial state the ledger exists to prevent. Once the row is open the money
-// steps are resumable (settlePlanChange), so a crash after this point is a
-// pending row, never a lost charge.
+// Every gate runs BEFORE the open, and the store refuses a charged decision
+// the gates did not pass (ChargeAllowed): the refusal the owner allowed ("no
+// usable card either") must leave no trace, and a plan that flipped without
+// the money being collectable would be exactly the partial state the ledger
+// exists to prevent. Once the row is open the money steps are resumable
+// (settlePlanChange), so a crash after this point is a pending row, never a
+// lost charge.
 func (s *Service) upgradeNow(
 	ctx context.Context, app AppMirror, from, to usage.Plan, now time.Time, hasOpen bool,
 ) (*AppPlanResponse, error) {
@@ -477,30 +527,7 @@ func (s *Service) upgradeNow(
 	}
 	anchorDay := billingperiod.AnchorDay(activatedAt)
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(now, anchorDay)
-
-	// 🔴 THE CREATION PERIOD IS STILL UNBILLED: fold. Not "inside the grace" —
-	// the sweep can run days after the grace elapsed, and until it has, the
-	// creation charge is the ONE charge that prices these days. The three
-	// markers are the same three ChargeCreationProration reads: an armed
-	// guard, a permanent skip, or an attempt already at the provider all mean
-	// the creation window is priced and this change owes its own delta.
-	if app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.ProrationAttempted {
-		creationStart, creationEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), anchorDay)
-		change, outcome, err := s.store.OpenPlanChange(ctx, OpenPlanChangeParams{
-			AppID: app.AppID, AccountID: app.AccountID, FromPlan: from, ToPlan: to,
-			Kind: PlanChangeUpgrade, RequestedAt: now, EffectiveAt: now,
-			PeriodStart: creationStart, PeriodEnd: creationEnd,
-			Folded: true, AmountMicros: 0, Status: PlanChangeSettled,
-		})
-		if err != nil {
-			return nil, billing.Internal("open plan change failed", err)
-		}
-		if outcome == PlanChangeAppStale {
-			return nil, billing.Conflict("the app changed while the plan change was being opened; retry")
-		}
-		app.Plan = to
-		return s.planResponse(ctx, app, &change)
-	}
+	creationStart, creationEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), anchorDay)
 
 	// The difference between the bases for the remaining days, the change day
 	// inclusive at the NEW plan (split by day, like the fold).
@@ -508,51 +535,56 @@ func (s *Service) upgradeNow(
 	if err != nil {
 		return nil, billing.Internal("upgrade delta derivation failed", err)
 	}
-	if amount == 0 {
-		change, outcome, err := s.store.OpenPlanChange(ctx, OpenPlanChangeParams{
-			AppID: app.AppID, AccountID: app.AccountID, FromPlan: from, ToPlan: to,
-			Kind: PlanChangeUpgrade, RequestedAt: now, EffectiveAt: now,
-			PeriodStart: periodStart, PeriodEnd: periodEnd, AmountMicros: 0, Status: PlanChangeSettled,
-		})
-		if err != nil {
-			return nil, billing.Internal("open plan change failed", err)
-		}
-		if outcome == PlanChangeAppStale {
-			return nil, billing.Conflict("the app changed while the plan change was being opened; retry")
-		}
-		app.Plan = to
-		return s.planResponse(ctx, app, &change)
-	}
+	folded := &PlanChangeShape{EffectiveAt: now, PeriodStart: creationStart, PeriodEnd: creationEnd}
+	charged := &PlanChangeShape{EffectiveAt: now, PeriodStart: periodStart, PeriodEnd: periodEnd, AmountMicros: amount}
 
-	// Gates, all before the write. H10: a prepaid account is never charged
-	// off-session by any leg, and an upgrade's charge is an off-session debit
-	// on a stored instrument however it was requested.
-	if permitted, err := s.offSessionChargePermitted(ctx, app.AccountID); err != nil {
-		return nil, err
-	} else if !permitted {
-		return nil, billing.PaymentRequired("account is in prepaid collection mode: an upgrade cannot be charged off-session")
-	}
-	walletState, walletAllowed, err := s.creditWalletChargeState(ctx, app.AccountID, periodStart, periodEnd)
-	if err != nil {
-		return nil, billing.Internal("wallet route classification failed", err)
-	}
-	credits := walletAllowed && walletState.Mode == CreditBillingModeCredits
-	_, cardOK, err := s.resolveChargeableCustomer(ctx, app.AccountID)
-	if err != nil {
-		return nil, err
-	}
-	if !cardOK && (!credits || walletState.SpendableBalanceMicros < amount) {
-		// Owner: draw what the wallet holds and charge the remainder to the
-		// card; refuse only with no usable card either. A standard account
-		// has no wallet leg here (its credit applies at the boundary spine,
-		// like the creation charge), so for it the card is the only rail.
-		return nil, billing.PaymentRequired("no usable payment card on file: an upgrade needs a card for the remainder")
+	// The unlocked HINT of which shape applies — only to pick the refusal
+	// message when the gates fail. The store decides for real.
+	expectFold := app.ProrationInvoiceID == "" && !app.ProrationSkipped && !app.ProrationAttempted
+
+	// Gates for the CHARGED shape, all before the write. H10: a prepaid
+	// account is never charged off-session by any leg, and an upgrade's charge
+	// is an off-session debit on a stored instrument however it was requested.
+	chargeAllowed := true
+	var wallet *PlanChangeWalletParams
+	var refusal error
+	if amount > 0 {
+		permitted, err := s.offSessionChargePermitted(ctx, app.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		walletState, walletAllowed, err := s.creditWalletChargeState(ctx, app.AccountID, periodStart, periodEnd)
+		if err != nil {
+			return nil, billing.Internal("wallet route classification failed", err)
+		}
+		credits := walletAllowed && walletState.Mode == CreditBillingModeCredits
+		_, cardOK, err := s.resolveChargeableCustomer(ctx, app.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		wallet = &PlanChangeWalletParams{Credits: credits, AllowRemainder: cardOK}
+		switch {
+		case !permitted:
+			chargeAllowed = false
+			refusal = billing.PaymentRequired("account is in prepaid collection mode: an upgrade cannot be charged off-session")
+		case !cardOK && !credits:
+			// Owner: draw what the wallet holds and charge the remainder to
+			// the card; refuse only with no usable card either. A standard
+			// account has no wallet leg here (its credit applies at the
+			// boundary spine, like the creation charge), so for it the card
+			// is the only rail.
+			chargeAllowed = false
+			refusal = billing.PaymentRequired("no usable payment card on file: an upgrade needs a card for the remainder")
+		}
+		if !chargeAllowed && !expectFold {
+			return nil, refusal
+		}
 	}
 
 	change, outcome, err := s.store.OpenPlanChange(ctx, OpenPlanChangeParams{
 		AppID: app.AppID, AccountID: app.AccountID, FromPlan: from, ToPlan: to,
-		Kind: PlanChangeUpgrade, RequestedAt: now, EffectiveAt: now,
-		PeriodStart: periodStart, PeriodEnd: periodEnd, AmountMicros: amount, Status: PlanChangePending,
+		Kind: PlanChangeUpgrade, RequestedAt: now,
+		Folded: folded, Charged: charged, Wallet: wallet, ChargeAllowed: chargeAllowed,
 	})
 	if err != nil {
 		return nil, billing.Internal("open plan change failed", err)
@@ -560,12 +592,24 @@ func (s *Service) upgradeNow(
 	switch outcome {
 	case PlanChangeAppStale:
 		return nil, billing.Conflict("the app changed while the plan change was being opened; retry")
+	case PlanChangeCapReached:
+		return nil, planLimitError(to, app.OwnerOrgID != uuid.Nil)
+	case PlanChangeOpenWalletShort:
+		return nil, billing.PaymentRequired("no usable payment card on file and the credit wallet does not cover the upgrade")
+	case PlanChangeChargeRefused:
+		if refusal == nil {
+			refusal = billing.PaymentRequired("the upgrade must be charged now and no rail can collect it")
+		}
+		return nil, refusal
 	case PlanChangeExisting:
 		if change.Status != PlanChangePending || change.ToPlan != to {
 			return nil, billing.Conflict(fmt.Sprintf("a change to plan %s is already open", change.ToPlan))
 		}
 	}
 	app.Plan = to
+	if change.Status == PlanChangeSettled {
+		return s.planResponse(ctx, app, &change)
+	}
 	settled, err := s.settlePlanChange(ctx, change)
 	if err != nil {
 		return nil, err
@@ -573,22 +617,28 @@ func (s *Service) upgradeNow(
 	return s.planResponse(ctx, app, &settled)
 }
 
-// settlePlanChange runs an upgrade's money steps to completion, from whatever
-// state the row is in. Each step is idempotent against the row:
+// settlePlanChange runs a pending upgrade's remaining money steps, from
+// whatever state the row is in. Each step is idempotent against the row:
 //
-//  1. the WALLET DECISION, once (wallet_decided_at): in credits mode the
-//     wallet is drawn for what it holds; otherwise 0 is recorded. A row that
-//     the wallet fully covers settles here;
-//  2. the CARD REMAINDER, sealed as one intent whose lines total the gross
+//  1. the H10 gate, on EVERY resume: a prepaid account is never charged
+//     off-session, so a row resumed after the account tightened stays
+//     pending (reported as PaymentRequired; the reconciler counts it skipped)
+//     until the account relaxes;
+//  2. the WALLET DECISION, if the row was written without one (a row that
+//     predates the decision moving into the open): the same lots-only draw,
+//     once;
+//  3. the CARD REMAINDER, sealed as one intent whose lines total the gross
 //     and whose wallet allocation is the draw — so the provider is handed
-//     exactly the whole-cent remainder. The digest is a function of the row
-//     (amount, instant, id), so a re-proposal after a crash is the same
-//     document, and the row settles with its reference.
+//     exactly the whole-cent remainder. The execution window opens at the
+//     anchor STORED on the row at the first seal attempt (the request instant,
+//     or the first seal instant if the window since closed) and the line's
+//     label carries the app id only, so a retry after a crash — or after a
+//     rename — seals the same digest, and the row settles with its reference.
 //
-// A row left pending — the card vanished between the gate and the seal, or
-// the proposal failed — is finished by SweepPendingPlanChanges. It is never
-// reversed: the wallet draw was money the customer owed for a plan they are
-// on, and the plan is in force.
+// A row left pending — the card vanished between the gate and the seal, the
+// account went prepaid, or the proposal failed — is finished by
+// SweepPendingPlanChanges. It is never reversed: the wallet draw was money
+// the customer owed for a plan they are on, and the plan is in force.
 func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (PlanChange, error) {
 	if change.Status == PlanChangeSettled {
 		return change, nil
@@ -597,6 +647,11 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 		return change, billing.Internal(fmt.Sprintf("plan change %s is %s %s and cannot be settled", change.ID, change.Kind, change.Status), nil)
 	}
 	now := s.nowFn().UTC()
+	if permitted, err := s.offSessionChargePermitted(ctx, change.AccountID); err != nil {
+		return change, err
+	} else if !permitted {
+		return change, billing.PaymentRequired("account is in prepaid collection mode: the upgrade's charge waits until it relaxes")
+	}
 	_, cardOK, err := s.resolveChargeableCustomer(ctx, change.AccountID)
 	if err != nil {
 		return change, err
@@ -612,8 +667,6 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 		}
 		switch outcome {
 		case PlanChangeWalletShort:
-			// Nothing drawn, nothing decided: the row stays pending for the
-			// reconciler, and the caller is told why.
 			return change, billing.PaymentRequired("no usable payment card on file and the credit wallet does not cover the upgrade")
 		case PlanChangeWalletDecided:
 			if drawn > 0 {
@@ -631,6 +684,10 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 		if change.Status == PlanChangeSettled {
 			return change, nil
 		}
+	} else if change.WalletMicros > 0 && change.CardRef == "" && change.CardWindowStart.IsZero() {
+		// The open drew the wallet in its own transaction; the standing push
+		// happens here, once, on the first pass after it.
+		s.observeWalletMutation(ctx, change.AccountID)
 	}
 
 	remainder := change.AmountMicros - change.WalletMicros
@@ -651,11 +708,20 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 				"a plan upgrade has no intent proposer installed and this leg holds no charge path of its own; "+
 					"this deployment cannot bill an upgrade", nil)
 		}
-		app, _, err := s.store.AppMirror(ctx, change.AppID)
-		if err != nil {
-			return change, billing.Internal("app mirror lookup failed", err)
+		// The window anchor: the request instant, unless the window that
+		// would open there has already closed — then this seal instant.
+		// Stored, so a retry seals the same digest; re-anchored only when
+		// the stored window itself has closed (a failed seal's leftover, or a
+		// document that is dead anyway), never to seal what cannot collect.
+		anchor := change.RequestedAt
+		if !now.Before(change.RequestedAt.Add(executionWindow)) {
+			anchor = now
 		}
-		sealed, err := s.proposer.Propose(ctx, planChangeCharge(change, sealMicros, appLineLabel(app.Name, change.AppID)))
+		windowStart, err := s.store.EnsurePlanChangeCardWindow(ctx, change.ID, anchor, now.Add(-executionWindow))
+		if err != nil {
+			return change, billing.Internal("plan change card window anchor failed", err)
+		}
+		sealed, err := s.proposer.Propose(ctx, planChangeCharge(change, sealMicros, windowStart))
 		if err != nil {
 			return change, billing.Internal("propose plan change intent failed", err)
 		}
@@ -698,15 +764,17 @@ func upgradeDeltaMicros(from, to usage.Plan, at, periodStart, periodEnd time.Tim
 // less than they owed; sealing the raw derived micros would attest to a figure
 // the card was never charged.
 //
-// The execution window opens at the REQUEST instant, from the row, so a
-// re-proposal after a crash seals the same digest: the window is part of it.
-func planChangeCharge(change PlanChange, sealMicros int64, label string) proposer.Charge {
+// 🔴 RENAME-STABLE, RETRY-STABLE. The line names the app by id only — a
+// display name inside the digest made a rename between a crashed seal and its
+// retry a second document for one charge — and the execution window opens at
+// the anchor stored on the row, not at "now".
+func planChangeCharge(change PlanChange, sealMicros int64, windowStart time.Time) proposer.Charge {
 	return proposer.Charge{
 		AccountID: change.AccountID.String(),
 		Kind:      intent.KindPlatformBase,
 		Currency:  chargeCurrency,
 		Lines: proposer.SingleLine(
-			fmt.Sprintf("MirrorStack plan upgrade %s → %s (prorated) — %s", change.FromPlan, change.ToPlan, label),
+			fmt.Sprintf("MirrorStack plan upgrade %s → %s (prorated) — app %s", change.FromPlan, change.ToPlan, change.AppID),
 			planChangeRef(change.ID),
 			change.WalletMicros+sealMicros,
 		),
@@ -727,8 +795,8 @@ func planChangeCharge(change PlanChange, sealMicros int64, label string) propose
 			RuleRevision: proposedTaxRuleRevision,
 			Verification: intent.TaxNotApplicable,
 		},
-		ExecuteNotBefore: change.RequestedAt,
-		ExecuteNotAfter:  change.RequestedAt.Add(executionWindow),
+		ExecuteNotBefore: windowStart,
+		ExecuteNotAfter:  windowStart.Add(executionWindow),
 	}
 }
 
@@ -739,16 +807,16 @@ func planChangeRef(id uuid.UUID) string { return "plan-change:" + id.String() }
 type SweepPlanChangesResult struct {
 	Pending int // upgrades whose money steps had not all committed
 	Settled int // finished this sweep
-	Skipped int // still pending (no usable card yet); retried next sweep
+	Skipped int // still pending (no usable card yet, or prepaid); retried next sweep
 	Failed  int // per-change errors; retried next sweep
 }
 
 // SweepPendingPlanChanges is the reconciler: it finishes every upgrade whose
-// money steps did not all commit — a crash between the wallet draw and the
-// card seal, a card that vanished between the gate and the seal, a proposer
-// outage. Driven by cmd/billing-cycle after the other sweeps. Idempotent: a
-// settled row drops out of the work list, and a row that still cannot be
-// finished is counted and left for the next sweep.
+// money steps did not all commit — a crash between the open and the card
+// seal, a card that vanished between the gate and the seal, a proposer
+// outage, an account that went prepaid. Driven by cmd/billing-cycle after
+// the other sweeps. Idempotent: a settled row drops out of the work list, and
+// a row that still cannot be finished is counted and left for the next sweep.
 func (s *Service) SweepPendingPlanChanges(ctx context.Context, at time.Time) (*SweepPlanChangesResult, error) {
 	if at.IsZero() {
 		return nil, billing.InvalidInput("sweep instant required")
@@ -779,6 +847,23 @@ func (s *Service) SweepPendingPlanChanges(ctx context.Context, at time.Time) (*S
 			"wallet_micros", settled.WalletMicros, "card_micros", settled.CardMicros, "card_ref", settled.CardRef)
 	}
 	return res, nil
+}
+
+// ApplyDuePlanChanges moves every scheduled downgrade whose boundary has
+// arrived, on every account, onto its plan — the driver's global apply, run
+// before the charge phase so the boundary reads the plan in force, and
+// reaching the accounts the charge phase never does (an account whose only
+// apps are in their creation grace has no boundary run). RunBillingCycle
+// applies its own account's again as the belt.
+func (s *Service) ApplyDuePlanChanges(ctx context.Context, at time.Time) (applied, cancelled int, err error) {
+	if at.IsZero() {
+		return 0, 0, billing.InvalidInput("apply instant required")
+	}
+	applied, cancelled, err = s.store.ApplyAllDuePlanChanges(ctx, at.UTC())
+	if err != nil {
+		return 0, 0, billing.Internal("apply due plan changes failed", err)
+	}
+	return applied, cancelled, nil
 }
 
 func isPaymentRequired(err error) bool {

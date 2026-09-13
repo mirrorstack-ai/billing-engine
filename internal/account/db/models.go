@@ -374,8 +374,10 @@ type MsBillingApp struct {
 	Name       pgtype.Text `json:"name"`
 	OwnerOrgID pgtype.UUID `json:"owner_org_id"`
 	Plan       string      `json:"plan"`
-	// Live app-member count (migration 077), synced by api-platform on every member change. The boundary leg bills max(0, member_count − plan members included) × $2.00 for the new period; a deleted app's count is frozen like its module_count.
+	// Live app-member count (migration 077), synced by api-platform on every member change. The boundary leg bills the period's HIGH-WATER MARK (app_member_counts) minus the plan's included count, × $2.00; a deleted app's count is frozen like its module_count.
 	MemberCount int32 `json:"member_count"`
+	// The plan the app was registered on (migration 077), immutable. The creation charge prices its window from this plan through app_plan_changes; apps.plan is the plan in force NOW.
+	CreatedPlan string `json:"created_plan"`
 }
 
 type MsBillingAppBaseSnapshot struct {
@@ -441,6 +443,14 @@ type MsBillingAppCustomDomain struct {
 	ChargeForfeitedBy pgtype.UUID `json:"charge_forfeited_by"`
 }
 
+// Member-count history (migration 077): one row per change, written by RegisterApp and SyncAppModules. The boundary bills the period's high-water mark from it.
+type MsBillingAppMemberCount struct {
+	ID         string    `json:"id"`
+	AppID      string    `json:"app_id"`
+	Count      int32     `json:"count"`
+	RecordedAt time.Time `json:"recorded_at"`
+}
+
 type MsBillingAppModuleOverageTimer struct {
 	ID                 string             `json:"id"`
 	AccountID          string             `json:"account_id"`
@@ -480,6 +490,7 @@ type MsBillingAppPlanChange struct {
 	CardMicros         int64              `json:"card_micros"`
 	WalletDecidedAt    pgtype.Timestamptz `json:"wallet_decided_at"`
 	CardRef            pgtype.Text        `json:"card_ref"`
+	CardWindowStart    pgtype.Timestamptz `json:"card_window_start"`
 	Status             string             `json:"status"`
 	SettledAt          pgtype.Timestamptz `json:"settled_at"`
 	CreatedAt          time.Time          `json:"created_at"`

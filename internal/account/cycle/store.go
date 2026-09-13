@@ -509,21 +509,33 @@ type Store interface {
 	// a row moved: false = deleted or never registered.
 	SetAppPlan(ctx context.Context, appID uuid.UUID, plan usage.Plan) (bool, error)
 
-	// SetAppMemberCount snapshots a new app-member count (migration 077); a
-	// deleted app's count is frozen, like its module count.
-	SetAppMemberCount(ctx context.Context, appID uuid.UUID, memberCount int) error
+	// SetAppMemberCount writes a new app-member count and its history row
+	// (migration 077) at `at`; a deleted app's count is frozen, like its
+	// module count, and gets no history row.
+	SetAppMemberCount(ctx context.Context, appID uuid.UUID, memberCount int, at time.Time) error
 
-	// CountLiveAppsOnPlan counts the owner's live apps on a plan, excluding
-	// exceptAppID — the org's when ownerOrgID is set, else the personal
-	// account's user-owned rows. The Free cap is enforced against it.
-	CountLiveAppsOnPlan(ctx context.Context, accountID, ownerOrgID uuid.UUID, plan usage.Plan, exceptAppID uuid.UUID) (int, error)
+	// MemberHighWater returns, per live app on the account, the period's
+	// high-water member count: max(count in force at period start, max count
+	// recorded inside the period). The boundary's members input.
+	MemberHighWater(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (map[uuid.UUID]int, error)
+
+	// InsertFreeAppMirror registers a NEW app on Free under the owner's cap
+	// lock; capReached=true inserted nothing. An already-mirrored app is the
+	// idempotent no-op, never re-gated.
+	InsertFreeAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount, memberCount int, createdAt time.Time, name string) (capReached bool, err error)
 
 	// --- plan-change ledger (migration 076) --------------------------------
 
-	// OpenPlanChange inserts a change and, for an upgrade, flips apps.plan in
-	// the SAME transaction under the app row lock; the locked row is
-	// re-verified live and still on FromPlan (else PlanChangeAppStale), and an
-	// open change found under the lock is returned as PlanChangeExisting.
+	// OpenPlanChange is the one transaction that opens a change, under the
+	// app row lock: an open change found there is returned as
+	// PlanChangeExisting; a row not live / not on FromPlan is
+	// PlanChangeAppStale; the destination plan's per-owner cap (apps on it
+	// plus downgrades scheduled to it, under the owner lock) refuses with
+	// PlanChangeCapReached. For an upgrade the store DECIDES fold-vs-charge
+	// from the locked creation markers, inserts the row, flips apps.plan and
+	// takes the wallet decision (credits mode: a lots-only draw capped at the
+	// posted balance); a short wallet with no card remainder allowed rolls
+	// everything back as PlanChangeWalletShort.
 	OpenPlanChange(ctx context.Context, p OpenPlanChangeParams) (PlanChange, OpenPlanChangeOutcome, error)
 	// OpenPlanChangeForApp reads the app's one open change (pending or
 	// scheduled), if any.
@@ -533,9 +545,16 @@ type Store interface {
 	// PendingPlanChanges lists upgrades whose money steps did not all commit,
 	// requested at or before the instant — the reconciler's work list.
 	PendingPlanChanges(ctx context.Context, requestedBefore time.Time) ([]PlanChange, error)
-	// FoldedPlanChanges lists the app's in-grace upgrades in effect order —
-	// the segments the creation charge prices by day.
-	FoldedPlanChanges(ctx context.Context, appID uuid.UUID) ([]PlanChange, error)
+	// EffectivePlanChanges lists every change that has taken effect on the
+	// app (pending/settled upgrades, applied downgrades) in effect order —
+	// the segments the creation charge prices by day, chained from
+	// apps.created_plan.
+	EffectivePlanChanges(ctx context.Context, appID uuid.UUID) ([]PlanChange, error)
+	// EnsurePlanChangeCardWindow stores the card intent's window anchor and
+	// returns the surviving value, so every retry seals the same digest — a
+	// stored anchor older than reanchorBefore (its window has closed) is
+	// replaced instead of reused to seal a dead document.
+	EnsurePlanChangeCardWindow(ctx context.Context, id uuid.UUID, windowStart, reanchorBefore time.Time) (time.Time, error)
 	// DrawPlanChangeFromWallet takes the wallet decision for a pending upgrade
 	// ONCE: in credits mode it draws from the spendable lots up to the amount
 	// (never an unsecured remainder), otherwise it records 0. With
@@ -550,8 +569,11 @@ type Store interface {
 	// false when none was scheduled.
 	CancelScheduledPlanChange(ctx context.Context, appID uuid.UUID, at time.Time) (bool, error)
 	// ApplyDuePlanChanges moves every due scheduled downgrade of the account
-	// onto its plan and closes the rows; returns how many it applied.
+	// onto its plan and closes the rows (a row whose destination cap is full
+	// at the boundary is cancelled instead); returns how many it applied.
 	ApplyDuePlanChanges(ctx context.Context, accountID uuid.UUID, dueAt time.Time) (int, error)
+	// ApplyAllDuePlanChanges is the driver's global apply over every account.
+	ApplyAllDuePlanChanges(ctx context.Context, dueAt time.Time) (applied, cancelled int, err error)
 
 	// MarkAppDeleted soft-deletes the roster row out of future advance base
 	// fees. Idempotent — the first deletion instant is kept.
@@ -878,8 +900,12 @@ type AppMirror struct {
 	ModuleCount        int
 	CreatedModuleCount int
 	CreatedAt          time.Time
-	// Plan is the app's billing plan (migration 075).
+	// Plan is the app's billing plan (migration 075) — the plan in force NOW.
 	Plan usage.Plan
+	// CreatedPlan is the plan the app was registered on (migration 077),
+	// immutable: the creation charge prices its window from it through the
+	// plan-change ledger, never from Plan.
+	CreatedPlan usage.Plan
 	// OwnerOrgID is the org principal of an org-owned app (migration 041);
 	// uuid.Nil for a user-owned one. The Free cap is per org for the former
 	// and per personal account for the latter.
@@ -2178,20 +2204,17 @@ func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID, ownerO
 	// RowsAffected 0 = a retry hit ON CONFLICT DO NOTHING — success either way.
 	// accountID uuid.Nil → NULL: an UNBILLED org roster row awaiting funding
 	// designation (migration 041); ownerOrgID uuid.Nil → NULL for user-owned apps.
-	if plan == "" {
-		plan = usage.DefaultPlan
+	// The roster row and its first member-count history row commit together
+	// (plan_change_store.go insertAppMirror).
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
 	}
-	_, err := s.q.InsertAppMirror(ctx, db.InsertAppMirrorParams{
-		AppID:       appID.String(),
-		AccountID:   pgUUIDOrNull(accountID),
-		OwnerOrgID:  pgUUIDOrNull(ownerOrgID),
-		ModuleCount: int32(moduleCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
-		MemberCount: int32(memberCount), //nolint:gosec // RegisterApp validates 0 ≤ count ≤ maxModuleCount (100000), far below int32 max
-		CreatedAt:   createdAt,
-		Name:        pgtype.Text{String: name, Valid: name != ""}, // NULL when the caller omits a name (frontend falls back)
-		Plan:        string(plan),
-	})
-	return err
+	defer deferredRollback(ctx, tx)
+	if err := insertAppMirror(ctx, s.q.WithTx(tx), appID, accountID, ownerOrgID, moduleCount, memberCount, createdAt, name, plan); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *pgxStore) SetAppName(ctx context.Context, appID uuid.UUID, name string) error {
@@ -2225,6 +2248,7 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirror, b
 		CreatedModuleCount: int(row.CreatedModuleCount),
 		CreatedAt:          row.CreatedAt,
 		Plan:               usage.Plan(row.Plan),
+		CreatedPlan:        usage.Plan(row.CreatedPlan),
 		OwnerOrgID:         uuidFromPg(row.OwnerOrgID),
 		MemberCount:        int(row.MemberCount),
 		Name:               row.Name.String,               // "" when NULL (pre-037 / unnamed)

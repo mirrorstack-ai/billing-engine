@@ -385,7 +385,7 @@ func (q *Queries) InsertAppTransferEvent(ctx context.Context, arg InsertAppTrans
 }
 
 const lockAppForTransfer = `-- name: LockAppForTransfer :one
-SELECT app_id, account_id, owner_org_id
+SELECT app_id, account_id, owner_org_id, plan
 FROM ms_billing.apps
 WHERE app_id = $1
   AND deleted_at IS NULL
@@ -396,6 +396,7 @@ type LockAppForTransferRow struct {
 	AppID      string      `json:"app_id"`
 	AccountID  pgtype.UUID `json:"account_id"`
 	OwnerOrgID pgtype.UUID `json:"owner_org_id"`
+	Plan       string      `json:"plan"`
 }
 
 // LockAppForTransfer takes the app's roster row FOR UPDATE and returns its
@@ -409,10 +410,17 @@ type LockAppForTransferRow struct {
 // whatever the deletion left behind on it. No row ⇒ NOT_FOUND, the same answer
 // as an app this service never mirrored, because to the caller both are "no
 // billing here to move".
+// plan (migration 075) is read so a Free app's transfer can count against
+// the destination owner's cap under the same lock.
 func (q *Queries) LockAppForTransfer(ctx context.Context, appID string) (LockAppForTransferRow, error) {
 	row := q.db.QueryRow(ctx, lockAppForTransfer, appID)
 	var i LockAppForTransferRow
-	err := row.Scan(&i.AppID, &i.AccountID, &i.OwnerOrgID)
+	err := row.Scan(
+		&i.AppID,
+		&i.AccountID,
+		&i.OwnerOrgID,
+		&i.Plan,
+	)
 	return i, err
 }
 

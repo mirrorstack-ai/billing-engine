@@ -12,6 +12,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelPlanChangeByID = `-- name: CancelPlanChangeByID :execrows
+UPDATE ms_billing.app_plan_changes
+SET status     = 'cancelled',
+    settled_at = $1::timestamptz
+WHERE id = $2::uuid
+  AND status = 'scheduled'
+`
+
+type CancelPlanChangeByIDParams struct {
+	CancelledAt time.Time `json:"cancelled_at"`
+	ID          string    `json:"id"`
+}
+
+// CancelPlanChangeByID withdraws one scheduled downgrade by id — the apply's
+// refusal when the destination plan's cap is full at the boundary.
+func (q *Queries) CancelPlanChangeByID(ctx context.Context, arg CancelPlanChangeByIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelPlanChangeByID, arg.CancelledAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const cancelScheduledPlanChange = `-- name: CancelScheduledPlanChange :execrows
 UPDATE ms_billing.app_plan_changes
 SET status     = 'cancelled',
@@ -68,8 +91,60 @@ func (q *Queries) DecidePlanChangeWallet(ctx context.Context, arg DecidePlanChan
 	return result.RowsAffected(), nil
 }
 
+const duePlanChangesAll = `-- name: DuePlanChangesAll :many
+SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
+FROM ms_billing.app_plan_changes
+WHERE status = 'scheduled'
+  AND effective_at <= $1::timestamptz
+ORDER BY effective_at, id
+FOR UPDATE
+`
+
+// DuePlanChangesAll is the driver's global apply list: every scheduled
+// downgrade whose boundary has arrived, on any account, under a row lock.
+func (q *Queries) DuePlanChangesAll(ctx context.Context, dueAt time.Time) ([]MsBillingAppPlanChange, error) {
+	rows, err := q.db.Query(ctx, duePlanChangesAll, dueAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []MsBillingAppPlanChange{}
+	for rows.Next() {
+		var i MsBillingAppPlanChange
+		if err := rows.Scan(
+			&i.ID,
+			&i.AppID,
+			&i.AccountID,
+			&i.FromPlan,
+			&i.ToPlan,
+			&i.Kind,
+			&i.RequestedAt,
+			&i.EffectiveAt,
+			&i.PeriodStart,
+			&i.PeriodEnd,
+			&i.FoldedIntoCreation,
+			&i.AmountMicros,
+			&i.WalletMicros,
+			&i.CardMicros,
+			&i.WalletDecidedAt,
+			&i.CardRef,
+			&i.CardWindowStart,
+			&i.Status,
+			&i.SettledAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const duePlanChangesForAccount = `-- name: DuePlanChangesForAccount :many
-SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, status, settled_at, created_at
+SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
 FROM ms_billing.app_plan_changes
 WHERE account_id = $1::uuid
   AND status = 'scheduled'
@@ -111,6 +186,7 @@ func (q *Queries) DuePlanChangesForAccount(ctx context.Context, arg DuePlanChang
 			&i.CardMicros,
 			&i.WalletDecidedAt,
 			&i.CardRef,
+			&i.CardWindowStart,
 			&i.Status,
 			&i.SettledAt,
 			&i.CreatedAt,
@@ -125,19 +201,23 @@ func (q *Queries) DuePlanChangesForAccount(ctx context.Context, arg DuePlanChang
 	return items, nil
 }
 
-const foldedPlanChangesForApp = `-- name: FoldedPlanChangesForApp :many
-SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, status, settled_at, created_at
+const effectivePlanChangesForApp = `-- name: EffectivePlanChangesForApp :many
+SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
 FROM ms_billing.app_plan_changes
 WHERE app_id = $1
-  AND folded_into_creation
+  AND status IN ('pending', 'settled', 'applied')
 ORDER BY effective_at, id
 `
 
-// FoldedPlanChangesForApp lists the app's upgrades that were folded into its
-// creation charge, in effect order — the segments the creation charge prices
-// by day (usage.SegmentedProratedBaseMicros).
-func (q *Queries) FoldedPlanChangesForApp(ctx context.Context, appID string) ([]MsBillingAppPlanChange, error) {
-	rows, err := q.db.Query(ctx, foldedPlanChangesForApp, appID)
+// EffectivePlanChangesForApp lists every change that has TAKEN EFFECT on the
+// app — settled upgrades (folded or charged) and applied downgrades — in
+// effect order: the segments the creation charge prices by day
+// (usage.SegmentedProratedBaseMicros), chained from apps.created_plan.
+// Pending upgrades are in force too (the plan flipped with the row) and are
+// included; scheduled and cancelled downgrades never moved the plan and are
+// not.
+func (q *Queries) EffectivePlanChangesForApp(ctx context.Context, appID string) ([]MsBillingAppPlanChange, error) {
+	rows, err := q.db.Query(ctx, effectivePlanChangesForApp, appID)
 	if err != nil {
 		return nil, err
 	}
@@ -162,6 +242,7 @@ func (q *Queries) FoldedPlanChangesForApp(ctx context.Context, appID string) ([]
 			&i.CardMicros,
 			&i.WalletDecidedAt,
 			&i.CardRef,
+			&i.CardWindowStart,
 			&i.Status,
 			&i.SettledAt,
 			&i.CreatedAt,
@@ -189,7 +270,7 @@ INSERT INTO ms_billing.app_plan_changes (
     $10::boolean, $11::bigint, 0, 0,
     $12::timestamptz, $13::text, $14::timestamptz
 )
-RETURNING id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, status, settled_at, created_at
+RETURNING id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
 `
 
 type InsertPlanChangeParams struct {
@@ -254,6 +335,7 @@ func (q *Queries) InsertPlanChange(ctx context.Context, arg InsertPlanChangePara
 		&i.CardMicros,
 		&i.WalletDecidedAt,
 		&i.CardRef,
+		&i.CardWindowStart,
 		&i.Status,
 		&i.SettledAt,
 		&i.CreatedAt,
@@ -262,7 +344,7 @@ func (q *Queries) InsertPlanChange(ctx context.Context, arg InsertPlanChangePara
 }
 
 const lockPlanChange = `-- name: LockPlanChange :one
-SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, status, settled_at, created_at
+SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
 FROM ms_billing.app_plan_changes
 WHERE id = $1
 FOR UPDATE
@@ -290,6 +372,7 @@ func (q *Queries) LockPlanChange(ctx context.Context, id string) (MsBillingAppPl
 		&i.CardMicros,
 		&i.WalletDecidedAt,
 		&i.CardRef,
+		&i.CardWindowStart,
 		&i.Status,
 		&i.SettledAt,
 		&i.CreatedAt,
@@ -320,7 +403,7 @@ func (q *Queries) MarkPlanChangeApplied(ctx context.Context, arg MarkPlanChangeA
 }
 
 const openPlanChangeForApp = `-- name: OpenPlanChangeForApp :one
-SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, status, settled_at, created_at
+SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
 FROM ms_billing.app_plan_changes
 WHERE app_id = $1
   AND status IN ('pending', 'scheduled')
@@ -348,6 +431,7 @@ func (q *Queries) OpenPlanChangeForApp(ctx context.Context, appID string) (MsBil
 		&i.CardMicros,
 		&i.WalletDecidedAt,
 		&i.CardRef,
+		&i.CardWindowStart,
 		&i.Status,
 		&i.SettledAt,
 		&i.CreatedAt,
@@ -356,7 +440,7 @@ func (q *Queries) OpenPlanChangeForApp(ctx context.Context, appID string) (MsBil
 }
 
 const pendingPlanChanges = `-- name: PendingPlanChanges :many
-SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, status, settled_at, created_at
+SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
 FROM ms_billing.app_plan_changes
 WHERE status = 'pending'
   AND requested_at <= $1::timestamptz
@@ -391,6 +475,7 @@ func (q *Queries) PendingPlanChanges(ctx context.Context, requestedBefore time.T
 			&i.CardMicros,
 			&i.WalletDecidedAt,
 			&i.CardRef,
+			&i.CardWindowStart,
 			&i.Status,
 			&i.SettledAt,
 			&i.CreatedAt,
@@ -406,7 +491,7 @@ func (q *Queries) PendingPlanChanges(ctx context.Context, requestedBefore time.T
 }
 
 const planChangeByID = `-- name: PlanChangeByID :one
-SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, status, settled_at, created_at
+SELECT id, app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, folded_into_creation, amount_micros, wallet_micros, card_micros, wallet_decided_at, card_ref, card_window_start, status, settled_at, created_at
 FROM ms_billing.app_plan_changes
 WHERE id = $1
 `
@@ -432,11 +517,42 @@ func (q *Queries) PlanChangeByID(ctx context.Context, id string) (MsBillingAppPl
 		&i.CardMicros,
 		&i.WalletDecidedAt,
 		&i.CardRef,
+		&i.CardWindowStart,
 		&i.Status,
 		&i.SettledAt,
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const setPlanChangeCardWindow = `-- name: SetPlanChangeCardWindow :one
+UPDATE ms_billing.app_plan_changes
+SET card_window_start = CASE
+    WHEN card_window_start IS NULL OR card_window_start < $1::timestamptz
+    THEN $2::timestamptz
+    ELSE card_window_start
+END
+WHERE id = $3::uuid
+RETURNING card_window_start
+`
+
+type SetPlanChangeCardWindowParams struct {
+	ReanchorBefore time.Time `json:"reanchor_before"`
+	WindowStart    time.Time `json:"window_start"`
+	ID             string    `json:"id"`
+}
+
+// SetPlanChangeCardWindow stores the card intent's window anchor and returns
+// the surviving value, so every retry seals the same digest — unless the
+// stored anchor's window has already CLOSED (stored < @reanchor_before, the
+// seal instant minus the execution window): an anchor a failed seal left
+// behind, or one whose sealed document is dead anyway, is replaced rather
+// than reused to seal a document that could never be collected.
+func (q *Queries) SetPlanChangeCardWindow(ctx context.Context, arg SetPlanChangeCardWindowParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, setPlanChangeCardWindow, arg.ReanchorBefore, arg.WindowStart, arg.ID)
+	var card_window_start pgtype.Timestamptz
+	err := row.Scan(&card_window_start)
+	return card_window_start, err
 }
 
 const settlePlanChangeCard = `-- name: SettlePlanChangeCard :execrows

@@ -56,16 +56,30 @@ func TestCreationBaseSegments_ChainsFoldedChanges(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []usage.BaseSegment{{From: created, BaseMicros: 20_000_000}}, segments)
 
-	segments, err = creationBaseSegments(app, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanPro, EffectiveAt: changed}})
+	// Created on Free, folded up to Pro: the chain starts on the CREATED plan.
+	createdFree := AppMirror{CreatedAt: created, Plan: usage.PlanPro, CreatedPlan: usage.PlanFree}
+	segments, err = creationBaseSegments(createdFree, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanPro, EffectiveAt: changed}})
 	require.NoError(t, err)
 	require.Equal(t, []usage.BaseSegment{{From: created, BaseMicros: 0}, {From: changed, BaseMicros: 20_000_000}}, segments)
 
+	// 🔴 THE CREATED PLAN, NOT THE ROW'S: an app created on Pro whose plan
+	// moved to Free at a boundary (an applied downgrade) prices its creation
+	// days at Pro and the days after the boundary at Free — never the whole
+	// window at Free because that is what apps.plan says now.
+	downgraded := AppMirror{CreatedAt: created, Plan: usage.PlanFree, CreatedPlan: usage.PlanPro}
+	boundary := time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)
+	segments, err = creationBaseSegments(downgraded, []PlanChange{{FromPlan: usage.PlanPro, ToPlan: usage.PlanFree, EffectiveAt: boundary, Kind: PlanChangeDowngrade}})
+	require.NoError(t, err)
+	require.Equal(t, []usage.BaseSegment{{From: created, BaseMicros: 20_000_000}, {From: boundary, BaseMicros: 0}}, segments)
+
 	_, err = creationBaseSegments(app, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed}})
+	require.Error(t, err, "the chain does not start on the created plan")
+	_, err = creationBaseSegments(createdFree, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed}})
 	require.Error(t, err, "the chain ends on business but the row says pro")
 
-	_, err = creationBaseSegments(app, []PlanChange{
+	_, err = creationBaseSegments(createdFree, []PlanChange{
 		{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed},
 		{FromPlan: usage.PlanFree, ToPlan: usage.PlanPro, EffectiveAt: changed.Add(time.Hour)},
 	})
-	require.Error(t, err, "the second fold does not start where the first ended")
+	require.Error(t, err, "the second change does not start where the first ended")
 }

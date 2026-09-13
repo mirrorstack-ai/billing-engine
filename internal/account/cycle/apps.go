@@ -203,13 +203,16 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		}
 		if plan == usage.PlanFree {
 			// The card half of the Free rules is the funding gate above; the
-			// per-owner cap is the other half (core-v2#1412).
-			if err := s.freeEligible(ctx, accountID, req.OwnerOrgID, req.AppID); err != nil {
-				return nil, err
+			// per-owner cap (core-v2#1412) is taken by the store under the
+			// owner lock, in the same transaction as the insert.
+			capReached, err := s.store.InsertFreeAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, req.MemberCount, createdAt, req.Name)
+			if err != nil {
+				return nil, billing.Internal("insert app mirror failed", err)
 			}
-		}
-
-		if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, req.MemberCount, createdAt, req.Name, plan); err != nil {
+			if capReached {
+				return nil, planLimitError(usage.PlanFree, req.OwnerOrgID != uuid.Nil)
+			}
+		} else if err := s.store.InsertAppMirror(ctx, req.AppID, accountID, req.OwnerOrgID, req.ModuleCount, req.MemberCount, createdAt, req.Name, plan); err != nil {
 			return nil, billing.Internal("insert app mirror failed", err)
 		}
 
@@ -327,9 +330,10 @@ func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest)
 
 	// Member count (migration 077) — no-op once deleted, like the module count:
 	// a deleted app accrues no future member fee. No timer, no proration: the
-	// boundary leg reads the count in force at the boundary.
+	// write appends a history row and the boundary bills the period's
+	// high-water mark from that history (owner 2026-09-13).
 	if req.MemberCount != nil && !app.Deleted {
-		if err := s.store.SetAppMemberCount(ctx, req.AppID, *req.MemberCount); err != nil {
+		if err := s.store.SetAppMemberCount(ctx, req.AppID, *req.MemberCount, now); err != nil {
 			return nil, billing.Internal("set app member count failed", err)
 		}
 		app.MemberCount = *req.MemberCount

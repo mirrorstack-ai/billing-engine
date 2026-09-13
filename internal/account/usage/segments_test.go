@@ -109,3 +109,32 @@ func TestUpgradeDeltaIsTheDifferenceNotTheNewPrice(t *testing.T) {
 		t.Errorf("free→pro at half period = %d, want 10_000_000", got)
 	}
 }
+
+// TestProratedSegmentMicrosTruncatesTheEndInstantToItsDay pins the split-by-day
+// rule at the segment END: a segment that ends at 15:00 on the 19th covers the
+// days up to the 18th inclusive — exactly what one ending at 00:00 on the
+// 19th covers — so the change day belongs wholly to the NEW plan's segment
+// and is never billed at both.
+func TestProratedSegmentMicrosTruncatesTheEndInstantToItsDay(t *testing.T) {
+	t.Parallel()
+
+	base := usage.BaseFeeMicros
+	midnight := time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC)
+	afternoon := time.Date(2026, 6, 19, 15, 0, 0, 0, time.UTC)
+	from := time.Date(2026, 6, 10, 9, 0, 0, 0, time.UTC)
+	atMidnight := usage.ProratedSegmentMicros(base, from, midnight, segPeriodStart, segPeriodEnd)
+	atAfternoon := usage.ProratedSegmentMicros(base, from, afternoon, segPeriodStart, segPeriodEnd)
+	if atMidnight != atAfternoon {
+		t.Errorf("end instant not truncated to its day: 00:00 → %d, 15:00 → %d", atMidnight, atAfternoon)
+	}
+	if want := (base*9 + 15) / 30; atMidnight != want { // days 10–18
+		t.Errorf("segment [10th, 19th) = %d, want %d", atMidnight, want)
+	}
+	// And the two halves of a split day-boundary sum to the whole window:
+	// nothing double-billed, nothing dropped.
+	whole := usage.ProratedBaseMicros(base, from, segPeriodStart, segPeriodEnd)
+	tail := usage.ProratedSegmentMicros(base, afternoon, segPeriodEnd, segPeriodStart, segPeriodEnd)
+	if atAfternoon+tail != whole {
+		t.Errorf("split halves %d + %d != whole %d", atAfternoon, tail, whole)
+	}
+}

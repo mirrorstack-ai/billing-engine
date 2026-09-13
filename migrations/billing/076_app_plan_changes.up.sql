@@ -79,6 +79,13 @@ CREATE TABLE IF NOT EXISTS ms_billing.app_plan_changes (
     -- 'intent:<digest>' once the card remainder is sealed on the intent rail.
     -- Never a provider invoice id: this leg holds no write port.
     card_ref             TEXT NULL,
+    -- The instant the card intent's execution window opens, stored at the
+    -- FIRST seal attempt and reused by every retry: requested_at, unless the
+    -- row went unsettled for longer than the execution window, in which case
+    -- the first seal instant — so a late reconciliation never seals a
+    -- document whose window has already closed, and a retry after a crash
+    -- seals the SAME digest (the window is part of it).
+    card_window_start    TIMESTAMPTZ NULL,
 
     -- upgrade:   pending  → settled
     -- downgrade: scheduled → applied | cancelled

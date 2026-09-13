@@ -120,6 +120,7 @@ func main() {
 	// dev cycle is a single batch.
 	at := time.Now().UTC()
 	runOrgAttachSweep(context.Background(), svc, at)
+	runPlanChangeApply(context.Background(), svc, at)
 	res := runCycle(context.Background(), svc, at)
 	// Proration runs BEFORE the overage sweep. A Stripe creation charge resolves
 	// its co-created overage on the combined invoice; a wallet creation charge
@@ -575,6 +576,7 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			at = time.Now().UTC()
 		}
 		runOrgAttachSweep(ctx, svc, at.UTC())
+		runPlanChangeApply(ctx, svc, at.UTC())
 		res := runCycle(ctx, svc, at.UTC())
 		// Proration runs BEFORE the overage sweep (see main): Stripe creations
 		// resolve co-created overage on their combined invoice; wallet creations
@@ -837,6 +839,20 @@ func runDomainSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *
 	slog.InfoContext(ctx, "custom-domain sweep complete",
 		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
 		"resolved", sweep.Resolved, "skipped", sweep.Skipped, "failed", sweep.Failed)
+}
+
+// runPlanChangeApply moves every due scheduled downgrade onto its plan BEFORE
+// the charge phase, on every account — including the ones runCycle never
+// hands to RunBillingCycle (an account whose only apps are in their creation
+// grace), whose downgrade would otherwise land a period late. RunBillingCycle
+// re-applies its own account's as the belt.
+func runPlanChangeApply(ctx context.Context, svc *cycle.Service, at time.Time) {
+	applied, cancelled, err := svc.ApplyDuePlanChanges(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "plan-change apply failed", "as_of", at, "error", err)
+		return
+	}
+	slog.InfoContext(ctx, "plan-change apply complete", "as_of", at, "applied", applied, "cancelled", cancelled)
 }
 
 // runPlanChangeSweep finishes every pending plan upgrade after the other
