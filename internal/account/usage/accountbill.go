@@ -188,7 +188,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	})
 
 	apps := make([]AccountAppBill, 0, len(appIDs))
-	var baseFeeTotal, moduleUsageTotal, infraTotal int64
+	var baseFeeTotal, moduleUsageTotal, infraTotal, deployUsageTotal int64
 	for _, appID := range appIDs {
 		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd)
 		if err != nil {
@@ -214,6 +214,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			BaseFeeMicros:     parts.BaseFeeMicros,
 			ModuleUsageMicros: parts.ModuleUsageTotalMicros,
 			InfraMicros:       parts.InfraTotalMicros,
+			DeployUsageMicros: parts.DeployUsageMicros,
 			// Set for the current window from the shares above; a frozen window
 			// gets the flat per-app base assigned after the roster is complete.
 			ProjectedBaseFeeMicros: projectedBaseByApp[appID],
@@ -224,6 +225,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		baseFeeTotal += parts.BaseFeeMicros
 		moduleUsageTotal += parts.ModuleUsageTotalMicros
 		infraTotal += parts.InfraTotalMicros
+		deployUsageTotal += parts.DeployUsageMicros
 	}
 
 	// Account-level agent scope (metered under uuid.Nil): the SAME pricing path
@@ -282,6 +284,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		BaseFeeTotalMicros:     baseFeeTotal,
 		ModuleUsageTotalMicros: moduleUsageTotal,
 		InfraTotalMicros:       infraTotal,
+		DeployUsageTotalMicros: deployUsageTotal,
 		AccountOverageMicros:   accountOverage,
 		CustomDomainsMicros:    customDomains,
 		PaasCreditMicros:       paasCredit,

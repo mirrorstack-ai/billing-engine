@@ -158,6 +158,10 @@ func TestGetAppBill_SplitsInfraFromModuleUsage(t *testing.T) {
 		appInfraLine("infra.egress.api.bytes", "network", 90000, 0.0001, 12),
 		appInfraLine("platform.tokens", "ai", 1000, 8, 8),
 		appInfraLine("infra.request.count", "requests", 1, 0, 0), // unused → $0
+		// The 'deploy' group (079/080): 部署用量 is their sum, a SUBSET of
+		// the infra total, never added on top.
+		appInfraLine("infra.egress.cdn.bytes", "deploy", 122406, 0.5, 73),
+		appInfraLine("infra.cdn.request.count", "deploy", 300, 2, 720),
 	}
 
 	resp, err := newService(store).GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: uuid.New()})
@@ -171,8 +175,9 @@ func TestGetAppBill_SplitsInfraFromModuleUsage(t *testing.T) {
 	// Infra breakdown is the catalog-anchored lines verbatim (incl. the $0 one),
 	// and the scalar total is their sum (12 + 8 + 0) — NOT the 2×9999 reserved rows
 	// on the AppBill read, which are dropped (no double-count).
-	require.Len(t, resp.InfraLines, 3)
-	require.EqualValues(t, 20, resp.InfraTotalMicros)
+	require.Len(t, resp.InfraLines, 5)
+	require.EqualValues(t, 20+73+720, resp.InfraTotalMicros)
+	require.EqualValues(t, 73+720, resp.DeployUsageMicros, "部署用量 = the 'deploy' lines, a subset of infra_total")
 	var lineSum int64
 	for _, l := range resp.InfraLines {
 		lineSum += l.ChargedMicros
@@ -186,8 +191,9 @@ func TestGetAppBill_SplitsInfraFromModuleUsage(t *testing.T) {
 	// Only the one non-reserved module counts → flat base fee.
 	require.Equal(t, usage.BaseFeeMicros, resp.BaseFeeMicros)
 
-	// Total = base + module usage + infra − credit (credit 0).
-	require.Equal(t, usage.BaseFeeMicros+1000+20, resp.TotalMicros)
+	// Total = base + module usage + infra − credit (credit 0). The deploy
+	// subset is INSIDE the infra term, never added again.
+	require.Equal(t, usage.BaseFeeMicros+1000+20+73+720, resp.TotalMicros)
 }
 
 func TestGetAppBill_PaasCreditSubscriptionGatedOff(t *testing.T) {

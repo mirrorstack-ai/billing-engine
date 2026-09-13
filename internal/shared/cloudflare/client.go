@@ -105,6 +105,14 @@ var datasetNamePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 // %[3]s = UTC window bounds formatted as cfDateTimeLayout, %[4]d = queryRowLimit.
 const sqlQueryTemplate = `SELECT blob1 AS app_id, blob2 AS module_id, SUM(_sample_interval * double1) AS bytes FROM %[1]s WHERE timestamp >= toDateTime('%[2]s') AND timestamp < toDateTime('%[3]s') GROUP BY blob1, blob2 LIMIT %[4]d FORMAT JSON`
 
+// requestSQLQueryTemplate is the second pull per window (cdn-worker#58,
+// billing-engine#212): the REQUEST count per (app, module, tier, stage),
+// from double2 (one per metered request) weighted by _sample_interval exactly
+// as the byte query weights double1. blob4 (tier) and blob5 (stage) are
+// trailing, additive dimensions: rows written before cdn-worker#58 carry them
+// empty and a double2 of 0, and contribute nothing.
+const requestSQLQueryTemplate = `SELECT blob1 AS app_id, blob2 AS module_id, blob4 AS tier, blob5 AS stage, SUM(_sample_interval * double2) AS requests FROM %[1]s WHERE timestamp >= toDateTime('%[2]s') AND timestamp < toDateTime('%[3]s') GROUP BY blob1, blob2, blob4, blob5 LIMIT %[4]d FORMAT JSON`
+
 // cfDateTimeLayout is the ONLY format ClickHouse's toDateTime() accepts:
 // "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS" — no trailing 'Z', no UTC
 // offset. Confirmed directly against the live SQL API: a plain time.RFC3339
@@ -125,6 +133,18 @@ type EgressRow struct {
 	Bytes    float64
 }
 
+// RequestRow is one aggregated request group from the CF Analytics dataset:
+// the summed request count for a single (app_id, module_id, tier, stage) over
+// the queried window (cdn-worker#58). Tier and Stage are the raw blob4/blob5
+// strings — "" on rows written before the worker carried them.
+type RequestRow struct {
+	AppID    string
+	ModuleID string
+	Tier     string
+	Stage    string
+	Requests float64
+}
+
 // AnalyticsQuerier is the CF Analytics surface the egress puller uses. Kept as
 // an interface so the cmd binary and the tests use a fake — tests MUST NEVER
 // call the real Cloudflare API (hard rule). Implementations:
@@ -138,6 +158,10 @@ type AnalyticsQuerier interface {
 	// partial bucket) so the SUM is stable across re-runs — which, paired with
 	// the deterministic event_id at ingest, makes the whole pull idempotent.
 	QueryEgressWindow(ctx context.Context, datasetName string, windowStart, windowEnd time.Time) ([]EgressRow, error)
+	// QueryRequestWindow returns the per-(app, module, tier, stage) summed
+	// request counts for the same closed window — the second pull the request
+	// and R2-read metrics are recorded from (billing-engine#212).
+	QueryRequestWindow(ctx context.Context, datasetName string, windowStart, windowEnd time.Time) ([]RequestRow, error)
 }
 
 // NewClient returns an AnalyticsQuerier backed by the real Cloudflare
@@ -189,6 +213,31 @@ type sqlQueryResponse struct {
 	} `json:"data"`
 }
 
+// requestQueryResponse is the request query's envelope.
+type requestQueryResponse struct {
+	Data []struct {
+		AppID    string  `json:"app_id"`
+		ModuleID string  `json:"module_id"`
+		Tier     string  `json:"tier"`
+		Stage    string  `json:"stage"`
+		Requests float64 `json:"requests"`
+	} `json:"data"`
+}
+
+// buildRequestSQLQuery renders the request query for one closed-hour window,
+// with the same dataset-name validation as buildSQLQuery.
+func buildRequestSQLQuery(datasetName string, windowStart, windowEnd time.Time) (string, error) {
+	if !datasetNamePattern.MatchString(datasetName) {
+		return "", fmt.Errorf("invalid cloudflare analytics dataset name %q: must match %s", datasetName, datasetNamePattern.String())
+	}
+	return fmt.Sprintf(requestSQLQueryTemplate,
+		datasetName,
+		windowStart.UTC().Format(cfDateTimeLayout),
+		windowEnd.UTC().Format(cfDateTimeLayout),
+		queryRowLimit,
+	), nil
+}
+
 // cfErrorEnvelope is the standard Cloudflare v4 API error shape, used to
 // extract a human-readable message from a non-200 response when one is
 // available; if the body doesn't match this shape, the raw body is used
@@ -222,27 +271,9 @@ func (c *realClient) QueryEgressWindow(ctx context.Context, datasetName string, 
 	if err != nil {
 		return nil, err
 	}
-
-	endpoint := fmt.Sprintf(sqlEndpointFormat, url.PathEscape(c.accountID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(query))
+	raw, err := c.post(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("build sql request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiToken)
-	req.Header.Set("Content-Type", "text/plain")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("cloudflare sql request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read sql response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("cloudflare sql query status %d: %s", resp.StatusCode, sqlErrorMessage(raw))
+		return nil, err
 	}
 
 	var parsed sqlQueryResponse
@@ -272,4 +303,61 @@ func (c *realClient) QueryEgressWindow(ctx context.Context, datasetName string, 
 			len(rows), windowStart.UTC().Format(time.RFC3339), windowEnd.UTC().Format(time.RFC3339))
 	}
 	return rows, nil
+}
+
+// QueryRequestWindow is the request-count pull (billing-engine#212), the same
+// transport and the same truncation guard as QueryEgressWindow over the
+// (app, module, tier, stage) groups.
+func (c *realClient) QueryRequestWindow(ctx context.Context, datasetName string, windowStart, windowEnd time.Time) ([]RequestRow, error) {
+	query, err := buildRequestSQLQuery(datasetName, windowStart, windowEnd)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := c.post(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	var parsed requestQueryResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("decode sql response: %w", err)
+	}
+	rows := make([]RequestRow, 0, len(parsed.Data))
+	for _, d := range parsed.Data {
+		rows = append(rows, RequestRow{
+			AppID: d.AppID, ModuleID: d.ModuleID, Tier: d.Tier, Stage: d.Stage, Requests: d.Requests,
+		})
+	}
+	if len(rows) >= queryRowLimit {
+		return nil, fmt.Errorf("%w: %d request rows for window [%s, %s)", ErrResultTruncated,
+			len(rows), windowStart.UTC().Format(time.RFC3339), windowEnd.UTC().Format(time.RFC3339))
+	}
+	return rows, nil
+}
+
+// post sends one raw SQL body to the account-scoped SQL endpoint and returns
+// the response body of a 200; any other status is an error carrying the CF
+// message.
+func (c *realClient) post(ctx context.Context, query string) ([]byte, error) {
+	endpoint := fmt.Sprintf(sqlEndpointFormat, url.PathEscape(c.accountID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(query))
+	if err != nil {
+		return nil, fmt.Errorf("build sql request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiToken)
+	req.Header.Set("Content-Type", "text/plain")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cloudflare sql request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read sql response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cloudflare sql query status %d: %s", resp.StatusCode, sqlErrorMessage(raw))
+	}
+	return raw, nil
 }
