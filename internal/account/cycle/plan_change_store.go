@@ -87,9 +87,10 @@ func (s *pgxStore) OpenPlanChange(ctx context.Context, p OpenPlanChangeParams) (
 	if err != nil {
 		return PlanChange{}, 0, err
 	}
-	if row.DeletedAt.Valid || usage.Plan(row.Plan) != p.FromPlan || uuidFromPg(row.AccountID) != p.AccountID {
-		return PlanChange{}, PlanChangeAppStale, nil
-	}
+	// The open row is checked BEFORE the derivation is: a second caller that
+	// lost the race to a concurrent upgrade sees the plan already flipped, and
+	// what it needs is that upgrade's row to resume, not a "stale" refusal
+	// that sends it round again.
 	existing, err := qtx.OpenPlanChangeForApp(ctx, p.AppID.String())
 	if err == nil {
 		c, err := planChangeFromRow(existing)
@@ -103,6 +104,9 @@ func (s *pgxStore) OpenPlanChange(ctx context.Context, p OpenPlanChangeParams) (
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return PlanChange{}, 0, err
+	}
+	if row.DeletedAt.Valid || usage.Plan(row.Plan) != p.FromPlan || uuidFromPg(row.AccountID) != p.AccountID {
+		return PlanChange{}, PlanChangeAppStale, nil
 	}
 
 	settledAt := pgtype.Timestamptz{}

@@ -39,11 +39,14 @@ func (f *fakeStore) OpenPlanChange(_ context.Context, p cycle.OpenPlanChangePara
 		return cycle.PlanChange{}, 0, f.errOpenPlanChange
 	}
 	app, ok := f.apps[p.AppID]
-	if !ok || app.Deleted || fakeEffectivePlan(app) != p.FromPlan || app.AccountID != p.AccountID {
+	if !ok {
 		return cycle.PlanChange{}, cycle.PlanChangeAppStale, nil
 	}
 	if existing, has := f.openPlanChangeFor(p.AppID); has {
-		return existing, cycle.PlanChangeExisting, nil
+		return existing, cycle.PlanChangeExisting, nil // the open row wins over a stale derivation
+	}
+	if app.Deleted || fakeEffectivePlan(app) != p.FromPlan || app.AccountID != p.AccountID {
+		return cycle.PlanChange{}, cycle.PlanChangeAppStale, nil
 	}
 	c := cycle.PlanChange{
 		ID: uuid.New(), AppID: p.AppID, AccountID: p.AccountID,
