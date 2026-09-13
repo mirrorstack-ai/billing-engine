@@ -84,9 +84,10 @@ const (
 	// boundary spine applies). Transient like no-PM: re-attempted once a
 	// webhook-driven relax flips the account back to arrears.
 	ProrationStatusPrepaid ProrationStatus = "skipped_prepaid"
-	// ProrationStatusNoCharge: the proration rounded to 0 cents (effectively
-	// unreachable for a real survived app whose base is ≥ $20) → nothing to
-	// invoice, guard left unarmed.
+	// ProrationStatusNoCharge: the proration rounded to 0 cents — a Free app,
+	// whose plan base is $0 → nothing to invoice, guard left unarmed. Before Free
+	// can be chosen, billing-engine#202 must arm the guard here too: the sweep
+	// re-selects an unarmed app, and co-created timers defer to its attempt.
 	ProrationStatusNoCharge ProrationStatus = "no_charge"
 
 	// ProrationStatusProposed: the intent cutover was armed, so this
@@ -250,9 +251,9 @@ type ProrationWalletCharge struct {
 // invokes per pending app. It is idempotent (the one-shot proration_invoice_id
 // guard) and race-safe against a concurrent soft-delete (the FOR UPDATE section).
 //
-// The amount is the FLAT per-app base, prorated to the creation window:
+// The amount is the app's plan base, prorated to the creation window:
 //
-//	ProratedBaseMicros(BaseFeeMicros, created_at,
+//	ProratedBaseMicros(TermsFor(plan).BaseFeeMicros, created_at,
 //	                   the anchored period CONTAINING created_at)
 //
 // anchored to the TRUE created_at (NOT now), so the app pays only for the whole
@@ -771,12 +772,14 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 // together with the exact timer IDs; every retry then consumes the persisted
 // winner rather than re-running this math or reading a mutable app name.
 func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (CombinedProrationChargeShape, error) {
+	// The app's own plan base (migration 075, core-v2#1412) prices its creation charge.
+	planBase := usage.TermsFor(app.Plan).BaseFeeMicros
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(
 		app.CreatedAt.UTC(),
 		billingperiod.AnchorDay(activatedAt),
 	)
 	creationPeriodMicros := usage.ProratedBaseMicros(
-		usage.BaseFeeMicros,
+		planBase,
 		app.CreatedAt,
 		periodStart,
 		periodEnd,
@@ -789,12 +792,12 @@ func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (Combine
 			billingperiod.AnchorDay(activatedAt),
 		)
 	}
-	baseMicros := usage.CreationChargeBaseMicros(app.CreatedAt, periodStart, periodEnd)
+	baseMicros := usage.CreationChargeBaseMicros(planBase, app.CreatedAt, periodStart, periodEnd)
 	coverageStart := usage.ProrationCoverageStart(app.CreatedAt, periodStart)
 	creationPeriodClosed := !activatedAt.Before(periodEnd)
 	if creationPeriodClosed {
 		creationPeriodMicros = 0
-		baseMicros = usage.BaseFeeMicros
+		baseMicros = planBase
 		coverageStart = periodEnd
 	}
 	baseCents, err := centsFromMicros(baseMicros)
@@ -839,7 +842,7 @@ func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (Combine
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	} else if straddle {
 		straddleSnapshot = &AppBaseSnapshot{
@@ -847,7 +850,7 @@ func combinedProrationChargeShape(app AppMirror, activatedAt time.Time) (Combine
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	}
 	label := appLineLabel(app.Name, app.AppID)
@@ -1086,14 +1089,29 @@ func (s *Service) adoptFinalizedProrationInvoice(
 // the credit wallet instead of minting a Stripe invoice. Co-created over-module
 // overage remains for the existing per-module overage sweep. The store draws the
 // full base amount and, ONLY if the wallet fully covers it, freezes the display
-// snapshot(s) and arms the one-shot guard, all in one transaction. created_at +
-// the activation anchor are immutable, so this pricing is deterministic across
-// retries.
+// snapshot(s) and arms the one-shot guard, all in one transaction.
+//
+// 🔴 THE PRICING INPUTS ARE NO LONGER ALL IMMUTABLE, AND THAT IS DELIBERATE.
+// This comment used to claim determinism from created_at + the activation
+// anchor alone. Those two are still immutable — but since migration 075 the
+// price also depends on apps.plan, which is MUTABLE and is read unlocked
+// (AppMirror, ~:292). So a plan change racing this sweep can land either side
+// of the read.
+//
+// That is correct, and the resolution is NOT to re-price from the locked row.
+// The plan read at sweep time IS the price for this creation charge; a
+// concurrent plan change is settled separately by the plan-change ledger
+// (migration 076, PR-2b), which charges the DIFFERENCE between the bases for
+// the remaining days. Re-pricing here from a later-locked plan would charge
+// that delta a second time — once in this base and once in the ledger — so an
+// upgrade racing creation would be billed twice.
 func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app AppMirror, activatedAt time.Time) (*ProrationResult, bool, error) {
+	// The app's own plan base (migration 075, core-v2#1412) prices its creation charge.
+	planBase := usage.TermsFor(app.Plan).BaseFeeMicros
 	// Window = the anchored period CONTAINING created_at (ADR 0005), derived from
 	// created_at never from now — identical to the Stripe callback.
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), billingperiod.AnchorDay(activatedAt))
-	creationPeriodMicros := usage.ProratedBaseMicros(usage.BaseFeeMicros, app.CreatedAt, periodStart, periodEnd)
+	creationPeriodMicros := usage.ProratedBaseMicros(planBase, app.CreatedAt, periodStart, periodEnd)
 
 	// Coverage end = the END of the period the creation grace elapses into (the
 	// coverage contract, review 2026-07-06) — the creation period itself unless the
@@ -1103,7 +1121,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 	if straddle {
 		_, coverageEnd = billingperiod.AnchoredPeriodWindow(moduleGraceExpiry(app.CreatedAt.UTC()), billingperiod.AnchorDay(activatedAt))
 	}
-	prorated := usage.CreationChargeBaseMicros(app.CreatedAt, periodStart, periodEnd)
+	prorated := usage.CreationChargeBaseMicros(planBase, app.CreatedAt, periodStart, periodEnd)
 	// D1d straddle narrowing (wave 2, D4): only reachable here for a grace that
 	// straddles into a post-activation period (the outer period-closed gate
 	// permanently skips every other closed case) — forgive the creation period,
@@ -1111,13 +1129,13 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 	creationPeriodClosed := !activatedAt.Before(periodEnd)
 	if creationPeriodClosed {
 		creationPeriodMicros = 0
-		prorated = usage.BaseFeeMicros
+		prorated = planBase
 	}
 
 	amountMicros := prorated
 	if amountMicros <= 0 {
-		// Rounds to nothing (unreachable for a survived app whose base ≥ $20) —
-		// nothing to draw, guard stays unarmed.
+		// A Free app's $0 plan base — nothing to draw, guard stays unarmed (see
+		// ProrationStatusNoCharge).
 		return &ProrationResult{AppID: app.AppID, Status: ProrationStatusNoCharge}, false, nil
 	}
 
@@ -1139,7 +1157,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	} else if straddle {
 		straddleSnapshot = &AppBaseSnapshot{
@@ -1147,7 +1165,7 @@ func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app App
 			PeriodStart: periodEnd,
 			PeriodEnd:   coverageEnd,
 			ModuleCount: app.CreatedModuleCount,
-			BaseMicros:  usage.BaseFeeMicros,
+			BaseMicros:  planBase,
 		}
 	}
 

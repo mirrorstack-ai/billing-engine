@@ -200,7 +200,7 @@ func TestCreationChargeBaseMicros_MatchesSweepMath(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, usage.CreationChargeBaseMicros(tc.createdAt, periodStart, periodEnd))
+			require.Equal(t, tc.want, usage.CreationChargeBaseMicros(usage.BaseFeeMicros, tc.createdAt, periodStart, periodEnd))
 		})
 	}
 }
@@ -226,7 +226,7 @@ func TestCreationChargeBaseMicros_EqualsSweepInputsAcrossWindow(t *testing.T) {
 		if !usage.GraceExpiry(createdAt.UTC()).Before(periodEnd) {
 			want += usage.BaseFeeMicros
 		}
-		require.Equal(t, want, usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd), createdAt.Format(time.RFC3339))
+		require.Equal(t, want, usage.CreationChargeBaseMicros(usage.BaseFeeMicros, createdAt, periodStart, periodEnd), createdAt.Format(time.RFC3339))
 	}
 }
 

@@ -221,7 +221,7 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 // presumably removed what they added most recently); a delete soft-removes ALL
 // the app's still-live timers. A removed timer never charges (matching the
 // delete-in-grace = never-charged posture), and no refund is issued for a timer
-// already charged this period (D1e). The per-app FLAT base still takes effect at
+// already charged this period (D1e). The per-app plan base still takes effect at
 // the NEXT boundary (no mid-period base micro-invoice / refund).
 func (s *Service) SyncAppModules(ctx context.Context, req SyncAppModulesRequest) (*SyncAppModulesResponse, error) {
 	if req.AppID == uuid.Nil {
@@ -394,14 +394,18 @@ type SetAppPlanRequest struct {
 // from its change-plan endpoint, after owner/admin authorization and step-up.
 //
 // 🔴 ONLY `pro` IS ACCEPTED, AND THE REFUSAL IS DELIBERATE — do not "fix" it
-// from the caller's side. The charge legs still bill every app the flat
-// usage.BaseFeeMicros (nine sites across cycle/charge.go and cycle/proration.go)
-// while both bill reads already price each app from its plan. Accepting `free`
-// or `business` here would show a Free app $0 and a Business app $50 while the
-// invoice charged each $20 — a bill that lies. billing-engine#202's charge-leg
-// change (PR-2, owner-reviewed) makes those legs plan-aware and removes this
-// refusal in the same change, together with Free's personal-only and
-// card-on-file rules.
+// from the caller's side. Every base-fee leg now bills each app its own plan
+// base, but two things a plan change needs are not built yet:
+//   - billing the change itself: an upgrade charges the prorated difference
+//     for the rest of the period at once, and a downgrade waits for the next
+//     period boundary;
+//   - the per-app module allowance: the module legs still price the account
+//     pool of usage.IncludedModules, so a Business app would be billed module
+//     overage its plan includes.
+//
+// Accepting `free` or `business` before both land would bill the change wrong.
+// The follow-up PRs of billing-engine#202 remove this refusal, together with
+// Free's personal-only and card-on-file rules.
 func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPlanResponse, error) {
 	if req.AppID == uuid.Nil {
 		return nil, billing.InvalidInput("app_id required")
@@ -412,7 +416,7 @@ func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPl
 	}
 	if plan != usage.PlanPro {
 		return nil, billing.PlanNotAvailable("plan " + string(plan) +
-			" is not available yet: the charge legs do not bill it (billing-engine#202)")
+			" is not available yet: plan changes are not billed yet (billing-engine#202)")
 	}
 	moved, err := s.store.SetAppPlan(ctx, req.AppID, plan)
 	if err != nil {

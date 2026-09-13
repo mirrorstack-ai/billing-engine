@@ -259,7 +259,7 @@ type ChargeSummary struct {
 	ArrearsMicros int64
 
 	// AdvanceBaseMicros is the NEW period's advance base fee: Σ over the
-	// account's live apps of the FLAT BaseFeeMicros. 0 for a pre-backfill
+	// account's live apps of each app's plan base. 0 for a pre-backfill
 	// account (no mirror rows). Module overage is billed SEPARATELY as
 	// AdvanceOverageMicros, not folded into an app's base.
 	AdvanceBaseMicros int64

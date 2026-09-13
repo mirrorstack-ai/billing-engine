@@ -33,6 +33,7 @@ import (
 const (
 	// BaseFeeMicros is 基本費用 — the fixed per-app/period platform base fee on the
 	// Pro plan (DefaultPlan, plans.go). It BUNDLES the PaaS infra credit (surfaced as PaasCreditMicros).
+	// Every leg prices an app through TermsFor(plan); this is the Pro row's base.
 	// It is FLAT per app: the IncludedModules allowance + the ModuleOverageFeeMicros
 	// surcharge are ACCOUNT-WIDE POOLED (migration 032 — see AccountOverageMicros),
 	// NOT folded into this per-app fee. Tunable. Default $20.

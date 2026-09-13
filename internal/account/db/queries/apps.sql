@@ -138,10 +138,11 @@ SET deleted_at = now()
 WHERE app_id = $1
   AND deleted_at IS NULL;
 
--- LiveAppModuleCountsCreatedBefore returns (app_id, module_count) for every
+-- LiveAppModuleCountsCreatedBefore returns (app_id, module_count, plan) for every
 -- LIVE (deleted_at IS NULL) app on the account that has JOINED the advance
 -- base mechanism by the cutoff — the boundary charge's advance-base input:
--- advance base = Σ (BaseFee + Overage × max(0, module_count − included)).
+-- advance base = Σ each app's plan base (module overage rides per-install
+-- timers, migration 033).
 -- The cutoff is the NEW period's start (the closed window's period_end). Two
 -- conditions, mirroring the module-timer coverage contract (review 2026-07-06):
 --   * created_at < @created_before — an app created INSIDE the new period is
@@ -168,7 +169,7 @@ WHERE app_id = $1
 -- UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
 -- by an hour around DST and double-bill or gap a whole period.
 -- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count
+SELECT app_id, module_count, plan
 FROM ms_billing.apps
 WHERE account_id = @account_id::uuid
   AND deleted_at IS NULL
@@ -352,7 +353,7 @@ ORDER BY i.created_at DESC, a.app_id;
 -- account-level FIFO rank that can shift before it fires, so unlike the
 -- created_at-anchored base that dollar amount is not deterministic here.
 -- name: PendingNewCreationCharges :many
-SELECT app_id, name, created_module_count, created_at
+SELECT app_id, name, created_module_count, created_at, plan
 FROM ms_billing.apps
 WHERE account_id = @account_id::uuid
   AND created_at >= @period_start::timestamptz

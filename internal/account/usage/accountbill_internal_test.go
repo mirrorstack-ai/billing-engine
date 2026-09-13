@@ -7,7 +7,9 @@ package usage
 
 import (
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -57,4 +59,62 @@ func TestAccountPaasCreditMicros_NeverExceedsUsagePlusInfra(t *testing.T) {
 		require.LessOrEqual(t, credit, tc.usage+tc.infra,
 			"usage=%d infra=%d: credit must never exceed the usage-plane charges", tc.usage, tc.infra)
 	}
+}
+
+// 🔴 THE FORECAST'S STRADDLE MUST PRICE THE APP'S PLAN, NOT THE FLAT BASE.
+//
+// unresolvedOneTimeChargeIncrementMicros derives its unit from
+// resolveBaseFeeMicros(charge.Plan) and then adds a FULL unit when the grace
+// straddles the boundary (accountbill.go, the `amount += unitMicros` and the
+// D1d `amount = unitMicros` narrowing). At the default plan the plan base and
+// the flat constant are the same $20, so every existing forecast assertion
+// passes whether or not the plan is read — a revert to BaseFeeMicros survives.
+//
+// A BUSINESS row ($50) separates them. Mutation-proved 2026-09-13 by reverting
+// resolveBaseFeeMicros to return BaseFeeMicros: this test fails, the rest pass.
+func TestUnresolvedOneTimeChargeIncrement_StraddlePricesThePlan(t *testing.T) {
+	t.Parallel()
+
+	// Created 2 days before the boundary with a 3-day grace: the grace crosses
+	// it, so the full unit is added on top of the prorated slice.
+	created := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
+	activated := time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)
+	projectedStart := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+
+	raw := func(plan Plan) UnresolvedOneTimeChargeRaw {
+		return UnresolvedOneTimeChargeRaw{
+			Kind:           UnresolvedOneTimeChargeCreationBase,
+			ChargeID:       uuid.New(),
+			AppID:          uuid.New(),
+			ChargeAt:       created,
+			GraceExpiresAt: GraceExpiry(created),
+			ActivatedAt:    activated,
+			Plan:           plan,
+		}
+	}
+
+	pro, err := unresolvedOneTimeChargeIncrementMicros(raw(PlanPro), projectedStart)
+	require.NoError(t, err)
+	business, err := unresolvedOneTimeChargeIncrementMicros(raw(PlanBusiness), projectedStart)
+	require.NoError(t, err)
+
+	require.Positive(t, pro, "the fixture must forecast something, or it cannot discriminate")
+	require.Equal(t, TermsFor(PlanPro).BaseFeeMicros, BaseFeeMicros,
+		"this test assumes Pro IS the flat base; if that changes, so must the reasoning below")
+
+	// 🔴 THE DISCRIMINATING ASSERTION. Business is 2.5× Pro's base, so its
+	// forecast increment must exceed Pro's. A site that reads the flat constant
+	// returns the SAME number for both.
+	require.Greater(t, business, pro,
+		"a Business app's forecast increment must exceed a Pro app's — the flat base was used")
+	// NOT asserted as an exact ratio: proration ROUNDS, so scaling one rounded
+	// slice by the base ratio lands a micro off the other. (I wrote that
+	// assertion twice in this session and it failed both times.) The
+	// strict-greater check above is what kills the mutant; the exact figure is
+	// pinned where it is computed, not re-derived here.
+	require.EqualValues(t, business-pro,
+		TermsFor(PlanBusiness).BaseFeeMicros-TermsFor(PlanPro).BaseFeeMicros+
+			(ProratedBaseMicros(TermsFor(PlanBusiness).BaseFeeMicros, created, projectedStart.AddDate(0, -1, 0), projectedStart)-
+				ProratedBaseMicros(TermsFor(PlanPro).BaseFeeMicros, created, projectedStart.AddDate(0, -1, 0), projectedStart)),
+		"the gap between the two forecasts is the gap between their plan bases")
 }

@@ -36,8 +36,9 @@ const (
 	// card. api-platform surfaces it as HTTP 402.
 	CodePaymentRequired Code = "PAYMENT_REQUIRED"
 	// CodePlanNotAvailable refuses a billing plan the engine cannot yet bill
-	// correctly: SetAppPlan returns it for `free` / `business` until the charge
-	// legs are plan-aware (billing-engine#202 PR-2). See cycle.SetAppPlan.
+	// correctly: SetAppPlan returns it for `free` / `business` until plan
+	// changes and the per-app module allowance are billed (billing-engine#202).
+	// See cycle.SetAppPlan.
 	CodePlanNotAvailable Code = "PLAN_NOT_AVAILABLE"
 )
 

@@ -451,7 +451,7 @@ func TestListNewCreationCharges_Integration_PendingAddonUsesAccountFIFO(t *testi
 	charge := resp.Charges[0]
 	require.Equal(t, appA, charge.AppID)
 	require.Equal(t, usage.NewCreationChargeStatusPending, charge.Status)
-	require.Equal(t, usage.CreationChargeBaseMicros(createdAt, periodStart, periodEnd), charge.AmountMicros)
+	require.Equal(t, usage.CreationChargeBaseMicros(usage.BaseFeeMicros, createdAt, periodStart, periodEnd), charge.AmountMicros)
 	require.Equal(t, charge.AmountMicros, charge.BaseFeeMicros)
 	require.Equal(t, perAppOverCount, charge.AddonModuleCount,
 		"the existing frozen per-app count surface remains unchanged")

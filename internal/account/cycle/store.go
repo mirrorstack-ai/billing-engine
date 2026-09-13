@@ -791,6 +791,8 @@ type ModuleOverageCandidate struct {
 type AppModuleCount struct {
 	AppID       uuid.UUID
 	ModuleCount int
+	// Plan prices the app's advance base (migration 075, core-v2#1412).
+	Plan usage.Plan
 }
 
 // AppBaseSnapshot is the in-memory form of a ms_billing.app_base_snapshots
@@ -2785,7 +2787,7 @@ func (s *pgxStore) LiveAppsCreatedBefore(ctx context.Context, accountID uuid.UUI
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount)})
+		out = append(out, AppModuleCount{AppID: id, ModuleCount: int(r.ModuleCount), Plan: usage.Plan(r.Plan)})
 	}
 	return out, nil
 }

@@ -143,9 +143,9 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	}
 
 	// The next-period recurring base, decomposed by owning app. Only the CURRENT
-	// live window forecasts one (a frozen window's projection is the flat per-app
+	// live window forecasts one (a frozen window's projection is each app's plan
 	// base and nothing else), so a historical bill reads no shares and allocates
-	// the flat fee directly below.
+	// that base directly below.
 	var recurringShares []AppRecurringFeeShare
 	if periodID == "" {
 		store, ok := s.store.(interface {
@@ -413,7 +413,9 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 }
 
 // unresolvedOneTimeChargeIncrementMicros mirrors the immutable D1d charge shape
-// shared by creation base and module-timer grace legs:
+// shared by creation base and module-timer grace legs. A creation-base row
+// prices at its app's plan base (charge.Plan), which is also the full-period
+// base a frozen attempt's snapshot is compared with.
 //   - charge day → its anchored period end, prorated at the unit fee;
 //   - plus one full unit when grace straddles into the following period;
 //   - if activation closed the first period, forgive it and retain only a
@@ -438,10 +440,11 @@ func unresolvedOneTimeChargeIncrementMicros(
 	charge UnresolvedOneTimeChargeRaw,
 	projectedPeriodStart time.Time,
 ) (int64, error) {
+	appBaseMicros := resolveBaseFeeMicros(charge.Plan)
 	var unitMicros int64
 	switch charge.Kind {
 	case UnresolvedOneTimeChargeCreationBase:
-		unitMicros = BaseFeeMicros
+		unitMicros = appBaseMicros
 	case UnresolvedOneTimeChargeModuleTimer:
 		unitMicros = ModuleOverageFeeMicros
 	default:
@@ -475,13 +478,13 @@ func unresolvedOneTimeChargeIncrementMicros(
 					charge.FrozenStraddleBaseMicros <= 0 {
 					return 0, billing.Internal("frozen one-time charge straddle snapshot is invalid", nil)
 				}
-				if charge.FrozenStraddleBaseMicros == BaseFeeMicros {
+				if charge.FrozenStraddleBaseMicros == appBaseMicros {
 					fullPeriodStart = charge.FrozenStraddlePeriodStart
 					fullPeriodEnd = charge.FrozenStraddlePeriodEnd
 					fullPeriodFound = true
 				}
 			}
-			if !fullPeriodFound && charge.FrozenSnapshotBaseMicros == BaseFeeMicros {
+			if !fullPeriodFound && charge.FrozenSnapshotBaseMicros == appBaseMicros {
 				fullPeriodStart = charge.FrozenSnapshotPeriodStart
 				fullPeriodEnd = charge.FrozenSnapshotPeriodEnd
 				fullPeriodFound = true
