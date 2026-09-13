@@ -42,8 +42,19 @@ type PlanTerms struct {
 	// DeployAllowanceMicros is the 部署費用 (tenant SSR compute) the base fee
 	// covers, as the amount a customer would otherwise be charged.
 	DeployAllowanceMicros int64 `json:"deploy_allowance_micros"`
-	// DeployCapHard: past the 部署費用 allowance the site pauses and nothing is
-	// charged (Free). Otherwise the overage is billed.
+	// DeployCapHard: past the 部署費用 allowance the site would pause and nothing
+	// be charged.
+	//
+	// 🔴 NO PLAN SETS THIS, AND THE OWNER'S RULE IS THAT NONE EVER SHOULD
+	// (2026-09-13, core-v2#1412). Free used to: it paused at its $1 allowance.
+	// That punished an app for usage it was already paying for — modules are
+	// charged by usage regardless of plan — so Free now bills its extras at the
+	// same rates as Pro and simply includes less before charging starts.
+	//
+	// The field stays because the SHAPE is still meaningful (a future plan
+	// could cap), but api-platform reads this through GetAppPlan, so leaving
+	// Free at true would let a pause reach the console after the product
+	// decision that there is no pause. A test asserts every plan is false.
 	DeployCapHard bool `json:"deploy_cap_hard"`
 	// MaxApps is how many apps on this plan one account may have; Unlimited
 	// means no ceiling.
@@ -60,9 +71,11 @@ var planTerms = map[Plan]PlanTerms{
 		ModulesIncluded:       3,
 		DomainsIncluded:       0,
 		DeployAllowanceMicros: 1_000_000, // $1
-		DeployCapHard:         true,
-		MaxApps:               1,
-		PersonalOnly:          true,
+		// Never pauses — see DeployCapHard. Past $1 the overage is billed at
+		// the same rate Pro pays.
+		DeployCapHard: false,
+		MaxApps:       1,
+		PersonalOnly:  true,
 	},
 	PlanPro: {
 		Plan:                  PlanPro,

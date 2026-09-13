@@ -17,7 +17,7 @@ func TestPlanTermsMatchTheOwnersMatrix(t *testing.T) {
 		usage.PlanFree: {
 			Plan: usage.PlanFree, BaseFeeMicros: 0,
 			ModulesIncluded: 3, DomainsIncluded: 0, DeployAllowanceMicros: 1_000_000,
-			DeployCapHard: true, MaxApps: 1, PersonalOnly: true,
+			MaxApps: 1, PersonalOnly: true,
 		},
 		usage.PlanPro: {
 			Plan: usage.PlanPro, BaseFeeMicros: 20_000_000,
@@ -33,6 +33,26 @@ func TestPlanTermsMatchTheOwnersMatrix(t *testing.T) {
 	for plan, w := range want {
 		if got := usage.TermsFor(plan); got != w {
 			t.Errorf("TermsFor(%s) = %+v, want %+v", plan, got, w)
+		}
+	}
+}
+
+// TestNoPlanPauses pins the owner's never-pause rule at its source
+// (2026-09-13, core-v2#1412). Free used to pause at its $1 部署費用 allowance,
+// which punished an app for usage it was already paying for; it now bills the
+// overage at the same rate Pro pays.
+//
+// 🔴 THIS IS ASSERTED OVER EVERY PLAN, NOT JUST FREE. api-platform reads these
+// terms through GetAppPlan and the console renders from them, so a single plan
+// left at true would put a "paused" state back in front of a customer after the
+// decision that no such state exists. A new plan added with a hard cap has to
+// fail here first.
+func TestNoPlanPauses(t *testing.T) {
+	t.Parallel()
+
+	for _, plan := range []usage.Plan{usage.PlanFree, usage.PlanPro, usage.PlanBusiness} {
+		if usage.TermsFor(plan).DeployCapHard {
+			t.Errorf("TermsFor(%s).DeployCapHard = true; no plan may pause (owner 2026-09-13)", plan)
 		}
 	}
 }

@@ -1089,9 +1089,22 @@ func (s *Service) adoptFinalizedProrationInvoice(
 // the credit wallet instead of minting a Stripe invoice. Co-created over-module
 // overage remains for the existing per-module overage sweep. The store draws the
 // full base amount and, ONLY if the wallet fully covers it, freezes the display
-// snapshot(s) and arms the one-shot guard, all in one transaction. created_at +
-// the activation anchor are immutable, so this pricing is deterministic across
-// retries.
+// snapshot(s) and arms the one-shot guard, all in one transaction.
+//
+// 🔴 THE PRICING INPUTS ARE NO LONGER ALL IMMUTABLE, AND THAT IS DELIBERATE.
+// This comment used to claim determinism from created_at + the activation
+// anchor alone. Those two are still immutable — but since migration 075 the
+// price also depends on apps.plan, which is MUTABLE and is read unlocked
+// (AppMirror, ~:292). So a plan change racing this sweep can land either side
+// of the read.
+//
+// That is correct, and the resolution is NOT to re-price from the locked row.
+// The plan read at sweep time IS the price for this creation charge; a
+// concurrent plan change is settled separately by the plan-change ledger
+// (migration 076, PR-2b), which charges the DIFFERENCE between the bases for
+// the remaining days. Re-pricing here from a later-locked plan would charge
+// that delta a second time — once in this base and once in the ledger — so an
+// upgrade racing creation would be billed twice.
 func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app AppMirror, activatedAt time.Time) (*ProrationResult, bool, error) {
 	// The app's own plan base (migration 075, core-v2#1412) prices its creation charge.
 	planBase := usage.TermsFor(app.Plan).BaseFeeMicros
