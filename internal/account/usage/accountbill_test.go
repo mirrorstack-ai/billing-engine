@@ -1554,3 +1554,48 @@ func TestGetAccountBill_UsageDeductionNetsTheUsagePlaneByPlan(t *testing.T) {
 	}
 	require.EqualValues(t, 16_500_000, resp.UsageDeductionTotalMicros)
 }
+
+// TestGetAccountBill_UsageDeductionFollowsTheMirroredPlan pins WHICH plan's
+// allowance applies (be#227 review): the roster's CURRENT plan
+// (ms_billing.apps.plan). An upgrade moves the roster at once (be#208 charges
+// its prorated fee immediately), so the new plan's allowance applies to the
+// WHOLE period — the owner's "never prorated"; a downgrade moves the roster
+// only at the boundary (ApplyDuePlanChanges), and the boundary reads the
+// allowance BEFORE applying due changes, so the old plan's allowance nets the
+// period that is closing and the new plan's applies from the next.
+func TestGetAccountBill_UsageDeductionFollowsTheMirroredPlan(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	acct := uuid.New()
+	store.accounts[owner] = acct
+	app := uuid.New()
+	old := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: old, Plan: usage.PlanPro}
+	store.appBillRowsByApp[app] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "renders.count", "", 12_000_000)} // $12 of module usage
+	store.usageAppIDs = []uuid.UUID{app}
+	read := func() (*usage.GetAccountBillResponse, int64) {
+		t.Helper()
+		resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
+		require.NoError(t, err)
+		allowance, err := newService(store).AccountUsageAllowanceMicros(context.Background(), acct, resp.PeriodStart, resp.PeriodEnd)
+		require.NoError(t, err)
+		require.Equal(t, resp.UsageDeductionTotalMicros, allowance, "bill and boundary agree")
+		return resp, allowance
+	}
+	// On Pro: $5 of the $12 is deducted.
+	_, got := read()
+	require.EqualValues(t, 5_000_000, got)
+	// Mid-period UPGRADE to Business: the roster moves at once → $12 fully
+	// covered by the $15 allowance for the whole period, not a prorated share.
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: old, Plan: usage.PlanBusiness}
+	_, got = read()
+	require.EqualValues(t, 12_000_000, got, "the new plan's allowance applies whole-period")
+	// A scheduled DOWNGRADE to Free leaves the roster on Business until the
+	// boundary applies it: this period still nets $12 …
+	_, got = read()
+	require.EqualValues(t, 12_000_000, got, "the old plan's allowance until the boundary")
+	// … and once the boundary has applied it, the next period nets Free's $1.
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: old, Plan: usage.PlanFree}
+	_, got = read()
+	require.EqualValues(t, 1_000_000, got, "the downgraded plan's allowance from the next period")
+}
