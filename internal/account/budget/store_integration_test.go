@@ -252,11 +252,19 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.EqualValues(t, 15_648_284, budget.ExposureLimitMicros(cfg, sig), "S 0: the curve itself (S2 k=2)")
 
 	// --- the three demerit transitions, one DB statement each -------------
-	// Closes are period boundaries: whole seconds, from ONE base, so "the
-	// same close again" is the same instant (a fresh time.Now() per call was
-	// a later instant, and Postgres keeps microseconds).
-	base := time.Now().UTC().Truncate(time.Second)
+	// Closes are period boundaries in the PAST (a close never lies ahead of
+	// the failures it judges): whole seconds from ONE base a day ago, so "the
+	// same close again" is the same instant (Postgres keeps microseconds).
+	// The failure instants the close compares against are set explicitly
+	// below — the fixture owns the clock, as the close transition's rule is
+	// "failed before the previous close" vs "failed inside this cycle".
+	base := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)
 	closeAt := func(h int) time.Time { return base.Add(time.Duration(h) * time.Hour) }
+	failedAt := func(id string, at time.Time) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `UPDATE ms_billing.invoices SET demerit_failed_at = $2 WHERE stripe_invoice_id = $1`, id, at)
+		require.NoError(t, err)
+	}
 	// FAIL: the invoice's first failure is +2, once.
 	applied, err := store.ApplyDemeritOnFailure(ctx, "in_exposure_c")
 	require.NoError(t, err)
@@ -264,6 +272,7 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_c")
 	require.NoError(t, err)
 	require.False(t, applied, "a repeated payment_failed for the same invoice charges nothing")
+	failedAt("in_exposure_c", base.Add(30*time.Minute)) // failed inside cycle 1 (before close 1)
 	sig, err = store.ExposureSignals(ctx, acct)
 	require.NoError(t, err)
 	require.InDelta(t, 2, sig.Demerit, 1e-9)
@@ -320,6 +329,7 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_d")
 	require.NoError(t, err)
 	require.True(t, applied)
+	failedAt("in_exposure_d", closeAt(3).Add(30*time.Minute)) // failed inside cycle 4 (after close 3)
 	sig, err = store.ExposureSignals(ctx, acct)
 	require.NoError(t, err)
 	require.EqualValues(t, 300_000_000, sig.ArrearsMicros, "$300 unpaid, counted as money")
@@ -358,11 +368,15 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_void")
 	require.NoError(t, err)
 	require.True(t, applied, "a failure event on a void invoice still latches (Stripe may deliver it) …")
-	_, err = pool.Exec(ctx, `UPDATE ms_billing.accounts SET demerit_score = 0 WHERE id = $1`, acct.String())
+	failedAt("in_exposure_void", closeAt(8).Add(30*time.Minute))
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.accounts SET demerit_score = 1 WHERE id = $1`, acct.String())
 	require.NoError(t, err)
 	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(9))
 	require.NoError(t, err)
-	require.Zero(t, d, "… but a void is never unpaid, so it never costs a cycle")
+	require.InDelta(t, 1, d, 1e-9, "… the cycle it failed in is not clean …")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(10))
+	require.NoError(t, err)
+	require.Zero(t, d, "… but a void is never unpaid, so it never costs a cycle: the next close is clean")
 	sig, err = store.ExposureSignals(ctx, acct)
 	require.NoError(t, err)
 	require.Equal(t, 3, sig.PaidInvoices, "k counts paid invoices only; the void is not one")
