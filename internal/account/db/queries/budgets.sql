@@ -12,25 +12,27 @@
 -- the row so the caller can echo the persisted (deduped+sorted) percents.
 -- name: UpsertBudget :one
 INSERT INTO ms_billing.budgets (
-    scope, scope_id, account_id, limit_micros, alert_percents, active
+    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage
 ) VALUES (
-    $1, $2, $3, $4, $5, $6
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 )
-ON CONFLICT (scope, scope_id)
+ON CONFLICT (scope, scope_id, category, template_key)
 DO UPDATE SET
     account_id     = EXCLUDED.account_id,
     limit_micros   = EXCLUDED.limit_micros,
     alert_percents = EXCLUDED.alert_percents,
-    active         = EXCLUDED.active
-RETURNING id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at;
+    active         = EXCLUDED.active,
+    hard_cap       = EXCLUDED.hard_cap,
+    allow_overage  = EXCLUDED.allow_overage
+RETURNING *;
 
 -- GetBudget resolves the budget for a (scope, scope_id), or no row when none
 -- exists. The ingest-path hook uses it to skip evaluation when an app has no
 -- budget; GetBudgetStatus uses it to read the cap + thresholds.
 -- name: GetBudget :one
-SELECT id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at
+SELECT *
 FROM ms_billing.budgets
-WHERE scope = $1 AND scope_id = $2;
+WHERE scope = $1 AND scope_id = $2 AND category = $3 AND template_key = $4;
 
 -- AppPeriodSpendMicros sums the app's current-period spend in micro-dollars:
 -- Σ usage_events.value × metric_definitions.unit_price_micros for the app in
@@ -84,6 +86,98 @@ LEFT JOIN ms_billing.metric_definitions md
 -- usage_event (account_id IS NOT NULL) and read that account's activated_at. This
 -- agrees with the ingest-path budget window, which anchors on the SAME payer
 -- account. No attributed usage yet (or a NULL anchor) → the Go layer falls back to
+-- AppPeriodAISpendMicros is AppPeriodSpendMicros restricted to the app's AI
+-- events (infra.ai.*) and priced the way the bill prices them (migration 018):
+-- the per-(metric, model) row of metric_model_prices is authoritative when the
+-- event carries a model, else the catalog row keyed by the event's module_id
+-- (the platform-infra sentinel for RecordInfraUsage events), else 0. A RETIRED
+-- model row (active = false) still prices at its own rate here: this feeds a
+-- CAP check, where pricing a retired model at a cheaper fallback would let
+-- spend slip under the ceiling — the rollup separately fails loud on it.
+-- Same window, same dev_served exclusion, same subject-aggregation shape as
+-- AppPeriodSpendMicros so category='ai' and category='all' agree on the events.
+-- @template_key '' = the app's whole AI spend; a key = that template's events
+-- only (usage_events.template_key, stamped by api-platform from the
+-- conversation — migration 084).
+-- name: AppPeriodAISpendMicros :one
+WITH base_events AS (
+    SELECT
+        module_id, metric, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        value
+    FROM ms_billing.usage_events
+    WHERE app_id = $1
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+      AND dev_served = false
+      AND metric LIKE 'infra.ai.%'
+      AND (@template_key::text = '' OR template_key = @template_key::text)
+),
+billable_events AS (
+    SELECT module_id, metric, model, value AS billable_value
+    FROM base_events
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, model,
+        MAX(value)::numeric AS billable_value
+    FROM base_events
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, model, subject
+)
+SELECT COALESCE(SUM(e.billable_value * COALESCE(mp.unit_price_micros, md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM billable_events e
+LEFT JOIN ms_billing.metric_model_prices mp
+    ON mp.metric = e.metric AND mp.model = e.model AND e.model <> ''
+LEFT JOIN ms_billing.metric_definitions md
+    ON md.module_id = e.module_id AND md.metric = e.metric;
+
+-- AccountPeriodAISpendMicros is the account-level twin of AppPeriodAISpendMicros
+-- (scenario 2: the console operator agent budgeted per personal account or per
+-- org, whose events carry account_id). Same window, exclusions and per-model
+-- pricing.
+-- name: AccountPeriodAISpendMicros :one
+WITH base_events AS (
+    SELECT
+        module_id, metric, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+      AND dev_served = false
+      AND metric LIKE 'infra.ai.%'
+),
+billable_events AS (
+    SELECT module_id, metric, model, value AS billable_value
+    FROM base_events
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, model,
+        MAX(value)::numeric AS billable_value
+    FROM base_events
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, model, subject
+)
+SELECT COALESCE(SUM(e.billable_value * COALESCE(mp.unit_price_micros, md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM billable_events e
+LEFT JOIN ms_billing.metric_model_prices mp
+    ON mp.metric = e.metric AND mp.model = e.model AND e.model <> ''
+LEFT JOIN ms_billing.metric_definitions md
+    ON md.module_id = e.module_id AND md.metric = e.metric;
+
+-- BudgetOrgAccountID resolves an org-scoped budget to the org's own billing
+-- account (the account whose events the console agent bills in an org-context
+-- conversation). No row = the org has no account yet (a lazy org): its AI
+-- spend is 0 and its anchor is the calendar month.
+-- name: BudgetOrgAccountID :one
+SELECT id
+FROM ms_billing.accounts
+WHERE owner_kind = 'org' AND owner_org_id = $1
+LIMIT 1;
+
 -- anchor day 1 (UTC calendar month). Returns at most one row.
 -- name: AppAccountActivatedAt :one
 SELECT a.activated_at

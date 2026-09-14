@@ -220,7 +220,7 @@ INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
     billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
-    dev_served
+    dev_served, template_key
 ) VALUES (
     @event_id::text, sqlc.narg(account_id)::uuid, @app_id::uuid,
     @module_id::uuid, @metric::text, @kind::ms_billing.metric_kind,
@@ -230,7 +230,7 @@ INSERT INTO ms_billing.usage_events (
     sqlc.narg(occurred_at)::timestamptz, @billable_at::timestamptz,
     sqlc.narg(aggregation_key)::text,
     @payload_fingerprint::bytea, @occurrence_policy::text,
-    @dev_served::boolean
+    @dev_served::boolean, sqlc.narg(template_key)::text
 )
 ON CONFLICT (event_id) DO NOTHING;
 

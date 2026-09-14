@@ -590,6 +590,10 @@ type UsageEvent struct {
 	OwnerOrgID         uuid.UUID
 	Model              string
 	ModuleVersion      string
+	// TemplateKey is the ai-assistant template an infra.ai.* event was
+	// produced under (migration 084), stamped by api-platform from the
+	// conversation; "" → NULL for every other event.
+	TemplateKey string
 	// DevServed is the migration-073 tunnel flag, carried verbatim from the
 	// RecordUsageRequest (or false on every platform-measured path). See
 	// RecordUsageRequest.DevServed for why it is stored on the fact and why it
@@ -998,6 +1002,7 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 		RecordedAt:    ev.RecordedAt,
 		Model:         nullableModel(ev.Model),
 		ModuleVersion: nullableModuleVersion(ev.ModuleVersion),
+		TemplateKey:   nullableTemplateKey(ev.TemplateKey),
 		//nolint:gosec // a small monotonic schema version, not caller-supplied
 		ObservationVersion: int16(ev.ObservationVersion),
 		Subject:            nullableText(ev.Subject),
@@ -1248,6 +1253,7 @@ func (s *pgxStore) InsertUsageObservation(
 		RecordedAt:    ev.RecordedAt,
 		Model:         nullableModel(ev.Model),
 		ModuleVersion: nullableModuleVersion(ev.ModuleVersion),
+		TemplateKey:   nullableTemplateKey(ev.TemplateKey),
 		//nolint:gosec // a small monotonic schema version, not caller-supplied
 		ObservationVersion: int16(ev.ObservationVersion),
 		Subject:            nullableText(ev.Subject),
@@ -2234,6 +2240,14 @@ func nullableModel(model string) pgtype.Text {
 // the nullable TEXT usage_events.module_version column: an empty version
 // (every event that doesn't report one) → SQL NULL, matching nullableModel's
 // contract for the analogous model column.
+// nullableTemplateKey maps "" (no template) to SQL NULL.
+func nullableTemplateKey(k string) pgtype.Text {
+	if k == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: k, Valid: true}
+}
+
 func nullableModuleVersion(version string) pgtype.Text {
 	if version == "" {
 		return pgtype.Text{} // Valid: false → NULL

@@ -602,6 +602,14 @@ type MsBillingBudget struct {
 	Active        bool                 `json:"active"`
 	CreatedAt     time.Time            `json:"created_at"`
 	UpdatedAt     time.Time            `json:"updated_at"`
+	// Which spend the cap measures: all (every usage event) or ai (infra.ai.* only, priced per model). One row per (scope, scope_id, category, template_key).
+	Category string `json:"category"`
+	// ai-assistant template this AI cap is for; '' = the scope's AI-wide row. Text key as the module stores it.
+	TemplateKey string `json:"template_key"`
+	// false = alert-only; true = GetBudgetStatus reports exhausted at spend >= limit and the consumer refuses further work (the agent gate).
+	HardCap bool `json:"hard_cap"`
+	// Customer opt-out of a hard cap: alerts still fire, exhausted stays false. Never lifts the risk-graded exposure limit.
+	AllowOverage bool `json:"allow_overage"`
 }
 
 type MsBillingBudgetAlert struct {
@@ -939,6 +947,8 @@ type MsBillingUsageEvent struct {
 	OccurrencePolicy   string              `json:"occurrence_policy"`
 	// Migration 073: the event was authenticated by a module live-tunnel session secret, not its deployed credential. Recorded and priced, never charged. A property of the fact, immutable like the rest of the row.
 	DevServed bool `json:"dev_served"`
+	// ai-assistant template an infra.ai.* event was produced under (stamped by api-platform from the conversation); NULL for every other event.
+	TemplateKey pgtype.Text `json:"template_key"`
 }
 
 type MsBillingUsageObservationRejection struct {

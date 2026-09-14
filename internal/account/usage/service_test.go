@@ -1328,7 +1328,11 @@ type fakeBudgetEvaluator struct {
 	gotTo   time.Time
 }
 
-func (f *fakeBudgetEvaluator) EvaluateAppBudget(_ context.Context, appID uuid.UUID, from, to time.Time) ([]int, error) {
+func (f *fakeBudgetEvaluator) EvaluateAccountBudget(_ context.Context, _, _ uuid.UUID, _, _ time.Time) ([]int, error) {
+	return nil, nil
+}
+
+func (f *fakeBudgetEvaluator) EvaluateAppBudget(_ context.Context, appID uuid.UUID, _ string, from, to time.Time) ([]int, error) {
 	f.called = true
 	f.gotApp = appID
 	f.gotFrom = from

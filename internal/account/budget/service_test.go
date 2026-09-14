@@ -29,8 +29,15 @@ type fakeStore struct {
 
 	// captured window AppPeriodSpendMicros was called with, so a test can assert
 	// the anchored [start, end) reached the store unchanged.
-	gotSpendStart time.Time
-	gotSpendEnd   time.Time
+	gotSpendStart    time.Time
+	gotSpendEnd      time.Time
+	gotSpendCategory budget.Category
+	gotSpendTemplate string
+	gotSpendAccount  uuid.UUID
+
+	spendBy      map[string]int64        // "category/template" → spend (overrides spend)
+	accountSpend int64                   // AccountPeriodAISpendMicros result
+	orgAccounts  map[uuid.UUID]uuid.UUID // org id → its billing account
 
 	errGet    error
 	errUpsert error
@@ -42,13 +49,18 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		budgets: map[string]budget.Budget{},
-		alerts:  map[alertKey]budget.BudgetAlert{},
+		budgets:     map[string]budget.Budget{},
+		alerts:      map[alertKey]budget.BudgetAlert{},
+		spendBy:     map[string]int64{},
+		orgAccounts: map[uuid.UUID]uuid.UUID{},
 	}
 }
 
-func budgetKey(scope budget.Scope, scopeID uuid.UUID) string {
-	return string(scope) + "/" + scopeID.String()
+func budgetKey(scope budget.Scope, scopeID uuid.UUID, cat budget.Category, tpl string) string {
+	if cat == "" {
+		cat = budget.CategoryAll
+	}
+	return string(scope) + "/" + scopeID.String() + "/" + string(cat) + "/" + tpl
 }
 
 func (f *fakeStore) UpsertBudget(_ context.Context, b budget.Budget) (budget.Budget, error) {
@@ -58,24 +70,52 @@ func (f *fakeStore) UpsertBudget(_ context.Context, b budget.Budget) (budget.Bud
 	if b.ID == uuid.Nil {
 		b.ID = uuid.New()
 	}
-	f.budgets[budgetKey(b.Scope, b.ScopeID)] = b
+	f.budgets[budgetKey(b.Scope, b.ScopeID, b.Category, b.TemplateKey)] = b
 	return b, nil
 }
 
-func (f *fakeStore) GetBudget(_ context.Context, scope budget.Scope, scopeID uuid.UUID) (budget.Budget, bool, error) {
+func (f *fakeStore) GetBudget(_ context.Context, scope budget.Scope, scopeID uuid.UUID, cat budget.Category, tpl string) (budget.Budget, bool, error) {
 	if f.errGet != nil {
 		return budget.Budget{}, false, f.errGet
 	}
-	b, ok := f.budgets[budgetKey(scope, scopeID)]
+	b, ok := f.budgets[budgetKey(scope, scopeID, cat, tpl)]
 	return b, ok, nil
 }
 
-func (f *fakeStore) AppPeriodSpendMicros(_ context.Context, _ uuid.UUID, start, end time.Time) (int64, error) {
+// AppPeriodSpendMicros answers f.spend, or a per-(category, template) figure
+// from f.spendBy when set — so a precedence test can give the template's own
+// events a different total from the app's AI-wide total.
+func (f *fakeStore) AppPeriodSpendMicros(_ context.Context, _ uuid.UUID, cat budget.Category, tpl string, start, end time.Time) (int64, error) {
 	f.gotSpendStart, f.gotSpendEnd = start, end
+	f.gotSpendCategory, f.gotSpendTemplate = cat, tpl
 	if f.errSpend != nil {
 		return 0, f.errSpend
 	}
+	if v, ok := f.spendBy[string(cat)+"/"+tpl]; ok {
+		return v, nil
+	}
 	return f.spend, nil
+}
+
+func (f *fakeStore) AccountPeriodAISpendMicros(_ context.Context, accountID uuid.UUID, start, end time.Time) (int64, error) {
+	f.gotSpendStart, f.gotSpendEnd = start, end
+	f.gotSpendAccount = accountID
+	if f.errSpend != nil {
+		return 0, f.errSpend
+	}
+	return f.accountSpend, nil
+}
+
+func (f *fakeStore) OrgAccountID(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	id, ok := f.orgAccounts[orgID]
+	return id, ok, nil
+}
+
+func (f *fakeStore) AccountAnchorDay(_ context.Context, _ uuid.UUID) (int, error) {
+	if f.anchorDay != 0 {
+		return f.anchorDay, nil
+	}
+	return 1, nil
 }
 
 // AppAnchorDay returns the configured app anchor day, defaulting to 1 (the UTC
@@ -151,11 +191,31 @@ func seedBudget(store *fakeStore, appID uuid.UUID, limit int64, percents []int) 
 		ID:            uuid.New(),
 		Scope:         budget.ScopeApp,
 		ScopeID:       appID,
+		Category:      budget.CategoryAll,
 		LimitMicros:   limit,
 		AlertPercents: percents,
 		Active:        true,
 	}
-	store.budgets[budgetKey(budget.ScopeApp, appID)] = b
+	store.budgets[budgetKey(budget.ScopeApp, appID, budget.CategoryAll, "")] = b
+	return b
+}
+
+// seedAIBudget installs an active AI cap (app-wide when tpl == "", else the
+// template's own) with a hard cap, and returns it.
+func seedAIBudget(store *fakeStore, scope budget.Scope, id uuid.UUID, tpl string, limit int64, hard, overage bool) budget.Budget {
+	b := budget.Budget{
+		ID:            uuid.New(),
+		Scope:         scope,
+		ScopeID:       id,
+		Category:      budget.CategoryAI,
+		TemplateKey:   tpl,
+		LimitMicros:   limit,
+		AlertPercents: []int{80, 100},
+		Active:        true,
+		HardCap:       hard,
+		AllowOverage:  overage,
+	}
+	store.budgets[budgetKey(scope, id, budget.CategoryAI, tpl)] = b
 	return b
 }
 
@@ -245,12 +305,12 @@ func TestEvaluateAppBudget_CrossesEightyThenHundred_Idempotent(t *testing.T) {
 
 	// Spend at 80% of the cap → only the 80 threshold crosses.
 	store.spend = 800_000
-	fired, err := svc.EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err := svc.EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Equal(t, []int{80}, fired)
 
 	// Same spend again → idempotent, nothing new recorded.
-	fired, err = svc.EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err = svc.EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired, "re-evaluating the same spend records nothing")
 	require.Len(t, store.alerts, 1)
@@ -258,7 +318,7 @@ func TestEvaluateAppBudget_CrossesEightyThenHundred_Idempotent(t *testing.T) {
 	// Spend climbs to the cap → only the 100 threshold is newly crossed (80
 	// is already recorded and stays idempotent).
 	store.spend = 1_000_000
-	fired, err = svc.EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err = svc.EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Equal(t, []int{100}, fired)
 	require.Len(t, store.alerts, 2)
@@ -271,7 +331,7 @@ func TestEvaluateAppBudget_NotCrossed_NoAlert(t *testing.T) {
 	store.spend = 500_000 // 50% — below the lowest threshold
 	start, end := period()
 
-	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired)
 	require.Empty(t, store.alerts)
@@ -284,7 +344,7 @@ func TestEvaluateAppBudget_MultipleThresholdsInOneJump(t *testing.T) {
 	store.spend = 1_200_000 // 120% — every threshold crosses at once
 	start, end := period()
 
-	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Equal(t, []int{50, 80, 100}, fired)
 	require.Len(t, store.alerts, 3)
@@ -293,7 +353,7 @@ func TestEvaluateAppBudget_MultipleThresholdsInOneJump(t *testing.T) {
 func TestEvaluateAppBudget_NoBudget_NoOp(t *testing.T) {
 	store := newFakeStore()
 	start, end := period()
-	fired, err := newService(store).EvaluateAppBudget(context.Background(), uuid.New(), start, end)
+	fired, err := newService(store).EvaluateAppBudget(context.Background(), uuid.New(), "", start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired)
 	require.Empty(t, store.alerts)
@@ -304,11 +364,11 @@ func TestEvaluateAppBudget_InactiveBudget_NoOp(t *testing.T) {
 	appID := uuid.New()
 	b := seedBudget(store, appID, 1_000_000, []int{80})
 	b.Active = false
-	store.budgets[budgetKey(budget.ScopeApp, appID)] = b
+	store.budgets[budgetKey(budget.ScopeApp, appID, budget.CategoryAll, "")] = b
 	store.spend = 2_000_000 // would cross if active
 	start, end := period()
 
-	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired)
 	require.Empty(t, store.alerts, "inactive budget is not evaluated")
@@ -323,7 +383,7 @@ func TestEvaluateAppBudget_ZeroLimit_AnySpendCrosses(t *testing.T) {
 	store.spend = 1
 	start, end := period()
 
-	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Equal(t, []int{80, 100}, fired)
 }
@@ -335,7 +395,7 @@ func TestEvaluateAppBudget_PropagatesSpendError(t *testing.T) {
 	store.errSpend = errors.New("boom")
 	start, end := period()
 
-	_, err := newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	_, err := newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.Error(t, err) // raw error — the caller (usage ingest) logs it best-effort
 }
 
@@ -351,12 +411,12 @@ func TestEvaluateAppBudget_LargeLimitNoOverflow(t *testing.T) {
 	start, end := period()
 
 	store.spend = limit*80/100 - 1 // one micro under the 80% target
-	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err := newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired, "just under 80%% must not cross")
 
 	store.spend = limit * 80 / 100 // exactly at the 80% target
-	fired, err = newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	fired, err = newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 	require.Equal(t, []int{80}, fired, "at the 80%% target crosses 80 only")
 }
@@ -373,7 +433,7 @@ func TestEvaluateAppBudget_PartialBatchFailureRecordsNothing(t *testing.T) {
 	store.errInsert = errors.New("tx boom")
 	start, end := period()
 
-	_, err := newService(store).EvaluateAppBudget(context.Background(), appID, start, end)
+	_, err := newService(store).EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.Error(t, err)
 	require.Empty(t, store.alerts, "a failed batch records nothing (all-or-nothing)")
 }
@@ -496,7 +556,7 @@ func TestGetBudgetAlerts_ReturnsRecordedCrossings(t *testing.T) {
 	start, end := period()
 	svc := newService(store)
 
-	_, err := svc.EvaluateAppBudget(context.Background(), appID, start, end)
+	_, err := svc.EvaluateAppBudget(context.Background(), appID, "", start, end)
 	require.NoError(t, err)
 
 	resp, err := svc.GetBudgetAlerts(context.Background(), budget.GetBudgetAlertsRequest{
@@ -512,4 +572,239 @@ func TestGetBudgetAlerts_NoBudget_Empty(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Empty(t, resp.Alerts)
+}
+
+// --- AI caps: precedence, exhaustion, scopes (migration 084, T101) ----------
+
+func TestSetBudget_AICapsValidateScopeAndTemplate(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	app, org, acct := uuid.New(), uuid.New(), uuid.New()
+
+	// A template cap on an app's AI budget: stored with its key, hard cap and overage flag.
+	resp, err := svc.SetBudget(context.Background(), budget.SetBudgetRequest{
+		Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "member-help",
+		LimitMicros: 5_000_000, Active: true, HardCap: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, budget.CategoryAI, resp.Category)
+	require.Equal(t, "member-help", resp.TemplateKey)
+	require.True(t, resp.HardCap)
+	require.False(t, resp.AllowOverage)
+
+	// Org and account scopes take 'ai' only; 'all' stays app-only.
+	_, err = svc.SetBudget(context.Background(), budget.SetBudgetRequest{Scope: budget.ScopeOrg, ScopeID: org, Category: budget.CategoryAI, LimitMicros: 1, Active: true, HardCap: true, AllowOverage: true})
+	require.NoError(t, err)
+	_, err = svc.SetBudget(context.Background(), budget.SetBudgetRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI, LimitMicros: 1, Active: true})
+	require.NoError(t, err)
+	_, err = svc.SetBudget(context.Background(), budget.SetBudgetRequest{Scope: budget.ScopeOrg, ScopeID: org, LimitMicros: 1, Active: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+
+	// A template key is an app AI thing with the module's key shape.
+	_, err = svc.SetBudget(context.Background(), budget.SetBudgetRequest{Scope: budget.ScopeApp, ScopeID: app, TemplateKey: "member-help", LimitMicros: 1, Active: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+	_, err = svc.SetBudget(context.Background(), budget.SetBudgetRequest{Scope: budget.ScopeOrg, ScopeID: org, Category: budget.CategoryAI, TemplateKey: "member-help", LimitMicros: 1, Active: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+	_, err = svc.SetBudget(context.Background(), budget.SetBudgetRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "Member Help", LimitMicros: 1, Active: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+	_, err = svc.SetBudget(context.Background(), budget.SetBudgetRequest{Scope: budget.ScopeApp, ScopeID: app, Category: "tokens", LimitMicros: 1, Active: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+// TestGetBudgetStatus_TemplateAndAppWideCompose pins the composition ONE
+// place computes (billing-engine#221 review): the template's row narrows the
+// app's AI-wide cap and never shadows it — exhausted if EITHER is, the
+// exhausted row (template first) else the more specific row reported.
+func TestGetBudgetStatus_TemplateAndAppWideCompose(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	app := uuid.New()
+	ctx := context.Background()
+	read := func(tpl string) *budget.GetBudgetStatusResponse {
+		st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: tpl})
+		require.NoError(t, err)
+		return st
+	}
+
+	// Nothing configured: exists=false, decided_by none.
+	st := read("member-help")
+	require.False(t, st.Exists)
+	require.Equal(t, budget.DecidedByNone, st.DecidedBy)
+
+	// App-wide AI row only: a template read is governed by it and sums the APP's AI spend.
+	seedAIBudget(store, budget.ScopeApp, app, "", 10_000_000, true, false)
+	store.spendBy["ai/"] = 9_000_000
+	store.spendBy["ai/member-help"] = 2_000_000
+	st = read("member-help")
+	require.True(t, st.Exists)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+	require.EqualValues(t, 9_000_000, st.SpendMicros)
+	require.False(t, st.Exhausted)
+	require.EqualValues(t, 1_000_000, st.RemainingMicros)
+
+	// The template's own row (roomy, not spent): reported as the specific row,
+	// but the app-wide row still counts.
+	seedAIBudget(store, budget.ScopeApp, app, "member-help", 5_000_000, true, false)
+	st = read("member-help")
+	require.Equal(t, budget.DecidedByTemplate, st.DecidedBy)
+	require.Equal(t, "member-help", st.TemplateKey)
+	require.EqualValues(t, 2_000_000, st.SpendMicros, "the template row reports its own events")
+	require.False(t, st.Exhausted)
+
+	// 🔴 The escape 94 named: the app-wide cap fills up while the template is
+	// under its own limit — the verdict must still be exhausted, labelled by
+	// the row that bit.
+	store.spendBy["ai/"] = 10_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted, "a template row must not shadow an exhausted app-wide cap")
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+	require.EqualValues(t, 10_000_000, st.SpendMicros)
+
+	// Both spent: the template wins the label.
+	store.spendBy["ai/member-help"] = 5_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByTemplate, st.DecidedBy)
+
+	// Template spent, app-wide fine: exhausted by the template.
+	store.spendBy["ai/"] = 6_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByTemplate, st.DecidedBy)
+	require.Zero(t, st.RemainingMicros)
+
+	// A template with overage allowed does not lift the app-wide cap.
+	store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "member-help")] = func() budget.Budget {
+		b := store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "member-help")]
+		b.AllowOverage = true
+		return b
+	}()
+	store.spendBy["ai/"] = 10_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+
+	// Another template with no row of its own composes with the app-wide row alone.
+	store.spendBy["ai/"] = 1_000_000
+	st = read("faq")
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+	require.False(t, st.Exhausted)
+}
+
+// TestGetBudgetStatus_ExhaustedRules: only an ACTIVE, HARD cap without the
+// customer's overage opt-out is ever exhausted; alert-only rows report the
+// crossing but never refuse.
+func TestGetBudgetStatus_ExhaustedRules(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name          string
+		hard, overage bool
+		active        bool
+		spend         int64
+		want          bool
+	}{
+		{"hard cap at limit", true, false, true, 1_000_000, true},
+		{"hard cap over limit", true, false, true, 1_500_000, true},
+		{"hard cap under limit", true, false, true, 999_999, false},
+		{"alert-only at limit", false, false, true, 1_000_000, false},
+		{"overage allowed at limit", true, true, true, 1_000_000, false},
+		{"inactive hard cap at limit", true, false, false, 1_000_000, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			app := uuid.New()
+			b := seedAIBudget(store, budget.ScopeApp, app, "", 1_000_000, tc.hard, tc.overage)
+			b.Active = tc.active
+			store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")] = b
+			store.spend = tc.spend
+			st, err := newService(store).GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI})
+			require.NoError(t, err)
+			require.Equal(t, tc.want, st.Exhausted)
+			require.Equal(t, tc.hard, st.HardCap)
+			require.Equal(t, tc.overage, st.AllowOverage)
+		})
+	}
+}
+
+// TestGetBudgetStatus_OrgAndAccountScopesSumTheAccount: scenario 2 — an
+// account row sums that account's AI events; an org row resolves the org's
+// own billing account first; a lazy org (no account) has spent nothing.
+func TestGetBudgetStatus_OrgAndAccountScopesSumTheAccount(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	ctx := context.Background()
+	acct, org, orgAcct := uuid.New(), uuid.New(), uuid.New()
+	store.accountSpend = 3_000_000
+
+	seedAIBudget(store, budget.ScopeAccount, acct, "", 3_000_000, true, false)
+	st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.Equal(t, budget.DecidedByAccount, st.DecidedBy)
+	require.Equal(t, acct, store.gotSpendAccount)
+	require.True(t, st.Exhausted)
+
+	seedAIBudget(store, budget.ScopeOrg, org, "", 10_000_000, true, false)
+	st, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeOrg, ScopeID: org, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.Equal(t, budget.DecidedByOrg, st.DecidedBy)
+	require.Zero(t, st.SpendMicros, "a lazy org with no account has spent nothing")
+	require.False(t, st.Exhausted)
+
+	store.orgAccounts[org] = orgAcct
+	st, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeOrg, ScopeID: org, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.Equal(t, orgAcct, store.gotSpendAccount, "an org row sums the ORG's own account")
+	require.EqualValues(t, 3_000_000, st.SpendMicros)
+
+	// The wrong category on an org scope is refused, never silently read as 'all'.
+	_, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeOrg, ScopeID: org})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+// TestEvaluateAppBudget_WalksAllAIAndTemplateRows: one AI event re-evaluates
+// the app's 'all' row, its AI-wide row and the stamped template's row, each
+// against its own spend, and records each row's crossings once.
+func TestEvaluateAppBudget_WalksAllAIAndTemplateRows(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	app := uuid.New()
+	start, end := period()
+	seedBudget(store, app, 100_000_000, []int{80, 100})
+	seedAIBudget(store, budget.ScopeApp, app, "", 10_000_000, true, false)
+	seedAIBudget(store, budget.ScopeApp, app, "member-help", 2_000_000, true, false)
+	store.spendBy["all/"] = 50_000_000          // 50% of 'all': nothing
+	store.spendBy["ai/"] = 8_000_000            // 80% of the AI-wide row
+	store.spendBy["ai/member-help"] = 2_000_000 // 100% of the template row
+
+	fired, err := svc.EvaluateAppBudget(context.Background(), app, "member-help", start, end)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []int{80, 80, 100}, fired, "AI-wide crossed 80; the template crossed 80 and 100")
+
+	fired, err = svc.EvaluateAppBudget(context.Background(), app, "member-help", start, end)
+	require.NoError(t, err)
+	require.Empty(t, fired, "idempotent per row+period+percent")
+
+	// A module event (no template) walks only the 'all' and AI-wide rows.
+	store.spendBy["ai/faq"] = 5_000_000
+	fired, err = svc.EvaluateAppBudget(context.Background(), app, "", start, end)
+	require.NoError(t, err)
+	require.Empty(t, fired)
+}
+
+func TestEvaluateAccountBudget_AccountThenOwningOrg(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	acct, org := uuid.New(), uuid.New()
+	start, end := period()
+	store.accountSpend = 4_000_000
+	seedAIBudget(store, budget.ScopeAccount, acct, "", 5_000_000, true, false) // 80%
+	seedAIBudget(store, budget.ScopeOrg, org, "", 4_000_000, true, false)      // 100%
+
+	fired, err := svc.EvaluateAccountBudget(context.Background(), acct, org, start, end)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []int{80, 80, 100}, fired)
+
+	fired, err = svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Empty(t, fired, "no org, and the account's crossings are already recorded")
 }

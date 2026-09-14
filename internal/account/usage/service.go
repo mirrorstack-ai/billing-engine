@@ -33,7 +33,10 @@ var reservedMetricPrefixes = []string{"platform.", "infra."}
 // newly-crossed threshold; it is called BEST-EFFORT (its error never fails
 // the usage ingest).
 type BudgetEvaluator interface {
-	EvaluateAppBudget(ctx context.Context, appID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error)
+	EvaluateAppBudget(ctx context.Context, appID uuid.UUID, templateKey string, periodStart, periodEnd time.Time) ([]int, error)
+	// EvaluateAccountBudget re-evaluates the account-scoped AI caps (and the
+	// owning org's) after an infra.ai.* event landed on an account.
+	EvaluateAccountBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error)
 }
 
 // Service implements the RecordUsage / GetUsageSummary /
@@ -359,7 +362,10 @@ func (s *Service) recordUsage(ctx context.Context, req RecordUsageRequest, timin
 	if recorded && (s.budget != nil || s.credit != nil) {
 		start, end := periodStart, periodEnd
 		if s.budget != nil {
-			if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, start, end); err != nil {
+			// A module's own metric never carries a template (that is the
+			// infra.ai.* family's, stamped on RecordInfraUsage), and it cannot
+			// move an AI cap, so only the app's rows are re-evaluated here.
+			if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, "", start, end); err != nil {
 				slog.Error("budget evaluation failed (usage still recorded)",
 					"app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric, "error", err)
 			}

@@ -40,17 +40,45 @@ func (s *Service) WithNow(now func() time.Time) *Service {
 	return s
 }
 
-// SetBudget upserts a scope's spending cap + alert thresholds (design §10).
-// It is a platform CONTROL-PLANE call (internal secret). v1 wires scope='app'
-// only: org/account scopes are rejected with INVALID_INPUT (the enum carries
-// them for forward-compat). Validates the limit + each percent (1..100), then
-// dedupes + sorts the thresholds before persisting so a re-set is stable.
-func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudgetResponse, error) {
-	if req.Scope != ScopeApp {
-		if req.Scope == ScopeOrg || req.Scope == ScopeAccount {
-			return nil, billing.InvalidInput("budget scope not yet supported (v1 wires 'app' only): " + string(req.Scope))
+// resolveScope validates a request's (scope, category, template) triple and
+// normalizes it. CategoryAll stays app-only (the pre-084 budget); CategoryAI
+// is allowed on app, org and account; a template key is only meaningful on
+// an app's AI cap and must have the module's key shape.
+func resolveScope(scope Scope, category Category, templateKey string) (Category, error) {
+	cat, ok := normalizeCategory(category)
+	if !ok {
+		return "", billing.InvalidInput("invalid budget category: " + string(category))
+	}
+	switch scope {
+	case ScopeApp:
+	case ScopeOrg, ScopeAccount:
+		if cat != CategoryAI {
+			return "", billing.InvalidInput("budget scope " + string(scope) + " supports category 'ai' only")
 		}
-		return nil, billing.InvalidInput("invalid budget scope: " + string(req.Scope))
+	default:
+		return "", billing.InvalidInput("invalid budget scope: " + string(scope))
+	}
+	if templateKey != "" {
+		if cat != CategoryAI || scope != ScopeApp {
+			return "", billing.InvalidInput("template_key applies to an app's 'ai' budget only")
+		}
+		if !templateKeyShape.MatchString(templateKey) {
+			return "", billing.InvalidInput("template_key must match ^[a-z][a-z0-9_-]*$ (max 64)")
+		}
+	}
+	return cat, nil
+}
+
+// SetBudget upserts a scope's spending cap + alert thresholds (design §10).
+// It is a platform CONTROL-PLANE call (internal secret). Validates the limit
+// + each percent (1..100), then dedupes + sorts the thresholds before
+// persisting so a re-set is stable. CategoryAI rows may carry a template
+// key (an ai-assistant template's own cap), a hard cap and the customer's
+// overage opt-out (migration 084).
+func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudgetResponse, error) {
+	cat, err := resolveScope(req.Scope, req.Category, req.TemplateKey)
+	if err != nil {
+		return nil, err
 	}
 	if req.ScopeID == uuid.Nil {
 		return nil, billing.InvalidInput("scope_id required")
@@ -71,75 +99,221 @@ func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudg
 	saved, err := s.store.UpsertBudget(ctx, Budget{
 		Scope:         req.Scope,
 		ScopeID:       req.ScopeID,
+		Category:      cat,
+		TemplateKey:   req.TemplateKey,
 		AccountID:     req.AccountID,
 		LimitMicros:   req.LimitMicros,
 		AlertPercents: clean,
 		Active:        req.Active,
+		HardCap:       req.HardCap,
+		AllowOverage:  req.AllowOverage,
 	})
 	if err != nil {
 		return nil, billing.Internal("upsert budget failed", err)
 	}
 	return &SetBudgetResponse{
+		Category:      saved.Category,
+		TemplateKey:   saved.TemplateKey,
 		LimitMicros:   saved.LimitMicros,
 		AlertPercents: saved.AlertPercents,
 		Active:        saved.Active,
+		HardCap:       saved.HardCap,
+		AllowOverage:  saved.AllowOverage,
 	}, nil
 }
 
+// candidate is one budget row a status read consults, with its spend.
+type candidate struct {
+	b         Budget
+	decidedBy DecidedBy
+	spend     int64
+}
+
+// candidates lists the rows a status read COMPOSES, most specific first. For
+// an app's AI cap with a template: the template's own row AND the app's
+// AI-wide row — both, never one shadowing the other. The template is named
+// by the widget in a client-supplied parameter that the agent cannot verify
+// against the module today, so a template row that HID the app-wide row would
+// let a caller escape both caps by naming the roomier template; composing
+// them keeps a more specific budget able to say LESS than the general one,
+// never more (94, review of billing-engine#221). Every other scope has one
+// row. Spend is read per row: the template's events for its row, the whole
+// app for the AI-wide row.
+func (s *Service) candidates(ctx context.Context, scope Scope, scopeID uuid.UUID, cat Category, templateKey string, start, end time.Time) ([]candidate, error) {
+	var out []candidate
+	add := func(tpl string, decidedBy DecidedBy) error {
+		b, found, err := s.store.GetBudget(ctx, scope, scopeID, cat, tpl)
+		if err != nil || !found {
+			return err
+		}
+		spend, err := s.spendFor(ctx, b, start, end)
+		if err != nil {
+			return err
+		}
+		out = append(out, candidate{b: b, decidedBy: decidedBy, spend: spend})
+		return nil
+	}
+	if templateKey != "" {
+		if err := add(templateKey, DecidedByTemplate); err != nil {
+			return nil, err
+		}
+	}
+	wide := DecidedByApp
+	switch scope {
+	case ScopeOrg:
+		wide = DecidedByOrg
+	case ScopeAccount:
+		wide = DecidedByAccount
+	}
+	if err := add("", wide); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// decide composes the candidates into ONE verdict: exhausted if ANY row is
+// exhausted; the row reported is the first exhausted one (the template wins
+// the label when both are spent), else the most specific row. This is the
+// single authority for the verdict — api-platform passes it through.
+func decide(cands []candidate) (candidate, bool) {
+	if len(cands) == 0 {
+		return candidate{}, false
+	}
+	for _, c := range cands {
+		if exhausted(c.b, c.spend) {
+			return c, true
+		}
+	}
+	return cands[0], false
+}
+
+// spendAccount is the billing account whose events an org/account-scoped
+// budget sums: the account itself, or the org's own account. found=false is
+// a lazy org with no account yet — its spend is 0.
+func (s *Service) spendAccount(ctx context.Context, scope Scope, scopeID uuid.UUID) (uuid.UUID, bool, error) {
+	if scope == ScopeAccount {
+		return scopeID, true, nil
+	}
+	return s.store.OrgAccountID(ctx, scopeID)
+}
+
+// windowFor derives the anchored period window a budget is evaluated in:
+// an app follows its payer's anchor, an account its own, an org its own
+// account's (calendar month while it has none).
+func (s *Service) windowFor(ctx context.Context, scope Scope, scopeID uuid.UUID) (time.Time, time.Time, error) {
+	var (
+		anchorDay int
+		err       error
+	)
+	switch scope {
+	case ScopeApp:
+		anchorDay, err = s.store.AppAnchorDay(ctx, scopeID)
+	default:
+		acct, found, aerr := s.spendAccount(ctx, scope, scopeID)
+		if aerr != nil {
+			return time.Time{}, time.Time{}, aerr
+		}
+		if !found {
+			anchorDay = billingperiod.DefaultAnchorDay
+		} else {
+			anchorDay, err = s.store.AccountAnchorDay(ctx, acct)
+		}
+	}
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	start, end := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
+	return start, end, nil
+}
+
+// spendFor sums the spend a budget row governs in [start, end).
+func (s *Service) spendFor(ctx context.Context, b Budget, start, end time.Time) (int64, error) {
+	if b.Scope == ScopeApp {
+		return s.store.AppPeriodSpendMicros(ctx, b.ScopeID, b.Category, b.TemplateKey, start, end)
+	}
+	acct, found, err := s.spendAccount(ctx, b.Scope, b.ScopeID)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, nil
+	}
+	return s.store.AccountPeriodAISpendMicros(ctx, acct, start, end)
+}
+
+// exhausted is the consumer's verdict for a hard cap: active, hard, not
+// overage-allowed, and spend at or over the limit. Integer micro math.
+func exhausted(b Budget, spendMicros int64) bool {
+	return b.Active && b.HardCap && !b.AllowOverage && spendMicros >= b.LimitMicros
+}
+
 // GetBudgetStatus returns the live spend-vs-cap status for a scope: the cap,
-// the current-period spend, the floored percent-used, and which thresholds
-// the spend has crossed. No budget configured → Exists=false with a nil
-// error (the caller renders "no budget", not an error). v1 = app scope only.
+// the current-period spend, the floored percent-used, which thresholds the
+// spend has crossed, and — for a hard cap — whether the consumer must refuse
+// further work. No budget configured → Exists=false with a nil error (the
+// caller renders "no budget", not an error). An app's AI request with a
+// template resolves template row → AI-wide row (DecidedBy says which).
 func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusRequest) (*GetBudgetStatusResponse, error) {
-	if req.Scope != ScopeApp {
-		return nil, billing.InvalidInput("budget scope not yet supported (v1 wires 'app' only): " + string(req.Scope))
+	cat, err := resolveScope(req.Scope, req.Category, req.TemplateKey)
+	if err != nil {
+		return nil, err
 	}
 	if req.ScopeID == uuid.Nil {
 		return nil, billing.InvalidInput("scope_id required")
 	}
 
-	b, found, err := s.store.GetBudget(ctx, req.Scope, req.ScopeID)
-	if err != nil {
-		return nil, billing.Internal("get budget failed", err)
-	}
-	if !found {
-		return &GetBudgetStatusResponse{Exists: false, Crossed: []int{}}, nil
-	}
-
-	anchorDay, err := s.store.AppAnchorDay(ctx, b.ScopeID)
+	start, end, err := s.windowFor(ctx, req.Scope, req.ScopeID)
 	if err != nil {
 		return nil, billing.Internal("anchor day lookup failed", err)
 	}
-	start, end := billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
-	spend, err := s.store.AppPeriodSpendMicros(ctx, b.ScopeID, start, end)
+	cands, err := s.candidates(ctx, req.Scope, req.ScopeID, cat, req.TemplateKey, start, end)
 	if err != nil {
-		return nil, billing.Internal("budget spend query failed", err)
+		return nil, billing.Internal("budget lookup failed", err)
 	}
+	c, isExhausted := decide(cands)
+	if len(cands) == 0 {
+		return &GetBudgetStatusResponse{Exists: false, Category: cat, DecidedBy: DecidedByNone, Crossed: []int{}}, nil
+	}
+	b, spend := c.b, c.spend
 
+	remaining := b.LimitMicros - spend
+	if remaining < 0 {
+		remaining = 0
+	}
 	return &GetBudgetStatusResponse{
-		Exists:      true,
-		PeriodStart: start,
-		PeriodEnd:   end,
-		LimitMicros: b.LimitMicros,
-		SpendMicros: spend,
-		PercentUsed: percentUsed(spend, b.LimitMicros),
-		Crossed:     crossedThresholds(spend, b.LimitMicros, b.AlertPercents),
-		Active:      b.Active,
+		Exists:          true,
+		Category:        b.Category,
+		DecidedBy:       c.decidedBy,
+		TemplateKey:     b.TemplateKey,
+		PeriodStart:     start,
+		PeriodEnd:       end,
+		LimitMicros:     b.LimitMicros,
+		SpendMicros:     spend,
+		PercentUsed:     percentUsed(spend, b.LimitMicros),
+		Crossed:         crossedThresholds(spend, b.LimitMicros, b.AlertPercents),
+		Active:          b.Active,
+		HardCap:         b.HardCap,
+		AllowOverage:    b.AllowOverage,
+		Exhausted:       isExhausted,
+		RemainingMicros: remaining,
 	}, nil
 }
 
 // GetBudgetAlerts returns the recorded threshold crossings for a scope's
 // budget in a period. PeriodStart zero defaults to the current period. No
-// budget configured → an empty Alerts slice with a nil error. v1 = app scope.
+// budget configured → an empty Alerts slice with a nil error. Reads exactly
+// the requested row (no template precedence: alerts belong to the row that
+// recorded them).
 func (s *Service) GetBudgetAlerts(ctx context.Context, req GetBudgetAlertsRequest) (*GetBudgetAlertsResponse, error) {
-	if req.Scope != ScopeApp {
-		return nil, billing.InvalidInput("budget scope not yet supported (v1 wires 'app' only): " + string(req.Scope))
+	cat, err := resolveScope(req.Scope, req.Category, req.TemplateKey)
+	if err != nil {
+		return nil, err
 	}
 	if req.ScopeID == uuid.Nil {
 		return nil, billing.InvalidInput("scope_id required")
 	}
 
-	b, found, err := s.store.GetBudget(ctx, req.Scope, req.ScopeID)
+	b, found, err := s.store.GetBudget(ctx, req.Scope, req.ScopeID, cat, req.TemplateKey)
 	if err != nil {
 		return nil, billing.Internal("get budget failed", err)
 	}
@@ -150,15 +324,13 @@ func (s *Service) GetBudgetAlerts(ctx context.Context, req GetBudgetAlertsReques
 	periodStart := req.PeriodStart
 	if periodStart.IsZero() {
 		// ListBudgetAlerts keys on period_start only (the idempotency anchor),
-		// so the window END is intentionally discarded here. Default to the app's
-		// current ANCHORED period start (card-binding day) — the same value the
-		// ingest-path evaluation records crossings under, so a default-period read
-		// matches the stored alerts.
-		anchorDay, err := s.store.AppAnchorDay(ctx, req.ScopeID)
+		// so the window END is intentionally discarded here. Default to the
+		// scope's current ANCHORED period start — the same value the
+		// ingest-path evaluation records crossings under.
+		periodStart, _, err = s.windowFor(ctx, req.Scope, req.ScopeID)
 		if err != nil {
 			return nil, billing.Internal("anchor day lookup failed", err)
 		}
-		periodStart, _ = billingperiod.AnchoredPeriodWindow(s.nowFn().UTC(), anchorDay)
 	} else {
 		periodStart = periodStart.UTC()
 	}
@@ -171,44 +343,106 @@ func (s *Service) GetBudgetAlerts(ctx context.Context, req GetBudgetAlertsReques
 }
 
 // EvaluateAppBudget is the ingest-path hook (design §5 / §10). After a usage
-// event is inserted, it recomputes the app's current-period spend and records
-// any newly-crossed threshold in budget_alerts (idempotent per period+percent
-// via ON CONFLICT). It returns the percents it recorded THIS call (a fresh
-// crossing); an already-recorded crossing is silently skipped.
+// event is inserted, it recomputes the app's current-period spend for every
+// budget row the event can move — the app's 'all' row, its AI-wide row, and
+// (for an infra.ai.* event stamped with a template) that template's row —
+// and records any newly-crossed threshold in budget_alerts (idempotent per
+// period+percent via ON CONFLICT). It returns the percents it recorded THIS
+// call across all rows; an already-recorded crossing is silently skipped.
 //
-// No budget configured (or inactive) for the app → a no-op with a nil error,
-// so the caller can invoke it unconditionally. The caller runs it BEST-EFFORT
-// off the usage write: an error here must NOT fail the ingest.
+// No budget configured (or inactive) for a row → that row is skipped, so the
+// caller can invoke it unconditionally. The caller runs it BEST-EFFORT off
+// the usage write: an error here must NOT fail the ingest.
 //
-// The crossings are recorded as a single all-or-nothing batch (the store wraps
-// the inserts in one transaction): if any insert fails the whole batch rolls
-// back, so a partial set of alerts is never persisted. The caller logs the
-// error best-effort and the NEXT usage event re-evaluates and records the
-// batch atomically — the spend snapshot then reflects the retry-time spend,
-// which is the closest faithful crossing-time value still observable.
+// Each row's crossings are recorded as a single all-or-nothing batch (the
+// store wraps the inserts in one transaction).
 //
 // periodStart/periodEnd are passed in so evaluation uses the EXACT window the
-// caller already derived for the event (the current calendar month — the same
-// window GetUsageSummary shows).
-func (s *Service) EvaluateAppBudget(ctx context.Context, appID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error) {
-	b, found, err := s.store.GetBudget(ctx, ScopeApp, appID)
-	if err != nil {
-		return nil, err
+// caller already derived for the event.
+func (s *Service) EvaluateAppBudget(ctx context.Context, appID uuid.UUID, templateKey string, periodStart, periodEnd time.Time) ([]int, error) {
+	rows := []struct {
+		cat Category
+		tpl string
+	}{{CategoryAll, ""}, {CategoryAI, ""}}
+	if templateKey != "" {
+		rows = append(rows, struct {
+			cat Category
+			tpl string
+		}{CategoryAI, templateKey})
 	}
-	if !found || !b.Active {
-		return nil, nil
+	var fired []int
+	for _, r := range rows {
+		b, found, err := s.store.GetBudget(ctx, ScopeApp, appID, r.cat, r.tpl)
+		if err != nil {
+			return fired, err
+		}
+		if !found || !b.Active {
+			continue
+		}
+		spend, err := s.store.AppPeriodSpendMicros(ctx, appID, r.cat, r.tpl, periodStart, periodEnd)
+		if err != nil {
+			return fired, err
+		}
+		got, err := s.recordCrossings(ctx, b, spend, periodStart)
+		if err != nil {
+			return fired, err
+		}
+		fired = append(fired, got...)
 	}
+	return fired, nil
+}
 
-	spend, err := s.store.AppPeriodSpendMicros(ctx, appID, periodStart, periodEnd)
-	if err != nil {
-		return nil, err
+// EvaluateAccountBudget is EvaluateAppBudget's twin for the account-scoped
+// AI caps (scenario 2): after an infra.ai.* event landed on an account, the
+// account's own 'ai' row and, if the account is an org's, the org's 'ai' row
+// are re-evaluated. Same best-effort contract.
+func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error) {
+	var fired []int
+	targets := []struct {
+		scope Scope
+		id    uuid.UUID
+	}{{ScopeAccount, accountID}}
+	if ownerOrgID != uuid.Nil {
+		targets = append(targets, struct {
+			scope Scope
+			id    uuid.UUID
+		}{ScopeOrg, ownerOrgID})
 	}
+	var (
+		spend    int64
+		spendSet bool
+	)
+	for _, t := range targets {
+		b, found, err := s.store.GetBudget(ctx, t.scope, t.id, CategoryAI, "")
+		if err != nil {
+			return fired, err
+		}
+		if !found || !b.Active {
+			continue
+		}
+		if !spendSet {
+			spend, err = s.store.AccountPeriodAISpendMicros(ctx, accountID, periodStart, periodEnd)
+			if err != nil {
+				return fired, err
+			}
+			spendSet = true
+		}
+		got, err := s.recordCrossings(ctx, b, spend, periodStart)
+		if err != nil {
+			return fired, err
+		}
+		fired = append(fired, got...)
+	}
+	return fired, nil
+}
 
+// recordCrossings inserts the thresholds spend has reached for one budget
+// row, all-or-nothing, and returns the freshly recorded percents.
+func (s *Service) recordCrossings(ctx context.Context, b Budget, spend int64, periodStart time.Time) ([]int, error) {
 	crossed := crossedThresholds(spend, b.LimitMicros, b.AlertPercents)
 	if len(crossed) == 0 {
 		return nil, nil
 	}
-
 	records := make([]AlertRecord, len(crossed))
 	for i, pct := range crossed {
 		records[i] = AlertRecord{
@@ -219,13 +453,7 @@ func (s *Service) EvaluateAppBudget(ctx context.Context, appID uuid.UUID, period
 			LimitMicros: b.LimitMicros,
 		}
 	}
-	// All-or-nothing: a partial batch would snapshot an inconsistent spend
-	// across thresholds, so the store commits the whole set in one transaction.
-	fired, err := s.store.InsertBudgetAlerts(ctx, records)
-	if err != nil {
-		return nil, err
-	}
-	return fired, nil
+	return s.store.InsertBudgetAlerts(ctx, records)
 }
 
 // crossedThresholds returns the subset of percents the spend has reached
