@@ -249,7 +249,7 @@ SELECT
     )::boolean AS delinquent_now,
     -- arrears: the open balance of prior invoices, in the invoice's minor
     -- units (cents); counted against the pool as money, not scored.
-    COALESCE((SELECT SUM(i.amount_due) FROM ms_billing.invoices i
+    COALESCE((SELECT SUM(GREATEST(0, i.amount_due - i.amount_paid)) FROM ms_billing.invoices i
               WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0), 0)::bigint AS arrears_cents,
     a.demerit_score::float8 AS demerit
 FROM ms_billing.accounts a
@@ -296,10 +296,13 @@ WHERE a.id = inv.account_id;
 
 -- ApplyDemeritAtClose: the account's cycle close at @close_at, once per close
 -- (demerit_closed_at latch, monotone). A late invoice still unpaid that was
--- charged BEFORE the previous close has stayed unpaid a full cycle: +p. A cycle
--- with nothing late and no failure since the previous close is clean: −r.
--- Anything else (a failure inside this cycle, paid or not) leaves S as the
--- failure and settle transitions set it.
+-- charged BEFORE the previous close has stayed unpaid a full cycle: +p — and
+-- only when a previous close EXISTS: at the first close after the migration a
+-- failure inside that cycle was charged by the failure transition already. A
+-- cycle with nothing late, no failure and no settle since the previous close
+-- is clean: −r. Anything else — a failure inside this cycle (paid or not), or
+-- a late invoice settled inside it (the settle already credited −r) — leaves S
+-- as the failure and settle transitions set it.
 -- name: ApplyDemeritAtClose :one
 WITH cfg AS (
     SELECT demerit_per_unpaid_cycle AS p, demerit_recovery AS r, demerit_max AS cap FROM ms_billing.risk_ramp_config WHERE id = 1
@@ -310,19 +313,22 @@ WITH cfg AS (
         EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
                 WHERE i.account_id = @account_id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
                   AND i.demerit_failed_at IS NOT NULL
-                  AND (prev.demerit_closed_at IS NULL OR i.demerit_failed_at < prev.demerit_closed_at)) AS unpaid_full_cycle,
+                  AND prev.demerit_closed_at IS NOT NULL AND i.demerit_failed_at < prev.demerit_closed_at) AS unpaid_full_cycle,
         EXISTS (SELECT 1 FROM ms_billing.invoices i
                 WHERE i.account_id = @account_id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
                   AND i.demerit_failed_at IS NOT NULL) AS late_now,
         EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
                 WHERE i.account_id = @account_id AND i.demerit_failed_at IS NOT NULL
-                  AND (prev.demerit_closed_at IS NULL OR i.demerit_failed_at >= prev.demerit_closed_at)) AS failed_this_cycle
+                  AND (prev.demerit_closed_at IS NULL OR i.demerit_failed_at >= prev.demerit_closed_at)) AS failed_this_cycle,
+        EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
+                WHERE i.account_id = @account_id AND i.demerit_settled_at IS NOT NULL
+                  AND (prev.demerit_closed_at IS NULL OR i.demerit_settled_at >= prev.demerit_closed_at)) AS settled_this_cycle
 )
 UPDATE ms_billing.accounts a
 SET demerit_closed_at = @close_at::timestamptz,
     demerit_score = CASE
         WHEN facts.unpaid_full_cycle THEN LEAST(cfg.cap, a.demerit_score + cfg.p)
-        WHEN facts.late_now OR facts.failed_this_cycle THEN a.demerit_score
+        WHEN facts.late_now OR facts.failed_this_cycle OR facts.settled_this_cycle THEN a.demerit_score
         ELSE GREATEST(0, a.demerit_score - cfg.r)
     END
 FROM cfg, facts

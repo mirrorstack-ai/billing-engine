@@ -265,6 +265,11 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 		_, err := pool.Exec(ctx, `UPDATE ms_billing.invoices SET demerit_failed_at = $2 WHERE stripe_invoice_id = $1`, id, at)
 		require.NoError(t, err)
 	}
+	settledAt := func(id string, at time.Time) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `UPDATE ms_billing.invoices SET demerit_settled_at = $2 WHERE stripe_invoice_id = $1`, id, at)
+		require.NoError(t, err)
+	}
 	// FAIL: the invoice's first failure is +2, once.
 	applied, err := store.ApplyDemeritOnFailure(ctx, "in_exposure_c")
 	require.NoError(t, err)
@@ -299,7 +304,8 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.InDelta(t, 1, sig.Demerit, 1e-9)
 	require.False(t, sig.DelinquentNow, "settled: nothing open with a balance")
 	require.Zero(t, sig.ArrearsMicros)
-	// CLOSE 1: the failure happened inside this cycle → S unchanged; the close is stamped.
+	settledAt("in_exposure_c", base.Add(45*time.Minute)) // settled inside cycle 1 too
+	// CLOSE 1: the failure (and the settle) happened inside this cycle → S unchanged; the close is stamped.
 	d, applied, err := store.ApplyDemeritAtClose(ctx, acct, closeAt(1))
 	require.NoError(t, err)
 	require.True(t, applied)
@@ -380,6 +386,51 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	sig, err = store.ExposureSignals(ctx, acct)
 	require.NoError(t, err)
 	require.Equal(t, 3, sig.PaidInvoices, "k counts paid invoices only; the void is not one")
+
+	// --- review cases (f2, be#223 delta): a second account -----------------
+	acct2 := seedAccountRow(t, pool, "user", uuid.New())
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.payment_methods_mirror (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year)
+		VALUES ($1, 'pm_exposure_2', 'visa', '4242', 12, 2099)`, acct2.String())
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
+		VALUES ($1, 'in_exposure_e', 'open', 500, 200, 'usd', true)`, acct2.String())
+	require.NoError(t, err)
+	// (3) arrears are what is still owed: amount_due − amount_paid.
+	sig2, err := store.ExposureSignals(ctx, acct2)
+	require.NoError(t, err)
+	require.EqualValues(t, 3_000_000, sig2.ArrearsMicros, "$5.00 due, $2.00 paid → $3.00 counts")
+	// (2) FIRST close after the migration (no previous close) with a failure
+	// inside that first cycle: the failure charged +2 already; the close must
+	// not read "unpaid a full cycle" against a close that never happened.
+	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_e")
+	require.NoError(t, err)
+	require.True(t, applied)
+	failedAt("in_exposure_e", base.Add(30*time.Minute))
+	d, applied, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(1))
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.InDelta(t, 2, d, 1e-9, "first close: +2 once (the failure), not twice")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(2))
+	require.NoError(t, err)
+	require.InDelta(t, 4, d, 1e-9, "second close: it has now stayed unpaid a full cycle")
+	// (1) fail in N, settle in N+1: the settle credits −1 the same day, and the
+	// close of N+1 is NOT clean — no second −1 for the same settle.
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET status = 'paid', amount_due = 500, amount_paid = 500 WHERE stripe_invoice_id = 'in_exposure_e'`)
+	require.NoError(t, err)
+	applied, err = store.ApplyDemeritOnSettle(ctx, "in_exposure_e")
+	require.NoError(t, err)
+	require.True(t, applied)
+	settledAt("in_exposure_e", closeAt(2).Add(30*time.Minute)) // settled inside cycle 3
+	sig2, err = store.ExposureSignals(ctx, acct2)
+	require.NoError(t, err)
+	require.InDelta(t, 3, sig2.Demerit, 1e-9)
+	require.Zero(t, sig2.ArrearsMicros, "paid in full: nothing owed")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(3))
+	require.NoError(t, err)
+	require.InDelta(t, 3, d, 1e-9, "the cycle a late invoice was settled in is not clean")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(4))
+	require.NoError(t, err)
+	require.InDelta(t, 2, d, 1e-9, "the next clean close recovers −1")
 
 	// The system exposure row is storable and re-upserts in place.
 	first, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 17_320_508, AlertPercents: []int{80, 100}, Active: true, HardCap: true})

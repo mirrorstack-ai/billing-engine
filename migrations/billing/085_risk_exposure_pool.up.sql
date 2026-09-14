@@ -120,7 +120,9 @@ COMMENT ON COLUMN ms_billing.budgets.category IS
 --                               (+p), so a repeated payment_failed is a no-op
 --                               and a close knows whether the invoice has
 --                               stayed unpaid a FULL cycle since;
---   invoices.demerit_settled_at when the settle credit (−r) was given, once.
+--   invoices.demerit_settled_at when the settle credit (−r) was given, once —
+--                               and the close of that cycle is then not
+--                               "clean" (no second −r for the same settle).
 ALTER TABLE ms_billing.accounts
     ADD COLUMN IF NOT EXISTS demerit_score     NUMERIC(5,2) NOT NULL DEFAULT 0 CONSTRAINT accounts_demerit_nonneg CHECK (demerit_score >= 0),
     ADD COLUMN IF NOT EXISTS demerit_closed_at TIMESTAMPTZ NULL;
