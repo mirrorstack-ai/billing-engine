@@ -49,6 +49,20 @@ type Store interface {
 	// (activated_at), DefaultAnchorDay when unactivated.
 	AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (int, error)
 
+	// AccountPeriodSpendMicros is the account's whole-period usage across
+	// EVERY metric (the exposure pool's accrual; base fees are not events).
+	AccountPeriodSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+
+	// AppPayerAccountID resolves an app to the account its usage bills;
+	// found=false for an unattributed app.
+	AppPayerAccountID(ctx context.Context, appID uuid.UUID) (uuid.UUID, bool, error)
+
+	// ExposureSignals reads the curve's inputs for an account.
+	ExposureSignals(ctx context.Context, accountID uuid.UUID) (ExposureSignals, error)
+
+	// RiskRampConfig reads the finance-owned curve row (085).
+	RiskRampConfig(ctx context.Context) (RiskRampConfig, error)
+
 	// InsertBudgetAlerts records a batch of threshold crossings in ONE
 	// transaction (all-or-nothing): either every row is committed or none are,
 	// so a partial set of alerts with an inconsistent spend snapshot is never
@@ -198,6 +212,48 @@ func (s *pgxStore) AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (i
 		return billingperiod.DefaultAnchorDay, nil
 	}
 	return billingperiod.AnchorDay(at.Time), nil
+}
+
+func (s *pgxStore) AccountPeriodSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	n, err := s.q.AccountPeriodSpendMicros(ctx, db.AccountPeriodSpendMicrosParams{
+		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return usage.MicrosFromNumeric(n)
+}
+
+func (s *pgxStore) AppPayerAccountID(ctx context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {
+	id, err := s.q.AppPayerAccountID(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if !id.Valid {
+		return uuid.Nil, false, nil
+	}
+	return id.Bytes, true, nil
+}
+
+func (s *pgxStore) ExposureSignals(ctx context.Context, accountID uuid.UUID) (ExposureSignals, error) {
+	row, err := s.q.ExposureSignals(ctx, accountID.String())
+	if err != nil {
+		return ExposureSignals{}, err
+	}
+	return ExposureSignals{BillingMode: row.BillingMode, HasUsableCard: row.HasUsableCard, PaidInvoices: int(row.PaidInvoices)}, nil
+}
+
+func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
+	row, err := s.q.RiskRampConfig(ctx)
+	if err != nil {
+		return RiskRampConfig{}, err
+	}
+	return RiskRampConfig{NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros}, nil
 }
 
 func (s *pgxStore) InsertBudgetAlerts(ctx context.Context, records []AlertRecord) ([]int, error) {

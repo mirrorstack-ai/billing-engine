@@ -39,6 +39,12 @@ type fakeStore struct {
 	accountSpend int64                   // AccountPeriodAISpendMicros result
 	orgAccounts  map[uuid.UUID]uuid.UUID // org id → its billing account
 
+	// exposure pool (085)
+	accountAllSpend int64                                // AccountPeriodSpendMicros (every metric)
+	appPayers       map[uuid.UUID]uuid.UUID              // app → payer account
+	signals         map[uuid.UUID]budget.ExposureSignals // account → curve inputs ("" mode = not paas)
+	rampCfg         budget.RiskRampConfig
+
 	errGet    error
 	errUpsert error
 	errSpend  error
@@ -53,6 +59,9 @@ func newFakeStore() *fakeStore {
 		alerts:      map[alertKey]budget.BudgetAlert{},
 		spendBy:     map[string]int64{},
 		orgAccounts: map[uuid.UUID]uuid.UUID{},
+		appPayers:   map[uuid.UUID]uuid.UUID{},
+		signals:     map[uuid.UUID]budget.ExposureSignals{},
+		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000},
 	}
 }
 
@@ -67,10 +76,15 @@ func (f *fakeStore) UpsertBudget(_ context.Context, b budget.Budget) (budget.Bud
 	if f.errUpsert != nil {
 		return budget.Budget{}, f.errUpsert
 	}
-	if b.ID == uuid.Nil {
+	// ON CONFLICT DO UPDATE keeps the row's id — the alert idempotency key
+	// (budget_id, period, percent) must survive a re-upsert, as it does in SQL.
+	k := budgetKey(b.Scope, b.ScopeID, b.Category, b.TemplateKey)
+	if existing, ok := f.budgets[k]; ok {
+		b.ID = existing.ID
+	} else if b.ID == uuid.Nil {
 		b.ID = uuid.New()
 	}
-	f.budgets[budgetKey(b.Scope, b.ScopeID, b.Category, b.TemplateKey)] = b
+	f.budgets[k] = b
 	return b, nil
 }
 
@@ -109,6 +123,26 @@ func (f *fakeStore) AccountPeriodAISpendMicros(_ context.Context, accountID uuid
 func (f *fakeStore) OrgAccountID(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
 	id, ok := f.orgAccounts[orgID]
 	return id, ok, nil
+}
+
+func (f *fakeStore) AccountPeriodSpendMicros(_ context.Context, accountID uuid.UUID, start, end time.Time) (int64, error) {
+	if f.errSpend != nil {
+		return 0, f.errSpend
+	}
+	return f.accountAllSpend, nil
+}
+
+func (f *fakeStore) AppPayerAccountID(_ context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {
+	id, ok := f.appPayers[appID]
+	return id, ok, nil
+}
+
+func (f *fakeStore) ExposureSignals(_ context.Context, accountID uuid.UUID) (budget.ExposureSignals, error) {
+	return f.signals[accountID], nil
+}
+
+func (f *fakeStore) RiskRampConfig(_ context.Context) (budget.RiskRampConfig, error) {
+	return f.rampCfg, nil
 }
 
 func (f *fakeStore) AccountAnchorDay(_ context.Context, _ uuid.UUID) (int, error) {
@@ -807,4 +841,170 @@ func TestEvaluateAccountBudget_AccountThenOwningOrg(t *testing.T) {
 	fired, err = svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired, "no org, and the account's crossings are already recorded")
+}
+
+// --- PaaS risk-exposure pool (migration 085, PR-B) ------------------------
+
+// TestExposureLimitMicros_OwnerCurve pins the owner's curve: $5 without a
+// card; with a card $10 × √(1+k) for k paid invoices, flattening; capped at
+// the ceiling; whole micros rounded half up.
+func TestExposureLimitMicros_OwnerCurve(t *testing.T) {
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000}
+	for _, tc := range []struct {
+		card bool
+		paid int
+		want int64
+	}{
+		{false, 0, 5_000_000},
+		{false, 50, 5_000_000},
+		{true, 0, 10_000_000},
+		{true, 1, 14_142_136},
+		{true, 2, 17_320_508},
+		{true, 3, 20_000_000},
+		{true, 8, 30_000_000},
+		{true, 15, 40_000_000},
+		{true, 24, 50_000_000},
+		{true, 399, 200_000_000},
+		{true, 10_000, 200_000_000},
+		{true, -3, 10_000_000},
+	} {
+		require.EqualValues(t, tc.want, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: tc.card, PaidInvoices: tc.paid}), "card=%v paid=%d", tc.card, tc.paid)
+	}
+	// A misconfigured floor above the ceiling is still bounded by the ceiling.
+	require.EqualValues(t, 1, budget.ExposureLimitMicros(budget.RiskRampConfig{NoCardMicros: 9, CardBaseMicros: 9, CeilingMicros: 1}, budget.ExposureSignals{}))
+}
+
+// TestGetBudgetStatus_ExposurePoolComposesWithTheCaps: on a PaaS account the
+// pool rides every AI read, exhausts on the account's WHOLE usage, is named
+// only when no customer cap bit, and is never lifted by allow_overage; a
+// credits account or an unattributed app has no pool.
+func TestGetBudgetStatus_ExposurePoolComposesWithTheCaps(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	ctx := context.Background()
+	app, acct := uuid.New(), uuid.New()
+	store.appPayers[app] = acct
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 3} // $20
+	read := func() *budget.GetBudgetStatusResponse {
+		st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "member-help"})
+		require.NoError(t, err)
+		return st
+	}
+
+	// No customer cap, pool under: exists=false, not exhausted, pool reported.
+	store.accountAllSpend = 12_000_000
+	st := read()
+	require.False(t, st.Exists)
+	require.False(t, st.Exhausted)
+	require.NotNil(t, st.Pool)
+	require.Equal(t, "paas", st.Pool.Mode)
+	require.Equal(t, budget.PoolSourceExposureLimit, st.Pool.Source)
+	require.EqualValues(t, 20_000_000, st.Pool.LimitMicros)
+	require.EqualValues(t, 8_000_000, st.Pool.RemainingMicros)
+	require.True(t, st.Pool.HasUsableCard)
+	require.Equal(t, 3, st.Pool.PaidInvoices)
+	// The system row exists now, with the curve as its limit.
+	sys, found, err := store.GetBudget(ctx, budget.ScopeAccount, acct, budget.CategoryExposure, "")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.EqualValues(t, 20_000_000, sys.LimitMicros)
+	require.True(t, sys.HardCap)
+
+	// No customer cap, pool full: exhausted by the pool.
+	store.accountAllSpend = 20_000_000
+	st = read()
+	require.False(t, st.Exists)
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
+
+	// A customer cap that is fine + a full pool: still exhausted, by the pool.
+	seedAIBudget(store, budget.ScopeApp, app, "", 100_000_000, true, false)
+	store.spendBy["ai/"] = 1_000_000
+	st = read()
+	require.True(t, st.Exists)
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
+	require.EqualValues(t, 100_000_000, st.LimitMicros, "the cap row's own figures are still reported")
+
+	// allow_overage on the customer's cap never lifts the pool.
+	store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")] = func() budget.Budget {
+		b := store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")]
+		b.AllowOverage = true
+		return b
+	}()
+	st = read()
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
+
+	// A customer cap that bites keeps ITS label even with the pool full.
+	store.spendBy["ai/"] = 100_000_000
+	store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")] = func() budget.Budget {
+		b := store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")]
+		b.AllowOverage = false
+		return b
+	}()
+	st = read()
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+	require.True(t, st.Pool.Exhausted)
+
+	// Credits mode: no pool, the caps alone decide.
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "credits", HasUsableCard: true}
+	store.spendBy["ai/"] = 0
+	st = read()
+	require.False(t, st.Exhausted)
+	require.Equal(t, budget.PoolSourceNone, st.Pool.Source)
+	require.Equal(t, "credits", st.Pool.Mode)
+
+	// An unattributed app (no payer yet): no pool either.
+	delete(store.appPayers, app)
+	st = read()
+	require.Equal(t, budget.PoolSourceNone, st.Pool.Source)
+	require.Equal(t, "none", st.Pool.Mode)
+
+	// The system category is never accepted from a caller.
+	_, err = svc.SetBudget(ctx, budget.SetBudgetRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, LimitMicros: 1, Active: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+	_, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+// TestEvaluateAccountBudget_RecordsPoolCrossings: an AI event on a PaaS
+// account records the pool's 80% and 100% crossings on the system row — the
+// pre-cliff warning — once per period, alongside the account's own AI cap.
+func TestEvaluateAccountBudget_RecordsPoolCrossings(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	acct := uuid.New()
+	start, end := period()
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: false} // $5
+	store.accountAllSpend = 4_000_000                                                           // 80%
+
+	fired, err := svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Equal(t, []int{80}, fired)
+
+	store.accountAllSpend = 5_000_000 // 100%
+	fired, err = svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Equal(t, []int{100}, fired, "80 was already recorded; only the cliff is new")
+
+	fired, err = svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Empty(t, fired)
+
+	// The recorded crossings are readable on the system row.
+	sys, found, err := store.GetBudget(context.Background(), budget.ScopeAccount, acct, budget.CategoryExposure, "")
+	require.NoError(t, err)
+	require.True(t, found)
+	alerts, err := store.ListBudgetAlerts(context.Background(), sys.ID, start)
+	require.NoError(t, err)
+	require.Len(t, alerts, 2)
+
+	// A credits account records nothing for the pool.
+	other := uuid.New()
+	store.signals[other] = budget.ExposureSignals{BillingMode: "credits"}
+	fired, err = svc.EvaluateAccountBudget(context.Background(), other, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Empty(t, fired)
 }

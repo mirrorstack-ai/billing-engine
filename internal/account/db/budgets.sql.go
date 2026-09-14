@@ -62,6 +62,56 @@ func (q *Queries) AccountPeriodAISpendMicros(ctx context.Context, arg AccountPer
 	return total_raw_cost_micros, err
 }
 
+const accountPeriodSpendMicros = `-- name: AccountPeriodSpendMicros :one
+WITH base_events AS (
+    SELECT
+        module_id, metric, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+      AND dev_served = false
+),
+billable_events AS (
+    SELECT module_id, metric, model, value AS billable_value
+    FROM base_events
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, model,
+        MAX(value)::numeric AS billable_value
+    FROM base_events
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, model, subject
+)
+SELECT COALESCE(SUM(e.billable_value * COALESCE(mp.unit_price_micros, md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM billable_events e
+LEFT JOIN ms_billing.metric_model_prices mp
+    ON mp.metric = e.metric AND mp.model = e.model AND e.model <> ''
+LEFT JOIN ms_billing.metric_definitions md
+    ON md.module_id = e.module_id AND md.metric = e.metric
+`
+
+type AccountPeriodSpendMicrosParams struct {
+	AccountID    pgtype.UUID        `json:"account_id"`
+	BillableAt   pgtype.Timestamptz `json:"billable_at"`
+	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+}
+
+// AccountPeriodSpendMicros is the account-level twin of AppPeriodSpendMicros
+// over EVERY metric — the accrued PaaS usage the risk-exposure pool measures
+// (AI + module usage + infra; plan/SaaS base fees are not usage events and so
+// are excluded by construction, as the owner ruled). Same window, dev_served
+// exclusion and subject-aggregation shape.
+func (q *Queries) AccountPeriodSpendMicros(ctx context.Context, arg AccountPeriodSpendMicrosParams) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, accountPeriodSpendMicros, arg.AccountID, arg.BillableAt, arg.BillableAt_2)
+	var total_raw_cost_micros pgtype.Numeric
+	err := row.Scan(&total_raw_cost_micros)
+	return total_raw_cost_micros, err
+}
+
 const appAccountActivatedAt = `-- name: AppAccountActivatedAt :one
 SELECT a.activated_at
 FROM ms_billing.accounts a
@@ -80,6 +130,24 @@ func (q *Queries) AppAccountActivatedAt(ctx context.Context, appID string) (pgty
 	var activated_at pgtype.Timestamptz
 	err := row.Scan(&activated_at)
 	return activated_at, err
+}
+
+const appPayerAccountID = `-- name: AppPayerAccountID :one
+SELECT e.account_id
+FROM ms_billing.usage_events e
+WHERE e.app_id = $1 AND e.account_id IS NOT NULL
+ORDER BY COALESCE(e.billable_at, e.recorded_at) DESC
+LIMIT 1
+`
+
+// AppPayerAccountID resolves an app to the account its usage is attributed
+// to (the app's most recent attributed event) — the account whose exposure
+// pool an app-surface AI turn draws on. No row = unattributed (lazy).
+func (q *Queries) AppPayerAccountID(ctx context.Context, appID string) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, appPayerAccountID, appID)
+	var account_id pgtype.UUID
+	err := row.Scan(&account_id)
+	return account_id, err
 }
 
 const appPeriodAISpendMicros = `-- name: AppPeriodAISpendMicros :one
@@ -232,6 +300,36 @@ func (q *Queries) BudgetOrgAccountID(ctx context.Context, ownerOrgID pgtype.UUID
 	return id, err
 }
 
+const exposureSignals = `-- name: ExposureSignals :one
+SELECT
+    a.billing_mode::text AS billing_mode,
+    EXISTS (
+        SELECT 1 FROM ms_billing.payment_methods_mirror pm
+        WHERE pm.account_id = a.id
+          AND pm.deleted_at IS NULL
+          AND (pm.exp_year, pm.exp_month) >= (EXTRACT(YEAR FROM current_date)::INT, EXTRACT(MONTH FROM current_date)::INT)
+    )::boolean AS has_usable_card,
+    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices
+FROM ms_billing.accounts a
+WHERE a.id = $1
+`
+
+type ExposureSignalsRow struct {
+	BillingMode   string `json:"billing_mode"`
+	HasUsableCard bool   `json:"has_usable_card"`
+	PaidInvoices  int32  `json:"paid_invoices"`
+}
+
+// ExposureSignals are the inputs of the PaaS exposure curve (085): the
+// account's billing mode, whether a usable (unexpired, undeleted) card is on
+// file, and how many invoices it has paid.
+func (q *Queries) ExposureSignals(ctx context.Context, id string) (ExposureSignalsRow, error) {
+	row := q.db.QueryRow(ctx, exposureSignals, id)
+	var i ExposureSignalsRow
+	err := row.Scan(&i.BillingMode, &i.HasUsableCard, &i.PaidInvoices)
+	return i, err
+}
+
 const getBudget = `-- name: GetBudget :one
 SELECT id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage
 FROM ms_billing.budgets
@@ -349,6 +447,26 @@ func (q *Queries) ListBudgetAlerts(ctx context.Context, arg ListBudgetAlertsPara
 		return nil, err
 	}
 	return items, nil
+}
+
+const riskRampConfig = `-- name: RiskRampConfig :one
+SELECT no_card_micros, card_base_micros, ceiling_micros
+FROM ms_billing.risk_ramp_config
+WHERE id = 1
+`
+
+type RiskRampConfigRow struct {
+	NoCardMicros   int64 `json:"no_card_micros"`
+	CardBaseMicros int64 `json:"card_base_micros"`
+	CeilingMicros  int64 `json:"ceiling_micros"`
+}
+
+// RiskRampConfig reads the singleton curve row (085).
+func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error) {
+	row := q.db.QueryRow(ctx, riskRampConfig)
+	var i RiskRampConfigRow
+	err := row.Scan(&i.NoCardMicros, &i.CardBaseMicros, &i.CeilingMicros)
+	return i, err
 }
 
 const upsertBudget = `-- name: UpsertBudget :one
