@@ -24,6 +24,20 @@ const (
 	// tracked against the gap register, and the count below must fall
 	// to zero before the deployment can be called intent-only.
 	VerdictPendingMigration FieldVerdict = "pending-migration"
+
+	// VerdictProvenance: the caller LABELS who acted, for the audit row,
+	// and the label grants nothing. The action is authorized by the
+	// transport (the internal secret) and happens the same way whatever
+	// the label says; a false label misattributes a row, it cannot move
+	// money, lift a cap or widen an authorization. It is not debt
+	// because nothing the engine could derive is being asserted — the
+	// engine has no operator session and cannot know who flipped an
+	// ops switch except by being told.
+	//
+	// This holds only while the field is read nowhere but the audit
+	// column. A provenance label that any decision branches on is an
+	// authority claim, whatever it is called.
+	VerdictProvenance FieldVerdict = "provenance"
 )
 
 // requestFieldVerdicts records every caller-supplied money or authority
@@ -51,6 +65,12 @@ var requestFieldVerdicts = map[string]struct {
 	"SetCustomerBillingModeRequest.CreditLimitMicros": {
 		VerdictCeiling,
 		"the credit ceiling for a customer on distributor billing; raising it grants no charge, it only permits spend the customer already has authority for.",
+	},
+
+	// --- provenance: a label on the audit row, granting nothing ---
+	"SetAIEnforcementPausedRequest.ActorID": {
+		VerdictProvenance,
+		"who flipped the AI-enforcement kill-switch (migration 085). Stored as risk_ramp_config.paused_by beside paused_reason and paused_at, read back by GetAIEnforcement, never branched on: the pause is authorized by the internal secret, and a blank actor is refused only so the audit row is never empty — no value of the label pauses, resumes, charges or lifts a cap.",
 	},
 
 	// --- debt: the caller decides something the engine must derive ---
