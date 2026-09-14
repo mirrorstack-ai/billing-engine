@@ -11,7 +11,7 @@ import (
 // TestPlanTermsMatchTheOwnersMatrix pins every plan term against the owner's
 // matrix: core-v2#1412 (2026-09-12) as amended on 2026-09-13 (core-v2#1458 and
 // the ask/review rulings of that day — Free includes 4 modules, members are a
-// priced allowance 3/10/25 at $2 each, Business includes 3 domains, the
+// priced allowance 3/10/25 at $2 each, Business includes 2 domains (09-14), the
 // allowance is a usage allowance, three Free apps per personal account and one
 // per org). Changing a number here must be a change to that decision first;
 // this test is what makes such an edit a visible diff rather than a quiet one.
@@ -35,7 +35,7 @@ func TestPlanTermsMatchTheOwnersMatrix(t *testing.T) {
 		},
 		usage.PlanBusiness: {
 			Plan: usage.PlanBusiness, BaseFeeMicros: 50_000_000,
-			ModulesIncluded: usage.Unlimited, DomainsIncluded: 3,
+			ModulesIncluded: usage.Unlimited, DomainsIncluded: 2,
 			MembersIncluded: 25, ExtraMemberFeeMicros: 2_000_000,
 			UsageAllowanceMicros: 15_000_000,
 			MaxApps:              usage.Unlimited, MaxAppsPerOrg: usage.Unlimited,

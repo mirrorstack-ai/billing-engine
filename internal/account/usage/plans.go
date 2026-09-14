@@ -164,9 +164,11 @@ var planTerms = map[Plan]PlanTerms{
 		Plan:            PlanBusiness,
 		BaseFeeMicros:   50_000_000, // $50
 		ModulesIncluded: Unlimited,
-		// 3, not 5 (owner 2026-09-13): extras are sold at $2 either way, so
-		// this is what the $50 includes before charging starts, not a cap.
-		DomainsIncluded:      3,
+		// 2 (owner 2026-09-14 via the ask/review session; it was 5 → 3 → 2):
+		// extras are sold at $2 either way, so this is what the $50 includes
+		// before charging starts — and it matches the platform's per-org hard
+		// cap on app-domain claims, which stays at 2.
+		DomainsIncluded:      2,
 		MembersIncluded:      25,
 		ExtraMemberFeeMicros: ExtraMemberFeeMicros,
 		UsageAllowanceMicros: 15_000_000, // $15
