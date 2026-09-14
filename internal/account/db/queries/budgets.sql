@@ -254,7 +254,7 @@ WHERE a.id = $1;
 -- incident kill-switch, so one read per verdict serves both.
 -- name: RiskRampConfig :one
 SELECT no_card_micros, card_base_micros, ceiling_micros, exponent::float8 AS exponent,
-       delinquent_floor, late_penalty_k, ai_enforcement_paused,
+       delinquent_divisor, late_penalty_k, ai_enforcement_paused,
        COALESCE(paused_reason, '')::text AS paused_reason,
        COALESCE(paused_by, '')::text     AS paused_by,
        paused_at

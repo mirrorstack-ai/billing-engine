@@ -276,15 +276,16 @@ func EffectivePaid(cfg RiskRampConfig, sig ExposureSignals) int {
 // usable card → NoCardMicros; a usable card with k paid invoices →
 // CardBaseMicros × (1+k)^Exponent — strict at first, flattening (0.5 = √,
 // the first seed; the owner is choosing the shape, so it is config) — never
-// above CeilingMicros. Delinquency rule (b): while an invoice is open with a
-// balance and DelinquentFloor is set, the limit is NoCardMicros regardless
-// of card or history — the risk control; once settled, k is EffectivePaid —
-// the memory. Whole micros, rounded half up; the ceiling also bounds a
-// zero-card floor so a misconfigured row cannot exceed it. An exponent
-// outside (0, 1] (a row the DB CHECK did not see) falls back to √.
+// above CeilingMicros. Delinquency (owner's pick): while an invoice is open
+// with a balance the limit is the curve divided by DelinquentDivisor, never
+// below NoCardMicros — the risk control without a hard cliff (a huge divisor
+// reproduces the cliff, 1 disables the reduction); once settled, k is
+// EffectivePaid — the memory. Whole micros, rounded half up; the ceiling
+// also bounds a zero-card floor so a misconfigured row cannot exceed it. An
+// exponent outside (0, 1] (a row the DB CHECK did not see) falls back to √.
 func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 	var limit int64
-	if sig.HasUsableCard && !(cfg.DelinquentFloor && sig.DelinquentNow) {
+	if sig.HasUsableCard {
 		k := EffectivePaid(cfg, sig)
 		p := cfg.Exponent
 		if p <= 0 || p > 1 {
@@ -296,6 +297,15 @@ func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 	}
 	if limit > cfg.CeilingMicros {
 		limit = cfg.CeilingMicros
+	}
+	if sig.DelinquentNow && cfg.DelinquentDivisor > 1 {
+		reduced := limit / int64(cfg.DelinquentDivisor)
+		if reduced < cfg.NoCardMicros {
+			reduced = cfg.NoCardMicros
+		}
+		if reduced < limit {
+			limit = reduced
+		}
 	}
 	if limit < 0 {
 		limit = 0
@@ -642,16 +652,16 @@ func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse,
 		return nil, billing.Internal("risk ramp config read failed", err)
 	}
 	return &AIEnforcementResponse{
-		Paused:          cfg.EnforcementPaused,
-		PausedReason:    cfg.PausedReason,
-		PausedBy:        cfg.PausedBy,
-		PausedAt:        cfg.PausedAt,
-		NoCardMicros:    cfg.NoCardMicros,
-		CardBaseMicros:  cfg.CardBaseMicros,
-		CeilingMicros:   cfg.CeilingMicros,
-		Exponent:        cfg.Exponent,
-		DelinquentFloor: cfg.DelinquentFloor,
-		LatePenaltyK:    cfg.LatePenaltyK,
+		Paused:            cfg.EnforcementPaused,
+		PausedReason:      cfg.PausedReason,
+		PausedBy:          cfg.PausedBy,
+		PausedAt:          cfg.PausedAt,
+		NoCardMicros:      cfg.NoCardMicros,
+		CardBaseMicros:    cfg.CardBaseMicros,
+		CeilingMicros:     cfg.CeilingMicros,
+		Exponent:          cfg.Exponent,
+		DelinquentDivisor: cfg.DelinquentDivisor,
+		LatePenaltyK:      cfg.LatePenaltyK,
 	}, nil
 }
 

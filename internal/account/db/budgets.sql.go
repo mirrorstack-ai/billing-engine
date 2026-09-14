@@ -469,7 +469,7 @@ func (q *Queries) ListBudgetAlerts(ctx context.Context, arg ListBudgetAlertsPara
 
 const riskRampConfig = `-- name: RiskRampConfig :one
 SELECT no_card_micros, card_base_micros, ceiling_micros, exponent::float8 AS exponent,
-       delinquent_floor, late_penalty_k, ai_enforcement_paused,
+       delinquent_divisor, late_penalty_k, ai_enforcement_paused,
        COALESCE(paused_reason, '')::text AS paused_reason,
        COALESCE(paused_by, '')::text     AS paused_by,
        paused_at
@@ -482,7 +482,7 @@ type RiskRampConfigRow struct {
 	CardBaseMicros      int64              `json:"card_base_micros"`
 	CeilingMicros       int64              `json:"ceiling_micros"`
 	Exponent            float64            `json:"exponent"`
-	DelinquentFloor     bool               `json:"delinquent_floor"`
+	DelinquentDivisor   int32              `json:"delinquent_divisor"`
 	LatePenaltyK        int32              `json:"late_penalty_k"`
 	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
 	PausedReason        string             `json:"paused_reason"`
@@ -500,7 +500,7 @@ func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error)
 		&i.CardBaseMicros,
 		&i.CeilingMicros,
 		&i.Exponent,
-		&i.DelinquentFloor,
+		&i.DelinquentDivisor,
 		&i.LatePenaltyK,
 		&i.AiEnforcementPaused,
 		&i.PausedReason,

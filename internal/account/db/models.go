@@ -900,15 +900,15 @@ type MsBillingPaymentMethodsMirror struct {
 	CardCountry    pgtype.Text        `json:"card_country"`
 }
 
-// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent (0.5 = sqrt); capped at ceiling_micros. Delinquency: floored at no_card_micros while delinquent (delinquent_floor), k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.
+// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent; capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.
 type MsBillingRiskRampConfig struct {
-	ID              int16          `json:"id"`
-	NoCardMicros    int64          `json:"no_card_micros"`
-	CardBaseMicros  int64          `json:"card_base_micros"`
-	CeilingMicros   int64          `json:"ceiling_micros"`
-	Exponent        pgtype.Numeric `json:"exponent"`
-	DelinquentFloor bool           `json:"delinquent_floor"`
-	LatePenaltyK    int32          `json:"late_penalty_k"`
+	ID                int16          `json:"id"`
+	NoCardMicros      int64          `json:"no_card_micros"`
+	CardBaseMicros    int64          `json:"card_base_micros"`
+	CeilingMicros     int64          `json:"ceiling_micros"`
+	Exponent          pgtype.Numeric `json:"exponent"`
+	DelinquentDivisor int32          `json:"delinquent_divisor"`
+	LatePenaltyK      int32          `json:"late_penalty_k"`
 	// Incident kill-switch: true = every AI budget verdict is allowed (decided_by paused) while alerts keep recording. Flip via the SetAIEnforcementPaused admin RPC; no deploy needed.
 	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
 	PausedReason        pgtype.Text        `json:"paused_reason"`

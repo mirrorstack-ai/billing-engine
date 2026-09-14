@@ -222,10 +222,11 @@ type RiskRampConfig struct {
 	// Exponent p in base × (1+k)^p: 0.5 = square root, 1 = linear; the DB
 	// bounds it to (0, 1].
 	Exponent float64
-	// DelinquentFloor / LatePenaltyK are delinquency rule (b): floored at
-	// NoCardMicros while delinquent; k_eff = max(0, paid − LatePenaltyK × late)
-	// once settled (LatePenaltyK large = any late payment resets k).
-	DelinquentFloor   bool
+	// DelinquentDivisor / LatePenaltyK are the delinquency rule (owner
+	// 2026-09-14): while delinquent the limit is curve / DelinquentDivisor,
+	// never below NoCardMicros (a huge divisor is the hard floor, 1 disables);
+	// k_eff = max(0, paid − LatePenaltyK × late) once settled.
+	DelinquentDivisor int
 	LatePenaltyK      int
 	EnforcementPaused bool
 	PausedReason      string
@@ -247,16 +248,16 @@ type SetAIEnforcementPausedRequest struct {
 // AIEnforcementResponse is the switch's state (with its provenance) plus the
 // curve, so an admin surface shows everything in one read.
 type AIEnforcementResponse struct {
-	Paused          bool      `json:"paused"`
-	PausedReason    string    `json:"paused_reason,omitempty"`
-	PausedBy        string    `json:"paused_by,omitempty"`
-	PausedAt        time.Time `json:"paused_at,omitempty"`
-	NoCardMicros    int64     `json:"no_card_micros"`
-	CardBaseMicros  int64     `json:"card_base_micros"`
-	CeilingMicros   int64     `json:"ceiling_micros"`
-	Exponent        float64   `json:"exponent"`
-	DelinquentFloor bool      `json:"delinquent_floor"`
-	LatePenaltyK    int       `json:"late_penalty_k"`
+	Paused            bool      `json:"paused"`
+	PausedReason      string    `json:"paused_reason,omitempty"`
+	PausedBy          string    `json:"paused_by,omitempty"`
+	PausedAt          time.Time `json:"paused_at,omitempty"`
+	NoCardMicros      int64     `json:"no_card_micros"`
+	CardBaseMicros    int64     `json:"card_base_micros"`
+	CeilingMicros     int64     `json:"ceiling_micros"`
+	Exponent          float64   `json:"exponent"`
+	DelinquentDivisor int       `json:"delinquent_divisor"`
+	LatePenaltyK      int       `json:"late_penalty_k"`
 }
 
 // GetBudgetStatusResponse is the live spend-vs-cap status. Exists is false

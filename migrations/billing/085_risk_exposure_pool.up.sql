@@ -9,12 +9,12 @@
 --
 --     no verified card            → no_card_micros              ($5)
 --     verified card, k paid inv.  → card_base_micros × (1+k)^exponent
---                                   (exponent 0.5 = √: $10, $14.1, $17.3, $20 …)
---     never above                 → ceiling_micros              (~$200)
+--                                   (owner's pick 2026-09-14: $10 × (1+k)^0.9 —
+--                                    $10 at k=0, $18.66 at k=1, $181.19 at k=24)
+--     never above                 → ceiling_micros              ($200)
 --
--- The SHAPE is config too (coordinator, PR-B review): the owner is choosing
--- between steeper curves ($20×√(1+k), $10×(1+k)^0.85, $15×(1+k)^0.75), so
--- base and exponent are columns and the next tuning is an UPDATE.
+-- The SHAPE is config too (coordinator, PR-B review): base and exponent are
+-- columns, so the next tuning is an UPDATE.
 --
 -- The constants are FINANCE-OWNED and live here, in one row, so they are
 -- tuned by an UPDATE and never by a code literal (collection.go's trust ramp
@@ -42,16 +42,16 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
     ceiling_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_ceiling_nonneg CHECK (ceiling_micros >= 0),
     -- (1+k)^exponent: 0.5 = square root; 1 = linear; bounded so the curve
     -- always grows and never explodes.
-    exponent              NUMERIC(4,3) NOT NULL DEFAULT 0.500
+    exponent              NUMERIC(4,3) NOT NULL DEFAULT 0.900
                           CONSTRAINT risk_ramp_exponent_range CHECK (exponent > 0 AND exponent <= 1),
-    -- Delinquency rule (b), coordinator's pick pending the owner's numbers:
-    -- while an invoice is open/uncollectible with a balance the limit is
-    -- no_card_micros regardless of card or history (delinquent_floor), and
-    -- once settled each late invoice costs late_penalty_k paid invoices of
-    -- trust: k_eff = max(0, paid − late_penalty_k × late). late_penalty_k
-    -- large = "any late payment resets k" (rule a). No multiplier: a fraction
-    -- of a large limit while delinquent is the wrong direction for a risk cap.
-    delinquent_floor      BOOLEAN NOT NULL DEFAULT true,
+    -- Delinquency (owner's pick 2026-09-14): while an invoice is open /
+    -- uncollectible with a balance the limit is the curve DIVIDED by
+    -- delinquent_divisor, never below no_card_micros (the owner found a hard
+    -- $5 cliff too harsh; a huge divisor reproduces it, 1 disables the
+    -- reduction). Once settled each late invoice costs late_penalty_k paid
+    -- invoices of trust: k_eff = max(0, paid − late_penalty_k × late)
+    -- (late_penalty_k large = any late payment resets k).
+    delinquent_divisor    INT NOT NULL DEFAULT 3 CONSTRAINT risk_ramp_divisor_min CHECK (delinquent_divisor >= 1),
     late_penalty_k        INT NOT NULL DEFAULT 2 CONSTRAINT risk_ramp_late_penalty_nonneg CHECK (late_penalty_k >= 0),
     ai_enforcement_paused BOOLEAN NOT NULL DEFAULT false,
     -- Who paused it, why, and since when — so "why was enforcement off for
@@ -68,7 +68,7 @@ VALUES (1, 5000000, 10000000, 200000000)
 ON CONFLICT (id) DO NOTHING;
 
 COMMENT ON TABLE ms_billing.risk_ramp_config IS
-    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent (0.5 = sqrt); capped at ceiling_micros. Delinquency: floored at no_card_micros while delinquent (delinquent_floor), k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
+    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent; capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
 
 ALTER TABLE ms_billing.budgets
     DROP CONSTRAINT IF EXISTS budgets_category_known;
