@@ -39,6 +39,7 @@ type Service struct {
 	// being blocked by it.
 	proposer      chargeProposer
 	demerit       DemeritCloser
+	allowance     UsageAllowanceReader
 	nowFn         func() time.Time
 	walletEnabled bool
 	// creditRollout is the immutable, account-scoped production rollout
@@ -68,6 +69,31 @@ type Service struct {
 // on purpose: only GetAccountBill's TotalMicros feeds the sponsored roster.
 type AccountBillReader interface {
 	GetAccountBill(ctx context.Context, req usage.GetAccountBillRequest) (*usage.GetAccountBillResponse, error)
+}
+
+// UsageAllowanceReader answers the plans' 用量減免 for an account and period
+// (PR-4): the figure the boundary charge nets off the closed period's arrears,
+// computed by the bill's own per-app function so the customer's bill and the
+// charge can never disagree. usage.Service implements it.
+type UsageAllowanceReader interface {
+	AccountUsageAllowanceMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+}
+
+// WithUsageAllowance wires the allowance read; unwired (rollup-only wiring,
+// tests) nets nothing, which is the pre-PR-4 posture.
+func (s *Service) WithUsageAllowance(r UsageAllowanceReader) *Service {
+	s.allowance = r
+	return s
+}
+
+// UsageAllowanceMicros is the account's 用量減免 for the closed period, 0
+// when unwired. An error is returned, never swallowed: charging without the
+// allowance would overcharge, so the caller fails the run and retries.
+func (s *Service) UsageAllowanceMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	if s.allowance == nil {
+		return 0, nil
+	}
+	return s.allowance.AccountUsageAllowanceMicros(ctx, accountID, periodStart, periodEnd)
 }
 
 // BoundaryEstimateReconciler is the narrow post-draw seam used at an

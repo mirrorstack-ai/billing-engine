@@ -107,7 +107,12 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.Equal(t, usage.BaseFeeMicros, resp.Apps[2].BaseFeeMicros)
 	require.EqualValues(t, 500, resp.Apps[2].ModuleUsageMicros)
 	require.EqualValues(t, 24, resp.Apps[2].InfraMicros)
-	require.Equal(t, usage.BaseFeeMicros+524, resp.Apps[2].TotalMicros)
+	// 用量減免 (PR-4): appC's Pro allowance ($5) covers its 500 of module
+	// usage in full; infra outside the 'deploy' group is not offset. appA has
+	// no roster row and so no plan of record: nothing deducted.
+	require.EqualValues(t, 500, resp.Apps[2].UsageDeductionMicros)
+	require.Zero(t, resp.Apps[1].UsageDeductionMicros)
+	require.Equal(t, usage.BaseFeeMicros+524-500, resp.Apps[2].TotalMicros)
 
 	// Account totals are the column sums plus the account-wide POOLED overage.
 	// All three apps are flat, so BaseFeeTotal = 3 × $20. Pool 7 → 2 over → 1 block → $5.
@@ -119,9 +124,10 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.EqualValues(t, 3*usage.DomainFeeMicros, resp.CustomDomainsMicros)
 	require.EqualValues(t, 6_000_000, resp.CustomDomainsMicros) // 3 domains × $2
 	require.Zero(t, resp.PaasCreditMicros)
+	require.EqualValues(t, 500, resp.UsageDeductionTotalMicros, "Σ apps[].usage_deduction_micros (PR-4)")
 	require.Equal(t,
 		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
-			resp.AccountOverageMicros+resp.CustomDomainsMicros,
+			resp.AccountOverageMicros+resp.CustomDomainsMicros-resp.UsageDeductionTotalMicros,
 		resp.TotalMicros)
 	// apps[].total_micros are the app plane only: agent, pooled overage, and
 	// account credit are never allocated back into these rows.
@@ -129,8 +135,8 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	for _, a := range resp.Apps {
 		perApp += a.TotalMicros
 	}
-	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, perApp,
-		"Σ apps[].total == base fee total + module usage total + infra total")
+	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros-resp.UsageDeductionTotalMicros, perApp,
+		"Σ apps[].total == base fee total + module usage total + infra total − 用量減免")
 }
 
 func TestGetAccountBill_DeterministicAppOrdering(t *testing.T) {
@@ -212,8 +218,8 @@ func TestGetAccountBill_AgentOnlyHasNoAppRowOrBaseFee(t *testing.T) {
 	for _, app := range resp.Apps {
 		perApp += app.TotalMicros
 	}
-	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, perApp,
-		"the app-plane identity excludes agent spend")
+	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros-resp.UsageDeductionTotalMicros, perApp,
+		"Σ apps[].total == base fee total + module usage total + infra total − 用量減免")
 }
 
 func TestGetAccountBill_AgentModelsDecomposeModelCarryingLines(t *testing.T) {
@@ -465,14 +471,15 @@ func TestGetAccountBill_MixedAppsAndAgentReconcileExactly(t *testing.T) {
 	for _, app := range resp.Apps {
 		perApp += app.TotalMicros
 	}
-	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros, perApp,
-		"Σ apps[].total == base fee total + module usage total + infra total")
+	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros-resp.UsageDeductionTotalMicros, perApp,
+		"Σ apps[].total == base fee total + module usage total + infra total − 用量減免")
+	require.EqualValues(t, 1000, resp.UsageDeductionTotalMicros, "both apps' module usage (700 + 300) sits inside their Pro allowance (PR-4)")
 	require.Equal(t,
 		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
 			resp.AccountOverageMicros+resp.CustomDomainsMicros+
-			resp.Agent.TotalMicros-resp.PaasCreditMicros,
+			resp.Agent.TotalMicros-resp.UsageDeductionTotalMicros-resp.PaasCreditMicros,
 		resp.TotalMicros,
-		"agent spend is included exactly once alongside the app plane")
+		"agent spend is included exactly once alongside the app plane; 用量減免 subtracted once")
 }
 
 func TestGetAccountBill_AgentBucketDiscardsDefaultAppBaseFee(t *testing.T) {
@@ -540,7 +547,9 @@ func TestGetAccountBill_MirrorLifecycleAcrossTheWindow(t *testing.T) {
 	require.Len(t, resp.Apps, 2, "deleted apps render only while they still owe arrears")
 	require.Equal(t, deletedWithUsage, resp.Apps[0].AppID)
 	require.Zero(t, resp.Apps[0].BaseFeeMicros, "a deleted app's uncharged base previews 0 (the charge legs skip deleted apps)")
-	require.EqualValues(t, 700, resp.Apps[0].TotalMicros, "its accrued usage still renders (and bills) — usage-only row")
+	require.EqualValues(t, 700, resp.Apps[0].ModuleUsageMicros, "its accrued usage still renders — usage-only row")
+	require.EqualValues(t, 700, resp.Apps[0].UsageDeductionMicros, "deleted inside the period after surviving grace: the period's plan fee was charged, so its allowance applies (PR-4)")
+	require.Zero(t, resp.Apps[0].TotalMicros, "and covers the usage: the row shows why nothing is owed")
 	require.True(t, resp.Apps[0].IsDeleted)
 	require.Equal(t, createdDuring, resp.Apps[1].AppID)
 	// Regression #63: mid-period creation must NOT prorate the recurring
@@ -548,7 +557,7 @@ func TestGetAccountBill_MirrorLifecycleAcrossTheWindow(t *testing.T) {
 	// creation" charge; this line previews the advance-base leg, always the
 	// full fee. (Prod symptom: $20 plan showed 20×22/31 = $14.19 per app.)
 	require.EqualValues(t, usage.BaseFeeMicros, resp.Apps[1].BaseFeeMicros, "created mid-period still previews the FULL advance base")
-	require.Equal(t, usage.BaseFeeMicros+700, resp.TotalMicros)
+	require.Equal(t, usage.BaseFeeMicros, resp.TotalMicros, "the deleted app's 700 of usage is netted by its allowance (PR-4)")
 }
 
 // --- snapshot-first base ----------------------------------------------------
@@ -626,8 +635,10 @@ func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
 	expectedProjectedBase := int64(liveAppCount) * usage.BaseFeeMicros
 	require.Equal(t, expectedAccruedBase, resp.BaseFeeTotalMicros)
 	require.Equal(t, expectedProjectedBase, resp.ProjectedBaseFeeTotalMicros)
-	require.Equal(t, expectedAccruedBase+700, resp.TotalMicros)
-	require.Equal(t, expectedProjectedBase+700, resp.ProjectedTotalMicros)
+	// The deleted app's 700 of usage is inside its allowance (PR-4): rendered, netted.
+	require.EqualValues(t, 700, resp.UsageDeductionTotalMicros)
+	require.Equal(t, expectedAccruedBase, resp.TotalMicros)
+	require.Equal(t, expectedProjectedBase, resp.ProjectedTotalMicros)
 	require.Greater(t, resp.ProjectedTotalMicros, resp.TotalMicros)
 	// Invariant: ONLY the base differs between the projected and accrued totals
 	// — every usage/overage/domain/agent/credit component is carried identically.
@@ -683,9 +694,9 @@ func TestGetAccountBill_ProjectedTotalIncludesUnresolvedCreationUntilDurableTerm
 	require.NoError(t, err)
 
 	const (
-		recurringProjection = int64(80_070_000) // $80.07
+		recurringProjection = int64(80_010_000) // $80.01: $80 base + 70,000 usage − 60,000 用量減免 (PR-4)
 		pendingCreation     = int64(10_967_742) // $10.967742 → UI $10.97
-		wantProjection      = int64(91_037_742) // UI rounds to $91.04
+		wantProjection      = int64(90_977_742) // UI rounds to $90.98
 	)
 	require.Equal(t, int64(4)*usage.BaseFeeMicros, bill.ProjectedBaseFeeTotalMicros)
 	require.Equal(t, recurringProjection, bill.ProjectedTotalMicros-pendingCreation)
@@ -727,7 +738,7 @@ func TestGetAccountBill_ProjectedTotalIncludesUnresolvedCreationUntilDurableTerm
 		OwnerUserID: owner,
 	})
 	require.NoError(t, err)
-	require.Equal(t, int64(100_070_000), terminal.ProjectedTotalMicros)
+	require.Equal(t, int64(100_010_000), terminal.ProjectedTotalMicros, "$100 base + 70,000 usage − 60,000 用量減免 (PR-4)")
 }
 
 func TestGetAccountBill_CurrentProjectedBaseJoinsOnlyAfterInitialChargesSettle(t *testing.T) {
@@ -1156,6 +1167,7 @@ func TestProjectedCreditChargeContainsOnlyUnpaidUsageExposure(t *testing.T) {
 	wantExposure := bill.ModuleUsageTotalMicros +
 		bill.InfraTotalMicros +
 		bill.Agent.TotalMicros -
+		bill.UsageDeductionTotalMicros -
 		bill.PaasCreditMicros
 	require.Equal(t, wantExposure, projection.AmountMicros)
 	require.Equal(t,
@@ -1477,4 +1489,68 @@ func TestGetAccountBill_TaxIsNotConfiguredForAJurisdictionWithoutARule(t *testin
 	require.Equal(t, usage.TaxStatusNotConfigured, resp.Tax.Status)
 	require.Equal(t, "US", resp.Tax.Jurisdiction, "the jurisdiction is reported even when no rule applies")
 	require.Zero(t, resp.Tax.TaxMicros)
+}
+
+// TestGetAccountBill_UsageDeductionNetsTheUsagePlaneByPlan pins 用量減免 on
+// the account bill (PR-4): per app the plan's allowance against module usage
+// + the 'deploy' infra group only (storage / network infra stays outside),
+// capped by usage, Free $1 / Pro $5 / Business $15, nothing in the creation
+// grace; Σ apps == the account total's deduction; base fees never offset.
+func TestGetAccountBill_UsageDeductionNetsTheUsagePlaneByPlan(t *testing.T) {
+	store := newFakeStore()
+	owner := uuid.New()
+	acct := uuid.New()
+	store.accounts[owner] = acct
+	old := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	freeApp, proApp, bizApp, graceApp := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	store.appMirrors[freeApp] = usage.AppMirrorInfo{CreatedAt: old, Plan: usage.PlanFree}
+	store.appMirrors[proApp] = usage.AppMirrorInfo{CreatedAt: old, Plan: usage.PlanPro}
+	store.appMirrors[bizApp] = usage.AppMirrorInfo{CreatedAt: old, Plan: usage.PlanBusiness}
+	// Free: $2.50 of module usage + $0.80 of deploy usage against a $1 allowance → $1.
+	store.appBillRowsByApp[freeApp] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "orders.placed", "", 2_500_000)}
+	store.appInfraBillRowsByApp[freeApp] = []usage.AppInfraUsage{
+		appInfraLine("infra.compute.ssr.gb_seconds", "deploy", 100, 8_000, 800_000),
+		appInfraLine("infra.storage.gib_hours", "storage", 10, 32, 320), // outside the category
+	}
+	// Pro: $0.30 module + $0.20 deploy under the $5 allowance → $0.50, all of it.
+	store.appBillRowsByApp[proApp] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "views.count", "", 300_000)}
+	store.appInfraBillRowsByApp[proApp] = []usage.AppInfraUsage{appInfraLine("infra.egress.cdn.bytes", "deploy", 5, 40_000, 200_000)}
+	// Business: $20 of module usage against $15 → $15.
+	store.appBillRowsByApp[bizApp] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "renders.count", "", 20_000_000)}
+	store.usageAppIDs = []uuid.UUID{freeApp, proApp, bizApp} // the usage-ledger half of the roster (the boundary's enumeration)
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	byApp := map[uuid.UUID]usage.AccountAppBill{}
+	for _, a := range resp.Apps {
+		byApp[a.AppID] = a
+	}
+	require.EqualValues(t, 1_000_000, byApp[freeApp].UsageDeductionMicros, "Free: capped at the $1 allowance")
+	require.EqualValues(t, 500_000, byApp[proApp].UsageDeductionMicros, "Pro: capped at what was used")
+	require.EqualValues(t, 15_000_000, byApp[bizApp].UsageDeductionMicros, "Business: capped at $15")
+	require.EqualValues(t, byApp[freeApp].BaseFeeMicros+2_500_000+800_320-1_000_000, byApp[freeApp].TotalMicros, "base + usage + infra − 減免; storage infra untouched")
+	require.EqualValues(t, byApp[proApp].BaseFeeMicros+300_000+200_000-500_000, byApp[proApp].TotalMicros)
+	require.EqualValues(t, byApp[bizApp].BaseFeeMicros+20_000_000-15_000_000, byApp[bizApp].TotalMicros)
+	require.EqualValues(t, 16_500_000, resp.UsageDeductionTotalMicros, "Σ apps[].usage_deduction_micros")
+	require.Equal(t,
+		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+resp.AccountOverageMicros+resp.CustomDomainsMicros-resp.UsageDeductionTotalMicros-resp.PaasCreditMicros,
+		resp.TotalMicros)
+	// The boundary nets the same figure the bill shows.
+	allowance, err := newService(store).AccountUsageAllowanceMicros(context.Background(), acct, resp.PeriodStart, resp.PeriodEnd)
+	require.NoError(t, err)
+	require.Equal(t, resp.UsageDeductionTotalMicros, allowance, "charge and bill can never disagree")
+
+	// An app created 2 days before the period's end is inside its grace: no
+	// allowance this period, 100% of its usage owed.
+	store.appMirrors[graceApp] = usage.AppMirrorInfo{CreatedAt: resp.PeriodEnd.Add(-2 * 24 * time.Hour), Plan: usage.PlanPro}
+	store.appBillRowsByApp[graceApp] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "orders.placed", "", 400_000)}
+	resp, err = newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	for _, a := range resp.Apps {
+		if a.AppID == graceApp {
+			require.Zero(t, a.UsageDeductionMicros, "inside the creation grace: nothing")
+			require.EqualValues(t, 400_000, a.ModuleUsageMicros)
+		}
+	}
+	require.EqualValues(t, 16_500_000, resp.UsageDeductionTotalMicros)
 }

@@ -232,3 +232,49 @@ func ExtraMembersMicros(p Plan, memberCount int) int64 {
 func UsageAllowanceAccrues(createdAt, at time.Time) bool {
 	return !at.Before(GraceExpiry(createdAt.UTC()))
 }
+
+// UsageAllowanceEligible says whether an app earns its plan's usage allowance
+// for [periodStart, periodEnd) (billing-engine#202 PR-4, owner 2026-09-13):
+//
+//   - no roster row (a pre-027 anomaly) → no plan of record, nothing;
+//   - deleted at or before the period opened → the boundary never charged a
+//     plan fee for this period, so there is no allowance to have bought;
+//   - otherwise the app must have survived its creation grace by the period's
+//     end — or, if it was deleted inside the period, by its deletion: an app
+//     cancelled inside its grace owes 100% of what it metered
+//     (UsageAllowanceAccrues, the owner's rule).
+func UsageAllowanceEligible(mirrored bool, createdAt time.Time, deleted bool, deletedAt, periodStart, periodEnd time.Time) bool {
+	if !mirrored {
+		return false
+	}
+	instant := periodEnd
+	if deleted && !deletedAt.IsZero() {
+		if !deletedAt.After(periodStart) {
+			return false
+		}
+		if deletedAt.Before(instant) {
+			instant = deletedAt
+		}
+	}
+	return UsageAllowanceAccrues(createdAt, instant)
+}
+
+// UsageDeductionMicros is the plan's 用量減免 for one app and one period: the
+// plan's UsageAllowanceMicros offsets the app's 模組使用量 PLUS its 部署用量
+// (the 'deploy' display group), as a category — never more than the app
+// actually used (an allowance is not a credit) and the FULL allowance whenever
+// it applies (never prorated, the owner's explicit choice); nothing when the
+// app is not eligible (UsageAllowanceEligible).
+func UsageDeductionMicros(terms PlanTerms, eligible bool, moduleUsageMicros, deployUsageMicros int64) int64 {
+	if !eligible {
+		return 0
+	}
+	base := moduleUsageMicros + deployUsageMicros
+	if base < 0 {
+		base = 0
+	}
+	if terms.UsageAllowanceMicros < base {
+		return terms.UsageAllowanceMicros
+	}
+	return base
+}

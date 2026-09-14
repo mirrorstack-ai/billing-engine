@@ -30,9 +30,8 @@
 // have actually closed and are not yet invoiced — the driver can run daily
 // (EventBridge, once provisioned) or as a local one-shot without double-charging.
 //
-// allowanceMicros is 0 for v1 (the allowance-netting math is implemented in
-// cycle.RunBillingCycle; tier-sourced allowance + the advance leg are DEFERRED
-// to the subscription/tier PR).
+// The allowance netted off each account's arrears is the plans' 用量減免 (PR-4),
+// read per account via cycle.Service.UsageAllowanceMicros — see runCycle.
 //
 // Spec: docs-temp/milestone-d-meter/design.md §4 Axis 4 / §5 / §6 (PR #6) and
 // mirrorstack-docs/adr/0005-billing-period-anchor.md.
@@ -66,11 +65,11 @@ import (
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
-// allowanceMicros is the per-account usage allowance netted off the arrears
-// charge. 0 in v1 (tier-sourced allowance + the advance leg are DEFERRED to the
-// subscription/tier PR — they need tier pricing + per-account seat/app counts
-// that do not exist in billing yet).
-const allowanceMicros int64 = 0
+// The per-account usage allowance netted off the arrears charge is the plans'
+// 用量減免 (billing-engine#202 PR-4): Σ per app of min(the plan's
+// UsageAllowanceMicros, module usage + 部署用量), none inside the creation
+// grace — read per account through cycle.Service.UsageAllowanceMicros, the
+// same function the bill shows. Unwired (tests) it is 0, the pre-PR-4 posture.
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -336,6 +335,8 @@ func buildService() *cycle.Service {
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 	svc := cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey)).
 		WithDemeritCloser(budget.NewStore(pool)).
+		// 用量減免 (PR-4): the bill's own per-app deduction, netted at the boundary.
+		WithUsageAllowance(usage.NewService(usage.NewStore(pool))).
 		WithCreditWallet(walletEnabled).
 		WithCreditRollout(controller)
 	coordinator := credit.NewCoordinatorIfReady(
@@ -706,8 +707,18 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 			slog.InfoContext(ctx, "demerit close transition applied", "account_id", a.ID, "period_end", end, "demerit", demerit)
 		}
 
-		// Phase 2 — charge the just-closed window.
+		// Phase 2 — charge the just-closed window, netting the plans' 用量減免.
+		// An allowance read error fails THIS account's run (retried next cycle)
+		// rather than charging without the deduction.
 		res.Processed++
+		allowanceMicros, err := svc.UsageAllowanceMicros(ctx, a.ID, start, end)
+		if err != nil {
+			slog.ErrorContext(ctx, "usage allowance read failed; not charging without it",
+				"account_id", a.ID, "period_start", start, "period_end", end, "error", err)
+			res.FailedRuns++
+			res.Failed++
+			continue
+		}
 		chargeSummary, err := svc.RunBillingCycle(ctx, a.ID, start, end, allowanceMicros)
 		if err != nil {
 			// A charge error already marked the run 'failed' (auditable, retried

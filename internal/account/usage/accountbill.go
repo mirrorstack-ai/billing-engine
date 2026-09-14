@@ -188,13 +188,18 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	})
 
 	apps := make([]AccountAppBill, 0, len(appIDs))
-	var baseFeeTotal, moduleUsageTotal, infraTotal, deployUsageTotal int64
+	var baseFeeTotal, moduleUsageTotal, infraTotal, deployUsageTotal, usageDeductionTotal int64
 	for _, appID := range appIDs {
 		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd)
 		if err != nil {
 			return nil, err
 		}
-		total := parts.BaseFeeMicros + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros
+		// gross is what the app accrued; total is what it owes after the plan's
+		// 用量減免 (PR-4). The row-drop rule below reads GROSS: a deleted app
+		// that used something still renders its usage and the deduction that
+		// covered it, so the customer sees why it owes nothing.
+		gross := parts.BaseFeeMicros + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros
+		total := gross - parts.UsageDeductionMicros
 		// A deleted app contributes NOTHING to this bill once its estimated base
 		// zeroes (computeAppBill) and it has no usage/infra arrears — drop the
 		// row rather than rendering a dead $0 line. A deleted app WITH arrears
@@ -203,7 +208,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// can keep a live charged custom domain, and dropping the row would delete
 		// that money from the per-app decomposition while leaving it in the
 		// account total.
-		if parts.IsDeleted && total == 0 && projectedBaseByApp[appID] == 0 {
+		if parts.IsDeleted && gross == 0 && projectedBaseByApp[appID] == 0 {
 			continue
 		}
 		apps = append(apps, AccountAppBill{
@@ -215,6 +220,8 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			ModuleUsageMicros: parts.ModuleUsageTotalMicros,
 			InfraMicros:       parts.InfraTotalMicros,
 			DeployUsageMicros: parts.DeployUsageMicros,
+			// 用量減免 (PR-4): per app, already netted in TotalMicros.
+			UsageDeductionMicros: parts.UsageDeductionMicros,
 			// Set for the current window from the shares above; a frozen window
 			// gets the flat per-app base assigned after the roster is complete.
 			ProjectedBaseFeeMicros: projectedBaseByApp[appID],
@@ -226,6 +233,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		moduleUsageTotal += parts.ModuleUsageTotalMicros
 		infraTotal += parts.InfraTotalMicros
 		deployUsageTotal += parts.DeployUsageMicros
+		usageDeductionTotal += parts.UsageDeductionMicros
 	}
 
 	// Account-level agent scope (metered under uuid.Nil): the SAME pricing path
@@ -275,20 +283,21 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	}
 
 	response := &GetAccountBillResponse{
-		PeriodID:               periodID,
-		PeriodStart:            periodStart,
-		PeriodEnd:              periodEnd,
-		Plan:                   planStub,
-		Apps:                   apps,
-		Agent:                  agent,
-		BaseFeeTotalMicros:     baseFeeTotal,
-		ModuleUsageTotalMicros: moduleUsageTotal,
-		InfraTotalMicros:       infraTotal,
-		DeployUsageTotalMicros: deployUsageTotal,
-		AccountOverageMicros:   accountOverage,
-		CustomDomainsMicros:    customDomains,
-		PaasCreditMicros:       paasCredit,
-		TotalMicros:            baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + customDomains + agent.TotalMicros - paasCredit,
+		PeriodID:                  periodID,
+		PeriodStart:               periodStart,
+		PeriodEnd:                 periodEnd,
+		Plan:                      planStub,
+		Apps:                      apps,
+		Agent:                     agent,
+		BaseFeeTotalMicros:        baseFeeTotal,
+		ModuleUsageTotalMicros:    moduleUsageTotal,
+		InfraTotalMicros:          infraTotal,
+		DeployUsageTotalMicros:    deployUsageTotal,
+		UsageDeductionTotalMicros: usageDeductionTotal,
+		AccountOverageMicros:      accountOverage,
+		CustomDomainsMicros:       customDomains,
+		PaasCreditMicros:          paasCredit,
+		TotalMicros:               baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + customDomains + agent.TotalMicros - usageDeductionTotal - paasCredit,
 	}
 
 	var projectedBaseFeeTotal int64
@@ -350,6 +359,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		infraTotal,
 		projectedRecurringSurcharges,
 		agent.TotalMicros,
+		usageDeductionTotal,
 		paasCredit,
 		unresolvedOneTimeTotal,
 	)
@@ -370,6 +380,7 @@ func projectedTotalMicros(
 	infraTotal int64,
 	projectedRecurringSurcharges int64,
 	agentTotalMicros int64,
+	usageDeductionTotal int64,
 	paasCredit int64,
 	unresolvedOneTimeTotal int64,
 ) int64 {
@@ -378,6 +389,7 @@ func projectedTotalMicros(
 		infraTotal +
 		projectedRecurringSurcharges +
 		agentTotalMicros -
+		usageDeductionTotal -
 		paasCredit +
 		unresolvedOneTimeTotal
 }
@@ -573,9 +585,13 @@ func (s *Service) ProjectedCreditCharge(ctx context.Context, ownerUserID, ownerO
 	if err != nil {
 		return credit.Projection{}, err
 	}
+	// The plans' 用量減免 (PR-4) nets the usage plane here exactly as it nets
+	// the bill and the boundary charge: a prepaid account's draw is what it
+	// would be charged, and that is net of its allowances.
 	unpaidExposure := bill.ModuleUsageTotalMicros +
 		bill.InfraTotalMicros +
 		bill.Agent.TotalMicros -
+		bill.UsageDeductionTotalMicros -
 		bill.PaasCreditMicros
 	return credit.Projection{
 		AmountMicros: unpaidExposure,
@@ -634,4 +650,30 @@ func accountPaasCreditMicros(subscriptionActive bool, moduleUsageTotalMicros, in
 		credit = maxCredit
 	}
 	return credit, nil
+}
+
+// AccountUsageAllowanceMicros is what the boundary charge nets off the closed
+// period's arrears (PR-4): Σ over the account's apps of UsageDeductionMicros
+// for [periodStart, periodEnd) — computed by the SAME per-app function the
+// bill shows, so the figure the customer read as 用量減免 is exactly the one
+// their charge omits. The agent scope (uuid.Nil) has no plan and earns none.
+// An error is an error: netting nothing would overcharge, so the caller must
+// not proceed on a guess.
+func (s *Service) AccountUsageAllowanceMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	usageApps, err := s.store.AppIDsWithUsage(ctx, accountID, periodStart, periodEnd)
+	if err != nil {
+		return 0, billing.Internal("app usage enumeration failed", err)
+	}
+	var total int64
+	for _, appID := range usageApps {
+		if appID == uuid.Nil {
+			continue
+		}
+		parts, err := s.computeAppBill(ctx, accountID, true, appID, periodStart, periodEnd)
+		if err != nil {
+			return 0, err
+		}
+		total += parts.UsageDeductionMicros
+	}
+	return total, nil
 }

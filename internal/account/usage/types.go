@@ -516,6 +516,11 @@ type GetAppBillResponse struct {
 	// owner 2026-09-13). The plan's 用量額度 offsets this group plus module
 	// usage as a category.
 	DeployUsageMicros int64 `json:"deploy_usage_micros"`
+	// UsageDeductionMicros is the plan's 用量減免 (PR-4): UsageAllowanceMicros
+	// netted against ModuleUsageTotal + DeployUsage, never more than used, the
+	// full allowance or nothing (0 inside the creation grace). Positive, and
+	// subtracted in TotalMicros.
+	UsageDeductionMicros int64 `json:"usage_deduction_micros"`
 
 	// InfraLines is the per-metric 基礎設施 RESIDUAL breakdown: one line for EVERY
 	// active declared infra metric (the platform-infra sentinel catalog rows),
@@ -663,6 +668,13 @@ type AccountAppBill struct {
 	// DeployUsageMicros is this app's 部署用量 — the 'deploy' display-group
 	// subset of InfraMicros (see GetAppBillResponse.DeployUsageMicros).
 	DeployUsageMicros int64 `json:"deploy_usage_micros"`
+	// UsageDeductionMicros is the plan's 用量減免 for this app (PR-4, owner
+	// 2026-09-13): its UsageAllowanceMicros netted against ModuleUsage +
+	// DeployUsage, never more than used, the full allowance (never prorated),
+	// and 0 inside the creation grace. Positive, and SUBTRACTED in TotalMicros
+	// below; Σ Apps[].UsageDeductionMicros == UsageDeductionTotalMicros, and it
+	// is exactly what the boundary charge nets off the arrears.
+	UsageDeductionMicros int64 `json:"usage_deduction_micros"`
 	// TotalMicros = BaseFee + ModuleUsage + Infra for THIS app, PRE-CREDIT: the
 	// account-level agent bucket, overage, and PaaS credit are never allocated
 	// back per-app, so Σ apps[].total_micros == BaseFeeTotalMicros +
@@ -730,6 +742,10 @@ type GetAccountBillResponse struct {
 	// DeployUsageTotalMicros is Σ Apps[].DeployUsageMicros — the 'deploy'
 	// display-group subset of InfraTotalMicros, never added to it.
 	DeployUsageTotalMicros int64 `json:"deploy_usage_total_micros"`
+	// UsageDeductionTotalMicros is Σ Apps[].UsageDeductionMicros — the plans'
+	// 用量減免 (PR-4), SUBTRACTED in TotalMicros and ProjectedTotalMicros. The
+	// same figure the boundary charge nets off the closed period's arrears.
+	UsageDeductionTotalMicros int64 `json:"usage_deduction_total_micros"`
 
 	// AccountOverageMicros is the account's module overage for the period
 	// (migration 033): $5 × ceil(max(0, Σ live-app module_count − IncludedModules) / 5),

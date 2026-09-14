@@ -3322,3 +3322,35 @@ func (f *fakeStore) TransferApp(ctx context.Context, p cycle.TransferAppParams) 
 	}
 	return &cycle.TransferAppResponse{AccountID: p.ToAccount}, cycle.TransferApplied, nil
 }
+
+// fakeAllowance is a UsageAllowanceReader with one answer.
+type fakeAllowance struct {
+	micros int64
+	err    error
+	calls  int
+}
+
+func (f *fakeAllowance) AccountUsageAllowanceMicros(context.Context, uuid.UUID, time.Time, time.Time) (int64, error) {
+	f.calls++
+	return f.micros, f.err
+}
+
+// TestUsageAllowanceMicros_WiredUnwiredAndError: unwired nets nothing (the
+// pre-PR-4 posture); wired it is the bill's figure; an error is returned,
+// never turned into 0 — charging without the allowance would overcharge.
+func TestUsageAllowanceMicros_WiredUnwiredAndError(t *testing.T) {
+	svc := cycle.NewService(newFakeStore(), nil)
+	got, err := svc.UsageAllowanceMicros(context.Background(), uuid.New(), time.Now(), time.Now())
+	if err != nil || got != 0 {
+		t.Fatalf("unwired = %d %v", got, err)
+	}
+	fa := &fakeAllowance{micros: 1_500_000}
+	got, err = svc.WithUsageAllowance(fa).UsageAllowanceMicros(context.Background(), uuid.New(), time.Now(), time.Now())
+	if err != nil || got != 1_500_000 || fa.calls != 1 {
+		t.Fatalf("wired = %d %v calls=%d", got, err, fa.calls)
+	}
+	boom := &fakeAllowance{err: errors.New("bill unavailable")}
+	if _, err := svc.WithUsageAllowance(boom).UsageAllowanceMicros(context.Background(), uuid.New(), time.Now(), time.Now()); err == nil {
+		t.Fatal("an allowance read error was swallowed")
+	}
+}
