@@ -250,7 +250,7 @@ func (s *pgxStore) ExposureSignals(ctx context.Context, accountID uuid.UUID) (Ex
 	if err != nil {
 		return ExposureSignals{}, err
 	}
-	return ExposureSignals{BillingMode: row.BillingMode, HasUsableCard: row.HasUsableCard, PaidInvoices: int(row.PaidInvoices)}, nil
+	return ExposureSignals{BillingMode: row.BillingMode, HasUsableCard: row.HasUsableCard, PaidInvoices: int(row.PaidInvoices), DelinquentNow: row.DelinquentNow, LateCount: int(row.LateCount)}, nil
 }
 
 func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
@@ -260,6 +260,7 @@ func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
 	}
 	cfg := RiskRampConfig{
 		NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros,
+		Exponent:          row.Exponent,
 		EnforcementPaused: row.AiEnforcementPaused, PausedReason: row.PausedReason, PausedBy: row.PausedBy,
 	}
 	if row.PausedAt.Valid {

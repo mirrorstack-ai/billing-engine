@@ -309,7 +309,13 @@ SELECT
           AND pm.deleted_at IS NULL
           AND (pm.exp_year, pm.exp_month) >= (EXTRACT(YEAR FROM current_date)::INT, EXTRACT(MONTH FROM current_date)::INT)
     )::boolean AS has_usable_card,
-    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices
+    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices,
+    EXISTS (
+        SELECT 1 FROM ms_billing.invoices i
+        WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+    )::boolean AS delinquent_now,
+    (SELECT COUNT(*) FROM ms_billing.invoices i
+     WHERE i.account_id = a.id AND (i.ever_failed OR i.status IN ('uncollectible', 'void')))::int AS late_count
 FROM ms_billing.accounts a
 WHERE a.id = $1
 `
@@ -318,15 +324,27 @@ type ExposureSignalsRow struct {
 	BillingMode   string `json:"billing_mode"`
 	HasUsableCard bool   `json:"has_usable_card"`
 	PaidInvoices  int32  `json:"paid_invoices"`
+	DelinquentNow bool   `json:"delinquent_now"`
+	LateCount     int32  `json:"late_count"`
 }
 
 // ExposureSignals are the inputs of the PaaS exposure curve (085): the
 // account's billing mode, whether a usable (unexpired, undeleted) card is on
-// file, and how many invoices it has paid.
+// file, how many invoices it has paid, and its delinquency — delinquent_now
+// is the cycle-close judge's own definition (HasUnpaidInvoice: an open or
+// uncollectible invoice with a balance), late_count is how many invoices ever
+// needed a failed payment attempt (ever_failed, migration 0xx) or ended
+// uncollectible/void — the memory a delinquency rule can subtract from k.
 func (q *Queries) ExposureSignals(ctx context.Context, id string) (ExposureSignalsRow, error) {
 	row := q.db.QueryRow(ctx, exposureSignals, id)
 	var i ExposureSignalsRow
-	err := row.Scan(&i.BillingMode, &i.HasUsableCard, &i.PaidInvoices)
+	err := row.Scan(
+		&i.BillingMode,
+		&i.HasUsableCard,
+		&i.PaidInvoices,
+		&i.DelinquentNow,
+		&i.LateCount,
+	)
 	return i, err
 }
 
@@ -450,7 +468,7 @@ func (q *Queries) ListBudgetAlerts(ctx context.Context, arg ListBudgetAlertsPara
 }
 
 const riskRampConfig = `-- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused,
+SELECT no_card_micros, card_base_micros, ceiling_micros, exponent::float8 AS exponent, ai_enforcement_paused,
        COALESCE(paused_reason, '')::text AS paused_reason,
        COALESCE(paused_by, '')::text     AS paused_by,
        paused_at
@@ -462,6 +480,7 @@ type RiskRampConfigRow struct {
 	NoCardMicros        int64              `json:"no_card_micros"`
 	CardBaseMicros      int64              `json:"card_base_micros"`
 	CeilingMicros       int64              `json:"ceiling_micros"`
+	Exponent            float64            `json:"exponent"`
 	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
 	PausedReason        string             `json:"paused_reason"`
 	PausedBy            string             `json:"paused_by"`
@@ -477,6 +496,7 @@ func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error)
 		&i.NoCardMicros,
 		&i.CardBaseMicros,
 		&i.CeilingMicros,
+		&i.Exponent,
 		&i.AiEnforcementPaused,
 		&i.PausedReason,
 		&i.PausedBy,

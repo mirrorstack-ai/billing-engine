@@ -249,9 +249,11 @@ const paasBillingMode = "standard"
 
 // ExposureLimitMicros is the owner's curve (2026-09-14, migration 085): no
 // usable card → NoCardMicros; a usable card with k paid invoices →
-// CardBaseMicros × √(1+k) — strict at first, flattening — never above
-// CeilingMicros. Whole micros, rounded half up; the ceiling also bounds a
-// zero-card floor so a misconfigured row cannot exceed it.
+// CardBaseMicros × (1+k)^Exponent — strict at first, flattening (0.5 = √,
+// the first seed; the owner is choosing the shape, so it is config) — never
+// above CeilingMicros. Whole micros, rounded half up; the ceiling also
+// bounds a zero-card floor so a misconfigured row cannot exceed it. An
+// exponent outside (0, 1] (a row the DB CHECK did not see) falls back to √.
 func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 	var limit int64
 	if sig.HasUsableCard {
@@ -259,7 +261,11 @@ func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 		if k < 0 {
 			k = 0
 		}
-		limit = int64(math.Round(float64(cfg.CardBaseMicros) * math.Sqrt(1+float64(k))))
+		p := cfg.Exponent
+		if p <= 0 || p > 1 {
+			p = 0.5
+		}
+		limit = int64(math.Round(float64(cfg.CardBaseMicros) * math.Pow(1+float64(k), p)))
 	} else {
 		limit = cfg.NoCardMicros
 	}
@@ -315,6 +321,8 @@ func (s *Service) poolFor(ctx context.Context, cfg RiskRampConfig, accountID uui
 		Exhausted:       accrued >= limit,
 		HasUsableCard:   sig.HasUsableCard,
 		PaidInvoices:    sig.PaidInvoices,
+		DelinquentNow:   sig.DelinquentNow,
+		LateCount:       sig.LateCount,
 	}, nil
 }
 
@@ -615,6 +623,7 @@ func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse,
 		NoCardMicros:   cfg.NoCardMicros,
 		CardBaseMicros: cfg.CardBaseMicros,
 		CeilingMicros:  cfg.CeilingMicros,
+		Exponent:       cfg.Exponent,
 	}, nil
 }
 

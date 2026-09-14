@@ -226,7 +226,11 @@ LIMIT 1;
 
 -- ExposureSignals are the inputs of the PaaS exposure curve (085): the
 -- account's billing mode, whether a usable (unexpired, undeleted) card is on
--- file, and how many invoices it has paid.
+-- file, how many invoices it has paid, and its delinquency — delinquent_now
+-- is the cycle-close judge's own definition (HasUnpaidInvoice: an open or
+-- uncollectible invoice with a balance), late_count is how many invoices ever
+-- needed a failed payment attempt (ever_failed, migration 0xx) or ended
+-- uncollectible/void — the memory a delinquency rule can subtract from k.
 -- name: ExposureSignals :one
 SELECT
     a.billing_mode::text AS billing_mode,
@@ -236,14 +240,20 @@ SELECT
           AND pm.deleted_at IS NULL
           AND (pm.exp_year, pm.exp_month) >= (EXTRACT(YEAR FROM current_date)::INT, EXTRACT(MONTH FROM current_date)::INT)
     )::boolean AS has_usable_card,
-    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices
+    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices,
+    EXISTS (
+        SELECT 1 FROM ms_billing.invoices i
+        WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+    )::boolean AS delinquent_now,
+    (SELECT COUNT(*) FROM ms_billing.invoices i
+     WHERE i.account_id = a.id AND (i.ever_failed OR i.status IN ('uncollectible', 'void')))::int AS late_count
 FROM ms_billing.accounts a
 WHERE a.id = $1;
 
 -- RiskRampConfig reads the singleton curve row (085) together with the
 -- incident kill-switch, so one read per verdict serves both.
 -- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused,
+SELECT no_card_micros, card_base_micros, ceiling_micros, exponent::float8 AS exponent, ai_enforcement_paused,
        COALESCE(paused_reason, '')::text AS paused_reason,
        COALESCE(paused_by, '')::text     AS paused_by,
        paused_at

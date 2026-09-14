@@ -189,25 +189,36 @@ type Pool struct {
 	AccruedMicros   int64      `json:"accrued_micros"`
 	RemainingMicros int64      `json:"remaining_micros"`
 	Exhausted       bool       `json:"exhausted"`
-	// HasUsableCard / PaidInvoices are the curve's inputs, echoed so a console
-	// can explain the limit ("$14.10: card on file, 1 paid invoice").
+	// HasUsableCard / PaidInvoices / DelinquentNow / LateCount are the curve's
+	// inputs, echoed so a console can explain the limit ("$14.10: card on
+	// file, 1 paid invoice").
 	HasUsableCard bool `json:"has_usable_card"`
 	PaidInvoices  int  `json:"paid_invoices"`
+	DelinquentNow bool `json:"delinquent_now"`
+	LateCount     int  `json:"late_count"`
 }
 
-// ExposureSignals are the curve's inputs for one account.
+// ExposureSignals are the curve's inputs for one account. DelinquentNow and
+// LateCount are read for the delinquency rule (owner's pick pending): an
+// open/uncollectible invoice with a balance, and how many invoices ever
+// needed a failed attempt or ended uncollectible/void.
 type ExposureSignals struct {
 	BillingMode   string
 	HasUsableCard bool
 	PaidInvoices  int
+	DelinquentNow bool
+	LateCount     int
 }
 
 // RiskRampConfig is the finance-owned curve row (085), read once per AI
 // verdict together with the incident kill-switch.
 type RiskRampConfig struct {
-	NoCardMicros      int64
-	CardBaseMicros    int64
-	CeilingMicros     int64
+	NoCardMicros   int64
+	CardBaseMicros int64
+	CeilingMicros  int64
+	// Exponent p in base × (1+k)^p: 0.5 = square root, 1 = linear; the DB
+	// bounds it to (0, 1].
+	Exponent          float64
 	EnforcementPaused bool
 	PausedReason      string
 	PausedBy          string
@@ -235,6 +246,7 @@ type AIEnforcementResponse struct {
 	NoCardMicros   int64     `json:"no_card_micros"`
 	CardBaseMicros int64     `json:"card_base_micros"`
 	CeilingMicros  int64     `json:"ceiling_micros"`
+	Exponent       float64   `json:"exponent"`
 }
 
 // GetBudgetStatusResponse is the live spend-vs-cap status. Exists is false

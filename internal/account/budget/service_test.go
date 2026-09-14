@@ -61,7 +61,7 @@ func newFakeStore() *fakeStore {
 		orgAccounts: map[uuid.UUID]uuid.UUID{},
 		appPayers:   map[uuid.UUID]uuid.UUID{},
 		signals:     map[uuid.UUID]budget.ExposureSignals{},
-		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000},
+		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5},
 	}
 }
 
@@ -859,7 +859,7 @@ func TestEvaluateAccountBudget_AccountThenOwningOrg(t *testing.T) {
 // card; with a card $10 × √(1+k) for k paid invoices, flattening; capped at
 // the ceiling; whole micros rounded half up.
 func TestExposureLimitMicros_OwnerCurve(t *testing.T) {
-	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000}
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5}
 	for _, tc := range []struct {
 		card bool
 		paid int
@@ -882,6 +882,14 @@ func TestExposureLimitMicros_OwnerCurve(t *testing.T) {
 	}
 	// A misconfigured floor above the ceiling is still bounded by the ceiling.
 	require.EqualValues(t, 1, budget.ExposureLimitMicros(budget.RiskRampConfig{NoCardMicros: 9, CardBaseMicros: 9, CeilingMicros: 1}, budget.ExposureSignals{}))
+
+	// The SHAPE is config: the owner's candidate steeper curves, and linear.
+	card := budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 3} // k=3 → (1+k)=4
+	require.EqualValues(t, 40_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 20_000_000, CeilingMicros: 200_000_000, Exponent: 0.5}, card), "$20×√4")
+	require.EqualValues(t, 32_490_096, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.85}, card), "$10×4^0.85")
+	require.EqualValues(t, 42_426_407, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 15_000_000, CeilingMicros: 200_000_000, Exponent: 0.75}, card), "$15×4^0.75")
+	require.EqualValues(t, 40_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 1}, card), "linear")
+	require.EqualValues(t, 20_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0}, card), "an unset exponent falls back to √")
 }
 
 // TestGetBudgetStatus_ExposurePoolComposesWithTheCaps: on a PaaS account the

@@ -7,9 +7,14 @@
 -- settling at cycle close) with a curve of their own: strict at first, then
 -- flattening —
 --
---     no verified card            → no_card_micros           ($5)
---     verified card, k paid inv.  → card_base_micros × √(1+k) ($10, $14.1, $17.3, $20 …)
---     never above                 → ceiling_micros            (~$200)
+--     no verified card            → no_card_micros              ($5)
+--     verified card, k paid inv.  → card_base_micros × (1+k)^exponent
+--                                   (exponent 0.5 = √: $10, $14.1, $17.3, $20 …)
+--     never above                 → ceiling_micros              (~$200)
+--
+-- The SHAPE is config too (coordinator, PR-B review): the owner is choosing
+-- between steeper curves ($20×√(1+k), $10×(1+k)^0.85, $15×(1+k)^0.75), so
+-- base and exponent are columns and the next tuning is an UPDATE.
 --
 -- The constants are FINANCE-OWNED and live here, in one row, so they are
 -- tuned by an UPDATE and never by a code literal (collection.go's trust ramp
@@ -35,6 +40,10 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
     no_card_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_no_card_nonneg CHECK (no_card_micros >= 0),
     card_base_micros      BIGINT NOT NULL CONSTRAINT risk_ramp_card_base_nonneg CHECK (card_base_micros >= 0),
     ceiling_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_ceiling_nonneg CHECK (ceiling_micros >= 0),
+    -- (1+k)^exponent: 0.5 = square root; 1 = linear; bounded so the curve
+    -- always grows and never explodes.
+    exponent              NUMERIC(4,3) NOT NULL DEFAULT 0.500
+                          CONSTRAINT risk_ramp_exponent_range CHECK (exponent > 0 AND exponent <= 1),
     ai_enforcement_paused BOOLEAN NOT NULL DEFAULT false,
     -- Who paused it, why, and since when — so "why was enforcement off for
     -- six hours" is answered from the row, not from archaeology. Cleared on
@@ -50,7 +59,7 @@ VALUES (1, 5000000, 10000000, 200000000)
 ON CONFLICT (id) DO NOTHING;
 
 COMMENT ON TABLE ms_billing.risk_ramp_config IS
-    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × sqrt(1+k); capped at ceiling_micros. Finance-owned; tune by UPDATE.';
+    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent (0.5 = sqrt); capped at ceiling_micros. Finance-owned; tune by UPDATE.';
 
 ALTER TABLE ms_billing.budgets
     DROP CONSTRAINT IF EXISTS budgets_category_known;
