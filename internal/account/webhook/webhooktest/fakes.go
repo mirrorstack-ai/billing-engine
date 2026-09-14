@@ -46,6 +46,7 @@ type FakeStore struct {
 	SoftDeletes        []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
 	StampedPMs         []string                            // "setupIntentID=stripePMID" from SetAddCardRequestStripePM
 	ResolvedPMs        []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
+	FailedSetupIntents []string                            // "setupIntentID=failureCode" from FailAddCardRequestBySetupIntent
 	ActivatedCustomers []string                            // stripe_customer_id values from StampAccountActivated
 
 	AppliedInvoices  []webhook.ApplyInvoiceStatusParams // captured calls to ApplyInvoiceStatus
@@ -55,6 +56,7 @@ type FakeStore struct {
 	insertedDefaults map[string]bool                    // advisory is_default by stripe_payment_method_id
 
 	// Found-flag knobs
+	FailSetupNotFound   bool // FailAddCardRequestBySetupIntent returns found=false (nothing pending)
 	TouchedFound        bool // returned by TouchAccountByStripeCustomer
 	InsertFound         bool // returned by InsertPaymentMethod
 	InsertBecameDefault bool // returned by InsertPaymentMethod
@@ -74,6 +76,7 @@ type FakeStore struct {
 	ErrSoftDel      error // from SoftDeletePaymentMethod
 	ErrStamp        error // from SetAddCardRequestStripePM
 	ErrResolve      error // from ResolvePendingAddCardRequest
+	ErrFailSetup    error // from FailAddCardRequestBySetupIntent
 	ErrApplyInvoice error // from ApplyInvoiceStatus
 	ErrRelax        error // from RelaxCollectionOnPaidInvoice
 	ErrMarkFailed   error // from MarkInvoiceFailed
@@ -181,6 +184,14 @@ func (s *FakeStore) SetAddCardRequestStripePM(_ context.Context, setupIntentID, 
 	}
 	s.StampedPMs = append(s.StampedPMs, setupIntentID+"="+stripePMID)
 	return nil
+}
+
+func (s *FakeStore) FailAddCardRequestBySetupIntent(_ context.Context, setupIntentID, failureCode string) (bool, error) {
+	if s.ErrFailSetup != nil {
+		return false, s.ErrFailSetup
+	}
+	s.FailedSetupIntents = append(s.FailedSetupIntents, setupIntentID+"="+failureCode)
+	return !s.FailSetupNotFound, nil
 }
 
 func (s *FakeStore) ResolvePendingAddCardRequest(_ context.Context, stripePMID string) error {

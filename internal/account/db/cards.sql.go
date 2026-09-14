@@ -14,6 +14,7 @@ import (
 const getAddCardRequest = `-- name: GetAddCardRequest :one
 SELECT
     r.status,
+    COALESCE(r.failure_code, '')::text AS failure_code,
     pm.id AS payment_method_id,
     COALESCE(pm.stripe_payment_method_id, '')::text AS stripe_payment_method_id,
     COALESCE(pm.brand, '')::text AS brand,
@@ -34,6 +35,7 @@ type GetAddCardRequestParams struct {
 
 type GetAddCardRequestRow struct {
 	Status                MsBillingAddCardRequestStatus `json:"status"`
+	FailureCode           string                        `json:"failure_code"`
 	PaymentMethodID       pgtype.UUID                   `json:"payment_method_id"`
 	StripePaymentMethodID string                        `json:"stripe_payment_method_id"`
 	Brand                 string                        `json:"brand"`
@@ -60,6 +62,7 @@ func (q *Queries) GetAddCardRequest(ctx context.Context, arg GetAddCardRequestPa
 	var i GetAddCardRequestRow
 	err := row.Scan(
 		&i.Status,
+		&i.FailureCode,
 		&i.PaymentMethodID,
 		&i.StripePaymentMethodID,
 		&i.Brand,

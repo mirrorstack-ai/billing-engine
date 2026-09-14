@@ -60,6 +60,7 @@ SELECT (
 -- name: GetAddCardRequest :one
 SELECT
     r.status,
+    COALESCE(r.failure_code, '')::text AS failure_code,
     pm.id AS payment_method_id,
     COALESCE(pm.stripe_payment_method_id, '')::text AS stripe_payment_method_id,
     COALESCE(pm.brand, '')::text AS brand,

@@ -158,6 +158,21 @@ UPDATE ms_billing.add_card_requests
 SET stripe_pm_id = $2
 WHERE setup_intent_id = $1 AND status = 'pending';
 
+-- FailAddCardRequestBySetupIntent is setup_intent.setup_failed's terminal
+-- write (billing-engine#215): the still-pending request keyed by the
+-- SetupIntent becomes 'failed' with the Stripe reason and resolved_at=now().
+-- The same partial index as SetAddCardRequestStripePM covers it. :execrows so
+-- the handler can tell a real transition (1) from a no-op (0): the row already
+-- resolved through the succeeded/attached path (Stripe can deliver a stale
+-- setup_failed after a retried confirmation succeeded — the success stands),
+-- or the SetupIntent was created outside StartAddPaymentMethod (no row).
+-- name: FailAddCardRequestBySetupIntent :execrows
+UPDATE ms_billing.add_card_requests
+SET status       = 'failed',
+    failure_code = NULLIF(@failure_code::text, ''),
+    resolved_at  = now()
+WHERE setup_intent_id = @setup_intent_id::text AND status = 'pending';
+
 -- MirrorRowByStripePM looks up a just-mirrored row by Stripe PM id, for
 -- the resolve transaction (step 1). fingerprint is nullable.
 -- `AND deleted_at IS NULL` guards the resolve anchor: a soft-deleted

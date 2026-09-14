@@ -195,6 +195,7 @@ const (
 	MsBillingMetricGroupRequests         MsBillingMetricGroup = "requests"
 	MsBillingMetricGroupPlatformSecurity MsBillingMetricGroup = "platform_security"
 	MsBillingMetricGroupOther            MsBillingMetricGroup = "other"
+	MsBillingMetricGroupDeploy           MsBillingMetricGroup = "deploy"
 )
 
 func (e *MsBillingMetricGroup) Scan(src interface{}) error {
@@ -354,6 +355,8 @@ type MsBillingAddCardRequest struct {
 	PaymentMethodID pgtype.UUID                   `json:"payment_method_id"`
 	CreatedAt       time.Time                     `json:"created_at"`
 	ResolvedAt      pgtype.Timestamptz            `json:"resolved_at"`
+	// Stripe last_setup_error decline_code (else code) recorded by setup_intent.setup_failed; NULL unless the bind failed with a Stripe reason (billing-engine#215).
+	FailureCode pgtype.Text `json:"failure_code"`
 }
 
 type MsBillingApp struct {

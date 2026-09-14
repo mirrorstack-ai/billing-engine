@@ -867,6 +867,64 @@ func TestPgxStore_ResolvePendingAddCardRequest_CompletedThenDuplicate(t *testing
 	require.Equal(t, 1, activeCount)
 }
 
+// TestPgxStore_FailAddCardRequestBySetupIntent pins billing-engine#215: the
+// pending request keyed by the SetupIntent becomes failed with the reason and
+// a resolved_at, exactly once; a resolved row is never touched.
+func TestPgxStore_FailAddCardRequestBySetupIntent(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := webhook.NewStore(pool)
+	ctx := context.Background()
+	accountID := seedAccount(t, pool, "cus_setup_failed")
+	reqID := seedPendingAddCardRequest(t, pool, accountID, "pm_never_attached")
+	_, err := pool.Exec(ctx, `UPDATE ms_billing.add_card_requests SET setup_intent_id = 'seti_fail' WHERE id = $1`, reqID)
+	require.NoError(t, err)
+
+	found, err := store.FailAddCardRequestBySetupIntent(ctx, "seti_fail", "insufficient_funds")
+	require.NoError(t, err)
+	require.True(t, found)
+	var status, code string
+	var resolved *time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status::text, COALESCE(failure_code, ''), resolved_at FROM ms_billing.add_card_requests WHERE id = $1`, reqID).
+		Scan(&status, &code, &resolved))
+	require.Equal(t, "failed", status)
+	require.Equal(t, "insufficient_funds", code)
+	require.NotNil(t, resolved, "a failed request is resolved (terminal)")
+
+	// Replay: terminal row, nothing pending → not found, reason unchanged.
+	found, err = store.FailAddCardRequestBySetupIntent(ctx, "seti_fail", "do_not_honor")
+	require.NoError(t, err)
+	require.False(t, found)
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COALESCE(failure_code, '') FROM ms_billing.add_card_requests WHERE id = $1`, reqID).Scan(&code))
+	require.Equal(t, "insufficient_funds", code)
+
+	// Unknown SetupIntent (created outside StartAddPaymentMethod): no row, not found.
+	found, err = store.FailAddCardRequestBySetupIntent(ctx, "seti_not_ours", "card_declined")
+	require.NoError(t, err)
+	require.False(t, found)
+
+	// A completed request is never re-failed by a stale setup_failed.
+	doneID := seedPendingAddCardRequest(t, pool, accountID, "pm_done")
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.add_card_requests SET setup_intent_id = 'seti_done', status = 'completed', resolved_at = now() WHERE id = $1`, doneID)
+	require.NoError(t, err)
+	found, err = store.FailAddCardRequestBySetupIntent(ctx, "seti_done", "card_declined")
+	require.NoError(t, err)
+	require.False(t, found)
+	doneStatus, _, _ := readAddCardRequest(t, pool, doneID)
+	require.Equal(t, "completed", doneStatus)
+
+	// An empty reason stores NULL, not ''.
+	emptyID := seedPendingAddCardRequest(t, pool, accountID, "pm_empty")
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.add_card_requests SET setup_intent_id = 'seti_empty' WHERE id = $1`, emptyID)
+	require.NoError(t, err)
+	found, err = store.FailAddCardRequestBySetupIntent(ctx, "seti_empty", "")
+	require.NoError(t, err)
+	require.True(t, found)
+	var isNull bool
+	require.NoError(t, pool.QueryRow(ctx, `SELECT failure_code IS NULL FROM ms_billing.add_card_requests WHERE id = $1`, emptyID).Scan(&isNull))
+	require.True(t, isNull)
+}
+
 func TestPgxStore_ResolvePendingAddCardRequest_NoMirrorRow_IsNoOp(t *testing.T) {
 	// Event ordering: setup_intent.succeeded can arrive before
 	// payment_method.attached. The resolver should bail out cleanly when

@@ -141,6 +141,35 @@ func (q *Queries) DuplicateFingerprintPM(ctx context.Context, arg DuplicateFinge
 	return id, err
 }
 
+const failAddCardRequestBySetupIntent = `-- name: FailAddCardRequestBySetupIntent :execrows
+UPDATE ms_billing.add_card_requests
+SET status       = 'failed',
+    failure_code = NULLIF($1::text, ''),
+    resolved_at  = now()
+WHERE setup_intent_id = $2::text AND status = 'pending'
+`
+
+type FailAddCardRequestBySetupIntentParams struct {
+	FailureCode   string `json:"failure_code"`
+	SetupIntentID string `json:"setup_intent_id"`
+}
+
+// FailAddCardRequestBySetupIntent is setup_intent.setup_failed's terminal
+// write (billing-engine#215): the still-pending request keyed by the
+// SetupIntent becomes 'failed' with the Stripe reason and resolved_at=now().
+// The same partial index as SetAddCardRequestStripePM covers it. :execrows so
+// the handler can tell a real transition (1) from a no-op (0): the row already
+// resolved through the succeeded/attached path (Stripe can deliver a stale
+// setup_failed after a retried confirmation succeeded — the success stands),
+// or the SetupIntent was created outside StartAddPaymentMethod (no row).
+func (q *Queries) FailAddCardRequestBySetupIntent(ctx context.Context, arg FailAddCardRequestBySetupIntentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failAddCardRequestBySetupIntent, arg.FailureCode, arg.SetupIntentID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const flagPaymentMethodFraud = `-- name: FlagPaymentMethodFraud :execrows
 UPDATE ms_billing.payment_methods_mirror pmm
 SET fraud_blocked    = true,

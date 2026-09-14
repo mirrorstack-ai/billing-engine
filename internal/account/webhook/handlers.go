@@ -194,6 +194,64 @@ func (r *Router) handleSetupIntentSucceeded(ctx context.Context, event stripego.
 	return Result{HTTPStatus: 200, Status: StatusOK}
 }
 
+// handleSetupIntentSetupFailed is the FAILURE resolution path for add-card
+// requests (billing-engine#215). Stripe sends setup_intent.setup_failed when
+// a confirmation is refused — issuer decline, 3DS authentication failed, an
+// expired or revoked method. Before this handler the matching
+// add_card_requests row stayed 'pending' for ever: the console's status poll
+// never learned the bind failed, and nothing recorded why.
+//
+// The reason stored is last_setup_error.decline_code when the issuer gave one
+// (insufficient_funds, do_not_honor, …), else the Stripe error code
+// (card_declined, setup_intent_authentication_failure, …) — a short machine
+// token the console maps to copy; never the free-text message. A payload
+// with no last_setup_error still fails the row (reason NULL): the fact that
+// the bind failed is the observable, the reason is a bonus.
+//
+// Ordering: Stripe retries a confirmation on the SAME SetupIntent, so a
+// setup_failed can be followed by a succeeded (or arrive after it, out of
+// order). The store's UPDATE … WHERE status='pending' makes a late
+// setup_failed a no-op against an already-completed row (the success
+// stands), and a setup_failed followed by a success is handled by the
+// succeeded path only if the row is still pending — a request that failed
+// is terminal; the user starts a new request (StartAddPaymentMethod mints a
+// fresh SetupIntent), which is the flow the console already drives.
+func (r *Router) handleSetupIntentSetupFailed(ctx context.Context, event stripego.Event) Result {
+	si, err := decodeSetupIntent(event)
+	if err != nil {
+		r.log.WarnContext(ctx, "setup_intent.setup_failed decode failed", "event_id", event.ID, "error", err)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+	if si.ID == "" {
+		r.log.WarnContext(ctx, "setup_intent.setup_failed missing setup_intent id", "event_id", event.ID)
+		return Result{HTTPStatus: 400, Status: StatusInvalidBody}
+	}
+	code := setupFailureCode(si)
+	found, err := r.store.FailAddCardRequestBySetupIntent(ctx, si.ID, code)
+	if err != nil {
+		r.log.ErrorContext(ctx, "setup_intent.setup_failed mark add-card request failed", "event_id", event.ID, "setup_intent_id", si.ID, "error", err)
+		return Result{HTTPStatus: 500, Status: StatusInternal}
+	}
+	if !found {
+		r.log.InfoContext(ctx, "setup_intent.setup_failed: no pending add-card request (already resolved, or not ours)", "event_id", event.ID, "setup_intent_id", si.ID, "failure_code", code)
+		return Result{HTTPStatus: 200, Status: StatusOK}
+	}
+	r.log.InfoContext(ctx, "setup_intent.setup_failed: add-card request marked failed", "event_id", event.ID, "setup_intent_id", si.ID, "failure_code", code)
+	return Result{HTTPStatus: 200, Status: StatusOK}
+}
+
+// setupFailureCode picks the machine token recorded for a failed bind:
+// the issuer's decline_code when present, else Stripe's error code, else "".
+func setupFailureCode(si *stripego.SetupIntent) string {
+	if si.LastSetupError == nil {
+		return ""
+	}
+	if si.LastSetupError.DeclineCode != "" {
+		return string(si.LastSetupError.DeclineCode)
+	}
+	return string(si.LastSetupError.Code)
+}
+
 // handlePaymentMethodDetached soft-deletes the mirror row. Idempotent:
 // a detached event for an already-soft-deleted row (e.g. Stripe retry
 // after another agent did the same delete) is a no-op but logged so

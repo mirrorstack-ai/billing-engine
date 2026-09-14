@@ -240,6 +240,10 @@ type DistributorMutationAuthority struct {
 type AddCardRequestStatus struct {
 	Status        AddCardStatus
 	PaymentMethod *PaymentMethod
+	// FailureCode is the Stripe reason a 'failed' request failed with
+	// (decline_code, else error code; migration 082) — "" when the request
+	// did not fail or failed without a Stripe reason.
+	FailureCode string
 }
 
 // NewStore returns a Store backed by the given pgxpool.
@@ -475,7 +479,7 @@ func (s *pgxStore) GetAddCardRequest(ctx context.Context, requestID, accountID u
 	if err != nil {
 		return nil, err
 	}
-	out := &AddCardRequestStatus{Status: AddCardStatus(row.Status)}
+	out := &AddCardRequestStatus{Status: AddCardStatus(row.Status), FailureCode: row.FailureCode}
 	if row.PaymentMethodID.Valid {
 		pmID, err := uuid.FromBytes(row.PaymentMethodID.Bytes[:])
 		if err != nil {
