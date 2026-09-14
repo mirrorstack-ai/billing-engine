@@ -150,35 +150,31 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		require.Zero(t, got.totalCents)
 	})
 
-	// 🔴 DRIFT — THE RECLAIM REFUSES INSTEAD OF RE-DERIVING.
+	// 🔴 DRIFT — A STALE FREEZE IS RE-DERIVED; A SEALED ONE IS REFUSED (billing-engine#217).
 	//
-	// This subtest deliberately builds a run whose durable commitment and live
-	// state DISAGREE: a crashed attempt froze 137 cents, while live state (no
-	// usage, no live apps, no domains) derives 0. That gap is the subject. The
-	// deleted collector closed it by REUSING the frozen cents verbatim
-	// (charge.go:398-402) and sending 137 to Stripe under the run's stable idem
-	// keys.
+	// Both subtests build a run whose durable commitment and live state
+	// DISAGREE: a crashed attempt froze 137 cents, while live state (no usage,
+	// no live apps, no domains) derives 0. The deleted collector closed that
+	// gap by REUSING the frozen cents verbatim (charge.go:398-402); the intent
+	// rail cannot (a frozen total cannot be split back into lines), so it used
+	// to refuse unconditionally — and refused for ever, on a number nothing
+	// external had ever seen (the 2026-09-11 production run).
 	//
-	// The intent rail cannot do that, and boundary_charges.go's splitBoundary
-	// says why: a single frozen cents figure cannot be split back into arrears
-	// plus the three advance components, so sealing 137 would put a document in
-	// front of the customer whose lines nobody derived. It COMPARES instead and
-	// refuses, naming both numbers — and the run is left reclaimable with its
-	// commitment intact rather than terminally marked against a charge that
-	// never happened.
-	//
-	// Both figures the collecting assertion pinned are still pinned: 137 as the
-	// durable amount that must not be silently dropped, 0 as the live total
-	// that must not be silently substituted for it.
-	t.Run("reclaimed frozen greater than zero", func(t *testing.T) {
+	// Owner rule (b): what makes a frozen figure binding is a provider invoice
+	// or a sealed intent. Without either the freeze is a stale intention and
+	// moves to the live derivation (compare-and-set, audit-logged); with the
+	// migration-083 marker (the run was ever handed to the proposer) the
+	// refusal stands, naming both numbers.
+	t.Run("reclaimed frozen greater than zero, never handed to the proposer: re-frozen at live", func(t *testing.T) {
 		store := cycle.NewStore(pool)
 		accountID := seedAccount(t, pool)
 		installStandardPaymentMethod(t, pool, accountID, "cus_standard_frozen_positive")
 
-		runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
+		runID, shouldCharge, reclaimed, everProposed, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.True(t, shouldCharge)
 		require.False(t, reclaimed)
+		require.False(t, everProposed)
 
 		const frozenCents int64 = 137
 		frozen, claim, err := store.FreezeBillingRunCharge(ctx, runID, cycle.FrozenBoundaryCharge{
@@ -194,44 +190,84 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		sc := newFakeStripe()
 		svc, p := boundarySvcProposing(store, sc)
 		resp, err := svc.WithCreditWallet(false).RunBillingCycle(ctx, accountID, start, end, 0)
+		require.NoError(t, err, "a never-presented, never-sealed freeze reconciles instead of refusing")
+		require.True(t, resp.FirstRun)
+
+		// The freeze moved to the live figure — 0 — so this is a zero
+		// boundary: nothing is sealed (a $0 document is still a document) and
+		// the run terminally marks.
+		require.Equal(t, cycle.RunStatusInvoiced, resp.Status)
+		require.Zero(t, resp.ChargedCents)
+		require.Empty(t, p.groups, "a zero boundary seals no intent")
+		require.Empty(t, p.charges)
+
+		// Nothing reached the provider; the crash-recovery READ still ran
+		// under this run's own charge ref (it is what proved no invoice exists).
+		require.Empty(t, sc.invoiceCalls)
+		require.Empty(t, sc.itemCalls)
+		require.Empty(t, sc.finalizeCalls)
+		require.Len(t, sc.findByRefCalls, 1)
+		require.Equal(t, "run:"+runID.String(), sc.findByRefCalls[0])
+
+		got := readStandardRun(t, pool, runID)
+		require.Equal(t, "invoiced", got.status)
+		require.Nil(t, got.stripeInvoice)
+		require.Zero(t, got.totalCents)
+		require.NotNil(t, got.frozenCents)
+		require.Zero(t, *got.frozenCents, "the run marker holds the live figure after the compare-and-set")
+	})
+
+	t.Run("reclaimed frozen greater than zero, previously handed to the proposer: refused", func(t *testing.T) {
+		store := cycle.NewStore(pool)
+		accountID := seedAccount(t, pool)
+		installStandardPaymentMethod(t, pool, accountID, "cus_standard_frozen_sealed")
+
+		runID, shouldCharge, reclaimed, everProposed, err := store.InsertBillingRun(ctx, accountID, start, end)
+		require.NoError(t, err)
+		require.True(t, shouldCharge)
+		require.False(t, reclaimed)
+		require.False(t, everProposed)
+
+		const frozenCents int64 = 137
+		_, claim, err := store.FreezeBillingRunCharge(ctx, runID, cycle.FrozenBoundaryCharge{Cents: frozenCents, WithBase: true})
+		require.NoError(t, err)
+		require.Equal(t, cycle.StripeRailClaimed, claim)
+		// The prior attempt got as far as the proposer (migration-083 marker),
+		// then died before the 'proposed' mark: status says nothing, the marker
+		// says "maybe sealed". The reclaim's prior CTE must read the marker.
+		require.NoError(t, store.MarkBillingRunProposalAttempted(ctx, runID))
+		require.NoError(t, store.MarkBillingRun(ctx, runID, cycle.RunStatusFailed, "in_stale", 999))
+
+		sc := newFakeStripe()
+		svc, p := boundarySvcProposing(store, sc)
+		resp, err := svc.WithCreditWallet(false).RunBillingCycle(ctx, accountID, start, end, 0)
 
 		// The refusal names BOTH numbers: what this run committed to, and what
 		// live state now derives.
 		require.Error(t, err)
 		require.ErrorContains(t, err, "this run froze 137 cents but live state now derives 0",
-			"a drifted reclaim must name the durable amount and the live one")
+			"a drifted reclaim on a maybe-sealed run must name the durable amount and the live one")
 		require.Nil(t, resp)
-
-		// 🔴 Nothing was sealed. Sealing EITHER number would be the failure the
-		// refusal exists to prevent: 137 is a total nobody derived lines for,
-		// and 0 silently forgives the amount the crashed attempt committed to.
-		require.Empty(t, p.groups, "a drifted reclaim sealed an amount nobody derived")
+		require.Empty(t, p.groups, "a drifted sealed reclaim sealed an amount nobody derived")
 		require.Empty(t, p.charges)
-
-		// 🔴 And nothing reached the provider — the drop's central claim.
 		require.Empty(t, sc.invoiceCalls)
 		require.Empty(t, sc.itemCalls)
 		require.Empty(t, sc.finalizeCalls)
 
-		// The crash-recovery READ survives the collector's deletion: it is what
-		// decides whether money may already have moved, and it still runs under
-		// this run's own charge ref.
-		require.Len(t, sc.findByRefCalls, 1)
-		require.Equal(t, "run:"+runID.String(), sc.findByRefCalls[0])
-
 		// The run is left RECLAIMABLE with its commitment intact — 'pending'
-		// from the reclaim's own reset, no invoice, and the frozen 137 still on
-		// the row for whoever resolves the disagreement.
+		// from the reclaim's own reset, no invoice, the frozen 137 still on the
+		// row, and the marker still set for the next reclaim to read.
 		got := readStandardRun(t, pool, runID)
-		require.Equal(t, "pending", got.status,
-			"a refused reclaim must stay reclaimable, never terminal")
+		require.Equal(t, "pending", got.status, "a refused reclaim must stay reclaimable, never terminal")
 		require.Nil(t, got.stripeInvoice)
 		require.Zero(t, got.totalCents)
 		require.NotNil(t, got.frozenCents)
-		require.EqualValues(t, frozenCents, *got.frozenCents,
-			"the durable commitment must survive the refusal")
+		require.EqualValues(t, frozenCents, *got.frozenCents, "the durable commitment must survive the refusal")
 		require.NotNil(t, got.frozenWithBase)
 		require.True(t, *got.frozenWithBase)
+		_, _, _, everProposed, err = store.InsertBillingRun(ctx, accountID, start, end)
+		require.NoError(t, err)
+		require.True(t, everProposed, "the marker survives every reclaim")
 	})
 
 	t.Run("reclaimed frozen equal to zero", func(t *testing.T) {
