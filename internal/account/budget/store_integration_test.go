@@ -247,8 +247,8 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.Equal(t, 2, sig.PaidInvoices, "open invoices do not count as paid")
 	require.True(t, sig.DelinquentNow, "an open invoice with a balance is delinquent now")
 	require.Zero(t, sig.LateCount)
-	// k=2: $72.64; delinquent → /3 = $24.21 (above the $5 floor).
-	require.EqualValues(t, 24_213_063, budget.ExposureLimitMicros(cfg, sig), "delinquent: the curve divided by 3, above the no-card floor")
+	// S2 k=2: $15.65; delinquent → /3 = $5.22 (just above the $5 floor).
+	require.EqualValues(t, 5_216_094, budget.ExposureLimitMicros(cfg, sig), "delinquent: the curve divided by 3, above the no-card floor")
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET ever_failed = true WHERE stripe_invoice_id = 'in_exposure_a'`)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET status = 'paid', amount_due = 0 WHERE stripe_invoice_id = 'in_exposure_c'`)
@@ -266,7 +266,7 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.Equal(t, 1, sig.LateCount, "a voided, never-failed invoice does not count as late")
 	require.False(t, sig.DelinquentNow)
 	require.Equal(t, 3, sig.PaidInvoices)
-	require.EqualValues(t, 44_441_157, budget.ExposureLimitMicros(cfg, sig), "3 paid − 2×1 late = k 1 → $44.44")
+	require.EqualValues(t, 12_008_832, budget.ExposureLimitMicros(cfg, sig), "3 paid − 2×1 late = k 1 → $12.01 on S2")
 
 	// The system exposure row is storable and re-upserts in place.
 	first, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 17_320_508, AlertPercents: []int{80, 100}, Active: true, HardCap: true})
