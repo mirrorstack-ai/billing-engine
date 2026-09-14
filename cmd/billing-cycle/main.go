@@ -53,6 +53,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/budget"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
@@ -334,6 +335,7 @@ func buildService() *cycle.Service {
 
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
 	svc := cycle.NewService(cycle.NewStore(pool), billingstripe.NewClient(stripeKey)).
+		WithDemeritCloser(budget.NewStore(pool)).
 		WithCreditWallet(walletEnabled).
 		WithCreditRollout(controller)
 	coordinator := credit.NewCoordinatorIfReady(
@@ -691,6 +693,17 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 			}
 		} else {
 			res.RolledUp++
+		}
+
+		// The exposure pool's delinquency score moves at the close (migration
+		// 085): once per account per boundary, before the charge so a failed
+		// run still accounts the cycle. Its own error is logged and counted,
+		// never fatal to the charge.
+		if demerit, applied, err := svc.CloseDemerit(ctx, a.ID, end); err != nil {
+			slog.ErrorContext(ctx, "demerit close transition failed", "account_id", a.ID, "period_end", end, "error", err)
+			res.Failed++
+		} else if applied {
+			slog.InfoContext(ctx, "demerit close transition applied", "account_id", a.ID, "period_end", end, "demerit", demerit)
 		}
 
 		// Phase 2 — charge the just-closed window.

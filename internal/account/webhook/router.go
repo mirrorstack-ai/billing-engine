@@ -162,6 +162,14 @@ type Store interface {
 	// reset on invoice.paid.
 	MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string) error
 
+	// ApplyDemeritOnFailure / ApplyDemeritOnSettle are the delinquency
+	// score's event transitions (migration 085, owner 2026-09-14): +p on an
+	// invoice's FIRST failure, −r the day a late invoice is settled. Both are
+	// invoice-latched single statements, so at-least-once and out-of-order
+	// delivery change nothing the second time. applied=false is the no-op.
+	ApplyDemeritOnFailure(ctx context.Context, stripeInvoiceID string) (applied bool, err error)
+	ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID string) (applied bool, err error)
+
 	// FlagPaymentMethodFraud latches fraud_blocked (migration 038) on a disputed /
 	// early-fraud-warned card so the service-block gate stops counting it as
 	// usable. Card-scoped + account-bounded: every ACTIVE mirror row for the

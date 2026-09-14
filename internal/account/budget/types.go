@@ -189,29 +189,33 @@ type Pool struct {
 	AccruedMicros   int64      `json:"accrued_micros"`
 	RemainingMicros int64      `json:"remaining_micros"`
 	Exhausted       bool       `json:"exhausted"`
-	// HasUsableCard / PaidInvoices / DelinquentNow / LateCount are the curve's
-	// inputs, echoed so a console can explain the limit ("$14.10: card on
-	// file, 1 paid invoice").
+	// HasUsableCard / PaidInvoices / DelinquentNow / Demerit / ArrearsMicros
+	// are the pool's inputs, echoed so a console can explain the limit
+	// ("$167.96: card on file, 10 paid, S 2 → ÷3; $300 unpaid counts").
 	HasUsableCard bool `json:"has_usable_card"`
 	PaidInvoices  int  `json:"paid_invoices"`
 	DelinquentNow bool `json:"delinquent_now"`
-	LateCount     int  `json:"late_count"`
-	// EffectivePaid is k after the delinquency penalty — the k the limit was
-	// computed from ("$14.14: 3 paid, 1 late × 2 = k 1").
-	EffectivePaid int `json:"effective_paid"`
+	// Demerit is the account's delinquency score S (0 = Normal; the limit is
+	// curve ÷ (1 + S)); Tier is its display band: normal | watch |
+	// restricted | severe.
+	Demerit float64 `json:"demerit"`
+	Tier    string  `json:"tier"`
+	// ArrearsMicros is the open balance of prior invoices, counted in
+	// AccruedMicros as money (never scored).
+	ArrearsMicros int64 `json:"arrears_micros"`
 }
 
-// ExposureSignals are the curve's inputs for one account. DelinquentNow and
-// LateCount are read for the delinquency rule (owner's pick pending): an
-// open/uncollectible invoice with a balance, and how many invoices ever
-// needed a failed attempt or ended uncollectible (a void is our own
-// cancellation and never counts).
+// ExposureSignals are the pool's inputs for one account: the curve's k
+// (paid invoices), the card, the delinquency score S (accounts.demerit_score,
+// moved only by the three demerit transitions), whether an invoice is open
+// with a balance, and that balance (arrears) as money.
 type ExposureSignals struct {
 	BillingMode   string
 	HasUsableCard bool
 	PaidInvoices  int
 	DelinquentNow bool
-	LateCount     int
+	Demerit       float64
+	ArrearsMicros int64
 }
 
 // Shape selects the exposure curve's growth function (085).
@@ -238,16 +242,19 @@ type RiskRampConfig struct {
 	K0          float64
 	KMax        int
 	Tau         float64
-	// DelinquentDivisor / LatePenaltyK are the delinquency rule (owner
-	// 2026-09-14): while delinquent the limit is curve / DelinquentDivisor,
-	// never below NoCardMicros (a huge divisor is the hard floor, 1 disables);
-	// k_eff = max(0, paid − LatePenaltyK × late) once settled.
-	DelinquentDivisor int
-	LatePenaltyK      int
-	EnforcementPaused bool
-	PausedReason      string
-	PausedBy          string
-	PausedAt          time.Time // zero when not paused
+	// DemeritPerUnpaidCycle (p), DemeritRecovery (r) and DemeritMax are the
+	// delinquency score's parameters (owner FINAL 2026-09-14): +p on an
+	// invoice's first failure and at each close it stays unpaid, −r on
+	// settling a late invoice and at each clean close, 0 ≤ S ≤ DemeritMax.
+	// The limit is curve ÷ (1 + S). Applied by the DB transitions; carried
+	// here for the admin read.
+	DemeritPerUnpaidCycle float64
+	DemeritRecovery       float64
+	DemeritMax            float64
+	EnforcementPaused     bool
+	PausedReason          string
+	PausedBy              string
+	PausedAt              time.Time // zero when not paused
 }
 
 // SetAIEnforcementPausedRequest flips the incident kill-switch (admin RPC,
@@ -264,21 +271,22 @@ type SetAIEnforcementPausedRequest struct {
 // AIEnforcementResponse is the switch's state (with its provenance) plus the
 // curve, so an admin surface shows everything in one read.
 type AIEnforcementResponse struct {
-	Paused            bool      `json:"paused"`
-	PausedReason      string    `json:"paused_reason,omitempty"`
-	PausedBy          string    `json:"paused_by,omitempty"`
-	PausedAt          time.Time `json:"paused_at,omitempty"`
-	NoCardMicros      int64     `json:"no_card_micros"`
-	CardBaseMicros    int64     `json:"card_base_micros"`
-	CeilingMicros     int64     `json:"ceiling_micros"`
-	RangeMicros       int64     `json:"range_micros"`
-	Shape             Shape     `json:"shape"`
-	A                 float64   `json:"p_a"`
-	K0                float64   `json:"p_k0"`
-	KMax              int       `json:"k_max"`
-	Tau               float64   `json:"tau"`
-	DelinquentDivisor int       `json:"delinquent_divisor"`
-	LatePenaltyK      int       `json:"late_penalty_k"`
+	Paused                bool      `json:"paused"`
+	PausedReason          string    `json:"paused_reason,omitempty"`
+	PausedBy              string    `json:"paused_by,omitempty"`
+	PausedAt              time.Time `json:"paused_at,omitempty"`
+	NoCardMicros          int64     `json:"no_card_micros"`
+	CardBaseMicros        int64     `json:"card_base_micros"`
+	CeilingMicros         int64     `json:"ceiling_micros"`
+	RangeMicros           int64     `json:"range_micros"`
+	Shape                 Shape     `json:"shape"`
+	A                     float64   `json:"p_a"`
+	K0                    float64   `json:"p_k0"`
+	KMax                  int       `json:"k_max"`
+	Tau                   float64   `json:"tau"`
+	DemeritPerUnpaidCycle float64   `json:"demerit_per_unpaid_cycle"`
+	DemeritRecovery       float64   `json:"demerit_recovery"`
+	DemeritMax            float64   `json:"demerit_max"`
 }
 
 // GetBudgetStatusResponse is the live spend-vs-cap status. Exists is false

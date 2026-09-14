@@ -68,6 +68,12 @@ type Store interface {
 	// a pause and clearing them on resume; returns the stored value.
 	SetAIEnforcementPaused(ctx context.Context, paused bool, reason, actorID string) (bool, error)
 
+	// The three demerit transitions (migration 085), each idempotent by its
+	// own latch; applied reports whether this call moved the score.
+	ApplyDemeritOnFailure(ctx context.Context, stripeInvoiceID string) (applied bool, err error)
+	ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID string) (applied bool, err error)
+	ApplyDemeritAtClose(ctx context.Context, accountID uuid.UUID, closeAt time.Time) (demerit float64, applied bool, err error)
+
 	// InsertBudgetAlerts records a batch of threshold crossings in ONE
 	// transaction (all-or-nothing): either every row is committed or none are,
 	// so a partial set of alerts with an inconsistent spend snapshot is never
@@ -250,7 +256,8 @@ func (s *pgxStore) ExposureSignals(ctx context.Context, accountID uuid.UUID) (Ex
 	if err != nil {
 		return ExposureSignals{}, err
 	}
-	return ExposureSignals{BillingMode: row.BillingMode, HasUsableCard: row.HasUsableCard, PaidInvoices: int(row.PaidInvoices), DelinquentNow: row.DelinquentNow, LateCount: int(row.LateCount)}, nil
+	// amount_due is in the invoice's minor units (cents); the pool is micros.
+	return ExposureSignals{BillingMode: row.BillingMode, HasUsableCard: row.HasUsableCard, PaidInvoices: int(row.PaidInvoices), DelinquentNow: row.DelinquentNow, Demerit: row.Demerit, ArrearsMicros: row.ArrearsCents * microsPerCent}, nil
 }
 
 func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
@@ -260,7 +267,7 @@ func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
 	}
 	cfg := RiskRampConfig{
 		NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros,
-		RangeMicros: row.RangeMicros, Shape: Shape(row.Shape), A: row.PA, K0: row.PK0, KMax: int(row.KMax), Tau: row.Tau, DelinquentDivisor: int(row.DelinquentDivisor), LatePenaltyK: int(row.LatePenaltyK),
+		RangeMicros: row.RangeMicros, Shape: Shape(row.Shape), A: row.PA, K0: row.PK0, KMax: int(row.KMax), Tau: row.Tau, DemeritPerUnpaidCycle: row.DemeritPerUnpaidCycle, DemeritRecovery: row.DemeritRecovery, DemeritMax: row.DemeritMax,
 		EnforcementPaused: row.AiEnforcementPaused, PausedReason: row.PausedReason, PausedBy: row.PausedBy,
 	}
 	if row.PausedAt.Valid {
@@ -410,4 +417,39 @@ func int32sToInt(in []int32) []int {
 		out[i] = int(v)
 	}
 	return out
+}
+
+// microsPerCent converts an invoice's minor units (USD cents, the only
+// currency the charge spine writes) to the pool's micro-dollars.
+const microsPerCent = 10_000
+
+// ApplyDemeritOnFailure charges +p for an invoice's FIRST failure; applied
+// reports whether this call was that first time.
+func (s *pgxStore) ApplyDemeritOnFailure(ctx context.Context, stripeInvoiceID string) (applied bool, err error) {
+	n, err := s.q.ApplyDemeritOnFailure(ctx, stripeInvoiceID)
+	return n > 0, err
+}
+
+// ApplyDemeritOnSettle credits −r once when a late invoice reaches 'paid'.
+func (s *pgxStore) ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID string) (applied bool, err error) {
+	n, err := s.q.ApplyDemeritOnSettle(ctx, stripeInvoiceID)
+	return n > 0, err
+}
+
+// ApplyDemeritAtClose applies the account's cycle-close transition once per
+// close (a repeat or an older close is a no-op: applied=false, demerit = the
+// stored score).
+func (s *pgxStore) ApplyDemeritAtClose(ctx context.Context, accountID uuid.UUID, closeAt time.Time) (demerit float64, applied bool, err error) {
+	d, err := s.q.ApplyDemeritAtClose(ctx, db.ApplyDemeritAtCloseParams{AccountID: accountID.String(), CloseAt: closeAt.UTC()})
+	if errors.Is(err, pgx.ErrNoRows) {
+		sig, err := s.q.ExposureSignals(ctx, accountID.String())
+		if err != nil {
+			return 0, false, err
+		}
+		return sig.Demerit, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return d, true, nil
 }

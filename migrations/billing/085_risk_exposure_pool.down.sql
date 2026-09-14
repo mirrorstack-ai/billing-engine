@@ -8,3 +8,5 @@ ALTER TABLE ms_billing.budgets
 DROP INDEX IF EXISTS ms_billing.usage_events_app_billable_metric_idx;
 DROP INDEX IF EXISTS ms_billing.usage_events_account_billable_metric_idx;
 DROP TABLE IF EXISTS ms_billing.risk_ramp_config;
+ALTER TABLE ms_billing.invoices DROP COLUMN IF EXISTS demerit_failed_at, DROP COLUMN IF EXISTS demerit_settled_at;
+ALTER TABLE ms_billing.accounts DROP COLUMN IF EXISTS demerit_score, DROP COLUMN IF EXISTS demerit_closed_at;

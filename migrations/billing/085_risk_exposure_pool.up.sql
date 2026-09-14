@@ -58,15 +58,20 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
     p_k0                  NUMERIC(6,3) NOT NULL DEFAULT 10.000,
     k_max                 INT NOT NULL DEFAULT 24 CONSTRAINT risk_ramp_k_max_positive CHECK (k_max > 0),
     tau                   NUMERIC(6,3) NOT NULL DEFAULT 5.000 CONSTRAINT risk_ramp_tau_positive CHECK (tau > 0),
-    -- Delinquency (owner's pick 2026-09-14): while an invoice is open /
-    -- uncollectible with a balance the limit is the curve DIVIDED by
-    -- delinquent_divisor, never below no_card_micros (the owner found a hard
-    -- $5 cliff too harsh; a huge divisor reproduces it, 1 disables the
-    -- reduction). Once settled each late invoice costs late_penalty_k paid
-    -- invoices of trust: k_eff = max(0, paid − late_penalty_k × late)
-    -- (late_penalty_k large = any late payment resets k).
-    delinquent_divisor    INT NOT NULL DEFAULT 3 CONSTRAINT risk_ramp_divisor_min CHECK (delinquent_divisor >= 1),
-    late_penalty_k        INT NOT NULL DEFAULT 2 CONSTRAINT risk_ramp_late_penalty_nonneg CHECK (late_penalty_k >= 0),
+    -- Delinquency = ONE demerit score S per account (owner FINAL 2026-09-14,
+    -- via f5): limit = curve(k) ÷ (1 + S), never below no_card_micros.
+    --   +demerit_per_unpaid_cycle  the first time an invoice fails (or is
+    --                              marked uncollectible), and again at every
+    --                              cycle close it has then stayed unpaid;
+    --   −demerit_recovery          the day a late invoice is settled, and at
+    --                              every cycle close with nothing late;
+    --   never above demerit_max, never below 0 — so the worst history is
+    --   back to Normal after demerit_max ÷ demerit_recovery clean cycles.
+    -- Unpaid DOLLARS are not scored: the open balance counts against the
+    -- pool as money (arrears), exactly. A VOID is our cancellation: never late.
+    demerit_per_unpaid_cycle NUMERIC(5,2) NOT NULL DEFAULT 2.00 CONSTRAINT risk_ramp_demerit_p_nonneg CHECK (demerit_per_unpaid_cycle >= 0),
+    demerit_recovery         NUMERIC(5,2) NOT NULL DEFAULT 1.00 CONSTRAINT risk_ramp_demerit_r_nonneg CHECK (demerit_recovery >= 0),
+    demerit_max              NUMERIC(5,2) NOT NULL DEFAULT 12.00 CONSTRAINT risk_ramp_demerit_max_nonneg CHECK (demerit_max >= 0),
     ai_enforcement_paused BOOLEAN NOT NULL DEFAULT false,
     -- Who paused it, why, and since when — so "why was enforcement off for
     -- six hours" is answered from the row, not from archaeology. Cleared on
@@ -82,7 +87,7 @@ VALUES (1, 5000000, 10000000, 1000000000)
 ON CONFLICT (id) DO NOTHING;
 
 COMMENT ON TABLE ms_billing.risk_ramp_config IS
-    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × growth(k) where growth is the configured shape (sigmoid: normalised logistic reaching 1 at k_max; exp: 1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
+    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × growth(k) where growth is the configured shape (sigmoid: normalised logistic reaching 1 at k_max; exp: 1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve ÷ (1 + accounts.demerit_score), never below no_card_micros; S moves by demerit_per_unpaid_cycle / demerit_recovery, capped at demerit_max (see the column comments). Finance-owned; tune by UPDATE.';
 
 ALTER TABLE ms_billing.budgets
     DROP CONSTRAINT IF EXISTS budgets_category_known;
@@ -105,3 +110,22 @@ CREATE INDEX IF NOT EXISTS usage_events_account_billable_metric_idx
 
 COMMENT ON COLUMN ms_billing.budgets.category IS
     'Which spend the cap measures: all (every usage event), ai (infra.ai.* only, priced per model), or exposure (the SYSTEM row billing-engine maintains per PaaS account so budget_alerts can record crossings of the risk-exposure pool; never written by a customer).';
+
+-- The demerit score lives on the ACCOUNT (one row, updated by three
+-- transitions, each idempotent):
+--   accounts.demerit_score      S, 0 = Normal;
+--   accounts.demerit_closed_at  the last cycle close the score accounted for,
+--                               so a re-run of the same close changes nothing;
+--   invoices.demerit_failed_at  when the invoice's first failure was charged
+--                               (+p), so a repeated payment_failed is a no-op
+--                               and a close knows whether the invoice has
+--                               stayed unpaid a FULL cycle since;
+--   invoices.demerit_settled_at when the settle credit (−r) was given, once.
+ALTER TABLE ms_billing.accounts
+    ADD COLUMN IF NOT EXISTS demerit_score     NUMERIC(5,2) NOT NULL DEFAULT 0 CONSTRAINT accounts_demerit_nonneg CHECK (demerit_score >= 0),
+    ADD COLUMN IF NOT EXISTS demerit_closed_at TIMESTAMPTZ NULL;
+ALTER TABLE ms_billing.invoices
+    ADD COLUMN IF NOT EXISTS demerit_failed_at  TIMESTAMPTZ NULL,
+    ADD COLUMN IF NOT EXISTS demerit_settled_at TIMESTAMPTZ NULL;
+COMMENT ON COLUMN ms_billing.accounts.demerit_score IS
+    'Delinquency demerit S (owner 2026-09-14): the exposure limit is curve(k) ÷ (1 + S). +demerit_per_unpaid_cycle on an invoice''s first failure and at each cycle close it stays unpaid; −demerit_recovery on settling a late invoice and at each clean cycle close; 0 ≤ S ≤ demerit_max. Written only by the budget store''s three demerit transitions.';

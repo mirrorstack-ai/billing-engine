@@ -385,6 +385,20 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 			r.log.ErrorContext(ctx, "invoice failure latch (ever_failed) failed", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "error", err)
 			return Result{HTTPStatus: 500, Status: StatusInternal}
 		}
+		// DEMERIT +p on the invoice's FIRST failure (migration 085): the
+		// exposure pool's delinquency score moves the moment the charge
+		// fails, not at the next cycle close. Invoice-latched, so the same
+		// failure delivered twice — or payment_failed followed by
+		// marked_uncollectible — charges once. Surfaced (500) so Stripe
+		// retries: a lost +p is a lost risk control.
+		applied, err := r.store.ApplyDemeritOnFailure(ctx, inv.ID)
+		if err != nil {
+			r.log.ErrorContext(ctx, "invoice failure demerit failed", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID, "error", err)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		if applied {
+			r.log.InfoContext(ctx, "invoice failure charged the delinquency demerit", "event_id", event.ID, "type", event.Type, "stripe_invoice_id", inv.ID)
+		}
 	}
 
 	if failureCode, reconcile := creditFailureCode(event.Type); reconcile {
@@ -492,6 +506,17 @@ func (r *Router) handleInvoiceLifecycle(ctx context.Context, event stripego.Even
 	// service-block auto-cure needs no write here — paying an invoice moves the
 	// ServiceBlockSignals streak cutoff (most-recent paid) forward automatically.
 	if event.Type == stripego.EventTypeInvoicePaid {
+		// DEMERIT −r the day a LATE invoice is settled (migration 085): after
+		// the mirror says 'paid', once per invoice; a never-late invoice
+		// paying is a clean cycle, credited at the close instead.
+		settled, err := r.store.ApplyDemeritOnSettle(ctx, inv.ID)
+		if err != nil {
+			r.log.ErrorContext(ctx, "invoice.paid demerit settle failed", "event_id", event.ID, "stripe_invoice_id", inv.ID, "error", err)
+			return Result{HTTPStatus: 500, Status: StatusInternal}
+		}
+		if settled {
+			r.log.InfoContext(ctx, "invoice.paid settled a late invoice; demerit credited", "event_id", event.ID, "stripe_invoice_id", inv.ID)
+		}
 		relaxed, err := r.store.RelaxCollectionOnPaidInvoice(ctx, inv.ID)
 		if err != nil {
 			r.log.ErrorContext(ctx, "invoice.paid relax collection failed", "event_id", event.ID, "stripe_invoice_id", inv.ID, "error", err)

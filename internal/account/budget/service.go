@@ -247,29 +247,19 @@ func (s *Service) spendFor(ctx context.Context, b Budget, start, end time.Time) 
 // web's 隨用隨付 card maps to it); 'credits' is the prepaid mode.
 const paasBillingMode = "standard"
 
-// EffectivePaid is k after the delinquency memory (rule b): each late
-// invoice costs LatePenaltyK paid invoices of trust, floored at zero. A
-// LatePenaltyK of 0 keeps k as is; a huge one is "any late payment resets k".
-func EffectivePaid(cfg RiskRampConfig, sig ExposureSignals) int {
-	k := sig.PaidInvoices
-	if k < 0 {
-		k = 0
+// DemeritTier is the display band of a demerit score: 0 Normal, up to 2
+// watch (one failure), up to 6 restricted, above that severe. Bands only —
+// every decision uses S itself.
+func DemeritTier(s float64) string {
+	switch {
+	case s <= 0:
+		return "normal"
+	case s <= 2:
+		return "watch"
+	case s <= 6:
+		return "restricted"
 	}
-	late := sig.LateCount
-	if late < 0 {
-		late = 0
-	}
-	penalty := cfg.LatePenaltyK
-	if penalty < 0 {
-		penalty = 0
-	}
-	if penalty > 0 && late > 0 {
-		if late > k/penalty { // k − penalty×late < 0 without overflow
-			return 0
-		}
-		k -= penalty * late
-	}
-	return k
+	return "severe"
 }
 
 // growth is the configured shape's fraction of the range earned at k paid
@@ -309,27 +299,24 @@ func growth(cfg RiskRampConfig, k int) float64 {
 // usable card → NoCardMicros; a usable card with k paid invoices →
 // CardBaseMicros + RangeMicros × growth(k) — the configured shape (sigmoid
 // seeded: $10 + $990 × a normalised logistic, exactly $1,000 at k = 24) —
-// and never above CeilingMicros, the hard clamp. Delinquency (owner's pick): while an
-// invoice is open with a balance the limit is the curve divided by
-// DelinquentDivisor, never below NoCardMicros — the risk control without a
-// hard cliff (a huge divisor reproduces the cliff, 1 disables the
-// reduction); once settled, k is EffectivePaid — the memory, applied before
-// the divisor. Whole micros, rounded half up; the ceiling also bounds a
-// zero-card floor so a misconfigured row cannot exceed it. A non-positive
-// tau (a row the DB CHECK did not see) means "no growth": the base alone.
+// and never above CeilingMicros, the hard clamp. Delinquency (owner FINAL):
+// the curve is divided by (1 + S), S the account's demerit score, never
+// below NoCardMicros — one failure (S 2) is ÷3, three cycles unpaid (S 6)
+// ÷7, and every clean cycle brings it back. Whole micros, rounded half up;
+// the ceiling also bounds a zero-card floor so a misconfigured row cannot
+// exceed it. Unusable shape parameters mean "no growth": the base alone.
 func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 	var limit int64
 	if sig.HasUsableCard {
-		k := EffectivePaid(cfg, sig)
-		limit = int64(math.Round(float64(cfg.CardBaseMicros) + float64(cfg.RangeMicros)*growth(cfg, k)))
+		limit = int64(math.Round(float64(cfg.CardBaseMicros) + float64(cfg.RangeMicros)*growth(cfg, sig.PaidInvoices)))
 	} else {
 		limit = cfg.NoCardMicros
 	}
 	if limit > cfg.CeilingMicros {
 		limit = cfg.CeilingMicros
 	}
-	if sig.DelinquentNow && cfg.DelinquentDivisor > 1 {
-		reduced := limit / int64(cfg.DelinquentDivisor)
+	if sig.Demerit > 0 {
+		reduced := int64(math.Round(float64(limit) / (1 + sig.Demerit)))
 		if reduced < cfg.NoCardMicros {
 			reduced = cfg.NoCardMicros
 		}
@@ -360,9 +347,16 @@ func (s *Service) poolFor(ctx context.Context, cfg RiskRampConfig, accountID uui
 		return &Pool{Mode: sig.BillingMode, Source: PoolSourceNone, HasUsableCard: sig.HasUsableCard, PaidInvoices: sig.PaidInvoices}, nil
 	}
 	limit := ExposureLimitMicros(cfg, sig)
-	accrued, err := s.store.AccountPeriodSpendMicros(ctx, accountID, start, end)
+	spend, err := s.store.AccountPeriodSpendMicros(ctx, accountID, start, end)
 	if err != nil {
 		return nil, err
+	}
+	// Unpaid dollars enter the pool EXACTLY, as money (owner FINAL): the open
+	// balance of prior invoices is accrued exposure, so a $300 arrears against
+	// a $168 limit is exhausted on the spot and a $5 one dents it by $5.
+	accrued := spend + sig.ArrearsMicros
+	if accrued < spend { // overflow: exhausted is the safe reading
+		accrued = math.MaxInt64
 	}
 	remaining := limit - accrued
 	if remaining < 0 {
@@ -387,8 +381,9 @@ func (s *Service) poolFor(ctx context.Context, cfg RiskRampConfig, accountID uui
 		HasUsableCard:   sig.HasUsableCard,
 		PaidInvoices:    sig.PaidInvoices,
 		DelinquentNow:   sig.DelinquentNow,
-		LateCount:       sig.LateCount,
-		EffectivePaid:   EffectivePaid(cfg, sig),
+		Demerit:         sig.Demerit,
+		Tier:            DemeritTier(sig.Demerit),
+		ArrearsMicros:   sig.ArrearsMicros,
 	}, nil
 }
 
@@ -682,21 +677,22 @@ func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse,
 		return nil, billing.Internal("risk ramp config read failed", err)
 	}
 	return &AIEnforcementResponse{
-		Paused:            cfg.EnforcementPaused,
-		PausedReason:      cfg.PausedReason,
-		PausedBy:          cfg.PausedBy,
-		PausedAt:          cfg.PausedAt,
-		NoCardMicros:      cfg.NoCardMicros,
-		CardBaseMicros:    cfg.CardBaseMicros,
-		CeilingMicros:     cfg.CeilingMicros,
-		RangeMicros:       cfg.RangeMicros,
-		Shape:             cfg.Shape,
-		A:                 cfg.A,
-		K0:                cfg.K0,
-		KMax:              cfg.KMax,
-		Tau:               cfg.Tau,
-		DelinquentDivisor: cfg.DelinquentDivisor,
-		LatePenaltyK:      cfg.LatePenaltyK,
+		Paused:                cfg.EnforcementPaused,
+		PausedReason:          cfg.PausedReason,
+		PausedBy:              cfg.PausedBy,
+		PausedAt:              cfg.PausedAt,
+		NoCardMicros:          cfg.NoCardMicros,
+		CardBaseMicros:        cfg.CardBaseMicros,
+		CeilingMicros:         cfg.CeilingMicros,
+		RangeMicros:           cfg.RangeMicros,
+		Shape:                 cfg.Shape,
+		A:                     cfg.A,
+		K0:                    cfg.K0,
+		KMax:                  cfg.KMax,
+		Tau:                   cfg.Tau,
+		DemeritPerUnpaidCycle: cfg.DemeritPerUnpaidCycle,
+		DemeritRecovery:       cfg.DemeritRecovery,
+		DemeritMax:            cfg.DemeritMax,
 	}, nil
 }
 

@@ -336,6 +336,9 @@ type MsBillingAccount struct {
 	AutoCollectThresholdMicros pgtype.Int8 `json:"auto_collect_threshold_micros"`
 	// Universal-wallet policy: standard applies wallet credit before ordinary collection; credits settles the full boundary through the wallet. Distinct from usage_billing_mode, which is the arrears/prepaid collection-risk state.
 	BillingMode string `json:"billing_mode"`
+	// Delinquency demerit S (owner 2026-09-14): the exposure limit is curve(k) ÷ (1 + S). +demerit_per_unpaid_cycle on an invoice's first failure and at each cycle close it stays unpaid; −demerit_recovery on settling a late invoice and at each clean cycle close; 0 ≤ S ≤ demerit_max. Written only by the budget store's three demerit transitions.
+	DemeritScore    pgtype.Numeric     `json:"demerit_score"`
+	DemeritClosedAt pgtype.Timestamptz `json:"demerit_closed_at"`
 }
 
 // Rotating funding authority for atomic pre-Stripe charge arms. Every designation mutation creates a new generation; durable attempts retain the exact generation and funder they armed under.
@@ -786,10 +789,12 @@ type MsBillingInvoice struct {
 	// Server-computed at invoice-create time: true iff the charged amount (netted arrears + advance base, micros) exceeded the account auto_collect_threshold_micros (or the default when NULL) that applied WHEN THE CHARGE FIRED. Post-hoc disclosure only.
 	IsLargeAutoCollect bool `json:"is_large_auto_collect"`
 	// Sticky, set-only: true once this invoice failed a payment (payment_failed / marked_uncollectible), never cleared. Lets the service-block gate DERIVE the failed-charge streak at read time — counting (ever_failed OR uncollectible) invoices created after the last paid one — so it survives a later flip to paid and is immune to webhook delivery order.
-	EverFailed                    bool        `json:"ever_failed"`
-	ChargeFundingAccountID        pgtype.UUID `json:"charge_funding_account_id"`
-	ChargeFundingGeneration       pgtype.UUID `json:"charge_funding_generation"`
-	ChargeFundingLegacyUnresolved bool        `json:"charge_funding_legacy_unresolved"`
+	EverFailed                    bool               `json:"ever_failed"`
+	ChargeFundingAccountID        pgtype.UUID        `json:"charge_funding_account_id"`
+	ChargeFundingGeneration       pgtype.UUID        `json:"charge_funding_generation"`
+	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
+	DemeritFailedAt               pgtype.Timestamptz `json:"demerit_failed_at"`
+	DemeritSettledAt              pgtype.Timestamptz `json:"demerit_settled_at"`
 }
 
 type MsBillingMetricDefinition struct {
@@ -900,20 +905,21 @@ type MsBillingPaymentMethodsMirror struct {
 	CardCountry    pgtype.Text        `json:"card_country"`
 }
 
-// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × growth(k) where growth is the configured shape (sigmoid: normalised logistic reaching 1 at k_max; exp: 1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.
+// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × growth(k) where growth is the configured shape (sigmoid: normalised logistic reaching 1 at k_max; exp: 1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve ÷ (1 + accounts.demerit_score), never below no_card_micros; S moves by demerit_per_unpaid_cycle / demerit_recovery, capped at demerit_max (see the column comments). Finance-owned; tune by UPDATE.
 type MsBillingRiskRampConfig struct {
-	ID                int16          `json:"id"`
-	NoCardMicros      int64          `json:"no_card_micros"`
-	CardBaseMicros    int64          `json:"card_base_micros"`
-	CeilingMicros     int64          `json:"ceiling_micros"`
-	RangeMicros       int64          `json:"range_micros"`
-	Shape             string         `json:"shape"`
-	PA                pgtype.Numeric `json:"p_a"`
-	PK0               pgtype.Numeric `json:"p_k0"`
-	KMax              int32          `json:"k_max"`
-	Tau               pgtype.Numeric `json:"tau"`
-	DelinquentDivisor int32          `json:"delinquent_divisor"`
-	LatePenaltyK      int32          `json:"late_penalty_k"`
+	ID                    int16          `json:"id"`
+	NoCardMicros          int64          `json:"no_card_micros"`
+	CardBaseMicros        int64          `json:"card_base_micros"`
+	CeilingMicros         int64          `json:"ceiling_micros"`
+	RangeMicros           int64          `json:"range_micros"`
+	Shape                 string         `json:"shape"`
+	PA                    pgtype.Numeric `json:"p_a"`
+	PK0                   pgtype.Numeric `json:"p_k0"`
+	KMax                  int32          `json:"k_max"`
+	Tau                   pgtype.Numeric `json:"tau"`
+	DemeritPerUnpaidCycle pgtype.Numeric `json:"demerit_per_unpaid_cycle"`
+	DemeritRecovery       pgtype.Numeric `json:"demerit_recovery"`
+	DemeritMax            pgtype.Numeric `json:"demerit_max"`
 	// Incident kill-switch: true = every AI budget verdict is allowed (decided_by paused) while alerts keep recording. Flip via the SetAIEnforcementPaused admin RPC; no deploy needed.
 	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
 	PausedReason        pgtype.Text        `json:"paused_reason"`
