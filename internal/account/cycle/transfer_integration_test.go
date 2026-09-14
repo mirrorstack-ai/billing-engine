@@ -801,12 +801,18 @@ func TestTransferAppTreatsASealedProposalAsResolved(t *testing.T) {
 			require.True(t, found)
 			require.False(t, row.forfeitedProration, "a sealed proposal was forfeited; the intent rail owns it")
 			require.Nil(t, row.forfeitReason)
+			// The transfer forfeits only a NEVER-ARMED proration
+			// (ForfeitAppProrationOnTransfer's predicate); the sealed
+			// proposal's stamp survives it unchanged, so the intent rail
+			// still finds its guard armed on the new owner's app.
 			var skippedAt *time.Time
+			var invoiceAfter *string
 			require.NoError(t, f.pool.QueryRow(ctx,
 				`SELECT proration_skipped_at, proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`,
-				f.appID.String()).Scan(&skippedAt, &invoice))
-			require.Nil(t, skippedAt)
-			require.Nil(t, invoice)
+				f.appID.String()).Scan(&skippedAt, &invoiceAfter))
+			require.Nil(t, skippedAt, "a sealed proposal is not forfeited")
+			require.NotNil(t, invoiceAfter, "the armed guard was cleared by the transfer")
+			require.Equal(t, *invoice, *invoiceAfter, "the transfer must not re-point the guard")
 		})
 	}
 }

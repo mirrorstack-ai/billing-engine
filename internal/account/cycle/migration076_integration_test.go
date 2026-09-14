@@ -122,7 +122,7 @@ func TestMigration076_OpenPlanChangeDecidesFoldOrChargeUnderTheLock(t *testing.T
 	// TWO effective changes after the boundary: the EARLIEST wins (its
 	// from_plan is the boundary plan), whatever the later one says.
 	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.app_plan_changes
-		(app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, amount_micros, status, applied_at)
+		(app_id, account_id, from_plan, to_plan, kind, requested_at, effective_at, period_start, period_end, amount_micros, status, settled_at)
 		VALUES ($1, $2, 'pro', 'free', 'downgrade', $3, $3, $3, $3, 0, 'applied', $3)`,
 		unbilled.String(), acct.String(), boundary.Add(48*time.Hour))
 	require.NoError(t, err)
