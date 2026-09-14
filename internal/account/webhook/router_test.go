@@ -1723,3 +1723,43 @@ func TestProcess_SetupIntentSetupFailed(t *testing.T) {
 		require.Empty(t, s.FailedSetupIntents)
 	})
 }
+
+// TestProcess_InvoiceEvents_MoveTheDemerit pins the two event transitions of
+// the exposure pool's delinquency score (migration 085): a failure signal
+// charges +p (payment_failed AND marked_uncollectible, never the transient
+// payment_action_required), invoice.paid credits the settle −r AFTER the
+// mirror write, and no other invoice event touches the score.
+func TestProcess_InvoiceEvents_MoveTheDemerit(t *testing.T) {
+	for _, ev := range []struct {
+		name, typ, status string
+		failed, settled   bool
+	}{
+		{"payment_failed", "invoice.payment_failed", "open", true, false},
+		{"uncollectible", "invoice.marked_uncollectible", "uncollectible", true, false},
+		{"paid", "invoice.paid", "paid", false, true},
+		{"action_required", "invoice.payment_action_required", "open", false, false},
+		{"finalized", "invoice.finalized", "open", false, false},
+		{"voided", "invoice.voided", "void", false, false},
+	} {
+		t.Run(ev.name, func(t *testing.T) {
+			v := &webhooktest.FakeVerifier{Event: invoiceEvent("evt_dm_"+ev.name, ev.typ, "in_dm", ev.status, 0, 1200)}
+			s := webhooktest.NewFakeStore()
+			r := newRouter(v, s)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, webhook.StatusOK, res.Status)
+			if ev.failed {
+				require.Equal(t, []string{"in_dm"}, s.DemeritFailed, "a failure signal charges the demerit")
+			} else {
+				require.Empty(t, s.DemeritFailed)
+			}
+			if ev.settled {
+				require.Equal(t, []string{"in_dm"}, s.DemeritSettled, "invoice.paid credits the settle")
+				require.Len(t, s.AppliedInvoices, 1, "after the mirror write")
+			} else {
+				require.Empty(t, s.DemeritSettled)
+			}
+		})
+	}
+}

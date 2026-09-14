@@ -464,6 +464,16 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.budgetSvc.GetBudgetAlerts(ctx, req)
 
+	case "SetAIEnforcementPaused":
+		var req budget.SetAIEnforcementPausedRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.budgetSvc.SetAIEnforcementPaused(ctx, req)
+
+	case "GetAIEnforcement":
+		return d.budgetSvc.GetAIEnforcement(ctx)
+
 	default:
 		return nil, billing.InvalidInput("unknown action: " + action)
 	}

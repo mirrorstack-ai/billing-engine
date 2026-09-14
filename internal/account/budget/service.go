@@ -2,6 +2,8 @@ package budget
 
 import (
 	"context"
+	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -46,7 +48,7 @@ func (s *Service) WithNow(now func() time.Time) *Service {
 // an app's AI cap and must have the module's key shape.
 func resolveScope(scope Scope, category Category, templateKey string) (Category, error) {
 	cat, ok := normalizeCategory(category)
-	if !ok {
+	if !ok || cat == CategoryExposure {
 		return "", billing.InvalidInput("invalid budget category: " + string(category))
 	}
 	switch scope {
@@ -241,6 +243,159 @@ func (s *Service) spendFor(ctx context.Context, b Budget, start, end time.Time) 
 	return s.store.AccountPeriodAISpendMicros(ctx, acct, start, end)
 }
 
+// paasBillingMode is accounts.billing_mode's value for pay-after-use (the
+// web's 隨用隨付 card maps to it); 'credits' is the prepaid mode.
+const paasBillingMode = "standard"
+
+// DemeritTier is the display band of a demerit score: 0 Normal, up to 2
+// watch (one failure), up to 6 restricted, above that severe. Bands only —
+// every decision uses S itself.
+func DemeritTier(s float64) string {
+	switch {
+	case s <= 0:
+		return "normal"
+	case s <= 2:
+		return "watch"
+	case s <= 6:
+		return "restricted"
+	}
+	return "severe"
+}
+
+// growth is the configured shape's fraction of the range earned at k paid
+// invoices, in [0, 1]. Sigmoid (owner's final shape): a logistic
+// normalised so it is 0 at k=0 and EXACTLY 1 at k >= KMax — the curve
+// reaches base + range at KMax, never asymptotically. Exp: 1 − e^(−k/Tau).
+// A row with unusable parameters (the DB CHECKs guard the real one) earns
+// nothing: the base alone.
+func growth(cfg RiskRampConfig, k int) float64 {
+	if k < 0 {
+		k = 0
+	}
+	switch cfg.Shape {
+	case ShapeSigmoid:
+		if cfg.KMax <= 0 || cfg.A <= 0 {
+			return 0
+		}
+		if k >= cfg.KMax {
+			return 1
+		}
+		g := func(x float64) float64 { return 1 / (1 + math.Exp(-cfg.A*(x-cfg.K0))) }
+		den := g(float64(cfg.KMax)) - g(0)
+		if den <= 0 {
+			return 0
+		}
+		return (g(float64(k)) - g(0)) / den
+	case ShapeExp:
+		if cfg.Tau <= 0 {
+			return 0
+		}
+		return 1 - math.Exp(-float64(k)/cfg.Tau)
+	}
+	return 0
+}
+
+// ExposureLimitMicros is the owner's curve (2026-09-14, migration 085): no
+// usable card → NoCardMicros; a usable card with k paid invoices →
+// CardBaseMicros + RangeMicros × growth(k) — the configured shape (sigmoid
+// seeded: $10 + $990 × a normalised logistic, exactly $1,000 at k = 24) —
+// and never above CeilingMicros, the hard clamp. Delinquency (owner FINAL):
+// the curve is divided by (1 + S), S the account's demerit score, never
+// below NoCardMicros — one failure (S 2) is ÷3, three cycles unpaid (S 6)
+// ÷7, and every clean cycle brings it back. Whole micros, rounded half up;
+// the ceiling also bounds a zero-card floor so a misconfigured row cannot
+// exceed it. Unusable shape parameters mean "no growth": the base alone.
+func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
+	var limit int64
+	if sig.HasUsableCard {
+		limit = int64(math.Round(float64(cfg.CardBaseMicros) + float64(cfg.RangeMicros)*growth(cfg, sig.PaidInvoices)))
+	} else {
+		limit = cfg.NoCardMicros
+	}
+	if limit > cfg.CeilingMicros {
+		limit = cfg.CeilingMicros
+	}
+	if sig.Demerit > 0 {
+		reduced := int64(math.Round(float64(limit) / (1 + sig.Demerit)))
+		if reduced < cfg.NoCardMicros {
+			reduced = cfg.NoCardMicros
+		}
+		if reduced < limit {
+			limit = reduced
+		}
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	return limit
+}
+
+// poolFor computes the PaaS risk-exposure pool for an account in [start,
+// end). A non-PaaS account (credits mode) or an unattributed scope has
+// Source none and never exhausts. On a PaaS account it also refreshes the
+// account's SYSTEM 'exposure' budget row (limit = the curve, hard cap) so the
+// ingest-path evaluation can record 80% / 100% crossings against it.
+func (s *Service) poolFor(ctx context.Context, cfg RiskRampConfig, accountID uuid.UUID, found bool, start, end time.Time) (*Pool, error) {
+	if !found {
+		return &Pool{Mode: "none", Source: PoolSourceNone}, nil
+	}
+	sig, err := s.store.ExposureSignals(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if sig.BillingMode != paasBillingMode {
+		return &Pool{Mode: sig.BillingMode, Source: PoolSourceNone, HasUsableCard: sig.HasUsableCard, PaidInvoices: sig.PaidInvoices}, nil
+	}
+	limit := ExposureLimitMicros(cfg, sig)
+	spend, err := s.store.AccountPeriodSpendMicros(ctx, accountID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	// Unpaid dollars enter the pool EXACTLY, as money (owner FINAL): the open
+	// balance of prior invoices is accrued exposure, so a $300 arrears against
+	// a $168 limit is exhausted on the spot and a $5 one dents it by $5.
+	accrued := spend + sig.ArrearsMicros
+	if accrued < spend { // overflow: exhausted is the safe reading
+		accrued = math.MaxInt64
+	}
+	remaining := limit - accrued
+	if remaining < 0 {
+		remaining = 0
+	}
+	// The system row: what budget_alerts hangs the pool's crossings on.
+	// Upserted here (not only at ingest) so the limit follows the curve as
+	// the account earns trust; alert_percents are the defaults.
+	if _, err := s.store.UpsertBudget(ctx, Budget{
+		Scope: ScopeAccount, ScopeID: accountID, Category: CategoryExposure, AccountID: accountID,
+		LimitMicros: limit, AlertPercents: defaultAlertPercents, Active: true, HardCap: true,
+	}); err != nil {
+		return nil, err
+	}
+	return &Pool{
+		Mode:            "paas",
+		Source:          PoolSourceExposureLimit,
+		LimitMicros:     limit,
+		AccruedMicros:   accrued,
+		RemainingMicros: remaining,
+		Exhausted:       accrued >= limit,
+		HasUsableCard:   sig.HasUsableCard,
+		PaidInvoices:    sig.PaidInvoices,
+		DelinquentNow:   sig.DelinquentNow,
+		Demerit:         sig.Demerit,
+		Tier:            DemeritTier(sig.Demerit),
+		ArrearsMicros:   sig.ArrearsMicros,
+	}, nil
+}
+
+// payerAccount is the account whose exposure pool a scope draws on: an app's
+// attributed payer, an org's own account, the account itself.
+func (s *Service) payerAccount(ctx context.Context, scope Scope, scopeID uuid.UUID) (uuid.UUID, bool, error) {
+	if scope == ScopeApp {
+		return s.store.AppPayerAccountID(ctx, scopeID)
+	}
+	return s.spendAccount(ctx, scope, scopeID)
+}
+
 // exhausted is the consumer's verdict for a hard cap: active, hard, not
 // overage-allowed, and spend at or over the limit. Integer micro math.
 func exhausted(b Budget, spendMicros int64) bool {
@@ -271,8 +426,46 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 		return nil, billing.Internal("budget lookup failed", err)
 	}
 	c, isExhausted := decide(cands)
+
+	// The PaaS exposure pool rides every category='ai' read (PR-B): OR'd into
+	// the verdict, named by decided_by only when no customer cap bit. The
+	// curve row is read ONCE per verdict and carries the incident
+	// kill-switch: while paused, every AI verdict is allowed and says so —
+	// the figures (caps, pool) are still reported so the console can show
+	// what WOULD have refused.
+	var pool *Pool
+	decidedBy := c.decidedBy
+	if cat == CategoryAI {
+		cfg, err := s.store.RiskRampConfig(ctx)
+		if err != nil {
+			return nil, billing.Internal("risk ramp config read failed", err)
+		}
+		acct, found, err := s.payerAccount(ctx, req.Scope, req.ScopeID)
+		if err != nil {
+			return nil, billing.Internal("payer account lookup failed", err)
+		}
+		pool, err = s.poolFor(ctx, cfg, acct, found, start, end)
+		if err != nil {
+			return nil, billing.Internal("exposure pool evaluation failed", err)
+		}
+		if pool.Exhausted && !isExhausted {
+			isExhausted = true
+			decidedBy = DecidedByExposureLimit
+		}
+		if cfg.EnforcementPaused && isExhausted {
+			isExhausted = false
+			decidedBy = DecidedByPaused
+		}
+	}
 	if len(cands) == 0 {
-		return &GetBudgetStatusResponse{Exists: false, Category: cat, DecidedBy: DecidedByNone, Crossed: []int{}}, nil
+		return &GetBudgetStatusResponse{
+			Exists:    false,
+			Category:  cat,
+			DecidedBy: map[bool]DecidedBy{true: DecidedByExposureLimit, false: DecidedByNone}[isExhausted],
+			Exhausted: isExhausted,
+			Crossed:   []int{},
+			Pool:      pool,
+		}, nil
 	}
 	b, spend := c.b, c.spend
 
@@ -283,7 +476,7 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 	return &GetBudgetStatusResponse{
 		Exists:          true,
 		Category:        b.Category,
-		DecidedBy:       c.decidedBy,
+		DecidedBy:       decidedBy,
 		TemplateKey:     b.TemplateKey,
 		PeriodStart:     start,
 		PeriodEnd:       end,
@@ -296,6 +489,7 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 		AllowOverage:    b.AllowOverage,
 		Exhausted:       isExhausted,
 		RemainingMicros: remaining,
+		Pool:            pool,
 	}, nil
 }
 
@@ -408,6 +602,30 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 			id    uuid.UUID
 		}{ScopeOrg, ownerOrgID})
 	}
+	// The pool's crossings (085): refresh the system row against the curve and
+	// record 80% / 100% of the account's whole-period usage — the pre-cliff
+	// warning the console shows before the assistant stops.
+	cfg, err := s.store.RiskRampConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := s.poolFor(ctx, cfg, accountID, true, periodStart, periodEnd)
+	if err != nil {
+		return nil, err
+	}
+	if pool.Source == PoolSourceExposureLimit {
+		row, found, err := s.store.GetBudget(ctx, ScopeAccount, accountID, CategoryExposure, "")
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			got, err := s.recordCrossings(ctx, row, pool.AccruedMicros, periodStart)
+			if err != nil {
+				return nil, err
+			}
+			fired = append(fired, got...)
+		}
+	}
 	var (
 		spend    int64
 		spendSet bool
@@ -434,6 +652,48 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 		fired = append(fired, got...)
 	}
 	return fired, nil
+}
+
+// SetAIEnforcementPaused flips the incident kill-switch (migration 085): a
+// platform CONTROL-PLANE call (internal secret). Paused=true makes every AI
+// verdict allowed (decided_by "paused") on the next read — no deploy, no
+// cache on this side. Logged with the caller's reason.
+func (s *Service) SetAIEnforcementPaused(ctx context.Context, req SetAIEnforcementPausedRequest) (*AIEnforcementResponse, error) {
+	if req.Paused && (req.Reason == "" || req.ActorID == "") {
+		return nil, billing.InvalidInput("pausing AI enforcement requires reason and actor_id")
+	}
+	paused, err := s.store.SetAIEnforcementPaused(ctx, req.Paused, req.Reason, req.ActorID)
+	if err != nil {
+		return nil, billing.Internal("set ai enforcement paused failed", err)
+	}
+	slog.WarnContext(ctx, "AI budget enforcement kill-switch changed", "paused", paused, "reason", req.Reason, "actor_id", req.ActorID)
+	return s.GetAIEnforcement(ctx)
+}
+
+// GetAIEnforcement reads the kill-switch and the curve in one call.
+func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse, error) {
+	cfg, err := s.store.RiskRampConfig(ctx)
+	if err != nil {
+		return nil, billing.Internal("risk ramp config read failed", err)
+	}
+	return &AIEnforcementResponse{
+		Paused:                cfg.EnforcementPaused,
+		PausedReason:          cfg.PausedReason,
+		PausedBy:              cfg.PausedBy,
+		PausedAt:              cfg.PausedAt,
+		NoCardMicros:          cfg.NoCardMicros,
+		CardBaseMicros:        cfg.CardBaseMicros,
+		CeilingMicros:         cfg.CeilingMicros,
+		RangeMicros:           cfg.RangeMicros,
+		Shape:                 cfg.Shape,
+		A:                     cfg.A,
+		K0:                    cfg.K0,
+		KMax:                  cfg.KMax,
+		Tau:                   cfg.Tau,
+		DemeritPerUnpaidCycle: cfg.DemeritPerUnpaidCycle,
+		DemeritRecovery:       cfg.DemeritRecovery,
+		DemeritMax:            cfg.DemeritMax,
+	}, nil
 }
 
 // recordCrossings inserts the thresholds spend has reached for one budget

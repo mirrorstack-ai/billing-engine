@@ -49,6 +49,31 @@ type Store interface {
 	// (activated_at), DefaultAnchorDay when unactivated.
 	AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (int, error)
 
+	// AccountPeriodSpendMicros is the account's whole-period usage across
+	// EVERY metric (the exposure pool's accrual; base fees are not events).
+	AccountPeriodSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+
+	// AppPayerAccountID resolves an app to the account its usage bills;
+	// found=false for an unattributed app.
+	AppPayerAccountID(ctx context.Context, appID uuid.UUID) (uuid.UUID, bool, error)
+
+	// ExposureSignals reads the curve's inputs for an account.
+	ExposureSignals(ctx context.Context, accountID uuid.UUID) (ExposureSignals, error)
+
+	// RiskRampConfig reads the finance-owned curve row (085) and the
+	// incident kill-switch.
+	RiskRampConfig(ctx context.Context) (RiskRampConfig, error)
+
+	// SetAIEnforcementPaused flips the kill-switch, storing reason/actor on
+	// a pause and clearing them on resume; returns the stored value.
+	SetAIEnforcementPaused(ctx context.Context, paused bool, reason, actorID string) (bool, error)
+
+	// The three demerit transitions (migration 085), each idempotent by its
+	// own latch; applied reports whether this call moved the score.
+	ApplyDemeritOnFailure(ctx context.Context, stripeInvoiceID string) (applied bool, err error)
+	ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID string) (applied bool, err error)
+	ApplyDemeritAtClose(ctx context.Context, accountID uuid.UUID, closeAt time.Time) (demerit float64, applied bool, err error)
+
 	// InsertBudgetAlerts records a batch of threshold crossings in ONE
 	// transaction (all-or-nothing): either every row is committed or none are,
 	// so a partial set of alerts with an inconsistent spend snapshot is never
@@ -200,6 +225,65 @@ func (s *pgxStore) AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (i
 	return billingperiod.AnchorDay(at.Time), nil
 }
 
+func (s *pgxStore) AccountPeriodSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	n, err := s.q.AccountPeriodSpendMicros(ctx, db.AccountPeriodSpendMicrosParams{
+		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return usage.MicrosFromNumeric(n)
+}
+
+func (s *pgxStore) AppPayerAccountID(ctx context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {
+	id, err := s.q.AppPayerAccountID(ctx, appID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if !id.Valid {
+		return uuid.Nil, false, nil
+	}
+	return id.Bytes, true, nil
+}
+
+func (s *pgxStore) ExposureSignals(ctx context.Context, accountID uuid.UUID) (ExposureSignals, error) {
+	row, err := s.q.ExposureSignals(ctx, accountID.String())
+	if err != nil {
+		return ExposureSignals{}, err
+	}
+	// amount_due is in the invoice's minor units (cents); the pool is micros.
+	return ExposureSignals{BillingMode: row.BillingMode, HasUsableCard: row.HasUsableCard, PaidInvoices: int(row.PaidInvoices), DelinquentNow: row.DelinquentNow, Demerit: row.Demerit, ArrearsMicros: row.ArrearsCents * microsPerCent}, nil
+}
+
+func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
+	row, err := s.q.RiskRampConfig(ctx)
+	if err != nil {
+		return RiskRampConfig{}, err
+	}
+	cfg := RiskRampConfig{
+		NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros,
+		RangeMicros: row.RangeMicros, Shape: Shape(row.Shape), A: row.PA, K0: row.PK0, KMax: int(row.KMax), Tau: row.Tau, DemeritPerUnpaidCycle: row.DemeritPerUnpaidCycle, DemeritRecovery: row.DemeritRecovery, DemeritMax: row.DemeritMax,
+		EnforcementPaused: row.AiEnforcementPaused, PausedReason: row.PausedReason, PausedBy: row.PausedBy,
+	}
+	if row.PausedAt.Valid {
+		cfg.PausedAt = row.PausedAt.Time
+	}
+	return cfg, nil
+}
+
+func (s *pgxStore) SetAIEnforcementPaused(ctx context.Context, paused bool, reason, actorID string) (bool, error) {
+	row, err := s.q.SetAIEnforcementPaused(ctx, db.SetAIEnforcementPausedParams{Paused: paused, Reason: reason, Actor: actorID})
+	if err != nil {
+		return false, err
+	}
+	return row.AiEnforcementPaused, nil
+}
+
 func (s *pgxStore) InsertBudgetAlerts(ctx context.Context, records []AlertRecord) ([]int, error) {
 	if len(records) == 0 {
 		return nil, nil
@@ -333,4 +417,41 @@ func int32sToInt(in []int32) []int {
 		out[i] = int(v)
 	}
 	return out
+}
+
+// microsPerCent converts an invoice's minor units (USD cents, the only
+// currency the charge spine writes) to the pool's micro-dollars.
+const microsPerCent = 10_000
+
+// ApplyDemeritOnFailure charges +p for an invoice's FIRST failure; applied
+// reports whether this call was that first time.
+func (s *pgxStore) ApplyDemeritOnFailure(ctx context.Context, stripeInvoiceID string) (applied bool, err error) {
+	n, err := s.q.ApplyDemeritOnFailure(ctx, stripeInvoiceID)
+	return n > 0, err
+}
+
+// ApplyDemeritOnSettle credits −r once when a late invoice reaches 'paid'.
+func (s *pgxStore) ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID string) (applied bool, err error) {
+	n, err := s.q.ApplyDemeritOnSettle(ctx, stripeInvoiceID)
+	return n > 0, err
+}
+
+// ApplyDemeritAtClose applies the account's cycle-close transition once per
+// close (a repeat or an older close is a no-op: applied=false, demerit = the
+// stored score).
+func (s *pgxStore) ApplyDemeritAtClose(ctx context.Context, accountID uuid.UUID, closeAt time.Time) (demerit float64, applied bool, err error) {
+	// Postgres keeps microseconds; a nanosecond tail would read "newer" than
+	// the stored stamp of the same close and apply it twice.
+	d, err := s.q.ApplyDemeritAtClose(ctx, db.ApplyDemeritAtCloseParams{AccountID: accountID.String(), CloseAt: closeAt.UTC().Truncate(time.Microsecond)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		sig, err := s.q.ExposureSignals(ctx, accountID.String())
+		if err != nil {
+			return 0, false, err
+		}
+		return sig.Demerit, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return d, true, nil
 }

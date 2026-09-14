@@ -156,3 +156,287 @@ func TestPgxStore_Budgets_TemplateRowsAndOrgResolution(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, orgAcct, id)
 }
+
+// TestPgxStore_ExposurePoolReads pins the migration-085 reads: the curve row
+// is seeded; the account's whole-period spend counts every metric (AI + compute)
+// and still excludes dev-served and the next period; the signals read sees the
+// billing mode, a usable card and the paid-invoice count; an app resolves to
+// its payer through its attributed events.
+func TestPgxStore_ExposurePoolReads(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := budget.NewStore(pool)
+	ctx := context.Background()
+	acct := seedAccountRow(t, pool, "user", uuid.New())
+	app := uuid.New()
+	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	at := start.Add(72 * time.Hour)
+
+	cfg, err := store.RiskRampConfig(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 5_000_000, cfg.NoCardMicros)
+	require.EqualValues(t, 10_000_000, cfg.CardBaseMicros)
+	require.EqualValues(t, 1_000_000_000, cfg.CeilingMicros, "the cap moved $200 → $1,000 (owner 2026-09-14)")
+	require.EqualValues(t, 990_000_000, cfg.RangeMicros)
+	require.Equal(t, budget.ShapeSigmoid, cfg.Shape, "the owner's final shape, S2")
+	require.InDelta(t, 0.6, cfg.A, 1e-9)
+	require.InDelta(t, 10, cfg.K0, 1e-9)
+	require.Equal(t, 24, cfg.KMax)
+	require.InDelta(t, 5, cfg.Tau, 1e-9, "tau stays for shape 'exp'")
+	require.EqualValues(t, 1_000_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}), "the seeded row reaches $1,000 exactly at k=24")
+	require.InDelta(t, 2, cfg.DemeritPerUnpaidCycle, 1e-9, "owner FINAL: +2 per unpaid cycle")
+	require.InDelta(t, 1, cfg.DemeritRecovery, 1e-9, "−1 per clean cycle / on settle")
+	require.InDelta(t, 12, cfg.DemeritMax, 1e-9, "the worst history is back to Normal after 12 clean cycles")
+	require.False(t, cfg.EnforcementPaused, "the kill-switch ships off")
+	paused, err := store.SetAIEnforcementPaused(ctx, true, "incident", "ops:owner")
+	require.NoError(t, err)
+	require.True(t, paused)
+	cfg, err = store.RiskRampConfig(ctx)
+	require.NoError(t, err)
+	require.True(t, cfg.EnforcementPaused, "one row, read per verdict")
+	require.Equal(t, "incident", cfg.PausedReason)
+	require.Equal(t, "ops:owner", cfg.PausedBy)
+	require.False(t, cfg.PausedAt.IsZero())
+	_, err = store.SetAIEnforcementPaused(ctx, false, "", "")
+	require.NoError(t, err)
+	cfg, err = store.RiskRampConfig(ctx)
+	require.NoError(t, err)
+	require.False(t, cfg.EnforcementPaused)
+	require.Empty(t, cfg.PausedBy, "resume clears the provenance")
+	require.True(t, cfg.PausedAt.IsZero())
+
+	_, found, err := store.AppPayerAccountID(ctx, app)
+	require.NoError(t, err)
+	require.False(t, found, "no attributed event yet")
+
+	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 10, haiku, "member-help", at, false) // 10,000 µ$
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.usage_events (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, $2, $3, '00000000-0000-0000-0000-000000000000', 'infra.compute.walltime.ms', 'sum', 1000000, $4)`,
+		uuid.NewString(), acct.String(), app.String(), at) // 1,000,000 µ$ (1 µ$/ms)
+	require.NoError(t, err)
+	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 100, haiku, "", at, true)   // dev-served
+	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 100, haiku, "", end, false) // next period
+
+	got, err := store.AccountPeriodSpendMicros(ctx, acct, start, end)
+	require.NoError(t, err)
+	require.EqualValues(t, 1_010_000, got, "every metric counts toward the pool; dev-served and the next period do not")
+
+	payer, found, err := store.AppPayerAccountID(ctx, app)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, acct, payer)
+
+	sig, err := store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, "standard", sig.BillingMode, "accounts default to PaaS")
+	require.False(t, sig.HasUsableCard)
+	require.Zero(t, sig.PaidInvoices)
+
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.payment_methods_mirror (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year)
+		VALUES ($1, 'pm_exposure', 'visa', '4242', 12, 2099)`, acct.String())
+	require.NoError(t, err)
+	for i, st := range []string{"paid", "paid", "open"} {
+		// charge_funding_legacy_unresolved = true is the pre-052 provenance shape
+		// (no funding account pinned); the CHECK requires one of the two shapes.
+		_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
+			VALUES ($1, $2, $3, 100, 100, 'usd', true)`, acct.String(), "in_exposure_"+string(rune('a'+i)), st)
+		require.NoError(t, err)
+	}
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.True(t, sig.HasUsableCard)
+	require.Equal(t, 2, sig.PaidInvoices, "open invoices do not count as paid")
+	require.True(t, sig.DelinquentNow, "an open invoice with a balance is delinquent now")
+	require.Zero(t, sig.Demerit, "no failure yet: Normal")
+	require.EqualValues(t, 1_000_000, sig.ArrearsMicros, "the open $1.00 (100 cents) counts against the pool as money")
+	require.EqualValues(t, 15_648_284, budget.ExposureLimitMicros(cfg, sig), "S 0: the curve itself (S2 k=2)")
+
+	// --- the three demerit transitions, one DB statement each -------------
+	// Closes are period boundaries in the PAST (a close never lies ahead of
+	// the failures it judges): whole seconds from ONE base a day ago, so "the
+	// same close again" is the same instant (Postgres keeps microseconds).
+	// The failure instants the close compares against are set explicitly
+	// below — the fixture owns the clock, as the close transition's rule is
+	// "failed before the previous close" vs "failed inside this cycle".
+	base := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)
+	closeAt := func(h int) time.Time { return base.Add(time.Duration(h) * time.Hour) }
+	failedAt := func(id string, at time.Time) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `UPDATE ms_billing.invoices SET demerit_failed_at = $2 WHERE stripe_invoice_id = $1`, id, at)
+		require.NoError(t, err)
+	}
+	settledAt := func(id string, at time.Time) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `UPDATE ms_billing.invoices SET demerit_settled_at = $2 WHERE stripe_invoice_id = $1`, id, at)
+		require.NoError(t, err)
+	}
+	// FAIL: the invoice's first failure is +2, once.
+	applied, err := store.ApplyDemeritOnFailure(ctx, "in_exposure_c")
+	require.NoError(t, err)
+	require.True(t, applied)
+	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_c")
+	require.NoError(t, err)
+	require.False(t, applied, "a repeated payment_failed for the same invoice charges nothing")
+	failedAt("in_exposure_c", base.Add(30*time.Minute)) // failed inside cycle 1 (before close 1)
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.InDelta(t, 2, sig.Demerit, 1e-9)
+	require.EqualValues(t, 5_216_095, budget.ExposureLimitMicros(cfg, sig), "S 2: $15.65 ÷ 3 = $5.22, above the $5 floor")
+	// SETTLE: not before the mirror says paid …
+	applied, err = store.ApplyDemeritOnSettle(ctx, "in_exposure_c")
+	require.NoError(t, err)
+	require.False(t, applied)
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET status = 'paid', amount_due = 0, ever_failed = true WHERE stripe_invoice_id = 'in_exposure_c'`)
+	require.NoError(t, err)
+	// … then −1 the same day, once.
+	applied, err = store.ApplyDemeritOnSettle(ctx, "in_exposure_c")
+	require.NoError(t, err)
+	require.True(t, applied)
+	applied, err = store.ApplyDemeritOnSettle(ctx, "in_exposure_c")
+	require.NoError(t, err)
+	require.False(t, applied, "a re-delivered invoice.paid credits nothing")
+	// A never-late invoice paying is not a settle.
+	applied, err = store.ApplyDemeritOnSettle(ctx, "in_exposure_a")
+	require.NoError(t, err)
+	require.False(t, applied)
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.InDelta(t, 1, sig.Demerit, 1e-9)
+	require.False(t, sig.DelinquentNow, "settled: nothing open with a balance")
+	require.Zero(t, sig.ArrearsMicros)
+	settledAt("in_exposure_c", base.Add(45*time.Minute)) // settled inside cycle 1 too
+	// CLOSE 1: the failure (and the settle) happened inside this cycle → S unchanged; the close is stamped.
+	d, applied, err := store.ApplyDemeritAtClose(ctx, acct, closeAt(1))
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.InDelta(t, 1, d, 1e-9, "a cycle with a failure in it is not clean, even settled")
+	// CLOSE 2: clean → −1 → 0.
+	d, applied, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(2))
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Zero(t, d, "one clean cycle after the settle: Normal")
+	// The same close again, and an OLDER close: no-ops.
+	d, applied, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(2))
+	require.NoError(t, err)
+	require.False(t, applied)
+	require.Zero(t, d)
+	_, applied, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(1))
+	require.NoError(t, err)
+	require.False(t, applied)
+	// FLOOR: a clean close at S 0 stays 0.
+	d, applied, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(3))
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Zero(t, d)
+	// UNPAID FULL CYCLES: a new invoice fails (+2 → S 2) and stays unpaid.
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
+		VALUES ($1, 'in_exposure_d', 'open', 30000, 0, 'usd', true)`, acct.String())
+	require.NoError(t, err)
+	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_d")
+	require.NoError(t, err)
+	require.True(t, applied)
+	failedAt("in_exposure_d", closeAt(3).Add(30*time.Minute)) // failed inside cycle 4 (after close 3)
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.EqualValues(t, 300_000_000, sig.ArrearsMicros, "$300 unpaid, counted as money")
+	// Its first close is the cycle it failed in: unchanged (2).
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(4))
+	require.NoError(t, err)
+	require.InDelta(t, 2, d, 1e-9)
+	// Every further close it stays unpaid: +2, +2 …
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(5))
+	require.NoError(t, err)
+	require.InDelta(t, 4, d, 1e-9, "unpaid a full cycle since the failure")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(6))
+	require.NoError(t, err)
+	require.InDelta(t, 6, d, 1e-9, "three cycles unpaid: S 6 → ÷7")
+	// CAP: the score never passes demerit_max.
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.accounts SET demerit_score = 11.5 WHERE id = $1`, acct.String())
+	require.NoError(t, err)
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(7))
+	require.NoError(t, err)
+	require.InDelta(t, 12, d, 1e-9, "capped at 12")
+	// VOID is our cancellation: the debt is gone and it was never late — the
+	// next close is clean and recovery starts.
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET status = 'void', amount_due = 0 WHERE stripe_invoice_id = 'in_exposure_d'`)
+	require.NoError(t, err)
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.False(t, sig.DelinquentNow)
+	require.Zero(t, sig.ArrearsMicros)
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(8))
+	require.NoError(t, err)
+	require.InDelta(t, 11, d, 1e-9, "clean close after the void: −1")
+	// A voided, never-failed invoice changes nothing either way.
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
+		VALUES ($1, 'in_exposure_void', 'void', 0, 0, 'usd', true)`, acct.String())
+	require.NoError(t, err)
+	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_void")
+	require.NoError(t, err)
+	require.True(t, applied, "a failure event on a void invoice still latches (Stripe may deliver it) …")
+	failedAt("in_exposure_void", closeAt(8).Add(30*time.Minute))
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.accounts SET demerit_score = 1 WHERE id = $1`, acct.String())
+	require.NoError(t, err)
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(9))
+	require.NoError(t, err)
+	require.InDelta(t, 1, d, 1e-9, "… the cycle it failed in is not clean …")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct, closeAt(10))
+	require.NoError(t, err)
+	require.Zero(t, d, "… but a void is never unpaid, so it never costs a cycle: the next close is clean")
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, 3, sig.PaidInvoices, "k counts paid invoices only; the void is not one")
+
+	// --- review cases (f2, be#223 delta): a second account -----------------
+	acct2 := seedAccountRow(t, pool, "user", uuid.New())
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.payment_methods_mirror (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year)
+		VALUES ($1, 'pm_exposure_2', 'visa', '4242', 12, 2099)`, acct2.String())
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
+		VALUES ($1, 'in_exposure_e', 'open', 500, 200, 'usd', true)`, acct2.String())
+	require.NoError(t, err)
+	// (3) arrears are what is still owed: amount_due − amount_paid.
+	sig2, err := store.ExposureSignals(ctx, acct2)
+	require.NoError(t, err)
+	require.EqualValues(t, 3_000_000, sig2.ArrearsMicros, "$5.00 due, $2.00 paid → $3.00 counts")
+	// (2) FIRST close after the migration (no previous close) with a failure
+	// inside that first cycle: the failure charged +2 already; the close must
+	// not read "unpaid a full cycle" against a close that never happened.
+	applied, err = store.ApplyDemeritOnFailure(ctx, "in_exposure_e")
+	require.NoError(t, err)
+	require.True(t, applied)
+	failedAt("in_exposure_e", base.Add(30*time.Minute))
+	d, applied, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(1))
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.InDelta(t, 2, d, 1e-9, "first close: +2 once (the failure), not twice")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(2))
+	require.NoError(t, err)
+	require.InDelta(t, 4, d, 1e-9, "second close: it has now stayed unpaid a full cycle")
+	// (1) fail in N, settle in N+1: the settle credits −1 the same day, and the
+	// close of N+1 is NOT clean — no second −1 for the same settle.
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET status = 'paid', amount_due = 500, amount_paid = 500 WHERE stripe_invoice_id = 'in_exposure_e'`)
+	require.NoError(t, err)
+	applied, err = store.ApplyDemeritOnSettle(ctx, "in_exposure_e")
+	require.NoError(t, err)
+	require.True(t, applied)
+	settledAt("in_exposure_e", closeAt(2).Add(30*time.Minute)) // settled inside cycle 3
+	sig2, err = store.ExposureSignals(ctx, acct2)
+	require.NoError(t, err)
+	require.InDelta(t, 3, sig2.Demerit, 1e-9)
+	require.Zero(t, sig2.ArrearsMicros, "paid in full: nothing owed")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(3))
+	require.NoError(t, err)
+	require.InDelta(t, 3, d, 1e-9, "the cycle a late invoice was settled in is not clean")
+	d, _, err = store.ApplyDemeritAtClose(ctx, acct2, closeAt(4))
+	require.NoError(t, err)
+	require.InDelta(t, 2, d, 1e-9, "the next clean close recovers −1")
+
+	// The system exposure row is storable and re-upserts in place.
+	first, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 17_320_508, AlertPercents: []int{80, 100}, Active: true, HardCap: true})
+	require.NoError(t, err)
+	again, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 20_000_000, AlertPercents: []int{80, 100}, Active: true, HardCap: true})
+	require.NoError(t, err)
+	require.Equal(t, first.ID, again.ID, "the alert key (budget_id) survives the curve moving")
+	require.EqualValues(t, 20_000_000, again.LimitMicros)
+}

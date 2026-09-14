@@ -38,6 +38,7 @@ type Service struct {
 	// on shadow reconciliation (docs/DESIGN.md §11 step 4) instead of
 	// being blocked by it.
 	proposer      chargeProposer
+	demerit       DemeritCloser
 	nowFn         func() time.Time
 	walletEnabled bool
 	// creditRollout is the immutable, account-scoped production rollout
@@ -186,6 +187,29 @@ func (s *Service) recoveryCustomer(ctx context.Context, accountID uuid.UUID) (st
 
 // WithNow overrides the Service clock — deterministic-test hook only (mirrors
 // the usage.Service nowFn seam). Returns the Service for chaining.
+// DemeritCloser is the exposure pool's cycle-close transition (budget.Store,
+// migration 085): once per account per close, +p when a late invoice has
+// stayed unpaid a full cycle, −r when the cycle was clean.
+type DemeritCloser interface {
+	ApplyDemeritAtClose(ctx context.Context, accountID uuid.UUID, closeAt time.Time) (demerit float64, applied bool, err error)
+}
+
+// WithDemeritCloser wires the delinquency score's close transition; nil
+// (rollup-only wiring, tests) skips it.
+func (s *Service) WithDemeritCloser(c DemeritCloser) *Service {
+	s.demerit = c
+	return s
+}
+
+// CloseDemerit applies the account's cycle-close demerit transition for the
+// boundary at closeAt. Idempotent per close; a no-op without a closer.
+func (s *Service) CloseDemerit(ctx context.Context, accountID uuid.UUID, closeAt time.Time) (float64, bool, error) {
+	if s.demerit == nil {
+		return 0, false, nil
+	}
+	return s.demerit.ApplyDemeritAtClose(ctx, accountID, closeAt)
+}
+
 func (s *Service) WithNow(now func() time.Time) *Service {
 	s.nowFn = now
 	return s

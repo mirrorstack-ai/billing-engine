@@ -178,6 +178,187 @@ FROM ms_billing.accounts
 WHERE owner_kind = 'org' AND owner_org_id = $1
 LIMIT 1;
 
+-- AccountPeriodSpendMicros is the account-level twin of AppPeriodSpendMicros
+-- over EVERY metric — the accrued PaaS usage the risk-exposure pool measures
+-- (AI + module usage + infra; plan/SaaS base fees are not usage events and so
+-- are excluded by construction, as the owner ruled). Same window, dev_served
+-- exclusion and subject-aggregation shape.
+-- name: AccountPeriodSpendMicros :one
+WITH base_events AS (
+    SELECT
+        module_id, metric, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+      AND dev_served = false
+),
+billable_events AS (
+    SELECT module_id, metric, model, value AS billable_value
+    FROM base_events
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, model,
+        MAX(value)::numeric AS billable_value
+    FROM base_events
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, model, subject
+)
+SELECT COALESCE(SUM(e.billable_value * COALESCE(mp.unit_price_micros, md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM billable_events e
+LEFT JOIN ms_billing.metric_model_prices mp
+    ON mp.metric = e.metric AND mp.model = e.model AND e.model <> ''
+LEFT JOIN ms_billing.metric_definitions md
+    ON md.module_id = e.module_id AND md.metric = e.metric;
+
+-- AppPayerAccountID resolves an app to the account its usage is attributed
+-- to (the app's most recent attributed event) — the account whose exposure
+-- pool an app-surface AI turn draws on. No row = unattributed (lazy).
+-- name: AppPayerAccountID :one
+SELECT e.account_id
+FROM ms_billing.usage_events e
+WHERE e.app_id = $1 AND e.account_id IS NOT NULL
+ORDER BY COALESCE(e.billable_at, e.recorded_at) DESC
+LIMIT 1;
+
+-- ExposureSignals are the inputs of the PaaS exposure curve (085): the
+-- account's billing mode, whether a usable (unexpired, undeleted) card is on
+-- file, how many invoices it has paid, and its delinquency — delinquent_now
+-- is the cycle-close judge's own definition (HasUnpaidInvoice: an open or
+-- uncollectible invoice with a balance), late_count is how many invoices ever
+-- needed a failed payment attempt (ever_failed, migration 0xx) or ended
+-- uncollectible — the memory a delinquency rule can subtract from k. A VOID
+-- is OUR cancellation (a corrected or zeroed invoice), never the customer's
+-- failure, so it does not count.
+-- name: ExposureSignals :one
+SELECT
+    a.billing_mode::text AS billing_mode,
+    EXISTS (
+        SELECT 1 FROM ms_billing.payment_methods_mirror pm
+        WHERE pm.account_id = a.id
+          AND pm.deleted_at IS NULL
+          AND (pm.exp_year, pm.exp_month) >= (EXTRACT(YEAR FROM current_date)::INT, EXTRACT(MONTH FROM current_date)::INT)
+    )::boolean AS has_usable_card,
+    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices,
+    EXISTS (
+        SELECT 1 FROM ms_billing.invoices i
+        WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+    )::boolean AS delinquent_now,
+    -- arrears: the open balance of prior invoices, in the invoice's minor
+    -- units (cents); counted against the pool as money, not scored.
+    COALESCE((SELECT SUM(GREATEST(0, i.amount_due - i.amount_paid)) FROM ms_billing.invoices i
+              WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0), 0)::bigint AS arrears_cents,
+    a.demerit_score::float8 AS demerit
+FROM ms_billing.accounts a
+WHERE a.id = $1;
+
+-- The three demerit transitions (migration 085). Each is ONE statement over the
+-- invoice/account rows with its own idempotency latch, so Stripe's at-least-once
+-- delivery and a re-run cycle change nothing the second time. Rows affected
+-- (0/1) says whether the transition applied.
+
+-- ApplyDemeritOnFailure: an invoice's FIRST failure (payment_failed or
+-- marked_uncollectible) costs +p, once per invoice (demerit_failed_at latch).
+-- name: ApplyDemeritOnFailure :execrows
+WITH inv AS (
+    UPDATE ms_billing.invoices
+    SET demerit_failed_at = now()
+    WHERE stripe_invoice_id = @stripe_invoice_id AND demerit_failed_at IS NULL
+    RETURNING account_id
+), cfg AS (
+    SELECT demerit_per_unpaid_cycle AS p, demerit_max AS cap FROM ms_billing.risk_ramp_config WHERE id = 1
+)
+UPDATE ms_billing.accounts a
+SET demerit_score = LEAST(cfg.cap, a.demerit_score + cfg.p)
+FROM inv, cfg
+WHERE a.id = inv.account_id;
+
+-- ApplyDemeritOnSettle: a LATE invoice (one that was charged +p) reaching
+-- 'paid' earns −r the same day, once (demerit_settled_at latch). A never-late
+-- invoice paying is not a settle — it is a clean cycle, credited at the close.
+-- name: ApplyDemeritOnSettle :execrows
+WITH inv AS (
+    UPDATE ms_billing.invoices
+    SET demerit_settled_at = now()
+    WHERE stripe_invoice_id = @stripe_invoice_id
+      AND status = 'paid' AND demerit_failed_at IS NOT NULL AND demerit_settled_at IS NULL
+    RETURNING account_id
+), cfg AS (
+    SELECT demerit_recovery AS r FROM ms_billing.risk_ramp_config WHERE id = 1
+)
+UPDATE ms_billing.accounts a
+SET demerit_score = GREATEST(0, a.demerit_score - cfg.r)
+FROM inv, cfg
+WHERE a.id = inv.account_id;
+
+-- ApplyDemeritAtClose: the account's cycle close at @close_at, once per close
+-- (demerit_closed_at latch, monotone). A late invoice still unpaid that was
+-- charged BEFORE the previous close has stayed unpaid a full cycle: +p — and
+-- only when a previous close EXISTS: at the first close after the migration a
+-- failure inside that cycle was charged by the failure transition already. A
+-- cycle with nothing late, no failure and no settle since the previous close
+-- is clean: −r. Anything else — a failure inside this cycle (paid or not), or
+-- a late invoice settled inside it (the settle already credited −r) — leaves S
+-- as the failure and settle transitions set it.
+-- name: ApplyDemeritAtClose :one
+WITH cfg AS (
+    SELECT demerit_per_unpaid_cycle AS p, demerit_recovery AS r, demerit_max AS cap FROM ms_billing.risk_ramp_config WHERE id = 1
+), prev AS (
+    SELECT demerit_closed_at FROM ms_billing.accounts WHERE id = @account_id
+), facts AS (
+    SELECT
+        EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
+                WHERE i.account_id = @account_id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+                  AND i.demerit_failed_at IS NOT NULL
+                  AND prev.demerit_closed_at IS NOT NULL AND i.demerit_failed_at < prev.demerit_closed_at) AS unpaid_full_cycle,
+        EXISTS (SELECT 1 FROM ms_billing.invoices i
+                WHERE i.account_id = @account_id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+                  AND i.demerit_failed_at IS NOT NULL) AS late_now,
+        EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
+                WHERE i.account_id = @account_id AND i.demerit_failed_at IS NOT NULL
+                  AND (prev.demerit_closed_at IS NULL OR i.demerit_failed_at >= prev.demerit_closed_at)) AS failed_this_cycle,
+        EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
+                WHERE i.account_id = @account_id AND i.demerit_settled_at IS NOT NULL
+                  AND (prev.demerit_closed_at IS NULL OR i.demerit_settled_at >= prev.demerit_closed_at)) AS settled_this_cycle
+)
+UPDATE ms_billing.accounts a
+SET demerit_closed_at = @close_at::timestamptz,
+    demerit_score = CASE
+        WHEN facts.unpaid_full_cycle THEN LEAST(cfg.cap, a.demerit_score + cfg.p)
+        WHEN facts.late_now OR facts.failed_this_cycle OR facts.settled_this_cycle THEN a.demerit_score
+        ELSE GREATEST(0, a.demerit_score - cfg.r)
+    END
+FROM cfg, facts
+WHERE a.id = @account_id
+  AND (a.demerit_closed_at IS NULL OR a.demerit_closed_at < @close_at::timestamptz)
+RETURNING a.demerit_score::float8 AS demerit;
+
+-- RiskRampConfig reads the singleton curve row (085) together with the
+-- incident kill-switch, so one read per verdict serves both.
+-- name: RiskRampConfig :one
+SELECT no_card_micros, card_base_micros, ceiling_micros, range_micros, shape, p_a::float8 AS p_a, p_k0::float8 AS p_k0, k_max, tau::float8 AS tau,
+       demerit_per_unpaid_cycle::float8 AS demerit_per_unpaid_cycle, demerit_recovery::float8 AS demerit_recovery, demerit_max::float8 AS demerit_max, ai_enforcement_paused,
+       COALESCE(paused_reason, '')::text AS paused_reason,
+       COALESCE(paused_by, '')::text     AS paused_by,
+       paused_at
+FROM ms_billing.risk_ramp_config
+WHERE id = 1;
+
+-- SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret),
+-- recording who/why/since on a pause and clearing them on resume.
+-- name: SetAIEnforcementPaused :one
+UPDATE ms_billing.risk_ramp_config
+SET ai_enforcement_paused = @paused::boolean,
+    paused_reason         = CASE WHEN @paused::boolean THEN NULLIF(@reason::text, '') ELSE NULL END,
+    paused_by             = CASE WHEN @paused::boolean THEN NULLIF(@actor::text, '')  ELSE NULL END,
+    paused_at             = CASE WHEN @paused::boolean THEN now() ELSE NULL END,
+    updated_at            = now()
+WHERE id = 1
+RETURNING ai_enforcement_paused, paused_at;
+
 -- anchor day 1 (UTC calendar month). Returns at most one row.
 -- name: AppAccountActivatedAt :one
 SELECT a.activated_at

@@ -75,6 +75,10 @@ type Category string
 const (
 	CategoryAll Category = "all"
 	CategoryAI  Category = "ai"
+	// CategoryExposure is the SYSTEM row billing-engine maintains per PaaS
+	// account (migration 085) so budget_alerts can record crossings of the
+	// risk-exposure pool. Never accepted from a caller.
+	CategoryExposure Category = "exposure"
 )
 
 // normalizeCategory maps the wire value (empty = the pre-084 default) onto a
@@ -153,7 +157,137 @@ const (
 	DecidedByAccount  DecidedBy = "account"
 	DecidedByOrg      DecidedBy = "org"
 	DecidedByNone     DecidedBy = "none"
+	// DecidedByExposureLimit: no customer cap bit, the PaaS risk-exposure
+	// pool did (PR-B, migration 085).
+	DecidedByExposureLimit DecidedBy = "exposure_limit"
+	// DecidedByPaused: the incident kill-switch is on — every verdict is
+	// allowed regardless of caps and pool (migration 085).
+	DecidedByPaused DecidedBy = "paused"
 )
+
+// PoolSource says what bounds the pool: the risk-exposure curve, or nothing
+// (not PaaS, or an unattributed scope).
+type PoolSource string
+
+const (
+	PoolSourceExposureLimit PoolSource = "exposure_limit"
+	PoolSourceNone          PoolSource = "none"
+)
+
+// Pool is the PaaS risk-exposure pool on a category='ai' status read (owner
+// 2026-09-14): PaaS is pay-AFTER-use, so the platform's exposure is bounded
+// by a risk-graded limit that REFUSES AI turns live. LimitMicros is the
+// curve (risk_ramp_config × the account's signals), AccruedMicros the
+// account's whole-period PaaS usage — AI + module usage + infra; plan/SaaS
+// base fees are not usage and never count. Exhausted = Mode paas && accrued
+// >= limit. The customer's allow_overage never lifts it. v1 gates AI only.
+type Pool struct {
+	// Mode is the account's billing mode: "paas" (the 'standard' mode), "credits", or "none" (unattributed).
+	Mode            string     `json:"mode"`
+	Source          PoolSource `json:"source"`
+	LimitMicros     int64      `json:"limit_micros"`
+	AccruedMicros   int64      `json:"accrued_micros"`
+	RemainingMicros int64      `json:"remaining_micros"`
+	Exhausted       bool       `json:"exhausted"`
+	// HasUsableCard / PaidInvoices / DelinquentNow / Demerit / ArrearsMicros
+	// are the pool's inputs, echoed so a console can explain the limit
+	// ("$167.96: card on file, 10 paid, S 2 → ÷3; $300 unpaid counts").
+	HasUsableCard bool `json:"has_usable_card"`
+	PaidInvoices  int  `json:"paid_invoices"`
+	DelinquentNow bool `json:"delinquent_now"`
+	// Demerit is the account's delinquency score S (0 = Normal; the limit is
+	// curve ÷ (1 + S)); Tier is its display band: normal | watch |
+	// restricted | severe.
+	Demerit float64 `json:"demerit"`
+	Tier    string  `json:"tier"`
+	// ArrearsMicros is the open balance of prior invoices, counted in
+	// AccruedMicros as money (never scored).
+	ArrearsMicros int64 `json:"arrears_micros"`
+}
+
+// ExposureSignals are the pool's inputs for one account: the curve's k
+// (paid invoices), the card, the delinquency score S (accounts.demerit_score,
+// moved only by the three demerit transitions), whether an invoice is open
+// with a balance, and that balance (arrears) as money.
+type ExposureSignals struct {
+	BillingMode   string
+	HasUsableCard bool
+	PaidInvoices  int
+	DelinquentNow bool
+	Demerit       float64
+	ArrearsMicros int64
+}
+
+// Shape selects the exposure curve's growth function (085).
+type Shape string
+
+const (
+	ShapeExp     Shape = "exp"
+	ShapeSigmoid Shape = "sigmoid"
+)
+
+// RiskRampConfig is the finance-owned curve row (085), read once per AI
+// verdict together with the incident kill-switch.
+type RiskRampConfig struct {
+	NoCardMicros   int64
+	CardBaseMicros int64
+	CeilingMicros  int64
+	// RangeMicros is how far above the base the curve climbs; Shape and its
+	// parameters say how fast. ShapeSigmoid (owner's final shape): growth =
+	// [g(k) − g(0)] / [g(KMax) − g(0)], g(x) = 1/(1+e^(−A(x−K0))), exactly 1
+	// at k ≥ KMax. ShapeExp: growth = 1 − e^(−k/Tau).
+	RangeMicros int64
+	Shape       Shape
+	A           float64
+	K0          float64
+	KMax        int
+	Tau         float64
+	// DemeritPerUnpaidCycle (p), DemeritRecovery (r) and DemeritMax are the
+	// delinquency score's parameters (owner FINAL 2026-09-14): +p on an
+	// invoice's first failure and at each close it stays unpaid, −r on
+	// settling a late invoice and at each clean close, 0 ≤ S ≤ DemeritMax.
+	// The limit is curve ÷ (1 + S). Applied by the DB transitions; carried
+	// here for the admin read.
+	DemeritPerUnpaidCycle float64
+	DemeritRecovery       float64
+	DemeritMax            float64
+	EnforcementPaused     bool
+	PausedReason          string
+	PausedBy              string
+	PausedAt              time.Time // zero when not paused
+}
+
+// SetAIEnforcementPausedRequest flips the incident kill-switch (admin RPC,
+// internal secret): Paused=true allows every AI verdict platform-wide until
+// flipped back, with no deploy. Reason and ActorID are STORED on the row on
+// a pause (and cleared on resume) so the audit answers "why was enforcement
+// off, and who turned it off" without archaeology; both are required to pause.
+type SetAIEnforcementPausedRequest struct {
+	Paused  bool   `json:"paused"`
+	Reason  string `json:"reason,omitempty"`
+	ActorID string `json:"actor_id,omitempty"`
+}
+
+// AIEnforcementResponse is the switch's state (with its provenance) plus the
+// curve, so an admin surface shows everything in one read.
+type AIEnforcementResponse struct {
+	Paused                bool      `json:"paused"`
+	PausedReason          string    `json:"paused_reason,omitempty"`
+	PausedBy              string    `json:"paused_by,omitempty"`
+	PausedAt              time.Time `json:"paused_at,omitempty"`
+	NoCardMicros          int64     `json:"no_card_micros"`
+	CardBaseMicros        int64     `json:"card_base_micros"`
+	CeilingMicros         int64     `json:"ceiling_micros"`
+	RangeMicros           int64     `json:"range_micros"`
+	Shape                 Shape     `json:"shape"`
+	A                     float64   `json:"p_a"`
+	K0                    float64   `json:"p_k0"`
+	KMax                  int       `json:"k_max"`
+	Tau                   float64   `json:"tau"`
+	DemeritPerUnpaidCycle float64   `json:"demerit_per_unpaid_cycle"`
+	DemeritRecovery       float64   `json:"demerit_recovery"`
+	DemeritMax            float64   `json:"demerit_max"`
+}
 
 // GetBudgetStatusResponse is the live spend-vs-cap status. Exists is false
 // (with a nil error) when no budget is configured for the scope, so the
@@ -194,6 +328,11 @@ type GetBudgetStatusResponse struct {
 	AllowOverage    bool  `json:"allow_overage"`
 	Exhausted       bool  `json:"exhausted"`
 	RemainingMicros int64 `json:"remaining_micros"`
+
+	// Pool is the PaaS risk-exposure pool for the scope's paying account on a
+	// category='ai' read; nil for other categories. Exhausted above is the OR
+	// of the cap rows and the pool; DecidedBy says which bit.
+	Pool *Pool `json:"pool,omitempty"`
 }
 
 // GetBudgetAlertsRequest selects the recorded crossings for a budget + period.

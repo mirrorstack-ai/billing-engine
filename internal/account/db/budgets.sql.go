@@ -62,6 +62,56 @@ func (q *Queries) AccountPeriodAISpendMicros(ctx context.Context, arg AccountPer
 	return total_raw_cost_micros, err
 }
 
+const accountPeriodSpendMicros = `-- name: AccountPeriodSpendMicros :one
+WITH base_events AS (
+    SELECT
+        module_id, metric, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+      AND dev_served = false
+),
+billable_events AS (
+    SELECT module_id, metric, model, value AS billable_value
+    FROM base_events
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, model,
+        MAX(value)::numeric AS billable_value
+    FROM base_events
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, model, subject
+)
+SELECT COALESCE(SUM(e.billable_value * COALESCE(mp.unit_price_micros, md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM billable_events e
+LEFT JOIN ms_billing.metric_model_prices mp
+    ON mp.metric = e.metric AND mp.model = e.model AND e.model <> ''
+LEFT JOIN ms_billing.metric_definitions md
+    ON md.module_id = e.module_id AND md.metric = e.metric
+`
+
+type AccountPeriodSpendMicrosParams struct {
+	AccountID    pgtype.UUID        `json:"account_id"`
+	BillableAt   pgtype.Timestamptz `json:"billable_at"`
+	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+}
+
+// AccountPeriodSpendMicros is the account-level twin of AppPeriodSpendMicros
+// over EVERY metric — the accrued PaaS usage the risk-exposure pool measures
+// (AI + module usage + infra; plan/SaaS base fees are not usage events and so
+// are excluded by construction, as the owner ruled). Same window, dev_served
+// exclusion and subject-aggregation shape.
+func (q *Queries) AccountPeriodSpendMicros(ctx context.Context, arg AccountPeriodSpendMicrosParams) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, accountPeriodSpendMicros, arg.AccountID, arg.BillableAt, arg.BillableAt_2)
+	var total_raw_cost_micros pgtype.Numeric
+	err := row.Scan(&total_raw_cost_micros)
+	return total_raw_cost_micros, err
+}
+
 const appAccountActivatedAt = `-- name: AppAccountActivatedAt :one
 SELECT a.activated_at
 FROM ms_billing.accounts a
@@ -80,6 +130,24 @@ func (q *Queries) AppAccountActivatedAt(ctx context.Context, appID string) (pgty
 	var activated_at pgtype.Timestamptz
 	err := row.Scan(&activated_at)
 	return activated_at, err
+}
+
+const appPayerAccountID = `-- name: AppPayerAccountID :one
+SELECT e.account_id
+FROM ms_billing.usage_events e
+WHERE e.app_id = $1 AND e.account_id IS NOT NULL
+ORDER BY COALESCE(e.billable_at, e.recorded_at) DESC
+LIMIT 1
+`
+
+// AppPayerAccountID resolves an app to the account its usage is attributed
+// to (the app's most recent attributed event) — the account whose exposure
+// pool an app-surface AI turn draws on. No row = unattributed (lazy).
+func (q *Queries) AppPayerAccountID(ctx context.Context, appID string) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, appPayerAccountID, appID)
+	var account_id pgtype.UUID
+	err := row.Scan(&account_id)
+	return account_id, err
 }
 
 const appPeriodAISpendMicros = `-- name: AppPeriodAISpendMicros :one
@@ -214,6 +282,118 @@ func (q *Queries) AppPeriodSpendMicros(ctx context.Context, arg AppPeriodSpendMi
 	return total_raw_cost_micros, err
 }
 
+const applyDemeritAtClose = `-- name: ApplyDemeritAtClose :one
+WITH cfg AS (
+    SELECT demerit_per_unpaid_cycle AS p, demerit_recovery AS r, demerit_max AS cap FROM ms_billing.risk_ramp_config WHERE id = 1
+), prev AS (
+    SELECT demerit_closed_at FROM ms_billing.accounts WHERE id = $2
+), facts AS (
+    SELECT
+        EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
+                WHERE i.account_id = $2 AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+                  AND i.demerit_failed_at IS NOT NULL
+                  AND prev.demerit_closed_at IS NOT NULL AND i.demerit_failed_at < prev.demerit_closed_at) AS unpaid_full_cycle,
+        EXISTS (SELECT 1 FROM ms_billing.invoices i
+                WHERE i.account_id = $2 AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+                  AND i.demerit_failed_at IS NOT NULL) AS late_now,
+        EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
+                WHERE i.account_id = $2 AND i.demerit_failed_at IS NOT NULL
+                  AND (prev.demerit_closed_at IS NULL OR i.demerit_failed_at >= prev.demerit_closed_at)) AS failed_this_cycle,
+        EXISTS (SELECT 1 FROM ms_billing.invoices i, prev
+                WHERE i.account_id = $2 AND i.demerit_settled_at IS NOT NULL
+                  AND (prev.demerit_closed_at IS NULL OR i.demerit_settled_at >= prev.demerit_closed_at)) AS settled_this_cycle
+)
+UPDATE ms_billing.accounts a
+SET demerit_closed_at = $1::timestamptz,
+    demerit_score = CASE
+        WHEN facts.unpaid_full_cycle THEN LEAST(cfg.cap, a.demerit_score + cfg.p)
+        WHEN facts.late_now OR facts.failed_this_cycle OR facts.settled_this_cycle THEN a.demerit_score
+        ELSE GREATEST(0, a.demerit_score - cfg.r)
+    END
+FROM cfg, facts
+WHERE a.id = $2
+  AND (a.demerit_closed_at IS NULL OR a.demerit_closed_at < $1::timestamptz)
+RETURNING a.demerit_score::float8 AS demerit
+`
+
+type ApplyDemeritAtCloseParams struct {
+	CloseAt   time.Time `json:"close_at"`
+	AccountID string    `json:"account_id"`
+}
+
+// ApplyDemeritAtClose: the account's cycle close at @close_at, once per close
+// (demerit_closed_at latch, monotone). A late invoice still unpaid that was
+// charged BEFORE the previous close has stayed unpaid a full cycle: +p — and
+// only when a previous close EXISTS: at the first close after the migration a
+// failure inside that cycle was charged by the failure transition already. A
+// cycle with nothing late, no failure and no settle since the previous close
+// is clean: −r. Anything else — a failure inside this cycle (paid or not), or
+// a late invoice settled inside it (the settle already credited −r) — leaves S
+// as the failure and settle transitions set it.
+func (q *Queries) ApplyDemeritAtClose(ctx context.Context, arg ApplyDemeritAtCloseParams) (float64, error) {
+	row := q.db.QueryRow(ctx, applyDemeritAtClose, arg.CloseAt, arg.AccountID)
+	var demerit float64
+	err := row.Scan(&demerit)
+	return demerit, err
+}
+
+const applyDemeritOnFailure = `-- name: ApplyDemeritOnFailure :execrows
+
+WITH inv AS (
+    UPDATE ms_billing.invoices
+    SET demerit_failed_at = now()
+    WHERE stripe_invoice_id = $1 AND demerit_failed_at IS NULL
+    RETURNING account_id
+), cfg AS (
+    SELECT demerit_per_unpaid_cycle AS p, demerit_max AS cap FROM ms_billing.risk_ramp_config WHERE id = 1
+)
+UPDATE ms_billing.accounts a
+SET demerit_score = LEAST(cfg.cap, a.demerit_score + cfg.p)
+FROM inv, cfg
+WHERE a.id = inv.account_id
+`
+
+// The three demerit transitions (migration 085). Each is ONE statement over the
+// invoice/account rows with its own idempotency latch, so Stripe's at-least-once
+// delivery and a re-run cycle change nothing the second time. Rows affected
+// (0/1) says whether the transition applied.
+// ApplyDemeritOnFailure: an invoice's FIRST failure (payment_failed or
+// marked_uncollectible) costs +p, once per invoice (demerit_failed_at latch).
+func (q *Queries) ApplyDemeritOnFailure(ctx context.Context, stripeInvoiceID string) (int64, error) {
+	result, err := q.db.Exec(ctx, applyDemeritOnFailure, stripeInvoiceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const applyDemeritOnSettle = `-- name: ApplyDemeritOnSettle :execrows
+WITH inv AS (
+    UPDATE ms_billing.invoices
+    SET demerit_settled_at = now()
+    WHERE stripe_invoice_id = $1
+      AND status = 'paid' AND demerit_failed_at IS NOT NULL AND demerit_settled_at IS NULL
+    RETURNING account_id
+), cfg AS (
+    SELECT demerit_recovery AS r FROM ms_billing.risk_ramp_config WHERE id = 1
+)
+UPDATE ms_billing.accounts a
+SET demerit_score = GREATEST(0, a.demerit_score - cfg.r)
+FROM inv, cfg
+WHERE a.id = inv.account_id
+`
+
+// ApplyDemeritOnSettle: a LATE invoice (one that was charged +p) reaching
+// 'paid' earns −r the same day, once (demerit_settled_at latch). A never-late
+// invoice paying is not a settle — it is a clean cycle, credited at the close.
+func (q *Queries) ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID string) (int64, error) {
+	result, err := q.db.Exec(ctx, applyDemeritOnSettle, stripeInvoiceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const budgetOrgAccountID = `-- name: BudgetOrgAccountID :one
 SELECT id
 FROM ms_billing.accounts
@@ -230,6 +410,61 @@ func (q *Queries) BudgetOrgAccountID(ctx context.Context, ownerOrgID pgtype.UUID
 	var id string
 	err := row.Scan(&id)
 	return id, err
+}
+
+const exposureSignals = `-- name: ExposureSignals :one
+SELECT
+    a.billing_mode::text AS billing_mode,
+    EXISTS (
+        SELECT 1 FROM ms_billing.payment_methods_mirror pm
+        WHERE pm.account_id = a.id
+          AND pm.deleted_at IS NULL
+          AND (pm.exp_year, pm.exp_month) >= (EXTRACT(YEAR FROM current_date)::INT, EXTRACT(MONTH FROM current_date)::INT)
+    )::boolean AS has_usable_card,
+    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices,
+    EXISTS (
+        SELECT 1 FROM ms_billing.invoices i
+        WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
+    )::boolean AS delinquent_now,
+    -- arrears: the open balance of prior invoices, in the invoice's minor
+    -- units (cents); counted against the pool as money, not scored.
+    COALESCE((SELECT SUM(GREATEST(0, i.amount_due - i.amount_paid)) FROM ms_billing.invoices i
+              WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0), 0)::bigint AS arrears_cents,
+    a.demerit_score::float8 AS demerit
+FROM ms_billing.accounts a
+WHERE a.id = $1
+`
+
+type ExposureSignalsRow struct {
+	BillingMode   string  `json:"billing_mode"`
+	HasUsableCard bool    `json:"has_usable_card"`
+	PaidInvoices  int32   `json:"paid_invoices"`
+	DelinquentNow bool    `json:"delinquent_now"`
+	ArrearsCents  int64   `json:"arrears_cents"`
+	Demerit       float64 `json:"demerit"`
+}
+
+// ExposureSignals are the inputs of the PaaS exposure curve (085): the
+// account's billing mode, whether a usable (unexpired, undeleted) card is on
+// file, how many invoices it has paid, and its delinquency — delinquent_now
+// is the cycle-close judge's own definition (HasUnpaidInvoice: an open or
+// uncollectible invoice with a balance), late_count is how many invoices ever
+// needed a failed payment attempt (ever_failed, migration 0xx) or ended
+// uncollectible — the memory a delinquency rule can subtract from k. A VOID
+// is OUR cancellation (a corrected or zeroed invoice), never the customer's
+// failure, so it does not count.
+func (q *Queries) ExposureSignals(ctx context.Context, id string) (ExposureSignalsRow, error) {
+	row := q.db.QueryRow(ctx, exposureSignals, id)
+	var i ExposureSignalsRow
+	err := row.Scan(
+		&i.BillingMode,
+		&i.HasUsableCard,
+		&i.PaidInvoices,
+		&i.DelinquentNow,
+		&i.ArrearsCents,
+		&i.Demerit,
+	)
+	return i, err
 }
 
 const getBudget = `-- name: GetBudget :one
@@ -349,6 +584,92 @@ func (q *Queries) ListBudgetAlerts(ctx context.Context, arg ListBudgetAlertsPara
 		return nil, err
 	}
 	return items, nil
+}
+
+const riskRampConfig = `-- name: RiskRampConfig :one
+SELECT no_card_micros, card_base_micros, ceiling_micros, range_micros, shape, p_a::float8 AS p_a, p_k0::float8 AS p_k0, k_max, tau::float8 AS tau,
+       demerit_per_unpaid_cycle::float8 AS demerit_per_unpaid_cycle, demerit_recovery::float8 AS demerit_recovery, demerit_max::float8 AS demerit_max, ai_enforcement_paused,
+       COALESCE(paused_reason, '')::text AS paused_reason,
+       COALESCE(paused_by, '')::text     AS paused_by,
+       paused_at
+FROM ms_billing.risk_ramp_config
+WHERE id = 1
+`
+
+type RiskRampConfigRow struct {
+	NoCardMicros          int64              `json:"no_card_micros"`
+	CardBaseMicros        int64              `json:"card_base_micros"`
+	CeilingMicros         int64              `json:"ceiling_micros"`
+	RangeMicros           int64              `json:"range_micros"`
+	Shape                 string             `json:"shape"`
+	PA                    float64            `json:"p_a"`
+	PK0                   float64            `json:"p_k0"`
+	KMax                  int32              `json:"k_max"`
+	Tau                   float64            `json:"tau"`
+	DemeritPerUnpaidCycle float64            `json:"demerit_per_unpaid_cycle"`
+	DemeritRecovery       float64            `json:"demerit_recovery"`
+	DemeritMax            float64            `json:"demerit_max"`
+	AiEnforcementPaused   bool               `json:"ai_enforcement_paused"`
+	PausedReason          string             `json:"paused_reason"`
+	PausedBy              string             `json:"paused_by"`
+	PausedAt              pgtype.Timestamptz `json:"paused_at"`
+}
+
+// RiskRampConfig reads the singleton curve row (085) together with the
+// incident kill-switch, so one read per verdict serves both.
+func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error) {
+	row := q.db.QueryRow(ctx, riskRampConfig)
+	var i RiskRampConfigRow
+	err := row.Scan(
+		&i.NoCardMicros,
+		&i.CardBaseMicros,
+		&i.CeilingMicros,
+		&i.RangeMicros,
+		&i.Shape,
+		&i.PA,
+		&i.PK0,
+		&i.KMax,
+		&i.Tau,
+		&i.DemeritPerUnpaidCycle,
+		&i.DemeritRecovery,
+		&i.DemeritMax,
+		&i.AiEnforcementPaused,
+		&i.PausedReason,
+		&i.PausedBy,
+		&i.PausedAt,
+	)
+	return i, err
+}
+
+const setAIEnforcementPaused = `-- name: SetAIEnforcementPaused :one
+UPDATE ms_billing.risk_ramp_config
+SET ai_enforcement_paused = $1::boolean,
+    paused_reason         = CASE WHEN $1::boolean THEN NULLIF($2::text, '') ELSE NULL END,
+    paused_by             = CASE WHEN $1::boolean THEN NULLIF($3::text, '')  ELSE NULL END,
+    paused_at             = CASE WHEN $1::boolean THEN now() ELSE NULL END,
+    updated_at            = now()
+WHERE id = 1
+RETURNING ai_enforcement_paused, paused_at
+`
+
+type SetAIEnforcementPausedParams struct {
+	Paused bool   `json:"paused"`
+	Reason string `json:"reason"`
+	Actor  string `json:"actor"`
+}
+
+type SetAIEnforcementPausedRow struct {
+	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
+	PausedAt            pgtype.Timestamptz `json:"paused_at"`
+}
+
+// SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret),
+// recording who/why/since on a pause and clearing them on resume.
+func (q *Queries) SetAIEnforcementPaused(ctx context.Context, arg SetAIEnforcementPausedParams) (SetAIEnforcementPausedRow, error) {
+	row := q.db.QueryRow(ctx, setAIEnforcementPaused, arg.Paused, arg.Reason, arg.Actor)
+	var i SetAIEnforcementPausedRow
+	err := row.Scan(&i.AiEnforcementPaused, &i.PausedAt)
+	return i, err
 }
 
 const upsertBudget = `-- name: UpsertBudget :one

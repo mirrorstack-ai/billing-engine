@@ -45,6 +45,8 @@ type FakeStore struct {
 	Inserts            []webhook.InsertPaymentMethodParams // params from InsertPaymentMethod
 	SoftDeletes        []string                            // stripe_payment_method_id values from SoftDeletePaymentMethod
 	StampedPMs         []string                            // "setupIntentID=stripePMID" from SetAddCardRequestStripePM
+	DemeritFailed      []string                            // stripe_invoice_id values from ApplyDemeritOnFailure
+	DemeritSettled     []string                            // stripe_invoice_id values from ApplyDemeritOnSettle
 	ResolvedPMs        []string                            // stripe_payment_method_id values from ResolvePendingAddCardRequest
 	FailedSetupIntents []string                            // "setupIntentID=failureCode" from FailAddCardRequestBySetupIntent
 	ActivatedCustomers []string                            // stripe_customer_id values from StampAccountActivated
@@ -216,6 +218,18 @@ func (s *FakeStore) RelaxCollectionOnPaidInvoice(_ context.Context, stripeInvoic
 	}
 	s.RelaxedInvoices = append(s.RelaxedInvoices, stripeInvoiceID)
 	return s.Relaxed, nil
+}
+
+// ApplyDemeritOnFailure / ApplyDemeritOnSettle record the demerit transitions
+// the router asked for; the fake never scores, it remembers.
+func (s *FakeStore) ApplyDemeritOnFailure(_ context.Context, stripeInvoiceID string) (bool, error) {
+	s.DemeritFailed = append(s.DemeritFailed, stripeInvoiceID)
+	return true, nil
+}
+
+func (s *FakeStore) ApplyDemeritOnSettle(_ context.Context, stripeInvoiceID string) (bool, error) {
+	s.DemeritSettled = append(s.DemeritSettled, stripeInvoiceID)
+	return true, nil
 }
 
 func (s *FakeStore) MarkInvoiceFailed(_ context.Context, stripeInvoiceID string) error {

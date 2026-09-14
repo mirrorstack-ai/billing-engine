@@ -368,6 +368,21 @@ func (s *pgxStore) MarkInvoiceFailed(ctx context.Context, stripeInvoiceID string
 	return err
 }
 
+// ApplyDemeritOnFailure charges the delinquency score +p for the invoice's
+// first failure (latched on invoices.demerit_failed_at).
+func (s *pgxStore) ApplyDemeritOnFailure(ctx context.Context, stripeInvoiceID string) (bool, error) {
+	n, err := s.q.ApplyDemeritOnFailure(ctx, stripeInvoiceID)
+	return n > 0, err
+}
+
+// ApplyDemeritOnSettle credits −r once when a late invoice reaches 'paid'
+// (latched on invoices.demerit_settled_at). Runs AFTER ApplyInvoiceStatus so
+// the mirror row already says 'paid'.
+func (s *pgxStore) ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID string) (bool, error) {
+	n, err := s.q.ApplyDemeritOnSettle(ctx, stripeInvoiceID)
+	return n > 0, err
+}
+
 // FlagPaymentMethodFraud latches fraud_blocked on the disputed/warned card
 // (card-scoped, account-bounded; see the query doc). Returns (found, error):
 // found=false (0 rows) is a drift no-op the handler ACKs 200.

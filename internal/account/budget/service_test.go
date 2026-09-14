@@ -39,6 +39,12 @@ type fakeStore struct {
 	accountSpend int64                   // AccountPeriodAISpendMicros result
 	orgAccounts  map[uuid.UUID]uuid.UUID // org id → its billing account
 
+	// exposure pool (085)
+	accountAllSpend int64                                // AccountPeriodSpendMicros (every metric)
+	appPayers       map[uuid.UUID]uuid.UUID              // app → payer account
+	signals         map[uuid.UUID]budget.ExposureSignals // account → curve inputs ("" mode = not paas)
+	rampCfg         budget.RiskRampConfig
+
 	errGet    error
 	errUpsert error
 	errSpend  error
@@ -53,6 +59,9 @@ func newFakeStore() *fakeStore {
 		alerts:      map[alertKey]budget.BudgetAlert{},
 		spendBy:     map[string]int64{},
 		orgAccounts: map[uuid.UUID]uuid.UUID{},
+		appPayers:   map[uuid.UUID]uuid.UUID{},
+		signals:     map[uuid.UUID]budget.ExposureSignals{},
+		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 1_000_000_000, RangeMicros: 990_000_000, Shape: budget.ShapeSigmoid, A: 0.6, K0: 10, KMax: 24, Tau: 5, DemeritPerUnpaidCycle: 2, DemeritRecovery: 1, DemeritMax: 12}, // migration 085's seed: S2
 	}
 }
 
@@ -67,10 +76,15 @@ func (f *fakeStore) UpsertBudget(_ context.Context, b budget.Budget) (budget.Bud
 	if f.errUpsert != nil {
 		return budget.Budget{}, f.errUpsert
 	}
-	if b.ID == uuid.Nil {
+	// ON CONFLICT DO UPDATE keeps the row's id — the alert idempotency key
+	// (budget_id, period, percent) must survive a re-upsert, as it does in SQL.
+	k := budgetKey(b.Scope, b.ScopeID, b.Category, b.TemplateKey)
+	if existing, ok := f.budgets[k]; ok {
+		b.ID = existing.ID
+	} else if b.ID == uuid.Nil {
 		b.ID = uuid.New()
 	}
-	f.budgets[budgetKey(b.Scope, b.ScopeID, b.Category, b.TemplateKey)] = b
+	f.budgets[k] = b
 	return b, nil
 }
 
@@ -109,6 +123,48 @@ func (f *fakeStore) AccountPeriodAISpendMicros(_ context.Context, accountID uuid
 func (f *fakeStore) OrgAccountID(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
 	id, ok := f.orgAccounts[orgID]
 	return id, ok, nil
+}
+
+func (f *fakeStore) AccountPeriodSpendMicros(_ context.Context, accountID uuid.UUID, start, end time.Time) (int64, error) {
+	if f.errSpend != nil {
+		return 0, f.errSpend
+	}
+	return f.accountAllSpend, nil
+}
+
+func (f *fakeStore) AppPayerAccountID(_ context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {
+	id, ok := f.appPayers[appID]
+	return id, ok, nil
+}
+
+func (f *fakeStore) ExposureSignals(_ context.Context, accountID uuid.UUID) (budget.ExposureSignals, error) {
+	return f.signals[accountID], nil
+}
+
+func (f *fakeStore) RiskRampConfig(_ context.Context) (budget.RiskRampConfig, error) {
+	return f.rampCfg, nil
+}
+
+// The demerit transitions are DB statements (store_integration_test pins
+// each); the fake only records that they were asked for.
+func (f *fakeStore) ApplyDemeritOnFailure(_ context.Context, id string) (bool, error) {
+	return true, nil
+}
+func (f *fakeStore) ApplyDemeritOnSettle(_ context.Context, id string) (bool, error) {
+	return true, nil
+}
+func (f *fakeStore) ApplyDemeritAtClose(_ context.Context, _ uuid.UUID, _ time.Time) (float64, bool, error) {
+	return 0, true, nil
+}
+
+func (f *fakeStore) SetAIEnforcementPaused(_ context.Context, paused bool, reason, actorID string) (bool, error) {
+	f.rampCfg.EnforcementPaused = paused
+	if paused {
+		f.rampCfg.PausedReason, f.rampCfg.PausedBy, f.rampCfg.PausedAt = reason, actorID, time.Now()
+	} else {
+		f.rampCfg.PausedReason, f.rampCfg.PausedBy, f.rampCfg.PausedAt = "", "", time.Time{}
+	}
+	return paused, nil
 }
 
 func (f *fakeStore) AccountAnchorDay(_ context.Context, _ uuid.UUID) (int, error) {
@@ -807,4 +863,374 @@ func TestEvaluateAccountBudget_AccountThenOwningOrg(t *testing.T) {
 	fired, err = svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired, "no org, and the account's crossings are already recorded")
+}
+
+// --- PaaS risk-exposure pool (migration 085, PR-B) ------------------------
+
+// TestExposureLimitMicros_OwnerCurve pins the owner's FINAL curve (2026-09-14,
+// S2): $5 without a card; with a card $10 + $990 × a logistic normalised to
+// 0 at k=0 and EXACTLY 1 at k=24 (k0 10, a 0.6), so k=0 → $10 and k=24 →
+// $1,000 to the micro, monotone in between, clamped at the ceiling; whole
+// micros rounded half up.
+func TestExposureLimitMicros_OwnerCurve(t *testing.T) {
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 1_000_000_000, RangeMicros: 990_000_000, Shape: budget.ShapeSigmoid, A: 0.6, K0: 10, KMax: 24}
+	for _, tc := range []struct {
+		card bool
+		paid int
+		want int64
+	}{
+		{false, 0, 5_000_000},
+		{false, 50, 5_000_000},
+		{true, 0, 10_000_000},     // $10.00 exactly: the base alone
+		{true, 1, 12_008_832},     // $12.01
+		{true, 3, 22_211_334},     // $22.21
+		{true, 6, 90_109_162},     // $90.11
+		{true, 10, 503_884_326},   // $503.88 — the midpoint k0
+		{true, 14, 917_659_490},   // $917.66
+		{true, 18, 992_120_368},   // $992.12
+		{true, 24, 1_000_000_000}, // $1,000.00 EXACTLY at k_max, not asymptotically
+		{true, 25, 1_000_000_000}, // and stays there
+		{true, 1000, 1_000_000_000},
+		{true, -3, 10_000_000},
+	} {
+		require.EqualValues(t, tc.want, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: tc.card, PaidInvoices: tc.paid}), "card=%v paid=%d", tc.card, tc.paid)
+	}
+	// Monotone: every paid invoice earns at least as much as the last, and
+	// every one below k_max earns strictly more.
+	prev := int64(0)
+	for k := 0; k <= 40; k++ {
+		got := budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: k})
+		if k > 0 && k <= cfg.KMax {
+			require.Greater(t, got, prev, "k=%d", k)
+		} else {
+			require.GreaterOrEqual(t, got, prev, "k=%d", k)
+		}
+		prev = got
+	}
+	// The alternatives the owner weighed are the same shape with other
+	// parameters: S1 (k0 6, a 0.8) and S3 (k0 14, a 0.5) — an UPDATE, not a PR.
+	s1, s3 := cfg, cfg
+	s1.K0, s1.A = 6, 0.8
+	s3.K0, s3.A = 14, 0.5
+	require.EqualValues(t, 500_926_551, budget.ExposureLimitMicros(s1, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 6}), "S1 k=6 → $500.93")
+	require.EqualValues(t, 1_000_000_000, budget.ExposureLimitMicros(s1, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}))
+	require.EqualValues(t, 507_883_920, budget.ExposureLimitMicros(s3, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 14}), "S3 k=14 → $507.88")
+	require.EqualValues(t, 1_000_000_000, budget.ExposureLimitMicros(s3, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}))
+	// A misconfigured floor above the ceiling is still bounded by the ceiling.
+	require.EqualValues(t, 1, budget.ExposureLimitMicros(budget.RiskRampConfig{NoCardMicros: 9, CardBaseMicros: 9, CeilingMicros: 1}, budget.ExposureSignals{}))
+	// The ceiling clamps a range that overshoots it.
+	clamp := cfg
+	clamp.RangeMicros, clamp.CeilingMicros = 5_000_000_000, 150_000_000
+	require.EqualValues(t, 150_000_000, budget.ExposureLimitMicros(clamp, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}))
+	// Unusable parameters earn nothing: the base alone (the DB CHECKs keep the real row sane).
+	for _, bad := range []budget.RiskRampConfig{
+		{CardBaseMicros: 10_000_000, RangeMicros: 990_000_000, CeilingMicros: 1_000_000_000, Shape: budget.ShapeSigmoid, A: 0.6, K0: 10, KMax: 0},
+		{CardBaseMicros: 10_000_000, RangeMicros: 990_000_000, CeilingMicros: 1_000_000_000, Shape: budget.ShapeSigmoid, A: 0, K0: 10, KMax: 24},
+		{CardBaseMicros: 10_000_000, RangeMicros: 990_000_000, CeilingMicros: 1_000_000_000, Shape: "triangle", A: 0.6, K0: 10, KMax: 24},
+		{CardBaseMicros: 10_000_000, RangeMicros: 990_000_000, CeilingMicros: 1_000_000_000, Shape: budget.ShapeExp, Tau: 0},
+		{CardBaseMicros: 10_000_000, CeilingMicros: 1_000_000_000},
+	} {
+		require.EqualValues(t, 10_000_000, budget.ExposureLimitMicros(bad, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}), "%+v", bad)
+	}
+}
+
+// TestExposureLimitMicros_ExpShape keeps the earlier shape reachable by
+// config: $10 + range × (1 − e^(−k/tau)) — 63% of the range at k = tau,
+// saturating toward base + range but never reaching it.
+func TestExposureLimitMicros_ExpShape(t *testing.T) {
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, RangeMicros: 190_000_000, Shape: budget.ShapeExp, Tau: 5}
+	for _, tc := range []struct {
+		paid int
+		want int64
+	}{
+		{0, 10_000_000},
+		{1, 44_441_157},   // $44.44
+		{2, 72_639_191},   // $72.64
+		{3, 95_725_789},   // $95.73
+		{5, 130_102_906},  // $130.10 — 63% of the range at k = tau
+		{10, 174_286_296}, // $174.29
+		{24, 198_436_348}, // $198.44
+		{1000, 200_000_000},
+	} {
+		require.EqualValues(t, tc.want, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: tc.paid}), "paid=%d", tc.paid)
+	}
+	// A slower tau saturates later.
+	slow := cfg
+	slow.Tau = 7.75
+	require.EqualValues(t, 191_412_996, budget.ExposureLimitMicros(slow, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}), "tau 7.75 → $191.41 at k=24")
+}
+
+// TestGetBudgetStatus_ExposurePoolComposesWithTheCaps: on a PaaS account the
+// pool rides every AI read, exhausts on the account's WHOLE usage, is named
+// only when no customer cap bit, and is never lifted by allow_overage; a
+// credits account or an unattributed app has no pool.
+func TestGetBudgetStatus_ExposurePoolComposesWithTheCaps(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	ctx := context.Background()
+	app, acct := uuid.New(), uuid.New()
+	store.appPayers[app] = acct
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 3} // S2 at k=3: $22.21
+	read := func() *budget.GetBudgetStatusResponse {
+		st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "member-help"})
+		require.NoError(t, err)
+		return st
+	}
+
+	// No customer cap, pool under: exists=false, not exhausted, pool reported.
+	store.accountAllSpend = 20_000_000
+	st := read()
+	require.False(t, st.Exists)
+	require.False(t, st.Exhausted)
+	require.NotNil(t, st.Pool)
+	require.Equal(t, "paas", st.Pool.Mode)
+	require.Equal(t, budget.PoolSourceExposureLimit, st.Pool.Source)
+	require.EqualValues(t, 22_211_334, st.Pool.LimitMicros)
+	require.EqualValues(t, 2_211_334, st.Pool.RemainingMicros)
+	require.True(t, st.Pool.HasUsableCard)
+	require.Equal(t, 3, st.Pool.PaidInvoices)
+	// The system row exists now, with the curve as its limit.
+	sys, found, err := store.GetBudget(ctx, budget.ScopeAccount, acct, budget.CategoryExposure, "")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.EqualValues(t, 22_211_334, sys.LimitMicros)
+	require.True(t, sys.HardCap)
+
+	// No customer cap, pool full: exhausted by the pool.
+	store.accountAllSpend = 22_211_334
+	st = read()
+	require.False(t, st.Exists)
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
+
+	// A customer cap that is fine + a full pool: still exhausted, by the pool.
+	seedAIBudget(store, budget.ScopeApp, app, "", 100_000_000, true, false)
+	store.spendBy["ai/"] = 1_000_000
+	st = read()
+	require.True(t, st.Exists)
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
+	require.EqualValues(t, 100_000_000, st.LimitMicros, "the cap row's own figures are still reported")
+
+	// allow_overage on the customer's cap never lifts the pool.
+	store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")] = func() budget.Budget {
+		b := store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")]
+		b.AllowOverage = true
+		return b
+	}()
+	st = read()
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
+
+	// A customer cap that bites keeps ITS label even with the pool full.
+	store.spendBy["ai/"] = 100_000_000
+	store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")] = func() budget.Budget {
+		b := store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "")]
+		b.AllowOverage = false
+		return b
+	}()
+	st = read()
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+	require.True(t, st.Pool.Exhausted)
+
+	// Credits mode: no pool, the caps alone decide.
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "credits", HasUsableCard: true}
+	store.spendBy["ai/"] = 0
+	st = read()
+	require.False(t, st.Exhausted)
+	require.Equal(t, budget.PoolSourceNone, st.Pool.Source)
+	require.Equal(t, "credits", st.Pool.Mode)
+
+	// An unattributed app (no payer yet): no pool either.
+	delete(store.appPayers, app)
+	st = read()
+	require.Equal(t, budget.PoolSourceNone, st.Pool.Source)
+	require.Equal(t, "none", st.Pool.Mode)
+
+	// The system category is never accepted from a caller.
+	_, err = svc.SetBudget(ctx, budget.SetBudgetRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, LimitMicros: 1, Active: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+	_, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure})
+	requireCode(t, err, billing.CodeInvalidInput)
+}
+
+// TestEvaluateAccountBudget_RecordsPoolCrossings: an AI event on a PaaS
+// account records the pool's 80% and 100% crossings on the system row — the
+// pre-cliff warning — once per period, alongside the account's own AI cap.
+func TestEvaluateAccountBudget_RecordsPoolCrossings(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	acct := uuid.New()
+	start, end := period()
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: false} // $5
+	store.accountAllSpend = 4_000_000                                                           // 80%
+
+	fired, err := svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Equal(t, []int{80}, fired)
+
+	store.accountAllSpend = 5_000_000 // 100%
+	fired, err = svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Equal(t, []int{100}, fired, "80 was already recorded; only the cliff is new")
+
+	fired, err = svc.EvaluateAccountBudget(context.Background(), acct, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Empty(t, fired)
+
+	// The recorded crossings are readable on the system row.
+	sys, found, err := store.GetBudget(context.Background(), budget.ScopeAccount, acct, budget.CategoryExposure, "")
+	require.NoError(t, err)
+	require.True(t, found)
+	alerts, err := store.ListBudgetAlerts(context.Background(), sys.ID, start)
+	require.NoError(t, err)
+	require.Len(t, alerts, 2)
+
+	// A credits account records nothing for the pool.
+	other := uuid.New()
+	store.signals[other] = budget.ExposureSignals{BillingMode: "credits"}
+	fired, err = svc.EvaluateAccountBudget(context.Background(), other, uuid.Nil, start, end)
+	require.NoError(t, err)
+	require.Empty(t, fired)
+}
+
+// TestGetBudgetStatus_KillSwitchAllowsEveryVerdict: the incident switch
+// (085) is read per verdict — flipping it through the admin RPC allows the
+// next read with decided_by "paused" while the figures still show what would
+// have refused; flipping it back restores the refusal, no deploy involved.
+func TestGetBudgetStatus_KillSwitchAllowsEveryVerdict(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	ctx := context.Background()
+	app, acct := uuid.New(), uuid.New()
+	store.appPayers[app] = acct
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard"} // $5 pool
+	store.accountAllSpend = 5_000_000                                     // pool full
+	seedAIBudget(store, budget.ScopeApp, app, "", 1_000_000, true, false)
+	store.spendBy["ai/"] = 1_000_000 // cap full too
+	read := func() *budget.GetBudgetStatusResponse {
+		st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI})
+		require.NoError(t, err)
+		return st
+	}
+
+	st := read()
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+
+	// A pause without a reason and an actor is refused: the row must answer
+	// "why was enforcement off, and who did it".
+	_, err := svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+	resp, err := svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true, Reason: "incident: gate misfiring", ActorID: "ops:owner"})
+	require.NoError(t, err)
+	require.True(t, resp.Paused)
+	require.Equal(t, "incident: gate misfiring", resp.PausedReason)
+	require.Equal(t, "ops:owner", resp.PausedBy)
+	require.False(t, resp.PausedAt.IsZero())
+	require.EqualValues(t, 5_000_000, resp.NoCardMicros)
+
+	st = read()
+	require.False(t, st.Exhausted, "paused: every verdict is allowed")
+	require.Equal(t, budget.DecidedByPaused, st.DecidedBy)
+	require.True(t, st.Pool.Exhausted, "the pool's own figure still says what would have refused")
+	require.EqualValues(t, 1_000_000, st.SpendMicros)
+
+	got, err := svc.GetAIEnforcement(ctx)
+	require.NoError(t, err)
+	require.True(t, got.Paused)
+
+	resp, err = svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: false})
+	require.NoError(t, err)
+	require.False(t, resp.Paused)
+	require.Empty(t, resp.PausedReason, "resume clears the provenance")
+	require.True(t, resp.PausedAt.IsZero())
+	st = read()
+	require.True(t, st.Exhausted, "unpaused: the refusal is back")
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+
+	// A verdict that was not exhausted is untouched by the switch.
+	store.spendBy["ai/"] = 0
+	store.accountAllSpend = 0
+	_, err = svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true, Reason: "drill", ActorID: "ops:owner"})
+	require.NoError(t, err)
+	st = read()
+	require.False(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy, "paused labels only a verdict it changed")
+}
+
+// TestExposureLimitMicros_Demerit pins the owner's FINAL delinquency rule
+// (2026-09-14): the curve divided by (1 + S), S the account's demerit score,
+// never below the no-card floor; one failure (S 2) is ÷3, three cycles
+// unpaid (S 6) ÷7, the cap (S 12) ÷13, and S 0 is the curve itself. The
+// transitions that move S are DB statements, pinned in
+// store_integration_test; the tiers are display bands over S.
+func TestExposureLimitMicros_Demerit(t *testing.T) {
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 1_000_000_000, RangeMicros: 990_000_000, Shape: budget.ShapeSigmoid, A: 0.6, K0: 10, KMax: 24, DemeritPerUnpaidCycle: 2, DemeritRecovery: 1, DemeritMax: 12}
+	at := func(k int, s float64) int64 {
+		return budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: k, Demerit: s})
+	}
+	require.EqualValues(t, 503_884_326, at(10, 0), "S 0: Normal(10) = $503.88")
+	require.EqualValues(t, 251_942_163, at(10, 1), "S 1 → ÷2")
+	require.EqualValues(t, 167_961_442, at(10, 2), "one failure, S 2 → ÷3 = $167.96 (the owner's ÷3 is S 2, not a constant)")
+	require.EqualValues(t, 71_983_475, at(10, 6), "three cycles unpaid, S 6 → ÷7 = $71.98")
+	require.EqualValues(t, 38_760_333, at(10, 12), "the cap, S 12 → ÷13 = $38.76")
+	require.EqualValues(t, 333_333_333, at(24, 2), "$1,000 ÷ 3")
+	// Never below the no-card floor: $10 ÷ 3 = $3.33 → $5.
+	require.EqualValues(t, 5_000_000, at(0, 2))
+	// No card: the floor, whatever S.
+	require.EqualValues(t, 5_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: false, PaidInvoices: 24, Demerit: 6}))
+	// A negative score (impossible by CHECK) reads as Normal.
+	require.EqualValues(t, 503_884_326, at(10, -1))
+	// Monotone in S: more demerit is never more exposure.
+	prev := at(10, 0)
+	for s := 0.5; s <= 12; s += 0.5 {
+		got := at(10, s)
+		require.LessOrEqual(t, got, prev, "S=%v", s)
+		prev = got
+	}
+	// Tiers are bands over S, for display only.
+	require.Equal(t, "normal", budget.DemeritTier(0))
+	require.Equal(t, "watch", budget.DemeritTier(1))
+	require.Equal(t, "watch", budget.DemeritTier(2))
+	require.Equal(t, "restricted", budget.DemeritTier(2.5))
+	require.Equal(t, "restricted", budget.DemeritTier(6))
+	require.Equal(t, "severe", budget.DemeritTier(7))
+	require.Equal(t, "severe", budget.DemeritTier(12))
+}
+
+// TestGetBudgetStatus_DelinquentAccountOnTheWire: a delinquent PaaS account
+// reports the divided limit, its inputs (S, tier, arrears) so the console can
+// say why, and its ARREARS count against the pool as money — a balance larger
+// than the limit exhausts it on the spot.
+func TestGetBudgetStatus_DelinquentAccountOnTheWire(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	acct := uuid.New()
+	// 24 paid, one failure (S 2) → $1,000 ÷ 3 = $333.33; $300 unpaid counts.
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 24, DelinquentNow: true, Demerit: 2, ArrearsMicros: 300_000_000}
+	store.accountAllSpend = 0
+	st, err := svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.EqualValues(t, 333_333_333, st.Pool.LimitMicros)
+	require.EqualValues(t, 300_000_000, st.Pool.AccruedMicros, "arrears are accrued exposure")
+	require.EqualValues(t, 33_333_333, st.Pool.RemainingMicros)
+	require.True(t, st.Pool.DelinquentNow)
+	require.InDelta(t, 2, st.Pool.Demerit, 1e-9)
+	require.Equal(t, "watch", st.Pool.Tier)
+	require.EqualValues(t, 300_000_000, st.Pool.ArrearsMicros)
+	require.False(t, st.Pool.Exhausted)
+	// $34 of usage on top: the pool is full — the arrears and the usage together.
+	store.accountAllSpend = 34_000_000
+	st, err = svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
+	// Paid the debt (settle −1 → S 1, arrears 0): $500 of room again.
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 24, Demerit: 1}
+	st, err = svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.EqualValues(t, 500_000_000, st.Pool.LimitMicros)
+	require.False(t, st.Exhausted)
 }
