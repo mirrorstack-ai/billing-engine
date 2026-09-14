@@ -317,6 +317,12 @@ type RecordInfraUsageRequest struct {
 	// carry a version). Empty when the producer doesn't report one → stored
 	// as a NULL usage_events.module_version.
 	ModuleVersion string `json:"module_version,omitempty"`
+	// TemplateKey is the ai-assistant template an infra.ai.* turn ran under,
+	// taken by api-platform from the CONVERSATION (fixed at creation, never a
+	// per-turn client value); empty for console turns and non-AI metrics. It
+	// is what lets a per-template AI budget sum its own spend (migration 084).
+	// Same shape as the module's template keys: ^[a-z][a-z0-9_-]*$, ≤ 64.
+	TemplateKey string `json:"template_key,omitempty"`
 
 	// DevServed marks compute the platform spent forwarding to a module being
 	// served from a DEVELOPER'S TUNNEL rather than from its deployed function.
@@ -481,6 +487,7 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		OwnerOrgID:         req.OwnerOrgID,
 		Model:              req.Model,         // empty for non-AI metrics → NULL usage_events.model
 		ModuleVersion:      req.ModuleVersion, // empty → NULL usage_events.module_version
+		TemplateKey:        req.TemplateKey,   // empty → NULL usage_events.template_key
 		OccurrencePolicy:   OccurrencePolicyV1IngestTime,
 		// DevServed is now carried through rather than forced false.
 		//
@@ -536,6 +543,37 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 				slog.Error("credit infra projection evaluation failed (usage still recorded)",
 					"app_id", req.AppID, "account_id", accountID,
 					"metric", req.Metric, "error", creditErr)
+			}
+		}
+	}
+
+	// AI caps (migration 084, T101): an infra.ai.* event can move the app's
+	// AI-wide row, its template's row (req.TemplateKey) and — once attributed
+	// to an account — the account's / owning org's AI row. Best-effort like
+	// the credit hook above: alerts are recorded, the ingest never fails.
+	// The window is the payer's anchored period (calendar month while lazy),
+	// the same one GetBudgetStatus reads.
+	if recorded && s.budget != nil && strings.HasPrefix(req.Metric, "infra.ai.") {
+		anchorDay := billingperiod.DefaultAnchorDay
+		if accountID != uuid.Nil {
+			if day, anchorErr := s.store.AccountAnchorDay(ctx, accountID); anchorErr != nil {
+				slog.Error("anchor day lookup failed (AI budget hook uses the calendar month)",
+					"app_id", req.AppID, "account_id", accountID, "error", anchorErr)
+			} else {
+				anchorDay = day
+			}
+		}
+		start, end := billingperiod.AnchoredPeriodWindow(recordedAt.UTC(), anchorDay)
+		if req.AppID != uuid.Nil {
+			if _, err := s.budget.EvaluateAppBudget(ctx, req.AppID, req.TemplateKey, start, end); err != nil {
+				slog.Error("AI budget evaluation failed (usage still recorded)",
+					"app_id", req.AppID, "template_key", req.TemplateKey, "metric", req.Metric, "error", err)
+			}
+		}
+		if accountID != uuid.Nil {
+			if _, err := s.budget.EvaluateAccountBudget(ctx, accountID, req.OwnerOrgID, start, end); err != nil {
+				slog.Error("account AI budget evaluation failed (usage still recorded)",
+					"account_id", accountID, "metric", req.Metric, "error", err)
 			}
 		}
 	}

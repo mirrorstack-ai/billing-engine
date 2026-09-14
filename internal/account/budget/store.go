@@ -19,20 +19,35 @@ import (
 // every method maps to a specific RPC / hook need — so tests satisfy it with
 // a small in-memory fake (see service_test.go).
 type Store interface {
-	// UpsertBudget writes one budget keyed (scope, scope_id); a re-set
-	// updates limit/alert_percents/active/account_id in place. Returns the
-	// persisted row.
+	// UpsertBudget writes one budget keyed (scope, scope_id, category); a
+	// re-set updates limit/alert_percents/active/hard_cap/account_id in
+	// place. Returns the persisted row.
 	UpsertBudget(ctx context.Context, b Budget) (Budget, error)
 
-	// GetBudget resolves the budget for a (scope, scope_id), or (zero, false)
-	// when none exists. found=false is a normal "no budget configured"
-	// outcome, not an error.
-	GetBudget(ctx context.Context, scope Scope, scopeID uuid.UUID) (Budget, bool, error)
+	// GetBudget resolves the budget for a (scope, scope_id, category,
+	// template_key), or (zero, false) when none exists. found=false is a
+	// normal "no budget configured" outcome, not an error.
+	GetBudget(ctx context.Context, scope Scope, scopeID uuid.UUID, category Category, templateKey string) (Budget, bool, error)
 
-	// AppPeriodSpendMicros sums the app's spend (Σ value × unit_price) in
-	// [periodStart, periodEnd), in micro-dollars (NULL price → 0). Decoded
+	// AppPeriodSpendMicros sums the app's spend in [periodStart, periodEnd)
+	// for a category, in micro-dollars: CategoryAll = Σ value × unit_price
+	// over every event (NULL price → 0); CategoryAI = the infra.ai.* events
+	// only, priced per model like the bill (metric_model_prices, catalog
+	// fallback), narrowed to one template when templateKey is set. Decoded
 	// through the same single rounding point the usage summary uses.
-	AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+	AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, category Category, templateKey string, periodStart, periodEnd time.Time) (int64, error)
+
+	// AccountPeriodAISpendMicros is the account-level AI spend (scenario 2:
+	// the console agent billed to a personal or org account).
+	AccountPeriodAISpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+
+	// OrgAccountID resolves an org to its own billing account; found=false
+	// for a lazy org with no account yet (its AI spend is 0).
+	OrgAccountID(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
+
+	// AccountAnchorDay is the account's own billing-period anchor day
+	// (activated_at), DefaultAnchorDay when unactivated.
+	AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (int, error)
 
 	// InsertBudgetAlerts records a batch of threshold crossings in ONE
 	// transaction (all-or-nothing): either every row is committed or none are,
@@ -79,10 +94,14 @@ func (s *pgxStore) UpsertBudget(ctx context.Context, b Budget) (Budget, error) {
 	row, err := s.q.UpsertBudget(ctx, db.UpsertBudgetParams{
 		Scope:         db.MsBillingBudgetScope(b.Scope),
 		ScopeID:       b.ScopeID.String(),
+		Category:      string(b.Category),
+		TemplateKey:   b.TemplateKey,
 		AccountID:     nullableAccountID(b.AccountID),
 		LimitMicros:   b.LimitMicros,
 		AlertPercents: intsToInt32(b.AlertPercents),
 		Active:        b.Active,
+		HardCap:       b.HardCap,
+		AllowOverage:  b.AllowOverage,
 	})
 	if err != nil {
 		return Budget{}, err
@@ -90,10 +109,12 @@ func (s *pgxStore) UpsertBudget(ctx context.Context, b Budget) (Budget, error) {
 	return budgetFromRow(row)
 }
 
-func (s *pgxStore) GetBudget(ctx context.Context, scope Scope, scopeID uuid.UUID) (Budget, bool, error) {
+func (s *pgxStore) GetBudget(ctx context.Context, scope Scope, scopeID uuid.UUID, category Category, templateKey string) (Budget, bool, error) {
 	row, err := s.q.GetBudget(ctx, db.GetBudgetParams{
-		Scope:   db.MsBillingBudgetScope(scope),
-		ScopeID: scopeID.String(),
+		Scope:       db.MsBillingBudgetScope(scope),
+		ScopeID:     scopeID.String(),
+		Category:    string(category),
+		TemplateKey: templateKey,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Budget{}, false, nil
@@ -108,18 +129,75 @@ func (s *pgxStore) GetBudget(ctx context.Context, scope Scope, scopeID uuid.UUID
 	return b, true, nil
 }
 
-func (s *pgxStore) AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
-	n, err := s.q.AppPeriodSpendMicros(ctx, db.AppPeriodSpendMicrosParams{
-		AppID:        appID.String(),
-		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
-		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
-	})
+func (s *pgxStore) AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, category Category, templateKey string, periodStart, periodEnd time.Time) (int64, error) {
+	var (
+		n   pgtype.Numeric
+		err error
+	)
+	switch category {
+	case CategoryAI:
+		n, err = s.q.AppPeriodAISpendMicros(ctx, db.AppPeriodAISpendMicrosParams{
+			AppID:        appID.String(),
+			BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+			BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+			TemplateKey:  templateKey,
+		})
+	default:
+		n, err = s.q.AppPeriodSpendMicros(ctx, db.AppPeriodSpendMicrosParams{
+			AppID:        appID.String(),
+			BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+			BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+		})
+	}
 	if err != nil {
 		return 0, err
 	}
 	// Decode through the SAME rounding point CurrentPeriodUsage uses — money
 	// never goes through float64.
 	return usage.MicrosFromNumeric(n)
+}
+
+func (s *pgxStore) AccountPeriodAISpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	n, err := s.q.AccountPeriodAISpendMicros(ctx, db.AccountPeriodAISpendMicrosParams{
+		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return usage.MicrosFromNumeric(n)
+}
+
+func (s *pgxStore) OrgAccountID(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	id, err := s.q.BudgetOrgAccountID(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	return parsed, true, nil
+}
+
+// AccountAnchorDay is the account's own activated_at anchor (migration 025);
+// unactivated → the calendar month.
+func (s *pgxStore) AccountAnchorDay(ctx context.Context, accountID uuid.UUID) (int, error) {
+	at, err := s.q.AccountActivatedAt(ctx, accountID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return billingperiod.DefaultAnchorDay, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !at.Valid {
+		return billingperiod.DefaultAnchorDay, nil
+	}
+	return billingperiod.AnchorDay(at.Time), nil
 }
 
 func (s *pgxStore) InsertBudgetAlerts(ctx context.Context, records []AlertRecord) ([]int, error) {
@@ -218,10 +296,14 @@ func budgetFromRow(row db.MsBillingBudget) (Budget, error) {
 		ID:            id,
 		Scope:         Scope(row.Scope),
 		ScopeID:       scopeID,
+		Category:      Category(row.Category),
+		TemplateKey:   row.TemplateKey,
 		AccountID:     accountID,
 		LimitMicros:   row.LimitMicros,
 		AlertPercents: int32sToInt(row.AlertPercents),
 		Active:        row.Active,
+		HardCap:       row.HardCap,
+		AllowOverage:  row.AllowOverage,
 	}, nil
 }
 

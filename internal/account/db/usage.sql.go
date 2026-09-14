@@ -1122,7 +1122,7 @@ INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
     billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
-    dev_served
+    dev_served, template_key
 ) VALUES (
     $1::text, $2::uuid, $3::uuid,
     $4::uuid, $5::text, $6::ms_billing.metric_kind,
@@ -1132,7 +1132,7 @@ INSERT INTO ms_billing.usage_events (
     $14::timestamptz, $15::timestamptz,
     $16::text,
     $17::bytea, $18::text,
-    $19::boolean
+    $19::boolean, $20::text
 )
 ON CONFLICT (event_id) DO NOTHING
 `
@@ -1157,6 +1157,7 @@ type InsertUsageEventParams struct {
 	PayloadFingerprint []byte              `json:"payload_fingerprint"`
 	OccurrencePolicy   string              `json:"occurrence_policy"`
 	DevServed          bool                `json:"dev_served"`
+	TemplateKey        pgtype.Text         `json:"template_key"`
 }
 
 // InsertUsageEvent writes one raw metered fact, idempotent on event_id.
@@ -1196,6 +1197,7 @@ func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventPara
 		arg.PayloadFingerprint,
 		arg.OccurrencePolicy,
 		arg.DevServed,
+		arg.TemplateKey,
 	)
 	if err != nil {
 		return 0, err
