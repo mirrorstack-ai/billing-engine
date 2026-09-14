@@ -366,7 +366,7 @@ type MsBillingApp struct {
 	UpdatedAt          time.Time          `json:"updated_at"`
 	// Module count frozen at RegisterApp time (immutable — SyncAppModules never writes this column). ChargeCreationProration prices the creation-period window off THIS value, never the live module_count.
 	CreatedModuleCount int32 `json:"created_module_count"`
-	// Set once (never unset) when ChargeCreationProration determines the account only activated at/after this app's anchored creation period had already closed — a would-be retroactive catch-up charge (D1d). The app is permanently excluded from the proration sweep from then on.
+	// Set once (never unset) when ChargeCreationProration determines this app's creation period will never be charged: the account only activated at/after the anchored creation period had already closed (a would-be retroactive catch-up, D1d), or the combined creation charge priced to nothing (a Free app with no co-created module overage, migration 076). The app is permanently excluded from the proration sweep from then on.
 	ProrationSkippedAt pgtype.Timestamptz `json:"proration_skipped_at"`
 	// First instant a creation-proration charge attempt for this app reached its Stripe section; NULL = never attempted. Recovery marker (036) — a retry with this set and an unarmed guard reconciles against Stripe (ms_charge_ref app-proration:<app_id>) before minting new Stripe objects.
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
@@ -374,6 +374,10 @@ type MsBillingApp struct {
 	Name       pgtype.Text `json:"name"`
 	OwnerOrgID pgtype.UUID `json:"owner_org_id"`
 	Plan       string      `json:"plan"`
+	// Live app-member count (migration 077), synced by api-platform on every member change. The boundary leg bills the period's HIGH-WATER MARK (app_member_counts) minus the plan's included count, × $2.00; a deleted app's count is frozen like its module_count.
+	MemberCount int32 `json:"member_count"`
+	// The plan the app was registered on (migration 077), immutable. The creation charge prices its window from this plan through app_plan_changes; apps.plan is the plan in force NOW.
+	CreatedPlan string `json:"created_plan"`
 }
 
 type MsBillingAppBaseSnapshot struct {
@@ -439,6 +443,14 @@ type MsBillingAppCustomDomain struct {
 	ChargeForfeitedBy pgtype.UUID `json:"charge_forfeited_by"`
 }
 
+// Member-count history (migration 077): one row per change, written by RegisterApp and SyncAppModules. The boundary bills the period's high-water mark from it.
+type MsBillingAppMemberCount struct {
+	ID         string    `json:"id"`
+	AppID      string    `json:"app_id"`
+	Count      int32     `json:"count"`
+	RecordedAt time.Time `json:"recorded_at"`
+}
+
 type MsBillingAppModuleOverageTimer struct {
 	ID                 string             `json:"id"`
 	AccountID          string             `json:"account_id"`
@@ -458,6 +470,30 @@ type MsBillingAppModuleOverageTimer struct {
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 	// The app_transfer_events.request_id of the transfer that resolved this grace overage WITHOUT charging it, because the account that owed it could not settle it soon (071). NULL for every other resolution.
 	GraceForfeitedBy pgtype.UUID `json:"grace_forfeited_by"`
+}
+
+// One row per plan change of one app (migration 076). An upgrade is charged its prorated difference at once (pending → settled); a downgrade waits for the period boundary (scheduled → applied | cancelled). The row is the idempotency key of every money step of the change.
+type MsBillingAppPlanChange struct {
+	ID                 string             `json:"id"`
+	AppID              string             `json:"app_id"`
+	AccountID          string             `json:"account_id"`
+	FromPlan           string             `json:"from_plan"`
+	ToPlan             string             `json:"to_plan"`
+	Kind               string             `json:"kind"`
+	RequestedAt        time.Time          `json:"requested_at"`
+	EffectiveAt        time.Time          `json:"effective_at"`
+	PeriodStart        time.Time          `json:"period_start"`
+	PeriodEnd          time.Time          `json:"period_end"`
+	FoldedIntoCreation bool               `json:"folded_into_creation"`
+	AmountMicros       int64              `json:"amount_micros"`
+	WalletMicros       int64              `json:"wallet_micros"`
+	CardMicros         int64              `json:"card_micros"`
+	WalletDecidedAt    pgtype.Timestamptz `json:"wallet_decided_at"`
+	CardRef            pgtype.Text        `json:"card_ref"`
+	CardWindowStart    pgtype.Timestamptz `json:"card_window_start"`
+	Status             string             `json:"status"`
+	SettledAt          pgtype.Timestamptz `json:"settled_at"`
+	CreatedAt          time.Time          `json:"created_at"`
 }
 
 // One row per accepted app billing-account transfer. request_id is the caller's idempotency key; a replay returns the stored result and a different app, target or mode for the same key is a conflict. Append-only.

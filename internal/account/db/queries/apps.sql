@@ -21,8 +21,14 @@
 -- (an UNBILLED roster row, migration 041); owner_org_id ($6) is stamped on
 -- every org-owned registration — funded or not — so the RepointOrgUsage sweep
 -- can scope the org's NULL-account events through the roster.
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id)
-VALUES ($1, $2, $3, $3, $4, $5, $6)
+-- member_count ($7, migration 077) is the live app-member count at creation
+-- and plan ($8, migration 075) the plan the app is created ON — a creation
+-- that chooses Free lands on it directly instead of registering on the default
+-- and changing plan inside its grace. Both are validated by RegisterApp.
+-- created_plan is stamped from the SAME $8 value as plan and never written
+-- again (migration 077): the creation charge prices from it.
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id, member_count, plan, created_plan)
+VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $8)
 ON CONFLICT (app_id) DO NOTHING;
 
 -- SelectAppMirror reads one roster row (deleted or not — the caller decides
@@ -30,7 +36,8 @@ ON CONFLICT (app_id) DO NOTHING;
 -- GetAppBill still displays the spent creation-period base).
 -- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count, created_plan
 FROM ms_billing.apps
 WHERE app_id = $1;
 
@@ -44,7 +51,8 @@ WHERE app_id = $1;
 -- read, never for the duration of a Stripe HTTP call.
 -- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count, created_plan
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE;
@@ -98,6 +106,23 @@ SET proration_skipped_at = now()
 WHERE app_id = $1
   AND proration_skipped_at IS NULL
   AND proration_invoice_id IS NULL;
+
+-- SetAppProrationSkippedOnPlan arms the permanent skip marker for a window
+-- priced at $0 — ONLY while the row still carries the plan the derivation
+-- priced and none of the three creation markers (billing-engine#208 round 4).
+-- The derivation runs on an unlocked read; a plan-change fold committing
+-- between that read and this write (under the app lock, flipping apps.plan)
+-- would otherwise be made terminal at $0 and its days priced by nobody. The
+-- row-level UPDATE re-evaluates the predicate under the row lock, so 0 rows
+-- means "the row moved: re-derive next sweep". :execrows for that reason.
+-- name: SetAppProrationSkippedOnPlan :execrows
+UPDATE ms_billing.apps
+SET proration_skipped_at = now()
+WHERE app_id = $1
+  AND plan = $2
+  AND proration_skipped_at IS NULL
+  AND proration_invoice_id IS NULL
+  AND proration_attempted_at IS NULL;
 
 -- MarkAppProrationAttempted stamps the recovery marker (036) BEFORE a
 -- creation-proration charge attempt's first Stripe call. First-write-wins
@@ -168,13 +193,38 @@ WHERE app_id = $1
 -- timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
 -- UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
 -- by an hour around DST and double-bill or gap a whole period.
+-- member_count is deliberately NOT returned: the members fee (migration 077)
+-- is the CLOSED period's, priced in arrears from MemberHighWaterForAccount —
+-- nothing on this roster is an advance-members component.
+-- The plan column returned is the plan whose base the NEW period [boundary,
+-- next boundary) is owed at, not the row's live plan. From the ledger
+-- (migration 076 — every change flips apps.plan in the transaction that
+-- writes its row, so the chain is exact): the earliest effective change that
+-- does NOT price the new period carries, as its from_plan, the plan this
+-- roster bills. That is every change effective strictly after the boundary
+-- — and an UPGRADE effective exactly AT it, because upgradeNow's delta for
+-- an instant on the boundary covers the whole new period (its anchored
+-- period is half-open at the start). A downgrade applied at the boundary is
+-- the opposite case: it has taken effect for the new period, so it is not
+-- excluded and a.plan (the plan it moved to) is billed. An upgrade requested
+-- in the gap between the boundary and the cron that closes it has already
+-- charged (new − old) for the new period on its own row; pricing this base
+-- at the live plan would bill the new base a second time — and a reclaim of
+-- a failed run days later must derive the SAME figure the first attempt did,
+-- whatever the plan has become since.
 -- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count, plan
-FROM ms_billing.apps
-WHERE account_id = @account_id::uuid
-  AND deleted_at IS NULL
-  AND created_at < @created_before::timestamptz
-  AND created_at + make_interval(hours => @grace_hours::int) < @created_before::timestamptz;
+SELECT a.app_id, a.module_count,
+       COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
+                 WHERE c.app_id = a.app_id
+                   AND c.status IN ('pending', 'settled', 'applied')
+                   AND (c.effective_at > @created_before::timestamptz
+                        OR (c.effective_at = @created_before::timestamptz AND c.kind = 'upgrade'))
+                 ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan
+FROM ms_billing.apps a
+WHERE a.account_id = @account_id::uuid
+  AND a.deleted_at IS NULL
+  AND a.created_at < @created_before::timestamptz
+  AND a.created_at + make_interval(hours => @grace_hours::int) < @created_before::timestamptz;
 
 -- UpsertProrationBaseSnapshot records what RegisterApp's creation-proration
 -- leg billed one app for its creation period (migration 028). Keyed by the
@@ -373,3 +423,94 @@ UPDATE ms_billing.apps
 SET plan = $2
 WHERE app_id = $1
   AND deleted_at IS NULL;
+
+-- SetAppMemberCount snapshots a new app-member count (SyncAppModules,
+-- migration 077). WHERE deleted_at IS NULL freezes the count once deleted —
+-- the same posture as SetAppModuleCount: a deleted app accrues no future
+-- member fee, so there is no future count to move. :execrows; the service
+-- resolves 0 rows through the SelectAppMirror existence check it already made.
+-- name: SetAppMemberCount :execrows
+UPDATE ms_billing.apps
+SET member_count = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL;
+
+-- CountUserPlanCommitments counts one PERSONAL account's live apps that are
+-- ON a plan or have a SCHEDULED downgrade TO it (owner_org_id IS NULL — a
+-- user-owned roster row), excluding @except_app_id so a change of the app
+-- being asked about never counts itself. The Free cap (usage.PlanTerms.MaxApps:
+-- 3 per personal account) is enforced against it, under the owner's advisory
+-- lock (LockPlanCapOwner) so two concurrent commitments cannot both pass.
+-- name: CountUserPlanCommitments :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps a
+WHERE a.account_id = @account_id::uuid
+  AND a.owner_org_id IS NULL
+  AND a.deleted_at IS NULL
+  AND a.app_id <> @except_app_id::uuid
+  AND (a.plan = @plan::text
+       OR EXISTS (SELECT 1 FROM ms_billing.app_plan_changes c
+                  WHERE c.app_id = a.app_id AND c.status = 'scheduled' AND c.to_plan = @plan::text));
+
+-- CountOrgPlanCommitments is the org twin: one ORGANIZATION's, keyed by
+-- owner_org_id rather than the funding account (a sponsored org's apps sit on
+-- the sponsor's account, and the cap is per org, not per payer —
+-- usage.PlanTerms.MaxAppsPerOrg: 1 Free app per org).
+-- name: CountOrgPlanCommitments :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps a
+WHERE a.owner_org_id = @owner_org_id::uuid
+  AND a.deleted_at IS NULL
+  AND a.app_id <> @except_app_id::uuid
+  AND (a.plan = @plan::text
+       OR EXISTS (SELECT 1 FROM ms_billing.app_plan_changes c
+                  WHERE c.app_id = a.app_id AND c.status = 'scheduled' AND c.to_plan = @plan::text));
+
+-- LockPlanCapOwner serializes every Free-cap decision for one owner (a
+-- personal account or an org) for the rest of the transaction: the count
+-- above and the write that commits to the plan happen under it, so two
+-- concurrent RegisterApp / SetAppPlan / TransferApp calls cannot both read
+-- "2 of 3" and both commit. A transaction-scoped advisory lock keyed on the
+-- owner id, released at commit/rollback.
+-- name: LockPlanCapOwner :exec
+SELECT pg_advisory_xact_lock(hashtext('plan-cap:' || @owner_id::text));
+
+-- InsertAppMemberCount appends one member-count history row (migration 077).
+-- name: InsertAppMemberCount :exec
+INSERT INTO ms_billing.app_member_counts (app_id, count, recorded_at)
+VALUES (@app_id::uuid, @count::int, @recorded_at::timestamptz);
+
+-- MemberHighWaterForAccount is the boundary's members input (migration 077,
+-- owner 2026-09-13): per app that HELD members during the closed period
+-- [period_start, period_end) — live, or deleted inside it, created before it
+-- ended, in or out of its creation grace — the period's high-water mark:
+-- max(count in force when the period opened, max count recorded inside it).
+-- The plan returned is the plan IN FORCE WHEN THE PERIOD OPENED: the earliest
+-- ledger change effective strictly after period_start carries it as its
+-- from_plan (a change effective exactly at period_start — a downgrade the
+-- previous boundary applied, or an upgrade whose delta covered this whole
+-- period — is in force); otherwise the row's plan. Within a period plans only
+-- rise (a downgrade lands at a boundary), so pricing the included count at
+-- the opening plan means a last-day upgrade cannot buy the period's member
+-- allowance for one day's delta — and a reclaim after the boundary apply
+-- flipped the row still prices the closed period the same.
+-- name: MemberHighWaterForAccount :many
+SELECT a.app_id,
+       COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
+                 WHERE c.app_id = a.app_id
+                   AND c.status IN ('pending', 'settled', 'applied')
+                   AND c.effective_at > @period_start::timestamptz
+                 ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan,
+       GREATEST(
+           COALESCE((SELECT c.count FROM ms_billing.app_member_counts c
+                     WHERE c.app_id = a.app_id AND c.recorded_at < @period_start::timestamptz
+                     ORDER BY c.recorded_at DESC, c.id DESC LIMIT 1), 0),
+           COALESCE((SELECT MAX(c.count) FROM ms_billing.app_member_counts c
+                     WHERE c.app_id = a.app_id
+                       AND c.recorded_at >= @period_start::timestamptz
+                       AND c.recorded_at < @period_end::timestamptz), 0)
+       )::int AS member_hwm
+FROM ms_billing.apps a
+WHERE a.account_id = @account_id::uuid
+  AND a.created_at < @period_end::timestamptz
+  AND (a.deleted_at IS NULL OR a.deleted_at >= @period_start::timestamptz);

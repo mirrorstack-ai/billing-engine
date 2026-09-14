@@ -35,6 +35,32 @@ type fakeStore struct {
 	orgDistributors       map[uuid.UUID]uuid.UUID
 	orgDistributorSources map[uuid.UUID]string
 	proposedProrations    []string
+	// planChanges is the migration-076 ledger; planChangeDraws the wallet
+	// micros drawn per change (the fake's credit_ledger subscription_draw rows).
+	planChanges        map[uuid.UUID]cycle.PlanChange
+	planChangeDraws    map[uuid.UUID]int64
+	errOpenPlanChange  error
+	errPlanChangeDraw  error
+	errSettlePlanCard  error
+	errApplyPlanChange error
+	// memberHistory is the migration-077 app_member_counts table.
+	memberHistory map[uuid.UUID][]fakeMemberCount
+	// walletNegativeAdjust models settled negative adjustments that lower the
+	// posted balance below Σ lot remainders (the balance cap a plan-change
+	// draw honours).
+	walletNegativeAdjust int64
+	// beforePlanChangeOpen runs once, inside OpenPlanChange before the locked
+	// read — a test's window for a state change the caller's unlocked read
+	// could not see. beforeCombinedFreeze does the same inside
+	// FreezeCombinedProrationAttempt.
+	beforePlanChangeOpen func(f *fakeStore, appID uuid.UUID)
+	beforeCombinedFreeze func(f *fakeStore, appID uuid.UUID)
+	// beforeCancelScheduled runs once inside CancelScheduledPlanChangeByID,
+	// before the UPDATE — the boundary apply racing a cancel.
+	beforeCancelScheduled func(f *fakeStore, appID uuid.UUID)
+	// beforeSkipOnPlan runs once inside SkipCreationProrationOnPlan, before
+	// the plan-guarded write — a fold racing the $0-base terminal.
+	beforeSkipOnPlan func(f *fakeStore, appID uuid.UUID)
 	// rollup inputs
 	raws        []cycle.RawAggregate
 	prices      map[string]int64 // module/metric → price; absent = unpriced (0)
@@ -376,6 +402,9 @@ func newFakeStore() *fakeStore {
 		creationDrawn:             map[uuid.UUID]int64{},
 		moduleOverageDrawn:        map[uuid.UUID]int64{},
 		apps:                      map[uuid.UUID]cycle.AppMirror{},
+		planChanges:               map[uuid.UUID]cycle.PlanChange{},
+		planChangeDraws:           map[uuid.UUID]int64{},
+		memberHistory:             map[uuid.UUID][]fakeMemberCount{},
 		combinedProrationAttempts: map[uuid.UUID]cycle.CombinedProrationAttempt{},
 		accountsByUser:            map[uuid.UUID]uuid.UUID{},
 		activation:                map[uuid.UUID]time.Time{},
@@ -975,19 +1004,27 @@ func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (t
 	return at, ok, nil
 }
 
-func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount int, createdAt time.Time, name string) error {
+func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount, memberCount int, createdAt time.Time, name string, plan usage.Plan) error {
 	if f.errAppInsert != nil {
 		return f.errAppInsert
 	}
 	if _, exists := f.apps[appID]; exists {
 		return nil // ON CONFLICT (app_id) DO NOTHING — the FIRST registration wins
 	}
+	if plan == "" {
+		plan = usage.DefaultPlan // migration 075's column default
+	}
 	f.apps[appID] = cycle.AppMirror{
 		AppID: appID, AccountID: accountID, ModuleCount: moduleCount,
 		CreatedModuleCount: moduleCount, // frozen at insert, mirroring InsertAppMirror's $3/$3 write
 		CreatedAt:          createdAt,
 		Name:               name, // frozen on first registration (migration 037)
+		Plan:               plan,
+		CreatedPlan:        plan, // frozen at insert (migration 077)
+		OwnerOrgID:         ownerOrgID,
+		MemberCount:        memberCount, // migration 077
 	}
+	f.memberHistory[appID] = append(f.memberHistory[appID], fakeMemberCount{count: memberCount, at: createdAt.UTC()})
 	if ownerOrgID != uuid.Nil {
 		f.appOwnerOrg[appID] = ownerOrgID // owner_org_id stamp (migration 041); Nil = user-owned (NULL)
 	}
@@ -1330,6 +1367,28 @@ func (f *fakeStore) SetAppProrationInvoice(_ context.Context, appID uuid.UUID, s
 	return nil
 }
 
+// SkipCreationProrationOnPlan mirrors SetAppProrationSkippedOnPlan: armed
+// only while the row carries `plan` and none of the three markers. The
+// beforeSkipOnPlan hook runs once before the check — a fold committing
+// between the caller's derivation and this write.
+func (f *fakeStore) SkipCreationProrationOnPlan(_ context.Context, appID uuid.UUID, plan usage.Plan) (bool, error) {
+	if f.errSetSkipped != nil {
+		return false, f.errSetSkipped
+	}
+	if f.beforeSkipOnPlan != nil {
+		hook := f.beforeSkipOnPlan
+		f.beforeSkipOnPlan = nil
+		hook(f, appID)
+	}
+	app, ok := f.apps[appID]
+	if !ok || fakeEffectivePlan(app) != plan || app.ProrationSkipped || app.ProrationInvoiceID != "" || app.ProrationAttempted {
+		return false, nil
+	}
+	app.ProrationSkipped = true
+	f.apps[appID] = app
+	return true, nil
+}
+
 func (f *fakeStore) SetAppProrationSkipped(_ context.Context, appID uuid.UUID) error {
 	if f.errSetSkipped != nil {
 		return f.errSetSkipped
@@ -1516,6 +1575,9 @@ func (f *fakeStore) DrawCreationProrationFromWallet(_ context.Context, appID uui
 	if app.ProrationAttempted {
 		return cycle.ProrationWalletDeferToStripe, "", nil
 	}
+	if pc.PricedPlan != "" && fakeEffectivePlan(app) != pc.PricedPlan {
+		return cycle.ProrationWalletLockedStale, "", nil // the plan moved under the lock (migration 076)
+	}
 	if app.AccountID == uuid.Nil || (pc.AccountID != uuid.Nil && app.AccountID != pc.AccountID) {
 		return cycle.ProrationWalletLockedStale, "", nil
 	}
@@ -1609,7 +1671,15 @@ func (f *fakeStore) LiveAppsCreatedBefore(_ context.Context, accountID uuid.UUID
 		// and its creation charge covers through the grace-elapsed period).
 		if app.AccountID == accountID && !app.Deleted && app.CreatedAt.Before(createdBefore) &&
 			app.CreatedAt.AddDate(0, 0, graceDays).Before(createdBefore) {
-			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: app.Plan})
+			// The plan the NEW period's base is owed at, from the ledger (a
+			// change effective strictly after the boundary — or an upgrade
+			// exactly at it — carries it as its from_plan), mirroring
+			// LiveAppModuleCountsCreatedBefore.
+			plan := f.planAtInstant(app, createdBefore, true)
+			if app.Plan == "" && plan == usage.DefaultPlan {
+				plan = app.Plan // an unset fake plan stays unset, as before
+			}
+			apps = append(apps, cycle.AppModuleCount{AppID: app.AppID, ModuleCount: app.ModuleCount, Plan: plan})
 		}
 	}
 	return apps, nil
@@ -1901,6 +1971,11 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 	if f.errFreezeCombined != nil {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, f.errFreezeCombined
 	}
+	if f.beforeCombinedFreeze != nil {
+		hook := f.beforeCombinedFreeze
+		f.beforeCombinedFreeze = nil
+		hook(f, appID)
+	}
 	if attempt, ok := f.combinedProrationAttempts[appID]; ok {
 		if attempt.ChargeFundingAccountID == uuid.Nil {
 			attempt.ChargeFundingAccountID, _ = f.ChargeFundingAccount(ctx, attempt.Shape.AccountID)
@@ -1919,6 +1994,9 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 	if app.ProrationInvoiceID != "" || app.ProrationSkipped ||
 		(app.Deleted && app.DeletedAt.Before(app.CreatedAt.AddDate(0, 0, usage.GraceDays))) {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, nil
+	}
+	if shape.PricedPlan != "" && fakeEffectivePlan(app) != shape.PricedPlan {
+		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, nil // the plan moved under the lock (migration 076)
 	}
 	if creditRailEnabled && f.walletMode == cycle.CreditBillingModeCredits {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailWalletRequired, nil

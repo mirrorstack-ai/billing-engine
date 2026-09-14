@@ -32,7 +32,7 @@ func TestCustomDomains_Integration_SweepWorkListAndBoundaryCount(t *testing.T) {
 	require.NoError(t, err)
 
 	app := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, app, acct, uuid.Nil, 0, mustTime(t, "2026-06-01T00:00:00Z"), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, app, acct, uuid.Nil, 0, 0, mustTime(t, "2026-06-01T00:00:00Z"), "", ""))
 
 	activated := mustTime(t, "2026-06-10T00:00:00Z")
 	require.NoError(t, store.InsertDomain(ctx, acct, app, "one.example.test", activated))
@@ -128,7 +128,7 @@ func TestCustomDomains_Integration_UnactivatedGateAndResolvedForgiveness(t *test
 	// Deliberately NOT activated (activated_at stays NULL).
 	acct := seedAccount(t, pool)
 	app := uuid.New()
-	require.NoError(t, store.InsertAppMirror(ctx, app, acct, uuid.Nil, 0, mustTime(t, "2026-06-01T00:00:00Z"), ""))
+	require.NoError(t, store.InsertAppMirror(ctx, app, acct, uuid.Nil, 0, 0, mustTime(t, "2026-06-01T00:00:00Z"), "", ""))
 	require.NoError(t, store.InsertDomain(ctx, acct, app, "gated.example.test", mustTime(t, "2026-06-10T00:00:00Z")))
 
 	// Unactivated account → excluded from the sweep (the spine's D1d gate), even

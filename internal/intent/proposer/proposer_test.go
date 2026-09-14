@@ -25,6 +25,15 @@ type recordingStore struct {
 // returns an OWNER id that differs from the account id it was given, which is
 // the whole point: a test whose owner equalled its account id could not tell
 // a resolved subject from an unresolved one.
+func (s *recordingStore) IntentState(_ context.Context, digest string) (string, bool, error) {
+	for _, in := range s.saved {
+		if in.Digest() == digest {
+			return "proposed", true, nil
+		}
+	}
+	return "", false, nil
+}
+
 func (s *recordingStore) PayerForAccount(_ context.Context, accountID string) (intent.Subject, error) {
 	if s.payerErr != nil {
 		return intent.Subject{}, s.payerErr

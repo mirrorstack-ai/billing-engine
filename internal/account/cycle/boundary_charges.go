@@ -35,6 +35,12 @@ type boundaryComponents struct {
 	AdvanceBaseMicros    int64
 	AdvanceOverageMicros int64
 	AdvanceDomainsMicros int64
+	// MembersMicros is the extra app members' fee for the CLOSED period, in
+	// arrears (migration 077): the period's high-water count against the
+	// plan in force when it opened. The fourth line of the platform_base
+	// kind (a per-unit platform fee like domains), and the one that looks
+	// back — it is not part of the next period's coverage.
+	MembersMicros int64
 	// WalletDrawnMicros is the stored-value credit already allocated to this
 	// boundary. The collector subtracted it from the total it sent; the split
 	// has to place it on the right intents instead.
@@ -48,7 +54,7 @@ type boundaryComponents struct {
 }
 
 func (b boundaryComponents) advanceMicros() int64 {
-	return b.AdvanceBaseMicros + b.AdvanceOverageMicros + b.AdvanceDomainsMicros
+	return b.AdvanceBaseMicros + b.AdvanceOverageMicros + b.AdvanceDomainsMicros + b.MembersMicros
 }
 
 func (b boundaryComponents) grossMicros() int64 {
@@ -233,6 +239,18 @@ func advanceLines(b boundaryComponents) []proposer.ChargeLine {
 			Description:  "Custom domains — next period",
 			SourceRef:    "advance:domains",
 			AmountMicros: b.AdvanceDomainsMicros,
+		})
+	}
+	if b.MembersMicros > 0 {
+		// The one line here that looks BACK: the closed period's member fee,
+		// on its high-water count (migration 077). It rides the platform
+		// kind with the subscription, not the usage kind with the arrears —
+		// it is a per-unit platform fee like domains, not metered usage —
+		// and says which period it is for.
+		lines = append(lines, proposer.ChargeLine{
+			Description:  "App members above the plan's included count — closed period (high-water mark)",
+			SourceRef:    "members:closed",
+			AmountMicros: b.MembersMicros,
 		})
 	}
 	return lines

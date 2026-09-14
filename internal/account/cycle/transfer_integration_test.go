@@ -730,22 +730,22 @@ func TestTransferForfeitFencesTheWalletProrationDraw(t *testing.T) {
 	require.Equal(t, ref, *invoice)
 }
 
-// 🔴 A SEALED PROPOSAL IS NOT PENDING. On the intent rail a creation
-// proration is proposed, not collected: FreezeCombinedProrationAttempt writes
-// the header and stamps apps.proration_attempted_at, and
+// TestTransferAppTreatsASealedProposalAsResolved: FreezeCombinedProrationAttempt
+// writes the header and stamps apps.proration_attempted_at, and
 // MarkCombinedProrationProposed resolves the header with the intent's
-// reference — while apps.proration_invoice_id stays NULL, because the
-// intent rail owns the charge from there. Read on the app columns alone that
-// is "pending AND in flight", so a transfer would refuse — and the sweep can
-// never clear it: ChargeCreationProration on that app reports the attempt as
-// disagreeing with its unarmed guard on every run and the guard is never
-// armed. The owner's transfer would be refused forever. The NOT EXISTS
-// resolved-attempt clauses in AppUnresolvedOneTimeCharges are what make a
-// sealed proposal count as resolved; the control is the same header left
-// unresolved, which IS in flight and must refuse.
+// reference AND arms apps.proration_invoice_id with it in the same
+// transaction (billing-engine#208 round 3; before that the guard stayed NULL,
+// the sweep re-selected the app every cycle and refused it as disagreeing
+// with its unarmed guard, and a transfer read "pending AND in flight" on the
+// app columns alone). So a sealed proposal is not pending on either reading:
+// the guard says settled, and the NOT EXISTS resolved-attempt clauses in
+// AppUnresolvedOneTimeCharges say the same for rows resolved before the
+// stamp existed (migration 081 backfills those). The control is the same
+// header left unresolved, which IS in flight and must refuse.
 //
-// Mutation: drop the resolved-attempt clauses and the sealed case refuses
-// with app_transfer_charges_pending.
+// Mutation: drop the resolved-attempt clauses and the sealed case still
+// proceeds (the guard is armed); they are the belt for pre-081 rows and are
+// pinned by the migration-081 backfill test, not here.
 func TestTransferAppTreatsASealedProposalAsResolved(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -773,7 +773,12 @@ func TestTransferAppTreatsASealedProposalAsResolved(t *testing.T) {
 				`SELECT proration_attempted_at::text, proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`,
 				f.appID.String()).Scan(&attemptedAt, &invoice))
 			require.NotNil(t, attemptedAt, "fixture error: the legacy attempt marker is not set")
-			require.Nil(t, invoice, "fixture error: the guard must be unarmed — the intent rail owns the charge")
+			if tc.sealed {
+				require.NotNil(t, invoice, "the proposed stamp arms the guard with the header's reference")
+				require.Contains(t, *invoice, "intent:")
+			} else {
+				require.Nil(t, invoice, "fixture error: an unresolved attempt must leave the guard unarmed")
+			}
 
 			req := cycle.TransferAppRequest{
 				AppID:       f.appID,
@@ -796,12 +801,18 @@ func TestTransferAppTreatsASealedProposalAsResolved(t *testing.T) {
 			require.True(t, found)
 			require.False(t, row.forfeitedProration, "a sealed proposal was forfeited; the intent rail owns it")
 			require.Nil(t, row.forfeitReason)
+			// The transfer forfeits only a NEVER-ARMED proration
+			// (ForfeitAppProrationOnTransfer's predicate); the sealed
+			// proposal's stamp survives it unchanged, so the intent rail
+			// still finds its guard armed on the new owner's app.
 			var skippedAt *time.Time
+			var invoiceAfter *string
 			require.NoError(t, f.pool.QueryRow(ctx,
 				`SELECT proration_skipped_at, proration_invoice_id FROM ms_billing.apps WHERE app_id = $1`,
-				f.appID.String()).Scan(&skippedAt, &invoice))
-			require.Nil(t, skippedAt)
-			require.Nil(t, invoice)
+				f.appID.String()).Scan(&skippedAt, &invoiceAfter))
+			require.Nil(t, skippedAt, "a sealed proposal is not forfeited")
+			require.NotNil(t, invoiceAfter, "the armed guard was cleared by the transfer")
+			require.Equal(t, *invoice, *invoiceAfter, "the transfer must not re-point the guard")
 		})
 	}
 }

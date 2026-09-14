@@ -51,6 +51,11 @@ import (
 // trace of.
 type Store interface {
 	PayerForAccount(ctx context.Context, accountID string) (intent.Subject, error)
+	// IntentState reads a stored intent's lifecycle state; found=false when
+	// nothing was stored under the digest. A leg that lost its own record of
+	// a seal (a crash between Propose and its row write) asks this before it
+	// seals again, so one charge never becomes two documents.
+	IntentState(ctx context.Context, digest string) (state string, found bool, err error)
 	SaveIntentWithEvidence(
 		ctx context.Context,
 		sealed intent.ChargeIntent,
@@ -228,6 +233,23 @@ func (p *Proposer) Propose(ctx context.Context, c Charge) (intent.ChargeIntent, 
 		return intent.ChargeIntent{}, fmt.Errorf("proposer: store sealed intent: %w", err)
 	}
 	return sealed, nil
+}
+
+// Digest seals a charge WITHOUT storing it and returns the digest the stored
+// document carries — the identity a leg needs to ask what became of a
+// proposal whose own record it lost. Storing is idempotent on this digest, so
+// it is exactly what a repeat Propose of the same charge would return.
+func (p *Proposer) Digest(ctx context.Context, c Charge) (string, error) {
+	sealed, err := p.seal(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	return sealed.Digest(), nil
+}
+
+// IntentState reads the lifecycle state of a stored intent (Store.IntentState).
+func (p *Proposer) IntentState(ctx context.Context, digest string) (string, bool, error) {
+	return p.store.IntentState(ctx, digest)
 }
 
 // seal validates a charge and turns it into a sealed intent, WITHOUT storing

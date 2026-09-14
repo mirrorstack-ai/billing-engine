@@ -131,12 +131,17 @@ func requireCentsMatchMicros(which string, cents, micros int64) error {
 // service that cannot bill this charge kind at all. Say so, loudly, at the
 // point of use: the alternative is a nil dereference inside a money path, and
 // the one after that is a charge that silently never happens.
+// The second return says whether anything was SEALED. An attempt with no
+// positive line — a Free app's $0 base with no co-created over-module timer —
+// has nothing to propose, and returning a zero intent for it used to let the
+// caller stamp "intent:" with an empty digest as the app's terminal
+// reference. The caller stamps a nothing-to-bill marker instead.
 func (s *Service) proposeCombinedProration(
 	ctx context.Context,
 	attempt CombinedProrationAttempt,
-) (intent.ChargeIntent, error) {
+) (intent.ChargeIntent, bool, error) {
 	if s.proposer == nil {
-		return intent.ChargeIntent{}, billing.Internal(
+		return intent.ChargeIntent{}, false, billing.Internal(
 			"combined creation-proration has no intent proposer installed, and its direct "+
 				"charge path no longer exists; this deployment cannot bill an app's creation period",
 			nil,
@@ -167,15 +172,15 @@ func (s *Service) proposeCombinedProration(
 		ExecuteNotAfter:  attempt.Shape.CoverageEnd.AddDate(0, 1, 0),
 	})
 	if err != nil {
-		return intent.ChargeIntent{}, billing.Internal("combined proration intent derivation failed", err)
+		return intent.ChargeIntent{}, false, billing.Internal("combined proration intent derivation failed", err)
 	}
 	if len(charge.Lines) == 0 {
-		return intent.ChargeIntent{}, nil
+		return intent.ChargeIntent{}, false, nil
 	}
 
 	sealed, err := s.proposer.Propose(ctx, charge)
 	if err != nil {
-		return intent.ChargeIntent{}, billing.Internal("combined proration intent proposal failed", err)
+		return intent.ChargeIntent{}, false, billing.Internal("combined proration intent proposal failed", err)
 	}
-	return sealed, nil
+	return sealed, true, nil
 }

@@ -306,6 +306,10 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// The counts are SUMMED FROM the same shares the per-app allocation was
 		// built from, so this total and Σ Apps[].ProjectedBaseFeeMicros are one
 		// row set added up two ways — they cannot drift into disagreement.
+		// The extra-member fee (migration 077) is billed in arrears on the
+		// period's high-water count and is NOT forecast here yet — the
+		// projection has no member history to read; billing-engine#202 PR-4
+		// adds it. Until then the boundary can exceed this figure by that fee.
 		counts := RecurringFeeCountsOf(recurringShares)
 		projectedBaseFeeTotal = activatedBaseMicros(recurringShares) +
 			ModuleBlockMicros(int64(counts.ModuleOverages)) +

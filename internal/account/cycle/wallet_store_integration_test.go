@@ -220,7 +220,7 @@ func TestDrawCreationProrationFromWallet_Integration_AttemptedDefersBeforeDraw(t
 	installStandardPaymentMethod(t, pool, accountID, "cus_wallet_attempted_"+accountID.String())
 	appID := uuid.New()
 	createdAt := mustTime(t, "2026-06-19T12:00:00Z")
-	require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, createdAt, "race app"))
+	require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, 0, createdAt, "race app", ""))
 	shape := combinedAttemptShape(appID, accountID)
 	shape.Snapshot.ModuleCount = 0
 	_, claim, err := store.FreezeCombinedProrationAttempt(
@@ -300,7 +300,7 @@ func TestMidPeriodWalletDraws_Integration_ModeFlipSerializesAndDefersBeforeLedge
 		require.NoError(t, err)
 		appID := uuid.New()
 		createdAt := mustTime(t, "2026-06-19T12:00:00Z")
-		require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, createdAt, "mode-race app"))
+		require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 0, 0, createdAt, "mode-race app", ""))
 		insertWalletEntry(t, pool, accountID, uuid.New(), 50_000_000, "grant", "settled", nil, createdAt)
 
 		periodStart := mustTime(t, "2026-06-04T00:00:00Z")
@@ -375,7 +375,7 @@ func TestMidPeriodWalletDraws_Integration_ModeFlipSerializesAndDefersBeforeLedge
 		require.NoError(t, err)
 		appID := uuid.New()
 		installedAt := mustTime(t, "2026-06-10T12:00:00Z")
-		require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 1, installedAt, "mode-race module"))
+		require.NoError(t, store.InsertAppMirror(ctx, appID, accountID, uuid.Nil, 1, 0, installedAt, "mode-race module", ""))
 		require.NoError(t, store.InsertModuleOverageTimers(
 			ctx, accountID, appID, installedAt, installedAt.AddDate(0, 0, 3), 1,
 		))

@@ -42,6 +42,7 @@ func onBusinessPlan(t *testing.T, store *fakeStore, appID uuid.UUID) {
 	app, ok := store.apps[appID]
 	require.True(t, ok, "app must be registered before its plan is set")
 	app.Plan = usage.PlanBusiness
+	app.CreatedPlan = usage.PlanBusiness // as an app CREATED on Business: no ledger row to chain through
 	store.apps[appID] = app
 	require.EqualValues(t, businessBaseMicros, usage.TermsFor(app.Plan).BaseFeeMicros,
 		"the fixture must differ from the flat base, or it cannot discriminate")

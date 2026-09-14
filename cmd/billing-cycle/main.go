@@ -56,16 +56,12 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/intentcutover"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/legacyrestamp"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
-	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
-	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
-	intentstore "github.com/mirrorstack-ai/billing-engine/internal/intent/store"
-	"github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
-	"github.com/mirrorstack-ai/billing-engine/internal/shared/signing"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -120,6 +116,7 @@ func main() {
 	// dev cycle is a single batch.
 	at := time.Now().UTC()
 	runOrgAttachSweep(context.Background(), svc, at)
+	runPlanChangeApply(context.Background(), svc, at)
 	res := runCycle(context.Background(), svc, at)
 	// Proration runs BEFORE the overage sweep. A Stripe creation charge resolves
 	// its co-created overage on the combined invoice; a wallet creation charge
@@ -128,6 +125,7 @@ func main() {
 	sweepFailed := runProrationSweep(context.Background(), svc, at)
 	runOverageSweep(context.Background(), svc, at, &res)
 	runDomainSweep(context.Background(), svc, at, &res)
+	runPlanChangeSweep(context.Background(), svc, at, &res)
 	slog.Info("billing-cycle local run complete",
 		"as_of", res.AsOf,
 		"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
@@ -437,8 +435,8 @@ func cutoverWiringDecision(proposerArmed bool) error {
 // template stop this worker collecting, and a worker that proposes
 // collects nothing at all.
 const (
-	intentCutoverEnv   = "BILLING_CYCLE_INTENT_CUTOVER"
-	intentCutoverArmed = "propose-do-not-collect"
+	intentCutoverEnv   = intentcutover.Env
+	intentCutoverArmed = intentcutover.Armed
 )
 
 // withIntentCutover attaches the proposer seam.
@@ -477,63 +475,39 @@ const (
 // impossible to repeat — the arming path is now exercised by a test
 // rather than asserted in a comment.
 func withIntentCutover(svc *cycle.Service, pool *pgxpool.Pool, flag string) *cycle.Service {
-	arm, err := intentCutoverDecision(flag)
+	// The ONE contract (internal/account/intentcutover), shared with
+	// cmd/account-api: the flag from the argument, every key from the
+	// environment.
+	getenv := func(name string) string {
+		if name == intentcutover.Env {
+			return flag
+		}
+		return os.Getenv(name)
+	}
+	p, armed, err := intentcutover.Arm(pool, getenv, func() time.Time { return time.Now().UTC() })
 	if err != nil {
-		slog.Error("intent cutover flag is not a recognised value; refusing to start",
-			"env", intentCutoverEnv, "error", err)
+		var ae *intentcutover.ArmError
+		if errors.As(err, &ae) && ae.Stage == "flag" {
+			slog.Error("intent cutover flag is not a recognised value; refusing to start",
+				"env", intentCutoverEnv, "error", ae.Err)
+			os.Exit(1)
+		}
+		needs := intentCutoverEnv
+		if errors.As(err, &ae) {
+			needs = ae.Needs
+		}
+		slog.Error("intent cutover is armed but "+err.Error()+"; refusing to start",
+			"env", intentCutoverEnv,
+			"needs", needs,
+			"why", "docs/DESIGN.md INV-014: an evidence record is a side effect of the money moving, not a report")
 		os.Exit(1)
 	}
-	if !arm {
+	if !armed {
 		return svc
 	}
-	// 🔴 Arming the cutover now REQUIRES an evidence signing key.
-	//
-	// Sealing an intent is the first of docs/DESIGN.md:388's eight evidence
-	// events, and :398 makes an evidence record a durable side effect of the
-	// money moving rather than a report something chooses to render. A
-	// deployment that can seal charge documents but cannot record them
-	// produces documents the customer has no independent trace of, and no
-	// later reconciler can tell "never recorded" from "recorded and withheld".
-	//
-	// So this refuses to start rather than degrading. The alternative —
-	// proposing without evidence when the key is absent — is the silent-skip
-	// this design exists to remove, and it would be invisible: the legs would
-	// run, intents would appear, and the outbox would simply stay empty.
-	//
-	// The flag is unset in every environment today, so nothing changes until
-	// somebody deliberately arms it, which is exactly when they should be
-	// told a key is missing.
-	signer, err := signing.Load(os.Getenv)
-	if err != nil {
-		slog.Error("intent cutover is armed but the signing key material will not load; refusing to start",
-			"env", intentCutoverEnv, "error", err.Error())
-		os.Exit(1)
-	}
-	recorder, err := evidence.NewRecorder(signer, evidence.Options{
-		Issuer:      "billing-engine",
-		Audience:    "customer",
-		Environment: buildinfo.Current().Environment,
-		Now:         func() time.Time { return time.Now().UTC() },
-	})
-	if err != nil {
-		slog.Error("intent cutover is armed but this deployment cannot record evidence; refusing to start",
-			"env", intentCutoverEnv,
-			"needs", signing.EnvBillingEvidenceKey,
-			"why", "docs/DESIGN.md INV-014: an evidence record is a side effect of the money moving, not a report",
-			"error", err.Error())
-		os.Exit(1)
-	}
-
-	p, err := proposer.New(intentstore.New(pool), recorder, func() time.Time { return time.Now().UTC() })
-	if err != nil {
-		slog.Error("intent cutover is armed but the proposer will not construct; refusing to start",
-			"env", intentCutoverEnv, "error", err.Error())
-		os.Exit(1)
-	}
-
 	slog.Warn("INTENT CUTOVER ARMED — cut-over legs will propose sealed intents instead of charging",
 		"env", intentCutoverEnv,
-		"evidence_key", recorder != nil,
+		"evidence_key", true,
 		"exception", "in-flight legacy charges are still completed by each leg's crash-recovery path")
 	return svc.WithIntentProposer(p)
 }
@@ -546,20 +520,13 @@ func withIntentCutover(svc *cycle.Service, pool *pgxpool.Pool, flag string) *cyc
 // customers while an operator believed the worker was only proposing,
 // and a wrong belief about whether money is moving is worse than a
 // worker that will not start.
-var errUnrecognisedCutoverFlag = errors.New("unrecognised intent cutover flag")
+var errUnrecognisedCutoverFlag = intentcutover.ErrUnrecognisedFlag
 
 // intentCutoverDecision is the whole policy, as a pure function, so the
-// arming path can be exercised by a test instead of reasoned about.
+// arming path can be exercised by a test instead of reasoned about. It lives
+// in internal/account/intentcutover so cmd/account-api applies the same one.
 func intentCutoverDecision(flag string) (arm bool, err error) {
-	switch flag {
-	case "":
-		return false, nil
-	case intentCutoverArmed:
-		return true, nil
-	default:
-		return false, fmt.Errorf("%w: %q (expected %q or unset)",
-			errUnrecognisedCutoverFlag, flag, intentCutoverArmed)
-	}
+	return intentcutover.Decision(flag)
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The
@@ -574,6 +541,7 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			at = time.Now().UTC()
 		}
 		runOrgAttachSweep(ctx, svc, at.UTC())
+		runPlanChangeApply(ctx, svc, at.UTC())
 		res := runCycle(ctx, svc, at.UTC())
 		// Proration runs BEFORE the overage sweep (see main): Stripe creations
 		// resolve co-created overage on their combined invoice; wallet creations
@@ -581,6 +549,7 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 		runProrationSweep(ctx, svc, at.UTC())
 		runOverageSweep(ctx, svc, at.UTC(), &res)
 		runDomainSweep(ctx, svc, at.UTC(), &res)
+		runPlanChangeSweep(ctx, svc, at.UTC(), &res)
 		slog.InfoContext(ctx, "billing-cycle lambda run complete",
 			"as_of", res.AsOf,
 			"activated", res.Activated, "rolled_up", res.RolledUp, "processed", res.Processed, "charged", res.Charged,
@@ -627,6 +596,13 @@ type cycleResult struct {
 	DomainCharged    int // activation-period prorations invoiced this sweep
 	DomainSkipped    int // resolved without charge or transiently skipped
 	DomainFailed     int // per-domain errors (counted, never abort)
+
+	// Plan-change reconciler (migration 076): upgrades whose money steps did
+	// not all commit when they were requested.
+	PlanChangeCandidates int // pending upgrades this sweep evaluated
+	PlanChangeSettled    int // finished this sweep
+	PlanChangeSkipped    int // still pending (no usable card yet)
+	PlanChangeFailed     int // per-change errors (counted, never abort)
 }
 
 // runCycle closes every card-bound account's just-ended ANCHORED period as of
@@ -828,6 +804,41 @@ func runDomainSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *
 	slog.InfoContext(ctx, "custom-domain sweep complete",
 		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
 		"resolved", sweep.Resolved, "skipped", sweep.Skipped, "failed", sweep.Failed)
+}
+
+// runPlanChangeApply moves every due scheduled downgrade onto its plan BEFORE
+// the charge phase, on every account — including the ones runCycle never
+// hands to RunBillingCycle (an account whose only apps are in their creation
+// grace), whose downgrade would otherwise land a period late. RunBillingCycle
+// re-applies its own account's as the belt.
+func runPlanChangeApply(ctx context.Context, svc *cycle.Service, at time.Time) {
+	applied, cancelled, err := svc.ApplyDuePlanChanges(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "plan-change apply failed", "as_of", at, "error", err)
+		return
+	}
+	slog.InfoContext(ctx, "plan-change apply complete", "as_of", at, "applied", applied, "cancelled", cancelled)
+}
+
+// runPlanChangeSweep finishes every pending plan upgrade after the other
+// sweeps: a crash between an upgrade's wallet draw and its card seal, or a
+// card that vanished in between, leaves a pending ledger row and this is
+// what completes it. Each change is independently resumable against its row.
+func runPlanChangeSweep(ctx context.Context, svc *cycle.Service, at time.Time, res *cycleResult) {
+	sweep, err := svc.SweepPendingPlanChanges(ctx, at)
+	if err != nil {
+		slog.ErrorContext(ctx, "plan-change sweep failed", "as_of", at, "error", err)
+		res.Failed++
+		return
+	}
+	res.PlanChangeCandidates = sweep.Pending
+	res.PlanChangeSettled = sweep.Settled
+	res.PlanChangeSkipped = sweep.Skipped
+	res.PlanChangeFailed = sweep.Failed
+	res.Failed += sweep.Failed
+	slog.InfoContext(ctx, "plan-change sweep complete",
+		"as_of", at, "pending", sweep.Pending, "settled", sweep.Settled,
+		"skipped", sweep.Skipped, "failed", sweep.Failed)
 }
 
 // tally classifies one account's charge summary for the run totals + a

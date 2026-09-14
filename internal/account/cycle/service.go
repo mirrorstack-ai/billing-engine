@@ -211,6 +211,12 @@ type chargeProposer interface {
 	// them separately would let the executor collect them as two invoices
 	// with two roundings, which is not what the legacy path takes.
 	ProposeGroup(ctx context.Context, charges []proposer.Charge) ([]intent.ChargeIntent, error)
+	// Digest is the digest Propose(c) would store, derived WITHOUT storing;
+	// IntentState is what became of a stored digest (found=false: nothing
+	// stored). Together they let a leg that lost its own record of a seal
+	// ask before it seals again (the plan-change card leg, settlePlanChange).
+	Digest(ctx context.Context, c proposer.Charge) (string, error)
+	IntentState(ctx context.Context, digest string) (state string, found bool, err error)
 }
 
 // WithIntentProposer cuts this service's charge legs over to the intent

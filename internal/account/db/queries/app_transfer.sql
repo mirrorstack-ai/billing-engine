@@ -33,8 +33,10 @@ INSERT INTO ms_billing.app_transfer_events (
 -- whatever the deletion left behind on it. No row ⇒ NOT_FOUND, the same answer
 -- as an app this service never mirrored, because to the caller both are "no
 -- billing here to move".
+-- plan (migration 075) is read so a Free app's transfer can count against
+-- the destination owner's cap under the same lock.
 -- name: LockAppForTransfer :one
-SELECT app_id, account_id, owner_org_id
+SELECT app_id, account_id, owner_org_id, plan
 FROM ms_billing.apps
 WHERE app_id = $1
   AND deleted_at IS NULL

@@ -455,6 +455,19 @@ func (s *Store) AdvanceState(ctx context.Context, digest, from, to string) error
 	return nil
 }
 
+// IntentState is State for a caller that must distinguish "never stored"
+// from an error: found=false, no error, when nothing carries the digest.
+func (s *Store) IntentState(ctx context.Context, digest string) (string, bool, error) {
+	state, err := s.State(ctx, digest)
+	if errors.Is(err, ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return state, true, nil
+}
+
 // State reads an intent's current lifecycle state.
 func (s *Store) State(ctx context.Context, digest string) (string, error) {
 	var state string

@@ -115,6 +115,12 @@ type TransferAppResponse struct {
 	// standing, and the console offers keep only for an unfunded target, so
 	// this refusal is the money authority's backstop, not the first notice.
 	RecurringFrom time.Time `json:"recurring_from"`
+
+	// CancelledPlanChangeID is the old owner's SCHEDULED downgrade this
+	// transfer cancelled (migration 076), so the new payer can state its own.
+	// Zero when there was none — and on a replay, which returns the stored
+	// result: the cancellation itself is durable on the ledger row.
+	CancelledPlanChangeID uuid.UUID `json:"cancelled_plan_change_id,omitempty"`
 }
 
 // TransferPeriod is a half-open [start, end) billing window.
@@ -257,6 +263,10 @@ func (s *Service) TransferApp(ctx context.Context, req TransferAppRequest) (*Tra
 		return nil, billing.Conflict("app_transfer_unbilled_backlog: this app has usage recorded before its organization designated funding; that backlog must be attached to the current organization's account before the app can move")
 	case TransferTargetUnfunded:
 		return nil, billing.Conflict("app_transfer_target_unfunded: move needs a funded billing account; keep is available")
+	case TransferPlanChangePending:
+		return nil, billing.Conflict("app_transfer_plan_change_pending: an upgrade of this app is still being settled on its current account; retry after it settles")
+	case TransferPlanLimit:
+		return nil, billing.PlanLimit("app_transfer_plan_limit: the destination owner has no Free slot left for this app; change its plan first")
 	}
 	return resp, nil
 }

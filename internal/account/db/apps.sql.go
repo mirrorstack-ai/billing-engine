@@ -63,6 +63,65 @@ func (q *Queries) AppsPendingProration(ctx context.Context, arg AppsPendingProra
 	return items, nil
 }
 
+const countOrgPlanCommitments = `-- name: CountOrgPlanCommitments :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps a
+WHERE a.owner_org_id = $1::uuid
+  AND a.deleted_at IS NULL
+  AND a.app_id <> $2::uuid
+  AND (a.plan = $3::text
+       OR EXISTS (SELECT 1 FROM ms_billing.app_plan_changes c
+                  WHERE c.app_id = a.app_id AND c.status = 'scheduled' AND c.to_plan = $3::text))
+`
+
+type CountOrgPlanCommitmentsParams struct {
+	OwnerOrgID  string `json:"owner_org_id"`
+	ExceptAppID string `json:"except_app_id"`
+	Plan        string `json:"plan"`
+}
+
+// CountOrgPlanCommitments is the org twin: one ORGANIZATION's, keyed by
+// owner_org_id rather than the funding account (a sponsored org's apps sit on
+// the sponsor's account, and the cap is per org, not per payer —
+// usage.PlanTerms.MaxAppsPerOrg: 1 Free app per org).
+func (q *Queries) CountOrgPlanCommitments(ctx context.Context, arg CountOrgPlanCommitmentsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOrgPlanCommitments, arg.OwnerOrgID, arg.ExceptAppID, arg.Plan)
+	var live_count int64
+	err := row.Scan(&live_count)
+	return live_count, err
+}
+
+const countUserPlanCommitments = `-- name: CountUserPlanCommitments :one
+SELECT count(*)::bigint AS live_count
+FROM ms_billing.apps a
+WHERE a.account_id = $1::uuid
+  AND a.owner_org_id IS NULL
+  AND a.deleted_at IS NULL
+  AND a.app_id <> $2::uuid
+  AND (a.plan = $3::text
+       OR EXISTS (SELECT 1 FROM ms_billing.app_plan_changes c
+                  WHERE c.app_id = a.app_id AND c.status = 'scheduled' AND c.to_plan = $3::text))
+`
+
+type CountUserPlanCommitmentsParams struct {
+	AccountID   string `json:"account_id"`
+	ExceptAppID string `json:"except_app_id"`
+	Plan        string `json:"plan"`
+}
+
+// CountUserPlanCommitments counts one PERSONAL account's live apps that are
+// ON a plan or have a SCHEDULED downgrade TO it (owner_org_id IS NULL — a
+// user-owned roster row), excluding @except_app_id so a change of the app
+// being asked about never counts itself. The Free cap (usage.PlanTerms.MaxApps:
+// 3 per personal account) is enforced against it, under the owner's advisory
+// lock (LockPlanCapOwner) so two concurrent commitments cannot both pass.
+func (q *Queries) CountUserPlanCommitments(ctx context.Context, arg CountUserPlanCommitmentsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countUserPlanCommitments, arg.AccountID, arg.ExceptAppID, arg.Plan)
+	var live_count int64
+	err := row.Scan(&live_count)
+	return live_count, err
+}
+
 const insertAdvanceBaseSnapshot = `-- name: InsertAdvanceBaseSnapshot :execrows
 INSERT INTO ms_billing.app_base_snapshots
     (app_id, period_start, period_end, module_count, base_micros, source)
@@ -98,10 +157,27 @@ func (q *Queries) InsertAdvanceBaseSnapshot(ctx context.Context, arg InsertAdvan
 	return result.RowsAffected(), nil
 }
 
+const insertAppMemberCount = `-- name: InsertAppMemberCount :exec
+INSERT INTO ms_billing.app_member_counts (app_id, count, recorded_at)
+VALUES ($1::uuid, $2::int, $3::timestamptz)
+`
+
+type InsertAppMemberCountParams struct {
+	AppID      string    `json:"app_id"`
+	Count      int32     `json:"count"`
+	RecordedAt time.Time `json:"recorded_at"`
+}
+
+// InsertAppMemberCount appends one member-count history row (migration 077).
+func (q *Queries) InsertAppMemberCount(ctx context.Context, arg InsertAppMemberCountParams) error {
+	_, err := q.db.Exec(ctx, insertAppMemberCount, arg.AppID, arg.Count, arg.RecordedAt)
+	return err
+}
+
 const insertAppMirror = `-- name: InsertAppMirror :execrows
 
-INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id)
-VALUES ($1, $2, $3, $3, $4, $5, $6)
+INSERT INTO ms_billing.apps (app_id, account_id, module_count, created_module_count, created_at, name, owner_org_id, member_count, plan, created_plan)
+VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $8)
 ON CONFLICT (app_id) DO NOTHING
 `
 
@@ -112,6 +188,8 @@ type InsertAppMirrorParams struct {
 	CreatedAt   time.Time   `json:"created_at"`
 	Name        pgtype.Text `json:"name"`
 	OwnerOrgID  pgtype.UUID `json:"owner_org_id"`
+	MemberCount int32       `json:"member_count"`
+	Plan        string      `json:"plan"`
 }
 
 // Queries backing the ms_billing.apps mirror (migration 027) — the base-fee
@@ -135,6 +213,12 @@ type InsertAppMirrorParams struct {
 // (an UNBILLED roster row, migration 041); owner_org_id ($6) is stamped on
 // every org-owned registration — funded or not — so the RepointOrgUsage sweep
 // can scope the org's NULL-account events through the roster.
+// member_count ($7, migration 077) is the live app-member count at creation
+// and plan ($8, migration 075) the plan the app is created ON — a creation
+// that chooses Free lands on it directly instead of registering on the default
+// and changing plan inside its grace. Both are validated by RegisterApp.
+// created_plan is stamped from the SAME $8 value as plan and never written
+// again (migration 077): the creation charge prices from it.
 func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertAppMirror,
 		arg.AppID,
@@ -143,6 +227,8 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 		arg.CreatedAt,
 		arg.Name,
 		arg.OwnerOrgID,
+		arg.MemberCount,
+		arg.Plan,
 	)
 	if err != nil {
 		return 0, err
@@ -151,17 +237,23 @@ func (q *Queries) InsertAppMirror(ctx context.Context, arg InsertAppMirrorParams
 }
 
 const liveAppModuleCountsCreatedBefore = `-- name: LiveAppModuleCountsCreatedBefore :many
-SELECT app_id, module_count, plan
-FROM ms_billing.apps
-WHERE account_id = $1::uuid
-  AND deleted_at IS NULL
-  AND created_at < $2::timestamptz
-  AND created_at + make_interval(hours => $3::int) < $2::timestamptz
+SELECT a.app_id, a.module_count,
+       COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
+                 WHERE c.app_id = a.app_id
+                   AND c.status IN ('pending', 'settled', 'applied')
+                   AND (c.effective_at > $1::timestamptz
+                        OR (c.effective_at = $1::timestamptz AND c.kind = 'upgrade'))
+                 ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan
+FROM ms_billing.apps a
+WHERE a.account_id = $2::uuid
+  AND a.deleted_at IS NULL
+  AND a.created_at < $1::timestamptz
+  AND a.created_at + make_interval(hours => $3::int) < $1::timestamptz
 `
 
 type LiveAppModuleCountsCreatedBeforeParams struct {
-	AccountID     string    `json:"account_id"`
 	CreatedBefore time.Time `json:"created_before"`
+	AccountID     string    `json:"account_id"`
 	GraceHours    int32     `json:"grace_hours"`
 }
 
@@ -202,8 +294,27 @@ type LiveAppModuleCountsCreatedBeforeRow struct {
 // timezone (DST-shifting), while the Go legs' grace is a fixed GraceDays*24h
 // UTC window (moduleGraceExpiry) — a non-UTC session would disagree with them
 // by an hour around DST and double-bill or gap a whole period.
+// member_count is deliberately NOT returned: the members fee (migration 077)
+// is the CLOSED period's, priced in arrears from MemberHighWaterForAccount —
+// nothing on this roster is an advance-members component.
+// The plan column returned is the plan whose base the NEW period [boundary,
+// next boundary) is owed at, not the row's live plan. From the ledger
+// (migration 076 — every change flips apps.plan in the transaction that
+// writes its row, so the chain is exact): the earliest effective change that
+// does NOT price the new period carries, as its from_plan, the plan this
+// roster bills. That is every change effective strictly after the boundary
+// — and an UPGRADE effective exactly AT it, because upgradeNow's delta for
+// an instant on the boundary covers the whole new period (its anchored
+// period is half-open at the start). A downgrade applied at the boundary is
+// the opposite case: it has taken effect for the new period, so it is not
+// excluded and a.plan (the plan it moved to) is billed. An upgrade requested
+// in the gap between the boundary and the cron that closes it has already
+// charged (new − old) for the new period on its own row; pricing this base
+// at the live plan would bill the new base a second time — and a reclaim of
+// a failed run days later must derive the SAME figure the first attempt did,
+// whatever the plan has become since.
 func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg LiveAppModuleCountsCreatedBeforeParams) ([]LiveAppModuleCountsCreatedBeforeRow, error) {
-	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.AccountID, arg.CreatedBefore, arg.GraceHours)
+	rows, err := q.db.Query(ctx, liveAppModuleCountsCreatedBefore, arg.CreatedBefore, arg.AccountID, arg.GraceHours)
 	if err != nil {
 		return nil, err
 	}
@@ -220,6 +331,21 @@ func (q *Queries) LiveAppModuleCountsCreatedBefore(ctx context.Context, arg Live
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockPlanCapOwner = `-- name: LockPlanCapOwner :exec
+SELECT pg_advisory_xact_lock(hashtext('plan-cap:' || $1::text))
+`
+
+// LockPlanCapOwner serializes every Free-cap decision for one owner (a
+// personal account or an org) for the rest of the transaction: the count
+// above and the write that commits to the plan happen under it, so two
+// concurrent RegisterApp / SetAppPlan / TransferApp calls cannot both read
+// "2 of 3" and both commit. A transaction-scoped advisory lock keyed on the
+// owner id, released at commit/rollback.
+func (q *Queries) LockPlanCapOwner(ctx context.Context, ownerID string) error {
+	_, err := q.db.Exec(ctx, lockPlanCapOwner, ownerID)
+	return err
 }
 
 const markAppDeleted = `-- name: MarkAppDeleted :execrows
@@ -258,6 +384,74 @@ type MarkAppProrationAttemptedParams struct {
 func (q *Queries) MarkAppProrationAttempted(ctx context.Context, arg MarkAppProrationAttemptedParams) error {
 	_, err := q.db.Exec(ctx, markAppProrationAttempted, arg.AppID, arg.ProrationAttemptedAt)
 	return err
+}
+
+const memberHighWaterForAccount = `-- name: MemberHighWaterForAccount :many
+SELECT a.app_id,
+       COALESCE((SELECT c.from_plan FROM ms_billing.app_plan_changes c
+                 WHERE c.app_id = a.app_id
+                   AND c.status IN ('pending', 'settled', 'applied')
+                   AND c.effective_at > $1::timestamptz
+                 ORDER BY c.effective_at, c.id LIMIT 1), a.plan)::text AS plan,
+       GREATEST(
+           COALESCE((SELECT c.count FROM ms_billing.app_member_counts c
+                     WHERE c.app_id = a.app_id AND c.recorded_at < $1::timestamptz
+                     ORDER BY c.recorded_at DESC, c.id DESC LIMIT 1), 0),
+           COALESCE((SELECT MAX(c.count) FROM ms_billing.app_member_counts c
+                     WHERE c.app_id = a.app_id
+                       AND c.recorded_at >= $1::timestamptz
+                       AND c.recorded_at < $2::timestamptz), 0)
+       )::int AS member_hwm
+FROM ms_billing.apps a
+WHERE a.account_id = $3::uuid
+  AND a.created_at < $2::timestamptz
+  AND (a.deleted_at IS NULL OR a.deleted_at >= $1::timestamptz)
+`
+
+type MemberHighWaterForAccountParams struct {
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	AccountID   string    `json:"account_id"`
+}
+
+type MemberHighWaterForAccountRow struct {
+	AppID     string `json:"app_id"`
+	Plan      string `json:"plan"`
+	MemberHwm int32  `json:"member_hwm"`
+}
+
+// MemberHighWaterForAccount is the boundary's members input (migration 077,
+// owner 2026-09-13): per app that HELD members during the closed period
+// [period_start, period_end) — live, or deleted inside it, created before it
+// ended, in or out of its creation grace — the period's high-water mark:
+// max(count in force when the period opened, max count recorded inside it).
+// The plan returned is the plan IN FORCE WHEN THE PERIOD OPENED: the earliest
+// ledger change effective strictly after period_start carries it as its
+// from_plan (a change effective exactly at period_start — a downgrade the
+// previous boundary applied, or an upgrade whose delta covered this whole
+// period — is in force); otherwise the row's plan. Within a period plans only
+// rise (a downgrade lands at a boundary), so pricing the included count at
+// the opening plan means a last-day upgrade cannot buy the period's member
+// allowance for one day's delta — and a reclaim after the boundary apply
+// flipped the row still prices the closed period the same.
+func (q *Queries) MemberHighWaterForAccount(ctx context.Context, arg MemberHighWaterForAccountParams) ([]MemberHighWaterForAccountRow, error) {
+	rows, err := q.db.Query(ctx, memberHighWaterForAccount, arg.PeriodStart, arg.PeriodEnd, arg.AccountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []MemberHighWaterForAccountRow{}
+	for rows.Next() {
+		var i MemberHighWaterForAccountRow
+		if err := rows.Scan(&i.AppID, &i.Plan, &i.MemberHwm); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const mirroredAppIDsOverlappingWindow = `-- name: MirroredAppIDsOverlappingWindow :many
@@ -423,7 +617,8 @@ func (q *Queries) SelectAppBaseSnapshot(ctx context.Context, arg SelectAppBaseSn
 
 const selectAppMirror = `-- name: SelectAppMirror :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count, created_plan
 FROM ms_billing.apps
 WHERE app_id = $1
 `
@@ -440,6 +635,9 @@ type SelectAppMirrorRow struct {
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 	Plan                 string             `json:"plan"`
+	OwnerOrgID           pgtype.UUID        `json:"owner_org_id"`
+	MemberCount          int32              `json:"member_count"`
+	CreatedPlan          string             `json:"created_plan"`
 }
 
 // SelectAppMirror reads one roster row (deleted or not — the caller decides
@@ -460,13 +658,17 @@ func (q *Queries) SelectAppMirror(ctx context.Context, appID string) (SelectAppM
 		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
 		&i.Plan,
+		&i.OwnerOrgID,
+		&i.MemberCount,
+		&i.CreatedPlan,
 	)
 	return i, err
 }
 
 const selectAppMirrorForUpdate = `-- name: SelectAppMirrorForUpdate :one
 SELECT app_id, account_id, module_count, created_module_count, created_at, name,
-       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan
+       proration_invoice_id, proration_skipped_at, proration_attempted_at, deleted_at, plan,
+       owner_org_id, member_count, created_plan
 FROM ms_billing.apps
 WHERE app_id = $1
 FOR UPDATE
@@ -484,6 +686,9 @@ type SelectAppMirrorForUpdateRow struct {
 	ProrationAttemptedAt pgtype.Timestamptz `json:"proration_attempted_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 	Plan                 string             `json:"plan"`
+	OwnerOrgID           pgtype.UUID        `json:"owner_org_id"`
+	MemberCount          int32              `json:"member_count"`
+	CreatedPlan          string             `json:"created_plan"`
 }
 
 // SelectAppMirrorForUpdate reads one roster row under a ROW LOCK (FOR UPDATE) —
@@ -509,8 +714,36 @@ func (q *Queries) SelectAppMirrorForUpdate(ctx context.Context, appID string) (S
 		&i.ProrationAttemptedAt,
 		&i.DeletedAt,
 		&i.Plan,
+		&i.OwnerOrgID,
+		&i.MemberCount,
+		&i.CreatedPlan,
 	)
 	return i, err
+}
+
+const setAppMemberCount = `-- name: SetAppMemberCount :execrows
+UPDATE ms_billing.apps
+SET member_count = $2
+WHERE app_id = $1
+  AND deleted_at IS NULL
+`
+
+type SetAppMemberCountParams struct {
+	AppID       string `json:"app_id"`
+	MemberCount int32  `json:"member_count"`
+}
+
+// SetAppMemberCount snapshots a new app-member count (SyncAppModules,
+// migration 077). WHERE deleted_at IS NULL freezes the count once deleted —
+// the same posture as SetAppModuleCount: a deleted app accrues no future
+// member fee, so there is no future count to move. :execrows; the service
+// resolves 0 rows through the SelectAppMirror existence check it already made.
+func (q *Queries) SetAppMemberCount(ctx context.Context, arg SetAppMemberCountParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setAppMemberCount, arg.AppID, arg.MemberCount)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setAppModuleCount = `-- name: SetAppModuleCount :execrows
@@ -628,6 +861,37 @@ WHERE app_id = $1
 // observe (and tolerate) the already-set / already-charged cases.
 func (q *Queries) SetAppProrationSkipped(ctx context.Context, appID string) (int64, error) {
 	result, err := q.db.Exec(ctx, setAppProrationSkipped, appID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setAppProrationSkippedOnPlan = `-- name: SetAppProrationSkippedOnPlan :execrows
+UPDATE ms_billing.apps
+SET proration_skipped_at = now()
+WHERE app_id = $1
+  AND plan = $2
+  AND proration_skipped_at IS NULL
+  AND proration_invoice_id IS NULL
+  AND proration_attempted_at IS NULL
+`
+
+type SetAppProrationSkippedOnPlanParams struct {
+	AppID string `json:"app_id"`
+	Plan  string `json:"plan"`
+}
+
+// SetAppProrationSkippedOnPlan arms the permanent skip marker for a window
+// priced at $0 — ONLY while the row still carries the plan the derivation
+// priced and none of the three creation markers (billing-engine#208 round 4).
+// The derivation runs on an unlocked read; a plan-change fold committing
+// between that read and this write (under the app lock, flipping apps.plan)
+// would otherwise be made terminal at $0 and its days priced by nobody. The
+// row-level UPDATE re-evaluates the predicate under the row lock, so 0 rows
+// means "the row moved: re-derive next sweep". :execrows for that reason.
+func (q *Queries) SetAppProrationSkippedOnPlan(ctx context.Context, arg SetAppProrationSkippedOnPlanParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setAppProrationSkippedOnPlan, arg.AppID, arg.Plan)
 	if err != nil {
 		return 0, err
 	}
