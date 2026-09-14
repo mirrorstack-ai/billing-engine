@@ -75,6 +75,10 @@ type Category string
 const (
 	CategoryAll Category = "all"
 	CategoryAI  Category = "ai"
+	// CategoryExposure is the SYSTEM row billing-engine maintains per PaaS
+	// account (migration 085) so budget_alerts can record crossings of the
+	// risk-exposure pool. Never accepted from a caller.
+	CategoryExposure Category = "exposure"
 )
 
 // normalizeCategory maps the wire value (empty = the pre-084 default) onto a
@@ -153,7 +157,54 @@ const (
 	DecidedByAccount  DecidedBy = "account"
 	DecidedByOrg      DecidedBy = "org"
 	DecidedByNone     DecidedBy = "none"
+	// DecidedByExposureLimit: no customer cap bit, the PaaS risk-exposure
+	// pool did (PR-B, migration 085).
+	DecidedByExposureLimit DecidedBy = "exposure_limit"
 )
+
+// PoolSource says what bounds the pool: the risk-exposure curve, or nothing
+// (not PaaS, or an unattributed scope).
+type PoolSource string
+
+const (
+	PoolSourceExposureLimit PoolSource = "exposure_limit"
+	PoolSourceNone          PoolSource = "none"
+)
+
+// Pool is the PaaS risk-exposure pool on a category='ai' status read (owner
+// 2026-09-14): PaaS is pay-AFTER-use, so the platform's exposure is bounded
+// by a risk-graded limit that REFUSES AI turns live. LimitMicros is the
+// curve (risk_ramp_config × the account's signals), AccruedMicros the
+// account's whole-period PaaS usage — AI + module usage + infra; plan/SaaS
+// base fees are not usage and never count. Exhausted = Mode paas && accrued
+// >= limit. The customer's allow_overage never lifts it. v1 gates AI only.
+type Pool struct {
+	// Mode is the account's billing mode: "paas" (the 'standard' mode), "credits", or "none" (unattributed).
+	Mode            string     `json:"mode"`
+	Source          PoolSource `json:"source"`
+	LimitMicros     int64      `json:"limit_micros"`
+	AccruedMicros   int64      `json:"accrued_micros"`
+	RemainingMicros int64      `json:"remaining_micros"`
+	Exhausted       bool       `json:"exhausted"`
+	// HasUsableCard / PaidInvoices are the curve's inputs, echoed so a console
+	// can explain the limit ("$14.10: card on file, 1 paid invoice").
+	HasUsableCard bool `json:"has_usable_card"`
+	PaidInvoices  int  `json:"paid_invoices"`
+}
+
+// ExposureSignals are the curve's inputs for one account.
+type ExposureSignals struct {
+	BillingMode   string
+	HasUsableCard bool
+	PaidInvoices  int
+}
+
+// RiskRampConfig is the finance-owned curve row (085).
+type RiskRampConfig struct {
+	NoCardMicros   int64
+	CardBaseMicros int64
+	CeilingMicros  int64
+}
 
 // GetBudgetStatusResponse is the live spend-vs-cap status. Exists is false
 // (with a nil error) when no budget is configured for the scope, so the
@@ -194,6 +245,11 @@ type GetBudgetStatusResponse struct {
 	AllowOverage    bool  `json:"allow_overage"`
 	Exhausted       bool  `json:"exhausted"`
 	RemainingMicros int64 `json:"remaining_micros"`
+
+	// Pool is the PaaS risk-exposure pool for the scope's paying account on a
+	// category='ai' read; nil for other categories. Exhausted above is the OR
+	// of the cap rows and the pool; DecidedBy says which bit.
+	Pool *Pool `json:"pool,omitempty"`
 }
 
 // GetBudgetAlertsRequest selects the recorded crossings for a budget + period.

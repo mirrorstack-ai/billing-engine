@@ -178,6 +178,74 @@ FROM ms_billing.accounts
 WHERE owner_kind = 'org' AND owner_org_id = $1
 LIMIT 1;
 
+-- AccountPeriodSpendMicros is the account-level twin of AppPeriodSpendMicros
+-- over EVERY metric — the accrued PaaS usage the risk-exposure pool measures
+-- (AI + module usage + infra; plan/SaaS base fees are not usage events and so
+-- are excluded by construction, as the owner ruled). Same window, dev_served
+-- exclusion and subject-aggregation shape.
+-- name: AccountPeriodSpendMicros :one
+WITH base_events AS (
+    SELECT
+        module_id, metric, aggregation_key, subject,
+        COALESCE(model, '') AS model,
+        value
+    FROM ms_billing.usage_events
+    WHERE account_id = $1
+      AND COALESCE(billable_at, recorded_at) >= $2
+      AND COALESCE(billable_at, recorded_at) <  $3
+      AND dev_served = false
+),
+billable_events AS (
+    SELECT module_id, metric, model, value AS billable_value
+    FROM base_events
+    WHERE aggregation_key IS DISTINCT FROM 'subject'
+    UNION ALL
+    SELECT
+        module_id, metric, model,
+        MAX(value)::numeric AS billable_value
+    FROM base_events
+    WHERE aggregation_key = 'subject'
+    GROUP BY module_id, metric, model, subject
+)
+SELECT COALESCE(SUM(e.billable_value * COALESCE(mp.unit_price_micros, md.unit_price_micros, 0)), 0)::numeric AS total_raw_cost_micros
+FROM billable_events e
+LEFT JOIN ms_billing.metric_model_prices mp
+    ON mp.metric = e.metric AND mp.model = e.model AND e.model <> ''
+LEFT JOIN ms_billing.metric_definitions md
+    ON md.module_id = e.module_id AND md.metric = e.metric;
+
+-- AppPayerAccountID resolves an app to the account its usage is attributed
+-- to (the app's most recent attributed event) — the account whose exposure
+-- pool an app-surface AI turn draws on. No row = unattributed (lazy).
+-- name: AppPayerAccountID :one
+SELECT e.account_id
+FROM ms_billing.usage_events e
+WHERE e.app_id = $1 AND e.account_id IS NOT NULL
+ORDER BY COALESCE(e.billable_at, e.recorded_at) DESC
+LIMIT 1;
+
+-- ExposureSignals are the inputs of the PaaS exposure curve (085): the
+-- account's billing mode, whether a usable (unexpired, undeleted) card is on
+-- file, and how many invoices it has paid.
+-- name: ExposureSignals :one
+SELECT
+    a.billing_mode::text AS billing_mode,
+    EXISTS (
+        SELECT 1 FROM ms_billing.payment_methods_mirror pm
+        WHERE pm.account_id = a.id
+          AND pm.deleted_at IS NULL
+          AND (pm.exp_year, pm.exp_month) >= (EXTRACT(YEAR FROM current_date)::INT, EXTRACT(MONTH FROM current_date)::INT)
+    )::boolean AS has_usable_card,
+    (SELECT COUNT(*) FROM ms_billing.invoices i WHERE i.account_id = a.id AND i.status = 'paid')::int AS paid_invoices
+FROM ms_billing.accounts a
+WHERE a.id = $1;
+
+-- RiskRampConfig reads the singleton curve row (085).
+-- name: RiskRampConfig :one
+SELECT no_card_micros, card_base_micros, ceiling_micros
+FROM ms_billing.risk_ramp_config
+WHERE id = 1;
+
 -- anchor day 1 (UTC calendar month). Returns at most one row.
 -- name: AppAccountActivatedAt :one
 SELECT a.activated_at

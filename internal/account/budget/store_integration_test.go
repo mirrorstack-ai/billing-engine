@@ -156,3 +156,74 @@ func TestPgxStore_Budgets_TemplateRowsAndOrgResolution(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, orgAcct, id)
 }
+
+// TestPgxStore_ExposurePoolReads pins the migration-085 reads: the curve row
+// is seeded; the account's whole-period spend counts every metric (AI + compute)
+// and still excludes dev-served and the next period; the signals read sees the
+// billing mode, a usable card and the paid-invoice count; an app resolves to
+// its payer through its attributed events.
+func TestPgxStore_ExposurePoolReads(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := budget.NewStore(pool)
+	ctx := context.Background()
+	acct := seedAccountRow(t, pool, "user", uuid.New())
+	app := uuid.New()
+	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	at := start.Add(72 * time.Hour)
+
+	cfg, err := store.RiskRampConfig(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 5_000_000, cfg.NoCardMicros)
+	require.EqualValues(t, 10_000_000, cfg.CardBaseMicros)
+	require.EqualValues(t, 200_000_000, cfg.CeilingMicros)
+
+	_, found, err := store.AppPayerAccountID(ctx, app)
+	require.NoError(t, err)
+	require.False(t, found, "no attributed event yet")
+
+	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 10, haiku, "member-help", at, false) // 10,000 µ$
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.usage_events (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
+		VALUES ($1, $2, $3, '00000000-0000-0000-0000-000000000000', 'infra.compute.walltime.ms', 'sum', 1000000, $4)`,
+		uuid.NewString(), acct.String(), app.String(), at) // 1,000,000 µ$ (1 µ$/ms)
+	require.NoError(t, err)
+	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 100, haiku, "", at, true)   // dev-served
+	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 100, haiku, "", end, false) // next period
+
+	got, err := store.AccountPeriodSpendMicros(ctx, acct, start, end)
+	require.NoError(t, err)
+	require.EqualValues(t, 1_010_000, got, "every metric counts toward the pool; dev-served and the next period do not")
+
+	payer, found, err := store.AppPayerAccountID(ctx, app)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, acct, payer)
+
+	sig, err := store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, "standard", sig.BillingMode, "accounts default to PaaS")
+	require.False(t, sig.HasUsableCard)
+	require.Zero(t, sig.PaidInvoices)
+
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.payment_methods_mirror (account_id, stripe_payment_method_id, brand, last4, exp_month, exp_year)
+		VALUES ($1, 'pm_exposure', 'visa', '4242', 12, 2099)`, acct.String())
+	require.NoError(t, err)
+	for i, st := range []string{"paid", "paid", "open"} {
+		_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency)
+			VALUES ($1, $2, $3, 100, 100, 'usd')`, acct.String(), "in_exposure_"+string(rune('a'+i)), st)
+		require.NoError(t, err)
+	}
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.True(t, sig.HasUsableCard)
+	require.Equal(t, 2, sig.PaidInvoices, "open invoices do not count as paid")
+	require.EqualValues(t, 17_320_508, budget.ExposureLimitMicros(cfg, sig))
+
+	// The system exposure row is storable and re-upserts in place.
+	first, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 17_320_508, AlertPercents: []int{80, 100}, Active: true, HardCap: true})
+	require.NoError(t, err)
+	again, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 20_000_000, AlertPercents: []int{80, 100}, Active: true, HardCap: true})
+	require.NoError(t, err)
+	require.Equal(t, first.ID, again.ID, "the alert key (budget_id) survives the curve moving")
+	require.EqualValues(t, 20_000_000, again.LimitMicros)
+}

@@ -602,7 +602,7 @@ type MsBillingBudget struct {
 	Active        bool                 `json:"active"`
 	CreatedAt     time.Time            `json:"created_at"`
 	UpdatedAt     time.Time            `json:"updated_at"`
-	// Which spend the cap measures: all (every usage event) or ai (infra.ai.* only, priced per model). One row per (scope, scope_id, category, template_key).
+	// Which spend the cap measures: all (every usage event), ai (infra.ai.* only, priced per model), or exposure (the SYSTEM row billing-engine maintains per PaaS account so budget_alerts can record crossings of the risk-exposure pool; never written by a customer).
 	Category string `json:"category"`
 	// ai-assistant template this AI cap is for; '' = the scope's AI-wide row. Text key as the module stores it.
 	TemplateKey string `json:"template_key"`
@@ -898,6 +898,15 @@ type MsBillingPaymentMethodsMirror struct {
 	// Audit: when fraud_blocked was set. NULL until flagged.
 	FraudFlaggedAt pgtype.Timestamptz `json:"fraud_flagged_at"`
 	CardCountry    pgtype.Text        `json:"card_country"`
+}
+
+// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × sqrt(1+k); capped at ceiling_micros. Finance-owned; tune by UPDATE.
+type MsBillingRiskRampConfig struct {
+	ID             int16     `json:"id"`
+	NoCardMicros   int64     `json:"no_card_micros"`
+	CardBaseMicros int64     `json:"card_base_micros"`
+	CeilingMicros  int64     `json:"ceiling_micros"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type MsBillingUsageAggregate struct {
