@@ -120,7 +120,7 @@ func TestBillingRunWalletDraw_Integration_CrashThenTrueOffReclaim(t *testing.T) 
 				nil,
 				mustTime(t, "2026-01-01T00:00:00Z"),
 			)
-			runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+			runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 			require.NoError(t, err)
 			require.True(t, shouldCharge)
 			require.False(t, reclaimed)
@@ -248,7 +248,7 @@ func TestBillingRunWalletDraw_Integration_ConcurrentStripeFreezeWinsBeforeAlloca
 	start, end := mustTime(t, pStart), mustTime(t, pEnd)
 	periodID, err := store.OpenPeriodForAccount(ctx, accountID, start, end)
 	require.NoError(t, err)
-	runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+	runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 	require.NoError(t, err)
 	require.True(t, shouldCharge)
 	require.False(t, reclaimed)

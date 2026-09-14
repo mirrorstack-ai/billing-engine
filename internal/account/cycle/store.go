@@ -155,7 +155,24 @@ type Store interface {
 	// its id so the deterministic Stripe Idempotency-Keys stay stable across
 	// attempts. shouldCharge=false means the window already has an 'invoiced'
 	// (terminal-success) run and the cycle must NOT re-charge.
-	InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (runID uuid.UUID, shouldCharge, reclaimed bool, err error)
+	// everProposed reports whether ANY earlier attempt of the reclaimed run
+	// was handed to the intent proposer (status 'proposed', or the durable
+	// proposal_attempted_at stamp of migration 083 — read BEFORE the reclaim
+	// resets status). Such a run may hold a sealed intent, so the stale-freeze
+	// reconciliation in RunBillingCycle never re-freezes it (billing-engine#217).
+	InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (runID uuid.UUID, shouldCharge, reclaimed, everProposed bool, err error)
+
+	// MarkBillingRunProposalAttempted stamps the durable "handed to the
+	// proposer" marker BEFORE ProposeGroup is called; first instant wins,
+	// nothing clears it. "Maybe sealed" is treated as sealed from here on.
+	MarkBillingRunProposalAttempted(ctx context.Context, runID uuid.UUID) error
+
+	// RefreezeBillingRunCharge moves a STALE frozen figure to the live
+	// derivation with a compare-and-set on the old cents, only while the run
+	// is still pending (billing-engine#217). moved=false means the row no
+	// longer holds oldCents — another daemon reconciled it first or the run
+	// left 'pending' — and the caller re-reads instead of proceeding.
+	RefreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, oldCents, newCents int64) (moved bool, err error)
 
 	// AccountsWithUsageEvents returns the accounts with raw usage_events in the
 	// window [periodStart, periodEnd) — the rollup-phase work list for
@@ -1495,7 +1512,7 @@ func (s *pgxStore) UpsertDeveloperSettlement(ctx context.Context, periodID, acco
 	})
 }
 
-func (s *pgxStore) InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (uuid.UUID, bool, bool, error) {
+func (s *pgxStore) InsertBillingRun(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (uuid.UUID, bool, bool, bool, error) {
 	row, err := s.q.InsertBillingRun(ctx, db.InsertBillingRunParams{
 		AccountID:   accountID.String(),
 		PeriodStart: periodStart,
@@ -1504,16 +1521,32 @@ func (s *pgxStore) InsertBillingRun(ctx context.Context, accountID uuid.UUID, pe
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The DO UPDATE's WHERE excluded the row → the existing run is 'invoiced'
 		// (terminal success). The window was already charged; do not re-charge.
-		return uuid.Nil, false, false, nil
+		return uuid.Nil, false, false, false, nil
 	}
 	if err != nil {
-		return uuid.Nil, false, false, err
+		return uuid.Nil, false, false, false, err
 	}
 	runID, err := uuid.Parse(row.ID)
 	if err != nil {
-		return uuid.Nil, false, false, err
+		return uuid.Nil, false, false, false, err
 	}
-	return runID, true, row.Reclaimed, nil
+	return runID, true, row.Reclaimed, row.EverProposed, nil
+}
+
+func (s *pgxStore) MarkBillingRunProposalAttempted(ctx context.Context, runID uuid.UUID) error {
+	return s.q.MarkBillingRunProposalAttempted(ctx, runID.String())
+}
+
+func (s *pgxStore) RefreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, oldCents, newCents int64) (bool, error) {
+	n, err := s.q.RefreezeBillingRunCharge(ctx, db.RefreezeBillingRunChargeParams{
+		NewCents: newCents,
+		ID:       runID.String(),
+		OldCents: oldCents,
+	})
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 func (s *pgxStore) PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {

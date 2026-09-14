@@ -177,8 +177,22 @@ WHERE ua.account_id   = $1
 -- bit is a money-recovery boundary: a reclaimed run may need to recover a
 -- previously committed wallet draw even when the current rollout is off or the
 -- account is no longer selected. A fresh run must not make that recovery read.
+-- ever_proposed says whether ANY earlier attempt of this run was handed to the
+-- intent proposer: status 'proposed' (the mark after a successful seal) OR
+-- proposal_attempted_at (migration 083, stamped before the seal, never
+-- cleared). Read from a CTE over the statement-start snapshot, i.e. BEFORE the
+-- reclaim below resets status to 'pending' — that reset is why status alone
+-- cannot carry it across two reclaims. The stale-freeze reconciliation
+-- (charge.go, billing-engine#217) never re-freezes a run with ever_proposed.
 -- name: InsertBillingRun :one
-WITH inserted AS (
+WITH prior AS (
+    SELECT (p.status = 'proposed' OR p.proposal_attempted_at IS NOT NULL) AS ever_proposed
+    FROM ms_billing.billing_runs p
+    WHERE p.account_id = $1
+      AND p.period_start = $2
+      AND p.period_end = $3
+),
+inserted AS (
     INSERT INTO ms_billing.billing_runs (
         account_id,
         period_start,
@@ -190,23 +204,44 @@ WITH inserted AS (
     RETURNING id
 ),
 reclaimed AS (
-    UPDATE ms_billing.billing_runs
+    UPDATE ms_billing.billing_runs r
     SET status            = 'pending',
         stripe_invoice_id = NULL,
         total_amount      = 0
-    WHERE account_id = $1
-      AND period_start = $2
-      AND period_end = $3
-      AND status <> 'invoiced'
+    WHERE r.account_id = $1
+      AND r.period_start = $2
+      AND r.period_end = $3
+      AND r.status <> 'invoiced'
       AND NOT EXISTS (SELECT 1 FROM inserted)
-    RETURNING id
+    RETURNING r.id
 )
-SELECT id, false::boolean AS reclaimed
+SELECT id, false::boolean AS reclaimed, false::boolean AS ever_proposed
 FROM inserted
 UNION ALL
-SELECT id, true::boolean AS reclaimed
+SELECT reclaimed.id, true::boolean AS reclaimed,
+       COALESCE((SELECT prior.ever_proposed FROM prior LIMIT 1), false)::boolean AS ever_proposed
 FROM reclaimed
 LIMIT 1;
+
+-- MarkBillingRunProposalAttempted stamps the durable "handed to the proposer"
+-- marker (083) BEFORE ProposeGroup; COALESCE keeps the first instant, so a
+-- retry never moves it and nothing ever clears it.
+-- name: MarkBillingRunProposalAttempted :exec
+UPDATE ms_billing.billing_runs
+SET proposal_attempted_at = COALESCE(proposal_attempted_at, now())
+WHERE id = $1;
+
+-- RefreezeBillingRunCharge moves a STALE frozen figure to the live derivation
+-- (billing-engine#217): a compare-and-set on the old cents, only while the run
+-- is still pending, so two daemons reconciling the same run agree — the loser's
+-- CAS matches 0 rows and re-reads the survivor. Never called when a provider
+-- invoice or a sealed intent exists for the run (charge.go decides that).
+-- name: RefreezeBillingRunCharge :execrows
+UPDATE ms_billing.billing_runs
+SET frozen_charge_cents = @new_cents::bigint
+WHERE id = @id::uuid
+  AND frozen_charge_cents = @old_cents::bigint
+  AND status = 'pending';
 
 -- MarkBillingRun sets a run's terminal status, the Stripe invoice id (NULL for
 -- zero-arrears / skipped runs), and the charged total. Scoped to the run id so

@@ -588,6 +588,8 @@ type MsBillingBillingRun struct {
 	ChargeFundingAccountID        pgtype.UUID    `json:"charge_funding_account_id"`
 	ChargeFundingGeneration       pgtype.UUID    `json:"charge_funding_generation"`
 	ChargeFundingLegacyUnresolved bool           `json:"charge_funding_legacy_unresolved"`
+	// First instant this run was handed to the intent proposer (stamped BEFORE ProposeGroup, never cleared). A run carrying it may hold a sealed intent, so its frozen figure is never re-frozen (billing-engine#217).
+	ProposalAttemptedAt pgtype.Timestamptz `json:"proposal_attempted_at"`
 }
 
 type MsBillingBudget struct {
