@@ -204,7 +204,8 @@ type Pool struct {
 // ExposureSignals are the curve's inputs for one account. DelinquentNow and
 // LateCount are read for the delinquency rule (owner's pick pending): an
 // open/uncollectible invoice with a balance, and how many invoices ever
-// needed a failed attempt or ended uncollectible/void.
+// needed a failed attempt or ended uncollectible (a void is our own
+// cancellation and never counts).
 type ExposureSignals struct {
 	BillingMode   string
 	HasUsableCard bool

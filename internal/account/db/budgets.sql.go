@@ -315,7 +315,7 @@ SELECT
         WHERE i.account_id = a.id AND i.status IN ('open', 'uncollectible') AND i.amount_due > 0
     )::boolean AS delinquent_now,
     (SELECT COUNT(*) FROM ms_billing.invoices i
-     WHERE i.account_id = a.id AND (i.ever_failed OR i.status IN ('uncollectible', 'void')))::int AS late_count
+     WHERE i.account_id = a.id AND (i.ever_failed OR i.status = 'uncollectible'))::int AS late_count
 FROM ms_billing.accounts a
 WHERE a.id = $1
 `
@@ -334,7 +334,9 @@ type ExposureSignalsRow struct {
 // is the cycle-close judge's own definition (HasUnpaidInvoice: an open or
 // uncollectible invoice with a balance), late_count is how many invoices ever
 // needed a failed payment attempt (ever_failed, migration 0xx) or ended
-// uncollectible/void — the memory a delinquency rule can subtract from k.
+// uncollectible — the memory a delinquency rule can subtract from k. A VOID
+// is OUR cancellation (a corrected or zeroed invoice), never the customer's
+// failure, so it does not count.
 func (q *Queries) ExposureSignals(ctx context.Context, id string) (ExposureSignalsRow, error) {
 	row := q.db.QueryRow(ctx, exposureSignals, id)
 	var i ExposureSignalsRow

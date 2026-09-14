@@ -252,6 +252,14 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, sig.DelinquentNow, "settled: nothing open with a balance")
 	require.Equal(t, 1, sig.LateCount, "a paid invoice that once failed is remembered as late")
+	// A VOID is our cancellation, not the customer's failure: k is untouched.
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
+		VALUES ($1, 'in_exposure_void', 'void', 0, 0, 'usd', true)`, acct.String())
+	require.NoError(t, err)
+	sig, err = store.ExposureSignals(ctx, acct)
+	require.NoError(t, err)
+	require.Equal(t, 1, sig.LateCount, "a voided, never-failed invoice does not count as late")
+	require.False(t, sig.DelinquentNow)
 	require.Equal(t, 3, sig.PaidInvoices)
 	require.EqualValues(t, 44_441_157, budget.ExposureLimitMicros(cfg, sig), "3 paid − 2×1 late = k 1 → $44.44")
 
