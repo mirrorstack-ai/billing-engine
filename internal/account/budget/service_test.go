@@ -611,51 +611,84 @@ func TestSetBudget_AICapsValidateScopeAndTemplate(t *testing.T) {
 	requireCode(t, err, billing.CodeInvalidInput)
 }
 
-// TestGetBudgetStatus_TemplateRowWinsThenAppWideThenNone pins the precedence
-// ONE place computes (owner 2026-09-14): the template's own row, else the app's
-// AI-wide row, else nothing — and that the spend read is the deciding row's own.
-func TestGetBudgetStatus_TemplateRowWinsThenAppWideThenNone(t *testing.T) {
+// TestGetBudgetStatus_TemplateAndAppWideCompose pins the composition ONE
+// place computes (billing-engine#221 review): the template's row narrows the
+// app's AI-wide cap and never shadows it — exhausted if EITHER is, the
+// exhausted row (template first) else the more specific row reported.
+func TestGetBudgetStatus_TemplateAndAppWideCompose(t *testing.T) {
 	store := newFakeStore()
 	svc := newService(store)
 	app := uuid.New()
 	ctx := context.Background()
+	read := func(tpl string) *budget.GetBudgetStatusResponse {
+		st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: tpl})
+		require.NoError(t, err)
+		return st
+	}
 
 	// Nothing configured: exists=false, decided_by none.
-	st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "member-help"})
-	require.NoError(t, err)
+	st := read("member-help")
 	require.False(t, st.Exists)
 	require.Equal(t, budget.DecidedByNone, st.DecidedBy)
 
-	// App-wide AI row only: a template read falls back to it, and sums the APP's AI spend.
+	// App-wide AI row only: a template read is governed by it and sums the APP's AI spend.
 	seedAIBudget(store, budget.ScopeApp, app, "", 10_000_000, true, false)
 	store.spendBy["ai/"] = 9_000_000
 	store.spendBy["ai/member-help"] = 2_000_000
-	st, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "member-help"})
-	require.NoError(t, err)
+	st = read("member-help")
 	require.True(t, st.Exists)
 	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
-	require.Equal(t, "", st.TemplateKey)
 	require.EqualValues(t, 9_000_000, st.SpendMicros)
-	require.Equal(t, "", store.gotSpendTemplate, "the app-wide row sums the whole app, not the template")
 	require.False(t, st.Exhausted)
 	require.EqualValues(t, 1_000_000, st.RemainingMicros)
 
-	// The template's own row wins and sums ONLY its own events.
-	seedAIBudget(store, budget.ScopeApp, app, "member-help", 2_000_000, true, false)
-	st, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "member-help"})
-	require.NoError(t, err)
+	// The template's own row (roomy, not spent): reported as the specific row,
+	// but the app-wide row still counts.
+	seedAIBudget(store, budget.ScopeApp, app, "member-help", 5_000_000, true, false)
+	st = read("member-help")
 	require.Equal(t, budget.DecidedByTemplate, st.DecidedBy)
 	require.Equal(t, "member-help", st.TemplateKey)
-	require.Equal(t, "member-help", store.gotSpendTemplate)
-	require.EqualValues(t, 2_000_000, st.SpendMicros)
-	require.True(t, st.Exhausted, "spend == limit on a hard cap is exhausted")
-	require.Zero(t, st.RemainingMicros)
-	require.Equal(t, []int{80, 100}, st.Crossed)
+	require.EqualValues(t, 2_000_000, st.SpendMicros, "the template row reports its own events")
+	require.False(t, st.Exhausted)
 
-	// Another template with no row of its own still resolves to the app-wide row.
-	st, err = svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "faq"})
-	require.NoError(t, err)
+	// 🔴 The escape 94 named: the app-wide cap fills up while the template is
+	// under its own limit — the verdict must still be exhausted, labelled by
+	// the row that bit.
+	store.spendBy["ai/"] = 10_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted, "a template row must not shadow an exhausted app-wide cap")
 	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+	require.EqualValues(t, 10_000_000, st.SpendMicros)
+
+	// Both spent: the template wins the label.
+	store.spendBy["ai/member-help"] = 5_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByTemplate, st.DecidedBy)
+
+	// Template spent, app-wide fine: exhausted by the template.
+	store.spendBy["ai/"] = 6_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByTemplate, st.DecidedBy)
+	require.Zero(t, st.RemainingMicros)
+
+	// A template with overage allowed does not lift the app-wide cap.
+	store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "member-help")] = func() budget.Budget {
+		b := store.budgets[budgetKey(budget.ScopeApp, app, budget.CategoryAI, "member-help")]
+		b.AllowOverage = true
+		return b
+	}()
+	store.spendBy["ai/"] = 10_000_000
+	st = read("member-help")
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+
+	// Another template with no row of its own composes with the app-wide row alone.
+	store.spendBy["ai/"] = 1_000_000
+	st = read("faq")
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+	require.False(t, st.Exhausted)
 }
 
 // TestGetBudgetStatus_ExhaustedRules: only an ACTIVE, HARD cap without the

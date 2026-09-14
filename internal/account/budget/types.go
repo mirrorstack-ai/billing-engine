@@ -32,8 +32,10 @@
 // infra.ai.* events only, priced per model exactly like the bill. One row per
 // (scope, scope_id, category, template_key), so an app can carry both, plus
 // one AI row per ai-assistant TEMPLATE (owner 2026-09-14: the module's cap
-// is per template, enforced, in money). Precedence on a status read for
-// (app, template): the template row → the app's AI-wide row → none.
+// is per template, enforced, in money). A status read for (app, template)
+// COMPOSES the template's row with the app's AI-wide row: exhausted if
+// either is, the exhausted (else the more specific) row reported. A
+// template row narrows the app cap; it never shadows it.
 //
 // SCOPES for CategoryAI: 'app' (scenario 1) and 'org' / 'account' (scenario
 // 2: the console operator agent, billed to the org of an org-context
@@ -131,9 +133,10 @@ type SetBudgetResponse struct {
 }
 
 // GetBudgetStatusRequest selects the budget whose live status to read. For
-// Category "ai" on an app, TemplateKey asks for the cap in force for THAT
-// template: the template's own row if one exists, else the app's AI-wide
-// row (DecidedBy says which). Empty TemplateKey reads the AI-wide row.
+// Category "ai" on an app, TemplateKey asks for the verdict in force for
+// THAT template: the template's own row composed with the app's AI-wide
+// row (DecidedBy says which one bit). Empty TemplateKey reads the AI-wide
+// row alone.
 type GetBudgetStatusRequest struct {
 	Scope       Scope     `json:"scope"`
 	ScopeID     uuid.UUID `json:"scope_id"`

@@ -122,35 +122,69 @@ func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudg
 	}, nil
 }
 
-// resolveBudget finds the row a status read is governed by. For an app's
-// AI cap with a template: the template's own row, else the app's AI-wide
-// row (precedence, owner 2026-09-14 — one place computes it so two
-// consumers can never disagree). Every other request resolves exactly its
-// own row. Returns found=false with DecidedByNone when nothing applies.
-func (s *Service) resolveBudget(ctx context.Context, scope Scope, scopeID uuid.UUID, cat Category, templateKey string) (Budget, DecidedBy, bool, error) {
-	if templateKey != "" {
-		b, found, err := s.store.GetBudget(ctx, scope, scopeID, cat, templateKey)
+// candidate is one budget row a status read consults, with its spend.
+type candidate struct {
+	b         Budget
+	decidedBy DecidedBy
+	spend     int64
+}
+
+// candidates lists the rows a status read COMPOSES, most specific first. For
+// an app's AI cap with a template: the template's own row AND the app's
+// AI-wide row — both, never one shadowing the other. The template is named
+// by the widget in a client-supplied parameter that the agent cannot verify
+// against the module today, so a template row that HID the app-wide row would
+// let a caller escape both caps by naming the roomier template; composing
+// them keeps a more specific budget able to say LESS than the general one,
+// never more (94, review of billing-engine#221). Every other scope has one
+// row. Spend is read per row: the template's events for its row, the whole
+// app for the AI-wide row.
+func (s *Service) candidates(ctx context.Context, scope Scope, scopeID uuid.UUID, cat Category, templateKey string, start, end time.Time) ([]candidate, error) {
+	var out []candidate
+	add := func(tpl string, decidedBy DecidedBy) error {
+		b, found, err := s.store.GetBudget(ctx, scope, scopeID, cat, tpl)
+		if err != nil || !found {
+			return err
+		}
+		spend, err := s.spendFor(ctx, b, start, end)
 		if err != nil {
-			return Budget{}, DecidedByNone, false, err
+			return err
 		}
-		if found {
-			return b, DecidedByTemplate, true, nil
+		out = append(out, candidate{b: b, decidedBy: decidedBy, spend: spend})
+		return nil
+	}
+	if templateKey != "" {
+		if err := add(templateKey, DecidedByTemplate); err != nil {
+			return nil, err
 		}
 	}
-	b, found, err := s.store.GetBudget(ctx, scope, scopeID, cat, "")
-	if err != nil {
-		return Budget{}, DecidedByNone, false, err
-	}
-	if !found {
-		return Budget{}, DecidedByNone, false, nil
-	}
+	wide := DecidedByApp
 	switch scope {
 	case ScopeOrg:
-		return b, DecidedByOrg, true, nil
+		wide = DecidedByOrg
 	case ScopeAccount:
-		return b, DecidedByAccount, true, nil
+		wide = DecidedByAccount
 	}
-	return b, DecidedByApp, true, nil
+	if err := add("", wide); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// decide composes the candidates into ONE verdict: exhausted if ANY row is
+// exhausted; the row reported is the first exhausted one (the template wins
+// the label when both are spent), else the most specific row. This is the
+// single authority for the verdict — api-platform passes it through.
+func decide(cands []candidate) (candidate, bool) {
+	if len(cands) == 0 {
+		return candidate{}, false
+	}
+	for _, c := range cands {
+		if exhausted(c.b, c.spend) {
+			return c, true
+		}
+	}
+	return cands[0], false
 }
 
 // spendAccount is the billing account whose events an org/account-scoped
@@ -228,22 +262,19 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 		return nil, billing.InvalidInput("scope_id required")
 	}
 
-	b, decidedBy, found, err := s.resolveBudget(ctx, req.Scope, req.ScopeID, cat, req.TemplateKey)
-	if err != nil {
-		return nil, billing.Internal("get budget failed", err)
-	}
-	if !found {
-		return &GetBudgetStatusResponse{Exists: false, Category: cat, DecidedBy: DecidedByNone, Crossed: []int{}}, nil
-	}
-
 	start, end, err := s.windowFor(ctx, req.Scope, req.ScopeID)
 	if err != nil {
 		return nil, billing.Internal("anchor day lookup failed", err)
 	}
-	spend, err := s.spendFor(ctx, b, start, end)
+	cands, err := s.candidates(ctx, req.Scope, req.ScopeID, cat, req.TemplateKey, start, end)
 	if err != nil {
-		return nil, billing.Internal("budget spend query failed", err)
+		return nil, billing.Internal("budget lookup failed", err)
 	}
+	c, isExhausted := decide(cands)
+	if len(cands) == 0 {
+		return &GetBudgetStatusResponse{Exists: false, Category: cat, DecidedBy: DecidedByNone, Crossed: []int{}}, nil
+	}
+	b, spend := c.b, c.spend
 
 	remaining := b.LimitMicros - spend
 	if remaining < 0 {
@@ -252,7 +283,7 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 	return &GetBudgetStatusResponse{
 		Exists:          true,
 		Category:        b.Category,
-		DecidedBy:       decidedBy,
+		DecidedBy:       c.decidedBy,
 		TemplateKey:     b.TemplateKey,
 		PeriodStart:     start,
 		PeriodEnd:       end,
@@ -263,7 +294,7 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 		Active:          b.Active,
 		HardCap:         b.HardCap,
 		AllowOverage:    b.AllowOverage,
-		Exhausted:       exhausted(b, spend),
+		Exhausted:       isExhausted,
 		RemainingMicros: remaining,
 	}, nil
 }
