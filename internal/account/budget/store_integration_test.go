@@ -178,6 +178,8 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.EqualValues(t, 10_000_000, cfg.CardBaseMicros)
 	require.EqualValues(t, 200_000_000, cfg.CeilingMicros)
 	require.InDelta(t, 0.5, cfg.Exponent, 1e-9, "the first seed is the square root")
+	require.True(t, cfg.DelinquentFloor)
+	require.Equal(t, 2, cfg.LatePenaltyK)
 	require.False(t, cfg.EnforcementPaused, "the kill-switch ships off")
 	paused, err := store.SetAIEnforcementPaused(ctx, true, "incident", "ops:owner")
 	require.NoError(t, err)
@@ -239,7 +241,7 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.Equal(t, 2, sig.PaidInvoices, "open invoices do not count as paid")
 	require.True(t, sig.DelinquentNow, "an open invoice with a balance is delinquent now")
 	require.Zero(t, sig.LateCount)
-	require.EqualValues(t, 17_320_508, budget.ExposureLimitMicros(cfg, sig))
+	require.EqualValues(t, 5_000_000, budget.ExposureLimitMicros(cfg, sig), "delinquent: floored regardless of the card and 2 paid invoices")
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET ever_failed = true WHERE stripe_invoice_id = 'in_exposure_a'`)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET status = 'paid', amount_due = 0 WHERE stripe_invoice_id = 'in_exposure_c'`)
@@ -249,6 +251,7 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.False(t, sig.DelinquentNow, "settled: nothing open with a balance")
 	require.Equal(t, 1, sig.LateCount, "a paid invoice that once failed is remembered as late")
 	require.Equal(t, 3, sig.PaidInvoices)
+	require.EqualValues(t, 14_142_136, budget.ExposureLimitMicros(cfg, sig), "3 paid − 2×1 late = k 1 → $10×√2")
 
 	// The system exposure row is storable and re-upserts in place.
 	first, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 17_320_508, AlertPercents: []int{80, 100}, Active: true, HardCap: true})

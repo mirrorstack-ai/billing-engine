@@ -247,20 +247,45 @@ func (s *Service) spendFor(ctx context.Context, b Budget, start, end time.Time) 
 // web's 隨用隨付 card maps to it); 'credits' is the prepaid mode.
 const paasBillingMode = "standard"
 
+// EffectivePaid is k after the delinquency memory (rule b): each late
+// invoice costs LatePenaltyK paid invoices of trust, floored at zero. A
+// LatePenaltyK of 0 keeps k as is; a huge one is "any late payment resets k".
+func EffectivePaid(cfg RiskRampConfig, sig ExposureSignals) int {
+	k := sig.PaidInvoices
+	if k < 0 {
+		k = 0
+	}
+	late := sig.LateCount
+	if late < 0 {
+		late = 0
+	}
+	penalty := cfg.LatePenaltyK
+	if penalty < 0 {
+		penalty = 0
+	}
+	if penalty > 0 && late > 0 {
+		if late > k/penalty { // k − penalty×late < 0 without overflow
+			return 0
+		}
+		k -= penalty * late
+	}
+	return k
+}
+
 // ExposureLimitMicros is the owner's curve (2026-09-14, migration 085): no
 // usable card → NoCardMicros; a usable card with k paid invoices →
 // CardBaseMicros × (1+k)^Exponent — strict at first, flattening (0.5 = √,
 // the first seed; the owner is choosing the shape, so it is config) — never
-// above CeilingMicros. Whole micros, rounded half up; the ceiling also
-// bounds a zero-card floor so a misconfigured row cannot exceed it. An
-// exponent outside (0, 1] (a row the DB CHECK did not see) falls back to √.
+// above CeilingMicros. Delinquency rule (b): while an invoice is open with a
+// balance and DelinquentFloor is set, the limit is NoCardMicros regardless
+// of card or history — the risk control; once settled, k is EffectivePaid —
+// the memory. Whole micros, rounded half up; the ceiling also bounds a
+// zero-card floor so a misconfigured row cannot exceed it. An exponent
+// outside (0, 1] (a row the DB CHECK did not see) falls back to √.
 func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 	var limit int64
-	if sig.HasUsableCard {
-		k := sig.PaidInvoices
-		if k < 0 {
-			k = 0
-		}
+	if sig.HasUsableCard && !(cfg.DelinquentFloor && sig.DelinquentNow) {
+		k := EffectivePaid(cfg, sig)
 		p := cfg.Exponent
 		if p <= 0 || p > 1 {
 			p = 0.5
@@ -323,6 +348,7 @@ func (s *Service) poolFor(ctx context.Context, cfg RiskRampConfig, accountID uui
 		PaidInvoices:    sig.PaidInvoices,
 		DelinquentNow:   sig.DelinquentNow,
 		LateCount:       sig.LateCount,
+		EffectivePaid:   EffectivePaid(cfg, sig),
 	}, nil
 }
 
@@ -616,14 +642,16 @@ func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse,
 		return nil, billing.Internal("risk ramp config read failed", err)
 	}
 	return &AIEnforcementResponse{
-		Paused:         cfg.EnforcementPaused,
-		PausedReason:   cfg.PausedReason,
-		PausedBy:       cfg.PausedBy,
-		PausedAt:       cfg.PausedAt,
-		NoCardMicros:   cfg.NoCardMicros,
-		CardBaseMicros: cfg.CardBaseMicros,
-		CeilingMicros:  cfg.CeilingMicros,
-		Exponent:       cfg.Exponent,
+		Paused:          cfg.EnforcementPaused,
+		PausedReason:    cfg.PausedReason,
+		PausedBy:        cfg.PausedBy,
+		PausedAt:        cfg.PausedAt,
+		NoCardMicros:    cfg.NoCardMicros,
+		CardBaseMicros:  cfg.CardBaseMicros,
+		CeilingMicros:   cfg.CeilingMicros,
+		Exponent:        cfg.Exponent,
+		DelinquentFloor: cfg.DelinquentFloor,
+		LatePenaltyK:    cfg.LatePenaltyK,
 	}, nil
 }
 

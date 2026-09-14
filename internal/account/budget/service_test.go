@@ -61,7 +61,7 @@ func newFakeStore() *fakeStore {
 		orgAccounts: map[uuid.UUID]uuid.UUID{},
 		appPayers:   map[uuid.UUID]uuid.UUID{},
 		signals:     map[uuid.UUID]budget.ExposureSignals{},
-		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5},
+		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5, DelinquentFloor: true, LatePenaltyK: 2},
 	}
 }
 
@@ -1090,4 +1090,65 @@ func TestGetBudgetStatus_KillSwitchAllowsEveryVerdict(t *testing.T) {
 	st = read()
 	require.False(t, st.Exhausted)
 	require.Equal(t, budget.DecidedByApp, st.DecidedBy, "paused labels only a verdict it changed")
+}
+
+// TestExposureLimitMicros_DelinquencyRuleB pins rule (b): a delinquent
+// account is floored at the no-card figure regardless of card or history;
+// once settled, each late invoice costs late_penalty_k paid invoices of
+// trust; a huge penalty is rule (a) (any late payment resets k); the floor
+// can be switched off by config.
+func TestExposureLimitMicros_DelinquencyRuleB(t *testing.T) {
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5, DelinquentFloor: true, LatePenaltyK: 2}
+
+	// Delinquent NOW: floored at $5 regardless of card and k.
+	require.EqualValues(t, 5_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24, DelinquentNow: true}), "a delinquent account with a card and 24 paid invoices is floored")
+	require.EqualValues(t, 5_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: false, PaidInvoices: 24, DelinquentNow: true}))
+
+	// Settled, with memory: 8 paid, 1 late → k_eff 6 → $10×√7.
+	require.EqualValues(t, 26_457_513, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 1}))
+	require.Equal(t, 6, budget.EffectivePaid(cfg, budget.ExposureSignals{PaidInvoices: 8, LateCount: 1}))
+	// 3 paid, 2 late → k_eff floors at 0 → $10.
+	require.EqualValues(t, 10_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 3, LateCount: 2}))
+	require.Zero(t, budget.EffectivePaid(cfg, budget.ExposureSignals{PaidInvoices: 3, LateCount: 2}))
+	// No late history: unchanged curve.
+	require.EqualValues(t, 30_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8}))
+
+	// Rule (a) through the same column: a huge penalty resets k on any late payment.
+	reset := cfg
+	reset.LatePenaltyK = 1_000_000
+	require.EqualValues(t, 10_000_000, budget.ExposureLimitMicros(reset, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24, LateCount: 1}))
+	require.Zero(t, budget.EffectivePaid(reset, budget.ExposureSignals{PaidInvoices: 24, LateCount: 1}))
+
+	// Penalty 0: late history is forgotten.
+	none := cfg
+	none.LatePenaltyK = 0
+	require.EqualValues(t, 30_000_000, budget.ExposureLimitMicros(none, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 5}))
+
+	// Floor switched off: a delinquent account keeps the curve (memory still applies).
+	noFloor := cfg
+	noFloor.DelinquentFloor = false
+	require.EqualValues(t, 26_457_513, budget.ExposureLimitMicros(noFloor, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 1, DelinquentNow: true}))
+}
+
+// TestGetBudgetStatus_DelinquentAccountIsFlooredOnTheWire: the pool a
+// delinquent PaaS account reports is the $5 floor, and its inputs are echoed
+// so the console can say why.
+func TestGetBudgetStatus_DelinquentAccountIsFlooredOnTheWire(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	acct := uuid.New()
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 24, DelinquentNow: true, LateCount: 1}
+	store.accountAllSpend = 4_500_000
+	st, err := svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.EqualValues(t, 5_000_000, st.Pool.LimitMicros)
+	require.True(t, st.Pool.DelinquentNow)
+	require.Equal(t, 1, st.Pool.LateCount)
+	require.Equal(t, 22, st.Pool.EffectivePaid)
+	require.False(t, st.Pool.Exhausted)
+	store.accountAllSpend = 5_000_000
+	st, err = svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
+	require.NoError(t, err)
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByExposureLimit, st.DecidedBy)
 }

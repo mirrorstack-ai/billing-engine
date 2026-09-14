@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
     -- always grows and never explodes.
     exponent              NUMERIC(4,3) NOT NULL DEFAULT 0.500
                           CONSTRAINT risk_ramp_exponent_range CHECK (exponent > 0 AND exponent <= 1),
+    -- Delinquency rule (b), coordinator's pick pending the owner's numbers:
+    -- while an invoice is open/uncollectible with a balance the limit is
+    -- no_card_micros regardless of card or history (delinquent_floor), and
+    -- once settled each late invoice costs late_penalty_k paid invoices of
+    -- trust: k_eff = max(0, paid − late_penalty_k × late). late_penalty_k
+    -- large = "any late payment resets k" (rule a). No multiplier: a fraction
+    -- of a large limit while delinquent is the wrong direction for a risk cap.
+    delinquent_floor      BOOLEAN NOT NULL DEFAULT true,
+    late_penalty_k        INT NOT NULL DEFAULT 2 CONSTRAINT risk_ramp_late_penalty_nonneg CHECK (late_penalty_k >= 0),
     ai_enforcement_paused BOOLEAN NOT NULL DEFAULT false,
     -- Who paused it, why, and since when — so "why was enforcement off for
     -- six hours" is answered from the row, not from archaeology. Cleared on
@@ -59,7 +68,7 @@ VALUES (1, 5000000, 10000000, 200000000)
 ON CONFLICT (id) DO NOTHING;
 
 COMMENT ON TABLE ms_billing.risk_ramp_config IS
-    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent (0.5 = sqrt); capped at ceiling_micros. Finance-owned; tune by UPDATE.';
+    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent (0.5 = sqrt); capped at ceiling_micros. Delinquency: floored at no_card_micros while delinquent (delinquent_floor), k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
 
 ALTER TABLE ms_billing.budgets
     DROP CONSTRAINT IF EXISTS budgets_category_known;
