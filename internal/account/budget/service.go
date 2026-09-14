@@ -272,11 +272,44 @@ func EffectivePaid(cfg RiskRampConfig, sig ExposureSignals) int {
 	return k
 }
 
-// ExposureLimitMicros is the owner's FINAL curve (2026-09-14, migration
-// 085): no usable card → NoCardMicros; a usable card with k paid invoices →
-// CardBaseMicros + RangeMicros × (1 − e^(−k/Tau)) — steep at first,
-// saturating toward base + range ($10 + $190) — and never above
-// CeilingMicros, the hard clamp. Delinquency (owner's pick): while an
+// growth is the configured shape's fraction of the range earned at k paid
+// invoices, in [0, 1]. Sigmoid (owner's final shape): a logistic
+// normalised so it is 0 at k=0 and EXACTLY 1 at k >= KMax — the curve
+// reaches base + range at KMax, never asymptotically. Exp: 1 − e^(−k/Tau).
+// A row with unusable parameters (the DB CHECKs guard the real one) earns
+// nothing: the base alone.
+func growth(cfg RiskRampConfig, k int) float64 {
+	if k < 0 {
+		k = 0
+	}
+	switch cfg.Shape {
+	case ShapeSigmoid:
+		if cfg.KMax <= 0 || cfg.A <= 0 {
+			return 0
+		}
+		if k >= cfg.KMax {
+			return 1
+		}
+		g := func(x float64) float64 { return 1 / (1 + math.Exp(-cfg.A*(x-cfg.K0))) }
+		den := g(float64(cfg.KMax)) - g(0)
+		if den <= 0 {
+			return 0
+		}
+		return (g(float64(k)) - g(0)) / den
+	case ShapeExp:
+		if cfg.Tau <= 0 {
+			return 0
+		}
+		return 1 - math.Exp(-float64(k)/cfg.Tau)
+	}
+	return 0
+}
+
+// ExposureLimitMicros is the owner's curve (2026-09-14, migration 085): no
+// usable card → NoCardMicros; a usable card with k paid invoices →
+// CardBaseMicros + RangeMicros × growth(k) — the configured shape (sigmoid
+// seeded: $10 + $990 × a normalised logistic, exactly $1,000 at k = 24) —
+// and never above CeilingMicros, the hard clamp. Delinquency (owner's pick): while an
 // invoice is open with a balance the limit is the curve divided by
 // DelinquentDivisor, never below NoCardMicros — the risk control without a
 // hard cliff (a huge divisor reproduces the cliff, 1 disables the
@@ -288,11 +321,7 @@ func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 	var limit int64
 	if sig.HasUsableCard {
 		k := EffectivePaid(cfg, sig)
-		growth := 0.0
-		if cfg.Tau > 0 && cfg.RangeMicros > 0 {
-			growth = float64(cfg.RangeMicros) * (1 - math.Exp(-float64(k)/cfg.Tau))
-		}
-		limit = int64(math.Round(float64(cfg.CardBaseMicros) + growth))
+		limit = int64(math.Round(float64(cfg.CardBaseMicros) + float64(cfg.RangeMicros)*growth(cfg, k)))
 	} else {
 		limit = cfg.NoCardMicros
 	}
@@ -661,6 +690,10 @@ func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse,
 		CardBaseMicros:    cfg.CardBaseMicros,
 		CeilingMicros:     cfg.CeilingMicros,
 		RangeMicros:       cfg.RangeMicros,
+		Shape:             cfg.Shape,
+		A:                 cfg.A,
+		K0:                cfg.K0,
+		KMax:              cfg.KMax,
 		Tau:               cfg.Tau,
 		DelinquentDivisor: cfg.DelinquentDivisor,
 		LatePenaltyK:      cfg.LatePenaltyK,

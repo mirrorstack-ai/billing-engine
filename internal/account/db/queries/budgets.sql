@@ -255,7 +255,7 @@ WHERE a.id = $1;
 -- RiskRampConfig reads the singleton curve row (085) together with the
 -- incident kill-switch, so one read per verdict serves both.
 -- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros, range_micros, tau::float8 AS tau,
+SELECT no_card_micros, card_base_micros, ceiling_micros, range_micros, shape, p_a::float8 AS p_a, p_k0::float8 AS p_k0, k_max, tau::float8 AS tau,
        delinquent_divisor, late_penalty_k, ai_enforcement_paused,
        COALESCE(paused_reason, '')::text AS paused_reason,
        COALESCE(paused_by, '')::text     AS paused_by,

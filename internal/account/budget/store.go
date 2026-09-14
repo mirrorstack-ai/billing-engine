@@ -260,7 +260,7 @@ func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
 	}
 	cfg := RiskRampConfig{
 		NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros,
-		RangeMicros: row.RangeMicros, Tau: row.Tau, DelinquentDivisor: int(row.DelinquentDivisor), LatePenaltyK: int(row.LatePenaltyK),
+		RangeMicros: row.RangeMicros, Shape: Shape(row.Shape), A: row.PA, K0: row.PK0, KMax: int(row.KMax), Tau: row.Tau, DelinquentDivisor: int(row.DelinquentDivisor), LatePenaltyK: int(row.LatePenaltyK),
 		EnforcementPaused: row.AiEnforcementPaused, PausedReason: row.PausedReason, PausedBy: row.PausedBy,
 	}
 	if row.PausedAt.Valid {

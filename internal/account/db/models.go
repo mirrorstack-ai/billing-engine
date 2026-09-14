@@ -900,13 +900,17 @@ type MsBillingPaymentMethodsMirror struct {
 	CardCountry    pgtype.Text        `json:"card_country"`
 }
 
-// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × (1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.
+// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × growth(k) where growth is the configured shape (sigmoid: normalised logistic reaching 1 at k_max; exp: 1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.
 type MsBillingRiskRampConfig struct {
 	ID                int16          `json:"id"`
 	NoCardMicros      int64          `json:"no_card_micros"`
 	CardBaseMicros    int64          `json:"card_base_micros"`
 	CeilingMicros     int64          `json:"ceiling_micros"`
 	RangeMicros       int64          `json:"range_micros"`
+	Shape             string         `json:"shape"`
+	PA                pgtype.Numeric `json:"p_a"`
+	PK0               pgtype.Numeric `json:"p_k0"`
+	KMax              int32          `json:"k_max"`
 	Tau               pgtype.Numeric `json:"tau"`
 	DelinquentDivisor int32          `json:"delinquent_divisor"`
 	LatePenaltyK      int32          `json:"late_penalty_k"`

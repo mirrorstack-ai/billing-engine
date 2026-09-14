@@ -214,16 +214,29 @@ type ExposureSignals struct {
 	LateCount     int
 }
 
+// Shape selects the exposure curve's growth function (085).
+type Shape string
+
+const (
+	ShapeExp     Shape = "exp"
+	ShapeSigmoid Shape = "sigmoid"
+)
+
 // RiskRampConfig is the finance-owned curve row (085), read once per AI
 // verdict together with the incident kill-switch.
 type RiskRampConfig struct {
 	NoCardMicros   int64
 	CardBaseMicros int64
 	CeilingMicros  int64
-	// RangeMicros / Tau shape the saturating growth base + range × (1 −
-	// e^(−k/tau)): 63% of the range at k = tau, 95% at 3·tau; the DB keeps
-	// tau positive.
+	// RangeMicros is how far above the base the curve climbs; Shape and its
+	// parameters say how fast. ShapeSigmoid (owner's final shape): growth =
+	// [g(k) − g(0)] / [g(KMax) − g(0)], g(x) = 1/(1+e^(−A(x−K0))), exactly 1
+	// at k ≥ KMax. ShapeExp: growth = 1 − e^(−k/Tau).
 	RangeMicros int64
+	Shape       Shape
+	A           float64
+	K0          float64
+	KMax        int
 	Tau         float64
 	// DelinquentDivisor / LatePenaltyK are the delinquency rule (owner
 	// 2026-09-14): while delinquent the limit is curve / DelinquentDivisor,
@@ -259,6 +272,10 @@ type AIEnforcementResponse struct {
 	CardBaseMicros    int64     `json:"card_base_micros"`
 	CeilingMicros     int64     `json:"ceiling_micros"`
 	RangeMicros       int64     `json:"range_micros"`
+	Shape             Shape     `json:"shape"`
+	A                 float64   `json:"p_a"`
+	K0                float64   `json:"p_k0"`
+	KMax              int       `json:"k_max"`
 	Tau               float64   `json:"tau"`
 	DelinquentDivisor int       `json:"delinquent_divisor"`
 	LatePenaltyK      int       `json:"late_penalty_k"`

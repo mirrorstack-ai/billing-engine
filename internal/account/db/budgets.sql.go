@@ -470,7 +470,7 @@ func (q *Queries) ListBudgetAlerts(ctx context.Context, arg ListBudgetAlertsPara
 }
 
 const riskRampConfig = `-- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros, range_micros, tau::float8 AS tau,
+SELECT no_card_micros, card_base_micros, ceiling_micros, range_micros, shape, p_a::float8 AS p_a, p_k0::float8 AS p_k0, k_max, tau::float8 AS tau,
        delinquent_divisor, late_penalty_k, ai_enforcement_paused,
        COALESCE(paused_reason, '')::text AS paused_reason,
        COALESCE(paused_by, '')::text     AS paused_by,
@@ -484,6 +484,10 @@ type RiskRampConfigRow struct {
 	CardBaseMicros      int64              `json:"card_base_micros"`
 	CeilingMicros       int64              `json:"ceiling_micros"`
 	RangeMicros         int64              `json:"range_micros"`
+	Shape               string             `json:"shape"`
+	PA                  float64            `json:"p_a"`
+	PK0                 float64            `json:"p_k0"`
+	KMax                int32              `json:"k_max"`
 	Tau                 float64            `json:"tau"`
 	DelinquentDivisor   int32              `json:"delinquent_divisor"`
 	LatePenaltyK        int32              `json:"late_penalty_k"`
@@ -503,6 +507,10 @@ func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error)
 		&i.CardBaseMicros,
 		&i.CeilingMicros,
 		&i.RangeMicros,
+		&i.Shape,
+		&i.PA,
+		&i.PK0,
+		&i.KMax,
 		&i.Tau,
 		&i.DelinquentDivisor,
 		&i.LatePenaltyK,

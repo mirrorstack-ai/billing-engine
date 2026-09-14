@@ -8,14 +8,21 @@
 -- flattening —
 --
 --     no verified card            → no_card_micros              ($5)
---     verified card, k paid inv.  → card_base_micros + range_micros × (1 − e^(−k/tau))
---                                   (owner's FINAL shape 2026-09-14: $10 + $190 ×
---                                    (1 − e^(−k/5)) — $10 at k=0, $44 at k=1,
---                                    $130 at k=5, saturating toward $200)
---     never above                 → ceiling_micros              ($200, the hard clamp)
+--     verified card, k paid inv.  → card_base_micros + range_micros × growth(k)
+--                                   growth(k) is the configured SHAPE:
+--                                     'sigmoid' (owner 2026-09-14, FINAL):
+--                                        [g(k) − g(0)] / [g(k_max) − g(0)],
+--                                        g(x) = 1 / (1 + e^(−p_a·(x − p_k0))),
+--                                        = 1 for k ≥ k_max  → exactly base + range
+--                                     'exp': 1 − e^(−k/tau)
+--     never above                 → ceiling_micros              (the hard clamp)
 --
--- The SHAPE is config too (coordinator, PR-B review): base, range and tau
--- are columns, so the next tuning is an UPDATE.
+-- The SHAPE is config (coordinator, PR-B review): shape, base, range, the
+-- shape's parameters and the cap are columns, so the next change is an
+-- UPDATE and not a PR. 🔴 CAP MOVED $200 → $1,000 (a 5× risk-appetite
+-- change, owner's decision 2026-09-14 via f5). Seed = S2 (k0 10, a 0.6):
+-- $10 (k=0), $22 (k=3), $90 (k=6), $504 (k=10), $918 (k=14), $1,000 (k=24);
+-- S1 (k0 6, a 0.8) and S3 (k0 14, a 0.5) are the alternatives on the PR.
 --
 -- The constants are FINANCE-OWNED and live here, in one row, so they are
 -- tuned by an UPDATE and never by a code literal (collection.go's trust ramp
@@ -41,10 +48,15 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
     no_card_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_no_card_nonneg CHECK (no_card_micros >= 0),
     card_base_micros      BIGINT NOT NULL CONSTRAINT risk_ramp_card_base_nonneg CHECK (card_base_micros >= 0),
     ceiling_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_ceiling_nonneg CHECK (ceiling_micros >= 0),
-    -- Saturating growth: range_micros is how far above the base the curve
-    -- can climb, tau (in paid invoices) how fast it gets there — 63% of the
-    -- range at k = tau, 95% at 3·tau.
-    range_micros          BIGINT NOT NULL DEFAULT 190000000 CONSTRAINT risk_ramp_range_nonneg CHECK (range_micros >= 0),
+    -- range_micros is how far above the base the curve can climb; the shape
+    -- and its parameters say how fast: 'sigmoid' uses p_a (steepness), p_k0
+    -- (the midpoint in paid invoices) and k_max (where it reaches base+range
+    -- exactly); 'exp' uses tau (63% of the range at k = tau).
+    range_micros          BIGINT NOT NULL DEFAULT 990000000 CONSTRAINT risk_ramp_range_nonneg CHECK (range_micros >= 0),
+    shape                 TEXT NOT NULL DEFAULT 'sigmoid' CONSTRAINT risk_ramp_shape_known CHECK (shape IN ('exp', 'sigmoid')),
+    p_a                   NUMERIC(6,3) NOT NULL DEFAULT 0.600 CONSTRAINT risk_ramp_p_a_positive CHECK (p_a > 0),
+    p_k0                  NUMERIC(6,3) NOT NULL DEFAULT 10.000,
+    k_max                 INT NOT NULL DEFAULT 24 CONSTRAINT risk_ramp_k_max_positive CHECK (k_max > 0),
     tau                   NUMERIC(6,3) NOT NULL DEFAULT 5.000 CONSTRAINT risk_ramp_tau_positive CHECK (tau > 0),
     -- Delinquency (owner's pick 2026-09-14): while an invoice is open /
     -- uncollectible with a balance the limit is the curve DIVIDED by
@@ -66,11 +78,11 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
 );
 
 INSERT INTO ms_billing.risk_ramp_config (id, no_card_micros, card_base_micros, ceiling_micros)
-VALUES (1, 5000000, 10000000, 200000000)
+VALUES (1, 5000000, 10000000, 1000000000)
 ON CONFLICT (id) DO NOTHING;
 
 COMMENT ON TABLE ms_billing.risk_ramp_config IS
-    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × (1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
+    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × growth(k) where growth is the configured shape (sigmoid: normalised logistic reaching 1 at k_max; exp: 1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
 
 ALTER TABLE ms_billing.budgets
     DROP CONSTRAINT IF EXISTS budgets_category_known;
