@@ -60,8 +60,12 @@ type Store interface {
 	// ExposureSignals reads the curve's inputs for an account.
 	ExposureSignals(ctx context.Context, accountID uuid.UUID) (ExposureSignals, error)
 
-	// RiskRampConfig reads the finance-owned curve row (085).
+	// RiskRampConfig reads the finance-owned curve row (085) and the
+	// incident kill-switch.
 	RiskRampConfig(ctx context.Context) (RiskRampConfig, error)
+
+	// SetAIEnforcementPaused flips the kill-switch; returns the stored value.
+	SetAIEnforcementPaused(ctx context.Context, paused bool) (bool, error)
 
 	// InsertBudgetAlerts records a batch of threshold crossings in ONE
 	// transaction (all-or-nothing): either every row is committed or none are,
@@ -253,7 +257,15 @@ func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
 	if err != nil {
 		return RiskRampConfig{}, err
 	}
-	return RiskRampConfig{NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros}, nil
+	return RiskRampConfig{NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros, EnforcementPaused: row.AiEnforcementPaused}, nil
+}
+
+func (s *pgxStore) SetAIEnforcementPaused(ctx context.Context, paused bool) (bool, error) {
+	row, err := s.q.SetAIEnforcementPaused(ctx, paused)
+	if err != nil {
+		return false, err
+	}
+	return row.AiEnforcementPaused, nil
 }
 
 func (s *pgxStore) InsertBudgetAlerts(ctx context.Context, records []AlertRecord) ([]int, error) {

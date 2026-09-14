@@ -240,11 +240,20 @@ SELECT
 FROM ms_billing.accounts a
 WHERE a.id = $1;
 
--- RiskRampConfig reads the singleton curve row (085).
+-- RiskRampConfig reads the singleton curve row (085) together with the
+-- incident kill-switch, so one read per verdict serves both.
 -- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros
+SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused
 FROM ms_billing.risk_ramp_config
 WHERE id = 1;
+
+-- SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret).
+-- name: SetAIEnforcementPaused :one
+UPDATE ms_billing.risk_ramp_config
+SET ai_enforcement_paused = @paused::boolean,
+    updated_at            = now()
+WHERE id = 1
+RETURNING ai_enforcement_paused, updated_at;
 
 -- anchor day 1 (UTC calendar month). Returns at most one row.
 -- name: AppAccountActivatedAt :one

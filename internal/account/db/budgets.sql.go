@@ -450,22 +450,50 @@ func (q *Queries) ListBudgetAlerts(ctx context.Context, arg ListBudgetAlertsPara
 }
 
 const riskRampConfig = `-- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros
+SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused
 FROM ms_billing.risk_ramp_config
 WHERE id = 1
 `
 
 type RiskRampConfigRow struct {
-	NoCardMicros   int64 `json:"no_card_micros"`
-	CardBaseMicros int64 `json:"card_base_micros"`
-	CeilingMicros  int64 `json:"ceiling_micros"`
+	NoCardMicros        int64 `json:"no_card_micros"`
+	CardBaseMicros      int64 `json:"card_base_micros"`
+	CeilingMicros       int64 `json:"ceiling_micros"`
+	AiEnforcementPaused bool  `json:"ai_enforcement_paused"`
 }
 
-// RiskRampConfig reads the singleton curve row (085).
+// RiskRampConfig reads the singleton curve row (085) together with the
+// incident kill-switch, so one read per verdict serves both.
 func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error) {
 	row := q.db.QueryRow(ctx, riskRampConfig)
 	var i RiskRampConfigRow
-	err := row.Scan(&i.NoCardMicros, &i.CardBaseMicros, &i.CeilingMicros)
+	err := row.Scan(
+		&i.NoCardMicros,
+		&i.CardBaseMicros,
+		&i.CeilingMicros,
+		&i.AiEnforcementPaused,
+	)
+	return i, err
+}
+
+const setAIEnforcementPaused = `-- name: SetAIEnforcementPaused :one
+UPDATE ms_billing.risk_ramp_config
+SET ai_enforcement_paused = $1::boolean,
+    updated_at            = now()
+WHERE id = 1
+RETURNING ai_enforcement_paused, updated_at
+`
+
+type SetAIEnforcementPausedRow struct {
+	AiEnforcementPaused bool      `json:"ai_enforcement_paused"`
+	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+// SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret).
+func (q *Queries) SetAIEnforcementPaused(ctx context.Context, paused bool) (SetAIEnforcementPausedRow, error) {
+	row := q.db.QueryRow(ctx, setAIEnforcementPaused, paused)
+	var i SetAIEnforcementPausedRow
+	err := row.Scan(&i.AiEnforcementPaused, &i.UpdatedAt)
 	return i, err
 }
 

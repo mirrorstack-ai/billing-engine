@@ -2,6 +2,7 @@ package budget
 
 import (
 	"context"
+	"log/slog"
 	"math"
 	"sort"
 	"time"
@@ -276,7 +277,7 @@ func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 // Source none and never exhausts. On a PaaS account it also refreshes the
 // account's SYSTEM 'exposure' budget row (limit = the curve, hard cap) so the
 // ingest-path evaluation can record 80% / 100% crossings against it.
-func (s *Service) poolFor(ctx context.Context, accountID uuid.UUID, found bool, start, end time.Time) (*Pool, error) {
+func (s *Service) poolFor(ctx context.Context, cfg RiskRampConfig, accountID uuid.UUID, found bool, start, end time.Time) (*Pool, error) {
 	if !found {
 		return &Pool{Mode: "none", Source: PoolSourceNone}, nil
 	}
@@ -286,10 +287,6 @@ func (s *Service) poolFor(ctx context.Context, accountID uuid.UUID, found bool, 
 	}
 	if sig.BillingMode != paasBillingMode {
 		return &Pool{Mode: sig.BillingMode, Source: PoolSourceNone, HasUsableCard: sig.HasUsableCard, PaidInvoices: sig.PaidInvoices}, nil
-	}
-	cfg, err := s.store.RiskRampConfig(ctx)
-	if err != nil {
-		return nil, err
 	}
 	limit := ExposureLimitMicros(cfg, sig)
 	accrued, err := s.store.AccountPeriodSpendMicros(ctx, accountID, start, end)
@@ -362,21 +359,33 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 	c, isExhausted := decide(cands)
 
 	// The PaaS exposure pool rides every category='ai' read (PR-B): OR'd into
-	// the verdict, named by decided_by only when no customer cap bit.
+	// the verdict, named by decided_by only when no customer cap bit. The
+	// curve row is read ONCE per verdict and carries the incident
+	// kill-switch: while paused, every AI verdict is allowed and says so —
+	// the figures (caps, pool) are still reported so the console can show
+	// what WOULD have refused.
 	var pool *Pool
 	decidedBy := c.decidedBy
 	if cat == CategoryAI {
+		cfg, err := s.store.RiskRampConfig(ctx)
+		if err != nil {
+			return nil, billing.Internal("risk ramp config read failed", err)
+		}
 		acct, found, err := s.payerAccount(ctx, req.Scope, req.ScopeID)
 		if err != nil {
 			return nil, billing.Internal("payer account lookup failed", err)
 		}
-		pool, err = s.poolFor(ctx, acct, found, start, end)
+		pool, err = s.poolFor(ctx, cfg, acct, found, start, end)
 		if err != nil {
 			return nil, billing.Internal("exposure pool evaluation failed", err)
 		}
 		if pool.Exhausted && !isExhausted {
 			isExhausted = true
 			decidedBy = DecidedByExposureLimit
+		}
+		if cfg.EnforcementPaused && isExhausted {
+			isExhausted = false
+			decidedBy = DecidedByPaused
 		}
 	}
 	if len(cands) == 0 {
@@ -527,7 +536,11 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 	// The pool's crossings (085): refresh the system row against the curve and
 	// record 80% / 100% of the account's whole-period usage — the pre-cliff
 	// warning the console shows before the assistant stops.
-	pool, err := s.poolFor(ctx, accountID, true, periodStart, periodEnd)
+	cfg, err := s.store.RiskRampConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := s.poolFor(ctx, cfg, accountID, true, periodStart, periodEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -570,6 +583,33 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 		fired = append(fired, got...)
 	}
 	return fired, nil
+}
+
+// SetAIEnforcementPaused flips the incident kill-switch (migration 085): a
+// platform CONTROL-PLANE call (internal secret). Paused=true makes every AI
+// verdict allowed (decided_by "paused") on the next read — no deploy, no
+// cache on this side. Logged with the caller's reason.
+func (s *Service) SetAIEnforcementPaused(ctx context.Context, req SetAIEnforcementPausedRequest) (*AIEnforcementResponse, error) {
+	paused, err := s.store.SetAIEnforcementPaused(ctx, req.Paused)
+	if err != nil {
+		return nil, billing.Internal("set ai enforcement paused failed", err)
+	}
+	slog.WarnContext(ctx, "AI budget enforcement kill-switch changed", "paused", paused, "reason", req.Reason)
+	return s.GetAIEnforcement(ctx)
+}
+
+// GetAIEnforcement reads the kill-switch and the curve in one call.
+func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse, error) {
+	cfg, err := s.store.RiskRampConfig(ctx)
+	if err != nil {
+		return nil, billing.Internal("risk ramp config read failed", err)
+	}
+	return &AIEnforcementResponse{
+		Paused:         cfg.EnforcementPaused,
+		NoCardMicros:   cfg.NoCardMicros,
+		CardBaseMicros: cfg.CardBaseMicros,
+		CeilingMicros:  cfg.CeilingMicros,
+	}, nil
 }
 
 // recordCrossings inserts the thresholds spend has reached for one budget

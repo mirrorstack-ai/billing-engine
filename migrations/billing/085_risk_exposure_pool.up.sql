@@ -24,12 +24,19 @@
 -- budget and the console can warn BEFORE the assistant stops for every member
 -- at once (94's review note: with a $5 floor the 80% notice is the only
 -- warning anyone gets).
+-- ai_enforcement_paused is the INCIDENT KILL-SWITCH (coordinator, PR-B review):
+-- read on every AI verdict, so flipping it through the SetAIEnforcementPaused
+-- admin RPC pauses refusals platform-wide without a wave — the agent's own
+-- enforcement flag is a provision-time env snapshot and cannot do that. While
+-- paused every verdict is allowed and decided_by = 'paused'; alerts keep
+-- recording so the pause leaves an audit trail of what WOULD have refused.
 CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
-    id                 SMALLINT PRIMARY KEY DEFAULT 1 CONSTRAINT risk_ramp_config_singleton CHECK (id = 1),
-    no_card_micros     BIGINT NOT NULL CONSTRAINT risk_ramp_no_card_nonneg CHECK (no_card_micros >= 0),
-    card_base_micros   BIGINT NOT NULL CONSTRAINT risk_ramp_card_base_nonneg CHECK (card_base_micros >= 0),
-    ceiling_micros     BIGINT NOT NULL CONSTRAINT risk_ramp_ceiling_nonneg CHECK (ceiling_micros >= 0),
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                    SMALLINT PRIMARY KEY DEFAULT 1 CONSTRAINT risk_ramp_config_singleton CHECK (id = 1),
+    no_card_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_no_card_nonneg CHECK (no_card_micros >= 0),
+    card_base_micros      BIGINT NOT NULL CONSTRAINT risk_ramp_card_base_nonneg CHECK (card_base_micros >= 0),
+    ceiling_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_ceiling_nonneg CHECK (ceiling_micros >= 0),
+    ai_enforcement_paused BOOLEAN NOT NULL DEFAULT false,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 INSERT INTO ms_billing.risk_ramp_config (id, no_card_micros, card_base_micros, ceiling_micros)
@@ -43,6 +50,20 @@ ALTER TABLE ms_billing.budgets
     DROP CONSTRAINT IF EXISTS budgets_category_known;
 ALTER TABLE ms_billing.budgets
     ADD CONSTRAINT budgets_category_known CHECK (category IN ('all', 'ai', 'exposure'));
+
+COMMENT ON COLUMN ms_billing.risk_ramp_config.ai_enforcement_paused IS
+    'Incident kill-switch: true = every AI budget verdict is allowed (decided_by paused) while alerts keep recording. Flip via the SetAIEnforcementPaused admin RPC; no deploy needed.';
+
+-- Covering indexes for the per-event spend sums the AI caps and the exposure
+-- pool run on every ai status read and every infra.ai.* ingest (084/085):
+-- the predicates are app_id / account_id + COALESCE(billable_at, recorded_at)
+-- range + metric, so the expression is indexed as the queries spell it —
+-- the existing (…, metric, recorded_at) / occurrence indexes do not match
+-- the COALESCE and put module_id in the middle of the app key.
+CREATE INDEX IF NOT EXISTS usage_events_app_billable_metric_idx
+    ON ms_billing.usage_events (app_id, (COALESCE(billable_at, recorded_at)), metric);
+CREATE INDEX IF NOT EXISTS usage_events_account_billable_metric_idx
+    ON ms_billing.usage_events (account_id, (COALESCE(billable_at, recorded_at)), metric);
 
 COMMENT ON COLUMN ms_billing.budgets.category IS
     'Which spend the cap measures: all (every usage event), ai (infra.ai.* only, priced per model), or exposure (the SYSTEM row billing-engine maintains per PaaS account so budget_alerts can record crossings of the risk-exposure pool; never written by a customer).';

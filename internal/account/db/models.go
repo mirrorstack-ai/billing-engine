@@ -902,11 +902,13 @@ type MsBillingPaymentMethodsMirror struct {
 
 // The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × sqrt(1+k); capped at ceiling_micros. Finance-owned; tune by UPDATE.
 type MsBillingRiskRampConfig struct {
-	ID             int16     `json:"id"`
-	NoCardMicros   int64     `json:"no_card_micros"`
-	CardBaseMicros int64     `json:"card_base_micros"`
-	CeilingMicros  int64     `json:"ceiling_micros"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             int16 `json:"id"`
+	NoCardMicros   int64 `json:"no_card_micros"`
+	CardBaseMicros int64 `json:"card_base_micros"`
+	CeilingMicros  int64 `json:"ceiling_micros"`
+	// Incident kill-switch: true = every AI budget verdict is allowed (decided_by paused) while alerts keep recording. Flip via the SetAIEnforcementPaused admin RPC; no deploy needed.
+	AiEnforcementPaused bool      `json:"ai_enforcement_paused"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type MsBillingUsageAggregate struct {

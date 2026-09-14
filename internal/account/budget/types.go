@@ -160,6 +160,9 @@ const (
 	// DecidedByExposureLimit: no customer cap bit, the PaaS risk-exposure
 	// pool did (PR-B, migration 085).
 	DecidedByExposureLimit DecidedBy = "exposure_limit"
+	// DecidedByPaused: the incident kill-switch is on — every verdict is
+	// allowed regardless of caps and pool (migration 085).
+	DecidedByPaused DecidedBy = "paused"
 )
 
 // PoolSource says what bounds the pool: the risk-exposure curve, or nothing
@@ -199,11 +202,30 @@ type ExposureSignals struct {
 	PaidInvoices  int
 }
 
-// RiskRampConfig is the finance-owned curve row (085).
+// RiskRampConfig is the finance-owned curve row (085), read once per AI
+// verdict together with the incident kill-switch.
 type RiskRampConfig struct {
-	NoCardMicros   int64
-	CardBaseMicros int64
-	CeilingMicros  int64
+	NoCardMicros      int64
+	CardBaseMicros    int64
+	CeilingMicros     int64
+	EnforcementPaused bool
+}
+
+// SetAIEnforcementPausedRequest flips the incident kill-switch (admin RPC,
+// internal secret): Paused=true allows every AI verdict platform-wide until
+// flipped back, with no deploy. Reason is logged, never stored.
+type SetAIEnforcementPausedRequest struct {
+	Paused bool   `json:"paused"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// AIEnforcementResponse is the switch's state plus the curve, so an admin
+// surface shows both in one read.
+type AIEnforcementResponse struct {
+	Paused         bool  `json:"paused"`
+	NoCardMicros   int64 `json:"no_card_micros"`
+	CardBaseMicros int64 `json:"card_base_micros"`
+	CeilingMicros  int64 `json:"ceiling_micros"`
 }
 
 // GetBudgetStatusResponse is the live spend-vs-cap status. Exists is false

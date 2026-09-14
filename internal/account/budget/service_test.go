@@ -145,6 +145,11 @@ func (f *fakeStore) RiskRampConfig(_ context.Context) (budget.RiskRampConfig, er
 	return f.rampCfg, nil
 }
 
+func (f *fakeStore) SetAIEnforcementPaused(_ context.Context, paused bool) (bool, error) {
+	f.rampCfg.EnforcementPaused = paused
+	return paused, nil
+}
+
 func (f *fakeStore) AccountAnchorDay(_ context.Context, _ uuid.UUID) (int, error) {
 	if f.anchorDay != 0 {
 		return f.anchorDay, nil
@@ -1007,4 +1012,60 @@ func TestEvaluateAccountBudget_RecordsPoolCrossings(t *testing.T) {
 	fired, err = svc.EvaluateAccountBudget(context.Background(), other, uuid.Nil, start, end)
 	require.NoError(t, err)
 	require.Empty(t, fired)
+}
+
+// TestGetBudgetStatus_KillSwitchAllowsEveryVerdict: the incident switch
+// (085) is read per verdict — flipping it through the admin RPC allows the
+// next read with decided_by "paused" while the figures still show what would
+// have refused; flipping it back restores the refusal, no deploy involved.
+func TestGetBudgetStatus_KillSwitchAllowsEveryVerdict(t *testing.T) {
+	store := newFakeStore()
+	svc := newService(store)
+	ctx := context.Background()
+	app, acct := uuid.New(), uuid.New()
+	store.appPayers[app] = acct
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard"} // $5 pool
+	store.accountAllSpend = 5_000_000                                     // pool full
+	seedAIBudget(store, budget.ScopeApp, app, "", 1_000_000, true, false)
+	store.spendBy["ai/"] = 1_000_000 // cap full too
+	read := func() *budget.GetBudgetStatusResponse {
+		st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI})
+		require.NoError(t, err)
+		return st
+	}
+
+	st := read()
+	require.True(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+
+	resp, err := svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true, Reason: "incident: gate misfiring"})
+	require.NoError(t, err)
+	require.True(t, resp.Paused)
+	require.EqualValues(t, 5_000_000, resp.NoCardMicros)
+
+	st = read()
+	require.False(t, st.Exhausted, "paused: every verdict is allowed")
+	require.Equal(t, budget.DecidedByPaused, st.DecidedBy)
+	require.True(t, st.Pool.Exhausted, "the pool's own figure still says what would have refused")
+	require.EqualValues(t, 1_000_000, st.SpendMicros)
+
+	got, err := svc.GetAIEnforcement(ctx)
+	require.NoError(t, err)
+	require.True(t, got.Paused)
+
+	resp, err = svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: false})
+	require.NoError(t, err)
+	require.False(t, resp.Paused)
+	st = read()
+	require.True(t, st.Exhausted, "unpaused: the refusal is back")
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
+
+	// A verdict that was not exhausted is untouched by the switch.
+	store.spendBy["ai/"] = 0
+	store.accountAllSpend = 0
+	_, err = svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true})
+	require.NoError(t, err)
+	st = read()
+	require.False(t, st.Exhausted)
+	require.Equal(t, budget.DecidedByApp, st.DecidedBy, "paused labels only a verdict it changed")
 }
