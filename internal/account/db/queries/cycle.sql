@@ -177,15 +177,16 @@ WHERE ua.account_id   = $1
 -- bit is a money-recovery boundary: a reclaimed run may need to recover a
 -- previously committed wallet draw even when the current rollout is off or the
 -- account is no longer selected. A fresh run must not make that recovery read.
--- prior_status is the row's status BEFORE this statement reclaimed it ('' on a
--- fresh insert). A CTE reads the statement-start snapshot, so it sees the
--- crashed attempt's outcome, not the 'pending' the reclaim writes: 'proposed'
--- means a prior attempt reached ProposeGroup and sealed intents, which the
--- stale-freeze reconciliation (charge.go, billing-engine#217) must never
--- overwrite; 'pending' / 'skipped_*' / 'failed' mean nothing was sealed.
+-- ever_proposed says whether ANY earlier attempt of this run was handed to the
+-- intent proposer: status 'proposed' (the mark after a successful seal) OR
+-- proposal_attempted_at (migration 083, stamped before the seal, never
+-- cleared). Read from a CTE over the statement-start snapshot, i.e. BEFORE the
+-- reclaim below resets status to 'pending' — that reset is why status alone
+-- cannot carry it across two reclaims. The stale-freeze reconciliation
+-- (charge.go, billing-engine#217) never re-freezes a run with ever_proposed.
 -- name: InsertBillingRun :one
 WITH prior AS (
-    SELECT p.status::text AS prior_status
+    SELECT (p.status = 'proposed' OR p.proposal_attempted_at IS NOT NULL) AS ever_proposed
     FROM ms_billing.billing_runs p
     WHERE p.account_id = $1
       AND p.period_start = $2
@@ -214,13 +215,21 @@ reclaimed AS (
       AND NOT EXISTS (SELECT 1 FROM inserted)
     RETURNING r.id
 )
-SELECT id, false::boolean AS reclaimed, ''::text AS prior_status
+SELECT id, false::boolean AS reclaimed, false::boolean AS ever_proposed
 FROM inserted
 UNION ALL
 SELECT reclaimed.id, true::boolean AS reclaimed,
-       COALESCE((SELECT prior.prior_status FROM prior LIMIT 1), '')::text AS prior_status
+       COALESCE((SELECT prior.ever_proposed FROM prior LIMIT 1), false)::boolean AS ever_proposed
 FROM reclaimed
 LIMIT 1;
+
+-- MarkBillingRunProposalAttempted stamps the durable "handed to the proposer"
+-- marker (083) BEFORE ProposeGroup; COALESCE keeps the first instant, so a
+-- retry never moves it and nothing ever clears it.
+-- name: MarkBillingRunProposalAttempted :exec
+UPDATE ms_billing.billing_runs
+SET proposal_attempted_at = COALESCE(proposal_attempted_at, now())
+WHERE id = $1;
 
 -- RefreezeBillingRunCharge moves a STALE frozen figure to the live derivation
 -- (billing-engine#217): a compare-and-set on the old cents, only while the run

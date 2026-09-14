@@ -358,6 +358,15 @@ func (s *Service) proposeBoundary(
 				"is deleted; this deployment cannot bill a boundary", nil)
 	}
 
+	// 🔴 STAMP BEFORE THE SEAL, NEVER CLEAR IT (migration 083, billing-engine#217).
+	// From here on this run MAY hold a sealed intent — a crash between
+	// ProposeGroup and the 'proposed' mark, or a proposer error after the
+	// store committed, leaves status 'pending' with a live document. The
+	// stale-freeze reconciliation reads this marker (before the reclaim resets
+	// the status) and never re-freezes such a run.
+	if err := s.store.MarkBillingRunProposalAttempted(ctx, runID); err != nil {
+		return nil, billing.Internal("mark billing run proposal attempted failed", err)
+	}
 	sealed, err := s.proposer.ProposeGroup(ctx, charges)
 	if err != nil {
 		// A failed proposal leaves the run PENDING for the next reclaim. It

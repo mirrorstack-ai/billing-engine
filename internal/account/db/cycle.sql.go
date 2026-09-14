@@ -376,7 +376,7 @@ func (q *Queries) HasUsableDefaultPM(ctx context.Context, accountID string) (boo
 
 const insertBillingRun = `-- name: InsertBillingRun :one
 WITH prior AS (
-    SELECT p.status::text AS prior_status
+    SELECT (p.status = 'proposed' OR p.proposal_attempted_at IS NOT NULL) AS ever_proposed
     FROM ms_billing.billing_runs p
     WHERE p.account_id = $1
       AND p.period_start = $2
@@ -405,11 +405,11 @@ reclaimed AS (
       AND NOT EXISTS (SELECT 1 FROM inserted)
     RETURNING r.id
 )
-SELECT id, false::boolean AS reclaimed, ''::text AS prior_status
+SELECT id, false::boolean AS reclaimed, false::boolean AS ever_proposed
 FROM inserted
 UNION ALL
 SELECT reclaimed.id, true::boolean AS reclaimed,
-       COALESCE((SELECT prior.prior_status FROM prior LIMIT 1), '')::text AS prior_status
+       COALESCE((SELECT prior.ever_proposed FROM prior LIMIT 1), false)::boolean AS ever_proposed
 FROM reclaimed
 LIMIT 1
 `
@@ -421,9 +421,9 @@ type InsertBillingRunParams struct {
 }
 
 type InsertBillingRunRow struct {
-	ID          string `json:"id"`
-	Reclaimed   bool   `json:"reclaimed"`
-	PriorStatus string `json:"prior_status"`
+	ID           string `json:"id"`
+	Reclaimed    bool   `json:"reclaimed"`
+	EverProposed bool   `json:"ever_proposed"`
 }
 
 // InsertBillingRun is the FIRST idempotency layer: one run row per
@@ -448,16 +448,17 @@ type InsertBillingRunRow struct {
 // bit is a money-recovery boundary: a reclaimed run may need to recover a
 // previously committed wallet draw even when the current rollout is off or the
 // account is no longer selected. A fresh run must not make that recovery read.
-// prior_status is the row's status BEFORE this statement reclaimed it (” on a
-// fresh insert). A CTE reads the statement-start snapshot, so it sees the
-// crashed attempt's outcome, not the 'pending' the reclaim writes: 'proposed'
-// means a prior attempt reached ProposeGroup and sealed intents, which the
-// stale-freeze reconciliation (charge.go, billing-engine#217) must never
-// overwrite; 'pending' / 'skipped_*' / 'failed' mean nothing was sealed.
+// ever_proposed says whether ANY earlier attempt of this run was handed to the
+// intent proposer: status 'proposed' (the mark after a successful seal) OR
+// proposal_attempted_at (migration 083, stamped before the seal, never
+// cleared). Read from a CTE over the statement-start snapshot, i.e. BEFORE the
+// reclaim below resets status to 'pending' — that reset is why status alone
+// cannot carry it across two reclaims. The stale-freeze reconciliation
+// (charge.go, billing-engine#217) never re-freezes a run with ever_proposed.
 func (q *Queries) InsertBillingRun(ctx context.Context, arg InsertBillingRunParams) (InsertBillingRunRow, error) {
 	row := q.db.QueryRow(ctx, insertBillingRun, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
 	var i InsertBillingRunRow
-	err := row.Scan(&i.ID, &i.Reclaimed, &i.PriorStatus)
+	err := row.Scan(&i.ID, &i.Reclaimed, &i.EverProposed)
 	return i, err
 }
 
@@ -626,6 +627,20 @@ func (q *Queries) MarkBillingRunInvoicedIfUnfrozen(ctx context.Context, id strin
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const markBillingRunProposalAttempted = `-- name: MarkBillingRunProposalAttempted :exec
+UPDATE ms_billing.billing_runs
+SET proposal_attempted_at = COALESCE(proposal_attempted_at, now())
+WHERE id = $1
+`
+
+// MarkBillingRunProposalAttempted stamps the durable "handed to the proposer"
+// marker (083) BEFORE ProposeGroup; COALESCE keeps the first instant, so a
+// retry never moves it and nothing ever clears it.
+func (q *Queries) MarkBillingRunProposalAttempted(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, markBillingRunProposalAttempted, id)
+	return err
 }
 
 const periodChargedTotal = `-- name: PeriodChargedTotal :one

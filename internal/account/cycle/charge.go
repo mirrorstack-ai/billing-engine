@@ -107,7 +107,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("apply due plan changes failed", err)
 	}
 
-	runID, shouldCharge, reclaimed, priorStatus, err := s.store.InsertBillingRun(ctx, accountID, periodStart, periodEnd)
+	runID, shouldCharge, reclaimed, everProposed, err := s.store.InsertBillingRun(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("insert billing run failed", err)
 	}
@@ -785,23 +785,33 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		// live boundary IN CENTS (the precision the freeze was taken at —
 		// a sub-cent difference is rounding, not drift, and passes the split
 		// untouched); no provider invoice was recovered under the run's ref
-		// (`!moneyMayHaveMoved`, this branch); and the run was NOT 'proposed'
-		// before this reclaim (nothing sealed) — the freeze is stale and moves
-		// to the live figure by compare-and-set. The CAS is the two-daemons
-		// rule kept: the loser matches zero rows and re-reads the survivor.
-		// Old and new are logged as an audit line with every component, so
-		// the reconciliation is explainable after the fact even though the
-		// rollup keeps no history of the first derivation (core-v2#1485).
+		// (`!moneyMayHaveMoved`, this branch); and NO attempt of this run was
+		// ever handed to the proposer (`everProposed`: status 'proposed' or
+		// the migration-083 stamp, read before the reclaim reset the status —
+		// status alone forgets across two reclaims) — the freeze is stale and
+		// moves to the live figure by compare-and-set. The CAS is the
+		// two-daemons rule kept: the loser matches zero rows and re-reads the
+		// survivor. Old and new are logged as an audit line with every
+		// component, so the reconciliation is explainable after the fact even
+		// though the rollup keeps no history of the first derivation
+		// (core-v2#1485).
 		//
-		// A run whose prior status was 'proposed' keeps the refusal below: a
-		// sealed digest is exactly the commitment the guard protects.
+		// A run that was ever handed to the proposer keeps the refusal below:
+		// a sealed (or maybe-sealed) digest is exactly the commitment the
+		// guard protects.
+		components := boundaryComponents{
+			ArrearsMicros:        summary.ArrearsMicros,
+			AdvanceBaseMicros:    summary.AdvanceBaseMicros,
+			AdvanceOverageMicros: summary.AdvanceOverageMicros,
+			AdvanceDomainsMicros: summary.AdvanceDomainsMicros,
+			MembersMicros:        summary.MembersMicros,
+		}
 		if hasFrozen {
-			live, err := centsFromMicros(summary.ArrearsMicros + summary.AdvanceBaseMicros +
-				summary.AdvanceOverageMicros + summary.AdvanceDomainsMicros + summary.MembersMicros)
+			live, err := centsFromMicros(components.grossMicros())
 			if err != nil {
 				return nil, billing.Internal("stale-freeze comparison failed", err)
 			}
-			if frozen.Cents > live && priorStatus != RunStatusProposed {
+			if frozen.Cents > live && !everProposed {
 				moved, err := s.store.RefreezeBillingRunCharge(ctx, runID, frozen.Cents, live)
 				if err != nil {
 					return nil, billing.Internal("re-freeze stale boundary charge failed", err)
@@ -828,13 +838,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 						"advance_base_micros", summary.AdvanceBaseMicros,
 						"advance_overage_micros", summary.AdvanceOverageMicros,
 						"advance_domains_micros", summary.AdvanceDomainsMicros,
-						"members_micros", summary.MembersMicros,
-						"prior_status", string(priorStatus))
+						"members_micros", summary.MembersMicros)
 					frozen.Cents = live
 					summary.ChargedCents = live
 				}
 			} else if frozen.Cents > live {
-				slog.ErrorContext(ctx, "frozen boundary charge exceeds the live derivation on a run that already sealed intents; refusing (not a stale freeze)",
+				slog.ErrorContext(ctx, "frozen boundary charge exceeds the live derivation on a run that was handed to the proposer; refusing (not a stale freeze)",
 					"run_id", runID, "account_id", accountID, "frozen_cents", frozen.Cents, "live_cents", live)
 			}
 		}

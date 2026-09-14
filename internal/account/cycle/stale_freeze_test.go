@@ -2,6 +2,7 @@ package cycle_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -28,6 +29,7 @@ func TestRunBillingCycle_StaleFrozenAboveLiveRefreezesOnceWhenNothingWasSealed(t
 	store.chargedTotal = 1_000_000
 	runID := seedFrozenRun(t, store, sc, 100) // a crashed attempt froze 100¢ for a $1.00 boundary
 	require.NotEqual(t, cycle.RunStatusProposed, store.runStatus[runID], "fixture: the seeded run must not read as sealed")
+	require.False(t, store.proposalAttempted[runID], "fixture: the seeded run was never handed to the proposer")
 
 	// The closed period re-derives LOWER on the reclaim (a re-priced line).
 	store.chargedTotal = 800_000
@@ -124,4 +126,61 @@ func TestRunBillingCycle_StaleFreezeLostCASReReadsTheSurvivor(t *testing.T) {
 	require.Equal(t, cycle.RunStatusProposed, resp.Status)
 	require.EqualValues(t, 80, frozenClaim(t, store).Cents)
 	require.EqualValues(t, 800_000, proposedMicros(t, p))
+}
+
+// TestRunBillingCycle_ProposedThenReclaimedThenCrashedStillRefuses is the
+// round-2 blocker: attempt A seals ('proposed'); the next reclaim resets the
+// status to 'pending' and dies BEFORE ProposeGroup; the reclaim after that
+// sees a lower live boundary. Status alone would now say "never sealed" and a
+// re-freeze would seal a SECOND digest for one boundary while A's document is
+// alive. The migration-083 marker (stamped before the seal, never cleared) is
+// what keeps the refusal — proven by the mutant below, which drops it.
+func TestRunBillingCycle_ProposedThenReclaimedThenCrashedStillRefuses(t *testing.T) {
+	run := func(t *testing.T, dropMarker bool) (*fakeStore, error) {
+		t.Helper()
+		store := newFakeStore()
+		store.hasPM = true
+		store.stripeCustomer = "cus_proposed_then_crash"
+		sc := newFakeStripe()
+		store.chargedTotal = 1_000_000
+		svc, _ := chargeSvcProposing(store, sc)
+
+		// Attempt A: proposes and seals at $1.00 (frozen 100¢, status 'proposed').
+		resp, err := svc.WithCreditWallet(false).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+		require.NoError(t, err)
+		require.Equal(t, cycle.RunStatusProposed, resp.Status)
+		require.EqualValues(t, 100, frozenClaim(t, store).Cents)
+		var runID uuid.UUID
+		for _, id := range store.insertedRuns {
+			runID = id
+		}
+		require.True(t, store.proposalAttempted[runID], "the marker is stamped before the seal")
+
+		// Attempt B: reclaimed (status reset to 'pending'), dies before ProposeGroup.
+		store.dropProposalMarkerOnReclaim = dropMarker
+		store.errMarkRun = errors.New("process died before ProposeGroup")
+		_, err = svc.WithCreditWallet(false).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+		require.Error(t, err)
+		require.Equal(t, cycle.BillingRunStatus("pending"), store.runStatus[runID], "the reclaim reset the status; the seal is now invisible to status alone")
+		store.errMarkRun = nil
+
+		// Attempt C: the live boundary re-derives LOWER.
+		store.chargedTotal = 800_000
+		_, err = svc.WithCreditWallet(false).RunBillingCycle(context.Background(), chargeAccount, periodStart, periodEnd, 0)
+		return store, err
+	}
+
+	t.Run("with the durable marker: refused, frozen untouched", func(t *testing.T) {
+		store, err := run(t, false)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "a frozen remainder cannot exceed the boundary it is part of")
+		require.Zero(t, store.refreezeCalls, "a maybe-sealed run is never re-frozen")
+		require.EqualValues(t, 100, frozenClaim(t, store).Cents)
+	})
+	t.Run("MUTANT — marker dropped on reclaim: the re-freeze goes through (the defect the marker prevents)", func(t *testing.T) {
+		store, err := run(t, true)
+		require.NoError(t, err, "without the marker the reclaim reads 'never sealed' and reconciles — a second digest for one boundary")
+		require.EqualValues(t, 1, store.refreezeCalls)
+		require.EqualValues(t, 80, frozenClaim(t, store).Cents)
+	})
 }
