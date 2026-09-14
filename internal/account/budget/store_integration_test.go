@@ -209,8 +209,10 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 		VALUES ($1, 'pm_exposure', 'visa', '4242', 12, 2099)`, acct.String())
 	require.NoError(t, err)
 	for i, st := range []string{"paid", "paid", "open"} {
-		_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency)
-			VALUES ($1, $2, $3, 100, 100, 'usd')`, acct.String(), "in_exposure_"+string(rune('a'+i)), st)
+		// charge_funding_legacy_unresolved = true is the pre-052 provenance shape
+		// (no funding account pinned); the CHECK requires one of the two shapes.
+		_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
+			VALUES ($1, $2, $3, 100, 100, 'usd', true)`, acct.String(), "in_exposure_"+string(rune('a'+i)), st)
 		require.NoError(t, err)
 	}
 	sig, err = store.ExposureSignals(ctx, acct)
