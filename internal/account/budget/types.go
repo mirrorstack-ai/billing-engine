@@ -209,23 +209,32 @@ type RiskRampConfig struct {
 	CardBaseMicros    int64
 	CeilingMicros     int64
 	EnforcementPaused bool
+	PausedReason      string
+	PausedBy          string
+	PausedAt          time.Time // zero when not paused
 }
 
 // SetAIEnforcementPausedRequest flips the incident kill-switch (admin RPC,
 // internal secret): Paused=true allows every AI verdict platform-wide until
-// flipped back, with no deploy. Reason is logged, never stored.
+// flipped back, with no deploy. Reason and ActorID are STORED on the row on
+// a pause (and cleared on resume) so the audit answers "why was enforcement
+// off, and who turned it off" without archaeology; both are required to pause.
 type SetAIEnforcementPausedRequest struct {
-	Paused bool   `json:"paused"`
-	Reason string `json:"reason,omitempty"`
+	Paused  bool   `json:"paused"`
+	Reason  string `json:"reason,omitempty"`
+	ActorID string `json:"actor_id,omitempty"`
 }
 
-// AIEnforcementResponse is the switch's state plus the curve, so an admin
-// surface shows both in one read.
+// AIEnforcementResponse is the switch's state (with its provenance) plus the
+// curve, so an admin surface shows everything in one read.
 type AIEnforcementResponse struct {
-	Paused         bool  `json:"paused"`
-	NoCardMicros   int64 `json:"no_card_micros"`
-	CardBaseMicros int64 `json:"card_base_micros"`
-	CeilingMicros  int64 `json:"ceiling_micros"`
+	Paused         bool      `json:"paused"`
+	PausedReason   string    `json:"paused_reason,omitempty"`
+	PausedBy       string    `json:"paused_by,omitempty"`
+	PausedAt       time.Time `json:"paused_at,omitempty"`
+	NoCardMicros   int64     `json:"no_card_micros"`
+	CardBaseMicros int64     `json:"card_base_micros"`
+	CeilingMicros  int64     `json:"ceiling_micros"`
 }
 
 // GetBudgetStatusResponse is the live spend-vs-cap status. Exists is false

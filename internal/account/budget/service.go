@@ -590,11 +590,14 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 // verdict allowed (decided_by "paused") on the next read — no deploy, no
 // cache on this side. Logged with the caller's reason.
 func (s *Service) SetAIEnforcementPaused(ctx context.Context, req SetAIEnforcementPausedRequest) (*AIEnforcementResponse, error) {
-	paused, err := s.store.SetAIEnforcementPaused(ctx, req.Paused)
+	if req.Paused && (req.Reason == "" || req.ActorID == "") {
+		return nil, billing.InvalidInput("pausing AI enforcement requires reason and actor_id")
+	}
+	paused, err := s.store.SetAIEnforcementPaused(ctx, req.Paused, req.Reason, req.ActorID)
 	if err != nil {
 		return nil, billing.Internal("set ai enforcement paused failed", err)
 	}
-	slog.WarnContext(ctx, "AI budget enforcement kill-switch changed", "paused", paused, "reason", req.Reason)
+	slog.WarnContext(ctx, "AI budget enforcement kill-switch changed", "paused", paused, "reason", req.Reason, "actor_id", req.ActorID)
 	return s.GetAIEnforcement(ctx)
 }
 
@@ -606,6 +609,9 @@ func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse,
 	}
 	return &AIEnforcementResponse{
 		Paused:         cfg.EnforcementPaused,
+		PausedReason:   cfg.PausedReason,
+		PausedBy:       cfg.PausedBy,
+		PausedAt:       cfg.PausedAt,
 		NoCardMicros:   cfg.NoCardMicros,
 		CardBaseMicros: cfg.CardBaseMicros,
 		CeilingMicros:  cfg.CeilingMicros,

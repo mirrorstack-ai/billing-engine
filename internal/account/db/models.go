@@ -907,8 +907,11 @@ type MsBillingRiskRampConfig struct {
 	CardBaseMicros int64 `json:"card_base_micros"`
 	CeilingMicros  int64 `json:"ceiling_micros"`
 	// Incident kill-switch: true = every AI budget verdict is allowed (decided_by paused) while alerts keep recording. Flip via the SetAIEnforcementPaused admin RPC; no deploy needed.
-	AiEnforcementPaused bool      `json:"ai_enforcement_paused"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
+	PausedReason        pgtype.Text        `json:"paused_reason"`
+	PausedBy            pgtype.Text        `json:"paused_by"`
+	PausedAt            pgtype.Timestamptz `json:"paused_at"`
+	UpdatedAt           time.Time          `json:"updated_at"`
 }
 
 type MsBillingUsageAggregate struct {

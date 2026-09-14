@@ -64,8 +64,9 @@ type Store interface {
 	// incident kill-switch.
 	RiskRampConfig(ctx context.Context) (RiskRampConfig, error)
 
-	// SetAIEnforcementPaused flips the kill-switch; returns the stored value.
-	SetAIEnforcementPaused(ctx context.Context, paused bool) (bool, error)
+	// SetAIEnforcementPaused flips the kill-switch, storing reason/actor on
+	// a pause and clearing them on resume; returns the stored value.
+	SetAIEnforcementPaused(ctx context.Context, paused bool, reason, actorID string) (bool, error)
 
 	// InsertBudgetAlerts records a batch of threshold crossings in ONE
 	// transaction (all-or-nothing): either every row is committed or none are,
@@ -257,11 +258,18 @@ func (s *pgxStore) RiskRampConfig(ctx context.Context) (RiskRampConfig, error) {
 	if err != nil {
 		return RiskRampConfig{}, err
 	}
-	return RiskRampConfig{NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros, EnforcementPaused: row.AiEnforcementPaused}, nil
+	cfg := RiskRampConfig{
+		NoCardMicros: row.NoCardMicros, CardBaseMicros: row.CardBaseMicros, CeilingMicros: row.CeilingMicros,
+		EnforcementPaused: row.AiEnforcementPaused, PausedReason: row.PausedReason, PausedBy: row.PausedBy,
+	}
+	if row.PausedAt.Valid {
+		cfg.PausedAt = row.PausedAt.Time
+	}
+	return cfg, nil
 }
 
-func (s *pgxStore) SetAIEnforcementPaused(ctx context.Context, paused bool) (bool, error) {
-	row, err := s.q.SetAIEnforcementPaused(ctx, paused)
+func (s *pgxStore) SetAIEnforcementPaused(ctx context.Context, paused bool, reason, actorID string) (bool, error) {
+	row, err := s.q.SetAIEnforcementPaused(ctx, db.SetAIEnforcementPausedParams{Paused: paused, Reason: reason, Actor: actorID})
 	if err != nil {
 		return false, err
 	}

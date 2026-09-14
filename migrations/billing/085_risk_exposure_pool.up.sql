@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
     card_base_micros      BIGINT NOT NULL CONSTRAINT risk_ramp_card_base_nonneg CHECK (card_base_micros >= 0),
     ceiling_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_ceiling_nonneg CHECK (ceiling_micros >= 0),
     ai_enforcement_paused BOOLEAN NOT NULL DEFAULT false,
+    -- Who paused it, why, and since when — so "why was enforcement off for
+    -- six hours" is answered from the row, not from archaeology. Cleared on
+    -- resume.
+    paused_reason         TEXT NULL,
+    paused_by             TEXT NULL,
+    paused_at             TIMESTAMPTZ NULL,
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

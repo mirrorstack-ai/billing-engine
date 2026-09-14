@@ -243,17 +243,24 @@ WHERE a.id = $1;
 -- RiskRampConfig reads the singleton curve row (085) together with the
 -- incident kill-switch, so one read per verdict serves both.
 -- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused
+SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused,
+       COALESCE(paused_reason, '')::text AS paused_reason,
+       COALESCE(paused_by, '')::text     AS paused_by,
+       paused_at
 FROM ms_billing.risk_ramp_config
 WHERE id = 1;
 
--- SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret).
+-- SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret),
+-- recording who/why/since on a pause and clearing them on resume.
 -- name: SetAIEnforcementPaused :one
 UPDATE ms_billing.risk_ramp_config
 SET ai_enforcement_paused = @paused::boolean,
+    paused_reason         = CASE WHEN @paused::boolean THEN NULLIF(@reason::text, '') ELSE NULL END,
+    paused_by             = CASE WHEN @paused::boolean THEN NULLIF(@actor::text, '')  ELSE NULL END,
+    paused_at             = CASE WHEN @paused::boolean THEN now() ELSE NULL END,
     updated_at            = now()
 WHERE id = 1
-RETURNING ai_enforcement_paused, updated_at;
+RETURNING ai_enforcement_paused, paused_at;
 
 -- anchor day 1 (UTC calendar month). Returns at most one row.
 -- name: AppAccountActivatedAt :one

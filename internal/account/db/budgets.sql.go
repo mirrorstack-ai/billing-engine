@@ -450,16 +450,22 @@ func (q *Queries) ListBudgetAlerts(ctx context.Context, arg ListBudgetAlertsPara
 }
 
 const riskRampConfig = `-- name: RiskRampConfig :one
-SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused
+SELECT no_card_micros, card_base_micros, ceiling_micros, ai_enforcement_paused,
+       COALESCE(paused_reason, '')::text AS paused_reason,
+       COALESCE(paused_by, '')::text     AS paused_by,
+       paused_at
 FROM ms_billing.risk_ramp_config
 WHERE id = 1
 `
 
 type RiskRampConfigRow struct {
-	NoCardMicros        int64 `json:"no_card_micros"`
-	CardBaseMicros      int64 `json:"card_base_micros"`
-	CeilingMicros       int64 `json:"ceiling_micros"`
-	AiEnforcementPaused bool  `json:"ai_enforcement_paused"`
+	NoCardMicros        int64              `json:"no_card_micros"`
+	CardBaseMicros      int64              `json:"card_base_micros"`
+	CeilingMicros       int64              `json:"ceiling_micros"`
+	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
+	PausedReason        string             `json:"paused_reason"`
+	PausedBy            string             `json:"paused_by"`
+	PausedAt            pgtype.Timestamptz `json:"paused_at"`
 }
 
 // RiskRampConfig reads the singleton curve row (085) together with the
@@ -472,6 +478,9 @@ func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error)
 		&i.CardBaseMicros,
 		&i.CeilingMicros,
 		&i.AiEnforcementPaused,
+		&i.PausedReason,
+		&i.PausedBy,
+		&i.PausedAt,
 	)
 	return i, err
 }
@@ -479,21 +488,31 @@ func (q *Queries) RiskRampConfig(ctx context.Context) (RiskRampConfigRow, error)
 const setAIEnforcementPaused = `-- name: SetAIEnforcementPaused :one
 UPDATE ms_billing.risk_ramp_config
 SET ai_enforcement_paused = $1::boolean,
+    paused_reason         = CASE WHEN $1::boolean THEN NULLIF($2::text, '') ELSE NULL END,
+    paused_by             = CASE WHEN $1::boolean THEN NULLIF($3::text, '')  ELSE NULL END,
+    paused_at             = CASE WHEN $1::boolean THEN now() ELSE NULL END,
     updated_at            = now()
 WHERE id = 1
-RETURNING ai_enforcement_paused, updated_at
+RETURNING ai_enforcement_paused, paused_at
 `
 
-type SetAIEnforcementPausedRow struct {
-	AiEnforcementPaused bool      `json:"ai_enforcement_paused"`
-	UpdatedAt           time.Time `json:"updated_at"`
+type SetAIEnforcementPausedParams struct {
+	Paused bool   `json:"paused"`
+	Reason string `json:"reason"`
+	Actor  string `json:"actor"`
 }
 
-// SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret).
-func (q *Queries) SetAIEnforcementPaused(ctx context.Context, paused bool) (SetAIEnforcementPausedRow, error) {
-	row := q.db.QueryRow(ctx, setAIEnforcementPaused, paused)
+type SetAIEnforcementPausedRow struct {
+	AiEnforcementPaused bool               `json:"ai_enforcement_paused"`
+	PausedAt            pgtype.Timestamptz `json:"paused_at"`
+}
+
+// SetAIEnforcementPaused flips the kill-switch (admin RPC, internal secret),
+// recording who/why/since on a pause and clearing them on resume.
+func (q *Queries) SetAIEnforcementPaused(ctx context.Context, arg SetAIEnforcementPausedParams) (SetAIEnforcementPausedRow, error) {
+	row := q.db.QueryRow(ctx, setAIEnforcementPaused, arg.Paused, arg.Reason, arg.Actor)
 	var i SetAIEnforcementPausedRow
-	err := row.Scan(&i.AiEnforcementPaused, &i.UpdatedAt)
+	err := row.Scan(&i.AiEnforcementPaused, &i.PausedAt)
 	return i, err
 }
 

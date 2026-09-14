@@ -145,8 +145,13 @@ func (f *fakeStore) RiskRampConfig(_ context.Context) (budget.RiskRampConfig, er
 	return f.rampCfg, nil
 }
 
-func (f *fakeStore) SetAIEnforcementPaused(_ context.Context, paused bool) (bool, error) {
+func (f *fakeStore) SetAIEnforcementPaused(_ context.Context, paused bool, reason, actorID string) (bool, error) {
 	f.rampCfg.EnforcementPaused = paused
+	if paused {
+		f.rampCfg.PausedReason, f.rampCfg.PausedBy, f.rampCfg.PausedAt = reason, actorID, time.Now()
+	} else {
+		f.rampCfg.PausedReason, f.rampCfg.PausedBy, f.rampCfg.PausedAt = "", "", time.Time{}
+	}
 	return paused, nil
 }
 
@@ -1038,9 +1043,16 @@ func TestGetBudgetStatus_KillSwitchAllowsEveryVerdict(t *testing.T) {
 	require.True(t, st.Exhausted)
 	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
 
-	resp, err := svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true, Reason: "incident: gate misfiring"})
+	// A pause without a reason and an actor is refused: the row must answer
+	// "why was enforcement off, and who did it".
+	_, err := svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true})
+	requireCode(t, err, billing.CodeInvalidInput)
+	resp, err := svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true, Reason: "incident: gate misfiring", ActorID: "ops:owner"})
 	require.NoError(t, err)
 	require.True(t, resp.Paused)
+	require.Equal(t, "incident: gate misfiring", resp.PausedReason)
+	require.Equal(t, "ops:owner", resp.PausedBy)
+	require.False(t, resp.PausedAt.IsZero())
 	require.EqualValues(t, 5_000_000, resp.NoCardMicros)
 
 	st = read()
@@ -1056,6 +1068,8 @@ func TestGetBudgetStatus_KillSwitchAllowsEveryVerdict(t *testing.T) {
 	resp, err = svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: false})
 	require.NoError(t, err)
 	require.False(t, resp.Paused)
+	require.Empty(t, resp.PausedReason, "resume clears the provenance")
+	require.True(t, resp.PausedAt.IsZero())
 	st = read()
 	require.True(t, st.Exhausted, "unpaused: the refusal is back")
 	require.Equal(t, budget.DecidedByApp, st.DecidedBy)
@@ -1063,7 +1077,7 @@ func TestGetBudgetStatus_KillSwitchAllowsEveryVerdict(t *testing.T) {
 	// A verdict that was not exhausted is untouched by the switch.
 	store.spendBy["ai/"] = 0
 	store.accountAllSpend = 0
-	_, err = svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true})
+	_, err = svc.SetAIEnforcementPaused(ctx, budget.SetAIEnforcementPausedRequest{Paused: true, Reason: "drill", ActorID: "ops:owner"})
 	require.NoError(t, err)
 	st = read()
 	require.False(t, st.Exhausted)
