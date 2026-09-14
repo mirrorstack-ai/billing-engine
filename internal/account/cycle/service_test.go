@@ -208,6 +208,8 @@ type fakeStore struct {
 	markedRuns    map[uuid.UUID]markedRun                  // run id → terminal mark
 	invoices      map[string]cycle.InvoiceMirror           // stripe_invoice_id → mirror
 	frozenCharges map[uuid.UUID]cycle.FrozenBoundaryCharge // run id → frozen boundary charge (migration 035); survives a reclaim
+	refreezeCalls int                                      // RefreezeBillingRunCharge attempts (billing-engine#217)
+	errRefreeze   error                                    // injected RefreezeBillingRunCharge failure
 
 	// injected errors
 	errOpen               error
@@ -534,27 +536,46 @@ func (f *fakeStore) UpsertDeveloperSettlement(_ context.Context, periodID, _ uui
 	return nil
 }
 
-func (f *fakeStore) InsertBillingRun(_ context.Context, accountID uuid.UUID, start, end time.Time) (uuid.UUID, bool, bool, error) {
+func (f *fakeStore) InsertBillingRun(_ context.Context, accountID uuid.UUID, start, end time.Time) (uuid.UUID, bool, bool, cycle.BillingRunStatus, error) {
 	if f.errInsertRun != nil {
-		return uuid.Nil, false, false, f.errInsertRun
+		return uuid.Nil, false, false, "", f.errInsertRun
 	}
 	k := runKey(accountID, start, end)
 	if id, exists := f.insertedRuns[k]; exists {
 		// Conflict on an existing row. Mirrors the DB ON CONFLICT DO UPDATE …
 		// WHERE status <> 'invoiced': an 'invoiced' row blocks (shouldCharge=
 		// false); any non-terminal row (skipped_no_pm / failed / pending) is
-		// RECLAIMED — same id, reset to pending, shouldCharge=true.
+		// RECLAIMED — same id, reset to pending, shouldCharge=true, and the
+		// status it held BEFORE the reset is reported (the DB's prior CTE).
 		if f.runStatus[id] == cycle.RunStatusInvoiced {
-			return id, false, false, nil
+			return id, false, false, "", nil
 		}
+		prior := f.runStatus[id]
 		f.runStatus[id] = "pending"
-		return id, true, true, nil
+		return id, true, true, prior, nil
 	}
 	id := uuid.New()
 	f.insertedRuns[k] = id
 	f.runAccounts[id] = accountID
 	f.runStatus[id] = "pending"
-	return id, true, false, nil
+	return id, true, false, "", nil
+}
+
+// RefreezeBillingRunCharge mirrors the DB compare-and-set: the row must still
+// hold oldCents and be pending. refreezeCalls counts attempts so a test can
+// prove a stale freeze moves exactly once.
+func (f *fakeStore) RefreezeBillingRunCharge(_ context.Context, runID uuid.UUID, oldCents, newCents int64) (bool, error) {
+	f.refreezeCalls++
+	if f.errRefreeze != nil {
+		return false, f.errRefreeze
+	}
+	frozen, exists := f.frozenCharges[runID]
+	if !exists || frozen.Cents != oldCents || f.runStatus[runID] != "pending" {
+		return false, nil
+	}
+	frozen.Cents = newCents
+	f.frozenCharges[runID] = frozen
+	return true, nil
 }
 
 func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time.Time) (int64, error) {

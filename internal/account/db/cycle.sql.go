@@ -375,7 +375,14 @@ func (q *Queries) HasUsableDefaultPM(ctx context.Context, accountID string) (boo
 }
 
 const insertBillingRun = `-- name: InsertBillingRun :one
-WITH inserted AS (
+WITH prior AS (
+    SELECT p.status::text AS prior_status
+    FROM ms_billing.billing_runs p
+    WHERE p.account_id = $1
+      AND p.period_start = $2
+      AND p.period_end = $3
+),
+inserted AS (
     INSERT INTO ms_billing.billing_runs (
         account_id,
         period_start,
@@ -387,21 +394,22 @@ WITH inserted AS (
     RETURNING id
 ),
 reclaimed AS (
-    UPDATE ms_billing.billing_runs
+    UPDATE ms_billing.billing_runs r
     SET status            = 'pending',
         stripe_invoice_id = NULL,
         total_amount      = 0
-    WHERE account_id = $1
-      AND period_start = $2
-      AND period_end = $3
-      AND status <> 'invoiced'
+    WHERE r.account_id = $1
+      AND r.period_start = $2
+      AND r.period_end = $3
+      AND r.status <> 'invoiced'
       AND NOT EXISTS (SELECT 1 FROM inserted)
-    RETURNING id
+    RETURNING r.id
 )
-SELECT id, false::boolean AS reclaimed
+SELECT id, false::boolean AS reclaimed, ''::text AS prior_status
 FROM inserted
 UNION ALL
-SELECT id, true::boolean AS reclaimed
+SELECT reclaimed.id, true::boolean AS reclaimed,
+       COALESCE((SELECT prior.prior_status FROM prior LIMIT 1), '')::text AS prior_status
 FROM reclaimed
 LIMIT 1
 `
@@ -413,8 +421,9 @@ type InsertBillingRunParams struct {
 }
 
 type InsertBillingRunRow struct {
-	ID        string `json:"id"`
-	Reclaimed bool   `json:"reclaimed"`
+	ID          string `json:"id"`
+	Reclaimed   bool   `json:"reclaimed"`
+	PriorStatus string `json:"prior_status"`
 }
 
 // InsertBillingRun is the FIRST idempotency layer: one run row per
@@ -439,10 +448,16 @@ type InsertBillingRunRow struct {
 // bit is a money-recovery boundary: a reclaimed run may need to recover a
 // previously committed wallet draw even when the current rollout is off or the
 // account is no longer selected. A fresh run must not make that recovery read.
+// prior_status is the row's status BEFORE this statement reclaimed it (” on a
+// fresh insert). A CTE reads the statement-start snapshot, so it sees the
+// crashed attempt's outcome, not the 'pending' the reclaim writes: 'proposed'
+// means a prior attempt reached ProposeGroup and sealed intents, which the
+// stale-freeze reconciliation (charge.go, billing-engine#217) must never
+// overwrite; 'pending' / 'skipped_*' / 'failed' mean nothing was sealed.
 func (q *Queries) InsertBillingRun(ctx context.Context, arg InsertBillingRunParams) (InsertBillingRunRow, error) {
 	row := q.db.QueryRow(ctx, insertBillingRun, arg.AccountID, arg.PeriodStart, arg.PeriodEnd)
 	var i InsertBillingRunRow
-	err := row.Scan(&i.ID, &i.Reclaimed)
+	err := row.Scan(&i.ID, &i.Reclaimed, &i.PriorStatus)
 	return i, err
 }
 
@@ -644,6 +659,33 @@ func (q *Queries) PeriodChargedTotal(ctx context.Context, arg PeriodChargedTotal
 	var total_micros int64
 	err := row.Scan(&total_micros)
 	return total_micros, err
+}
+
+const refreezeBillingRunCharge = `-- name: RefreezeBillingRunCharge :execrows
+UPDATE ms_billing.billing_runs
+SET frozen_charge_cents = $1::bigint
+WHERE id = $2::uuid
+  AND frozen_charge_cents = $3::bigint
+  AND status = 'pending'
+`
+
+type RefreezeBillingRunChargeParams struct {
+	NewCents int64  `json:"new_cents"`
+	ID       string `json:"id"`
+	OldCents int64  `json:"old_cents"`
+}
+
+// RefreezeBillingRunCharge moves a STALE frozen figure to the live derivation
+// (billing-engine#217): a compare-and-set on the old cents, only while the run
+// is still pending, so two daemons reconciling the same run agree — the loser's
+// CAS matches 0 rows and re-reads the survivor. Never called when a provider
+// invoice or a sealed intent exists for the run (charge.go decides that).
+func (q *Queries) RefreezeBillingRunCharge(ctx context.Context, arg RefreezeBillingRunChargeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, refreezeBillingRunCharge, arg.NewCents, arg.ID, arg.OldCents)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const unactivatedAccountsWithUsage = `-- name: UnactivatedAccountsWithUsage :many

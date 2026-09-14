@@ -195,6 +195,7 @@ const (
 	MsBillingMetricGroupRequests         MsBillingMetricGroup = "requests"
 	MsBillingMetricGroupPlatformSecurity MsBillingMetricGroup = "platform_security"
 	MsBillingMetricGroupOther            MsBillingMetricGroup = "other"
+	MsBillingMetricGroupDeploy           MsBillingMetricGroup = "deploy"
 )
 
 func (e *MsBillingMetricGroup) Scan(src interface{}) error {

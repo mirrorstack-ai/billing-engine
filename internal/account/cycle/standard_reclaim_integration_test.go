@@ -90,7 +90,7 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		store := cycle.NewStore(pool)
 		accountID := seedAccount(t, pool)
 
-		runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+		runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.True(t, shouldCharge)
 		require.False(t, reclaimed)
@@ -107,7 +107,7 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, marked, "a genuinely fresh zero run may terminate")
 
-		blockedID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+		blockedID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.Equal(t, uuid.Nil, blockedID)
 		require.False(t, shouldCharge, "an invoiced window is terminal")
@@ -118,12 +118,12 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		store := cycle.NewStore(pool)
 		accountID := seedAccount(t, pool)
 
-		firstID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+		firstID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.True(t, shouldCharge)
 		require.False(t, reclaimed)
 
-		reclaimedID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+		reclaimedID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.True(t, shouldCharge)
 		require.True(t, reclaimed)
@@ -175,7 +175,7 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		accountID := seedAccount(t, pool)
 		installStandardPaymentMethod(t, pool, accountID, "cus_standard_frozen_positive")
 
-		runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+		runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.True(t, shouldCharge)
 		require.False(t, reclaimed)
@@ -239,7 +239,7 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		accountID := seedAccount(t, pool)
 		installStandardPaymentMethod(t, pool, accountID, "cus_standard_frozen_zero")
 
-		runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+		runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 		require.NoError(t, err)
 		require.True(t, shouldCharge)
 		require.False(t, reclaimed)
@@ -277,7 +277,7 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		t.Run("terminal mark wins before stale freeze", func(t *testing.T) {
 			store := cycle.NewStore(pool)
 			accountID := seedAccount(t, pool)
-			runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+			runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 			require.NoError(t, err)
 			require.True(t, shouldCharge)
 			require.False(t, reclaimed)
@@ -331,7 +331,7 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 		t.Run("freeze wins before stale terminal mark", func(t *testing.T) {
 			store := cycle.NewStore(pool)
 			accountID := seedAccount(t, pool)
-			runID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+			runID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 			require.NoError(t, err)
 			require.True(t, shouldCharge)
 			require.False(t, reclaimed)
@@ -386,7 +386,7 @@ func TestStandardModeReclaim_Integration_Matrix(t *testing.T) {
 			require.NotNil(t, got.frozenWithBase)
 			require.False(t, *got.frozenWithBase)
 
-			reclaimedID, shouldCharge, reclaimed, err := store.InsertBillingRun(ctx, accountID, start, end)
+			reclaimedID, shouldCharge, reclaimed, _, err := store.InsertBillingRun(ctx, accountID, start, end)
 			require.NoError(t, err)
 			require.True(t, shouldCharge)
 			require.True(t, reclaimed)

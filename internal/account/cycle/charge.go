@@ -107,7 +107,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("apply due plan changes failed", err)
 	}
 
-	runID, shouldCharge, reclaimed, err := s.store.InsertBillingRun(ctx, accountID, periodStart, periodEnd)
+	runID, shouldCharge, reclaimed, priorStatus, err := s.store.InsertBillingRun(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
 		return nil, billing.Internal("insert billing run failed", err)
 	}
@@ -770,6 +770,74 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// frozen charge while not 'invoiced') is the query that asks production
 	// when it has.
 	if !moneyMayHaveMoved {
+		// 🔴 A STALE FREEZE IS RECONCILED HERE, BEFORE THE SPLIT (billing-engine#217).
+		//
+		// splitBoundary refuses a frozen remainder above the live boundary,
+		// and it is right to when a prior attempt committed a PROVIDER to that
+		// figure. It is wrong when the figure was never presented to anyone:
+		// the 2026-09-11 run froze 11390¢, died on the nil-proposer panic
+		// before ProposeGroup, and every reclaim since re-derived 11202¢ —
+		// refused for ever, $112.02 never billed, for a number nothing
+		// external ever saw. The frozen figure is a marker of an INTENTION;
+		// what makes it binding is a provider invoice or a sealed intent.
+		//
+		// So, when ALL of these hold — a frozen figure exists; it exceeds the
+		// live boundary IN CENTS (the precision the freeze was taken at —
+		// a sub-cent difference is rounding, not drift, and passes the split
+		// untouched); no provider invoice was recovered under the run's ref
+		// (`!moneyMayHaveMoved`, this branch); and the run was NOT 'proposed'
+		// before this reclaim (nothing sealed) — the freeze is stale and moves
+		// to the live figure by compare-and-set. The CAS is the two-daemons
+		// rule kept: the loser matches zero rows and re-reads the survivor.
+		// Old and new are logged as an audit line with every component, so
+		// the reconciliation is explainable after the fact even though the
+		// rollup keeps no history of the first derivation (core-v2#1485).
+		//
+		// A run whose prior status was 'proposed' keeps the refusal below: a
+		// sealed digest is exactly the commitment the guard protects.
+		if hasFrozen {
+			live, err := centsFromMicros(summary.ArrearsMicros + summary.AdvanceBaseMicros +
+				summary.AdvanceOverageMicros + summary.AdvanceDomainsMicros + summary.MembersMicros)
+			if err != nil {
+				return nil, billing.Internal("stale-freeze comparison failed", err)
+			}
+			if frozen.Cents > live && priorStatus != RunStatusProposed {
+				moved, err := s.store.RefreezeBillingRunCharge(ctx, runID, frozen.Cents, live)
+				if err != nil {
+					return nil, billing.Internal("re-freeze stale boundary charge failed", err)
+				}
+				if !moved {
+					// Lost the CAS (or the run left 'pending'): the survivor
+					// decides. Re-read it; the split below refuses if it is
+					// still above the live boundary.
+					surviving, ok, err := s.store.BillingRunFrozenCharge(ctx, runID)
+					if err != nil {
+						return nil, billing.Internal("re-read frozen boundary charge after lost re-freeze failed", err)
+					}
+					if !ok {
+						return nil, billing.Internal("frozen boundary charge vanished during re-freeze", nil)
+					}
+					frozen = surviving
+				} else {
+					slog.WarnContext(ctx, "stale frozen boundary charge re-frozen at the live derivation",
+						"reason", "stale freeze, never sealed",
+						"run_id", runID, "account_id", accountID,
+						"period_start", periodStart, "period_end", periodEnd,
+						"frozen_cents_old", frozen.Cents, "frozen_cents_new", live,
+						"arrears_micros", summary.ArrearsMicros,
+						"advance_base_micros", summary.AdvanceBaseMicros,
+						"advance_overage_micros", summary.AdvanceOverageMicros,
+						"advance_domains_micros", summary.AdvanceDomainsMicros,
+						"members_micros", summary.MembersMicros,
+						"prior_status", string(priorStatus))
+					frozen.Cents = live
+					summary.ChargedCents = live
+				}
+			} else if frozen.Cents > live {
+				slog.ErrorContext(ctx, "frozen boundary charge exceeds the live derivation on a run that already sealed intents; refusing (not a stale freeze)",
+					"run_id", runID, "account_id", accountID, "frozen_cents", frozen.Cents, "live_cents", live)
+			}
+		}
 		return s.proposeBoundary(ctx, runID, accountID, summary, boundaryComponents{
 			// summary.ArrearsMicros is the ORIGINAL arrears. remainingArrears
 			// cannot be used to recover it: it is clamped at zero, so a wallet
