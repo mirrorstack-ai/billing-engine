@@ -137,13 +137,13 @@ func TestMigration076_OpenPlanChangeDecidesFoldOrChargeUnderTheLock(t *testing.T
 		unbilled.String(), boundary)
 	require.NoError(t, err)
 	require.Equal(t, "free", rosterPlan(unbilled), "an upgrade at the boundary instant: the plan it moved FROM")
-	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET kind = 'downgrade', from_plan = 'pro', to_plan = 'free', status = 'applied', applied_at = $2 WHERE app_id = $1`,
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET kind = 'downgrade', from_plan = 'pro', to_plan = 'free', status = 'applied', settled_at = $2 WHERE app_id = $1`,
 		unbilled.String(), boundary)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET plan = 'free' WHERE app_id = $1`, unbilled.String())
 	require.NoError(t, err)
 	require.Equal(t, "free", rosterPlan(unbilled), "a downgrade applied at the boundary instant: the plan it moved TO")
-	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET kind = 'upgrade', from_plan = 'free', to_plan = 'pro', status = 'settled', applied_at = NULL, effective_at = $2, requested_at = $2 WHERE app_id = $1`,
+	_, err = pool.Exec(ctx, `UPDATE ms_billing.app_plan_changes SET kind = 'upgrade', from_plan = 'free', to_plan = 'pro', status = 'settled', settled_at = $2, effective_at = $2, requested_at = $2 WHERE app_id = $1`,
 		unbilled.String(), boundary.Add(-time.Hour))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.apps SET plan = 'pro' WHERE app_id = $1`, unbilled.String())
