@@ -193,6 +193,20 @@ func (s *pgxStore) SetAddCardRequestStripePM(ctx context.Context, setupIntentID,
 	})
 }
 
+// FailAddCardRequestBySetupIntent marks the still-pending request keyed by
+// setup_intent_id 'failed' with the Stripe reason. :execrows → found; the
+// same partial index as SetAddCardRequestStripePM covers the lookup.
+func (s *pgxStore) FailAddCardRequestBySetupIntent(ctx context.Context, setupIntentID, failureCode string) (bool, error) {
+	n, err := s.q.FailAddCardRequestBySetupIntent(ctx, db.FailAddCardRequestBySetupIntentParams{
+		FailureCode:   failureCode,
+		SetupIntentID: setupIntentID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ResolvePendingAddCardRequest is the terminal step of the add-card
 // flow. Runs in a single transaction:
 //

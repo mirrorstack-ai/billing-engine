@@ -187,6 +187,10 @@ const (
 type FinishAddPaymentMethodResponse struct {
 	Status        AddCardStatus  `json:"status"`
 	PaymentMethod *PaymentMethod `json:"payment_method,omitempty"`
+	// FailureCode is set only when Status is failed AND Stripe gave a reason
+	// (setup_intent.setup_failed's decline_code, else its error code —
+	// billing-engine#215): a short machine token for the console's copy.
+	FailureCode string `json:"failure_code,omitempty"`
 }
 
 // GetPaymentMethodsRequest is the payload of GetPaymentMethods.

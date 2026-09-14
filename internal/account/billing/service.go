@@ -366,6 +366,7 @@ func (s *Service) FinishAddPaymentMethod(ctx context.Context, req FinishAddPayme
 	return &FinishAddPaymentMethodResponse{
 		Status:        row.Status,
 		PaymentMethod: row.PaymentMethod,
+		FailureCode:   row.FailureCode,
 	}, nil
 }
 

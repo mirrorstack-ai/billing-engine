@@ -1654,3 +1654,72 @@ func TestProcessTrusted_5xxDispatch_UnmarksSoRedeliveryReRuns(t *testing.T) {
 	require.Equal(t, webhook.StatusOK, res.Status)
 	require.Len(t, s.FraudFlags, 1, "redelivery re-ran the handler and flagged the card")
 }
+
+// setupIntentFailedEvent builds a setup_intent.setup_failed event with the
+// last_setup_error fields handleSetupIntentSetupFailed reads.
+func setupIntentFailedEvent(id, setupIntentID, code, declineCode string) stripego.Event {
+	payload := map[string]any{"id": setupIntentID, "status": "requires_payment_method"}
+	if code != "" || declineCode != "" {
+		payload["last_setup_error"] = map[string]any{
+			"type": "card_error", "code": code, "decline_code": declineCode,
+			"message": "Your card was declined.",
+		}
+	}
+	raw, _ := json.Marshal(payload)
+	return stripego.Event{ID: id, Type: stripego.EventTypeSetupIntentSetupFailed, Data: &stripego.EventData{Raw: raw}}
+}
+
+// TestProcess_SetupIntentSetupFailed pins billing-engine#215: a refused card
+// bind marks the pending add-card request failed with the issuer's
+// decline_code (else Stripe's code), and every non-transition is a 200 no-op
+// — never a 500 that would make Stripe retry a terminal fact.
+func TestProcess_SetupIntentSetupFailed(t *testing.T) {
+	t.Run("decline code wins over the error code", func(t *testing.T) {
+		s := webhooktest.NewFakeStore()
+		r := newRouter(&webhooktest.FakeVerifier{Event: setupIntentFailedEvent("evt_sf1", "seti_1", "card_declined", "insufficient_funds")}, s)
+		res := r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, webhook.StatusOK, res.Status)
+		require.Equal(t, []string{"seti_1=insufficient_funds"}, s.FailedSetupIntents)
+		require.Empty(t, s.StampedPMs, "a failure never stamps a PM")
+		require.Empty(t, s.ResolvedPMs, "a failure never resolves to a card")
+	})
+	t.Run("no decline code: the error code is the reason", func(t *testing.T) {
+		s := webhooktest.NewFakeStore()
+		r := newRouter(&webhooktest.FakeVerifier{Event: setupIntentFailedEvent("evt_sf2", "seti_2", "setup_intent_authentication_failure", "")}, s)
+		res := r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, []string{"seti_2=setup_intent_authentication_failure"}, s.FailedSetupIntents)
+	})
+	t.Run("no last_setup_error: the row still fails, reason empty", func(t *testing.T) {
+		s := webhooktest.NewFakeStore()
+		r := newRouter(&webhooktest.FakeVerifier{Event: setupIntentFailedEvent("evt_sf3", "seti_3", "", "")}, s)
+		res := r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, []string{"seti_3="}, s.FailedSetupIntents)
+	})
+	t.Run("nothing pending (already resolved or not ours) acks without error", func(t *testing.T) {
+		s := webhooktest.NewFakeStore()
+		s.FailSetupNotFound = true
+		r := newRouter(&webhooktest.FakeVerifier{Event: setupIntentFailedEvent("evt_sf4", "seti_4", "card_declined", "do_not_honor")}, s)
+		res := r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, webhook.StatusOK, res.Status)
+	})
+	t.Run("store error is a 500 so Stripe retries", func(t *testing.T) {
+		s := webhooktest.NewFakeStore()
+		s.ErrFailSetup = errors.New("db down")
+		r := newRouter(&webhooktest.FakeVerifier{Event: setupIntentFailedEvent("evt_sf5", "seti_5", "card_declined", "")}, s)
+		res := r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 500, res.HTTPStatus)
+		require.Equal(t, webhook.StatusInternal, res.Status)
+	})
+	t.Run("missing setup intent id is a bad body", func(t *testing.T) {
+		s := webhooktest.NewFakeStore()
+		r := newRouter(&webhooktest.FakeVerifier{Event: setupIntentFailedEvent("evt_sf6", "", "card_declined", "")}, s)
+		res := r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 400, res.HTTPStatus)
+		require.Equal(t, webhook.StatusInvalidBody, res.Status)
+		require.Empty(t, s.FailedSetupIntents)
+	})
+}

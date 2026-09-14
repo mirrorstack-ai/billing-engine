@@ -118,6 +118,16 @@ type Store interface {
 	// both have arrived).
 	ResolvePendingAddCardRequest(ctx context.Context, stripePaymentMethodID string) error
 
+	// FailAddCardRequestBySetupIntent is setup_intent.setup_failed's
+	// terminal write (billing-engine#215): the still-pending request keyed by
+	// setup_intent_id becomes 'failed' with the Stripe reason (decline_code,
+	// else code; "" stores NULL) and resolved_at=now(). Returns found=false
+	// when nothing was pending — already resolved through the succeeded /
+	// attached path (a stale setup_failed after a retried confirmation
+	// succeeded: the success stands), or a SetupIntent created outside
+	// StartAddPaymentMethod (no row) — both no-ops.
+	FailAddCardRequestBySetupIntent(ctx context.Context, setupIntentID, failureCode string) (found bool, err error)
+
 	// ApplyInvoiceStatus reconciles a Stripe invoice.* event onto the
 	// ms_billing.invoices mirror row keyed by stripe_invoice_id. It
 	// updates status + amount_paid + amount_due, plus the presentment
@@ -491,6 +501,8 @@ func (r *Router) dispatch(ctx context.Context, event stripego.Event) Result {
 		return r.handlePaymentMethodDetached(ctx, event)
 	case stripego.EventTypeSetupIntentSucceeded:
 		return r.handleSetupIntentSucceeded(ctx, event)
+	case stripego.EventTypeSetupIntentSetupFailed:
+		return r.handleSetupIntentSetupFailed(ctx, event)
 	case stripego.EventTypeInvoiceCreated,
 		stripego.EventTypeInvoiceFinalized,
 		stripego.EventTypeInvoicePaid,
