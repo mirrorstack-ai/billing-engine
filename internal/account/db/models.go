@@ -900,13 +900,14 @@ type MsBillingPaymentMethodsMirror struct {
 	CardCountry    pgtype.Text        `json:"card_country"`
 }
 
-// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent; capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.
+// The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × (1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.
 type MsBillingRiskRampConfig struct {
 	ID                int16          `json:"id"`
 	NoCardMicros      int64          `json:"no_card_micros"`
 	CardBaseMicros    int64          `json:"card_base_micros"`
 	CeilingMicros     int64          `json:"ceiling_micros"`
-	Exponent          pgtype.Numeric `json:"exponent"`
+	RangeMicros       int64          `json:"range_micros"`
+	Tau               pgtype.Numeric `json:"tau"`
 	DelinquentDivisor int32          `json:"delinquent_divisor"`
 	LatePenaltyK      int32          `json:"late_penalty_k"`
 	// Incident kill-switch: true = every AI budget verdict is allowed (decided_by paused) while alerts keep recording. Flip via the SetAIEnforcementPaused admin RPC; no deploy needed.

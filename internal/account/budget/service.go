@@ -272,26 +272,27 @@ func EffectivePaid(cfg RiskRampConfig, sig ExposureSignals) int {
 	return k
 }
 
-// ExposureLimitMicros is the owner's curve (2026-09-14, migration 085): no
-// usable card → NoCardMicros; a usable card with k paid invoices →
-// CardBaseMicros × (1+k)^Exponent — strict at first, flattening (0.5 = √,
-// the first seed; the owner is choosing the shape, so it is config) — never
-// above CeilingMicros. Delinquency (owner's pick): while an invoice is open
-// with a balance the limit is the curve divided by DelinquentDivisor, never
-// below NoCardMicros — the risk control without a hard cliff (a huge divisor
-// reproduces the cliff, 1 disables the reduction); once settled, k is
-// EffectivePaid — the memory. Whole micros, rounded half up; the ceiling
-// also bounds a zero-card floor so a misconfigured row cannot exceed it. An
-// exponent outside (0, 1] (a row the DB CHECK did not see) falls back to √.
+// ExposureLimitMicros is the owner's FINAL curve (2026-09-14, migration
+// 085): no usable card → NoCardMicros; a usable card with k paid invoices →
+// CardBaseMicros + RangeMicros × (1 − e^(−k/Tau)) — steep at first,
+// saturating toward base + range ($10 + $190) — and never above
+// CeilingMicros, the hard clamp. Delinquency (owner's pick): while an
+// invoice is open with a balance the limit is the curve divided by
+// DelinquentDivisor, never below NoCardMicros — the risk control without a
+// hard cliff (a huge divisor reproduces the cliff, 1 disables the
+// reduction); once settled, k is EffectivePaid — the memory, applied before
+// the divisor. Whole micros, rounded half up; the ceiling also bounds a
+// zero-card floor so a misconfigured row cannot exceed it. A non-positive
+// tau (a row the DB CHECK did not see) means "no growth": the base alone.
 func ExposureLimitMicros(cfg RiskRampConfig, sig ExposureSignals) int64 {
 	var limit int64
 	if sig.HasUsableCard {
 		k := EffectivePaid(cfg, sig)
-		p := cfg.Exponent
-		if p <= 0 || p > 1 {
-			p = 0.5
+		growth := 0.0
+		if cfg.Tau > 0 && cfg.RangeMicros > 0 {
+			growth = float64(cfg.RangeMicros) * (1 - math.Exp(-float64(k)/cfg.Tau))
 		}
-		limit = int64(math.Round(float64(cfg.CardBaseMicros) * math.Pow(1+float64(k), p)))
+		limit = int64(math.Round(float64(cfg.CardBaseMicros) + growth))
 	} else {
 		limit = cfg.NoCardMicros
 	}
@@ -659,7 +660,8 @@ func (s *Service) GetAIEnforcement(ctx context.Context) (*AIEnforcementResponse,
 		NoCardMicros:      cfg.NoCardMicros,
 		CardBaseMicros:    cfg.CardBaseMicros,
 		CeilingMicros:     cfg.CeilingMicros,
-		Exponent:          cfg.Exponent,
+		RangeMicros:       cfg.RangeMicros,
+		Tau:               cfg.Tau,
 		DelinquentDivisor: cfg.DelinquentDivisor,
 		LatePenaltyK:      cfg.LatePenaltyK,
 	}, nil

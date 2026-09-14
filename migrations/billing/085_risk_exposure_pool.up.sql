@@ -8,13 +8,14 @@
 -- flattening —
 --
 --     no verified card            → no_card_micros              ($5)
---     verified card, k paid inv.  → card_base_micros × (1+k)^exponent
---                                   (owner's pick 2026-09-14: $10 × (1+k)^0.9 —
---                                    $10 at k=0, $18.66 at k=1, $181.19 at k=24)
---     never above                 → ceiling_micros              ($200)
+--     verified card, k paid inv.  → card_base_micros + range_micros × (1 − e^(−k/tau))
+--                                   (owner's FINAL shape 2026-09-14: $10 + $190 ×
+--                                    (1 − e^(−k/5)) — $10 at k=0, $44 at k=1,
+--                                    $130 at k=5, saturating toward $200)
+--     never above                 → ceiling_micros              ($200, the hard clamp)
 --
--- The SHAPE is config too (coordinator, PR-B review): base and exponent are
--- columns, so the next tuning is an UPDATE.
+-- The SHAPE is config too (coordinator, PR-B review): base, range and tau
+-- are columns, so the next tuning is an UPDATE.
 --
 -- The constants are FINANCE-OWNED and live here, in one row, so they are
 -- tuned by an UPDATE and never by a code literal (collection.go's trust ramp
@@ -40,10 +41,11 @@ CREATE TABLE IF NOT EXISTS ms_billing.risk_ramp_config (
     no_card_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_no_card_nonneg CHECK (no_card_micros >= 0),
     card_base_micros      BIGINT NOT NULL CONSTRAINT risk_ramp_card_base_nonneg CHECK (card_base_micros >= 0),
     ceiling_micros        BIGINT NOT NULL CONSTRAINT risk_ramp_ceiling_nonneg CHECK (ceiling_micros >= 0),
-    -- (1+k)^exponent: 0.5 = square root; 1 = linear; bounded so the curve
-    -- always grows and never explodes.
-    exponent              NUMERIC(4,3) NOT NULL DEFAULT 0.900
-                          CONSTRAINT risk_ramp_exponent_range CHECK (exponent > 0 AND exponent <= 1),
+    -- Saturating growth: range_micros is how far above the base the curve
+    -- can climb, tau (in paid invoices) how fast it gets there — 63% of the
+    -- range at k = tau, 95% at 3·tau.
+    range_micros          BIGINT NOT NULL DEFAULT 190000000 CONSTRAINT risk_ramp_range_nonneg CHECK (range_micros >= 0),
+    tau                   NUMERIC(6,3) NOT NULL DEFAULT 5.000 CONSTRAINT risk_ramp_tau_positive CHECK (tau > 0),
     -- Delinquency (owner's pick 2026-09-14): while an invoice is open /
     -- uncollectible with a balance the limit is the curve DIVIDED by
     -- delinquent_divisor, never below no_card_micros (the owner found a hard
@@ -68,7 +70,7 @@ VALUES (1, 5000000, 10000000, 200000000)
 ON CONFLICT (id) DO NOTHING;
 
 COMMENT ON TABLE ms_billing.risk_ramp_config IS
-    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros × (1+k)^exponent; capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
+    'The PaaS exposure curve (owner 2026-09-14): no card → no_card_micros; verified card with k paid invoices → card_base_micros + range_micros × (1 − exp(−k/tau)); capped at ceiling_micros. Delinquency: curve / delinquent_divisor (never below no_card_micros) while delinquent; k reduced by late_penalty_k per late invoice once settled. Finance-owned; tune by UPDATE.';
 
 ALTER TABLE ms_billing.budgets
     DROP CONSTRAINT IF EXISTS budgets_category_known;

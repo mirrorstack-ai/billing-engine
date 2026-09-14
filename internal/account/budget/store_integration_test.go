@@ -177,7 +177,8 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.EqualValues(t, 5_000_000, cfg.NoCardMicros)
 	require.EqualValues(t, 10_000_000, cfg.CardBaseMicros)
 	require.EqualValues(t, 200_000_000, cfg.CeilingMicros)
-	require.InDelta(t, 0.9, cfg.Exponent, 1e-9, "the owner's seed: curve E")
+	require.EqualValues(t, 190_000_000, cfg.RangeMicros)
+	require.InDelta(t, 5, cfg.Tau, 1e-9, "the owner's final shape: $10 + $190 × (1 − e^(−k/5))")
 	require.Equal(t, 3, cfg.DelinquentDivisor)
 	require.Equal(t, 2, cfg.LatePenaltyK)
 	require.False(t, cfg.EnforcementPaused, "the kill-switch ships off")
@@ -241,8 +242,8 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.Equal(t, 2, sig.PaidInvoices, "open invoices do not count as paid")
 	require.True(t, sig.DelinquentNow, "an open invoice with a balance is delinquent now")
 	require.Zero(t, sig.LateCount)
-	// k=2 on curve E: $10×3^0.9 = $26.88; delinquent → /3 = $8.96 (above the $5 floor).
-	require.EqualValues(t, 8_959_584, budget.ExposureLimitMicros(cfg, sig), "delinquent: the curve divided by 3, above the no-card floor")
+	// k=2: $72.64; delinquent → /3 = $24.21 (above the $5 floor).
+	require.EqualValues(t, 24_213_063, budget.ExposureLimitMicros(cfg, sig), "delinquent: the curve divided by 3, above the no-card floor")
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET ever_failed = true WHERE stripe_invoice_id = 'in_exposure_a'`)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, `UPDATE ms_billing.invoices SET status = 'paid', amount_due = 0 WHERE stripe_invoice_id = 'in_exposure_c'`)
@@ -252,7 +253,7 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.False(t, sig.DelinquentNow, "settled: nothing open with a balance")
 	require.Equal(t, 1, sig.LateCount, "a paid invoice that once failed is remembered as late")
 	require.Equal(t, 3, sig.PaidInvoices)
-	require.EqualValues(t, 18_660_660, budget.ExposureLimitMicros(cfg, sig), "3 paid − 2×1 late = k 1 → $10×2^0.9")
+	require.EqualValues(t, 44_441_157, budget.ExposureLimitMicros(cfg, sig), "3 paid − 2×1 late = k 1 → $44.44")
 
 	// The system exposure row is storable and re-upserts in place.
 	first, err := store.UpsertBudget(ctx, budget.Budget{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryExposure, AccountID: acct, LimitMicros: 17_320_508, AlertPercents: []int{80, 100}, Active: true, HardCap: true})

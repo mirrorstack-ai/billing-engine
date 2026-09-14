@@ -61,7 +61,7 @@ func newFakeStore() *fakeStore {
 		orgAccounts: map[uuid.UUID]uuid.UUID{},
 		appPayers:   map[uuid.UUID]uuid.UUID{},
 		signals:     map[uuid.UUID]budget.ExposureSignals{},
-		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5, DelinquentDivisor: 3, LatePenaltyK: 2},
+		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, RangeMicros: 190_000_000, Tau: 5, DelinquentDivisor: 3, LatePenaltyK: 2},
 	}
 }
 
@@ -855,11 +855,12 @@ func TestEvaluateAccountBudget_AccountThenOwningOrg(t *testing.T) {
 
 // --- PaaS risk-exposure pool (migration 085, PR-B) ------------------------
 
-// TestExposureLimitMicros_OwnerCurve pins the owner's curve: $5 without a
-// card; with a card $10 × √(1+k) for k paid invoices, flattening; capped at
-// the ceiling; whole micros rounded half up.
+// TestExposureLimitMicros_OwnerCurve pins the owner's FINAL curve: $5 without
+// a card; with a card $10 + $190 × (1 − e^(−k/5)) for k paid invoices —
+// steep at first, saturating toward $200 — clamped at the ceiling; whole
+// micros rounded half up.
 func TestExposureLimitMicros_OwnerCurve(t *testing.T) {
-	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5}
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, RangeMicros: 190_000_000, Tau: 5}
 	for _, tc := range []struct {
 		card bool
 		paid int
@@ -868,28 +869,24 @@ func TestExposureLimitMicros_OwnerCurve(t *testing.T) {
 		{false, 0, 5_000_000},
 		{false, 50, 5_000_000},
 		{true, 0, 10_000_000},
-		{true, 1, 14_142_136},
-		{true, 2, 17_320_508},
-		{true, 3, 20_000_000},
-		{true, 8, 30_000_000},
-		{true, 15, 40_000_000},
-		{true, 24, 50_000_000},
-		{true, 399, 200_000_000},
-		{true, 10_000, 200_000_000},
+		{true, 1, 44_441_157},   // $44.44
+		{true, 2, 72_639_191},   // $72.64
+		{true, 3, 95_725_789},   // $95.73
+		{true, 5, 130_102_906},  // $130.10 — 63% of the range at k = tau
+		{true, 10, 174_286_296}, // $174.29
+		{true, 24, 198_436_348}, // $198.44
+		{true, 1000, 200_000_000},
 		{true, -3, 10_000_000},
 	} {
 		require.EqualValues(t, tc.want, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: tc.card, PaidInvoices: tc.paid}), "card=%v paid=%d", tc.card, tc.paid)
 	}
 	// A misconfigured floor above the ceiling is still bounded by the ceiling.
 	require.EqualValues(t, 1, budget.ExposureLimitMicros(budget.RiskRampConfig{NoCardMicros: 9, CardBaseMicros: 9, CeilingMicros: 1}, budget.ExposureSignals{}))
-
-	// The SHAPE is config: the owner's candidate steeper curves, and linear.
-	card := budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 3} // k=3 → (1+k)=4
-	require.EqualValues(t, 40_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 20_000_000, CeilingMicros: 200_000_000, Exponent: 0.5}, card), "$20×√4")
-	require.EqualValues(t, 32_490_096, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.85}, card), "$10×4^0.85")
-	require.EqualValues(t, 42_426_407, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 15_000_000, CeilingMicros: 200_000_000, Exponent: 0.75}, card), "$15×4^0.75")
-	require.EqualValues(t, 40_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 1}, card), "linear")
-	require.EqualValues(t, 20_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0}, card), "an unset exponent falls back to √")
+	// The ceiling clamps a range that overshoots it.
+	require.EqualValues(t, 150_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, RangeMicros: 500_000_000, Tau: 5, CeilingMicros: 150_000_000}, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}))
+	// The SHAPE is config: a slower tau saturates later; no tau/range = the base alone.
+	require.EqualValues(t, 191_412_996, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, RangeMicros: 190_000_000, Tau: 7.75, CeilingMicros: 200_000_000}, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}), "tau 7.75 → $191.41 at k=24")
+	require.EqualValues(t, 10_000_000, budget.ExposureLimitMicros(budget.RiskRampConfig{CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000}, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}))
 }
 
 // TestGetBudgetStatus_ExposurePoolComposesWithTheCaps: on a PaaS account the
@@ -902,7 +899,7 @@ func TestGetBudgetStatus_ExposurePoolComposesWithTheCaps(t *testing.T) {
 	ctx := context.Background()
 	app, acct := uuid.New(), uuid.New()
 	store.appPayers[app] = acct
-	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 3} // $20
+	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 3} // $10 + $190×(1−e^(−3/5)) = $95.73
 	read := func() *budget.GetBudgetStatusResponse {
 		st, err := svc.GetBudgetStatus(ctx, budget.GetBudgetStatusRequest{Scope: budget.ScopeApp, ScopeID: app, Category: budget.CategoryAI, TemplateKey: "member-help"})
 		require.NoError(t, err)
@@ -910,26 +907,26 @@ func TestGetBudgetStatus_ExposurePoolComposesWithTheCaps(t *testing.T) {
 	}
 
 	// No customer cap, pool under: exists=false, not exhausted, pool reported.
-	store.accountAllSpend = 12_000_000
+	store.accountAllSpend = 90_000_000
 	st := read()
 	require.False(t, st.Exists)
 	require.False(t, st.Exhausted)
 	require.NotNil(t, st.Pool)
 	require.Equal(t, "paas", st.Pool.Mode)
 	require.Equal(t, budget.PoolSourceExposureLimit, st.Pool.Source)
-	require.EqualValues(t, 20_000_000, st.Pool.LimitMicros)
-	require.EqualValues(t, 8_000_000, st.Pool.RemainingMicros)
+	require.EqualValues(t, 95_725_789, st.Pool.LimitMicros)
+	require.EqualValues(t, 5_725_789, st.Pool.RemainingMicros)
 	require.True(t, st.Pool.HasUsableCard)
 	require.Equal(t, 3, st.Pool.PaidInvoices)
 	// The system row exists now, with the curve as its limit.
 	sys, found, err := store.GetBudget(ctx, budget.ScopeAccount, acct, budget.CategoryExposure, "")
 	require.NoError(t, err)
 	require.True(t, found)
-	require.EqualValues(t, 20_000_000, sys.LimitMicros)
+	require.EqualValues(t, 95_725_789, sys.LimitMicros)
 	require.True(t, sys.HardCap)
 
 	// No customer cap, pool full: exhausted by the pool.
-	store.accountAllSpend = 20_000_000
+	store.accountAllSpend = 95_725_789
 	st = read()
 	require.False(t, st.Exists)
 	require.True(t, st.Exhausted)
@@ -1098,10 +1095,12 @@ func TestGetBudgetStatus_KillSwitchAllowsEveryVerdict(t *testing.T) {
 // one reproduces the hard floor; once settled each late invoice costs
 // late_penalty_k paid invoices of trust (a huge penalty resets k, 0 forgets).
 func TestExposureLimitMicros_DelinquencyDivisor(t *testing.T) {
-	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.5, DelinquentDivisor: 3, LatePenaltyK: 2}
+	cfg := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, RangeMicros: 190_000_000, Tau: 5, DelinquentDivisor: 3, LatePenaltyK: 2}
 
-	// Delinquent with a card at k=8: $30 / 3 = $10.
-	require.EqualValues(t, 10_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, DelinquentNow: true}))
+	// Delinquent with a card at k=8: $161.64 / 3.
+	require.EqualValues(t, 53_879_887, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, DelinquentNow: true}))
+	// Delinquent at k=24: $198.44 / 3 = $66.15.
+	require.EqualValues(t, 66_145_449, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24, DelinquentNow: true}))
 	// Never below the no-card figure: $10 / 3 = $3.33 → $5.
 	require.EqualValues(t, 5_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 0, DelinquentNow: true}))
 	// No card and delinquent: the floor as before.
@@ -1110,19 +1109,19 @@ func TestExposureLimitMicros_DelinquencyDivisor(t *testing.T) {
 	// Divisor 1: unchanged while delinquent.
 	one := cfg
 	one.DelinquentDivisor = 1
-	require.EqualValues(t, 30_000_000, budget.ExposureLimitMicros(one, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, DelinquentNow: true}))
+	require.EqualValues(t, 161_639_662, budget.ExposureLimitMicros(one, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, DelinquentNow: true}))
 	// A huge divisor reproduces the hard floor.
 	cliff := cfg
 	cliff.DelinquentDivisor = 1_000_000
 	require.EqualValues(t, 5_000_000, budget.ExposureLimitMicros(cliff, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24, DelinquentNow: true}))
 
-	// Settled, with memory: 8 paid, 1 late → k_eff 6 → $10×√7.
-	require.EqualValues(t, 26_457_513, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 1}))
+	// Settled, with memory: 8 paid, 1 late → k_eff 6 → $142.77.
+	require.EqualValues(t, 142_773_100, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 1}))
 	require.Equal(t, 6, budget.EffectivePaid(cfg, budget.ExposureSignals{PaidInvoices: 8, LateCount: 1}))
 	// 3 paid, 2 late → k_eff floors at 0 → $10.
 	require.EqualValues(t, 10_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 3, LateCount: 2}))
 	// No late history: unchanged curve.
-	require.EqualValues(t, 30_000_000, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8}))
+	require.EqualValues(t, 161_639_662, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8}))
 	// Rule (a) through the same column: a huge penalty resets k on any late payment.
 	reset := cfg
 	reset.LatePenaltyK = 1_000_000
@@ -1130,15 +1129,9 @@ func TestExposureLimitMicros_DelinquencyDivisor(t *testing.T) {
 	// Penalty 0: late history is forgotten.
 	none := cfg
 	none.LatePenaltyK = 0
-	require.EqualValues(t, 30_000_000, budget.ExposureLimitMicros(none, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 5}))
-	// Delinquent AND late history: memory first, then the divisor. 8 paid, 1 late → $26.46 / 3 = $8.82.
-	require.EqualValues(t, 8_819_171, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 1, DelinquentNow: true}))
-
-	// The owner's seed (curve E): $10 × (1+k)^0.9 — $10 at k=0, $18.66 at k=1, $181.19 at k=24.
-	seed := budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 200_000_000, Exponent: 0.9, DelinquentDivisor: 3, LatePenaltyK: 2}
-	require.EqualValues(t, 10_000_000, budget.ExposureLimitMicros(seed, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 0}))
-	require.EqualValues(t, 18_660_660, budget.ExposureLimitMicros(seed, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 1}))
-	require.EqualValues(t, 181_194_916, budget.ExposureLimitMicros(seed, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 24}), "$10×25^0.9 = $181.19")
+	require.EqualValues(t, 161_639_662, budget.ExposureLimitMicros(none, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 5}))
+	// Delinquent AND late history: memory first, then the divisor. 8 paid, 1 late → k 6 → $142.77 / 3.
+	require.EqualValues(t, 47_591_033, budget.ExposureLimitMicros(cfg, budget.ExposureSignals{HasUsableCard: true, PaidInvoices: 8, LateCount: 1, DelinquentNow: true}))
 }
 
 // TestGetBudgetStatus_DelinquentAccountIsFlooredOnTheWire: the pool a
@@ -1148,17 +1141,17 @@ func TestGetBudgetStatus_DelinquentAccountIsFlooredOnTheWire(t *testing.T) {
 	store := newFakeStore()
 	svc := newService(store)
 	acct := uuid.New()
-	// 24 paid, 1 late → k 22 → $10×√23 = $47.96, delinquent → /3 = $15.99.
+	// 24 paid, 1 late → k 22 → $197.67, delinquent → /3 = $65.89.
 	store.signals[acct] = budget.ExposureSignals{BillingMode: "standard", HasUsableCard: true, PaidInvoices: 24, DelinquentNow: true, LateCount: 1}
-	store.accountAllSpend = 15_000_000
+	store.accountAllSpend = 64_889_101
 	st, err := svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
 	require.NoError(t, err)
-	require.EqualValues(t, 15_986_105, st.Pool.LimitMicros)
+	require.EqualValues(t, 65_889_101, st.Pool.LimitMicros)
 	require.True(t, st.Pool.DelinquentNow)
 	require.Equal(t, 1, st.Pool.LateCount)
 	require.Equal(t, 22, st.Pool.EffectivePaid)
 	require.False(t, st.Pool.Exhausted)
-	store.accountAllSpend = 16_000_000
+	store.accountAllSpend = 65_889_101
 	st, err = svc.GetBudgetStatus(context.Background(), budget.GetBudgetStatusRequest{Scope: budget.ScopeAccount, ScopeID: acct, Category: budget.CategoryAI})
 	require.NoError(t, err)
 	require.True(t, st.Exhausted)

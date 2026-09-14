@@ -219,9 +219,11 @@ type RiskRampConfig struct {
 	NoCardMicros   int64
 	CardBaseMicros int64
 	CeilingMicros  int64
-	// Exponent p in base × (1+k)^p: 0.5 = square root, 1 = linear; the DB
-	// bounds it to (0, 1].
-	Exponent float64
+	// RangeMicros / Tau shape the saturating growth base + range × (1 −
+	// e^(−k/tau)): 63% of the range at k = tau, 95% at 3·tau; the DB keeps
+	// tau positive.
+	RangeMicros int64
+	Tau         float64
 	// DelinquentDivisor / LatePenaltyK are the delinquency rule (owner
 	// 2026-09-14): while delinquent the limit is curve / DelinquentDivisor,
 	// never below NoCardMicros (a huge divisor is the hard floor, 1 disables);
@@ -255,7 +257,8 @@ type AIEnforcementResponse struct {
 	NoCardMicros      int64     `json:"no_card_micros"`
 	CardBaseMicros    int64     `json:"card_base_micros"`
 	CeilingMicros     int64     `json:"ceiling_micros"`
-	Exponent          float64   `json:"exponent"`
+	RangeMicros       int64     `json:"range_micros"`
+	Tau               float64   `json:"tau"`
 	DelinquentDivisor int       `json:"delinquent_divisor"`
 	LatePenaltyK      int       `json:"late_penalty_k"`
 }
