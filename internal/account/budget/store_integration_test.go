@@ -238,8 +238,14 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	for i, st := range []string{"paid", "paid", "open"} {
 		// charge_funding_legacy_unresolved = true is the pre-052 provenance shape
 		// (no funding account pinned); the CHECK requires one of the two shapes.
+		// A paid invoice has paid its $1.00; the open one has paid nothing —
+		// arrears is what is still owed (amount_due − amount_paid).
+		paid := 0
+		if st == "paid" {
+			paid = 100
+		}
 		_, err = pool.Exec(ctx, `INSERT INTO ms_billing.invoices (account_id, stripe_invoice_id, status, amount_due, amount_paid, currency, charge_funding_legacy_unresolved)
-			VALUES ($1, $2, $3, 100, 100, 'usd', true)`, acct.String(), "in_exposure_"+string(rune('a'+i)), st)
+			VALUES ($1, $2, $3, 100, $4, 'usd', true)`, acct.String(), "in_exposure_"+string(rune('a'+i)), st, paid)
 		require.NoError(t, err)
 	}
 	sig, err = store.ExposureSignals(ctx, acct)

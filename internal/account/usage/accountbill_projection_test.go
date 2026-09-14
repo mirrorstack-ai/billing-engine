@@ -10,7 +10,7 @@ import "testing"
 // through GetAccountBill. These assert the sign on the sum directly.
 func TestProjectedTotalMicrosSubtractsPaasCredit(t *testing.T) {
 	const credit = int64(5)
-	total := projectedTotalMicros(100, 20, 30, 40, 50, credit, 6)
+	total := projectedTotalMicros(100, 20, 30, 40, 50, 0, credit, 6)
 
 	// 100+20+30+40+50-5+6. Adding the credit instead yields 251.
 	if want := int64(241); total != want {
@@ -21,8 +21,8 @@ func TestProjectedTotalMicrosSubtractsPaasCredit(t *testing.T) {
 // The arithmetic above pins one point; this pins the DIRECTION, so a future
 // edit cannot satisfy the constant by coincidence.
 func TestProjectedTotalMicrosFallsAsTheCreditGrows(t *testing.T) {
-	base := projectedTotalMicros(100, 20, 30, 40, 50, 0, 6)
-	withCredit := projectedTotalMicros(100, 20, 30, 40, 50, 7, 6)
+	base := projectedTotalMicros(100, 20, 30, 40, 50, 0, 0, 6)
+	withCredit := projectedTotalMicros(100, 20, 30, 40, 50, 0, 7, 6)
 
 	if withCredit >= base {
 		t.Fatalf("a larger credit did not lower the projected total: %d -> %d", base, withCredit)

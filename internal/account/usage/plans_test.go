@@ -225,3 +225,60 @@ func TestPlanTermsWireCarriesTheDeployAllowanceAlias(t *testing.T) {
 		t.Errorf("personal_only is retired (org apps may be Free, capped per org); it must not be emitted")
 	}
 }
+
+// TestUsageDeduction_TheOwnersRule pins 用量減免 (billing-engine#202 PR-4,
+// owner 2026-09-13): the plan's allowance nets module usage + 部署用量 as a
+// category, never more than was used, the FULL allowance (never prorated),
+// nothing inside the creation grace, nothing for an app the period's plan fee
+// never covered.
+func TestUsageDeduction_TheOwnersRule(t *testing.T) {
+	t.Parallel()
+	free, pro, biz := usage.TermsFor(usage.PlanFree), usage.TermsFor(usage.PlanPro), usage.TermsFor(usage.PlanBusiness)
+	// Capped by the allowance: Free $1 against $3 of usage.
+	if got := usage.UsageDeductionMicros(free, true, 2_000_000, 1_000_000); got != 1_000_000 {
+		t.Fatalf("free: %d", got)
+	}
+	// Capped by the usage: an allowance is not a credit.
+	if got := usage.UsageDeductionMicros(pro, true, 300_000, 200_000); got != 500_000 {
+		t.Fatalf("pro under: %d", got)
+	}
+	if got := usage.UsageDeductionMicros(biz, true, 10_000_000, 9_000_000); got != 15_000_000 {
+		t.Fatalf("business: %d", got)
+	}
+	// Not eligible → nothing; no usage → nothing; never negative.
+	if got := usage.UsageDeductionMicros(pro, false, 3_000_000, 0); got != 0 {
+		t.Fatalf("ineligible: %d", got)
+	}
+	if got := usage.UsageDeductionMicros(pro, true, 0, 0); got != 0 {
+		t.Fatalf("no usage: %d", got)
+	}
+	if got := usage.UsageDeductionMicros(pro, true, -5, -5); got != 0 {
+		t.Fatalf("negative usage: %d", got)
+	}
+
+	start := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	graceEndsInside := end.Add(-24 * time.Hour).Add(-time.Duration(usage.GraceDays) * 24 * time.Hour) // created 4 days before the end: grace over by the end
+	graceRunsPast := end.Add(-24 * time.Hour)                                                         // created the day before the end: still in grace at the end
+	for _, tc := range []struct {
+		name               string
+		mirrored, deleted  bool
+		created, deletedAt time.Time
+		want               bool
+	}{
+		{"no roster row", false, false, start.AddDate(-1, 0, 0), time.Time{}, false},
+		{"old app, live", true, false, start.AddDate(-1, 0, 0), time.Time{}, true},
+		{"created inside the period, grace over by its end", true, false, graceEndsInside, time.Time{}, true},
+		{"created inside the period, still in grace at its end", true, false, graceRunsPast, time.Time{}, false},
+		{"created after the period", true, false, end.Add(time.Hour), time.Time{}, false},
+		{"deleted before the period opened", true, true, start.AddDate(-1, 0, 0), start.Add(-time.Hour), false},
+		{"deleted at the period's open instant", true, true, start.AddDate(-1, 0, 0), start, false},
+		{"deleted inside the period after surviving grace", true, true, start.AddDate(-1, 0, 0), start.Add(10 * 24 * time.Hour), true},
+		{"cancelled inside its grace", true, true, start.Add(2 * 24 * time.Hour), start.Add(3 * 24 * time.Hour), false},
+		{"cancelled the moment its grace ended", true, true, start, usage.GraceExpiry(start), true},
+	} {
+		if got := usage.UsageAllowanceEligible(tc.mirrored, tc.created, tc.deleted, tc.deletedAt, start, end); got != tc.want {
+			t.Errorf("%s: eligible = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

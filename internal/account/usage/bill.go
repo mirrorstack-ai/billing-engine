@@ -17,7 +17,7 @@ import (
 //
 // The app-owner (customer) bill for ONE app for ONE period is:
 //
-//	最終費用 TotalMicros = BaseFee + ModuleUsageTotal + InfraTotal − PaasCredit
+//	最終費用 TotalMicros = BaseFee + ModuleUsageTotal + InfraTotal − UsageDeduction − PaasCredit
 //
 // ALL of the amounts below are TUNABLE post-build — the user adjusts them after
 // this ships. The billed STRUCTURE + the mechanism (tiering, infra split, credit
@@ -179,7 +179,8 @@ func pctMicros(base int64, pct int) (int64, error) {
 //  5. computes PaaS 額度 credit = PaasCreditPct% of the infra total, but ONLY when
 //     an active SaaS subscription earns it — v1 has no subscription system, so the
 //     credit is subscription-gated OFF and is 0 (the wire field stays for back-compat),
-//  6. TotalMicros = base + module usage + infra − credit.
+//  6. TotalMicros = base + module usage + infra − 用量減免 (the plan's usage
+//     allowance, PR-4) − credit.
 //
 // UNINSTALL-SAFE: usage is billed + displayed from the immutable ledgers only
 // (AppBill never joins an install table), so an uninstalled module's accrued
@@ -255,7 +256,9 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		baseFee += moduleOverage
 	}
 
-	total := baseFee + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros - paasCredit
+	// 用量減免 (PR-4): the plan's allowance nets the app's usage — module usage
+	// + 部署用量 — never the base fee, never more than was used.
+	total := baseFee + parts.ModuleUsageTotalMicros + parts.InfraTotalMicros - parts.UsageDeductionMicros - paasCredit
 
 	return &GetAppBillResponse{
 		AppID:                  req.AppID,
@@ -275,6 +278,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		ModuleUsageDevServedMicros: parts.ModuleUsageDevServedMicros,
 		InfraTotalMicros:           parts.InfraTotalMicros,
 		DeployUsageMicros:          parts.DeployUsageMicros,
+		UsageDeductionMicros:       parts.UsageDeductionMicros,
 		InfraLines:                 parts.InfraLines,
 		ModuleInfraLines:           parts.ModuleInfraLines,
 		ModuleInfraDevServedLines:  parts.ModuleInfraDevServedLines,
@@ -352,8 +356,12 @@ type appBillParts struct {
 	// (migration 079/080) — 部署用量 as one number. Group is the catalog's
 	// display_group, so a new deploy-side metric joins by its row alone.
 	DeployUsageMicros int64
-	InfraLines        []AppInfraUsage
-	ModuleInfraLines  []AppModuleInfraUsage
+	// UsageDeductionMicros is the plan's 用量減免 for this app and period
+	// (UsageDeductionMicros in plans.go): min(allowance, ModuleUsageTotal +
+	// DeployUsage), 0 inside the creation grace. Subtracted from TotalMicros.
+	UsageDeductionMicros int64
+	InfraLines           []AppInfraUsage
+	ModuleInfraLines     []AppModuleInfraUsage
 	// ModuleInfraDevServedLines is the tunnel-burned half of the same per-module
 	// infra read: priced, displayed, and — like ModuleUsageDevServedMicros — never
 	// a term in InfraTotalMicros or any other total.
@@ -650,6 +658,7 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 
 	return &appBillParts{
 		BaseFeeMicros:              baseFee,
+		UsageDeductionMicros:       UsageDeductionMicros(TermsFor(plan), UsageAllowanceEligible(mirrored, mirror.CreatedAt, mirrored && mirror.Deleted, mirror.DeletedAt, periodStart, periodEnd), moduleUsageTotal, deployUsage),
 		InstalledModuleCount:       mirror.ModuleCount,
 		ModuleUsage:                moduleUsage,
 		ModuleUsageTotalMicros:     moduleUsageTotal,
