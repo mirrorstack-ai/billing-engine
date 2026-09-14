@@ -440,7 +440,9 @@ func (s *pgxStore) ApplyDemeritOnSettle(ctx context.Context, stripeInvoiceID str
 // close (a repeat or an older close is a no-op: applied=false, demerit = the
 // stored score).
 func (s *pgxStore) ApplyDemeritAtClose(ctx context.Context, accountID uuid.UUID, closeAt time.Time) (demerit float64, applied bool, err error) {
-	d, err := s.q.ApplyDemeritAtClose(ctx, db.ApplyDemeritAtCloseParams{AccountID: accountID.String(), CloseAt: closeAt.UTC()})
+	// Postgres keeps microseconds; a nanosecond tail would read "newer" than
+	// the stored stamp of the same close and apply it twice.
+	d, err := s.q.ApplyDemeritAtClose(ctx, db.ApplyDemeritAtCloseParams{AccountID: accountID.String(), CloseAt: closeAt.UTC().Truncate(time.Microsecond)})
 	if errors.Is(err, pgx.ErrNoRows) {
 		sig, err := s.q.ExposureSignals(ctx, accountID.String())
 		if err != nil {

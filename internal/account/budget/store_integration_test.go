@@ -252,7 +252,11 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.EqualValues(t, 15_648_284, budget.ExposureLimitMicros(cfg, sig), "S 0: the curve itself (S2 k=2)")
 
 	// --- the three demerit transitions, one DB statement each -------------
-	closeAt := func(h int) time.Time { return time.Now().UTC().Add(time.Duration(h) * time.Hour) }
+	// Closes are period boundaries: whole seconds, from ONE base, so "the
+	// same close again" is the same instant (a fresh time.Now() per call was
+	// a later instant, and Postgres keeps microseconds).
+	base := time.Now().UTC().Truncate(time.Second)
+	closeAt := func(h int) time.Time { return base.Add(time.Duration(h) * time.Hour) }
 	// FAIL: the invoice's first failure is +2, once.
 	applied, err := store.ApplyDemeritOnFailure(ctx, "in_exposure_c")
 	require.NoError(t, err)
