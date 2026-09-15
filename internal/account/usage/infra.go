@@ -446,8 +446,37 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	// Resolve the owner's billing account. Nil owner (or no account yet)
 	// records a lazy event with NULL account_id — retained and backfilled on
 	// conversion (design §8), identical to RecordUsage.
+	//
+	// 🔴 T183 (owner 2026-09-15, "missing infra storage and infra cache"): the
+	// platform's own samplers — infra-storage-sync, infra-egress-sync,
+	// infra-ssr-compute-sync — carry NO principal, only the app the bytes belong
+	// to, and recorded NULL-account events "to be backfilled on conversion". The
+	// only backfill that can reach an ownerless row is the org attach sweep,
+	// which runs for FUNDED orgs and swept 0 on 09-15; every app-bill query
+	// filters `account_id = @account_id`, so twkpa-edu's storage and CDN lines
+	// existed and were invisible — absent, not zero — while dispatch's compute
+	// events, which stamp the app's owner, rendered. So an ownerless event with
+	// an app resolves its account from the ms_billing.apps roster AT RECORD TIME,
+	// the way the compute path resolves it from the stamped owner: the roster's
+	// account_id (an org app carries the org account once funded, migration 041;
+	// a personal app always carries its own), falling back to the owning org's
+	// funded account when the roster row has none yet. No roster row, or an
+	// unfunded org → still NULL-account (lazy), exactly as before.
 	accountID := uuid.Nil
 	owner := Owner{UserID: req.OwnerUserID, OrgID: req.OwnerOrgID}
+	if owner.IsZero() && req.AppID != uuid.Nil {
+		mirror, found, err := s.store.AppMirror(ctx, req.AppID)
+		if err != nil {
+			return nil, billing.Internal("app roster lookup failed", err)
+		}
+		if found {
+			if mirror.AccountID != uuid.Nil {
+				accountID = mirror.AccountID
+			} else if mirror.OwnerOrgID != uuid.Nil {
+				owner = Owner{OrgID: mirror.OwnerOrgID}
+			}
+		}
+	}
 	if !owner.IsZero() {
 		id, ok, err := s.store.AccountByOwner(ctx, owner)
 		if err != nil {

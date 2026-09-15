@@ -737,3 +737,86 @@ func TestRecordInfraUsage_DefaultsDevServedFalse(t *testing.T) {
 	require.False(t, store.events[req.EventID].DevServed,
 		"platform-incurred infra stays chargeable unless the producer marks the forward")
 }
+
+// T183 (owner 2026-09-15): the platform's samplers record infra events with NO
+// principal, only the app. Before this, such an event landed with account_id
+// NULL and no app-bill query could ever match it — twkpa-edu's 儲存空間 and CDN
+// lines existed in the ledger and were absent on the bill while dispatch's
+// owner-stamped compute line rendered. The account now resolves from the apps
+// roster at record time, the way the compute path resolves it from the owner.
+func TestRecordInfraUsage_OwnerlessEventResolvesTheAccountFromTheAppRoster(t *testing.T) {
+	store := newFakeStore()
+	req := validInfra()
+	req.OwnerUserID, req.OwnerOrgID = uuid.Nil, uuid.Nil // the storage/egress/SSR sync shape
+	acct := uuid.New()
+	store.appMirrors[req.AppID] = usage.AppMirrorInfo{AccountID: acct}
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, acct, store.events[req.EventID].AccountID,
+		"an ownerless infra event carries its app's roster account, not NULL")
+}
+
+func TestRecordInfraUsage_OwnerlessEventWithoutARosterRowStaysLazy(t *testing.T) {
+	// No roster row (a platform-agent app-less sample, or an app registered
+	// after the event) → the pre-existing lazy behaviour, unchanged: NULL
+	// account, recorded, backfilled by the sweeps that key on app_id.
+	store := newFakeStore()
+	req := validInfra()
+	req.OwnerUserID, req.OwnerOrgID = uuid.Nil, uuid.Nil
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, uuid.Nil, store.events[req.EventID].AccountID)
+}
+
+func TestRecordInfraUsage_OwnerlessEventOnAnUnfundedOrgAppStaysLazy(t *testing.T) {
+	// The roster row exists but carries no account yet (an org app before the
+	// org's funding designation, migration 041): the org path is tried through
+	// AccountByOwner exactly like a stamped org owner, finds no funded account,
+	// and the event stays NULL-account for the org attach sweep — as designed.
+	store := newFakeStore()
+	req := validInfra()
+	req.OwnerUserID, req.OwnerOrgID = uuid.Nil, uuid.Nil
+	store.appMirrors[req.AppID] = usage.AppMirrorInfo{OwnerOrgID: uuid.New()}
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, uuid.Nil, store.events[req.EventID].AccountID)
+}
+
+func TestRecordInfraUsage_AStampedOwnerStillWinsOverTheRoster(t *testing.T) {
+	// A producer that DOES stamp an owner (dispatch's compute path) is resolved
+	// from that owner as before; the roster is consulted only when the request
+	// carries none. Pinned so the new branch cannot silently re-attribute a
+	// stamped event to a roster row that disagrees.
+	store := newFakeStore()
+	req := validInfra()
+	ownerAcct, rosterAcct := uuid.New(), uuid.New()
+	store.accounts[req.OwnerUserID] = ownerAcct
+	store.appMirrors[req.AppID] = usage.AppMirrorInfo{AccountID: rosterAcct}
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+	require.Equal(t, ownerAcct, store.events[req.EventID].AccountID)
+}
+
+func TestRecordInfraUsage_RosterLookupErrorIsInternalNotSilentNull(t *testing.T) {
+	// A failed roster read must not degrade into a NULL-account row that the
+	// bill would then silently omit — the exact shape T183 was.
+	store := newFakeStore()
+	store.errAppMirror = errors.New("db down")
+	req := validInfra()
+	req.OwnerUserID, req.OwnerOrgID = uuid.Nil, uuid.Nil
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.Error(t, err)
+	var be *billing.Error
+	require.True(t, errors.As(err, &be))
+	require.Equal(t, billing.CodeInternal, be.Code)
+	require.Empty(t, store.events)
+}
