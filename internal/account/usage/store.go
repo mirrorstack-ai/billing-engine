@@ -510,6 +510,15 @@ type AppMirrorInfo struct {
 	DeletedAt   time.Time
 	// Plan is the app's billing plan (migration 075).
 	Plan Plan
+	// AccountID is the roster row's billing account (migration 027; NULL →
+	// uuid.Nil for an org app whose org is not yet funded — migration 041). It is
+	// what an OWNERLESS infra event resolves its account from at record time
+	// (T183): the platform's own samplers (storage / egress / SSR) carry no
+	// principal, only an app, and dispatch's compute path already stamps the
+	// app's owner — so the roster is the one place both paths agree on.
+	AccountID uuid.UUID
+	// OwnerOrgID is the roster's owning org (uuid.Nil for a personal app).
+	OwnerOrgID uuid.UUID
 }
 
 // MetricDefinition is the catalog projection the ingest path resolves
@@ -1365,14 +1374,21 @@ func (s *pgxStore) AppMirror(ctx context.Context, appID uuid.UUID) (AppMirrorInf
 	if err != nil {
 		return AppMirrorInfo{}, false, err
 	}
-	return AppMirrorInfo{
+	info := AppMirrorInfo{
 		ModuleCount: int(row.ModuleCount),
 		CreatedAt:   row.CreatedAt,
 		Name:        row.Name.String, // "" when NULL (pre-037 / unnamed)
 		Deleted:     row.DeletedAt.Valid,
 		DeletedAt:   row.DeletedAt.Time,
 		Plan:        Plan(row.Plan),
-	}, true, nil
+	}
+	if row.AccountID.Valid {
+		info.AccountID = uuid.UUID(row.AccountID.Bytes)
+	}
+	if row.OwnerOrgID.Valid {
+		info.OwnerOrgID = uuid.UUID(row.OwnerOrgID.Bytes)
+	}
+	return info, true, nil
 }
 
 func (s *pgxStore) AppBaseSnapshot(ctx context.Context, appID uuid.UUID, periodStart time.Time) (AppBaseSnapshotInfo, bool, error) {

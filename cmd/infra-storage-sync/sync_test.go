@@ -10,6 +10,8 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 )
 
 type fakeLister struct {
@@ -131,4 +133,19 @@ func TestSyncStorage_EmitsAGiBLevelNotGiBHours(t *testing.T) {
 	require.EqualValues(t, 2, gib, "the emitted value is the level in GiB")
 	require.NotEqualValues(t, 2*lookbackHours, gib,
 		"a pre-integrated value would be lookbackHours times too large")
+}
+
+func TestIsStaleReplayConflict_OnlyAnOlderInstantsConflictIsADedupe(t *testing.T) {
+	// 09-15 13:48Z: the bucket level changed between runs, the 10:00 and 11:00
+	// instants were re-emitted under their deterministic event_ids with the new
+	// level, and RecordInfraUsage answered CONFLICT. The first sample of an older
+	// instant stands; only the newest instant is this run's to record.
+	newest := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	older := newest.Add(-2 * time.Hour)
+	conflict := billing.Conflict("event_id is already bound to a different canonical usage payload")
+
+	require.True(t, isStaleReplayConflict(conflict, older, newest), "an older instant's CONFLICT is the replay disagreeing with itself")
+	require.False(t, isStaleReplayConflict(conflict, newest, newest), "a CONFLICT on the newest instant is real and stays a row error")
+	require.False(t, isStaleReplayConflict(billing.Internal("db down", errors.New("boom")), older, newest), "only CONFLICT is a dedupe; any other error stays a row error")
+	require.False(t, isStaleReplayConflict(errors.New("plain"), older, newest))
 }

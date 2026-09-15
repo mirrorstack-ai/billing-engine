@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
 
@@ -150,7 +152,8 @@ func syncStorage(ctx context.Context, svc *usage.Service, lister objectLister, b
 	}
 	res.Prefixes = len(sizes)
 
-	for _, instant := range closedHours(at, lookbackHours) {
+	instants := closedHours(at, lookbackHours)
+	for _, instant := range instants {
 		res.Samples++
 		for pk, bytes := range sizes {
 			// The LEVEL in GiB. The rollup integrates it over time (rollup.sql
@@ -170,6 +173,14 @@ func syncStorage(ctx context.Context, svc *usage.Service, lister objectLister, b
 				RecordedAt: instant,
 			})
 			if rerr != nil {
+				if isStaleReplayConflict(rerr, instant, instants[len(instants)-1]) {
+					// The first sample of an older instant already stands (it was
+					// taken closer to that instant); this run's re-emission with
+					// a NEWER level for the SAME event_id is the approximation
+					// above disagreeing with itself, not a failure. Dedupe it.
+					res.Deduped++
+					continue
+				}
 				res.RowErrors++
 				slog.ErrorContext(ctx, "record infra storage failed",
 					"app_id", pk.app, "module_id", pk.module, "metric", storageMetric,
@@ -187,3 +198,24 @@ func syncStorage(ctx context.Context, svc *usage.Service, lister objectLister, b
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// isStaleReplayConflict tells a CONFLICT on a re-emitted OLDER instant apart
+// from every other record error.
+//
+// Why it exists (09-15, 13:48Z, twkpa-edu): syncStorage lists the bucket ONCE
+// and stamps that level at every closed hour in the lookback. When the level
+// changes between runs (a video landed), the 10:00 and 11:00 instants — already
+// recorded at 10:48 and 11:48 with the earlier level — are re-emitted under the
+// same deterministic event_id with a different payload, and RecordInfraUsage
+// answers CONFLICT ("event_id is already bound to a different canonical usage
+// payload") instead of the DO NOTHING dedupe the loop was written for. The
+// earlier sample is the closer one and should stand; only the NEWEST instant
+// (first emission) is ever this run's to record, so a conflict there is real.
+func isStaleReplayConflict(err error, instant, newest time.Time) bool {
+	var be *billing.Error
+	if !errors.As(err, &be) || be.Code != billing.CodeConflict {
+		return false
+	}
+	return instant.Before(newest)
+}
+
