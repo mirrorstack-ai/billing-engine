@@ -124,8 +124,11 @@ when receipt time was already inside that funded window.
 period result is `SUM(MAX(value) per subject)` within the existing authoritative
 bill-line dimensions (account, app, module, metric, model, module version, and
 billing window). Model/version changes remain separate price definitions; no
-arrival-order rule moves a subject between them. Keyed peak is cardinality-like
-and receives no level-window proration. The aggregate uniqueness key includes
+arrival-order rule moves a subject between them. Each version's line is charged
+its share of the period (`active_seconds / period`, the same window model as
+unkeyed `peak`; the windows sum to the period), so a subject active under every
+version costs one period of the meter however many versions shipped — see
+`RollupKeyedPeakKind`. The aggregate uniqueness key includes
 the aggregation mode so a mid-period catalog mode change retains both immutable
 lines rather than overwriting one.
 

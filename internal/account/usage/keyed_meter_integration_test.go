@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -126,8 +127,12 @@ func TestKeyedMeterObservation_PostgresEndToEnd(t *testing.T) {
 	require.Equal(t, usage.AggregationKeySubject, rolled.Aggregates[0].AggregationKey)
 	require.Equal(t, "2", rolled.Aggregates[0].BillableQuantity)
 	require.Equal(t, int64(200), rolled.Aggregates[0].ChargedMicros)
-	require.Nil(t, rolled.Aggregates[0].ActiveSeconds, "cardinality peak is never level-window prorated")
-	require.Nil(t, rolled.Aggregates[0].PeriodDays)
+	// core-v2#1665: keyed peak is window-prorated. One version for the whole
+	// period is window == P (factor 1), so the charge above is the full 200.
+	require.NotNil(t, rolled.Aggregates[0].ActiveSeconds)
+	require.Equal(t, "2678400", *rolled.Aggregates[0].ActiveSeconds, "31 days: the single version owns the whole period")
+	require.NotNil(t, rolled.Aggregates[0].PeriodDays)
+	require.Equal(t, "31", *rolled.Aggregates[0].PeriodDays)
 
 	// The rolled branch reconciles to the same exact amount.
 	rolledRead, err := usageSvc.GetAppUsageSummary(ctx, usage.GetAppUsageSummaryRequest{OwnerUserID: ownerID, AppID: appID})
@@ -190,8 +195,10 @@ func TestKeyedMeterObservation_PostgresEndToEnd(t *testing.T) {
 	require.Equal(t, 1, futureAuditCount)
 
 	// September proves period independence and the authoritative version/model
-	// bill-line boundary: the same subject is deduped inside v1, but counted once
-	// again in v2 because it is a distinct immutable price definition.
+	// bill-line boundary: the same subject is deduped inside v1, and is its own
+	// line again in v2 because it is a distinct immutable price definition — but
+	// each line bills only its version's SHARE of the period (core-v2#1665), so
+	// the lines together are one period of the meter, not one period per version.
 	_, err = pool.Exec(ctx, `
 		INSERT INTO ms_billing.metric_version_prices (module_id, metric, module_version, unit_price_micros)
 		VALUES ($1, 'users.monthly_active', '1.0.0', 100),
@@ -220,9 +227,16 @@ func TestKeyedMeterObservation_PostgresEndToEnd(t *testing.T) {
 		require.Equal(t, "1", aggregate.BillableQuantity)
 		require.Equal(t, usage.AggregationKeySubject, aggregate.AggregationKey)
 	}
-	require.Equal(t, int64(100), byVersion["1.0.0"].ChargedMicros)
-	require.Equal(t, int64(200), byVersion["2.0.0"].ChargedMicros)
-	require.Equal(t, int64(100), byVersion[""].ChargedMicros)
+	// September is 720h. 1.0.0 owns [Sep 1 00:00, Sep 2 12:00) = 36h (the gap
+	// before the first observation is credited to the stream's first row);
+	// 2.0.0 owns the 1h until the version-less observation; "" owns the 683h
+	// to period end. Σ = 720h.
+	require.Equal(t, "129600", *byVersion["1.0.0"].ActiveSeconds)
+	require.Equal(t, "3600", *byVersion["2.0.0"].ActiveSeconds)
+	require.Equal(t, "2458800", *byVersion[""].ActiveSeconds)
+	require.Equal(t, int64(5), byVersion["1.0.0"].ChargedMicros, "1 × 100 × 36/720")
+	require.Equal(t, int64(0), byVersion["2.0.0"].ChargedMicros, "1 × 200 × 1/720 = 0.28, rounds to 0")
+	require.Equal(t, int64(95), byVersion[""].ChargedMicros, "1 × 100 × 683/720 = 94.86")
 
 	// Explicit mid-period mode-change coexistence: a legacy standard-peak line
 	// and a keyed line with otherwise identical dimensions must not overwrite.
@@ -667,4 +681,78 @@ func waitForNamedLockWaiter(t *testing.T, pool *pgxpool.Pool, queryName string) 
 		}
 		return waiters >= 1
 	}, 3*time.Second, 10*time.Millisecond)
+}
+
+// core-v2#1665: the owner's case, against the real rollup + live SQL. One user
+// stays signed in while the app ships 100 versions in one period. Every version
+// keeps its own bill line, and the 100 lines together cost exactly ONE period of
+// the meter — it was 100x.
+func TestKeyedMeterObservation_HundredVersionsBillOnePeriodPrice(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	accountID, ownerID := keyedIntegrationAccount(t, pool,
+		time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC))
+	moduleID, appID := uuid.New(), uuid.New()
+	now := time.Date(2027, 2, 28, 23, 0, 0, 0, time.UTC)
+	usageService := usage.NewService(usage.NewStore(pool)).WithNow(func() time.Time { return now })
+	_, err := usageService.SetMetricDefinitions(ctx, usage.SetMetricDefinitionsRequest{
+		ModuleID: moduleID,
+		Metrics: []usage.MetricDef{{
+			Metric: "users.monthly_active", Kind: usage.KindPeak,
+			AggregationKey: usage.AggregationKeySubject,
+			Unit:           "user", UnitPriceMicros: 20_000, Priced: true, Active: true,
+		}},
+	})
+	require.NoError(t, err)
+
+	periodStart := time.Date(2027, 2, 1, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2027, 3, 1, 0, 0, 0, 0, time.UTC)
+	const versions = 100
+	// 28 days / 100 = 24_192s per version, an exact 1/100 share each.
+	step := periodEnd.Sub(periodStart) / versions
+	for v := 0; v < versions; v++ {
+		response, recordErr := usageService.RecordUsage(ctx, usage.RecordUsageRequest{
+			Version: 2, EventID: fmt.Sprintf("v%03d", v), AppID: appID, ModuleID: moduleID,
+			OwnerUserID: ownerID, Metric: "users.monthly_active", Value: 1,
+			Subject: "same-end-user", Metadata: json.RawMessage(`{}`),
+			OccurredAt: periodStart.Add(time.Duration(v) * step), RecordedAt: now,
+			ModuleVersion: fmt.Sprintf("1.0.%d", v),
+		})
+		require.NoError(t, recordErr)
+		require.True(t, response.Recorded)
+	}
+
+	sumLines := func(label string) {
+		t.Helper()
+		read, readErr := usageService.GetAppUsageSummary(ctx, usage.GetAppUsageSummaryRequest{OwnerUserID: ownerID, AppID: appID})
+		require.NoError(t, readErr)
+		require.Len(t, read.Metrics, versions, label)
+		var total int64
+		for _, line := range read.Metrics {
+			require.Equal(t, 1.0, line.BillableQuantity, label)
+			require.Equal(t, int64(200), line.ChargedMicros, label)
+			total += line.ChargedMicros
+		}
+		require.Equal(t, int64(20_000), total, label)
+	}
+	sumLines("live per-version lines total one period price")
+
+	account, err := usageService.GetUsageSummary(ctx, usage.GetUsageSummaryRequest{OwnerUserID: ownerID})
+	require.NoError(t, err)
+	require.Len(t, account.Metrics, 1)
+	require.Equal(t, 1.0, account.Metrics[0].Quantity, "one user, not one per version")
+	require.Equal(t, int64(20_000), account.Metrics[0].ChargedMicros)
+
+	rolled, err := cycle.NewService(cycle.NewStore(pool), nil).
+		RollupPeriod(ctx, accountID, periodStart, periodEnd)
+	require.NoError(t, err)
+	require.Len(t, rolled.Aggregates, versions)
+	for _, aggregate := range rolled.Aggregates {
+		require.Equal(t, "1", aggregate.BillableQuantity)
+		require.Equal(t, "24192", *aggregate.ActiveSeconds)
+		require.Equal(t, int64(200), aggregate.ChargedMicros)
+	}
+	require.Equal(t, int64(20_000), rolled.TotalChargedMicros,
+		"100 versions in one period = exactly 1x the price")
+	sumLines("the rolled read reconciles with the live one")
 }

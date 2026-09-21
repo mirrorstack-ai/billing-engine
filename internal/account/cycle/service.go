@@ -581,8 +581,15 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 		// RollupTimeWeightedKind's query comment), and the additive kinds were
 		// never prorated. The PERSISTED billable_quantity (below) always stays
 		// the raw, unscaled representative level — proration is pricing-only.
+		//
+		// KEYED peak (aggregation_key="subject", e.g. monthly active users) is
+		// prorated by the SAME factor (core-v2#1665): its per-version line sums
+		// the subjects seen under that version, and a subject who stays active
+		// across N version handoffs is in all N lines — at 100% each that was N x
+		// the period price. Σ window_v == P (RollupKeyedPeakKind), so the same
+		// subject across any number of versions totals exactly one period price.
 		pricedQuantity := raw.BillableQuantity
-		if raw.Kind == usage.KindPeak && raw.AggregationKey == "" {
+		if raw.Kind == usage.KindPeak {
 			pricedQuantity, err = prorateLevelQuantity(raw.BillableQuantity, raw.ActiveSeconds, periodSeconds)
 			if err != nil {
 				return nil, billing.Internal("compute window-prorated peak quantity failed", err)

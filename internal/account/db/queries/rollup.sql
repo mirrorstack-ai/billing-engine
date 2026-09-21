@@ -202,8 +202,25 @@ GROUP BY app_id, module_id, metric, kind, model, module_version, dev_served;
 -- account/app/module/metric/model/module_version/window. A model or version
 -- change is a distinct pricing definition and therefore a distinct keyed line;
 -- no arrival-order-dependent "latest wins" reassignment can move usage between
--- prices. Keyed peak is a cardinality-style quantity and receives no
--- level-window proration.
+-- prices.
+--
+-- WINDOW PRORATION (core-v2#1665, owner rule 2026-09-21). A subject who stays
+-- active across a version handoff is a subject_peak of 1 in EVERY version's
+-- line, so billing each line at 100% charged N versions N x the period price
+-- (an app shipping 100 versions in a month paid 100x for the same users).
+-- Keyed peak is therefore a LEVEL metric like RollupPeakKind and bills
+-- charge_v = Σ subject_peak_v × (window_v / P) × price_v. active_seconds is
+-- window_v, derived EXACTLY as RollupPeakKind derives it, over the keyed
+-- stream of the meter: LEAD across the full (app, module, metric, model)
+-- stream with module_version and dev_served OUT of the PARTITION BY (a
+-- successor's first observation ends its predecessor's window at the true
+-- handoff) and the (period_start, first observation) gap credited to the
+-- stream's first row, so Σ window_v == P by telescoping. Two invariants
+-- follow: a single-version period has window_v == P (factor 1, byte-for-byte
+-- the pre-#1665 charge), and a subject present in every version totals ONE
+-- period price however many versions shipped. The per-version line and its
+-- version-keyed price are kept — only the share of the period is new. This
+-- query only aggregates; cycle.RollupPeriod applies window_v / P.
 --
 -- dev_served (migration 073) joins that scope at BOTH levels: one subject's
 -- tunnel-served peak and its deployed peak are different facts, so they are
@@ -219,7 +236,9 @@ WITH eligible AS (
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
         dev_served,
-        value
+        value,
+        COALESCE(billable_at, recorded_at) AS observation_at,
+        event_id
     FROM ms_billing.usage_events
     WHERE account_id = @account_id::uuid
       AND COALESCE(billable_at, recorded_at) >= @period_start::timestamptz
@@ -227,6 +246,25 @@ WITH eligible AS (
       AND (sqlc.arg(include_v2)::boolean OR observation_version <> 2)
       AND kind = 'peak'
       AND aggregation_key = 'subject'
+),
+windowed AS (
+    SELECT
+        app_id, module_id, metric, model, module_version, dev_served, observation_at,
+        LEAD(observation_at, 1, @period_end::timestamptz)
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end,
+        ROW_NUMBER()
+            OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS row_num
+    FROM eligible
+),
+version_windows AS (
+    SELECT
+        app_id, module_id, metric, model, module_version, dev_served,
+        SUM(
+            EXTRACT(EPOCH FROM (segment_end - observation_at))
+            + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (observation_at - @period_start::timestamptz)) ELSE 0 END
+        )::numeric AS active_seconds
+    FROM windowed
+    GROUP BY app_id, module_id, metric, model, module_version, dev_served
 ),
 subject_peaks AS (
     SELECT
@@ -244,8 +282,13 @@ SELECT
     p.model,
     p.module_version,
     p.dev_served,
-    COALESCE(SUM(p.subject_peak), 0)::numeric AS billable_quantity
+    COALESCE(SUM(p.subject_peak), 0)::numeric AS billable_quantity,
+    MAX(w.active_seconds)::numeric AS active_seconds
 FROM subject_peaks p
+JOIN version_windows w
+    ON  w.app_id = p.app_id AND w.module_id = p.module_id AND w.metric = p.metric
+    AND w.model = p.model AND w.module_version = p.module_version
+    AND w.dev_served = p.dev_served
 GROUP BY p.app_id, p.module_id, p.metric, p.model, p.module_version, p.dev_served;
 
 -- RollupTimeWeightedKind integrates the step function under the ordered

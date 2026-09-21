@@ -1340,7 +1340,7 @@ func (s *pgxStore) RawAggregates(ctx context.Context, accountID uuid.UUID, perio
 		}
 	}
 	for _, r := range keyedPeakRows {
-		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, pgtype.Numeric{}); err != nil {
+		if err := appendRow(r.AppID, r.ModuleID, r.Metric, r.Kind, r.AggregationKey, r.Model, r.ModuleVersion, r.DevServed, r.BillableQuantity, r.ActiveSeconds); err != nil {
 			return nil, err
 		}
 	}
