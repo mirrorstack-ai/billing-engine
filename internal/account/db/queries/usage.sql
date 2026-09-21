@@ -369,11 +369,38 @@ WITH base_events AS (
         app_id, module_id, metric, kind, aggregation_key, subject, dev_served,
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
-        value
+        value,
+        COALESCE(billable_at, recorded_at) AS observation_at,
+        event_id
     FROM ms_billing.usage_events
     WHERE account_id = $1
       AND COALESCE(billable_at, recorded_at) >= $2
       AND COALESCE(billable_at, recorded_at) <  $3
+),
+-- core-v2#1665: a keyed peak line bills its version's SHARE OF THE PERIOD, the
+-- same window_v / P the rollup freezes (RollupKeyedPeakKind owns the model and
+-- its reasons; this mirrors it so the live estimate reconciles with the rolled
+-- charge). On an OPEN period the newest version's window runs to period_end
+-- (the charge the rollup would freeze if no further version shipped), so the
+-- shares always sum to 1 and N versions never read as N x the price.
+keyed_windows AS (
+    SELECT
+        app_id, module_id, metric, model, module_version, dev_served,
+        SUM(
+            EXTRACT(EPOCH FROM (segment_end - observation_at))
+            + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (observation_at - $2::timestamptz)) ELSE 0 END
+        )::numeric AS active_seconds
+    FROM (
+        SELECT
+            app_id, module_id, metric, model, module_version, dev_served, observation_at,
+            LEAD(observation_at, 1, $3::timestamptz)
+                OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS segment_end,
+            ROW_NUMBER()
+                OVER (PARTITION BY app_id, module_id, metric, model ORDER BY observation_at, event_id) AS row_num
+        FROM base_events
+        WHERE aggregation_key = 'subject'
+    ) keyed_stream
+    GROUP BY app_id, module_id, metric, model, module_version, dev_served
 ),
 billable_events AS (
     -- Every legacy/non-keyed row keeps the exact coarse live behavior.
@@ -381,14 +408,22 @@ billable_events AS (
     FROM base_events
     WHERE aggregation_key IS DISTINCT FROM 'subject'
     UNION ALL
-    -- Keyed peak is exact even before rollup: one MAX per authoritative
-    -- subject inside the existing app/model/version bill-line dimensions.
+    -- Keyed peak: one MAX per authoritative subject inside the existing
+    -- app/model/version bill-line dimensions, weighted by that version's share
+    -- of the period. This summary collapses versions into ONE line, so the
+    -- weighted value is what keeps total_quantity * unit_price == raw_cost: a
+    -- user active under every version counts as one user, not one per version.
     SELECT
-        app_id, module_id, metric, kind, model, module_version, dev_served,
-        MAX(value)::numeric AS billable_value
-    FROM base_events
-    WHERE aggregation_key = 'subject'
-    GROUP BY app_id, module_id, metric, kind, model, module_version, dev_served, subject
+        b.app_id, b.module_id, b.metric, b.kind, b.model, b.module_version, b.dev_served,
+        (MAX(b.value) * MAX(w.active_seconds)
+            / EXTRACT(EPOCH FROM ($3::timestamptz - $2::timestamptz)))::numeric AS billable_value
+    FROM base_events b
+    JOIN keyed_windows w
+        ON  w.app_id = b.app_id AND w.module_id = b.module_id AND w.metric = b.metric
+        AND w.model = b.model AND w.module_version = b.module_version
+        AND w.dev_served = b.dev_served
+    WHERE b.aggregation_key = 'subject'
+    GROUP BY b.app_id, b.module_id, b.metric, b.kind, b.model, b.module_version, b.dev_served, b.subject
 )
 SELECT
     e.module_id                                         AS module_id,
@@ -588,24 +623,66 @@ live_base AS (
         module_id, metric, kind, aggregation_key, subject, dev_served,
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
-        value
+        value,
+        COALESCE(billable_at, recorded_at) AS observation_at,
+        event_id,
+        @period_start::timestamptz AS period_start,
+        @period_end::timestamptz AS period_end
     FROM ms_billing.usage_events
     WHERE account_id = @account_id::uuid
       AND app_id = @app_id::uuid
       AND COALESCE(billable_at, recorded_at) >= @period_start::timestamptz
       AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz
 ),
+-- core-v2#1665: a keyed peak line bills its version's SHARE OF THE PERIOD, the
+-- same window_v / P the rollup freezes (RollupKeyedPeakKind owns the model and
+-- its reasons; this mirrors it so the live estimate reconciles with the rolled
+-- charge). On an OPEN period the newest version's window runs to period_end
+-- (the charge the rollup would freeze if no further version shipped), so the
+-- shares always sum to 1 and N versions never read as N x the price.
+keyed_windows AS (
+    SELECT
+        module_id, metric, model, module_version, dev_served,
+        SUM(
+            EXTRACT(EPOCH FROM (segment_end - observation_at))
+            + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (observation_at - period_start)) ELSE 0 END
+        )::numeric AS active_seconds,
+        MAX(EXTRACT(EPOCH FROM (period_end - period_start)))::numeric AS period_seconds
+    FROM (
+        SELECT
+            module_id, metric, model, module_version, dev_served, observation_at,
+            period_start, period_end,
+            LEAD(observation_at, 1, period_end)
+                OVER (PARTITION BY module_id, metric, model ORDER BY observation_at, event_id) AS segment_end,
+            ROW_NUMBER()
+                OVER (PARTITION BY module_id, metric, model ORDER BY observation_at, event_id) AS row_num
+        FROM live_base
+        WHERE aggregation_key = 'subject'
+    ) keyed_stream
+    GROUP BY module_id, metric, model, module_version, dev_served
+),
 live_values AS (
-    SELECT module_id, metric, kind, model, module_version, dev_served, value AS billable_value
+    -- priced_value is what is charged; billable_value is what is displayed and
+    -- stays the raw per-version quantity, exactly as the rolled row persists it.
+    SELECT
+        module_id, metric, kind, model, module_version, dev_served,
+        value AS billable_value, value AS priced_value,
+        NULL::numeric AS active_seconds, NULL::numeric AS period_seconds
     FROM live_base
     WHERE aggregation_key IS DISTINCT FROM 'subject'
     UNION ALL
     SELECT
-        module_id, metric, kind, model, module_version, dev_served,
-        MAX(value)::numeric AS billable_value
-    FROM live_base
-    WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, kind, model, module_version, dev_served, subject
+        b.module_id, b.metric, b.kind, b.model, b.module_version, b.dev_served,
+        MAX(b.value)::numeric AS billable_value,
+        (MAX(b.value) * MAX(w.active_seconds) / MAX(w.period_seconds))::numeric AS priced_value,
+        MAX(w.active_seconds)::numeric AS active_seconds,
+        MAX(w.period_seconds)::numeric AS period_seconds
+    FROM live_base b
+    JOIN keyed_windows w
+        ON  w.module_id = b.module_id AND w.metric = b.metric AND w.model = b.model
+        AND w.module_version = b.module_version AND w.dev_served = b.dev_served
+    WHERE b.aggregation_key = 'subject'
+    GROUP BY b.module_id, b.metric, b.kind, b.model, b.module_version, b.dev_served, b.subject
 ),
 live AS (
     SELECT
@@ -618,15 +695,14 @@ live AS (
         COALESCE(SUM(e.billable_value), 0)::numeric         AS billable_quantity,
         COALESCE(MAX(md.unit_price_micros), 0)::bigint     AS unit_price_micros,
         COALESCE(
-            SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)),
+            SUM(e.priced_value * COALESCE(md.unit_price_micros, 0)),
             0
         )::numeric                                         AS charged_micros,
-        -- The live (pre-rollup) estimate has no window-segmentation logic —
-        -- that lives only in cmd/billing-cycle's rollup. Explicit NULL,
-        -- type-matched to the rolled branch so the UNION ALL type-checks:
-        -- before a period rolls up, the active window is simply unknown.
-        NULL::numeric                                      AS active_seconds,
-        NULL::numeric                                      AS period_days
+        -- Only a keyed peak line carries a live window (keyed_windows above);
+        -- every other kind stays NULL before the period rolls up, type-matched
+        -- to the rolled branch so the UNION ALL type-checks.
+        MAX(e.active_seconds)::numeric                     AS active_seconds,
+        (MAX(e.period_seconds) / 86400)::numeric           AS period_days
     FROM live_values e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
@@ -717,24 +793,66 @@ live_base AS (
         module_id, metric, kind, aggregation_key, subject, dev_served,
         COALESCE(model, '') AS model,
         COALESCE(module_version, '') AS module_version,
-        value
+        value,
+        COALESCE(billable_at, recorded_at) AS observation_at,
+        event_id,
+        @period_start::timestamptz AS period_start,
+        @period_end::timestamptz AS period_end
     FROM ms_billing.usage_events
     WHERE account_id = @account_id::uuid
       AND app_id = @app_id::uuid
       AND COALESCE(billable_at, recorded_at) >= @period_start::timestamptz
       AND COALESCE(billable_at, recorded_at) <  @period_end::timestamptz
 ),
+-- core-v2#1665: a keyed peak line bills its version's SHARE OF THE PERIOD, the
+-- same window_v / P the rollup freezes (RollupKeyedPeakKind owns the model and
+-- its reasons; this mirrors it so the live estimate reconciles with the rolled
+-- charge). On an OPEN period the newest version's window runs to period_end
+-- (the charge the rollup would freeze if no further version shipped), so the
+-- shares always sum to 1 and N versions never read as N x the price.
+keyed_windows AS (
+    SELECT
+        module_id, metric, model, module_version, dev_served,
+        SUM(
+            EXTRACT(EPOCH FROM (segment_end - observation_at))
+            + CASE WHEN row_num = 1 THEN EXTRACT(EPOCH FROM (observation_at - period_start)) ELSE 0 END
+        )::numeric AS active_seconds,
+        MAX(EXTRACT(EPOCH FROM (period_end - period_start)))::numeric AS period_seconds
+    FROM (
+        SELECT
+            module_id, metric, model, module_version, dev_served, observation_at,
+            period_start, period_end,
+            LEAD(observation_at, 1, period_end)
+                OVER (PARTITION BY module_id, metric, model ORDER BY observation_at, event_id) AS segment_end,
+            ROW_NUMBER()
+                OVER (PARTITION BY module_id, metric, model ORDER BY observation_at, event_id) AS row_num
+        FROM live_base
+        WHERE aggregation_key = 'subject'
+    ) keyed_stream
+    GROUP BY module_id, metric, model, module_version, dev_served
+),
 live_values AS (
-    SELECT module_id, metric, kind, model, module_version, dev_served, value AS billable_value
+    -- priced_value is what is charged; billable_value is what is displayed and
+    -- stays the raw per-version quantity, exactly as the rolled row persists it.
+    SELECT
+        module_id, metric, kind, model, module_version, dev_served,
+        value AS billable_value, value AS priced_value,
+        NULL::numeric AS active_seconds, NULL::numeric AS period_seconds
     FROM live_base
     WHERE aggregation_key IS DISTINCT FROM 'subject'
     UNION ALL
     SELECT
-        module_id, metric, kind, model, module_version, dev_served,
-        MAX(value)::numeric AS billable_value
-    FROM live_base
-    WHERE aggregation_key = 'subject'
-    GROUP BY module_id, metric, kind, model, module_version, dev_served, subject
+        b.module_id, b.metric, b.kind, b.model, b.module_version, b.dev_served,
+        MAX(b.value)::numeric AS billable_value,
+        (MAX(b.value) * MAX(w.active_seconds) / MAX(w.period_seconds))::numeric AS priced_value,
+        MAX(w.active_seconds)::numeric AS active_seconds,
+        MAX(w.period_seconds)::numeric AS period_seconds
+    FROM live_base b
+    JOIN keyed_windows w
+        ON  w.module_id = b.module_id AND w.metric = b.metric AND w.model = b.model
+        AND w.module_version = b.module_version AND w.dev_served = b.dev_served
+    WHERE b.aggregation_key = 'subject'
+    GROUP BY b.module_id, b.metric, b.kind, b.model, b.module_version, b.dev_served, b.subject
 ),
 live AS (
     SELECT
@@ -752,15 +870,14 @@ live AS (
         -- constant within each group.
         CASE
             WHEN e.metric LIKE 'infra.%' OR e.metric LIKE 'platform.%'
-                THEN COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
-            ELSE COALESCE(SUM(e.billable_value * COALESCE(md.unit_price_micros, 0)), 0)
+                THEN COALESCE(SUM(e.priced_value * COALESCE(md.unit_price_micros, 0)), 0) * 12 / 10
+            ELSE COALESCE(SUM(e.priced_value * COALESCE(md.unit_price_micros, 0)), 0)
         END::numeric                                       AS charged_micros,
-        -- The live (pre-rollup) estimate has no window-segmentation logic —
-        -- that lives only in cmd/billing-cycle's rollup. Explicit NULL,
-        -- type-matched to the rolled branch so the UNION ALL type-checks:
-        -- before a period rolls up, the active window is simply unknown.
-        NULL::numeric                                      AS active_seconds,
-        NULL::numeric                                      AS period_days
+        -- Only a keyed peak line carries a live window (keyed_windows above);
+        -- every other kind stays NULL before the period rolls up, type-matched
+        -- to the rolled branch so the UNION ALL type-checks.
+        MAX(e.active_seconds)::numeric                     AS active_seconds,
+        (MAX(e.period_seconds) / 86400)::numeric           AS period_days
     FROM live_values e
     LEFT JOIN ms_billing.metric_definitions md
         ON md.module_id = e.module_id AND md.metric = e.metric
