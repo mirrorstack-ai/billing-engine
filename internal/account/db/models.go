@@ -595,6 +595,40 @@ type MsBillingBillingRun struct {
 	ProposalAttemptedAt pgtype.Timestamptz `json:"proposal_attempted_at"`
 }
 
+type MsBillingBillingRunFreezeSnapshot struct {
+	RunID                string    `json:"run_id"`
+	FrozenCents          int64     `json:"frozen_cents"`
+	UsageChargedMicros   int64     `json:"usage_charged_micros"`
+	AllowanceMicros      int64     `json:"allowance_micros"`
+	ArrearsMicros        int64     `json:"arrears_micros"`
+	AdvanceBaseMicros    int64     `json:"advance_base_micros"`
+	AdvanceOverageMicros int64     `json:"advance_overage_micros"`
+	AdvanceDomainsMicros int64     `json:"advance_domains_micros"`
+	MembersMicros        int64     `json:"members_micros"`
+	WalletDrawnMicros    int64     `json:"wallet_drawn_micros"`
+	SnapshottedAt        time.Time `json:"snapshotted_at"`
+}
+
+type MsBillingBillingRunFreezeSnapshotLine struct {
+	RunID             string              `json:"run_id"`
+	AppID             string              `json:"app_id"`
+	ModuleID          string              `json:"module_id"`
+	Metric            string              `json:"metric"`
+	Model             string              `json:"model"`
+	ModuleVersion     string              `json:"module_version"`
+	Kind              MsBillingMetricKind `json:"kind"`
+	AggregationKey    pgtype.Text         `json:"aggregation_key"`
+	BillableQuantity  pgtype.Numeric      `json:"billable_quantity"`
+	UnitPriceMicros   int64               `json:"unit_price_micros"`
+	CustomerMarkupNum int32               `json:"customer_markup_num"`
+	CustomerMarkupDen int32               `json:"customer_markup_den"`
+	RawCostMicros     int64               `json:"raw_cost_micros"`
+	ChargedMicros     int64               `json:"charged_micros"`
+	ActiveSeconds     pgtype.Numeric      `json:"active_seconds"`
+	PeriodDays        pgtype.Numeric      `json:"period_days"`
+	RolledUpAt        time.Time           `json:"rolled_up_at"`
+}
+
 type MsBillingBudget struct {
 	ID            string               `json:"id"`
 	Scope         MsBillingBudgetScope `json:"scope"`
