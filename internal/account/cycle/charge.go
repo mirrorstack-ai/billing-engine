@@ -697,6 +697,12 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	//     second daemon that reclaimed the same run and froze first wins, and
 	//     THIS process adopts the winner's amount — two racing processes can
 	//     never send different bodies under the shared idem keys.
+	//
+	// The live derivation behind the figure (billing-engine#218) is snapshotted
+	// when this attempt's fresh freeze wins, and diffed against that snapshot,
+	// line by line, when a frozen figure differs from it. Diagnostic only:
+	// neither can fail the run or change what it charges (freeze_snapshot.go).
+	live, liveOK := liveFreezeDerivation(total, allowanceMicros, boundaryTotal, summary)
 	if hasFrozen {
 		cents = frozen.Cents
 		withBase = frozen.WithBase
@@ -727,6 +733,9 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		if claim != StripeRailClaimed {
 			return nil, billing.Internal("boundary funding arm lost its durable claim", nil)
 		}
+		if liveOK && surviving.Cents == live.FrozenCents {
+			s.snapshotFreezeDerivation(ctx, runID, live)
+		}
 		cents = surviving.Cents
 		withBase = surviving.WithBase
 		frozen = surviving
@@ -738,6 +747,9 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		if custID == "" {
 			return nil, billing.Internal("boundary pinned funder has a usable PM but no Stripe customer id", nil)
 		}
+	}
+	if liveOK && hasFrozen && frozen.Cents != live.FrozenCents {
+		s.logFreezeDrift(ctx, runID, accountID, frozen.Cents, live)
 	}
 	summary.ChargedCents = cents
 
@@ -792,9 +804,9 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		// moves to the live figure by compare-and-set. The CAS is the
 		// two-daemons rule kept: the loser matches zero rows and re-reads the
 		// survivor. Old and new are logged as an audit line with every
-		// component, so the reconciliation is explainable after the fact even
-		// though the rollup keeps no history of the first derivation
-		// (core-v2#1485).
+		// component, so the reconciliation is explainable after the fact; the
+		// line-level diff against the first derivation was logged above from
+		// its 087 snapshot, when the run has one (core-v2#1485).
 		//
 		// A run that was ever handed to the proposer keeps the refusal below:
 		// a sealed (or maybe-sealed) digest is exactly the commitment the

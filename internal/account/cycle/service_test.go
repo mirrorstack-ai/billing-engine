@@ -211,6 +211,12 @@ type fakeStore struct {
 	refreezeCalls int                                      // RefreezeBillingRunCharge attempts (billing-engine#217)
 	errRefreeze   error                                    // injected RefreezeBillingRunCharge failure
 
+	freezeSnapshots map[uuid.UUID]cycle.FreezeDerivation // migration 087 snapshots (billing-engine#218); first write wins
+	freezeDrift     []cycle.FrozenLineDrift              // the line diff FreezeDerivationDrift returns beside a snapshot
+	snapshotCalls   int                                  // SnapshotFreezeDerivation attempts
+	driftCalls      int                                  // FreezeDerivationDrift reads
+	errSnapshot     error                                // injected SnapshotFreezeDerivation failure
+
 	proposalAttempted           map[uuid.UUID]bool // run id → proposal_attempted_at set (migration 083); never cleared
 	dropProposalMarkerOnReclaim bool               // MUTANT: forget the marker on reclaim (pre-083 behaviour)
 	errMarkProposalAttempted    error              // injected MarkBillingRunProposalAttempted failure
@@ -598,6 +604,41 @@ func (f *fakeStore) RefreezeBillingRunCharge(_ context.Context, runID uuid.UUID,
 	frozen.Cents = newCents
 	f.frozenCharges[runID] = frozen
 	return true, nil
+}
+
+// SnapshotFreezeDerivation mirrors migration 087's writes: first-write-wins on
+// the run, bound to the run's CURRENT frozen cents, and refused when the
+// copied lines (the fake's live total) do not sum to the derivation's usage.
+func (f *fakeStore) SnapshotFreezeDerivation(_ context.Context, runID uuid.UUID, d cycle.FreezeDerivation) (bool, error) {
+	f.snapshotCalls++
+	if f.errSnapshot != nil {
+		return false, f.errSnapshot
+	}
+	if f.freezeSnapshots == nil {
+		f.freezeSnapshots = map[uuid.UUID]cycle.FreezeDerivation{}
+	}
+	if _, exists := f.freezeSnapshots[runID]; exists {
+		return false, nil
+	}
+	if frozen, ok := f.frozenCharges[runID]; !ok || frozen.Cents != d.FrozenCents {
+		return false, nil
+	}
+	if d.UsageChargedMicros != f.chargedTotal {
+		return false, fmt.Errorf("lines sum to %d micros but the freeze was derived from %d", f.chargedTotal, d.UsageChargedMicros)
+	}
+	f.freezeSnapshots[runID] = d
+	return true, nil
+}
+
+// FreezeDerivationDrift returns the stored snapshot with freezeDrift as the
+// line diff; driftCalls counts reads so a test can prove when a reclaim looks.
+func (f *fakeStore) FreezeDerivationDrift(_ context.Context, runID uuid.UUID) (cycle.FreezeDerivation, []cycle.FrozenLineDrift, bool, error) {
+	f.driftCalls++
+	snap, ok := f.freezeSnapshots[runID]
+	if !ok {
+		return cycle.FreezeDerivation{}, nil, false, nil
+	}
+	return snap, f.freezeDrift, true, nil
 }
 
 func (f *fakeStore) PeriodChargedTotal(_ context.Context, _ uuid.UUID, _, _ time.Time) (int64, error) {

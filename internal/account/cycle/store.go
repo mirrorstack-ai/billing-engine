@@ -174,6 +174,22 @@ type Store interface {
 	// left 'pending' — and the caller re-reads instead of proceeding.
 	RefreezeBillingRunCharge(ctx context.Context, runID uuid.UUID, oldCents, newCents int64) (moved bool, err error)
 
+	// SnapshotFreezeDerivation records, once per run, what a fresh boundary
+	// freeze was derived from: the components in d and the run's collectable
+	// usage_aggregates lines (migration 087, billing-engine#218). written=false
+	// with no error when a snapshot already exists or the run no longer holds
+	// d.FrozenCents. It errors, writing nothing, when the lines it copies do
+	// not sum to d.UsageChargedMicros — the rollup moved between the
+	// derivation and the copy, so they are not the lines the freeze came from.
+	// Nothing reads the snapshot to move money.
+	SnapshotFreezeDerivation(ctx context.Context, runID uuid.UUID, d FreezeDerivation) (written bool, err error)
+
+	// FreezeDerivationDrift returns a run's freeze snapshot and every
+	// aggregate line that differs between it and the live aggregates.
+	// found=false means there is no snapshot to compare against (a run frozen
+	// before 087, or one whose snapshot was refused).
+	FreezeDerivationDrift(ctx context.Context, runID uuid.UUID) (snap FreezeDerivation, drift []FrozenLineDrift, found bool, err error)
+
 	// AccountsWithUsageEvents returns the accounts with raw usage_events in the
 	// window [periodStart, periodEnd) — the rollup-phase work list for
 	// cmd/billing-cycle (phase 1: roll each up into usage_aggregates before the
@@ -989,6 +1005,47 @@ type FrozenBoundaryCharge struct {
 	ChargeFundingGeneration uuid.UUID
 }
 
+// FreezeDerivation is what a boundary figure is derived from (migration 087):
+// the whole cents and every micros component behind them. Snapshotted once
+// when a fresh freeze wins; built from live state on a reclaim to diff
+// against that snapshot.
+type FreezeDerivation struct {
+	FrozenCents          int64
+	UsageChargedMicros   int64 // PeriodChargedTotal, before allowance netting
+	AllowanceMicros      int64
+	ArrearsMicros        int64
+	AdvanceBaseMicros    int64
+	AdvanceOverageMicros int64
+	AdvanceDomainsMicros int64
+	MembersMicros        int64
+	WalletDrawnMicros    int64
+}
+
+// FrozenLineDrift is one aggregate line whose frozen and live derivations
+// differ. InFrozen or InLive false means the line exists on one side only;
+// the missing side's figures read zero.
+type FrozenLineDrift struct {
+	AppID          uuid.UUID
+	ModuleID       uuid.UUID
+	Metric         string
+	Model          string
+	ModuleVersion  string
+	AggregationKey string
+	InFrozen       bool
+	InLive         bool
+
+	FrozenQuantity        string
+	LiveQuantity          string
+	FrozenUnitPriceMicros int64
+	LiveUnitPriceMicros   int64
+	FrozenMarkupNum       int32
+	FrozenMarkupDen       int32
+	LiveMarkupNum         int32
+	LiveMarkupDen         int32
+	FrozenChargedMicros   int64
+	LiveChargedMicros     int64
+}
+
 // CombinedProrationChargeShape is the complete immutable app-base + per-timer
 // request and snapshot shape frozen before the first Stripe call (migration
 // 050). Descriptions and line coverage are included because they are part of
@@ -1547,6 +1604,102 @@ func (s *pgxStore) RefreezeBillingRunCharge(ctx context.Context, runID uuid.UUID
 		return false, err
 	}
 	return n == 1, nil
+}
+
+func (s *pgxStore) SnapshotFreezeDerivation(ctx context.Context, runID uuid.UUID, d FreezeDerivation) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer deferredRollback(ctx, tx)
+	qtx := s.q.WithTx(tx)
+
+	n, err := qtx.InsertBillingRunFreezeSnapshot(ctx, db.InsertBillingRunFreezeSnapshotParams{
+		FrozenCents:          d.FrozenCents,
+		UsageChargedMicros:   d.UsageChargedMicros,
+		AllowanceMicros:      d.AllowanceMicros,
+		ArrearsMicros:        d.ArrearsMicros,
+		AdvanceBaseMicros:    d.AdvanceBaseMicros,
+		AdvanceOverageMicros: d.AdvanceOverageMicros,
+		AdvanceDomainsMicros: d.AdvanceDomainsMicros,
+		MembersMicros:        d.MembersMicros,
+		WalletDrawnMicros:    d.WalletDrawnMicros,
+		RunID:                runID.String(),
+	})
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil // already snapshotted, or the run no longer holds these cents
+	}
+	copied, err := qtx.InsertBillingRunFreezeSnapshotLines(ctx, runID.String())
+	if err != nil {
+		return false, err
+	}
+	if copied.ChargedMicros != d.UsageChargedMicros {
+		return false, fmt.Errorf("billing run %s: %d aggregate lines sum to %d micros but the freeze was derived from %d; the rollup moved in between, no snapshot written",
+			runID, copied.Lines, copied.ChargedMicros, d.UsageChargedMicros)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *pgxStore) FreezeDerivationDrift(ctx context.Context, runID uuid.UUID) (FreezeDerivation, []FrozenLineDrift, bool, error) {
+	h, err := s.q.BillingRunFreezeSnapshot(ctx, runID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return FreezeDerivation{}, nil, false, nil
+	}
+	if err != nil {
+		return FreezeDerivation{}, nil, false, err
+	}
+	rows, err := s.q.BillingRunFreezeLineDrift(ctx, runID.String())
+	if err != nil {
+		return FreezeDerivation{}, nil, false, err
+	}
+	drift := make([]FrozenLineDrift, 0, len(rows))
+	for _, r := range rows {
+		appID, err := uuid.Parse(r.AppID)
+		if err != nil {
+			return FreezeDerivation{}, nil, false, err
+		}
+		moduleID, err := uuid.Parse(r.ModuleID)
+		if err != nil {
+			return FreezeDerivation{}, nil, false, err
+		}
+		drift = append(drift, FrozenLineDrift{
+			AppID:                 appID,
+			ModuleID:              moduleID,
+			Metric:                r.Metric,
+			Model:                 r.Model,
+			ModuleVersion:         r.ModuleVersion,
+			AggregationKey:        r.AggregationKey,
+			InFrozen:              r.InFrozen,
+			InLive:                r.InLive,
+			FrozenQuantity:        r.FrozenQuantity,
+			LiveQuantity:          r.LiveQuantity,
+			FrozenUnitPriceMicros: r.FrozenUnitPriceMicros,
+			LiveUnitPriceMicros:   r.LiveUnitPriceMicros,
+			FrozenMarkupNum:       r.FrozenMarkupNum,
+			FrozenMarkupDen:       r.FrozenMarkupDen,
+			LiveMarkupNum:         r.LiveMarkupNum,
+			LiveMarkupDen:         r.LiveMarkupDen,
+			FrozenChargedMicros:   r.FrozenChargedMicros,
+			LiveChargedMicros:     r.LiveChargedMicros,
+		})
+	}
+	return FreezeDerivation{
+		FrozenCents:          h.FrozenCents,
+		UsageChargedMicros:   h.UsageChargedMicros,
+		AllowanceMicros:      h.AllowanceMicros,
+		ArrearsMicros:        h.ArrearsMicros,
+		AdvanceBaseMicros:    h.AdvanceBaseMicros,
+		AdvanceOverageMicros: h.AdvanceOverageMicros,
+		AdvanceDomainsMicros: h.AdvanceDomainsMicros,
+		MembersMicros:        h.MembersMicros,
+		WalletDrawnMicros:    h.WalletDrawnMicros,
+	}, drift, true, nil
 }
 
 func (s *pgxStore) PeriodChargedTotal(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
