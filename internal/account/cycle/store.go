@@ -433,6 +433,20 @@ type Store interface {
 	// repointed_from (migration 041). Returns the swept-event count.
 	RepointOrgNullAccountEvents(ctx context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error)
 
+	// RepointUserNullAccountEvents is the user twin (core-v2#340): it hands a
+	// USER account the NULL-account events of the apps rostered to it, but only
+	// those inside its open window — older rows stay NULL (D1d), priced by
+	// UserUnbilledBacklogMicros. Returns the swept-event count.
+	RepointUserNullAccountEvents(ctx context.Context, accountID uuid.UUID, windowStart time.Time) (int64, error)
+
+	// UsersWithUnsweptUsage lists the activated user accounts the user repoint
+	// can still take rows for — the daily self-healing work list.
+	UsersWithUnsweptUsage(ctx context.Context) ([]uuid.UUID, error)
+
+	// UserUnbilledBacklogMicros prices the NULL-account events of the account's
+	// rostered apps older than windowStart — the rows the user repoint leaves.
+	UserUnbilledBacklogMicros(ctx context.Context, accountID uuid.UUID, windowStart time.Time) (int64, error)
+
 	// OrgLiveAppIDs lists the org's live roster rows — the attach sweep
 	// reconciles each one's timers after account_id backfills.
 	OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error)
@@ -4310,6 +4324,46 @@ func (s *pgxStore) AttachOrgAppsToAccount(ctx context.Context, orgID, accountID 
 }
 
 func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	return s.repointNullAccountEvents(ctx, accountID, windowStart, func(qtx *db.Queries, targetStart time.Time) (int64, error) {
+		return qtx.RepointOrgNullAccountEvents(ctx, db.RepointOrgNullAccountEventsParams{
+			AccountID:   accountID.String(),
+			WindowStart: targetStart,
+			OrgID:       orgID.String(),
+		})
+	})
+}
+
+func (s *pgxStore) RepointUserNullAccountEvents(ctx context.Context, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	return s.repointNullAccountEvents(ctx, accountID, windowStart, func(qtx *db.Queries, targetStart time.Time) (int64, error) {
+		return qtx.RepointUserNullAccountEvents(ctx, db.RepointUserNullAccountEventsParams{
+			AccountID:   accountID.String(),
+			WindowStart: targetStart,
+		})
+	})
+}
+
+func (s *pgxStore) UsersWithUnsweptUsage(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := s.q.UsersWithUnsweptUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return parseUUIDs(rows)
+}
+
+func (s *pgxStore) UserUnbilledBacklogMicros(ctx context.Context, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	n, err := s.q.UserUnbilledBacklogMicros(ctx, db.UserUnbilledBacklogMicrosParams{
+		AccountID: accountID.String(), WindowStart: windowStart,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return usage.MicrosFromNumeric(n)
+}
+
+// repointNullAccountEvents runs one repoint writer (org or user) inside the
+// target account's activation lock and period barrier, handing it the first
+// open window at or after windowStart.
+func (s *pgxStore) repointNullAccountEvents(ctx context.Context, accountID uuid.UUID, windowStart time.Time, repoint func(qtx *db.Queries, targetStart time.Time) (int64, error)) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -4349,11 +4403,7 @@ func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accou
 		targetStart = nextStart.UTC()
 	}
 
-	rows, err := qtx.RepointOrgNullAccountEvents(ctx, db.RepointOrgNullAccountEventsParams{
-		AccountID:   accountID.String(),
-		WindowStart: targetStart,
-		OrgID:       orgID.String(),
-	})
+	rows, err := repoint(qtx, targetStart)
 	if err != nil {
 		return 0, err
 	}
