@@ -349,15 +349,20 @@ FOR UPDATE;
 -- account threshold that applied WHEN THE CHARGE FIRED. A deterministic re-run
 -- (same Stripe idem key → same invoice, same charged amount) re-computes the same
 -- value, so carrying it through EXCLUDED on conflict is a no-op refresh.
+-- The tax_* columns (migration 088) record the sealed intent's
+-- TaxDetermination, all NULL when the caller has none. The first recorded
+-- determination wins: a later NULL mirror never erases it (COALESCE).
 -- name: UpsertInvoice :exec
 INSERT INTO ms_billing.invoices (
     account_id, stripe_invoice_id, status,
     amount_due, amount_paid, currency,
     period_start, period_end, is_large_auto_collect, ever_failed,
-    charge_funding_account_id, charge_funding_generation
+    charge_funding_account_id, charge_funding_generation,
+    tax_amount, tax_jurisdiction, tax_rule_revision, tax_verification
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    @charge_funding_account_id::uuid, @charge_funding_generation::uuid
+    @charge_funding_account_id::uuid, @charge_funding_generation::uuid,
+    @tax_amount, @tax_jurisdiction, @tax_rule_revision, @tax_verification
 )
 ON CONFLICT (stripe_invoice_id)
 DO UPDATE SET
@@ -380,7 +385,11 @@ DO UPDATE SET
     charge_funding_legacy_unresolved = (
         ms_billing.invoices.charge_funding_legacy_unresolved
         AND EXCLUDED.charge_funding_account_id IS NULL
-    )
+    ),
+    tax_amount        = COALESCE(ms_billing.invoices.tax_amount, EXCLUDED.tax_amount),
+    tax_jurisdiction  = COALESCE(ms_billing.invoices.tax_jurisdiction, EXCLUDED.tax_jurisdiction),
+    tax_rule_revision = COALESCE(ms_billing.invoices.tax_rule_revision, EXCLUDED.tax_rule_revision),
+    tax_verification  = COALESCE(ms_billing.invoices.tax_verification, EXCLUDED.tax_verification)
 WHERE ms_billing.invoices.account_id = EXCLUDED.account_id
   AND (
       ms_billing.invoices.charge_funding_account_id IS NULL

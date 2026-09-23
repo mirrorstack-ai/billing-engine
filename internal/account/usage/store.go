@@ -753,6 +753,9 @@ type InvoiceMirrorRaw struct {
 	IsLargeAutoCollect bool
 	// EverFailed is sticky: true once the invoice has failed a charge attempt.
 	EverFailed bool
+	// Tax is the recorded tax line (migration 088); nil when the row has no
+	// determination (tax_verification NULL) — unknown, never zero.
+	Tax *InvoiceTax
 }
 
 // NewStore returns a Store backed by the given pgxpool. The pool is
@@ -2143,6 +2146,10 @@ func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit 
 		if err != nil {
 			return nil, fmt.Errorf("decode amount_paid for invoice %q: %w", r.StripeInvoiceID, err)
 		}
+		tax, err := invoiceTaxFromRow(r)
+		if err != nil {
+			return nil, fmt.Errorf("decode tax for invoice %q: %w", r.StripeInvoiceID, err)
+		}
 		out = append(out, InvoiceMirrorRaw{
 			ID:              id,
 			StripeInvoiceID: r.StripeInvoiceID,
@@ -2160,9 +2167,37 @@ func (s *pgxStore) ListInvoices(ctx context.Context, accountID uuid.UUID, limit 
 			InvoicePDF:         r.InvoicePdf.String,
 			IsLargeAutoCollect: r.IsLargeAutoCollect,
 			EverFailed:         r.EverFailed,
+			Tax:                tax,
 		})
 	}
 	return out, nil
+}
+
+// invoiceTaxFromRow decodes migration 088's tax columns. tax_verification is
+// the presence key (the table CHECK makes the determination all-or-nothing):
+// NULL → nil, the UNKNOWN state, which must never surface as a zero line. The
+// amount is whole cents like amount_due, converted through the same path.
+func invoiceTaxFromRow(r db.ListInvoicesForAccountRow) (*InvoiceTax, error) {
+	if !r.TaxVerification.Valid {
+		return nil, nil
+	}
+	if !r.TaxAmount.Valid {
+		return nil, errors.New("tax_verification set without tax_amount")
+	}
+	amount, err := centsNumericToMicros(r.TaxAmount)
+	if err != nil {
+		return nil, err
+	}
+	tax := &InvoiceTax{
+		AmountMicros: amount,
+		Jurisdiction: r.TaxJurisdiction.String,
+		Verification: r.TaxVerification.String,
+		Inclusive:    r.TaxInclusive,
+	}
+	if r.TaxRateBps.Valid {
+		tax.RateBps = &r.TaxRateBps.Int32
+	}
+	return tax, nil
 }
 
 // appMetricUsageRaw decodes one generated app-usage/app-bill row into the
