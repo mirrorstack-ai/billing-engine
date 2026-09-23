@@ -236,6 +236,17 @@ func (s *Service) recordUsage(ctx context.Context, req RecordUsageRequest, timin
 			}
 			slog.WarnContext(ctx, "org usage retained but unbilled pending funding designation",
 				"org_id", owner.OrgID, "app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric)
+		} else {
+			// A user with no accounts row yet. The row is recorded NULL-account
+			// and stamped with this user (UsageEvent.LazyOwnerUserID, migration
+			// 088), which is the ONLY thing that lets the user sweep
+			// (cycle.SweepUnattachedUserUsage) find it once the user's account
+			// activates — and only inside that account's open window (D1d).
+			// No roster guard, unlike the org branch: the stamp, not the
+			// roster, is the attribution, because during a payer re-seat the
+			// roster still names the previous payer.
+			slog.WarnContext(ctx, "user usage retained but unbilled pending billing account",
+				"user_id", owner.UserID, "app_id", req.AppID, "module_id", req.ModuleID, "metric", req.Metric)
 		}
 	}
 
