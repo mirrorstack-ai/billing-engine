@@ -68,8 +68,9 @@ func TestQueryEgressWindow_ParsesGroupedRows(t *testing.T) {
 
 		_, _ = w.Write([]byte(`{"meta":[{"name":"app_id","type":"String"},{"name":"module_id","type":"String"},{"name":"bytes","type":"Float64"}],"data":[
 			{"app_id":"app-a","module_id":"mod-x","bytes":1024},
-			{"app_id":"app-b","module_id":"","bytes":2048}
-		],"rows":2}`))
+			{"app_id":"app-b","module_id":"","bytes":2048},
+			{"app_id":"","module_id":"","org_id":"org-c","bytes":4096}
+		],"rows":3}`))
 	}))
 	defer srv.Close()
 
@@ -81,6 +82,7 @@ func TestQueryEgressWindow_ParsesGroupedRows(t *testing.T) {
 	require.Equal(t, []EgressRow{
 		{AppID: "app-a", ModuleID: "mod-x", Bytes: 1024},
 		{AppID: "app-b", ModuleID: "", Bytes: 2048},
+		{AppID: "", ModuleID: "", OrgID: "org-c", Bytes: 4096},
 	}, rows)
 
 	// Bearer auth + the SQL API's raw-SQL-body / account-scoped-path shape.
@@ -89,7 +91,8 @@ func TestQueryEgressWindow_ParsesGroupedRows(t *testing.T) {
 	require.Equal(t, "/client/v4/accounts/acct-123/analytics_engine/sql", gotPath)
 	require.Contains(t, gotBody, "FROM cdn_egress")
 	require.Contains(t, gotBody, "SUM(_sample_interval * double1)")
-	require.Contains(t, gotBody, "GROUP BY blob1, blob2")
+	require.Contains(t, gotBody, "blob3 AS org_id")
+	require.Contains(t, gotBody, "GROUP BY blob1, blob2, blob3")
 	require.Contains(t, gotBody, "toDateTime('2026-06-15T11:00:00')")
 	require.Contains(t, gotBody, "toDateTime('2026-06-15T12:00:00')")
 	require.NotContains(t, gotBody, "Z')", "ClickHouse's toDateTime() rejects a trailing 'Z' (HTTP 422) — must never regress")

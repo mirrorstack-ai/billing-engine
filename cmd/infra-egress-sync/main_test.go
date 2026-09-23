@@ -309,6 +309,29 @@ func TestSyncEgress_SkipsUnparseableAppID(t *testing.T) {
 	require.InDelta(t, 4.0/bytesPerGiB, store.events[egressEventID(cdnEgressMetric, good, "m", win)].Value, 1e-15)
 }
 
+func TestSyncEgress_OrgRowsAreCountedNotRecorded(t *testing.T) {
+	org := uuid.New()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{
+		win: {
+			{OrgID: org.String(), Bytes: 100},                    // org → counted
+			{OrgID: uuid.New().String(), Bytes: 50},              // another org → counted
+			{OrgID: "not-a-uuid", Bytes: 7},                      // garbage org → skip
+			{OrgID: uuid.Nil.String(), Bytes: 8},                 // all-zeros org → skip
+			{AppID: "not-a-uuid", OrgID: org.String(), Bytes: 9}, // bad app wins → skip
+		},
+	}}
+	store := newFakeStore()
+
+	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.False(t, res.Failed)
+	require.Equal(t, 2, res.OrgRows)
+	require.InDelta(t, 150.0, res.OrgBytes, 1e-9)
+	require.Equal(t, 3, res.Skipped)
+	require.Equal(t, 0, res.Recorded)
+	require.Empty(t, store.events)
+}
+
 func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
 	bad, good := uuid.New(), uuid.New()
 	mod := uuid.New().String()

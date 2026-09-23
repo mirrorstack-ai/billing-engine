@@ -285,8 +285,14 @@ type syncResult struct {
 	Rows      int // total (app, module) rows returned across windows
 	Recorded  int // events newly inserted
 	Deduped   int // events that hit ON CONFLICT (already recorded)
-	Skipped   int // rows skipped for an empty / unparseable app_id
+	Skipped   int // rows skipped for an empty / unparseable app_id (org rows excluded)
 	RowErrors int // per-row RecordInfraUsage errors (logged, non-fatal)
+	// Org CDN egress (cdn-worker blob3, no app_id): counted and summed, never
+	// recorded. Org egress is not a per-usage line and the usage ledger is
+	// app-keyed, so there is nothing to record it against; the org plan leg
+	// that consumes it is a separate change.
+	OrgRows  int
+	OrgBytes float64
 	// The request pass (billing-engine#212): rows of the second query, the
 	// (app, module) request events recorded, and the rows dropped for a
 	// non-prod stage (or an empty one — pre-cdn-worker#58 rows).
@@ -326,6 +332,14 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 			res.Rows++
 			appID, err := uuid.Parse(row.AppID)
 			if err != nil || appID == uuid.Nil {
+				if orgID, oerr := uuid.Parse(row.OrgID); row.AppID == "" && oerr == nil && orgID != uuid.Nil {
+					// An org CDN host's egress: attributed, just not metered.
+					res.OrgRows++
+					res.OrgBytes += row.Bytes
+					slog.DebugContext(ctx, "org egress row counted, not recorded",
+						"org_id", orgID, "window_start", w.start, "bytes", row.Bytes)
+					continue
+				}
 				// Skip a row with an empty / garbage app_id — it can't be
 				// attributed to a billing account. Logged at debug volume so a
 				// flood of unattributable rows doesn't drown the log.
@@ -522,6 +536,7 @@ func logResult(ctx context.Context, msg string, res syncResult) {
 		"windows", res.Windows, "rows", res.Rows,
 		"recorded", res.Recorded, "deduped", res.Deduped,
 		"skipped", res.Skipped, "row_errors", res.RowErrors,
+		"org_rows", res.OrgRows, "org_bytes", res.OrgBytes,
 		"request_rows", res.RequestRows, "request_recorded", res.RequestRecorded,
 		"request_skipped", res.RequestSkipped,
 		"failed", res.Failed)
