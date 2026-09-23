@@ -502,6 +502,11 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		moduleID = platformInfraModuleID
 	}
 
+	// The owner fields are the request's, verbatim — never the roster-derived
+	// owner above. A user owner with no account makes this a lazy user row,
+	// stamped with that user (UsageEvent.LazyOwnerUserID, migration 088) exactly
+	// as on RecordUsage; an ownerless sampler row names no user and is never
+	// stamped from the roster.
 	event := UsageEvent{
 		ObservationVersion: observationVersionLegacy,
 		EventID:            req.EventID,

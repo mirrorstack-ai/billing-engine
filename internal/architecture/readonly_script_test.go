@@ -34,10 +34,12 @@ var mutatingVerb = regexp.MustCompile(
 func TestLegacyDropPreconditionsAreReadOnly(t *testing.T) {
 	// Every operator script embedded into a binary that connects to
 	// production. Adding one to scripts/embed.go without adding it here
-	// would ship an unchecked script, so the list is the contract.
+	// would ship an unchecked script, so the list is the contract. A script
+	// run by hand against production is held to the same rule.
 	for _, name := range []string{
 		"legacy-drop-preconditions.sql",
 		"billing-census.sql",
+		"user-stranded-usage.sql",
 	} {
 		t.Run(name, func(t *testing.T) { assertScriptIsReadOnly(t, name) })
 	}
