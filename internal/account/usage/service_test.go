@@ -1216,6 +1216,69 @@ func TestRecordUsage_UnresolvedUserKeepsLazyNullWithoutAppLookup(t *testing.T) {
 	require.Zero(t, store.appOwnerLookups)
 }
 
+// core-v2#340 / migration 088: a lazy USER row carries its owner as the
+// owner_user_id stamp — the only thing the user attach sweep can find it by —
+// on both observation contracts. Every other row carries no stamp: an
+// accounted row already names its payer, and an org row has no user to name.
+func TestRecordUsage_LazyUserRowIsStampedWithItsOwner(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	for name, req := range map[string]usage.RecordUsageRequest{
+		"v1": validRecord(),
+		"v2": v2Record(now),
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeStore() // the owner user has no account row
+			declare(store, req, usage.KindCount)
+
+			resp, err := usage.NewService(store).WithNow(func() time.Time { return now }).
+				RecordUsage(context.Background(), req)
+			require.NoError(t, err)
+			require.True(t, resp.Recorded)
+			event := store.events[req.EventID]
+			require.Equal(t, uuid.Nil, event.AccountID)
+			require.Equal(t, req.OwnerUserID, event.LazyOwnerUserID())
+		})
+	}
+}
+
+func TestRecordUsage_AccountedUserRowIsNotStamped(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	declare(store, req, usage.KindCount)
+	acct := uuid.New()
+	store.accounts[req.OwnerUserID] = acct
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	event := store.events[req.EventID]
+	require.Equal(t, acct, event.AccountID)
+	require.Equal(t, uuid.Nil, event.LazyOwnerUserID(), "an accounted row writes owner_user_id NULL")
+}
+
+func TestRecordUsage_LazyOrgRowIsNotUserStamped(t *testing.T) {
+	store := newFakeStore()
+	req := validRecord()
+	req.OwnerUserID = uuid.Nil
+	req.OwnerOrgID = uuid.New()
+	store.appOwnerOrgs[req.AppID] = req.OwnerOrgID
+	declare(store, req, usage.KindCount)
+
+	_, err := newService(store).RecordUsage(context.Background(), req)
+	require.NoError(t, err)
+	event := store.events[req.EventID]
+	require.Equal(t, uuid.Nil, event.AccountID)
+	require.Equal(t, uuid.Nil, event.LazyOwnerUserID(), "a lazy org row is the org sweep's, never a user's")
+}
+
+func TestUsageEventLazyOwnerUserID(t *testing.T) {
+	user, org, acct := uuid.New(), uuid.New(), uuid.New()
+	require.Equal(t, user, usage.UsageEvent{OwnerUserID: user}.LazyOwnerUserID())
+	require.Equal(t, uuid.Nil, usage.UsageEvent{OwnerUserID: user, AccountID: acct}.LazyOwnerUserID())
+	require.Equal(t, uuid.Nil, usage.UsageEvent{OwnerUserID: user, OwnerOrgID: org}.LazyOwnerUserID())
+	require.Equal(t, uuid.Nil, usage.UsageEvent{OwnerOrgID: org}.LazyOwnerUserID())
+	require.Equal(t, uuid.Nil, usage.UsageEvent{}.LazyOwnerUserID())
+}
+
 func TestRecordUsage_RejectsReservedPrefixes(t *testing.T) {
 	for _, metric := range []string{"platform.tokens", "infra.egress.bytes", "infra.compute.ms"} {
 		store := newFakeStore()

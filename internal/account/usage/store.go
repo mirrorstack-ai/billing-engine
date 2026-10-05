@@ -610,6 +610,27 @@ type UsageEvent struct {
 	DevServed bool
 }
 
+// LazyOwnerUserID is the owner user stamped onto the row as
+// usage_events.owner_user_id (migration 088): OwnerUserID when the row is a
+// lazy USER row — no account resolved (AccountID Nil) for an owner that is a
+// user and not an org — and Nil on every other row, which the insert persists
+// as NULL.
+//
+// 🔴 It is DERIVED, never set, so it cannot disagree with the account
+// resolution it describes: an account-attributed row already names its payer,
+// and an org or ownerless lazy row has no user to name (the org sweep finds
+// org rows through the roster). The user sweep bills a stamped NULL-account
+// row to that user's account once one activates, so a user stamp on an org
+// row would bill a user for an org's usage. It is deliberately NOT part of
+// observationFingerprint: the owner it is derived from already is, and the
+// account resolution is ingest's answer, not the caller's payload.
+func (ev UsageEvent) LazyOwnerUserID() uuid.UUID {
+	if ev.AccountID != uuid.Nil || ev.OwnerOrgID != uuid.Nil {
+		return uuid.Nil
+	}
+	return ev.OwnerUserID
+}
+
 // MetricUsageRaw is one grouped row from the live current-period query.
 // RawCostMicros = quantity × unit_price, rounded to whole micro-dollars
 // (round-half-up) at the store boundary. For custom metrics this IS the
@@ -1022,6 +1043,7 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
 		OccurrencePolicy:   string(ev.OccurrencePolicy),
 		DevServed:          ev.DevServed,
+		OwnerUserID:        nullableAccountID(ev.LazyOwnerUserID()),
 	})
 	if err != nil {
 		return false, err
@@ -1273,6 +1295,7 @@ func (s *pgxStore) InsertUsageObservation(
 		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
 		OccurrencePolicy:   string(ev.OccurrencePolicy),
 		DevServed:          ev.DevServed,
+		OwnerUserID:        nullableAccountID(ev.LazyOwnerUserID()),
 	})
 	if err != nil {
 		return false, 0, err

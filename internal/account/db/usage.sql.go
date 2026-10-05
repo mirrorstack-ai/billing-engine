@@ -1239,7 +1239,7 @@ INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
     billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
-    dev_served, template_key
+    dev_served, template_key, owner_user_id
 ) VALUES (
     $1::text, $2::uuid, $3::uuid,
     $4::uuid, $5::text, $6::ms_billing.metric_kind,
@@ -1249,7 +1249,8 @@ INSERT INTO ms_billing.usage_events (
     $14::timestamptz, $15::timestamptz,
     $16::text,
     $17::bytea, $18::text,
-    $19::boolean, $20::text
+    $19::boolean, $20::text,
+    $21::uuid
 )
 ON CONFLICT (event_id) DO NOTHING
 `
@@ -1275,6 +1276,7 @@ type InsertUsageEventParams struct {
 	OccurrencePolicy   string              `json:"occurrence_policy"`
 	DevServed          bool                `json:"dev_served"`
 	TemplateKey        pgtype.Text         `json:"template_key"`
+	OwnerUserID        pgtype.UUID         `json:"owner_user_id"`
 }
 
 // InsertUsageEvent writes one raw metered fact, idempotent on event_id.
@@ -1293,6 +1295,12 @@ type InsertUsageEventParams struct {
 // ordinary chargeable usage. The ON CONFLICT (event_id) DO NOTHING idempotency
 // is UNTOUCHED — dev_served rides along on the insert and, exactly like every
 // other column, a deduped retry never rewrites it.
+// owner_user_id is the migration-088 lazy-user stamp: the owner user of a row
+// written with account_id NULL because that user had no accounts row yet, and
+// NULL on every other row (usage.UsageEvent.LazyOwnerUserID decides which).
+// It is not part of the payload fingerprint — it is derived from the owner
+// the fingerprint already covers and from the account resolution — so it
+// changes no idempotency answer.
 func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertUsageEvent,
 		arg.EventID,
@@ -1315,6 +1323,7 @@ func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventPara
 		arg.OccurrencePolicy,
 		arg.DevServed,
 		arg.TemplateKey,
+		arg.OwnerUserID,
 	)
 	if err != nil {
 		return 0, err

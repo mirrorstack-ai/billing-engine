@@ -195,6 +195,18 @@ type fakeStore struct {
 	// activated orgs they sponsor) — the /me sponsored-orgs read's roster.
 	sponsoredOrgs map[uuid.UUID][]uuid.UUID
 
+	// lazy USER usage (migration 088). userUnswept seeds the user sweep's work
+	// list; userLazyEvents holds each user's stamped NULL-account rows, which
+	// the repoint consumes from the window start on (older rows stay, D1d) and
+	// the backlog read prices from the requested window start on;
+	// userRepointCalls / userBacklogWindows record what the service asked for;
+	// errUserRepoint fails one account's repoint.
+	userUnswept        []cycle.UserUsageAccount
+	userLazyEvents     map[uuid.UUID][]fakeLazyEvent
+	userRepointCalls   []userRepointCall
+	userBacklogWindows []time.Time
+	errUserRepoint     map[uuid.UUID]error
+
 	// per-module install-timer state (migration 033). timers models
 	// ms_billing.app_module_overage_timers keyed by surrogate id; each row's
 	// removed/graceResolved/graceCharged* fields mirror the columns the FIFO +
@@ -392,6 +404,21 @@ type repointCall struct {
 	windowStart time.Time
 }
 
+// userRepointCall records one RepointUserNullAccountEvents call — the stamped
+// owner, the destination account and the open-window start.
+type userRepointCall struct {
+	userID      uuid.UUID
+	accountID   uuid.UUID
+	windowStart time.Time
+}
+
+// fakeLazyEvent is one stamped lazy user row: its COALESCE(billable_at,
+// recorded_at) instant and the micros the disclosure pricing gives it.
+type fakeLazyEvent struct {
+	at     time.Time
+	micros int64
+}
+
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		prices:                    map[string]int64{},
@@ -433,6 +460,7 @@ func newFakeStore() *fakeStore {
 		appOwnerOrg:             map[uuid.UUID]uuid.UUID{},
 		orgBacklog:              map[uuid.UUID]int64{},
 		orgNullEvents:           map[uuid.UUID]int64{},
+		userLazyEvents:          map[uuid.UUID][]fakeLazyEvent{},
 		sponsoredOrgs:           map[uuid.UUID][]uuid.UUID{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
@@ -1222,6 +1250,43 @@ func (f *fakeStore) RepointOrgNullAccountEvents(_ context.Context, orgID, accoun
 	n := f.orgNullEvents[orgID]
 	delete(f.orgNullEvents, orgID) // swept events never match again (account_id IS NULL)
 	return n, nil
+}
+
+// --- lazy user usage fake (migration 088) ----------------------------------
+
+func (f *fakeStore) UserAccountsWithUnsweptUsage(_ context.Context, _ time.Time) ([]cycle.UserUsageAccount, error) {
+	return f.userUnswept, nil
+}
+
+// RepointUserNullAccountEvents mirrors the SQL's D1d filter: only rows at or
+// after windowStart move (and never match again); older rows stay NULL.
+func (f *fakeStore) RepointUserNullAccountEvents(_ context.Context, userID, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	f.userRepointCalls = append(f.userRepointCalls, userRepointCall{userID, accountID, windowStart})
+	if err := f.errUserRepoint[accountID]; err != nil {
+		return 0, err
+	}
+	var kept []fakeLazyEvent
+	var n int64
+	for _, ev := range f.userLazyEvents[userID] {
+		if ev.at.Before(windowStart) {
+			kept = append(kept, ev)
+			continue
+		}
+		n++
+	}
+	f.userLazyEvents[userID] = kept
+	return n, nil
+}
+
+func (f *fakeStore) UserUnbilledBacklogMicros(_ context.Context, userID uuid.UUID, windowStart time.Time) (int64, error) {
+	f.userBacklogWindows = append(f.userBacklogWindows, windowStart)
+	var total int64
+	for _, ev := range f.userLazyEvents[userID] {
+		if !ev.at.Before(windowStart) {
+			total += ev.micros
+		}
+	}
+	return total, nil
 }
 
 func (f *fakeStore) OrgLiveAppIDs(_ context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {

@@ -433,6 +433,25 @@ type Store interface {
 	// repointed_from (migration 041). Returns the swept-event count.
 	RepointOrgNullAccountEvents(ctx context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error)
 
+	// UserAccountsWithUnsweptUsage is the user sweep's work list (migration
+	// 088): activated USER accounts with at least one lazy row stamped for
+	// their owner at or after a coarse lower bound on any window they could
+	// have open as of asOf (the exact window is the caller's). Ordered by
+	// account id.
+	UserAccountsWithUnsweptUsage(ctx context.Context, asOf time.Time) ([]UserUsageAccount, error)
+
+	// RepointUserNullAccountEvents hands the user's stamped lazy rows at or
+	// after windowStart (the account's current open window) to accountID,
+	// under the same activation-lock + period-barrier transaction as
+	// RepointOrgNullAccountEvents. Rows older than the window stay NULL and
+	// unbilled (D1d). Returns the swept-event count.
+	RepointUserNullAccountEvents(ctx context.Context, userID, accountID uuid.UUID, windowStart time.Time) (int64, error)
+
+	// UserUnbilledBacklogMicros prices the user's stamped lazy rows at or after
+	// windowStart exactly as OrgUnbilledBacklogMicros prices an org's — the
+	// user twin of the disclosure figure. The zero time reads every stamped row.
+	UserUnbilledBacklogMicros(ctx context.Context, userID uuid.UUID, windowStart time.Time) (int64, error)
+
 	// OrgLiveAppIDs lists the org's live roster rows — the attach sweep
 	// reconciles each one's timers after account_id backfills.
 	OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error)
@@ -4310,6 +4329,43 @@ func (s *pgxStore) AttachOrgAppsToAccount(ctx context.Context, orgID, accountID 
 }
 
 func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	return s.repointNullAccountEvents(ctx, accountID, windowStart, func(qtx *db.Queries, targetStart time.Time) (int64, error) {
+		return qtx.RepointOrgNullAccountEvents(ctx, db.RepointOrgNullAccountEventsParams{
+			AccountID:   accountID.String(),
+			WindowStart: targetStart,
+			OrgID:       orgID.String(),
+		})
+	})
+}
+
+// RepointUserNullAccountEvents is the user twin of RepointOrgNullAccountEvents:
+// the same barrier, then the user query (user_usage.sql). The window the
+// barrier settles on is BOTH the clamp and the D1d filter there, so when the
+// barrier has to advance past a period rollup closed in the meantime, the
+// stamped rows inside that closed period are older than the window now open
+// and stay NULL — exactly what D1d says of every row older than the open
+// window, and the only outcome that neither re-opens a closed period nor bills
+// its usage into a later one.
+func (s *pgxStore) RepointUserNullAccountEvents(ctx context.Context, userID, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	return s.repointNullAccountEvents(ctx, accountID, windowStart, func(qtx *db.Queries, targetStart time.Time) (int64, error) {
+		return qtx.RepointUserNullAccountEvents(ctx, db.RepointUserNullAccountEventsParams{
+			AccountID:   accountID.String(),
+			WindowStart: targetStart,
+			OwnerUserID: userID.String(),
+		})
+	})
+}
+
+// repointNullAccountEvents is the one transaction every lazy-row sweep runs its
+// UPDATE in: the account's activation lock, then the period barrier, then
+// repoint(targetStart), then commit. Both sweeps share it so they cannot drift
+// apart on the lock order the ingest and rollup paths depend on.
+func (s *pgxStore) repointNullAccountEvents(
+	ctx context.Context,
+	accountID uuid.UUID,
+	windowStart time.Time,
+	repoint func(qtx *db.Queries, targetStart time.Time) (int64, error),
+) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -4349,11 +4405,7 @@ func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accou
 		targetStart = nextStart.UTC()
 	}
 
-	rows, err := qtx.RepointOrgNullAccountEvents(ctx, db.RepointOrgNullAccountEventsParams{
-		AccountID:   accountID.String(),
-		WindowStart: targetStart,
-		OrgID:       orgID.String(),
-	})
+	rows, err := repoint(qtx, targetStart)
 	if err != nil {
 		return 0, err
 	}
@@ -4361,6 +4413,38 @@ func (s *pgxStore) RepointOrgNullAccountEvents(ctx context.Context, orgID, accou
 		return 0, err
 	}
 	return rows, nil
+}
+
+func (s *pgxStore) UserAccountsWithUnsweptUsage(ctx context.Context, asOf time.Time) ([]UserUsageAccount, error) {
+	rows, err := s.q.UserAccountsWithUnsweptUsage(ctx, asOf.UTC())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UserUsageAccount, 0, len(rows))
+	for _, r := range rows {
+		accountID, err := uuid.Parse(r.ID)
+		if err != nil {
+			return nil, err
+		}
+		userID, err := uuid.Parse(r.OwnerUserID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, UserUsageAccount{AccountID: accountID, UserID: userID})
+	}
+	return out, nil
+}
+
+func (s *pgxStore) UserUnbilledBacklogMicros(ctx context.Context, userID uuid.UUID, windowStart time.Time) (int64, error) {
+	n, err := s.q.UserUnbilledBacklogMicros(ctx, db.UserUnbilledBacklogMicrosParams{
+		OwnerUserID: userID.String(),
+		WindowStart: windowStart.UTC(),
+	})
+	if err != nil {
+		return 0, err
+	}
+	// Same single decode-and-round point as every live money read.
+	return usage.MicrosFromNumeric(n)
 }
 
 func (s *pgxStore) OrgLiveAppIDs(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {
