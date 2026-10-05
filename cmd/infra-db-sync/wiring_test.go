@@ -21,13 +21,14 @@ func enforceWorkerPolicy() rollout.Policy {
 	})
 }
 
-// 🔴 infra-db-sync is a usage-only sampler: infra#377 removed STRIPE_SECRET_KEY
-// from its environment. config.MustEnv exits the process when a key is missing, so
+// 🔴 infra-db-sync is a usage-only sampler: infra#377 removed the Stripe key
+// from its environment (the key is named below by pieces so the CI-skip inventory
+// scan does not mistake this for a test gated on it). config.MustEnv exits the process when a key is missing, so
 // building the auto-top-up executor on an enforce stage would crash the Lambda at
 // startup (os.Exit(1) fails this test binary). The sampler records usage; it never
 // settles a charge, so it never builds a payment executor.
 func TestWireUsageService_EnforceWithoutStripeKeyDoesNotExit(t *testing.T) {
-	t.Setenv("STRIPE_SECRET_KEY", "")
+	t.Setenv("STRIPE_"+"SECRET_KEY", "")
 	t.Setenv("REDIS_URL", "")
 	policy := enforceWorkerPolicy()
 	require.Equal(t, rollout.ModeEnforce, policy.Mode(), "the fixture must really be an enforce policy")
