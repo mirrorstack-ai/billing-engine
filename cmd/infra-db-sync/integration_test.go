@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
@@ -76,16 +77,17 @@ func readMigration(t *testing.T, name string) string {
 
 // seedAppSchema creates app_<id> with a module_install table and the given
 // per-module tables, filled so every relation has a measurable size.
-func seedAppSchema(t *testing.T, pool *pgxpool.Pool, app uuid.UUID, installs map[uuid.UUID]string, tables []string) {
+func seedAppSchema(t *testing.T, pool *pgxpool.Pool, app uuid.UUID, installs []uuid.UUID, tables []string) {
 	t.Helper()
 	ctx := context.Background()
 	schema := appSchemaName(app)
 	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schema))
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.module_install (module_id uuid PRIMARY KEY, prefix text NOT NULL)`, schema))
+	_, err = pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.module_install (module_id uuid PRIMARY KEY, prefix text NOT NULL, version_id uuid NULL)`, schema))
 	require.NoError(t, err)
-	for m, p := range installs {
-		_, err = pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.module_install VALUES ($1, $2)`, schema), m, p)
+	for _, m := range installs {
+		// prefix is the platform's display value, deliberately NOT the physical one.
+		_, err = pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.module_install (module_id, prefix) VALUES ($1, 'acme_display_')`, schema), m)
 		require.NoError(t, err)
 	}
 	_, err = pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.members (user_id uuid PRIMARY KEY)`, schema))
@@ -105,19 +107,19 @@ func TestPGReader_ReadsSizesFromTheCatalogUnderAReadOnlyRole(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	ctx := context.Background()
 	app, mod := uuid.New(), uuid.New()
-	seedAppSchema(t, pool, app, map[uuid.UUID]string{mod: "acme_quiz_"}, []string{"acme_quiz_attempts"})
+	seedAppSchema(t, pool, app, []uuid.UUID{mod}, []string{phys(mod) + "attempts"})
 	// A view and a partitioned parent+child: only relations with storage count,
 	// each exactly once.
 	schema := appSchemaName(app)
 	for _, ddl := range []string{
-		fmt.Sprintf(`CREATE VIEW %s.acme_quiz_v AS SELECT * FROM %s.acme_quiz_attempts`, schema, schema),
-		fmt.Sprintf(`CREATE TABLE %s.acme_quiz_part (id int, d date) PARTITION BY RANGE (d)`, schema),
-		fmt.Sprintf(`CREATE TABLE %s.acme_quiz_part_1 PARTITION OF %s.acme_quiz_part FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`, schema, schema),
+		fmt.Sprintf(`CREATE VIEW %s.%sv AS SELECT * FROM %s.%sattempts`, schema, phys(mod), schema, phys(mod)),
+		fmt.Sprintf(`CREATE TABLE %s.%spart (id int, d date) PARTITION BY RANGE (d)`, schema, phys(mod)),
+		fmt.Sprintf(`CREATE TABLE %s.%spart_1 PARTITION OF %s.%spart FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`, schema, phys(mod), schema, phys(mod)),
 		`CREATE SCHEMA mod_m0123456789abcdef0123456789abcdef`,
 		`CREATE TABLE mod_m0123456789abcdef0123456789abcdef.t (id int)`,
 		`CREATE ROLE dbsize_test NOLOGIN`,
 		fmt.Sprintf(`GRANT USAGE ON SCHEMA %s TO dbsize_test`, schema),
-		fmt.Sprintf(`GRANT SELECT (module_id, prefix) ON %s.module_install TO dbsize_test`, schema),
+		fmt.Sprintf(`GRANT SELECT (module_id) ON %s.module_install TO dbsize_test`, schema),
 	} {
 		_, err := pool.Exec(ctx, ddl)
 		require.NoError(t, err, ddl)
@@ -137,21 +139,31 @@ func TestPGReader_ReadsSizesFromTheCatalogUnderAReadOnlyRole(t *testing.T) {
 		require.Equal(t, schema, tb.Schema, "only app schemas are returned; ms_billing and mod_* never")
 		got[tb.Table] = tb.Bytes
 	}
-	require.Contains(t, got, "acme_quiz_attempts")
+	require.Contains(t, got, phys(mod)+"attempts")
 	require.Contains(t, got, "members")
 	require.Contains(t, got, "module_install")
-	require.Contains(t, got, "acme_quiz_part_1", "a partition child is a relation with storage")
-	require.NotContains(t, got, "acme_quiz_v", "a view has no storage")
-	require.NotContains(t, got, "acme_quiz_part", "a partitioned parent has none; its children count as themselves")
-	require.Greater(t, got["acme_quiz_attempts"], int64(1_000_000), "heap + index + TOAST of 2000 x 1 kB rows")
+	require.Contains(t, got, phys(mod)+"part_1", "a partition child is a relation with storage")
+	require.NotContains(t, got, phys(mod)+"v", "a view has no storage")
+	require.NotContains(t, got, phys(mod)+"part", "a partitioned parent has none; its children count as themselves")
+	require.Greater(t, got[phys(mod)+"attempts"], int64(1_000_000), "heap + index + TOAST of 2000 x 1 kB rows")
 
 	installs, err := rd.Installs(ctx, app)
 	require.NoError(t, err)
-	require.Equal(t, []install{{Module: mod, Prefix: "acme_quiz_"}}, installs)
+	require.Equal(t, []install{{Module: mod}}, installs)
 
 	// An app with no schema (or no grant) is an error, never an empty answer.
 	_, err = rd.Installs(ctx, uuid.New())
 	require.Error(t, err)
+
+	// The reads run under statement_timeout and lock_timeout, scoped to the tx.
+	require.NoError(t, rd.readOnly(ctx, func(tx pgx.Tx) error {
+		var st, lt string
+		require.NoError(t, tx.QueryRow(ctx, `SHOW statement_timeout`).Scan(&st))
+		require.NoError(t, tx.QueryRow(ctx, `SHOW lock_timeout`).Scan(&lt))
+		require.Equal(t, "20s", st)
+		require.Equal(t, "3s", lt)
+		return nil
+	}))
 
 	// READ ONLY is enforced by the server, not just by the code.
 	_, werr := ro.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.module_install`, schema))
@@ -164,11 +176,11 @@ func TestSyncDB_EndToEndRecordsTheModuleLevelInUsageEvents(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	ctx := context.Background()
 	app, quiz, empty := uuid.New(), uuid.New(), uuid.New()
-	seedAppSchema(t, pool, app, map[uuid.UUID]string{quiz: "acme_quiz_", empty: "acme_empty_"}, []string{"acme_quiz_attempts"})
+	seedAppSchema(t, pool, app, []uuid.UUID{quiz, empty}, []string{phys(quiz) + "attempts"})
 
 	svc := usage.NewService(usage.NewStore(pool))
 	at := time.Date(2026, 10, 5, 12, 30, 0, 0, time.UTC)
-	res := syncDB(ctx, svc, pgReader{pool: pool}, at)
+	res := syncDB(ctx, svc, pgReader{pool: pool}, billingHistory{pool: pool}, at)
 	require.False(t, res.Failed, "%v", res.Err)
 	require.Equal(t, 2*lookbackHours, res.Recorded)
 	require.Greater(t, res.UnattributedBytes, int64(0), "members and module_install are the platform's")
@@ -190,7 +202,41 @@ func TestSyncDB_EndToEndRecordsTheModuleLevelInUsageEvents(t *testing.T) {
 	v, _, _ = read(empty)
 	require.EqualValues(t, 0, v, "an installed module with no tables records an explicit 0 level")
 
-	again := syncDB(ctx, svc, pgReader{pool: pool}, at)
+	again := syncDB(ctx, svc, pgReader{pool: pool}, billingHistory{pool: pool}, at)
 	require.Equal(t, 0, again.Recorded, "a re-run dedupes on the deterministic event_id")
 	require.Equal(t, 2*lookbackHours, again.Deduped)
+}
+
+// D3 against real rows: a module sampled positive, then uninstalled, is read back
+// from usage_events by billingHistory and zeroed; a pair already at 0 is not
+// returned again.
+func TestSyncDB_EndToEndZeroesAnUninstalledModule(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	app, keep, gone := uuid.New(), uuid.New(), uuid.New()
+	seedAppSchema(t, pool, app, []uuid.UUID{keep, gone}, []string{phys(keep) + "t", phys(gone) + "t"})
+	svc := usage.NewService(usage.NewStore(pool))
+	h := billingHistory{pool: pool}
+
+	t0 := time.Date(2026, 10, 5, 12, 30, 0, 0, time.UTC)
+	res := syncDB(ctx, svc, pgReader{pool: pool}, h, t0)
+	require.False(t, res.Failed, "%v", res.Err)
+
+	_, err := pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.module_install WHERE module_id = $1`, appSchemaName(app)), gone)
+	require.NoError(t, err)
+
+	t1 := t0.Add(2 * time.Hour)
+	res = syncDB(ctx, svc, pgReader{pool: pool}, h, t1)
+	require.False(t, res.Failed, "%v", res.Err)
+	require.Equal(t, 1, res.Zeroed)
+
+	newest := t1.Truncate(time.Hour).Add(-time.Hour)
+	var v float64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT value::float8 FROM ms_billing.usage_events WHERE event_id = $1`, dbEventID(app, gone, newest)).Scan(&v))
+	require.EqualValues(t, 0, v, "the vanished module's level ends at an explicit 0")
+
+	pairs, err := h.LivePairs(ctx, t0.Add(-historyWindow))
+	require.NoError(t, err)
+	require.Equal(t, []pair{{app, keep}}, pairs, "a zeroed pair is not returned again")
 }

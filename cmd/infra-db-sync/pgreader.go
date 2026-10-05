@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -28,8 +29,34 @@ WHERE n.nspname ~ '^app_[0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]
 // installsSQLFmt is the second fixed query, one app schema at a time. The
 // schema is the only part that varies and is never taken from the catalog or the
 // environment: installs builds it from a parsed UUID and quotes it as an
-// identifier.
-const installsSQLFmt = `SELECT module_id, prefix FROM %s.module_install`
+// identifier. module_id alone: the table prefix is derived from it (modulePrefix),
+// never read from the display-only prefix column, so the grant is one column.
+const installsSQLFmt = `SELECT module_id FROM %s.module_install`
+
+// readTimeoutsSQL bounds every read. SET LOCAL scopes both to the read-only
+// transaction, so a stuck catalog scan or a lock queue behind DDL (an app
+// install running ALTER) fails this run in seconds, instead of hanging the
+// Lambda until its own timeout, and a pooled connection never carries them on.
+const readTimeoutsSQL = `SET LOCAL statement_timeout = '20s'; SET LOCAL lock_timeout = '3s'`
+
+// rowScanner is the one pgx.Rows method scanTableSize needs, so the NULL-size
+// rule is unit-testable without a database.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanTableSize reads one catalog row. pg_total_relation_size is NULL for a
+// relation dropped between the catalog scan and the size call: that table has no
+// bytes to bill, and one racing DROP must not fail the whole read (ok=false).
+func scanTableSize(row rowScanner) (t tableSize, ok bool, err error) {
+	var size *int64
+	if err = row.Scan(&t.Schema, &t.Table, &size); err != nil {
+		return tableSize{}, false, err
+	}
+	if size == nil {
+		return tableSize{}, false, nil
+	}
+	t.Bytes = *size
+	return t, true, nil
+}
 
 // pgReader implements dbReader over a pool opened under the read-only role.
 // Every read runs in a READ ONLY transaction, so even a future edit that put a
@@ -45,11 +72,13 @@ func (r pgReader) TableSizes(ctx context.Context) ([]tableSize, error) {
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var t tableSize
-			if err := rows.Scan(&t.Schema, &t.Table, &t.Bytes); err != nil {
+			t, ok, err := scanTableSize(rows)
+			if err != nil {
 				return err
 			}
-			out = append(out, t)
+			if ok {
+				out = append(out, t)
+			}
 		}
 		return rows.Err()
 	})
@@ -67,7 +96,7 @@ func (r pgReader) Installs(ctx context.Context, app uuid.UUID) ([]install, error
 		defer rows.Close()
 		for rows.Next() {
 			var in install
-			if err := rows.Scan(&in.Module, &in.Prefix); err != nil {
+			if err := rows.Scan(&in.Module); err != nil {
 				return err
 			}
 			out = append(out, in)
@@ -83,5 +112,42 @@ func (r pgReader) readOnly(ctx context.Context, fn func(pgx.Tx) error) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, readTimeoutsSQL); err != nil {
+		return err
+	}
 	return fn(tx)
+}
+
+// lastLevelsSQL is the billing-side read behind levelHistory: the newest
+// infra.db.gib_hours sample of each (app, module) since $2, kept when above 0.
+// A pair already zeroed is not returned, so a vanished module is zeroed once and
+// then left alone. ms_billing.usage_events is read by the same service role that
+// writes it; no new grant.
+const lastLevelsSQL = `
+SELECT app_id, module_id FROM (
+    SELECT DISTINCT ON (app_id, module_id) app_id, module_id, value
+    FROM ms_billing.usage_events
+    WHERE metric = $1 AND recorded_at >= $2
+    ORDER BY app_id, module_id, recorded_at DESC, ingested_at DESC
+) last
+WHERE value > 0`
+
+// billingHistory implements levelHistory over the billing database pool.
+type billingHistory struct{ pool *pgxpool.Pool }
+
+func (h billingHistory) LivePairs(ctx context.Context, since time.Time) ([]pair, error) {
+	rows, err := h.pool.Query(ctx, lastLevelsSQL, dbMetric, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []pair
+	for rows.Next() {
+		var p pair
+		if err := rows.Scan(&p.App, &p.Module); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }

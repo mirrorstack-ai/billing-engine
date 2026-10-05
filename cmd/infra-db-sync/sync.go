@@ -23,10 +23,32 @@ type dbReader interface {
 	// every ordinary table and materialized view whose schema looks like an app
 	// schema, one row per table.
 	TableSizes(ctx context.Context) ([]tableSize, error)
-	// Installs returns the module installs of one app: which module owns which
-	// table-name prefix inside that app's schema.
+	// Installs returns the module installs of one app.
 	Installs(ctx context.Context, app uuid.UUID) ([]install, error)
 }
+
+// levelHistory is the billing-side memory the sampler needs to say 0. The rollup
+// carries the last observed level to the period end, so a module that vanished
+// (uninstalled, or its app dropped) is billed its last level unless the sampler
+// records an explicit 0 for it. The pairs that last stood at a positive level
+// are in usage_events; nothing in the app database remembers a gone install.
+type levelHistory interface {
+	// LivePairs returns every (app, module) whose most recent infra.db.gib_hours
+	// sample since the given instant is above 0.
+	LivePairs(ctx context.Context, since time.Time) ([]pair, error)
+}
+
+// historyWindow bounds LivePairs: a billing period. A pair whose last positive
+// sample is older was either zeroed by an earlier run or closed with its period.
+const historyWindow = 35 * 24 * time.Hour
+
+// unattributedWarnShare is the share of app-schema bytes no install owns above
+// which the run logs an alarm. Platform tables (members, module_install, the
+// install-time bookkeeping) are small next to module data; a majority is a
+// naming or grant fault.
+const unattributedWarnShare = 0.5
+
+type pair struct{ App, Module uuid.UUID }
 
 // recorder is the single usage.Service method the sampler calls.
 type recorder interface {
@@ -39,11 +61,12 @@ type tableSize struct {
 	Bytes  int64
 }
 
-// install is one row of app_<id>.module_install, the two columns the sampler
-// reads: the module and the "<username>_<slug>_" prefix its tables carry.
+// install is one row of app_<id>.module_install, the one column the sampler
+// reads. The table-name prefix is NOT read: module_install.prefix is a
+// "<username>_<slug>_" display value, and a deployed module's tables are named
+// from its id (see modulePrefix).
 type install struct {
 	Module uuid.UUID
-	Prefix string
 }
 
 // syncResult tallies one sweep, for logging and the exit code.
@@ -51,11 +74,14 @@ type syncResult struct {
 	Samples           int   // closed hour instants sampled
 	Apps              int   // app schemas with at least one table
 	AppErrors         int   // apps whose installs could not be read (skipped)
-	Modules           int   // distinct (app, module) pairs sampled
+	Installs          int   // module installs read across the readable apps
+	Modules           int   // distinct (app, module) pairs sampled, zeroed ones included
+	Zeroed            int   // pairs that disappeared since the last sample, recorded as 0
 	Recorded          int   // events newly inserted
 	Deduped           int   // events that hit ON CONFLICT (already recorded)
 	Skipped           int   // table rows whose schema is not an app schema
 	RowErrors         int   // per-row RecordInfraUsage errors (logged, non-fatal)
+	AttributedBytes   int64 // bytes in app schemas that an install owns; billed
 	UnattributedBytes int64 // bytes in app schemas that no install owns; never billed
 	Failed            bool
 	Err               error
@@ -100,53 +126,71 @@ func parseAppSchema(name string) (uuid.UUID, bool) {
 	return id, true
 }
 
-// attribute splits one app's table sizes among its installed modules by table
-// name prefix and returns bytes per module plus the bytes no module owns.
+// modulePrefix is the physical table-name prefix of a deployed module's tables
+// inside app_<id>: "m" + the 32 lowercase hex digits of the module uuid + "_".
+// It is the platform's own derivation (api-platform modulePhysicalPrefix over
+// ids.ModuleIDFromUUID; app-module-sdk ids.NormalizeModuleID and the db_guard
+// moduleTableRe), fixed-length 34 characters, so two modules' prefixes can never
+// be a prefix of one another.
+func modulePrefix(module uuid.UUID) string {
+	return "m" + strings.ReplaceAll(module.String(), "-", "") + "_"
+}
+
+// tableModule is the inverse of modulePrefix on a table name: the module whose
+// physical prefix the name carries, or false. Strict like parseAppSchema:
+// lowercase hex, and the underscore after it.
+func tableModule(table string) (uuid.UUID, bool) {
+	if len(table) < 34 || table[0] != 'm' || table[33] != '_' {
+		return uuid.Nil, false
+	}
+	hex := table[1:33]
+	for i := 0; i < len(hex); i++ {
+		c := hex[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return uuid.Nil, false
+		}
+	}
+	id, err := uuid.Parse(hex[:8] + "-" + hex[8:12] + "-" + hex[12:16] + "-" + hex[16:20] + "-" + hex[20:])
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+// attribute splits one app's table sizes among its installed modules by the
+// fixed physical prefix and returns bytes per module plus the bytes no installed
+// module owns.
 //
-//   - Longest prefix wins ("acme_quiz_core_" over "acme_quiz_"), so a module
-//     whose slug extends another's is not swallowed by it.
+//   - 🔴 THE PREFIX IS DERIVED FROM THE MODULE ID, NOT READ FROM
+//     module_install.prefix. That column is "<username>_<slug>_", documented in
+//     api-platform as a display/API value only; the SDK names a deployed
+//     module's tables m<32hex>_<table>. Matching the column attributed nothing
+//     on a real schema. There is no "<username>_<slug>_" fallback: no deployed
+//     schema names tables that way, and a table that did would be unattributed
+//     and loud (syncDB fails when installs exist and nothing matches).
 //   - Every installed module is present in the result, at 0 when it has no
 //     tables. 0 is a level, not an absence: the rollup carries the last
 //     observed level across a gap, so a module that emptied its tables must
 //     say so or it is billed for the old size forever.
-//   - A table is charged to exactly one module. Two installs sharing a prefix
-//     (which composePrefix should make impossible) resolve to the smaller
-//     module id and the other stays at 0, so a table is never charged twice.
-//   - An empty prefix never matches: it would claim the platform's own tables.
+//   - A table is charged to exactly one module: the one whose id its name
+//     carries.
 //   - Platform tables (members, module_install, ...) and the leftovers of an
-//     uninstalled module match nothing; their bytes are returned aside and are
+//     uninstalled module match no install; their bytes are returned aside and are
 //     the platform's cost, never a customer's.
 func attribute(installs []install, tables []tableSize) (map[uuid.UUID]int64, int64) {
-	owners := make([]install, 0, len(installs))
-	for _, in := range installs {
-		if in.Prefix != "" {
-			owners = append(owners, in)
-		}
-	}
-	sort.Slice(owners, func(i, j int) bool {
-		if len(owners[i].Prefix) != len(owners[j].Prefix) {
-			return len(owners[i].Prefix) > len(owners[j].Prefix)
-		}
-		return owners[i].Module.String() < owners[j].Module.String()
-	})
-
 	per := make(map[uuid.UUID]int64, len(installs))
 	for _, in := range installs {
 		per[in.Module] = 0
 	}
 	var unattributed int64
 	for _, tb := range tables {
-		matched := false
-		for _, o := range owners {
-			if strings.HasPrefix(tb.Table, o.Prefix) {
-				per[o.Module] += tb.Bytes
-				matched = true
-				break
+		if m, ok := tableModule(tb.Table); ok {
+			if _, installed := per[m]; installed {
+				per[m] += tb.Bytes
+				continue
 			}
 		}
-		if !matched {
-			unattributed += tb.Bytes
-		}
+		unattributed += tb.Bytes
 	}
 	return per, unattributed
 }
@@ -182,7 +226,7 @@ func dbEventID(app, module uuid.UUID, at time.Time) string {
 // can change within lookbackHours. In steady state only the newest instant is
 // new and every older one dedupes on its event_id; a repeat sample never
 // overwrites, because the first recording of an instant is the closest to it.
-func syncDB(ctx context.Context, rec recorder, rd dbReader, at time.Time) syncResult {
+func syncDB(ctx context.Context, rec recorder, rd dbReader, hist levelHistory, at time.Time) syncResult {
 	res := syncResult{}
 
 	tables, err := rd.TableSizes(ctx)
@@ -203,6 +247,16 @@ func syncDB(ctx context.Context, rec recorder, rd dbReader, at time.Time) syncRe
 	}
 	res.Apps = len(byApp)
 
+	// 🔴 A run that measured nothing must not look green. An empty app-schema set
+	// is indistinguishable from a wrong database, a wrong role or a regex that
+	// matches nothing, and the zeroing below would then zero everybody.
+	if res.Apps == 0 {
+		res.Failed = true
+		res.Err = errors.New("no app schema found: the read-only role sees no app_<id> tables")
+		slog.ErrorContext(ctx, "infra-db-sync: no app schema found", "skipped", res.Skipped)
+		return res
+	}
+
 	// Apps in a stable order so a partial failure is reproducible.
 	apps := make([]uuid.UUID, 0, len(byApp))
 	for a := range byApp {
@@ -215,21 +269,70 @@ func syncDB(ctx context.Context, rec recorder, rd dbReader, at time.Time) syncRe
 		bytes       int64
 	}
 	var samples []sample
+	live := map[pair]bool{}
+	unreadable := map[uuid.UUID]bool{}
 	for _, app := range apps {
 		installs, ierr := rd.Installs(ctx, app)
 		if ierr != nil {
 			// Counted and logged by app id only: the error and the log carry no
 			// table name or prefix (a prefix is a customer's handle).
 			res.AppErrors++
+			unreadable[app] = true
 			slog.ErrorContext(ctx, "infra-db-sync: reading module installs failed",
 				"app_id", app, "error", ierr)
 			continue
 		}
 		per, un := attribute(installs, byApp[app])
+		res.Installs += len(per)
 		res.UnattributedBytes += un
 		for mod, b := range per {
+			res.AttributedBytes += b
 			samples = append(samples, sample{app: app, module: mod, bytes: b})
+			live[pair{app, mod}] = true
 		}
+	}
+
+	// Every app unreadable means the role has no grant at all. A green run that
+	// records nothing is the failure this metric must never hide.
+	if res.AppErrors == res.Apps {
+		res.Failed = true
+		res.Err = errors.New("no app schema's module installs could be read: the read-only role is missing its grant")
+		return res
+	}
+
+	// Installs exist, tables exist, and not one byte matched: every module would
+	// record an explicit 0 and the run would look green. That is a naming or grant
+	// fault, never a fleet of empty databases.
+	if res.Installs > 0 && res.AttributedBytes == 0 && res.UnattributedBytes > 0 {
+		res.Failed = true
+		res.Err = errors.New("no table matched any installed module's m<id>_ prefix while unattributed bytes exist: the table naming or the install read is wrong")
+		slog.ErrorContext(ctx, "infra-db-sync: nothing attributed",
+			"installs", res.Installs, "unattributed_bytes", res.UnattributedBytes)
+		return res
+	}
+	if total := res.AttributedBytes + res.UnattributedBytes; total > 0 &&
+		float64(res.UnattributedBytes)/float64(total) >= unattributedWarnShare {
+		slog.WarnContext(ctx, "infra-db-sync: high unattributed share",
+			"unattributed_bytes", res.UnattributedBytes, "attributed_bytes", res.AttributedBytes)
+	}
+
+	// ZERO WHAT VANISHED. A pair that last stood at a positive level and is now
+	// absent (module uninstalled, app dropped) gets an explicit 0, or the rollup
+	// bills its last level to the period end. An app whose installs could not be
+	// read is skipped: that says nothing about its modules. A failed history read
+	// still records every measured size, then fails the run: a vanished module may
+	// be overcharged until it is read.
+	prior, histErr := hist.LivePairs(ctx, at.Add(-historyWindow))
+	if histErr != nil {
+		slog.ErrorContext(ctx, "infra-db-sync: reading level history failed", "error", histErr)
+	}
+	for _, pr := range prior {
+		if live[pr] || unreadable[pr.App] {
+			continue
+		}
+		live[pr] = true
+		res.Zeroed++
+		samples = append(samples, sample{app: pr.App, module: pr.Module})
 	}
 	sort.Slice(samples, func(i, j int) bool {
 		if samples[i].app != samples[j].app {
@@ -238,14 +341,6 @@ func syncDB(ctx context.Context, rec recorder, rd dbReader, at time.Time) syncRe
 		return samples[i].module.String() < samples[j].module.String()
 	})
 	res.Modules = len(samples)
-
-	// Every app unreadable means the role has no grant at all. A green run that
-	// records nothing is the failure this metric must never hide.
-	if res.Apps > 0 && res.AppErrors == res.Apps {
-		res.Failed = true
-		res.Err = errors.New("no app schema's module installs could be read: the read-only role is missing its grant")
-		return res
-	}
 
 	instants := closedHours(at, lookbackHours)
 	newest := instants[len(instants)-1]
@@ -283,6 +378,17 @@ func syncDB(ctx context.Context, rec recorder, rd dbReader, at time.Time) syncRe
 				res.Deduped++
 			}
 		}
+	}
+
+	// A green run is only green if it did what it is for. Every row was attempted
+	// above; the verdict comes after so one bad row never drops the others.
+	switch {
+	case res.Modules > 0 && res.Recorded+res.Deduped == 0:
+		res.Failed, res.Err = true, errors.New("no usage event was recorded or deduped")
+	case res.RowErrors > 0:
+		res.Failed, res.Err = true, fmt.Errorf("%d usage events failed to record", res.RowErrors)
+	case histErr != nil:
+		res.Failed, res.Err = true, fmt.Errorf("read level history: %w", histErr)
 	}
 	return res
 }

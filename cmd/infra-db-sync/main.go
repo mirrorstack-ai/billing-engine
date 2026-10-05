@@ -9,20 +9,33 @@
 // table that escapes both a per-entry fee and retention.
 //
 // ATTRIBUTION. An app's database is ONE schema, app_<app_id>, holding every
-// installed module's tables, each named "<prefix><table>" with the
-// "<username>_<slug>_" prefix recorded in app_<app_id>.module_install. Summing
-// pg_total_relation_size per table and assigning it to the install whose prefix
-// is the longest match yields per-(app, module) bytes with no SDK change and no
-// cooperation from the module. Tables no install owns (members, module_install,
-// the leftovers of an uninstalled module) are the platform's, never a customer's.
-// Module-scope mod_<id> schemas are shared by every app and have no app to
-// bill: out of scope here (see the PR).
+// installed module's tables, each physically named m<32 hex of the module
+// uuid>_<table> (api-platform modulePhysicalPrefix; app-module-sdk
+// ids.NormalizeModuleID). The prefix is derived from module_install.module_id,
+// never read from module_install.prefix: that column is a "<username>_<slug>_"
+// display value no deployed table carries. Summing pg_total_relation_size per
+// table and assigning it to the install whose id the name carries yields
+// per-(app, module) bytes with no SDK change and no cooperation from the module.
+// Tables no install owns (members, module_install, the leftovers of an
+// uninstalled module) are the platform's, never a customer's. Module-scope
+// mod_<id> schemas are shared by every app and have no app to bill: out of scope
+// here (see the PR).
+//
+// A MODULE THAT VANISHES IS ZEROED. The rollup carries the last level to the
+// period end, so a pair sampled last hour and absent now (uninstalled module,
+// dropped app) gets an explicit 0, found from its own previous samples in
+// ms_billing.usage_events (levelHistory).
+//
+// A GREEN RUN MEANS IT MEASURED. It fails on: no app schema at all, no
+// readable install, installs but no attributed byte, every row failing, any real
+// row error, an unreadable history. A high unattributed share logs an alarm.
 //
 // READ-ONLY, FIXED QUERIES, NO SECRETS. The sampler connects as a SELECT-only
 // role (DBSIZE_DATABASE_URL, a different identity from the service role that
 // writes usage events) and runs exactly two statements (pgreader.go): the
-// catalog size query and one SELECT module_id, prefix FROM app_<id>.module_install
-// per app. Logs carry counts and ids, never table names or prefixes.
+// catalog size query and one SELECT module_id FROM app_<id>.module_install per
+// app, each under statement_timeout and lock_timeout. Logs carry counts and ids,
+// never table names.
 //
 // IT EMITS A LEVEL, NOT A TOTAL. infra.db.gib_hours is time_weighted: Value is
 // the GiB standing at the observation instant and the rollup integrates it, so
@@ -46,6 +59,7 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
@@ -75,14 +89,14 @@ const lookbackHours = 3
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-	svc, rd := buildDeps()
+	svc, rd, hist := buildDeps()
 
 	if config.IsLambda() {
-		lambda.Start(handler(svc, rd))
+		lambda.Start(handler(svc, rd, hist))
 		return
 	}
 
-	res := syncDB(context.Background(), svc, rd, time.Now().UTC())
+	res := syncDB(context.Background(), svc, rd, hist, time.Now().UTC())
 	logResult(context.Background(), "infra-db-sync local run complete", res)
 	if res.Failed {
 		os.Exit(1)
@@ -90,15 +104,16 @@ func main() {
 }
 
 // buildDeps wires the usage service (the write path, identical to its sibling
-// collectors) and the read-only reader. DBSIZE_DATABASE_URL is required: a
+// collectors), the read-only reader, and the billing-side level history that
+// lets the sampler zero a vanished module. DBSIZE_DATABASE_URL is required: a
 // missing one exits at startup, never mid-run, so a misconfiguration can never
 // look like "no databases this hour".
-func buildDeps() (*usage.Service, dbReader) {
-	svc := buildUsageService()
-	return svc, pgReader{pool: config.MustPgxPoolFromEnv("DBSIZE_DATABASE_URL")}
+func buildDeps() (*usage.Service, dbReader, levelHistory) {
+	svc, billingPool := buildUsageService()
+	return svc, pgReader{pool: config.MustPgxPoolFromEnv("DBSIZE_DATABASE_URL")}, billingHistory{pool: billingPool}
 }
 
-func buildUsageService() *usage.Service {
+func buildUsageService() (*usage.Service, *pgxpool.Pool) {
 	pool := config.MustPgxPool()
 	candidate := rollout.FromEnv(rollout.ComponentWorker, true)
 	schemaReady := false
@@ -185,19 +200,19 @@ func buildUsageService() *usage.Service {
 			coordinator,
 		))
 	}
-	return svc
+	return svc, pool
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The
 // CloudWatchEvent carries no window, so the handler derives the closed-hour
 // lookback from the event time.
-func handler(svc *usage.Service, rd dbReader) func(context.Context, events.CloudWatchEvent) error {
+func handler(svc *usage.Service, rd dbReader, hist levelHistory) func(context.Context, events.CloudWatchEvent) error {
 	return func(ctx context.Context, ev events.CloudWatchEvent) error {
 		at := ev.Time
 		if at.IsZero() {
 			at = time.Now().UTC()
 		}
-		res := syncDB(ctx, svc, rd, at.UTC())
+		res := syncDB(ctx, svc, rd, hist, at.UTC())
 		logResult(ctx, "infra-db-sync lambda run complete", res)
 		// A read failure fails the run so EventBridge retries and the alarm sees
 		// it; per-row record errors are logged and counted but never abort the
@@ -212,7 +227,7 @@ func handler(svc *usage.Service, rd dbReader) func(context.Context, events.Cloud
 func logResult(ctx context.Context, msg string, res syncResult) {
 	slog.InfoContext(ctx, msg,
 		"samples", res.Samples, "apps", res.Apps, "app_errors", res.AppErrors,
-		"modules", res.Modules, "recorded", res.Recorded, "deduped", res.Deduped,
+		"installs", res.Installs, "modules", res.Modules, "zeroed", res.Zeroed, "recorded", res.Recorded, "deduped", res.Deduped,
 		"skipped", res.Skipped, "row_errors", res.RowErrors,
-		"unattributed_bytes", res.UnattributedBytes, "failed", res.Failed)
+		"attributed_bytes", res.AttributedBytes, "unattributed_bytes", res.UnattributedBytes, "failed", res.Failed)
 }
