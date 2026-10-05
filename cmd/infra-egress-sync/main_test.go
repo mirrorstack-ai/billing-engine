@@ -143,6 +143,10 @@ func (f *fakeStore) AppInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Ti
 	return nil, nil
 }
 
+func (f *fakeStore) ModuleInfraPriceCatalog(context.Context, []uuid.UUID) ([]usage.ModuleInfraCatalogRow, error) {
+	return nil, nil
+}
+
 func (f *fakeStore) AppModuleInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time, _ bool) ([]usage.AppModuleInfraUsage, error) {
 	return nil, nil
 }
