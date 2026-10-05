@@ -530,6 +530,24 @@ func TestRecordInfraUsage_AcceptsSSRComputeMetrics(t *testing.T) {
 	}
 }
 
+func TestRecordInfraUsage_AcceptsDBSizeAsATimeWeightedLevel(t *testing.T) {
+	// infra.db.gib_hours (migration 089, core-v2#1757): the platform-owned
+	// database-size gauge cmd/infra-db-sync emits per (app, module). It must
+	// resolve to time_weighted so the rollup integrates the standing level; a
+	// sum/count registration would add each hourly level up instead.
+	store := newFakeStore()
+	req := validInfra()
+	req.EventID = "db-size-level"
+	req.Metric = "infra.db.gib_hours"
+	req.Value = 2.5
+
+	resp, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, resp.Recorded)
+
+	require.Equal(t, usage.KindTimeWeighted, store.events[req.EventID].Kind)
+}
+
 func TestRecordInfraUsage_RejectsModelOnP1Metric(t *testing.T) {
 	// Model is a pricing dimension EXCLUSIVE to infra.ai.* — none of the P1
 	// metrics are AI, so a stray model must be rejected (it would persist a

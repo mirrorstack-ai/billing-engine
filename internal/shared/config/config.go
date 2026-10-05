@@ -511,7 +511,14 @@ func Port(envKey, fallback string) string {
 // pool is lazily connected — call pool.Ping if you want to fail fast
 // on the database being unreachable at startup.
 func MustPgxPool() *pgxpool.Pool {
-	dsn := MustEnv("DATABASE_URL")
+	return MustPgxPoolFromEnv("DATABASE_URL")
+}
+
+// MustPgxPoolFromEnv is MustPgxPool for a binary that holds a SECOND connection
+// under another identity (a read-only role beside the service role): the DSN
+// comes from the named env var, DB_AUTH applies to both.
+func MustPgxPoolFromEnv(key string) *pgxpool.Pool {
+	dsn := MustEnv(key)
 	poolCfg, err := pgxPoolConfig(dsn, os.Getenv("DB_AUTH"))
 	if err != nil {
 		slog.Error("pgxpool config failed", "error", err)

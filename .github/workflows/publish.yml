@@ -46,6 +46,7 @@ jobs:
             account-webhook:billing-webhook \
             account-webhook-eventbridge:billing-webhook-eventbridge \
             billing-cycle:billing-cycle \
+            infra-db-sync:billing-infra-db-sync \
             infra-egress-sync:billing-egress-sync \
             infra-ssr-compute-sync:billing-infra-ssr-compute-sync \
             infra-storage-sync:billing-infra-storage-sync \

@@ -90,6 +90,7 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.storage.put.count      S3 tier-1 PUT/COPY ops (per-1k)           → count
 //	infra.storage.list.count     S3 tier-1 LIST ops (per-1k)               → count
 //	infra.storage.gib_hours      S3 stored volume (GiB-hours integral)     → time_weighted
+//	infra.db.gib_hours           Postgres size per app+module (GiB level)  → time_weighted
 //	infra.task.vcpu.hours        Fargate task vCPU-hours                   → sum
 //	infra.task.memory.gib_hours  Fargate task GiB-hours                    → sum
 //	infra.task.gpu.hours         ECS GPU instance-hours                    → sum
@@ -207,6 +208,12 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// §2.4 S3 tier-1 LIST ops. count; priced per-1k → producer value =
 		// lists/1000 (rule 5; 0.005 µ$/LIST floors per-unit).
 		return KindCount, true
+	case "infra.db.gib_hours":
+		// Database size per (app, module) (migration 089, core-v2#1757). The
+		// producer (cmd/infra-db-sync) emits the GiB STANDING at an hour boundary,
+		// not a delta and not an integral: time_weighted, same contract as
+		// infra.storage.gib_hours below.
+		return KindTimeWeighted, true
 	case "infra.storage.gib_hours":
 		// §2.4 S3 stored VOLUME. time_weighted: producer (PR #7) emits the
 		// GiB-hours integral of the stored-bytes gauge (how much × how long), NOT

@@ -1,4 +1,4 @@
-.PHONY: db db-init db-reset test test-integration lint build dev-webhook dev-cycle dev-egress-sync dev-ssr-compute-sync
+.PHONY: db db-init db-reset test test-integration lint build dev-webhook dev-cycle dev-egress-sync dev-ssr-compute-sync dev-db-sync
 
 # Start infrastructure (Postgres)
 db:
@@ -85,3 +85,10 @@ dev-ssr-compute-sync:
 # Prod runs the same binary on an EventBridge schedule.
 dev-storage-sync:
 	cd cmd/infra-storage-sync && go run .
+
+# One-shot run of the database-size sampler: reads every app schema's table sizes
+# through a SELECT-only connection (DBSIZE_DATABASE_URL) and records each
+# module's level via RecordInfraUsage (DATABASE_URL). Read-only on the sampled
+# side; the binary must never pre-integrate (see cmd/infra-db-sync).
+dev-db-sync:
+	cd cmd/infra-db-sync && go run .
