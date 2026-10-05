@@ -221,7 +221,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		return nil, err
 	}
 
-	parts, err := s.computeAppBill(ctx, accountID, found, req.AppID, periodStart, periodEnd, installedModuleIDs)
+	parts, err := s.computeAppBill(ctx, accountID, found, req.AppID, periodStart, periodEnd, &installedModuleIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +442,7 @@ func clampModelChargesToTotal(lines []AgentModelUsage, limit int64) []AgentModel
 // usage-proxy fallbacks). found=false (no billing account yet) yields the
 // base-fee-only bill: no usage/module-infra reads, but the catalog-anchored
 // infra residual still renders every declared metric at $0.
-func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found bool, appID uuid.UUID, periodStart, periodEnd time.Time, installedModuleIDs []uuid.UUID) (*appBillParts, error) {
+func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found bool, appID uuid.UUID, periodStart, periodEnd time.Time, displayInstalled *[]uuid.UUID) (*appBillParts, error) {
 	// Read the usage lines (empty when no billing account exists yet — the bill is
 	// then base-fee-only).
 	var lines []AppMetricUsageRaw
@@ -539,7 +539,9 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	if err != nil {
 		return nil, billing.Internal("app infra bill query failed", err)
 	}
-	infraLines = withCustomerPrices(infraLines)
+	if displayInstalled != nil {
+		infraLines = withCustomerPrices(infraLines)
+	}
 
 	// 基礎設施, per-MODULE split (decision 19): reserved infra attributed to a real
 	// incurring module renders inside that module's card, dual-priced (SENTINEL default
@@ -578,10 +580,12 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 	// Display-only decoration (WP10): customer unit prices + price_source on every
 	// per-module line, and zero-quantity rows for installed modules with no usage.
 	// It runs AFTER both reads and BEFORE the totals below, which stay exact because
-	// every added row is qty 0 · $0.
-	moduleInfraLines, moduleInfraDevServed, err = s.priceModuleInfra(ctx, moduleInfraLines, moduleInfraDevServed, installedModuleIDs)
-	if err != nil {
-		return nil, err
+	// every added row is qty 0 · $0. Only the page read (GetAppBill) passes
+	// displayInstalled: the charge leg (AccountUsageAllowanceMicros), the account
+	// bill and the agent scope loop this function per app and must neither pay an
+	// extra catalog query per app nor depend on a display-only read.
+	if displayInstalled != nil {
+		moduleInfraLines, moduleInfraDevServed = s.priceModuleInfra(ctx, moduleInfraLines, moduleInfraDevServed, *displayInstalled)
 	}
 
 	// InfraTotalMicros stays the FULL reconciliation scalar: the per-module split is a

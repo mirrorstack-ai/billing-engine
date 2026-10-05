@@ -105,6 +105,8 @@ type fakeStore struct {
 	// filtered to the requested modules like the SQL's unnest join.
 	moduleInfraCatalog       []usage.ModuleInfraCatalogRow
 	moduleInfraCatalogCalled bool
+	moduleInfraCatalogCalls  int
+	errModuleInfraCatalog    error
 	gotModuleInfraCatalogIDs []uuid.UUID
 
 	// captured VersionBreakdown call args, so a test can assert the resolved
@@ -788,6 +790,10 @@ func (f *fakeStore) AppInfraBill(_ context.Context, accountID, appID uuid.UUID, 
 
 func (f *fakeStore) ModuleInfraPriceCatalog(_ context.Context, moduleIDs []uuid.UUID) ([]usage.ModuleInfraCatalogRow, error) {
 	f.moduleInfraCatalogCalled = true
+	f.moduleInfraCatalogCalls++
+	if f.errModuleInfraCatalog != nil {
+		return nil, f.errModuleInfraCatalog
+	}
 	f.gotModuleInfraCatalogIDs = moduleIDs
 	want := map[uuid.UUID]bool{}
 	for _, id := range moduleIDs {

@@ -3,7 +3,12 @@ package usage_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"regexp"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -316,4 +321,82 @@ func TestAppBillWire_NewInfraFieldsAreAdditive(t *testing.T) {
 	var req usage.GetAppBillRequest
 	require.NoError(t, json.Unmarshal([]byte(`{"app_id":"`+uuid.NewString()+`"}`), &req))
 	require.Empty(t, req.InstalledModuleIDs, "an old caller that omits installed_module_ids still decodes")
+}
+
+// chargePathStore is an account with one app that has module infra usage and a
+// catalog that WOULD decorate it, so a leak of the display read into a charge
+// path shows up as a catalog call, not as a vacuous green.
+func chargePathStore(t *testing.T) (store *fakeStore, owner, acct, app, mod uuid.UUID) {
+	t.Helper()
+	store = newFakeStore()
+	owner, acct, app, mod = uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	store.accounts[owner] = acct
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC), Plan: usage.PlanPro}
+	store.usageAppIDs = []uuid.UUID{app}
+	store.appBillRowsByApp[app] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "views.count", "", 300_000)}
+	store.appModuleInfraBillRowsByApp[app] = []usage.AppModuleInfraUsage{
+		moduleInfraLine(mod, "infra.compute.walltime.ms", "", 20, nil, 100, 24),
+	}
+	store.moduleInfraCatalog = catalogRows(nil, mod)
+	return store, owner, acct, app, mod
+}
+
+// The boundary charge reaches computeAppBill through AccountUsageAllowanceMicros;
+// the display-only catalog read must never run there, and could not fail it.
+func TestAccountUsageAllowance_NeverReadsTheDisplayCatalog(t *testing.T) {
+	store, owner, acct, _, _ := chargePathStore(t)
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	store.moduleInfraCatalogCalls = 0
+	store.errModuleInfraCatalog = errors.New("catalog down")
+
+	allowance, err := newService(store).AccountUsageAllowanceMicros(context.Background(), acct, resp.PeriodStart, resp.PeriodEnd)
+	require.NoError(t, err, "a catalog failure must not fail or delay the boundary charge")
+	require.EqualValues(t, 0, store.moduleInfraCatalogCalls, "the allowance path issues no catalog query")
+	require.Equal(t, resp.UsageDeductionTotalMicros, allowance)
+}
+
+// GetAccountBill and the agent scope loop computeAppBill per app: no per-app
+// catalog query (the N+1), and a catalog outage cannot touch them.
+func TestGetAccountBill_IssuesNoCatalogQueryPerApp(t *testing.T) {
+	store, owner, _, _, _ := chargePathStore(t)
+	store.errModuleInfraCatalog = errors.New("catalog down")
+
+	_, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, store.moduleInfraCatalogCalls)
+}
+
+// The page read is the only caller that decorates, and a catalog error there
+// degrades the decoration, never the bill.
+func TestGetAppBill_CatalogErrorDecoratesNothingAndKeepsTheBill(t *testing.T) {
+	store, owner, _, app, mod := chargePathStore(t)
+	svc := newService(store)
+	good, err := svc.GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, InstalledModuleIDs: []uuid.UUID{mod}})
+	require.NoError(t, err)
+	require.Equal(t, usage.PriceSourceDefault, good.ModuleInfraLines[0].PriceSource, "sanity: the happy path decorates")
+
+	store.errModuleInfraCatalog = errors.New("catalog down")
+	resp, err := svc.GetAppBill(context.Background(), usage.GetAppBillRequest{OwnerUserID: owner, AppID: app, InstalledModuleIDs: []uuid.UUID{mod}})
+	require.NoError(t, err, "a display-only read must not fail the bill")
+	require.Equal(t, good.TotalMicros, resp.TotalMicros)
+	require.Equal(t, good.InfraTotalMicros, resp.InfraTotalMicros)
+	require.Len(t, resp.ModuleInfraLines, 1, "usage rows survive; no zero rows without the catalog")
+	require.Empty(t, resp.ModuleInfraLines[0].PriceSource)
+	require.Nil(t, resp.ModuleInfraLines[0].ModuleCustomerUnitPriceMicros)
+	require.NotNil(t, resp.ModuleInfraLines, "never null on the wire")
+}
+
+// One markup constant. The Go fraction and every `* N / M` literal in the infra
+// queries must agree, or the displayed customer price drifts from the charge.
+func TestInfraMarkup_MatchesTheSQLLiteral(t *testing.T) {
+	src, err := os.ReadFile("../db/queries/usage.sql")
+	require.NoError(t, err)
+	re := regexp.MustCompile(`\)\s*\*\s*(\d+)\s*/\s*(\d+)`)
+	matches := re.FindAllStringSubmatch(string(src), -1)
+	require.GreaterOrEqual(t, len(matches), 3, "the three infra markup sites in usage.sql")
+	for _, m := range matches {
+		require.Equal(t, fmt.Sprint(usage.InfraMarkupNum), m[1], "usage.sql markup numerator drifted from usage.InfraMarkupNum")
+		require.Equal(t, fmt.Sprint(usage.InfraMarkupDen), m[2], "usage.sql markup denominator drifted from usage.InfraMarkupDen")
+	}
 }

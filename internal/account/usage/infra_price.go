@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 
 	"github.com/google/uuid"
@@ -14,19 +15,20 @@ import (
 // cap keeps the unnest join in ModuleInfraPriceCatalog bounded.
 const MaxInstalledModuleIDs = 500
 
-// The platform-infra markup (cycle.infraMarkupNum/Den, usage.sql's `* 12 / 10`):
-// the customer is charged 1.2x the raw COGS. The display unit prices below use the
-// same fraction so the page never re-derives it; the charged amounts still come
-// from SQL and are untouched by this file.
+// The platform-infra markup, the ONE Go definition: the customer is charged 1.2x
+// the raw COGS. cycle.infraMarkupNum/Den alias these (cycle imports usage), and
+// TestInfraMarkup_MatchesTheSQLLiteral ties them to the `* 12 / 10` literals in
+// usage.sql, so the display unit prices below cannot drift from the charge. The
+// charged amounts still come from SQL and are untouched by this file.
 const (
-	infraMarkupNum = 12
-	infraMarkupDen = 10
+	InfraMarkupNum = 12
+	InfraMarkupDen = 10
 )
 
 // customerUnitPrice is raw x 12/10, fractional on purpose (37 -> 44.4): a
 // per-GiB-month display built on a rounded 44 would read $0.0321, not $0.0324.
 func customerUnitPrice(rawMicros int64) float64 {
-	return float64(rawMicros*infraMarkupNum) / infraMarkupDen
+	return float64(rawMicros*InfraMarkupNum) / InfraMarkupDen
 }
 
 func customerUnitPricePtr(rawMicros *int64) *float64 {
@@ -51,9 +53,18 @@ func withCustomerPrices(lines []AppInfraUsage) []AppInfraUsage {
 // infraPriceSource says which price bills a (module, metric). override is the
 // module's stored price (nil = no row); absorbsAll is whether the module holds a
 // stored override on EVERY active infra metric, the only shape
-// AbsorbAllInfraPriceOverrides writes (the ms.AbsorbInfra() declaration itself is
-// not persisted). A stored 0 is "absorbed" only then; a lone ms.Price(0) on a
-// module that did not declare AbsorbInfra is an ordinary override.
+// AbsorbAllInfraPriceOverrides writes.
+//
+// 🔴 "absorbed" is a HEURISTIC: the ms.AbsorbInfra() declaration is not persisted,
+// so it is inferred from the stored rows. A stored 0 reads absorbed only when the
+// module is overridden on every active metric. Two known misclassifications:
+//  1. a module that declares an explicit Price(0) on EVERY active infra metric
+//     without AbsorbInfra reads "absorbed" (same stored shape);
+//  2. a newly added sentinel metric has no row for a module until it republishes,
+//     so that module's zeros read "override", not "absorbed", in the meantime.
+//
+// Persisting the declaration would remove both; this is display only and moves no
+// charge.
 func infraPriceSource(override *int64, absorbsAll bool) PriceSource {
 	switch {
 	case override == nil:
@@ -91,7 +102,11 @@ func normalizeInstalledModuleIDs(ids []uuid.UUID) ([]uuid.UUID, error) {
 // Usage rows keep their order and content (the new fields aside); zero rows follow,
 // sorted by module, display group, metric. With no module to look up the lines
 // come back unchanged and the catalog is not read.
-func (s *Service) priceModuleInfra(ctx context.Context, charged, devServed []AppModuleInfraUsage, installed []uuid.UUID) ([]AppModuleInfraUsage, []AppModuleInfraUsage, error) {
+//
+// The catalog read is display-only and NON-FATAL: on error it is logged and the
+// lines come back undecorated (no zero rows, no price_source) rather than failing
+// the bill. Only GetAppBill calls this (see computeAppBill's withDisplayPrices).
+func (s *Service) priceModuleInfra(ctx context.Context, charged, devServed []AppModuleInfraUsage, installed []uuid.UUID) ([]AppModuleInfraUsage, []AppModuleInfraUsage) {
 	ids := append([]uuid.UUID(nil), installed...)
 	seen := make(map[uuid.UUID]bool, len(installed))
 	for _, id := range installed {
@@ -107,12 +122,14 @@ func (s *Service) priceModuleInfra(ctx context.Context, charged, devServed []App
 	}
 	if len(ids) == 0 {
 		// Never null on the wire, whatever the store handed back.
-		return append([]AppModuleInfraUsage{}, charged...), append([]AppModuleInfraUsage{}, devServed...), nil
+		return append([]AppModuleInfraUsage{}, charged...), append([]AppModuleInfraUsage{}, devServed...)
 	}
 
 	cells, err := s.store.ModuleInfraPriceCatalog(ctx, ids)
 	if err != nil {
-		return nil, nil, billing.Internal("module infra price catalog query failed", err)
+		slog.ErrorContext(ctx, "module infra price catalog read failed (bill rendered without customer prices)",
+			"module_count", len(ids), "error", err)
+		return append([]AppModuleInfraUsage{}, charged...), append([]AppModuleInfraUsage{}, devServed...)
 	}
 	total, covered := map[uuid.UUID]int{}, map[uuid.UUID]int{}
 	for _, c := range cells {
@@ -176,5 +193,5 @@ func (s *Service) priceModuleInfra(ctx context.Context, charged, devServed []App
 		}
 		return a.Metric < b.Metric
 	})
-	return append(outCharged, zero...), outDev, nil
+	return append(outCharged, zero...), outDev
 }
