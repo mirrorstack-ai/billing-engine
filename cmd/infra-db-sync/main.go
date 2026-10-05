@@ -28,7 +28,11 @@
 //
 // A GREEN RUN MEANS IT MEASURED. It fails on: no app schema at all, no
 // readable install, installs but no attributed byte, every row failing, any real
-// row error, an unreadable history. A high unattributed share logs an alarm.
+// row error, an unreadable history, any app whose installs could not be read, an
+// app whose tables carry no installed module's m<id>_ prefix, and a read that
+// would zero the fleet (installs empty fleet-wide, or half of 10+ prior pairs
+// gone at once; refused before anything is recorded). A high unattributed share
+// logs an alarm.
 //
 // READ-ONLY, FIXED QUERIES, NO SECRETS. The sampler connects as a SELECT-only
 // role (DBSIZE_DATABASE_URL, a different identity from the service role that
@@ -61,7 +65,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/mirrorstack-ai/billing-engine/internal/account/autotopup"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
@@ -126,6 +129,20 @@ func buildUsageService() (*usage.Service, *pgxpool.Pool) {
 		schemaReady = ready
 	}
 	policy := rollout.FromEnv(rollout.ComponentWorker, schemaReady)
+	return wireUsageService(pool, policy), pool
+}
+
+// wireUsageService builds the write path for a policy. Split from
+// buildUsageService so a test can drive the enforce wiring without a database.
+//
+// 🔴 A USAGE-ONLY SAMPLER NEVER BUILDS A PAYMENT EXECUTOR. In enforce mode the
+// coordinator keeps the wallet estimate and the out-of-credits gate, but no
+// auto-top-up trigger is attached: Coordinator.maybeTriggerAutoTopUp returns at
+// once without one. The trigger needed autotopup.NewStandardExecutor and
+// config.MustEnv("STRIPE_SECRET_KEY"), a key infra#377 removed from this
+// binary's environment, so on an enforce stage the Lambda would exit at startup.
+// Settling a top-up belongs to the services that hold the Stripe credential.
+func wireUsageService(pool *pgxpool.Pool, policy rollout.Policy) *usage.Service {
 	controller := rollout.NewController(policy, rollout.NewReporter(os.Stdout))
 	walletEnabled := policy.Active()
 	creditAccess := func(accountID uuid.UUID) bool {
@@ -169,19 +186,6 @@ func buildUsageService() (*usage.Service, *pgxpool.Pool) {
 				slog.Error("credit estimate cache unavailable; live projection fallback remains active", "error", err)
 			}
 			coordinator = credit.NewCoordinator(counter, standingStore, svc, nil)
-			stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
-			autoTopUpExecutor := autotopup.NewStandardExecutor(pool, stripeKey).WithSettlementObserver(coordinator)
-			coordinator.WithAutoTopUpTrigger(credit.AutoTopUpTriggerFunc(
-				func(ctx context.Context, accountID uuid.UUID, projectedChargeMicros int64) (credit.AutoTopUpTriggerResult, error) {
-					result, err := autoTopUpExecutor.Trigger(ctx, accountID, projectedChargeMicros)
-					return credit.AutoTopUpTriggerResult{
-						Attempted:  result.Triggered,
-						NewAttempt: result.NewAttempt,
-						Terminal:   result.Status == "settled" || result.Status == "failed",
-					}, err
-				},
-			))
-
 			status := billing.NewService(standingStore, nil, "").
 				WithCreditWallet(true).
 				WithCreditAccess(creditAccess).
@@ -200,7 +204,7 @@ func buildUsageService() (*usage.Service, *pgxpool.Pool) {
 			coordinator,
 		))
 	}
-	return svc, pool
+	return svc
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The

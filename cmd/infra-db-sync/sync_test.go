@@ -269,9 +269,11 @@ func TestSyncDB_AnUnreadableAppIsSkippedButEveryAppUnreadableFails(t *testing.T)
 	r.installErr = map[uuid.UUID]error{appA: errors.New("permission denied for schema")}
 	rec := &fakeRecorder{}
 	res := syncDB(context.Background(), rec, r, &fakeHistory{}, at())
-	require.False(t, res.Failed)
 	require.Equal(t, 1, res.AppErrors)
 	require.Equal(t, lookbackHours, res.Recorded, "only (B,quiz) records")
+	// ...yet the run is not green: an app that cannot be read is billed nothing
+	// (see TestSyncDB_APartiallyUnreadableFleetFailsTheRunAfterRecording).
+	require.True(t, res.Failed)
 
 	// ...but if NO app can be read the role has no grant at all, and a green run
 	// of zero rows is the failure this metric must never hide.
