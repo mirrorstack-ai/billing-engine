@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -593,5 +595,55 @@ func TestEgressModuleID(t *testing.T) {
 	require.Equal(t, id, egressModuleID(strings.ToUpper(id.String())))
 	for _, raw := range []string{"", ssrModuleIDSentinel, "m", "not-a-uuid"} {
 		require.Equal(t, uuid.Nil, egressModuleID(raw), raw)
+	}
+}
+
+// captureLogs swaps the default slog for a text handler writing to a buffer.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func TestSyncEgress_LogsOneInfoLinePerRowWithModuleID(t *testing.T) {
+	logs := captureLogs(t)
+	app, ads := uuid.New(), uuid.New()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{win: {
+		{AppID: app.String(), ModuleID: ads.String(), Bytes: float64(bytesPerGiB)},
+		{AppID: app.String(), ModuleID: "", Bytes: float64(bytesPerGiB / 2)},
+		{AppID: "garbage", ModuleID: ads.String(), Bytes: 5},
+	}}}
+	store := newFakeStore()
+
+	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.Equal(t, 1, res.Skipped)
+	// Re-run: the same rows now dedupe.
+	syncEgress(context.Background(), newSvc(store), cf, at)
+
+	var rowLines []string
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "msg=\"egress row\"") {
+			rowLines = append(rowLines, l)
+		}
+	}
+	// 3 rows x 2 runs
+	require.Len(t, rowLines, 6)
+	joined := strings.Join(rowLines, "\n")
+	require.Contains(t, joined, "module_id="+ads.String())
+	require.Contains(t, joined, "module_id=none")
+	require.Contains(t, joined, "app_id="+app.String())
+	require.Contains(t, joined, "metric="+cdnEgressMetric)
+	require.Contains(t, joined, "quantity=1")
+	require.Contains(t, joined, "outcome=recorded")
+	require.Contains(t, joined, "outcome=deduped")
+	require.Contains(t, joined, "outcome=skipped")
+	require.Contains(t, joined, "window=2026-06-15")
+	// ids and numbers only: never an object path or key.
+	for _, banned := range []string{"apps/", "/ads/", ".mp4", "rendition", "key=", "path="} {
+		require.NotContains(t, joined, banned)
 	}
 }

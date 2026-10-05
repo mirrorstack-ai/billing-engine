@@ -332,6 +332,7 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 				res.Skipped++
 				slog.DebugContext(ctx, "skipping egress row with unparseable app_id",
 					"app_id", row.AppID, "module_id", row.ModuleID, "window_start", w.start)
+				logRow(ctx, row.AppID, row.ModuleID, "", row.Bytes, w.start, outcomeSkipped)
 				continue
 			}
 
@@ -363,8 +364,10 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 			}
 			if resp.Recorded {
 				res.Recorded++
+				logRow(ctx, appID.String(), row.ModuleID, metric, value, w.start, outcomeRecorded)
 			} else {
 				res.Deduped++
+				logRow(ctx, appID.String(), row.ModuleID, metric, value, w.start, outcomeDeduped)
 			}
 		}
 
@@ -449,11 +452,14 @@ func syncRequestRows(ctx context.Context, svc *usage.Service, w hourWindow, rows
 					"window_start", w.start, "count", count, "error", err)
 				return
 			}
+			outcome := outcomeDeduped
 			if resp.Recorded {
 				res.RequestRecorded++
+				outcome = outcomeRecorded
 			} else {
 				res.Deduped++
 			}
+			logRow(ctx, key.appID.String(), key.moduleID, metric, count/requestsPerUnit, w.start, outcome)
 		}
 		record(cdnRequestMetric, t.requests)
 		if t.r2Reads > 0 {
@@ -535,6 +541,27 @@ func closedHourWindows(at time.Time, count int) []hourWindow {
 		windows = append(windows, hourWindow{start: start, end: start.Add(time.Hour)})
 	}
 	return windows
+}
+
+const (
+	outcomeRecorded = "recorded"
+	outcomeDeduped  = "deduped"
+	outcomeSkipped  = "skipped"
+)
+
+// logRow emits ONE INFO line per egress/request row the sweep handled
+// (core-v2#1758 WP14 evidence: lets an operator see which module a row was
+// attributed to). Ids and numbers only — module is the UUID attributed or
+// "none" (empty / "ssr" / unparseable blob2, i.e. app-level); never an object
+// path, key or customer handle.
+func logRow(ctx context.Context, appID, rawModule, metric string, quantity float64, window time.Time, outcome string) {
+	module := "none"
+	if id := egressModuleID(rawModule); id != uuid.Nil {
+		module = id.String()
+	}
+	slog.InfoContext(ctx, "egress row",
+		"app_id", appID, "module_id", module, "metric", metric,
+		"quantity", quantity, "window", window, "outcome", outcome)
 }
 
 // logResult emits a single structured summary line for the sweep.
