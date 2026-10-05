@@ -348,6 +348,7 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 			resp, err := svc.RecordInfraUsage(ctx, usage.RecordInfraUsageRequest{
 				EventID:    egressEventID(metric, appID, row.ModuleID, w.start),
 				AppID:      appID,
+				ModuleID:   egressModuleID(row.ModuleID),
 				Metric:     metric,
 				Value:      value,
 				RecordedAt: w.start, // the window the egress occurred in, not now()
@@ -436,6 +437,7 @@ func syncRequestRows(ctx context.Context, svc *usage.Service, w hourWindow, rows
 			resp, err := svc.RecordInfraUsage(ctx, usage.RecordInfraUsageRequest{
 				EventID:    egressEventID(metric, key.appID, key.moduleID, w.start),
 				AppID:      key.appID,
+				ModuleID:   egressModuleID(key.moduleID),
 				Metric:     metric,
 				Value:      count / requestsPerUnit,
 				RecordedAt: w.start,
@@ -476,6 +478,25 @@ func egressMetricAndValue(moduleID string, bytesTotal float64) (metric string, v
 		return ssrEgressMetric, bytesTotal / bytesPerGiB
 	}
 	return cdnEgressMetric, bytesTotal / bytesPerGiB
+}
+
+// egressModuleID is the module an egress row is attributed to, from its raw CF
+// blob2 (core-v2#1758 WP14). cdn-worker emits the module UUID (3rd segment of
+// apps/<app>/<module>/...) for a module's own objects, so each module's
+// AbsorbInfra() absorbs the delivery it caused (video-core's HLS, ad-core's
+// mp4s) instead of the app paying it a second time.
+//
+// Anything that is not a UUID — empty (an app's own deploy/static assets, which
+// stay billable at app level), the "ssr" sentinel, or a garbage value — is
+// uuid.Nil, which RecordInfraUsage maps to the platform-infra sentinel exactly
+// as before. The event_id keeps the RAW blob2 string, so ids of existing rows
+// are unchanged and a module row can never collide with the app-level row.
+func egressModuleID(blob2 string) uuid.UUID {
+	id, err := uuid.Parse(blob2)
+	if err != nil || blob2 == ssrModuleIDSentinel {
+		return uuid.Nil
+	}
+	return id
 }
 
 // egressEventID is the DETERMINISTIC idempotency key for one (metric, app,
