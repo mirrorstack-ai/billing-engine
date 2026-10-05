@@ -101,6 +101,14 @@ type fakeStore struct {
 	appInfraBillRowsByApp       map[uuid.UUID][]usage.AppInfraUsage
 	appModuleInfraBillRowsByApp map[uuid.UUID][]usage.AppModuleInfraUsage
 
+	// ModuleInfraPriceCatalog: the raw (module x metric) cells the fake serves,
+	// filtered to the requested modules like the SQL's unnest join.
+	moduleInfraCatalog       []usage.ModuleInfraCatalogRow
+	moduleInfraCatalogCalled bool
+	moduleInfraCatalogCalls  int
+	errModuleInfraCatalog    error
+	gotModuleInfraCatalogIDs []uuid.UUID
+
 	// captured VersionBreakdown call args, so a test can assert the resolved
 	// module filter reached the store unchanged.
 	gotVersionModuleID uuid.UUID
@@ -778,6 +786,26 @@ func (f *fakeStore) AppInfraBill(_ context.Context, accountID, appID uuid.UUID, 
 		return rows, nil
 	}
 	return f.appInfraBillRows, nil
+}
+
+func (f *fakeStore) ModuleInfraPriceCatalog(_ context.Context, moduleIDs []uuid.UUID) ([]usage.ModuleInfraCatalogRow, error) {
+	f.moduleInfraCatalogCalled = true
+	f.moduleInfraCatalogCalls++
+	if f.errModuleInfraCatalog != nil {
+		return nil, f.errModuleInfraCatalog
+	}
+	f.gotModuleInfraCatalogIDs = moduleIDs
+	want := map[uuid.UUID]bool{}
+	for _, id := range moduleIDs {
+		want[id] = true
+	}
+	var out []usage.ModuleInfraCatalogRow
+	for _, r := range f.moduleInfraCatalog {
+		if want[r.ModuleID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) AppModuleInfraBill(_ context.Context, accountID, appID uuid.UUID, _, _ time.Time, devServed bool) ([]usage.AppModuleInfraUsage, error) {

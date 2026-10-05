@@ -1115,6 +1115,36 @@ LEFT JOIN ms_billing.metric_definitions md_ovr
     ON md_ovr.module_id = u.module_id AND md_ovr.metric = u.metric
 ORDER BY u.module_id, md_def.display_group, u.metric, u.module_version;
 
+-- ModuleInfraPriceCatalog is the CATALOG-ANCHORED, ledger-free sibling of
+-- AppModuleInfraBillLines: ONE row per (given module x ACTIVE sentinel infra
+-- metric), whether or not the module ever incurred usage. It exists so the app
+-- bill can list every installed module's infra meters at qty 0 with the price
+-- that WILL bill (WP10: the page must show what billing-engine charges, not what a
+-- manifest says).
+--
+-- It reads what AppModuleInfraBillLines reads, by the same join: md_def is the
+-- sentinel row (kind / unit / display_group / default price), md_ovr the
+-- module's stored override. module_unit_price_micros is NULL when the module
+-- has no override row — NEVER coalesced to the default (NULL is the plain-vs-
+-- adjusted switch), and a stored 0 stays a non-NULL 0 (ms.Price(0) / AbsorbInfra).
+-- The `absorbed` call is made in Go from these rows (service: infraPriceSource),
+-- so it is unit-tested without Postgres. Money-free: no total reads this.
+-- name: ModuleInfraPriceCatalog :many
+SELECT mid.module_id::uuid                                  AS module_id,
+       md_def.metric                                        AS metric,
+       md_def.kind                                          AS kind,
+       md_def.unit                                          AS unit,
+       md_def.display_group                                 AS display_group,
+       COALESCE(md_def.unit_price_micros, 0)::bigint        AS default_unit_price_micros,
+       md_ovr.unit_price_micros                             AS module_unit_price_micros
+FROM unnest(@module_ids::uuid[]) AS mid(module_id)
+CROSS JOIN ms_billing.metric_definitions md_def
+LEFT JOIN ms_billing.metric_definitions md_ovr
+    ON md_ovr.module_id = mid.module_id AND md_ovr.metric = md_def.metric
+WHERE md_def.module_id = '00000000-0000-0000-0000-000000000000'
+  AND md_def.active
+ORDER BY mid.module_id, md_def.display_group, md_def.metric;
+
 -- ListBillingPeriods lists an account's REAL billing_periods rows (the closed,
 -- rolled/invoiced periods) newest-first — the source for the web's top-right 週期
 -- (period) selector on the app bill. Each row carries is_current: true iff its

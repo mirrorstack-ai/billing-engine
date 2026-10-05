@@ -1490,6 +1490,75 @@ func (q *Queries) LookupMetricDefinition(ctx context.Context, arg LookupMetricDe
 	return i, err
 }
 
+const moduleInfraPriceCatalog = `-- name: ModuleInfraPriceCatalog :many
+SELECT mid.module_id::uuid                                  AS module_id,
+       md_def.metric                                        AS metric,
+       md_def.kind                                          AS kind,
+       md_def.unit                                          AS unit,
+       md_def.display_group                                 AS display_group,
+       COALESCE(md_def.unit_price_micros, 0)::bigint        AS default_unit_price_micros,
+       md_ovr.unit_price_micros                             AS module_unit_price_micros
+FROM unnest($1::uuid[]) AS mid(module_id)
+CROSS JOIN ms_billing.metric_definitions md_def
+LEFT JOIN ms_billing.metric_definitions md_ovr
+    ON md_ovr.module_id = mid.module_id AND md_ovr.metric = md_def.metric
+WHERE md_def.module_id = '00000000-0000-0000-0000-000000000000'
+  AND md_def.active
+ORDER BY mid.module_id, md_def.display_group, md_def.metric
+`
+
+type ModuleInfraPriceCatalogRow struct {
+	ModuleID               string               `json:"module_id"`
+	Metric                 string               `json:"metric"`
+	Kind                   MsBillingMetricKind  `json:"kind"`
+	Unit                   string               `json:"unit"`
+	DisplayGroup           MsBillingMetricGroup `json:"display_group"`
+	DefaultUnitPriceMicros int64                `json:"default_unit_price_micros"`
+	ModuleUnitPriceMicros  pgtype.Int8          `json:"module_unit_price_micros"`
+}
+
+// ModuleInfraPriceCatalog is the CATALOG-ANCHORED, ledger-free sibling of
+// AppModuleInfraBillLines: ONE row per (given module x ACTIVE sentinel infra
+// metric), whether or not the module ever incurred usage. It exists so the app
+// bill can list every installed module's infra meters at qty 0 with the price
+// that WILL bill (WP10: the page must show what billing-engine charges, not what a
+// manifest says).
+//
+// It reads what AppModuleInfraBillLines reads, by the same join: md_def is the
+// sentinel row (kind / unit / display_group / default price), md_ovr the
+// module's stored override. module_unit_price_micros is NULL when the module
+// has no override row — NEVER coalesced to the default (NULL is the plain-vs-
+// adjusted switch), and a stored 0 stays a non-NULL 0 (ms.Price(0) / AbsorbInfra).
+// The `absorbed` call is made in Go from these rows (service: infraPriceSource),
+// so it is unit-tested without Postgres. Money-free: no total reads this.
+func (q *Queries) ModuleInfraPriceCatalog(ctx context.Context, moduleIds []string) ([]ModuleInfraPriceCatalogRow, error) {
+	rows, err := q.db.Query(ctx, moduleInfraPriceCatalog, moduleIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ModuleInfraPriceCatalogRow{}
+	for rows.Next() {
+		var i ModuleInfraPriceCatalogRow
+		if err := rows.Scan(
+			&i.ModuleID,
+			&i.Metric,
+			&i.Kind,
+			&i.Unit,
+			&i.DisplayGroup,
+			&i.DefaultUnitPriceMicros,
+			&i.ModuleUnitPriceMicros,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertInfraPriceOverride = `-- name: UpsertInfraPriceOverride :execrows
 INSERT INTO ms_billing.metric_definitions (
     module_id, metric, kind, aggregation_key, unit, unit_price_micros, active

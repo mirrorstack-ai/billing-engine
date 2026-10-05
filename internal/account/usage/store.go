@@ -209,6 +209,10 @@ type Store interface {
 	// Both halves price identically because they are one query; see the
 	// AppModuleInfraBillLines header.
 	AppModuleInfraBill(ctx context.Context, accountID, appID uuid.UUID, periodStart, periodEnd time.Time, devServed bool) ([]AppModuleInfraUsage, error)
+	// ModuleInfraPriceCatalog returns one ModuleInfraCatalogRow per (module x
+	// active sentinel infra metric) with the module's stored override or nil —
+	// ledger-free, so a module with no usage still has its price. Money-free.
+	ModuleInfraPriceCatalog(ctx context.Context, moduleIDs []uuid.UUID) ([]ModuleInfraCatalogRow, error)
 
 	// ListBillingPeriods returns an account's real billing_periods rows
 	// newest-first (the closed periods behind the web 週期 selector).
@@ -2059,6 +2063,42 @@ func (s *pgxStore) AppModuleInfraBill(ctx context.Context, accountID, appID uuid
 			DefaultUnitPriceMicros: r.DefaultUnitPriceMicros,
 			ModuleUnitPriceMicros:  modulePrice,
 			ChargedMicros:          charged,
+		})
+	}
+	return out, nil
+}
+
+// ModuleInfraPriceCatalog reads the (module x active infra metric) price cells
+// for the given modules; see the ModuleInfraPriceCatalog query. A NULL override
+// stays nil (no override), an explicit 0 stays a non-nil 0.
+func (s *pgxStore) ModuleInfraPriceCatalog(ctx context.Context, moduleIDs []uuid.UUID) ([]ModuleInfraCatalogRow, error) {
+	ids := make([]string, len(moduleIDs))
+	for i, id := range moduleIDs {
+		ids[i] = id.String()
+	}
+	rows, err := s.q.ModuleInfraPriceCatalog(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ModuleInfraCatalogRow, 0, len(rows))
+	for _, r := range rows {
+		moduleID, err := uuid.Parse(r.ModuleID)
+		if err != nil {
+			return nil, fmt.Errorf("decode module_id for infra metric %q: %w", r.Metric, err)
+		}
+		var modulePrice *int64
+		if r.ModuleUnitPriceMicros.Valid {
+			mp := r.ModuleUnitPriceMicros.Int64
+			modulePrice = &mp
+		}
+		out = append(out, ModuleInfraCatalogRow{
+			ModuleID:               moduleID,
+			Metric:                 r.Metric,
+			Kind:                   Kind(r.Kind),
+			Unit:                   r.Unit,
+			Group:                  string(r.DisplayGroup),
+			DefaultUnitPriceMicros: r.DefaultUnitPriceMicros,
+			ModuleUnitPriceMicros:  modulePrice,
 		})
 	}
 	return out, nil
