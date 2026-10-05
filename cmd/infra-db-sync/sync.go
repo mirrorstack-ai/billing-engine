@@ -48,6 +48,25 @@ const historyWindow = 35 * 24 * time.Hour
 // naming or grant fault.
 const unattributedWarnShare = 0.5
 
+// zeroGuardMinPairs and zeroGuardShare bound how much of the prior fleet one run
+// may zero. A zero is only ever recorded once (the first sample of an instant
+// stands), so a run that zeroes most of the fleet because a read came back wrong
+// would under-bill every customer for good. A real uninstall wave is a few
+// modules; at zeroGuardMinPairs prior pairs or more, zeroing zeroGuardShare of
+// them or more in one run is a read fault, not a fleet event. Below the minimum
+// a lone uninstall must still zero, so the share guard does not apply.
+const (
+	zeroGuardMinPairs = 10
+	zeroGuardShare    = 0.5
+)
+
+// prefixMismatchMinBytes is the platform baseline of an app schema (members,
+// module_install, bookkeeping tables, all small). An app with installs, no byte
+// attributed and no more than this unattributed has modules with no tables, a
+// level of 0. Above it, tables exist that no installed module's m<id>_ prefix
+// claims: the app is billed 0 for data it holds.
+const prefixMismatchMinBytes = 1 << 20
+
 type pair struct{ App, Module uuid.UUID }
 
 // recorder is the single usage.Service method the sampler calls.
@@ -71,20 +90,21 @@ type install struct {
 
 // syncResult tallies one sweep, for logging and the exit code.
 type syncResult struct {
-	Samples           int   // closed hour instants sampled
-	Apps              int   // app schemas with at least one table
-	AppErrors         int   // apps whose installs could not be read (skipped)
-	Installs          int   // module installs read across the readable apps
-	Modules           int   // distinct (app, module) pairs sampled, zeroed ones included
-	Zeroed            int   // pairs that disappeared since the last sample, recorded as 0
-	Recorded          int   // events newly inserted
-	Deduped           int   // events that hit ON CONFLICT (already recorded)
-	Skipped           int   // table rows whose schema is not an app schema
-	RowErrors         int   // per-row RecordInfraUsage errors (logged, non-fatal)
-	AttributedBytes   int64 // bytes in app schemas that an install owns; billed
-	UnattributedBytes int64 // bytes in app schemas that no install owns; never billed
-	Failed            bool
-	Err               error
+	Samples            int   // closed hour instants sampled
+	Apps               int   // app schemas with at least one table
+	AppErrors          int   // apps whose installs could not be read (skipped)
+	Installs           int   // module installs read across the readable apps
+	Modules            int   // distinct (app, module) pairs sampled, zeroed ones included
+	Zeroed             int   // pairs that disappeared since the last sample, recorded as 0
+	PrefixMismatchApps int   // apps with installs and tables where no table carries an installed module's prefix
+	Recorded           int   // events newly inserted
+	Deduped            int   // events that hit ON CONFLICT (already recorded)
+	Skipped            int   // table rows whose schema is not an app schema
+	RowErrors          int   // per-row RecordInfraUsage errors (logged, non-fatal)
+	AttributedBytes    int64 // bytes in app schemas that an install owns; billed
+	UnattributedBytes  int64 // bytes in app schemas that no install owns; never billed
+	Failed             bool
+	Err                error
 }
 
 // appSchemaName composes app_<uuid with underscores>, matching the platform's
@@ -285,6 +305,15 @@ func syncDB(ctx context.Context, rec recorder, rd dbReader, hist levelHistory, a
 		per, un := attribute(installs, byApp[app])
 		res.Installs += len(per)
 		res.UnattributedBytes += un
+		var appBytes int64
+		for _, b := range per {
+			appBytes += b
+		}
+		if len(per) > 0 && appBytes == 0 && un > prefixMismatchMinBytes {
+			res.PrefixMismatchApps++
+			slog.ErrorContext(ctx, "infra-db-sync: app has installs and tables but no table carries an installed module's m<id>_ prefix; it is billed 0",
+				"app_id", app, "installs", len(per), "unattributed_bytes", un)
+		}
 		for mod, b := range per {
 			res.AttributedBytes += b
 			samples = append(samples, sample{app: app, module: mod, bytes: b})
@@ -326,6 +355,37 @@ func syncDB(ctx context.Context, rec recorder, rd dbReader, hist levelHistory, a
 	if histErr != nil {
 		slog.ErrorContext(ctx, "infra-db-sync: reading level history failed", "error", histErr)
 	}
+
+	// 🔴 REFUSE A MASS ZEROING BEFORE ANYTHING IS RECORDED. Every guard above
+	// catches a read that fails or attributes nothing; none catches installs that
+	// read EMPTY with tables present (a grant, schema or row filter that returns
+	// no rows) while billing remembers a fleet. Left alone, every prior pair gets
+	// an explicit 0 and the whole fleet is billed nothing. Apps whose installs
+	// were unreadable are excluded: they are never zeroed.
+	eligible, gone := 0, 0
+	for _, pr := range prior {
+		if unreadable[pr.App] {
+			continue
+		}
+		eligible++
+		if !live[pr] {
+			gone++
+		}
+	}
+	switch {
+	case histErr != nil:
+	case eligible > 0 && res.Installs == 0:
+		res.Failed = true
+		res.Err = errors.New("every app's module installs read empty while billing remembers live modules: refusing to zero the fleet")
+	case eligible >= zeroGuardMinPairs && float64(gone)/float64(eligible) >= zeroGuardShare:
+		res.Failed = true
+		res.Err = fmt.Errorf("%d of %d previously live modules vanished in one run: refusing to zero them, the install read is suspect", gone, eligible)
+	}
+	if res.Failed {
+		slog.ErrorContext(ctx, "infra-db-sync: refusing to zero", "prior_pairs", eligible, "vanished", gone, "installs", res.Installs)
+		return res
+	}
+
 	for _, pr := range prior {
 		if live[pr] || unreadable[pr.App] {
 			continue
@@ -389,6 +449,12 @@ func syncDB(ctx context.Context, rec recorder, rd dbReader, hist levelHistory, a
 		res.Failed, res.Err = true, fmt.Errorf("%d usage events failed to record", res.RowErrors)
 	case histErr != nil:
 		res.Failed, res.Err = true, fmt.Errorf("read level history: %w", histErr)
+	case res.AppErrors > 0:
+		// Partial fleet: the readable apps were recorded above, but an unreadable
+		// app is billed nothing (and never zeroed), so a green run would hide it.
+		res.Failed, res.Err = true, fmt.Errorf("%d of %d apps' module installs were unreadable and are not billed", res.AppErrors, res.Apps)
+	case res.PrefixMismatchApps > 0:
+		res.Failed, res.Err = true, fmt.Errorf("%d apps hold tables that carry no installed module's m<id>_ prefix and are billed 0", res.PrefixMismatchApps)
 	}
 	return res
 }
