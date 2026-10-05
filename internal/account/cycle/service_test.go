@@ -178,14 +178,22 @@ type fakeStore struct {
 	// seeds each org's pending NULL-account event count, consumed by the
 	// repoint sweep (swept rows never match again); repointCalls records the
 	// sweep's events half so tests can assert the window clamp.
-	accountsByOrg      map[uuid.UUID]uuid.UUID
-	orgDesignations    map[uuid.UUID]cycle.OrgDesignation
-	appOwnerOrg        map[uuid.UUID]uuid.UUID
-	orgBacklog         map[uuid.UUID]int64
-	orgNullEvents      map[uuid.UUID]int64
-	repointCalls       []repointCall
-	orgUnswept         []uuid.UUID
-	errOrgResolve      map[uuid.UUID]error
+	accountsByOrg   map[uuid.UUID]uuid.UUID
+	orgDesignations map[uuid.UUID]cycle.OrgDesignation
+	appOwnerOrg     map[uuid.UUID]uuid.UUID
+	orgBacklog      map[uuid.UUID]int64
+	orgNullEvents   map[uuid.UUID]int64
+	repointCalls    []repointCall
+	orgUnswept      []uuid.UUID
+	errOrgResolve   map[uuid.UUID]error
+
+	// The user repoint twin (core-v2#340): userNullEvents seeds the per-account
+	// NULL rows the repoint takes, userBacklog the rows it leaves.
+	userNullEvents     map[uuid.UUID]int64
+	userBacklog        map[uuid.UUID]int64
+	userRepointCalls   []userRepointCall
+	userUnswept        []uuid.UUID
+	errUserRepoint     map[uuid.UUID]error
 	orgDeletionOutcome cycle.OrgDeletionFinalizationOutcome
 	errOrgDeletion     error
 	orgDeletionOrg     uuid.UUID
@@ -392,6 +400,12 @@ type repointCall struct {
 	windowStart time.Time
 }
 
+// userRepointCall records one RepointUserNullAccountEvents call.
+type userRepointCall struct {
+	accountID   uuid.UUID
+	windowStart time.Time
+}
+
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		prices:                    map[string]int64{},
@@ -433,6 +447,8 @@ func newFakeStore() *fakeStore {
 		appOwnerOrg:             map[uuid.UUID]uuid.UUID{},
 		orgBacklog:              map[uuid.UUID]int64{},
 		orgNullEvents:           map[uuid.UUID]int64{},
+		userNullEvents:          map[uuid.UUID]int64{},
+		userBacklog:             map[uuid.UUID]int64{},
 		sponsoredOrgs:           map[uuid.UUID][]uuid.UUID{},
 		// Default collection state: arrears mode with a high credit limit + no
 		// spend ceiling, so the existing charge tests (which don't set risk
@@ -1222,6 +1238,24 @@ func (f *fakeStore) RepointOrgNullAccountEvents(_ context.Context, orgID, accoun
 	n := f.orgNullEvents[orgID]
 	delete(f.orgNullEvents, orgID) // swept events never match again (account_id IS NULL)
 	return n, nil
+}
+
+func (f *fakeStore) RepointUserNullAccountEvents(_ context.Context, accountID uuid.UUID, windowStart time.Time) (int64, error) {
+	if err := f.errUserRepoint[accountID]; err != nil {
+		return 0, err
+	}
+	f.userRepointCalls = append(f.userRepointCalls, userRepointCall{accountID, windowStart})
+	n := f.userNullEvents[accountID]
+	delete(f.userNullEvents, accountID) // swept events never match again (account_id IS NULL)
+	return n, nil
+}
+
+func (f *fakeStore) UsersWithUnsweptUsage(_ context.Context) ([]uuid.UUID, error) {
+	return f.userUnswept, nil
+}
+
+func (f *fakeStore) UserUnbilledBacklogMicros(_ context.Context, accountID uuid.UUID, _ time.Time) (int64, error) {
+	return f.userBacklog[accountID], nil
 }
 
 func (f *fakeStore) OrgLiveAppIDs(_ context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {
