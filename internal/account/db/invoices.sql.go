@@ -89,7 +89,8 @@ const listInvoicesForAccount = `-- name: ListInvoicesForAccount :many
 SELECT id, stripe_invoice_id, number, status,
        amount_due, amount_paid, currency,
        period_start, period_end, created_at,
-       hosted_invoice_url, invoice_pdf, is_large_auto_collect, ever_failed
+       hosted_invoice_url, invoice_pdf, is_large_auto_collect, ever_failed,
+       tax_amount, tax_rate_bps, tax_jurisdiction, tax_verification, tax_inclusive
 FROM ms_billing.invoices
 WHERE account_id = $1::uuid
   AND status <> 'draft'
@@ -122,6 +123,11 @@ type ListInvoicesForAccountRow struct {
 	InvoicePdf         pgtype.Text        `json:"invoice_pdf"`
 	IsLargeAutoCollect bool               `json:"is_large_auto_collect"`
 	EverFailed         bool               `json:"ever_failed"`
+	TaxAmount          pgtype.Numeric     `json:"tax_amount"`
+	TaxRateBps         pgtype.Int4        `json:"tax_rate_bps"`
+	TaxJurisdiction    pgtype.Text        `json:"tax_jurisdiction"`
+	TaxVerification    pgtype.Text        `json:"tax_verification"`
+	TaxInclusive       bool               `json:"tax_inclusive"`
 }
 
 // Account-scoped READS over the ms_billing.invoices Stripe mirror (011 + 026)
@@ -152,6 +158,7 @@ type ListInvoicesForAccountRow struct {
 // store converts cents → int64 micro-dollars (×10_000) so micros stay the only
 // money unit above the store boundary. number / hosted_invoice_url /
 // invoice_pdf are NULL until the finalization webhook enriches the row (026).
+// The tax_* columns (088) are NULL on a row with no recorded determination.
 func (q *Queries) ListInvoicesForAccount(ctx context.Context, arg ListInvoicesForAccountParams) ([]ListInvoicesForAccountRow, error) {
 	rows, err := q.db.Query(ctx, listInvoicesForAccount,
 		arg.AccountID,
@@ -182,6 +189,11 @@ func (q *Queries) ListInvoicesForAccount(ctx context.Context, arg ListInvoicesFo
 			&i.InvoicePdf,
 			&i.IsLargeAutoCollect,
 			&i.EverFailed,
+			&i.TaxAmount,
+			&i.TaxRateBps,
+			&i.TaxJurisdiction,
+			&i.TaxVerification,
+			&i.TaxInclusive,
 		); err != nil {
 			return nil, err
 		}

@@ -829,6 +829,13 @@ type MsBillingInvoice struct {
 	ChargeFundingLegacyUnresolved bool               `json:"charge_funding_legacy_unresolved"`
 	DemeritFailedAt               pgtype.Timestamptz `json:"demerit_failed_at"`
 	DemeritSettledAt              pgtype.Timestamptz `json:"demerit_settled_at"`
+	TaxAmount                     pgtype.Numeric     `json:"tax_amount"`
+	TaxRateBps                    pgtype.Int4        `json:"tax_rate_bps"`
+	TaxJurisdiction               pgtype.Text        `json:"tax_jurisdiction"`
+	TaxRuleRevision               pgtype.Text        `json:"tax_rule_revision"`
+	// How the sealed tax figure was established (intent.TaxVerificationClass). NULL = no determination recorded (pre-088 or no sealed intent) — unknown, never zero.
+	TaxVerification pgtype.Text `json:"tax_verification"`
+	TaxInclusive    bool        `json:"tax_inclusive"`
 }
 
 type MsBillingMetricDefinition struct {
