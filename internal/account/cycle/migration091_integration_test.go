@@ -129,7 +129,7 @@ func TestMigration091_OnlyMovesARowStillAtTheAuditedValue(t *testing.T) {
 	// A row at the audited price but on a unit someone already changed keeps both.
 	m091Exec(t, pool, down)
 	_, err := pool.Exec(context.Background(),
-		`UPDATE ms_billing.metric_definitions SET unit = 'per-request'
+		`UPDATE ms_billing.metric_definitions SET unit = 'per-request', unit_price_micros = 1
 		  WHERE module_id = $1 AND metric = 'infra.request.count'`, sentinelModuleID)
 	require.NoError(t, err)
 	m091Exec(t, pool, up)

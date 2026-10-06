@@ -141,7 +141,7 @@ func TestMigration019_UpDownUp_RoundTrips(t *testing.T) {
 	require.Equal(t, "sum", kind)
 	require.Equal(t, "millisecond", unit)
 	require.NotNil(t, price)
-	require.EqualValues(t, 1, *price)
+	require.EqualValues(t, 0, *price, "the rename carries the price 091 retired the walltime row to")
 	require.True(t, active)
 
 	_, _, price, _, ok = metricRow(t, pool, "infra.egress.bytes")
