@@ -43,19 +43,19 @@ func TestMigration089_SeedsTheDBSizeMeterAndIsRerunnable(t *testing.T) {
 	}
 	got, ok := read()
 	require.True(t, ok, "089 seeds the row")
-	require.Equal(t, row{"time_weighted", "GiB-hour", "database", 114, true}, got,
-		"114 raw x1.2 = 136.8 µ$/GiB-hour = $0.0999 per GiB-month at 730 h")
+	require.Equal(t, row{"time_weighted", "GiB-hour", "database", 137, true}, got,
+		"089 seeds 114; 090 corrects it to 137 raw (cost basis) x1.2 = $0.12 per GiB-month at 730 h")
 
 	up := readMigration(t, "089_db_size_metric.up.sql")
 	down := readMigration(t, "089_db_size_metric.down.sql")
 
-	_, err := pool.Exec(ctx, `UPDATE ms_billing.metric_definitions SET unit_price_micros = 137
+	_, err := pool.Exec(ctx, `UPDATE ms_billing.metric_definitions SET unit_price_micros = 150
 		WHERE module_id = $1 AND metric = 'infra.db.gib_hours'`, sentinelModule)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, up)
 	require.NoError(t, err, "rerunnable")
 	got, _ = read()
-	require.EqualValues(t, 137, got.price, "a re-run must not undo a finance UPDATE")
+	require.EqualValues(t, 150, got.price, "a re-run must not undo a finance UPDATE")
 
 	_, err = pool.Exec(ctx, down)
 	require.NoError(t, err)
@@ -65,7 +65,46 @@ func TestMigration089_SeedsTheDBSizeMeterAndIsRerunnable(t *testing.T) {
 	require.NoError(t, err)
 	got, ok = read()
 	require.True(t, ok)
-	require.EqualValues(t, 114, got.price)
+	require.EqualValues(t, 114, got.price, "089 alone seeds the original raw price")
+}
+
+// DATABASE claims of migration 090: the raw price is 137 after the full chain, a
+// re-run is a no-op, only a row still at 114 moves, and the down restores 114.
+func TestMigration090_DBSizePriceIsTheCostBasisAndRerunnable(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	ctx := context.Background()
+	price := func() int64 {
+		var p int64
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT unit_price_micros FROM ms_billing.metric_definitions WHERE module_id = $1 AND metric = 'infra.db.gib_hours'`,
+			sentinelModule).Scan(&p))
+		return p
+	}
+	set := func(p int64) {
+		_, err := pool.Exec(ctx, `UPDATE ms_billing.metric_definitions SET unit_price_micros = $2
+			WHERE module_id = $1 AND metric = 'infra.db.gib_hours'`, sentinelModule, p)
+		require.NoError(t, err)
+	}
+	up := readMigration(t, "090_db_size_price_cost_basis.up.sql")
+	down := readMigration(t, "090_db_size_price_cost_basis.down.sql")
+
+	require.EqualValues(t, 137, price(), "the migration chain ends at the cost-basis price")
+	_, err := pool.Exec(ctx, up)
+	require.NoError(t, err)
+	require.EqualValues(t, 137, price(), "rerun is a no-op")
+
+	set(150)
+	_, err = pool.Exec(ctx, up)
+	require.NoError(t, err)
+	require.EqualValues(t, 150, price(), "a finance UPDATE is never overwritten")
+
+	set(137)
+	_, err = pool.Exec(ctx, down)
+	require.NoError(t, err)
+	require.EqualValues(t, 114, price(), "down restores 114")
+	_, err = pool.Exec(ctx, up)
+	require.NoError(t, err)
+	require.EqualValues(t, 137, price(), "up from 114 gives 137")
 }
 
 func readMigration(t *testing.T, name string) string {
