@@ -43,8 +43,8 @@ func TestMigration089_SeedsTheDBSizeMeterAndIsRerunnable(t *testing.T) {
 	}
 	got, ok := read()
 	require.True(t, ok, "089 seeds the row")
-	require.Equal(t, row{"time_weighted", "GiB-hour", "database", 137, true}, got,
-		"089 seeds 114; 090 corrects it to 137 raw (cost basis) x1.2 = $0.12 per GiB-month at 730 h")
+	require.Equal(t, row{"time_weighted", "GiB-hour", "database", 164, true}, got,
+		"089 seeds 114; 090 corrects it to 137 (owner $0.10 cost); 091 to 164 raw (Aurora $0.12 cost) x1.2 = $0.144 per GiB-month at 730 h")
 
 	up := readMigration(t, "089_db_size_metric.up.sql")
 	down := readMigration(t, "089_db_size_metric.down.sql")
@@ -68,8 +68,8 @@ func TestMigration089_SeedsTheDBSizeMeterAndIsRerunnable(t *testing.T) {
 	require.EqualValues(t, 114, got.price, "089 alone seeds the original raw price")
 }
 
-// DATABASE claims of migration 090: the raw price is 137 after the full chain, a
-// re-run is a no-op, only a row still at 114 moves, and the down restores 114.
+// DATABASE claims of migration 090: the raw price is 164 after the full chain (091
+// moves 137 on), a re-run is a no-op, only a row still at 114 moves, and the down restores 114.
 func TestMigration090_DBSizePriceIsTheCostBasisAndRerunnable(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	ctx := context.Background()
@@ -88,10 +88,10 @@ func TestMigration090_DBSizePriceIsTheCostBasisAndRerunnable(t *testing.T) {
 	up := readMigration(t, "090_db_size_price_cost_basis.up.sql")
 	down := readMigration(t, "090_db_size_price_cost_basis.down.sql")
 
-	require.EqualValues(t, 137, price(), "the migration chain ends at the cost-basis price")
+	require.EqualValues(t, 164, price(), "the migration chain ends at the 091 cost-basis price")
 	_, err := pool.Exec(ctx, up)
 	require.NoError(t, err)
-	require.EqualValues(t, 137, price(), "rerun is a no-op")
+	require.EqualValues(t, 164, price(), "rerun is a no-op (the row is no longer at 114)")
 
 	set(150)
 	_, err = pool.Exec(ctx, up)

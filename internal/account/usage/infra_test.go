@@ -571,6 +571,7 @@ func TestRecordInfraUsage_AcceptsHeavyTaskMetrics(t *testing.T) {
 	}{
 		{"infra.task.vcpu.hours", ""},
 		{"infra.task.memory.gib_hours", ""},
+		{"infra.task.ephemeral.gib_hours", ""},
 		{"infra.task.gpu.hours", usage.TaskGPUModelG5GXlarge},
 	} {
 		t.Run(tc.metric, func(t *testing.T) {
@@ -696,6 +697,7 @@ func TestRecordInfraUsage_RejectsModelOnUndimensionedHeavyTaskMetrics(t *testing
 	for _, metric := range []string{
 		"infra.task.vcpu.hours",
 		"infra.task.memory.gib_hours",
+		"infra.task.ephemeral.gib_hours",
 	} {
 		t.Run(metric, func(t *testing.T) {
 			store := newFakeStore()

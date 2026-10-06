@@ -73,6 +73,8 @@ func TestPgxStore_AISpend_TemplateAndAccountScopes(t *testing.T) {
 	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 100, haiku, "member-help", at, true)  // dev-served: never money
 	seedAIEvent(t, pool, acct, otherApp, "infra.ai.input.tokens", 3, haiku, "", at, false)         // 3,000 µ$ on the account's other app
 	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 9, haiku, "member-help", end, false)  // next period: out of window
+	// 091 retired walltime.ms to 0; this fixture needs a priced non-AI metric.
+	setWalltimePrice1(t, pool)
 	_, err := pool.Exec(ctx, `INSERT INTO ms_billing.usage_events (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
 		VALUES ($1, $2, $3, '00000000-0000-0000-0000-000000000000', 'infra.compute.walltime.ms', 'sum', 1000000, $4)`,
 		uuid.NewString(), acct.String(), app.String(), at) // 1,000,000 µ$ of compute: not AI
@@ -210,6 +212,8 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.False(t, found, "no attributed event yet")
 
 	seedAIEvent(t, pool, acct, app, "infra.ai.input.tokens", 10, haiku, "member-help", at, false) // 10,000 µ$
+	// 091 retired walltime.ms to 0.
+	setWalltimePrice1(t, pool)
 	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.usage_events (event_id, account_id, app_id, module_id, metric, kind, value, recorded_at)
 		VALUES ($1, $2, $3, '00000000-0000-0000-0000-000000000000', 'infra.compute.walltime.ms', 'sum', 1000000, $4)`,
 		uuid.NewString(), acct.String(), app.String(), at) // 1,000,000 µ$ (1 µ$/ms)
@@ -445,4 +449,14 @@ func TestPgxStore_ExposurePoolReads(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, first.ID, again.ID, "the alert key (budget_id) survives the curve moving")
 	require.EqualValues(t, 20_000_000, again.LimitMicros)
+}
+
+// setWalltimePrice1 gives the sentinel infra.compute.walltime.ms row the 1 µ$/ms
+// these spend fixtures were written against (migration 091 retires the catalog
+// price to 0).
+func setWalltimePrice1(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `UPDATE ms_billing.metric_definitions SET unit_price_micros = 1
+		WHERE module_id = '00000000-0000-0000-0000-000000000000' AND metric = 'infra.compute.walltime.ms'`)
+	require.NoError(t, err)
 }
