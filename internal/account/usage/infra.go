@@ -81,9 +81,9 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens        → sum
 //	infra.ai.cache_read.tokens   additive prompt-cache READ tokens         → sum
 //	infra.ai.requests            provider-API-call count                   → count
-//	infra.request.count          per-invocation request fee                → count
+//	infra.request.count          per-invocation request fee (per-1k, 091)  → count
 //	infra.mcp.tool_call.count    MCP routing+auth fixed cost               → count
-//	infra.cron.count             scheduler fire (the tick)                 → count
+//	infra.cron.count             scheduler fire, the tick (per-1k, 091)    → count
 //	infra.event.count            per-subscriber fanout delivery            → count
 //	infra.event.bytes            event-bus payload size (per-GiB)          → sum
 //	infra.egress.api.bytes       non-CDN API egress bytes (per-GiB)        → sum
@@ -104,8 +104,12 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // names that already exist. Per design §3 rule 5, any per-unit COGS < 1 µ$ is
 // priced in the COARSEST unit ≥ 1 µ$ and the PRODUCER emits the value pre-scaled
 // to that unit — egress/event bytes per GiB (value = bytes/1024^3), event
-// deliveries + storage PUT/LIST per 1k (value = n/1000); request/mcp/cron stay
-// per-unit (≥ 1 µ$). The per-row contract lives in migration 020.
+// deliveries, storage PUT/LIST, requests and cron fires per 1k (value = n/1000);
+// only mcp.tool_call stays per-unit (≥ 1 µ$). infra.request.count and
+// infra.cron.count moved per-unit → per-1k in migration 091 (unit '1k requests' /
+// '1k fires'), so a producer of ANY of these four counts emits n/1000, never n;
+// migration091_integration_test.go asserts the catalog unit + price of each. The
+// per-row contract lives in migrations 020 and 091.
 //
 // The infra.ai.* family is priced PER MODEL: the producer (infra-metrics PR #2,
 // in api-platform cmd/agent) stamps the model on RecordInfraUsageRequest.Model,
