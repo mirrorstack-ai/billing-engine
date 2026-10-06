@@ -77,7 +77,7 @@ func assertHygieneApplied(t *testing.T, pool *pgxpool.Pool) {
 	require.Equal(t, "sum", kind)
 	require.Equal(t, "millisecond", unit)
 	require.NotNil(t, price)
-	require.EqualValues(t, 1, *price)
+	require.EqualValues(t, 0, *price, "the renamed row keeps the price 091 retired it to; only the re-seeded alias is 1")
 	require.True(t, active)
 
 	// (2) deprecated alias compute.ms still present (same sentinel/kind/price).
@@ -112,7 +112,7 @@ func TestMigration019_Up_AppliesCatalogHygiene(t *testing.T) {
 	require.Equal(t, "sum", kind)
 	require.Equal(t, "millisecond", unit)
 	require.NotNil(t, price)
-	require.EqualValues(t, 1, *price)
+	require.EqualValues(t, 0, *price, "091 retires the 017 placeholder price to 0")
 	require.True(t, active)
 
 	// 019 kept the infra.compute.ms alias, but migration 022 drops it — so after
@@ -164,7 +164,12 @@ func TestMigration019_UpDownUp_RoundTrips(t *testing.T) {
 }
 
 func TestMigration019_WalltimeMSRollupPricesViaNewRow(t *testing.T) {
-	pool := testutil.NewTestDB(t) // 019.up applied → walltime.ms seeded at 1 µ$
+	pool := testutil.NewTestDB(t) // 019.up applied → walltime.ms present (091 retired it to 0 µ$)
+	// The test proves the renamed row prices the rollup, so give it a price (091's 0 is a catalog fact, not this test's).
+	_, err := pool.Exec(context.Background(),
+		`UPDATE ms_billing.metric_definitions SET unit_price_micros = 1 WHERE module_id = $1 AND metric = 'infra.compute.walltime.ms'`,
+		sentinelModuleID)
+	require.NoError(t, err)
 	store := cycle.NewStore(pool)
 	svc := cycle.NewService(store, nil)
 	ctx := context.Background()
