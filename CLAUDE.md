@@ -59,7 +59,7 @@ migrations/billing/               ms_billing schema, 001..069 up/down
 
 `migrations/billing/` is authoritative. The `ms_billing` schema is documented
 under `db/ms_billing/` in
-[`mirrorstack-ai/mirrorstack-docs`](https://github.com/mirrorstack-ai/mirrorstack-docs).
+[`mirrorstack-ai/mirrorstack-docs-internal`](https://github.com/mirrorstack-ai/mirrorstack-docs-internal).
 If `tables.md` there disagrees with a migration, the migration wins and the doc
 is the bug.
 

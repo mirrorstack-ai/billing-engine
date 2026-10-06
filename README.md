@@ -569,8 +569,8 @@ Known defects are enumerated in exactly one place, the known-gaps register in
 
 Cross-repository references describing what runs today:
 
-- [`mirrorstack-docs/architecture/billing-flow.md`](https://github.com/mirrorstack-ai/mirrorstack-docs/blob/main/architecture/billing-flow.md) — end-to-end flows, invariants, failure modes.
-- [`mirrorstack-docs/api/billing/account-api.md`](https://github.com/mirrorstack-ai/mirrorstack-docs/blob/main/api/billing/account-api.md) — the RPC surface, and [`mirrorstack-docs/db/ms_billing/`](https://github.com/mirrorstack-ai/mirrorstack-docs/tree/main/db/ms_billing) — the schema.
+- [`mirrorstack-docs/architecture/billing-flow.md`](https://github.com/mirrorstack-ai/mirrorstack-docs-internal/blob/main/architecture/billing-flow.md) — end-to-end flows, invariants, failure modes.
+- [`mirrorstack-docs/api/billing/account-api.md`](https://github.com/mirrorstack-ai/mirrorstack-docs-internal/blob/main/api/billing/account-api.md) — the RPC surface, and [`mirrorstack-docs/db/ms_billing/`](https://github.com/mirrorstack-ai/mirrorstack-docs-internal/tree/main/db/ms_billing) — the schema.
 
 If those docs disagree with `migrations/billing/`, the migration wins and the
 doc is the bug.
