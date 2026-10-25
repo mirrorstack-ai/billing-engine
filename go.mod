@@ -2,6 +2,8 @@ module github.com/mirrorstack-ai/billing-engine
 
 go 1.26
 
+toolchain go1.26.10
+
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/aws/aws-lambda-go v1.54.0
