@@ -4,13 +4,16 @@ package usage_test
 
 import (
 	"context"
+	"math/big"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/testutil"
 )
@@ -170,4 +173,51 @@ func TestListInvoices_Integration_AccountScoped(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	require.Equal(t, "in_mine", rows[0].StripeInvoiceID)
+}
+
+// TestListInvoices_Integration_TaxLine (migration 088): a row with no recorded
+// determination reads as nil (unknown), a determined not_applicable row as an
+// itemized zero line — and a later Stripe status event (ApplyInvoiceStatus)
+// leaves the recorded determination untouched. The table refuses a partial
+// determination and an inclusive one.
+func TestListInvoices_Integration_TaxLine(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	seedInvoiceMirror(t, pool, acct, uuid.New(), "in_legacy", "open", 100, 0,
+		time.Date(2026, 5, 19, 0, 0, 0, 0, time.UTC), "", "", "", false)
+	seedInvoiceMirror(t, pool, acct, uuid.New(), "in_taxed", "open", 100, 0,
+		time.Date(2026, 6, 19, 0, 0, 0, 0, time.UTC), "", "", "", false)
+	_, err := pool.Exec(ctx, `UPDATE ms_billing.invoices
+		SET tax_amount = 0, tax_jurisdiction = 'not-applicable',
+		    tax_rule_revision = 'tax-1', tax_verification = 'not_applicable'
+		WHERE stripe_invoice_id = 'in_taxed'`)
+	require.NoError(t, err)
+
+	n, err := db.New(pool).ApplyInvoiceStatus(ctx, db.ApplyInvoiceStatusParams{
+		Status:          "paid",
+		AmountPaid:      pgtype.Numeric{Int: big.NewInt(100), Valid: true},
+		AmountDue:       pgtype.Numeric{Int: big.NewInt(100), Valid: true},
+		StripeInvoiceID: "in_taxed",
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+
+	rows, err := store.ListInvoices(ctx, acct, 10, nil)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	require.Equal(t, "paid", rows[0].Status)
+	require.Equal(t, &usage.InvoiceTax{Jurisdiction: "not-applicable", Verification: "not_applicable"}, rows[0].Tax)
+	require.Nil(t, rows[1].Tax, "NULL tax columns are unknown, never a zero line")
+
+	for name, set := range map[string]string{
+		"partial determination": `tax_verification = 'not_applicable'`,
+		"inclusive":             `tax_inclusive = true`,
+		"unsealable class":      `tax_amount = 0, tax_jurisdiction = 'x', tax_rule_revision = 'x', tax_verification = 'unverified'`,
+	} {
+		_, err := pool.Exec(ctx, `UPDATE ms_billing.invoices SET `+set+` WHERE stripe_invoice_id = 'in_legacy'`)
+		require.Error(t, err, name)
+	}
 }

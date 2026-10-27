@@ -6,6 +6,7 @@ package usage
 // from the outside in invoices_test.go; these pin the primitives.
 
 import (
+	"encoding/json"
 	"math/big"
 	"testing"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 )
 
 func TestInvoiceCursor_RoundTrip(t *testing.T) {
@@ -94,4 +97,50 @@ func TestCentsNumericToMicros_DoesNotMutateInput(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 0, n.Exp, "input exponent unchanged")
 	require.EqualValues(t, 1234, n.Int.Int64(), "input mantissa unchanged")
+}
+
+func TestInvoiceTaxFromRow(t *testing.T) {
+	// A row with no recorded determination (pre-088, or no sealed intent) is
+	// UNKNOWN: no tax object, and so never a line that reads as "no tax".
+	legacy, err := invoiceTaxFromRow(db.ListInvoicesForAccountRow{})
+	require.NoError(t, err)
+	require.Nil(t, legacy, "NULL tax columns must not decode as a zero line")
+
+	// A determined not_applicable is an itemized ZERO line that says why.
+	got, err := invoiceTaxFromRow(db.ListInvoicesForAccountRow{
+		TaxAmount:       numericFromString(t, "0"),
+		TaxJurisdiction: pgtype.Text{String: "not-applicable", Valid: true},
+		TaxVerification: pgtype.Text{String: "not_applicable", Valid: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, &InvoiceTax{
+		AmountMicros: 0,
+		Jurisdiction: "not-applicable",
+		Verification: "not_applicable",
+		Inclusive:    false,
+	}, got)
+
+	// Cents convert like amount_due, and a recorded rate rides along.
+	got, err = invoiceTaxFromRow(db.ListInvoicesForAccountRow{
+		TaxAmount:       numericFromString(t, "125"),
+		TaxRateBps:      pgtype.Int4{Int32: 500, Valid: true},
+		TaxJurisdiction: pgtype.Text{String: "TW", Valid: true},
+		TaxVerification: pgtype.Text{String: "independently_reproducible", Valid: true},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1_250_000, got.AmountMicros)
+	require.NotNil(t, got.RateBps)
+	require.EqualValues(t, 500, *got.RateBps)
+}
+
+func TestInvoiceRowTaxWire(t *testing.T) {
+	// The wire keeps the unknown state explicit: "tax": null, not an omitted
+	// key a client could default to zero.
+	b, err := json.Marshal(InvoiceRow{})
+	require.NoError(t, err)
+	require.Contains(t, string(b), `"tax":null`)
+
+	b, err = json.Marshal(InvoiceRow{Tax: &InvoiceTax{Jurisdiction: "not-applicable", Verification: "not_applicable"}})
+	require.NoError(t, err)
+	require.Contains(t, string(b), `"tax":{"amount_micros":0,"rate_bps":null,"jurisdiction":"not-applicable","verification":"not_applicable","inclusive":false}`)
 }
