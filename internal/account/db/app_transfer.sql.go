@@ -44,9 +44,11 @@ SELECT EXISTS (
 // re-seats the app's payer BEFORE calling this RPC, ingest stamps the
 // primary payer on every event, and a payer with no accounts row yet lands
 // the event with account_id NULL (usage/service.go, infra.go — the user
-// branch has no roster guard). No sweep ever reaches those rows — the org
-// sweep is scoped by owner_org_id — so refusing on them would refuse
-// FOREVER, on every retry, for an app whose target has never paid. They
+// branch has no roster guard). The org sweep never reaches those rows — it
+// is scoped by owner_org_id — and the user sweep (user_usage.sql, migration
+// 088) reaches only the stamped ones inside an ACTIVATED target's open
+// window, so refusing on them would refuse FOREVER, on every retry, for an
+// app whose target has never paid. They
 // were stamped for the target, so the transfer takes them instead:
 // RepointAppNullAccountEventsOnTransfer hands the rows inside the target's
 // open window to the target's account, and older rows are left where they
@@ -585,7 +587,8 @@ type RepointAppNullAccountEventsOnTransferParams struct {
 // NULL-account usage inside the target's open window to the target account —
 // the rows api-platform's payer re-seat stamped for the target before this
 // RPC created the target's accounts row (see AppHasUnbilledUsageBacklog for
-// why they exist and why no sweep can reach them). Runs in BOTH modes:
+// why they exist and why the transfer cannot wait for a sweep to reach
+// them). Runs in BOTH modes:
 // these rows never belonged to the old account, so mode — which decides the
 // old account's usage only — has no say over them.
 //

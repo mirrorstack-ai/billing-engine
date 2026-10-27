@@ -1011,6 +1011,8 @@ type MsBillingUsageEvent struct {
 	DevServed bool `json:"dev_served"`
 	// ai-assistant template an infra.ai.* event was produced under (stamped by api-platform from the conversation); NULL for every other event.
 	TemplateKey pgtype.Text `json:"template_key"`
+	// Lazy USER rows only: the owner user a usage event was recorded for when that user had no billing account (account_id NULL). NULL on every other row. Soft FK. The user attach sweep repoints the rows inside the account's open window once it activates.
+	OwnerUserID pgtype.UUID `json:"owner_user_id"`
 }
 
 type MsBillingUsageObservationRejection struct {

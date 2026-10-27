@@ -191,9 +191,11 @@ const (
 // WHAT DOES NOT BLOCK IT, AND COMES ACROSS INSTEAD: a USER-rostered app's
 // NULL-account rows. api-platform re-seats the app's payer before it calls
 // this RPC, ingest stamps the primary payer on every event, and a payer that
-// has no billing account yet lands the event with none — a row no sweep can
-// ever reach, because the org sweep is scoped by owner_org_id. Refusing on
-// it would refuse on every retry, forever, for a target that has never paid.
+// has no billing account yet lands the event with none — a row the org sweep
+// never reaches (it is scoped by owner_org_id), and one the user sweep
+// (migration 088) reaches only once the target's account has ACTIVATED, and
+// then only inside its open window. Refusing on it would refuse on every
+// retry, forever, for a target that has never paid.
 // Those rows were stamped for the target, so the transfer takes them: the
 // ones inside the target's open window are repointed to the target's account
 // with the org sweep's clamp, in both modes, and counted as

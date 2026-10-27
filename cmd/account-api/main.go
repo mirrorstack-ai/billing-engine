@@ -429,6 +429,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.RepointOrgUsage(ctx, req)
 
+	case "GetUserUnbilledBacklog":
+		var req cycle.GetUserUnbilledBacklogRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.GetUserUnbilledBacklog(ctx, req)
+
 	case "FinalizeOrgDeletion":
 		var req cycle.FinalizeOrgDeletionRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -841,6 +848,10 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.GetOrgDesignation", makeHTTPHandler(d, "GetOrgDesignation"))
 		r.Post("/v1/billing.RevokeSponsorship", makeHTTPHandler(d, "RevokeSponsorship"))
 		r.Post("/v1/billing.RepointOrgUsage", makeHTTPHandler(d, "RepointOrgUsage"))
+		// The user twin of GetOrgDesignation's backlog disclosure (migration
+		// 088): the lazy usage stamped for a user with no activated account, and
+		// the part the user attach sweep in cmd/billing-cycle will bill.
+		r.Post("/v1/billing.GetUserUnbilledBacklog", makeHTTPHandler(d, "GetUserUnbilledBacklog"))
 		r.Post("/v1/billing.FinalizeOrgDeletion", makeHTTPHandler(d, "FinalizeOrgDeletion"))
 		// Sponsored-orgs read (org-billing W1): the /me sponsored-orgs list.
 		// A control-plane read — internal secret, NOT the meter seam.
