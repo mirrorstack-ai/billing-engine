@@ -103,7 +103,11 @@ var datasetNamePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 // so this would bite hardest on exactly the highest-traffic single app_id).
 // %[1]s = dataset name (pre-validated against datasetNamePattern), %[2]s /
 // %[3]s = UTC window bounds formatted as cfDateTimeLayout, %[4]d = queryRowLimit.
-const sqlQueryTemplate = `SELECT blob1 AS app_id, blob2 AS module_id, SUM(_sample_interval * double1) AS bytes FROM %[1]s WHERE timestamp >= toDateTime('%[2]s') AND timestamp < toDateTime('%[3]s') GROUP BY blob1, blob2 LIMIT %[4]d FORMAT JSON`
+//
+// blob3 is the org_id cdn-worker writes for an org CDN host's egress (blob1
+// and blob2 empty on those rows). Grouping by it keeps each org its own row;
+// without it every org's bytes collapse into one ("", "") group.
+const sqlQueryTemplate = `SELECT blob1 AS app_id, blob2 AS module_id, blob3 AS org_id, SUM(_sample_interval * double1) AS bytes FROM %[1]s WHERE timestamp >= toDateTime('%[2]s') AND timestamp < toDateTime('%[3]s') GROUP BY blob1, blob2, blob3 LIMIT %[4]d FORMAT JSON`
 
 // requestSQLQueryTemplate is the second pull per window (cdn-worker#58,
 // billing-engine#212): the REQUEST count per (app, module, tier, stage),
@@ -123,13 +127,15 @@ const requestSQLQueryTemplate = `SELECT blob1 AS app_id, blob2 AS module_id, blo
 const cfDateTimeLayout = "2006-01-02T15:04:05"
 
 // EgressRow is one aggregated egress group from the CF Analytics dataset: the
-// summed bytes for a single (app_id, module_id) over the queried window.
-// AppID / ModuleID are the raw blob strings as Cloudflare returns them — the
-// caller parses + validates them (an empty or unparseable app_id is skipped at
-// ingest, not here).
+// summed bytes for a single (app_id, module_id, org_id) over the queried
+// window. AppID / ModuleID / OrgID are the raw blob strings as Cloudflare
+// returns them — the caller parses + validates them (an empty or unparseable
+// app_id is skipped at ingest, not here). OrgID is "" on every app row and on
+// rows written before cdn-worker carried blob3.
 type EgressRow struct {
 	AppID    string
 	ModuleID string
+	OrgID    string
 	Bytes    float64
 }
 
@@ -209,6 +215,7 @@ type sqlQueryResponse struct {
 	Data []struct {
 		AppID    string  `json:"app_id"`
 		ModuleID string  `json:"module_id"`
+		OrgID    string  `json:"org_id"`
 		Bytes    float64 `json:"bytes"`
 	} `json:"data"`
 }
@@ -286,6 +293,7 @@ func (c *realClient) QueryEgressWindow(ctx context.Context, datasetName string, 
 		rows = append(rows, EgressRow{
 			AppID:    d.AppID,
 			ModuleID: d.ModuleID,
+			OrgID:    d.OrgID,
 			Bytes:    d.Bytes,
 		})
 	}
@@ -295,8 +303,8 @@ func (c *realClient) QueryEgressWindow(ctx context.Context, datasetName string, 
 	// set AT the limit is indistinguishable from one that overflowed it. Fail
 	// the run loudly rather than silently under-bill the dropped groups (which
 	// the deterministic event_id would otherwise cause every retry to
-	// re-skip forever). Rows here are already grouped by (app_id, module_id)
-	// server-side (GROUP BY in the query), so this counts distinct groups —
+	// re-skip forever). Rows here are already grouped by (app_id, module_id,
+	// org_id) server-side (GROUP BY in the query), so this counts distinct groups —
 	// the same semantics the old GraphQL-based guard enforced.
 	if len(rows) >= queryRowLimit {
 		return nil, fmt.Errorf("%w: %d rows for window [%s, %s)", ErrResultTruncated,
