@@ -658,6 +658,13 @@ type Store interface {
 	// module_count idempotently across fire-and-forget retries.
 	LiveModuleTimerCountForApp(ctx context.Context, appID uuid.UUID) (int, error)
 
+	// LiveModuleTimerCountForAccount returns the account's currently-live
+	// (removed_at IS NULL) install timer count across every app — the
+	// account-wide pool QuoteChange prices install_modules steps against
+	// (usage.IncludedModules is one pool for the whole account, not per app).
+	// The same read usage.Store exposes for the account bill display.
+	LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
+
 	// InsertModuleOverageTimers inserts n identical install timers for one app,
 	// all anchored at installedAt with grace expiring at graceExpiresAt (=
 	// installedAt + the 3-day grace window). n <= 0 is a no-op.
@@ -3137,6 +3144,14 @@ func (s *pgxStore) InsertAdvanceBaseSnapshot(ctx context.Context, snap AppBaseSn
 
 func (s *pgxStore) LiveModuleTimerCountForApp(ctx context.Context, appID uuid.UUID) (int, error) {
 	n, err := s.q.LiveModuleTimerCountForApp(ctx, appID.String())
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (s *pgxStore) LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	n, err := s.q.CountLiveModuleTimersForAccount(ctx, accountID.String())
 	if err != nil {
 		return 0, err
 	}

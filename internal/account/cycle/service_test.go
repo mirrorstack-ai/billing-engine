@@ -171,6 +171,11 @@ type fakeStore struct {
 	// gate's card predicate); absent → derived from the usable-PM state above.
 	cardCount map[uuid.UUID]int
 
+	// liveModuleCountByAccount seeds LiveModuleTimerCountForAccount (the
+	// QuoteChange install_modules pool input); absent → 0.
+	liveModuleCountByAccount     map[uuid.UUID]int
+	errLiveModuleCountForAccount error
+
 	// org-billing state (migration 041). accountsByOrg models the
 	// EnsureOrgAccount get-or-create; orgDesignations the designation rows;
 	// appOwnerOrg the roster rows' owner_org_id stamp (cycle.AppMirror does
@@ -419,6 +424,7 @@ func newFakeStore() *fakeStore {
 		planChangeDraws:           map[uuid.UUID]int64{},
 		memberHistory:             map[uuid.UUID][]fakeMemberCount{},
 		combinedProrationAttempts: map[uuid.UUID]cycle.CombinedProrationAttempt{},
+		liveModuleCountByAccount:  map[uuid.UUID]int{},
 		accountsByUser:            map[uuid.UUID]uuid.UUID{},
 		activation:                map[uuid.UUID]time.Time{},
 		baseSnapshots:             map[snapKey]fakeBaseSnapshot{},
@@ -1794,6 +1800,13 @@ func (f *fakeStore) InsertAdvanceBaseSnapshot(_ context.Context, snap cycle.AppB
 }
 
 // --- per-module install-timer fake (migration 033) --------------------------
+
+func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, accountID uuid.UUID) (int, error) {
+	if f.errLiveModuleCountForAccount != nil {
+		return 0, f.errLiveModuleCountForAccount
+	}
+	return f.liveModuleCountByAccount[accountID], nil
+}
 
 func (f *fakeStore) LiveModuleTimerCountForApp(_ context.Context, appID uuid.UUID) (int, error) {
 	if f.errLiveTimerCount != nil {
