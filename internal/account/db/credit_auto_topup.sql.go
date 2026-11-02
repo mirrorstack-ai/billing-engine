@@ -453,15 +453,16 @@ func (q *Queries) LatestPendingAutoTopUp(ctx context.Context, accountID string) 
 
 const lockAutoTopUpAccount = `-- name: LockAutoTopUpAccount :one
 
-SELECT billing_mode, credit_limit_micros
+SELECT billing_mode, credit_limit_micros, owner_org_id
 FROM ms_billing.accounts
 WHERE id = $1::uuid
 FOR UPDATE
 `
 
 type LockAutoTopUpAccountRow struct {
-	BillingMode       string `json:"billing_mode"`
-	CreditLimitMicros int64  `json:"credit_limit_micros"`
+	BillingMode       string      `json:"billing_mode"`
+	CreditLimitMicros int64       `json:"credit_limit_micros"`
+	OwnerOrgID        pgtype.UUID `json:"owner_org_id"`
 }
 
 // Durable automatic credit top-up execution (migration 049).
@@ -473,7 +474,7 @@ type LockAutoTopUpAccountRow struct {
 func (q *Queries) LockAutoTopUpAccount(ctx context.Context, accountID string) (LockAutoTopUpAccountRow, error) {
 	row := q.db.QueryRow(ctx, lockAutoTopUpAccount, accountID)
 	var i LockAutoTopUpAccountRow
-	err := row.Scan(&i.BillingMode, &i.CreditLimitMicros)
+	err := row.Scan(&i.BillingMode, &i.CreditLimitMicros, &i.OwnerOrgID)
 	return i, err
 }
 
