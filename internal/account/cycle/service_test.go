@@ -1954,13 +1954,13 @@ func (f *fakeStore) ModuleOverageTimersPastGrace(ctx context.Context, at time.Ti
 	return out, nil
 }
 
-func (f *fakeStore) LiveModuleTimerRankBefore(_ context.Context, accountID, timerID uuid.UUID, installedAt time.Time) (int, error) {
+func (f *fakeStore) LiveModuleTimerRankBefore(_ context.Context, accountID, appID, timerID uuid.UUID, installedAt time.Time) (int, error) {
 	if f.errTimerRank != nil {
 		return 0, f.errTimerRank
 	}
 	rank := 0
 	for _, t := range f.timers {
-		if t.accountID != accountID || t.removed {
+		if t.accountID != accountID || t.appID != appID || t.removed {
 			continue
 		}
 		if t.installedAt.Before(installedAt) ||
@@ -2325,17 +2325,32 @@ func (f *fakeStore) liveTimersForAccountFIFO(accountID uuid.UUID) []*fakeTimer {
 	return out
 }
 
-func (f *fakeStore) CountOngoingOverModuleTimers(_ context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
+// liveTimersForAppFIFO is liveTimersForAccountFIFO narrowed to one app
+// (billing-engine#202 PR-2c: the module allowance ranks within one app, never
+// pooled across the account).
+func (f *fakeStore) liveTimersForAppFIFO(accountID, appID uuid.UUID) []*fakeTimer {
+	var out []*fakeTimer
+	for _, t := range f.liveTimersForAccountFIFO(accountID) {
+		if t.appID == appID {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (f *fakeStore) CountOngoingOverModuleTimers(_ context.Context, accountID, appID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
 	if f.errCountOngoingOver != nil {
 		return 0, f.errCountOngoingOver
 	}
-	// Live FIFO: the first includedModules are "included"; the rest are "over".
-	// Count the "over" tail owed a precharge for the new period opening at
-	// periodEnd: installed before it, grace elapsed before it — IMMUTABLE
-	// cutoffs only (wave 2, D1: resolution state is sweep-ordering-dependent
-	// and deliberately not part of the predicate), mirroring the SQL.
+	// Live FIFO WITHIN THE APP (billing-engine#202 PR-2c: never pooled across
+	// the account): the first includedModules are "included"; the rest are
+	// "over". Count the "over" tail owed a precharge for the new period
+	// opening at periodEnd: installed before it, grace elapsed before it —
+	// IMMUTABLE cutoffs only (wave 2, D1: resolution state is
+	// sweep-ordering-dependent and deliberately not part of the predicate),
+	// mirroring the SQL.
 	n := 0
-	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
+	for rank, t := range f.liveTimersForAppFIFO(accountID, appID) {
 		if rank >= includedModules &&
 			t.installedAt.Before(periodEnd) && t.graceExpiresAt.Before(periodEnd) {
 			n++
@@ -2349,8 +2364,8 @@ func (f *fakeStore) CoCreatedOverModuleTimers(_ context.Context, accountID, appI
 		return nil, f.errCoCreatedOver
 	}
 	var out []uuid.UUID
-	for rank, t := range f.liveTimersForAccountFIFO(accountID) {
-		if rank >= includedModules && t.appID == appID && !t.graceResolved && t.installedAt.Equal(createdAt) {
+	for rank, t := range f.liveTimersForAppFIFO(accountID, appID) {
+		if rank >= includedModules && !t.graceResolved && t.installedAt.Equal(createdAt) {
 			out = append(out, t.id)
 		}
 	}

@@ -751,11 +751,12 @@ type Store interface {
 	ModuleOverageTimersPastGrace(ctx context.Context, at time.Time) ([]ModuleOverageCandidate, error)
 
 	// LiveModuleTimerRankBefore returns the 0-based FIFO rank of one install timer
-	// among the account's currently-live timers ordered (installed_at ASC, id
-	// ASC): the count of live timers ordering STRICTLY BEFORE it. rank <
-	// IncludedModules ⇒ "included"; rank >= IncludedModules ⇒ "over". Computed
-	// fresh at every grace-check (never cached).
-	LiveModuleTimerRankBefore(ctx context.Context, accountID, timerID uuid.UUID, installedAt time.Time) (int, error)
+	// among its OWN APP'S currently-live timers ordered (installed_at ASC, id
+	// ASC) — never pooled against any other app on the account
+	// (billing-engine#202 PR-2c): the count of that app's live timers ordering
+	// STRICTLY BEFORE it. rank < the app's plan ModulesIncluded ⇒ "included";
+	// rank >= it ⇒ "over". Computed fresh at every grace-check (never cached).
+	LiveModuleTimerRankBefore(ctx context.Context, accountID, appID, timerID uuid.UUID, installedAt time.Time) (int, error)
 
 	// MarkModuleTimerIncluded stamps the TERMINAL "included" verdict
 	// (grace_resolved=true, no charge) — first-write-wins (WHERE grace_resolved
@@ -789,20 +790,24 @@ type Store interface {
 	DrawModuleOverageFromWallet(ctx context.Context, timerID uuid.UUID, charge ModuleOverageWalletCharge) (ModuleOverageWalletOutcome, string, error)
 
 	// CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario
-	// 6): the count of the account's live timers that are "over" (live-FIFO rank
-	// >= includedModules) AND owed a full precharge for the NEW period opening at
-	// periodEnd — installed before it, grace elapsed before it (a straddling
-	// grace's new period is Leg 1's coverage), and grace terminally resolved
-	// (charged, OR resolved-uncharged via the D1d period-closed posture — those
-	// still owe every post-activation period). See the query comment for the full
-	// coverage contract.
-	CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error)
+	// 6): the count of ONE APP's live timers that are "over" its OWN plan
+	// allowance (live-FIFO rank within the app >= includedModules — never pooled
+	// across the account, billing-engine#202 PR-2c) AND owed a full precharge for
+	// the NEW period opening at periodEnd — installed before it, grace elapsed
+	// before it (a straddling grace's new period is Leg 1's coverage), and grace
+	// terminally resolved (charged, OR resolved-uncharged via the D1d
+	// period-closed posture — those still owe every post-activation period). The
+	// caller sums ceil(over_i / ModuleBlockSize) PER APP before pricing blocks.
+	// See the query comment for the full coverage contract.
+	CountOngoingOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, includedModules int, periodEnd time.Time) (int, error)
 
 	// CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
 	// ids of an app's live, unresolved install timers whose install instant equals
-	// the app's createdAt (co-created at app creation) AND that are "over" (live-FIFO
-	// rank >= includedModules) — the co-created over-modules folded onto the app's
-	// own creation-proration invoice, priced from the same day-0 window.
+	// the app's createdAt (co-created at app creation) AND that are "over" that
+	// SAME app's own plan allowance (live-FIFO rank within the app >=
+	// includedModules — never pooled across the account, billing-engine#202
+	// PR-2c) — the co-created over-modules folded onto the app's own
+	// creation-proration invoice, priced from the same day-0 window.
 	CoCreatedOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, createdAt time.Time, includedModules int) ([]uuid.UUID, error)
 
 	// --- custom-domain charges (migration 047) -------------------------------
@@ -3458,10 +3463,13 @@ func (s *pgxStore) FreezeCombinedProrationAttempt(
 	var selected []string
 	if shape.ModuleChargeMicros > 0 && shape.ModuleChargeCents > 0 {
 		selected, err = qtx.CoCreatedOverModuleTimersForAttempt(ctx, db.CoCreatedOverModuleTimersForAttemptParams{
-			AccountID:       accountID.String(),
-			AppID:           appID.String(),
-			CreatedAt:       appRow.CreatedAt,
-			IncludedModules: int32(usage.IncludedModules),
+			AccountID: accountID.String(),
+			AppID:     appID.String(),
+			CreatedAt: appRow.CreatedAt,
+			// Billing-engine#202 PR-2c: this app's OWN plan allowance, never the
+			// retired account-wide pool — the query's rank window is scoped to
+			// this app alone.
+			IncludedModules: int32(usage.ModulesIncludedCutoff(usage.Plan(appRow.Plan))), //nolint:gosec // bounded by int32
 		})
 		if err != nil {
 			return CombinedProrationAttempt{}, StripeRailStale, err
@@ -3771,9 +3779,10 @@ func (s *pgxStore) ModuleOverageTimersPastGrace(ctx context.Context, at time.Tim
 	return out, nil
 }
 
-func (s *pgxStore) LiveModuleTimerRankBefore(ctx context.Context, accountID, timerID uuid.UUID, installedAt time.Time) (int, error) {
+func (s *pgxStore) LiveModuleTimerRankBefore(ctx context.Context, accountID, appID, timerID uuid.UUID, installedAt time.Time) (int, error) {
 	rank, err := s.q.LiveModuleTimerRankBefore(ctx, db.LiveModuleTimerRankBeforeParams{
 		AccountID:   accountID.String(),
+		AppID:       appID.String(),
 		InstalledAt: installedAt,
 		TimerID:     timerID.String(),
 	})
@@ -3964,10 +3973,11 @@ func (s *pgxStore) DrawModuleOverageFromWallet(ctx context.Context, timerID uuid
 	return ModuleOverageWalletLockedCharged, mc.Ref, nil
 }
 
-func (s *pgxStore) CountOngoingOverModuleTimers(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
+func (s *pgxStore) CountOngoingOverModuleTimers(ctx context.Context, accountID, appID uuid.UUID, includedModules int, periodEnd time.Time) (int, error) {
 	n, err := s.q.CountOngoingOverModuleTimers(ctx, db.CountOngoingOverModuleTimersParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is the small IncludedModules const (5)
+		AppID:           appID.String(),
+		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is usage.ModulesIncludedCutoff, bounded by int32
 		PeriodEnd:       periodEnd,
 	})
 	if err != nil {
@@ -3981,7 +3991,7 @@ func (s *pgxStore) CoCreatedOverModuleTimers(ctx context.Context, accountID, app
 		AccountID:       accountID.String(),
 		AppID:           appID.String(),
 		CreatedAt:       createdAt,
-		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is the small IncludedModules const (5)
+		IncludedModules: int32(includedModules), //nolint:gosec // includedModules is usage.ModulesIncludedCutoff, bounded by int32
 	})
 	if err != nil {
 		return nil, err

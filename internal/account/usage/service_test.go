@@ -349,7 +349,7 @@ func (f *fakeStore) CoCreatedOverModuleTimerCount(_ context.Context, _, appID uu
 // PendingAddonModuleCharges returns the fixture rows verbatim (the timer table
 // has no other fake representation); captures `now` so a test can assert the
 // service passed its own nowFn instant.
-func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, _ int, now time.Time) ([]usage.PendingAddonChargeRaw, error) {
+func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, now time.Time) ([]usage.PendingAddonChargeRaw, error) {
 	f.gotPendingAddonNow = now
 	if f.errPendingAddon != nil {
 		return nil, f.errPendingAddon
@@ -359,7 +359,7 @@ func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, _ 
 
 // UnresolvedOneTimeCharges returns the configured single-snapshot projection
 // rows. SQL eligibility and ownership predicates are covered in Postgres.
-func (f *fakeStore) UnresolvedOneTimeCharges(_ context.Context, _ uuid.UUID, _, _ int) ([]usage.UnresolvedOneTimeChargeRaw, error) {
+func (f *fakeStore) UnresolvedOneTimeCharges(_ context.Context, _ uuid.UUID, _ int) ([]usage.UnresolvedOneTimeChargeRaw, error) {
 	if f.errUnresolvedOneTime != nil {
 		return nil, f.errUnresolvedOneTime
 	}
@@ -435,7 +435,7 @@ func (f *fakeStore) LiveDomainCountForAccount(_ context.Context, _ uuid.UUID) (i
 // activatedRecurring; the counts are then spread over the live apps so that
 // usage.RecurringFeeCountsOf(shares) reproduces them exactly — the same
 // sum-of-rows identity the real query guarantees.
-func (f *fakeStore) ActivatedRecurringFeeShares(_ context.Context, _ uuid.UUID, _ int, _ time.Time) ([]usage.AppRecurringFeeShare, error) {
+func (f *fakeStore) ActivatedRecurringFeeShares(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.AppRecurringFeeShare, error) {
 	if f.errActivatedRecurring != nil {
 		return nil, f.errActivatedRecurring
 	}

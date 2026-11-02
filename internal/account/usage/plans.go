@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"math"
 	"time"
 )
 
@@ -257,6 +258,35 @@ func UsageAllowanceEligible(mirrored bool, createdAt time.Time, deleted bool, de
 		}
 	}
 	return UsageAllowanceAccrues(createdAt, instant)
+}
+
+// ModulesIncludedCutoff converts a plan's ModulesIncluded into the per-app
+// FIFO cutoff a module-overage query compares that app's OWN live install
+// rank against (billing-engine#202 PR-2c: the module allowance is per app,
+// never pooled across an account). Unlimited (Business) becomes a sentinel no
+// real install count can ever reach, so "rank > cutoff" is correctly always
+// false for it — the caller never special-cases Business separately.
+func ModulesIncludedCutoff(p Plan) int {
+	included := TermsFor(p).ModulesIncluded
+	if included == Unlimited {
+		return math.MaxInt32
+	}
+	return included
+}
+
+// ModuleAllowanceColumns returns the plan ladder as parallel arrays (plan
+// name, per-app module cutoff) for a SQL query that prices several apps —
+// each possibly on a different plan — in one call: the query JOINs each row's
+// own app.plan against this table instead of a single scalar threshold, so
+// one app's Business allowance can never leak onto another app's Free one.
+// This is the ONE ladder (TermsFor's), read generically — a query using it
+// carries no plan-specific number of its own.
+func ModuleAllowanceColumns() (plans []string, modulesIncluded []int32) {
+	for _, p := range []Plan{PlanFree, PlanPro, PlanBusiness} {
+		plans = append(plans, string(p))
+		modulesIncluded = append(modulesIncluded, int32(ModulesIncludedCutoff(p)))
+	}
+	return plans, modulesIncluded
 }
 
 // UsageDeductionMicros is the plan's 用量減免 for one app and one period: the

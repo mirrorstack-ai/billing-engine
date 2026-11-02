@@ -1,8 +1,6 @@
 package usage
 
 import (
-	"bytes"
-	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,12 +18,13 @@ const microsPerCent = 10_000
 // integer micro-dollars; the arithmetic here is pure int64 (no big.Rat needed:
 // the operands are bounded — see ProratedBaseMicros).
 //
-// The base is per app, from its plan (TermsFor); the $5-per-block-of-5 surcharge applies to the
-// account's over-count, max(0, live module count − IncludedModules). Under the
-// per-module-instance model (migration 033) the charge legs tier per install
-// TIMER (each on its own grace), while the DISPLAY reads the live timer count
-// through AccountOverageMicros. There is deliberately NO per-app overage helper:
-// an app's base is just the flat (plan-resolved) fee.
+// The base is per app, from its plan (TermsFor); the $5-per-block-of-5
+// surcharge applies to EACH APP'S OWN over-count against its OWN plan
+// allowance (billing-engine#202 PR-2c: never pooled across an account). Under
+// the per-module-instance model (migration 033) the charge legs tier per
+// install TIMER (each on its own grace, ranked within its own app), while the
+// DISPLAY reads the live per-app timer count through
+// LiveOverModuleTimerCountForApp.
 
 // ModuleOverageBlocks is the number of WHOLE overage blocks an over-count
 // occupies: ceil(overCount / ModuleBlockSize), clamped to 0. Overage is sold in
@@ -47,26 +46,6 @@ func ModuleOverageBlocks(overCount int64) int64 {
 // overCount is a live-row count, bounded by the timer table.
 func ModuleBlockMicros(overCount int64) int64 {
 	return ModuleOverageBlocks(overCount) * ModuleBlockFeeMicros
-}
-
-// AccountOverageMicros is the account's module overage shown for one period:
-//
-//	ModuleBlockFeeMicros × ceil(max(0, liveModuleCount − IncludedModules) / ModuleBlockSize)
-//
-// liveModuleCount is the account's live installed-module count (the count of live
-// install timers, migration 033 — one pool of IncludedModules for the WHOLE
-// account, not per app). The first IncludedModules live installs (by FIFO) are
-// "included"; the rest are "over", so max(0, live − included) is exactly the live
-// over-count, which ModuleBlockMicros then rounds UP to whole blocks. A
-// liveModuleCount ≤ IncludedModules yields 0 (ModuleOverageBlocks is total on
-// non-positive input; a negative count cannot occur — a live-row count).
-// GetAccountBill uses this current-live steady-state amount as the next-period
-// recurring overage forecast inside ProjectedTotalMicros; unresolved one-time
-// timer proration is layered on separately and any exact next-period straddle
-// overlap is counted once — at the per-module amortized rate, which is exactly
-// one module's marginal share of a full block.
-func AccountOverageMicros(liveModuleCount int) int64 {
-	return ModuleBlockMicros(int64(liveModuleCount) - IncludedModules)
 }
 
 // GraceExpiry is the single home of the "grace elapses at t + GraceDays" rule
@@ -252,73 +231,30 @@ func wholeDaysUTC(from, to time.Time) int64 {
 // account line GetAccountBill publishes:
 //
 //	Σ = Σ activated apps' plan base fees (activatedBaseMicros)
-//	  + ModuleBlockMicros(Σ overCounts)
+//	  + Σ apps' own ModuleBlockMicros(overCount) (moduleOverageBlocksMicros)
 //	  + Σ domainCounts × DomainFeeMicros
 //
 // exactly, for any share set — that identity is the whole point, and
 // TestProjectedBaseFeeByAppSumsToAccountTotal pins it.
 //
-// Two of the three terms are already per-app: an activated app owns its flat
-// base, and a custom domain owns its $2. The OVERAGE is not. Overage is sold in
-// whole blocks against an ACCOUNT-WIDE allowance (migration 033), so the account
-// pays ceil(over/ModuleBlockSize) blocks no matter how the over-modules are
-// spread — two apps with two over-modules each cost ONE block between them, and
-// recomputing the block price per app would bill two. The block total is
-// therefore DISTRIBUTED, never recomputed: each app takes the share of the
-// account's block money that its over-count earns.
-//
-// The split is by largest remainder, so the parts sum to the whole with no
-// rounding drift, and ties break on app id — a stable, arbitrary-but-repeatable
-// order beats a map-iteration one that would move money between apps run to run.
-// An account with all its over-modules on one app (the common shape) gives that
-// app every block, which is the intuitive answer and falls out of the general
-// rule rather than being special-cased.
+// All three terms are per-app (billing-engine#202 PR-2c): an activated app
+// owns its flat base, a custom domain owns its $2, and — since the module
+// allowance is now each app's OWN plan allowance rather than one account-wide
+// pool (migration 033 superseded) — an app's over-count prices its OWN
+// blocks directly, with no cross-app distribution needed.
 func projectedBaseFeeByApp(shares []AppRecurringFeeShare) map[uuid.UUID]int64 {
 	if len(shares) == 0 {
 		return nil
 	}
 	byApp := make(map[uuid.UUID]int64, len(shares))
-	var totalOver int64
 	for _, share := range shares {
 		var micros int64
 		if share.Activated {
 			micros += resolveBaseFeeMicros(share.Plan)
 		}
 		micros += int64(share.CustomDomainCount) * DomainFeeMicros
+		micros += ModuleBlockMicros(int64(share.OverModuleCount))
 		byApp[share.AppID] = micros
-		totalOver += int64(share.OverModuleCount)
-	}
-	if totalOver == 0 {
-		return byApp
-	}
-
-	// Largest remainder over the account's whole-block money. floor + the top
-	// remainders exhausts blockTotal precisely; nothing is created or lost.
-	blockTotal := ModuleBlockMicros(totalOver)
-	type portion struct {
-		appID     uuid.UUID
-		remainder int64
-	}
-	portions := make([]portion, 0, len(shares))
-	allocated := int64(0)
-	for _, share := range shares {
-		over := int64(share.OverModuleCount)
-		if over == 0 {
-			continue
-		}
-		exact := blockTotal * over
-		byApp[share.AppID] += exact / totalOver
-		allocated += exact / totalOver
-		portions = append(portions, portion{appID: share.AppID, remainder: exact % totalOver})
-	}
-	sort.Slice(portions, func(i, j int) bool {
-		if portions[i].remainder != portions[j].remainder {
-			return portions[i].remainder > portions[j].remainder
-		}
-		return bytes.Compare(portions[i].appID[:], portions[j].appID[:]) < 0
-	})
-	for i := int64(0); i < blockTotal-allocated; i++ {
-		byApp[portions[i%int64(len(portions))].appID]++
 	}
 	return byApp
 }
@@ -332,6 +268,20 @@ func activatedBaseMicros(shares []AppRecurringFeeShare) int64 {
 		if share.Activated {
 			total += resolveBaseFeeMicros(share.Plan)
 		}
+	}
+	return total
+}
+
+// moduleOverageBlocksMicros sums each share's OWN block price
+// (billing-engine#202 PR-2c): module overage is priced per app against that
+// app's own plan allowance, never pooled, so blocks are computed per app THEN
+// summed — pooling the raw counts first and blocking the sum would under-bill,
+// since ceil is not additive across apps (two apps at 2 over-modules each cost
+// ONE block pooled vs TWO priced per app).
+func moduleOverageBlocksMicros(shares []AppRecurringFeeShare) int64 {
+	var total int64
+	for _, share := range shares {
+		total += ModuleBlockMicros(int64(share.OverModuleCount))
 	}
 	return total
 }
