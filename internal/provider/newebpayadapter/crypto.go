@@ -40,7 +40,7 @@ func pkcs7Pad(data []byte, blockSize int) []byte {
 	out := make([]byte, len(data)+padLen)
 	copy(out, data)
 	for i := len(data); i < len(out); i++ {
-		out[i] = byte(padLen)
+		out[i] = byte(padLen) //nolint:gosec // padLen is in [1, blockSize], blockSize is the AES block size (16)
 	}
 	return out
 }
