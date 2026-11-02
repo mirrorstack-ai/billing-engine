@@ -917,7 +917,11 @@ general billing must never silently enable it.
 The engine supports Stripe today and a NewebPay Taiwan adapter next. Neither
 provider defines the domain model. No Stripe SDK type, NewebPay request field,
 provider invoice status or webhook payload may cross into the intent or ledger
-packages.
+packages. [`docs/newebpay-rail.md`](newebpay-rail.md) is the design note for
+the NewebPay rail specifically — the redirect-rail port, the seller and
+settlement questions a second rail raises, and where its keys live — and this
+section's ports stay the general shape; that note says where NewebPay departs
+from them.
 
 None of the Go below is built — not one of those type names appears in the tree.
 What exists is a single adapter method reachable only through the executor
@@ -2042,6 +2046,11 @@ marked and the rest is left open rather than rounded up.
     numbering, retention and correction duties; the Taiwan entity, business tax
     and TWD obligations; and which NewebPay products the merchant agreement
     permits. Blocks G1 and G3: the second rail cannot be specified without them.
+    [`docs/newebpay-rail.md`](newebpay-rail.md) answers the engineering half of
+    the second rail — the rail registry, the redirect-rail port, the seller
+    and settlement bridge, where TWD amounts live, the key broker, and the
+    notice path — without resolving the invoicing and tax items this entry
+    still leaves open.
 11. **Currency.** Supported currencies, TWD price books, and whether any FX is
     offered as a customer line. Blocks G1, G2 and G4: §8 forbids implicit
     cross-currency entries.
