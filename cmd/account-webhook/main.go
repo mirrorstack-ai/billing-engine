@@ -32,6 +32,13 @@
 // is its production caller, and Router.Process (the HMAC path) remains the seam
 // its ~30 behavioural tests drive the handlers through.
 //
+// 🔴 GET/HEAD AGAINST THIS PATH ARE HEALTH PROBES, NOT DELIVERIES, AND ANSWER
+// 200. #180 left every request — probe and delivery alike — answering 501,
+// which API Gateway and the Cloudflare health check in front of it both count
+// as a 5xx failure. No PSP delivers a webhook over GET or HEAD, so isProbe
+// claims both methods for health without any risk of mistaking a real
+// delivery for one. See proxyHandler and httpHandler. #189.
+//
 // Transport selection:
 //   - AWS_LAMBDA_FUNCTION_NAME set → lambda.Start(proxyHandler)
 //   - Otherwise → http.ListenAndServe on ACCOUNT_WEBHOOK_PORT (default 8092)
@@ -58,10 +65,25 @@ const (
 	webhookPath          = "/webhook"
 )
 
-// noProviderMessage is the body every request gets while the dispatch table is
-// empty. It names the reason rather than a bare status so a PSP engineer
+// noProviderMessage is the body every delivery gets while the dispatch table
+// is empty. It names the reason rather than a bare status so a PSP engineer
 // registering the URL sees why their delivery bounced.
 const noProviderMessage = "no payment provider is wired to this endpoint"
+
+// healthMessage is the body a GET/HEAD probe gets. 9x/minute something polls
+// this exact URL expecting 2xx (mirrorstack-infra cloudflare/adopted.tf:583),
+// and API Gateway counts the 501 above as a 5xx — so a probe cannot share the
+// delivery branch's status code even though it shares the path. #189.
+const healthMessage = "account-webhook endpoint reachable; no payment provider is wired yet"
+
+// isProbe reports whether a request is a health check rather than a provider
+// delivery. PSPs deliver webhooks with POST (NewebPay included, once wired);
+// GET and HEAD are not a delivery shape any provider uses against this path,
+// so both are free to claim for health without risking a real delivery being
+// mistaken for one.
+func isProbe(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -95,13 +117,30 @@ func main() {
 // / v1 proxy shape) because the HTTP API in front of this function is pinned to
 // payload format 1.0 — see mirrorstack-infra stacks/billing.go.
 //
-// 🔴 501, NOT 404. A 404 says the address is wrong and invites a PSP engineer
-// to go hunting for the right path; 501 says the address is right and the
-// feature is not built yet, which is the true statement. It also keeps the URL
-// answering, so an endpoint registration made ahead of the integration does not
-// have to be re-created later.
+// 🔴 501, NOT 404, FOR A DELIVERY. A 404 says the address is wrong and invites
+// a PSP engineer to go hunting for the right path; 501 says the address is
+// right and the feature is not built yet, which is the true statement. It
+// also keeps the URL answering, so an endpoint registration made ahead of the
+// integration does not have to be re-created later.
+//
+// 🔴 BUT NOT FOR A PROBE. A GET/HEAD is never a provider delivery — see
+// isProbe — and API Gateway counts 501 as a 5xx, which trips the Cloudflare
+// health check and the billing CodeDeploy gate alike. #189 is that bug; the
+// fix is a branch on method, not a change to what a delivery gets back.
 func proxyHandler() func(context.Context, events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	return func(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+		if isProbe(req.HTTPMethod) {
+			slog.InfoContext(ctx, "health probe", "path", req.Path, "method", req.HTTPMethod)
+			body := `{"status":"ok","message":"` + healthMessage + `"}`
+			if req.HTTPMethod == http.MethodHead {
+				body = ""
+			}
+			return events.APIGatewayProxyResponse{
+				StatusCode: http.StatusOK,
+				Headers:    map[string]string{"Content-Type": "application/json"},
+				Body:       body,
+			}, nil
+		}
 		slog.InfoContext(ctx, "provider webhook received with no provider wired",
 			"path", req.Path, "method", req.HTTPMethod)
 		return events.APIGatewayProxyResponse{
@@ -114,6 +153,11 @@ func proxyHandler() func(context.Context, events.APIGatewayProxyRequest) (events
 
 func httpHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isProbe(r.Method) {
+			slog.InfoContext(r.Context(), "health probe", "path", r.URL.Path, "method", r.Method)
+			httputil.JSON(w, http.StatusOK, map[string]string{"status": "ok", "message": healthMessage})
+			return
+		}
 		slog.InfoContext(r.Context(), "provider webhook received with no provider wired",
 			"path", r.URL.Path, "method", r.Method)
 		httputil.JSON(w, http.StatusNotImplemented, map[string]string{"error": noProviderMessage})
