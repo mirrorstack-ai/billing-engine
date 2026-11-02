@@ -497,7 +497,7 @@ func TestAppModuleInfraBill_Integration_ModuleAttributedCDNEgressIsAbsorbed(t *t
 
 	video := uuid.New() // declares ms.AbsorbInfra()
 	plain := uuid.New() // no override: sentinel fallback
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, video, true, nil))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, video, "", true, nil))
 
 	for _, m := range metrics {
 		appSeedEvent(t, pool, acct, app, video, m, kinds[m], 100, "2026-06-05T00:00:00Z", "", "")
@@ -549,12 +549,12 @@ func TestModuleInfraPriceCatalog_Integration_CellsForModulesWithNoUsage(t *testi
 	require.Positive(t, active, "precondition: the migrations seed active sentinel infra metrics")
 
 	absorbing, plain, partial := uuid.New(), uuid.New(), uuid.New()
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, absorbing, true, nil))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, absorbing, "", true, nil))
 	var firstMetric string
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT metric FROM ms_billing.metric_definitions WHERE module_id = $1 AND active ORDER BY metric LIMIT 1`,
 		usage.PlatformInfraModuleID().String()).Scan(&firstMetric))
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, partial, false, []usage.InfraPriceOverride{{Metric: firstMetric, UnitPriceMicros: 55}}))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, partial, "", false, []usage.InfraPriceOverride{{Metric: firstMetric, UnitPriceMicros: 55}}))
 
 	cells, err := store.ModuleInfraPriceCatalog(ctx, []uuid.UUID{absorbing, plain, partial})
 	require.NoError(t, err)

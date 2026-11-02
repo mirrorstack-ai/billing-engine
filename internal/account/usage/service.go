@@ -804,6 +804,12 @@ func (s *Service) SetMetricVersionPrices(ctx context.Context, req SetMetricVersi
 //     once, expanded from the catalog in the store — never from a list of metric
 //     names held by the caller, the SDK, or this package (see the request type).
 //     Explicit overrides apply after it and win.
+//   - When the caller names a ModuleVersion (issue #219), the store ALSO
+//     snapshots the resulting price(s) into the immutable
+//     ms_billing.metric_version_prices table, so a later re-price at a
+//     different version can never retroactively change this version's
+//     already-rolled-up charge. A version-less call keeps the prior
+//     version-blind behavior.
 //
 // 🔴 AUTHORITATIVE, NOT ADDITIVE. The set this call carries REPLACES the module's
 // reserved overrides; anything absent is deleted. An EMPTY payload is therefore
@@ -852,7 +858,7 @@ func (s *Service) SetInfraPriceOverrides(ctx context.Context, req SetInfraPriceO
 		}
 		overrides = append(overrides, o)
 	}
-	if err := s.store.SyncInfraPriceOverrides(ctx, req.ModuleID, req.AbsorbAll, overrides); err != nil {
+	if err := s.store.SyncInfraPriceOverrides(ctx, req.ModuleID, req.ModuleVersion, req.AbsorbAll, overrides); err != nil {
 		return nil, billing.Internal("sync infra price overrides failed", err)
 	}
 	return &SetInfraPriceOverridesResponse{Synced: len(overrides), AbsorbAll: req.AbsorbAll}, nil

@@ -987,6 +987,19 @@ type InfraPriceOverride struct {
 // every version record, not only when the manifest happens to contain one.
 type SetInfraPriceOverridesRequest struct {
 	ModuleID uuid.UUID `json:"module_id"`
+	// ModuleVersion is the OPTIONAL publishing version this override set takes
+	// effect at (issue #219). When set, the store ALSO snapshots every
+	// resulting price — the absorbed-to-0 set and each explicit override —
+	// into the immutable ms_billing.metric_version_prices table, keyed
+	// (module_id, metric, module_version), exactly as SetMetricVersionPrices
+	// does for custom metrics. A reserved infra.* event that carries this SAME
+	// module_version then resolves VERSION-FIRST (cycle.MetricPriceMicros
+	// already does this for any moduleVersion, custom or reserved), so a LATER
+	// publish's re-price can never retroactively change an EARLIER version's
+	// already-rolled-up charge. Empty means version-less: the override still
+	// lands in metric_definitions as before, and resolution keeps today's
+	// version-blind chain.
+	ModuleVersion string `json:"module_version,omitempty"`
 	// AbsorbAll is ms.AbsorbInfra(): pass EVERY platform infra metric through to
 	// the customer at 0, for a module that bills through its own meters and adds
 	// no infrastructure passthrough on top.

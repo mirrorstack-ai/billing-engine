@@ -573,7 +573,13 @@ func (f *fakeStore) UpsertMetricVersionPrices(_ context.Context, prices []usage.
 // sentinel row errors (the real store's INSERT ... SELECT affects 0 rows), never
 // a silent write. The written rows key the REAL moduleID, so a test asserts
 // f.defs[defKey(module, metric)].
-func (f *fakeStore) SyncInfraPriceOverrides(_ context.Context, moduleID uuid.UUID, absorbAll bool, overrides []usage.InfraPriceOverride) error {
+//
+// When moduleVersion is set (issue #219), it ALSO snapshots into
+// f.versionPrices, mirroring metric_version_prices' insert-only semantics
+// (ON CONFLICT DO NOTHING — "exists" wins, never the newest write): the
+// explicit override snapshots BEFORE the absorbed-0 sweep, so it wins the
+// snapshot exactly as it wins the live row.
+func (f *fakeStore) SyncInfraPriceOverrides(_ context.Context, moduleID uuid.UUID, moduleVersion string, absorbAll bool, overrides []usage.InfraPriceOverride) error {
 	if f.errUpsertOverride != nil {
 		return f.errUpsertOverride // all-or-nothing: nothing is written on error
 	}
@@ -582,6 +588,19 @@ func (f *fakeStore) SyncInfraPriceOverrides(_ context.Context, moduleID uuid.UUI
 	for _, o := range overrides {
 		if _, ok := f.defs[defKey(sentinel, o.Metric)]; !ok {
 			return errors.New("no sentinel catalog row for infra metric " + o.Metric)
+		}
+	}
+
+	snapshot := func(metric string, price int64) {
+		if moduleVersion == "" {
+			return
+		}
+		key := versionPriceKey(moduleID, metric, moduleVersion)
+		if _, exists := f.versionPrices[key]; exists {
+			return // ON CONFLICT DO NOTHING: immutable once written
+		}
+		f.versionPrices[key] = usage.MetricVersionPrice{
+			ModuleID: moduleID, Metric: metric, ModuleVersion: moduleVersion, UnitPriceMicros: price,
 		}
 	}
 
@@ -608,7 +627,25 @@ func (f *fakeStore) SyncInfraPriceOverrides(_ context.Context, moduleID uuid.UUI
 		}
 	}
 	for _, o := range overrides {
-		write(o.Metric, o.UnitPriceMicros) // after the absorb, so it wins
+		write(o.Metric, o.UnitPriceMicros) // after the absorb, so it wins the live row
+	}
+
+	// Version snapshot (issue #219): f.versionPrices is insert-only (ON CONFLICT
+	// DO NOTHING — the FIRST write wins), the OPPOSITE of the live map above
+	// (last assignment wins). So the explicit override snapshots BEFORE the
+	// absorbed-0 sweep, to make it win the snapshot the same way it wins the
+	// live row above.
+	for _, o := range overrides {
+		snapshot(o.Metric, o.UnitPriceMicros)
+	}
+	if absorbAll {
+		for key, def := range f.defs {
+			mod, metric, ok := splitDefKey(key)
+			if !ok || mod != sentinel.String() || !def.Active {
+				continue
+			}
+			snapshot(metric, 0)
+		}
 	}
 
 	// Withdraw: reserved rows under THIS module that the manifest dropped. A
@@ -2309,6 +2346,63 @@ func TestSetInfraPriceOverrides_ExplicitOverrideBeatsAbsorbAll(t *testing.T) {
 	require.Equal(t, int64(0), store.defs[defKey(mod, "infra.compute.walltime.ms")].UnitPriceMicros, "absorbed")
 	require.Equal(t, int64(120_000), store.defs[defKey(mod, "infra.egress.api.bytes")].UnitPriceMicros,
 		"the named metric overwrites the absorbed 0, not the other way round")
+}
+
+// TestSetInfraPriceOverrides_ModuleVersion_SnapshotsImmutably is the unit-test
+// mirror of issue #219's fix direction at the Service layer: a publish that
+// names a ModuleVersion snapshots the resulting infra prices into
+// metric_version_prices, and a LATER publish at a different version (or the
+// same one, re-sent) never rewrites an earlier version's snapshot — even
+// though the LIVE metric_definitions row it shares with custom metrics keeps
+// getting overwritten in place as it always has.
+func TestSetInfraPriceOverrides_ModuleVersion_SnapshotsImmutably(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+	svc := newService(store)
+
+	_, err := svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:      mod,
+		ModuleVersion: "1.0.0",
+		Overrides:     []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 100}},
+	})
+	require.NoError(t, err)
+
+	v1 := store.versionPrices[versionPriceKey(mod, "infra.compute.walltime.ms", "1.0.0")]
+	require.Equal(t, int64(100), v1.UnitPriceMicros)
+
+	// A later publish, at a new version, absorbs everything (price 0) — the
+	// LIVE row is overwritten (unchanged behavior), but v1's snapshot must not
+	// move.
+	_, err = svc.SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID: mod, ModuleVersion: "2.0.0", AbsorbAll: true,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, int64(0), store.defs[defKey(mod, "infra.compute.walltime.ms")].UnitPriceMicros,
+		"the live catalog row still mutates in place, as it always has")
+	v1Again := store.versionPrices[versionPriceKey(mod, "infra.compute.walltime.ms", "1.0.0")]
+	require.Equal(t, int64(100), v1Again.UnitPriceMicros,
+		"v1's immutable snapshot must not be re-priced by v2's later publish")
+	v2 := store.versionPrices[versionPriceKey(mod, "infra.compute.walltime.ms", "2.0.0")]
+	require.Equal(t, int64(0), v2.UnitPriceMicros, "v2 gets its own snapshot")
+}
+
+// A version-less call (the ModuleVersion zero value) must write no snapshot —
+// the pre-#219 behavior is untouched for a caller that doesn't opt in.
+func TestSetInfraPriceOverrides_NoModuleVersion_WritesNoSnapshot(t *testing.T) {
+	store := newFakeStore()
+	seedSentinelInfra(store, "infra.compute.walltime.ms", usage.KindSum, "millisecond", 1)
+	mod := uuid.New()
+
+	_, err := newService(store).SetInfraPriceOverrides(context.Background(), usage.SetInfraPriceOverridesRequest{
+		ModuleID:  mod,
+		Overrides: []usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 100}},
+	})
+	require.NoError(t, err)
+
+	_, ok := store.versionPrices[versionPriceKey(mod, "infra.compute.walltime.ms", "")]
+	require.False(t, ok, "a version-less publish must not write a metric_version_prices snapshot")
 }
 
 // A metric the platform has since DEACTIVATED is not re-absorbed, and its stale
