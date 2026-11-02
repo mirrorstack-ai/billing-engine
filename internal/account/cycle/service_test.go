@@ -156,6 +156,7 @@ type fakeStore struct {
 	combinedProrationAttempts map[uuid.UUID]cycle.CombinedProrationAttempt
 	accountsByUser            map[uuid.UUID]uuid.UUID
 	activation                map[uuid.UUID]time.Time
+	priceBasisBP              map[uuid.UUID]int32 // accountID → payer_price_basis.price_basis_bp (migration 093); absent → usage.DefaultPriceBasisBP
 	baseSnapshots             map[snapKey]fakeBaseSnapshot
 	// custom-domain mirror state (migration 047). The map is keyed by the
 	// surrogate domain id; InsertDomain enforces the live-hostname partial
@@ -1086,6 +1087,13 @@ func (f *fakeStore) AccountActivation(_ context.Context, accountID uuid.UUID) (t
 	}
 	at, ok := f.activation[accountID]
 	return at, ok, nil
+}
+
+func (f *fakeStore) PriceBasisBPForAccount(_ context.Context, accountID uuid.UUID) (int32, error) {
+	if bp, ok := f.priceBasisBP[accountID]; ok {
+		return bp, nil
+	}
+	return usage.DefaultPriceBasisBP, nil
 }
 
 func (f *fakeStore) InsertAppMirror(_ context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount, memberCount int, createdAt time.Time, name string, plan usage.Plan) error {

@@ -94,6 +94,14 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 		return nil, billing.Internal("RunBillingCycle requires a Stripe client", nil)
 	}
 
+	// The payer's price basis (billing-engine#258), resolved ONCE for this
+	// account/boundary and reused at every plan-fee line below (advance base,
+	// zero-skip snapshot, invoiced snapshot) — never re-queried per app.
+	priceBasisBP, err := s.store.PriceBasisBPForAccount(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("price basis lookup failed", err)
+	}
+
 	// A DOWNGRADE TAKES EFFECT AT THE BOUNDARY (migration 076, owner
 	// 2026-09-12): every scheduled downgrade of this account whose boundary
 	// is this one — or an earlier one a late cron never reached — moves the
@@ -291,7 +299,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// app's base — it rides per-module-instance grace timers (migration 033).
 	var advanceBase int64
 	for _, a := range apps {
-		advanceBase += usage.TermsFor(a.Plan).BaseFeeMicros // each app's own plan base (core-v2#1412)
+		advanceBase += usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(a.Plan).BaseFeeMicros) // each app's own plan base (core-v2#1412), payer-adjusted (billing-engine#258)
 	}
 	// MEMBERS leg (migration 077, owner 2026-09-13): the CLOSED period's
 	// extra-member fee — every member past the included count of the plan
@@ -493,7 +501,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 					PeriodStart: periodEnd,
 					PeriodEnd:   walletPeriodEnd,
 					ModuleCount: a.ModuleCount,
-					BaseMicros:  usage.TermsFor(a.Plan).BaseFeeMicros,
+					BaseMicros:  usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(a.Plan).BaseFeeMicros),
 				}); err != nil {
 					return nil, billing.Internal("advance base snapshot insert failed", err)
 				}
@@ -990,7 +998,7 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 			PeriodStart: periodEnd, // the new period opens where the closed one ends
 			PeriodEnd:   newPeriodEnd,
 			ModuleCount: a.ModuleCount,
-			BaseMicros:  usage.TermsFor(a.Plan).BaseFeeMicros, // the app's plan base; module overage rides per-module timers (migration 033)
+			BaseMicros:  usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(a.Plan).BaseFeeMicros), // the app's plan base, payer-adjusted (billing-engine#258); module overage rides per-module timers (migration 033)
 		}); err != nil {
 			return nil, billing.Internal("advance base snapshot insert failed", err)
 		}
