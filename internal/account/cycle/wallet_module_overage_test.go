@@ -29,10 +29,11 @@ import (
 // prorated overage (no boundary straddle), the cleanest amount to assert against.
 var overageInstalled = time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 
-// overageIncludedInstall anchors the five bundled-allowance timers STRICTLY BEFORE
-// overageInstalled, so the target timer lands at live-FIFO rank 5 ("over")
-// deterministically — a shared installed_at would leave the rank to random id
-// tie-breaks.
+// overageIncludedInstall anchors the ten bundled-allowance timers STRICTLY BEFORE
+// overageInstalled (this app's own DefaultPlan=Pro cutoff is 10,
+// billing-engine#202 PR-2c), so the target timer lands at live-FIFO rank 10
+// ("over") deterministically — a shared installed_at would leave the rank to
+// random id tie-breaks.
 var overageIncludedInstall = time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC)
 
 // (1) credits mode: the "over" timer's overage is DRAWN from a covering grant and
@@ -51,7 +52,7 @@ func TestChargeModuleOverage_CreditModeDrawsFromWallet(t *testing.T) {
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5) // occupy FIFO ranks 0-4
+	seedIncluded(store, acct, app, overageIncludedInstall, 10) // occupy FIFO ranks 0-4
 	over := seedTimer(store, acct, app, overageInstalled)
 
 	res, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
@@ -104,7 +105,7 @@ func TestChargeModuleOverage_StandardModeStaysOffTheWallet(t *testing.T) {
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 
 	res, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
@@ -141,7 +142,7 @@ func TestChargeModuleOverage_WalletFlagOffNeverReadsTheWallet(t *testing.T) {
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 
 	res, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
@@ -174,7 +175,7 @@ func TestChargeModuleOverage_CreditModeWalletShortUnsettledRetried(t *testing.T)
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 
 	first, err := svc.SweepModuleOverage(ctx, overageInstalled.AddDate(0, 0, 4))
@@ -209,7 +210,7 @@ func TestChargeModuleOverage_UnderLockAlreadyResolvedIsStaleNotDrawn(t *testing.
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 	// A concurrent sweep resolves the timer AFTER the top-of-charge pending re-check
 	// but before the wallet transaction's under-lock re-check.
@@ -244,7 +245,7 @@ func TestChargeModuleOverage_UnderLockAttemptedDefersOutOfTheWallet(t *testing.T
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 	store.beforeModuleOverageDraw = func(f *fakeStore, id uuid.UUID) {
 		f.timers[id].chargeAttemptedAt = overageInstalled.AddDate(0, 0, 4)
@@ -281,7 +282,7 @@ func TestChargeModuleOverage_ModeFlipsToStandardBeforeWalletLockDefersOutOfTheWa
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 	store.beforeModuleOverageDraw = func(f *fakeStore, _ uuid.UUID) {
 		f.walletMode = cycle.CreditBillingModeStandard
@@ -323,7 +324,7 @@ func TestChargeModuleOverage_WalletSettledThenStandardStripeAbortsStale(t *testi
 	ctx := context.Background()
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 
 	// The concurrent credits worker wallet-settles the timer between this (standard)

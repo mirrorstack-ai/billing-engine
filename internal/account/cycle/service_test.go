@@ -2096,7 +2096,10 @@ func (f *fakeStore) FreezeCombinedProrationAttempt(
 	if !hasPM {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailNoPaymentMethod, nil
 	}
-	timerIDs, err := f.CoCreatedOverModuleTimers(context.Background(), app.AccountID, appID, app.CreatedAt, usage.IncludedModules)
+	// billing-engine#202 PR-2c: this app's OWN plan allowance, never the retired
+	// account-wide pool (usage.IncludedModules) — mirrors the real pgxStore's
+	// FreezeCombinedProrationAttempt (store.go).
+	timerIDs, err := f.CoCreatedOverModuleTimers(context.Background(), app.AccountID, appID, app.CreatedAt, usage.ModulesIncludedCutoff(fakeEffectivePlan(app)))
 	if err != nil {
 		return cycle.CombinedProrationAttempt{}, cycle.StripeRailStale, err
 	}

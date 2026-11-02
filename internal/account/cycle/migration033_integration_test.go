@@ -54,7 +54,7 @@ func TestModuleOverageTimers_Integration_SynthesisFIFOAndSweep(t *testing.T) {
 	var overCand cycle.ModuleOverageCandidate
 	included := 0
 	for _, c := range cands {
-		rank, err := store.LiveModuleTimerRankBefore(ctx, c.AccountID, c.ID, c.InstalledAt)
+		rank, err := store.LiveModuleTimerRankBefore(ctx, c.AccountID, c.AppID, c.ID, c.InstalledAt)
 		require.NoError(t, err)
 		if rank < usage.IncludedModules {
 			included++

@@ -144,10 +144,14 @@ func TestListNewCreationCharges_IncludesSettledCustomDomainAtExactChargedLineAmo
 	require.Equal(t, charge.AmountMicros, charge.BaseFeeMicros)
 }
 
-// TestListNewCreationCharges_SettledBreakdown: a settled 7-module app splits its
+// TestListNewCreationCharges_SettledBreakdown: a settled 12-module app splits its
 // invoice total into base (the 'proration' snapshot) + add-ons, surfaces the app
-// name, and reports addon_module_count = max(0, 7 − IncludedModules) = 2 — with
-// base + addon == amount (the contract invariant).
+// name, and reports addon_module_count = max(0, 12 − DefaultPlan's cutoff(10)) = 2
+// — with base + addon == amount (the contract invariant). The settled read's
+// addonModuleCount always prices against DefaultPlan (addonModuleCount's doc:
+// SettledNewCreationChargeRaw carries no plan), which is Pro's cutoff of 10
+// modules per app (billing-engine#202; ModulesIncludedCutoff(PlanPro) == 10),
+// never the retired account-wide pool of 5.
 func TestListNewCreationCharges_SettledBreakdown(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()
@@ -158,11 +162,11 @@ func TestListNewCreationCharges_SettledBreakdown(t *testing.T) {
 	invAt := time.Date(2026, 5, 13, 0, 0, 0, 0, time.UTC)
 	app := uuid.New()
 	seedSettledApp(store, app, created, "in_brk", "INV-BRK", "paid", 22_000_000, invAt)
-	// 7 installed modules (2 over the bundled allowance) + a $16 base snapshot →
-	// the remaining $6 is the co-created over-module add-on component.
+	// 12 installed modules (2 over Pro's per-app allowance of 10) + a $16 base
+	// snapshot → the remaining $6 is the co-created over-module add-on component.
 	m := store.appMirrors[app]
 	m.Name = "Marketing Site"
-	m.ModuleCount = 7 // the fake maps this to created_module_count
+	m.ModuleCount = 12 // the fake maps this to created_module_count
 	store.appMirrors[app] = m
 	store.newAppProrationBase[app] = 16_000_000
 
@@ -176,7 +180,7 @@ func TestListNewCreationCharges_SettledBreakdown(t *testing.T) {
 	require.EqualValues(t, 22_000_000, c.AmountMicros)
 	require.EqualValues(t, 16_000_000, c.BaseFeeMicros)
 	require.EqualValues(t, 6_000_000, c.AddonMicros)
-	require.Equal(t, 2, c.AddonModuleCount, "7 − IncludedModules(5) = 2 add-on modules")
+	require.Equal(t, 2, c.AddonModuleCount, "12 − DefaultPlan's cutoff(10) = 2 add-on modules")
 	require.Zero(t, c.ProjectedAddonMicros, "settled rows never carry a pending add-on projection")
 	require.EqualValues(t, c.AmountMicros, c.BaseFeeMicros+c.AddonMicros, "base + addon == amount")
 }
@@ -226,8 +230,8 @@ func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	createdAt := time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)
 
 	app := uuid.New()
-	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Draft App", ModuleCount: 8}
-	store.coCreatedOverTimerCounts[app] = 5 // account FIFO, deliberately != per-app 8 − 5
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Draft App", ModuleCount: 13}
+	store.coCreatedOverTimerCounts[app] = 5 // account FIFO, deliberately != per-app 13 − 10
 
 	resp, err := newService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
 		OwnerUserID: owner, // current window
@@ -244,7 +248,7 @@ func TestListNewCreationCharges_PendingBreakdown(t *testing.T) {
 	require.EqualValues(t, expected, c.AmountMicros, "amount == exact base preview for pending")
 	require.NotEqualValues(t, usage.BaseFeeMicros, c.AmountMicros, "mid-period fixture must discriminate from the old flat preview")
 	require.Zero(t, c.AddonMicros, "the existing add-on field remains zero on a pending creation")
-	require.Equal(t, 3, c.AddonModuleCount, "8 − IncludedModules(5) = 3, known even while uncharged")
+	require.Equal(t, 3, c.AddonModuleCount, "13 − the app's own plan cutoff(10, DefaultPlan=Pro) = 3, known even while uncharged")
 	require.EqualValues(t, expectedAddon, c.ProjectedAddonMicros, "projection uses per-timer cents × account-FIFO count")
 }
 
@@ -264,7 +268,7 @@ func TestListNewCreationCharges_PendingProjectedAddonStraddle(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 
 	app := uuid.New()
-	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Boundary App", ModuleCount: 6}
+	store.appMirrors[app] = usage.AppMirrorInfo{CreatedAt: createdAt, Name: "Boundary App", ModuleCount: 11}
 	store.coCreatedOverTimerCounts[app] = 4 // earlier account timers push four co-created timers over
 
 	resp, err := newService(store).WithNow(func() time.Time { return now }).ListNewCreationCharges(context.Background(), usage.ListNewCreationChargesRequest{
@@ -281,7 +285,7 @@ func TestListNewCreationCharges_PendingProjectedAddonStraddle(t *testing.T) {
 	require.EqualValues(t, expectedBase, c.AmountMicros, "amount remains base-only")
 	require.EqualValues(t, expectedBase, c.BaseFeeMicros)
 	require.Zero(t, c.AddonMicros)
-	require.Equal(t, 1, c.AddonModuleCount, "the frozen per-app count remains 6 − 5")
+	require.Equal(t, 1, c.AddonModuleCount, "the frozen per-app count remains 11 − 10 (DefaultPlan=Pro's cutoff)")
 	require.EqualValues(t, int64(4)*perTimer, c.ProjectedAddonMicros, "FIFO over-count applies after per-timer cents rounding")
 }
 

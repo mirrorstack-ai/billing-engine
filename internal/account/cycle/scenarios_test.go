@@ -156,22 +156,23 @@ func TestScenario3_PoolOverFromDayZeroOneCombinedInvoice(t *testing.T) {
 	ctx := context.Background()
 	appID := uuid.New()
 
-	// 7 co-created modules → pool 7 > IncludedModules(5): 2 are "over" from day 0
+	// 12 co-created modules — this app's own DefaultPlan=Pro cutoff is 10
+	// (billing-engine#202 PR-2c) — so pool 12 > 10: 2 are "over" from day 0
 	// (installed AT created_at). Their grace elapses at the SAME instant as the
 	// app's creation grace, so they ride ONE combined charge with the base.
-	registerMirror(t, svc, user, appID, scenarioCreatedAt, 7)
+	registerMirror(t, svc, user, appID, scenarioCreatedAt, 12)
 
 	pro, err := svc.SweepCreationProrations(ctx, scenarioSweepAt)
 	require.NoError(t, err)
 	require.Equal(t, 1, pro.Proposed)
-	// The overage sweep AFTER the proposal finds the 5 included modules
+	// The overage sweep AFTER the proposal finds the 10 included modules
 	// resolvable with no charge and the 2 over ones already folded into the
 	// combined charge — it bills NOTHING on top.
 	over, err := svc.SweepModuleOverage(ctx, scenarioSweepAt)
 	require.NoError(t, err)
-	require.Equal(t, 7, over.Pending, "every co-created timer was evaluated")
+	require.Equal(t, 12, over.Pending, "every co-created timer was evaluated")
 	require.Equal(t, 0, over.Charged, "co-created over-modules already ride the combined charge")
-	require.Equal(t, 5, over.Included, "the 5 included modules resolve with no charge")
+	require.Equal(t, 10, over.Included, "the 10 included modules resolve with no charge")
 	require.Equal(t, 2, over.Skipped, "the 2 over ones defer to the combined charge")
 
 	// EXACTLY ONE sealed charge (never two), carrying THREE lines: base + 2
@@ -217,7 +218,7 @@ func TestScenario3_PoolOverFromDayZeroOneCombinedInvoice(t *testing.T) {
 		}
 		unresolved++
 	}
-	require.Equal(t, 5, included)
+	require.Equal(t, 10, included)
 	require.Equal(t, 2, unresolved, "the 2 over-modules ride the sealed combined charge")
 }
 
@@ -226,7 +227,8 @@ func TestScenario3_PoolOverFromDayZeroOneCombinedInvoice(t *testing.T) {
 
 func TestScenario3_ProrationPhase3FailureDoesNotMintSecondOverageInvoice(t *testing.T) {
 	// Reproduces the exact failure scenario, at the step that replaced the one it
-	// was written against. App A is created with 7 co-created modules (5 included
+	// was written against. App A is created with 12 co-created modules (10
+	// included — this app's own DefaultPlan=Pro cutoff, billing-engine#202 PR-2c —
 	// + 2 over). The combined creation charge's MONEY STEP succeeds — pre-cutover
 	// that was base + 2 overage items on ONE finalized Stripe invoice, now it is
 	// ONE sealed intent carrying the same three lines — and the terminal write
@@ -243,7 +245,7 @@ func TestScenario3_ProrationPhase3FailureDoesNotMintSecondOverageInvoice(t *test
 	svc, p := prorationSvc(store, sc)
 	ctx := context.Background()
 	appID := uuid.New()
-	registerMirror(t, svc, user, appID, scenarioCreatedAt, 7)
+	registerMirror(t, svc, user, appID, scenarioCreatedAt, 12)
 
 	// The combined charge seals; its terminal write fails after it.
 	store.errMarkProposed = errors.New("serialization failure (deadlock)")
@@ -271,9 +273,9 @@ func TestScenario3_ProrationPhase3FailureDoesNotMintSecondOverageInvoice(t *test
 	// ones back to the combined-charge path.
 	over, err := svc.SweepModuleOverage(ctx, scenarioSweepAt)
 	require.NoError(t, err)
-	require.Equal(t, 7, over.Pending, "all 7 reached the leg — the deferral is a decision, not a miss")
+	require.Equal(t, 12, over.Pending, "all 12 reached the leg — the deferral is a decision, not a miss")
 	require.Equal(t, 0, over.Charged, "co-created over-modules are NOT re-charged by Leg 1")
-	require.Equal(t, 5, over.Included, "the 5 included co-created timers resolve with no charge")
+	require.Equal(t, 10, over.Included, "the 10 included co-created timers resolve with no charge")
 	require.Equal(t, 2, over.Skipped, "the 2 over co-created timers are deferred to the combined charge")
 	require.Len(t, p.charges, 1,
 		"Leg 1 sealed nothing: a second charge for a co-created over-module bills that overage twice")
@@ -323,9 +325,10 @@ func TestScenario4_PoolCrossesFiveLaterPerModuleTimers(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	// 5 pre-existing included modules → the two newcomers land in the "over" bucket.
-	seedIncluded(store, acct, uuid.New(), timeUTC(2026, 5, 4, 0), 5)
+	// 10 pre-existing included modules (this app's own DefaultPlan=Pro cutoff,
+	// billing-engine#202 PR-2c) → the two newcomers land in the "over" bucket.
 	app := uuid.New()
+	seedIncluded(store, acct, app, timeUTC(2026, 5, 4, 0), 10)
 	timerA := seedTimer(store, acct, app, timeUTC(2026, 6, 10, 0))
 	timerB := seedTimer(store, acct, app, timeUTC(2026, 6, 11, 0))
 
@@ -483,10 +486,11 @@ func TestScenario6_BoundaryPrechargesOngoingOverModulesOnly(t *testing.T) {
 	store.stripeCustomer = "cus_s6"
 	app := seedApp(store, chargeAccount, 0, false) // one live pre-existing app → $20 base
 
-	// 5 included (ranks 0-4) + two ONGOING over-modules already charged in an
-	// earlier period (ranks 5-6) + one over-module STILL in its own grace (rank 7,
-	// never charged). Only the two ongoing ones are precharged for the new period.
-	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 5)
+	// 10 included (ranks 0-9, this app's own DefaultPlan=Pro cutoff,
+	// billing-engine#202 PR-2c) + two ONGOING over-modules already charged in an
+	// earlier period (ranks 10-11) + one over-module STILL in its own grace (rank
+	// 12, never charged). Only the two ongoing ones are precharged for the new period.
+	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 10)
 	ongoing1 := seedTimer(store, chargeAccount, app, timeUTC(2026, 5, 10, 0))
 	ongoing2 := seedTimer(store, chargeAccount, app, timeUTC(2026, 5, 11, 0))
 	// One over-module STILL inside its own grace (never charged) — excluded below.
@@ -556,9 +560,11 @@ func TestScenario6_ExpiredButUnresolvedTimerStillPrecharged(t *testing.T) {
 	store.stripeCustomer = "cus_d1"
 	app := seedApp(store, chargeAccount, 0, false)
 
-	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 5)
-	// Installed Jun 25 → grace expired Jun 28, BEFORE the Jul 1 boundary — but
-	// no sweep has resolved it yet (the boundary runs first in the beat).
+	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 10)
+	// Installed Jun 25 (rank 10, over — this app's own DefaultPlan=Pro cutoff is
+	// 10, billing-engine#202 PR-2c) → grace expired Jun 28, BEFORE the Jul 1
+	// boundary — but no sweep has resolved it yet (the boundary runs first in
+	// the beat).
 	seedTimer(store, chargeAccount, app, timeUTC(2026, 6, 25, 0))
 
 	sc := newFakeStripe()
@@ -579,9 +585,10 @@ func TestScenario6_D1dResolvedUnchargedOverModuleStillPrecharged(t *testing.T) {
 	store.stripeCustomer = "cus_c1"
 	app := seedApp(store, chargeAccount, 0, false)
 
-	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 5)
-	// Over-rank timer resolved terminally with NO charge (the D1d posture):
-	// grace_resolved = true, grace_charged_at never set.
+	seedIncluded(store, chargeAccount, app, timeUTC(2026, 5, 1, 0), 10)
+	// Over-rank timer (this app's own DefaultPlan=Pro cutoff is 10,
+	// billing-engine#202 PR-2c) resolved terminally with NO charge (the D1d
+	// posture): grace_resolved = true, grace_charged_at never set.
 	d1d := seedTimer(store, chargeAccount, app, timeUTC(2026, 5, 10, 0))
 	store.timers[d1d].graceResolved = true
 
