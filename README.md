@@ -510,7 +510,7 @@ billing-engine/
 │   └── shared/                      auth, buildinfo, config, signing, stripe
 ├── migrations/billing/              the database schema — see its README
 ├── scripts/                         local DB init and read-only SQL probes
-├── docs/                            DESIGN.md, VERIFICATION.md
+├── docs/                            DESIGN.md, VERIFICATION.md, price-lock-runbook.md
 ├── SECURITY.md
 ├── CLAUDE.md                        contributor and agent working rules
 └── README.md
@@ -563,6 +563,7 @@ what one would have to do.
 | [`SECURITY.md`](SECURITY.md) | reporting policy, the adversary model, trust assumptions, and the single register of known current gaps |
 | [`CLAUDE.md`](CLAUDE.md) | working rules for a contributor editing this repository |
 | [`migrations/billing/`](migrations/billing/) | the schema that exists today, plus its apply order |
+| [`docs/price-lock-runbook.md`](docs/price-lock-runbook.md) | the 2027-01-01 Annex 1 art 3 price-lock calendar: the monthly supplier-price check, the 45-day notice windows, and what the pinned fixture in `internal/account/usage/testdata/` checks against |
 
 Known defects are enumerated in exactly one place, the known-gaps register in
 [`SECURITY.md`](SECURITY.md). No other file here keeps a second list.
