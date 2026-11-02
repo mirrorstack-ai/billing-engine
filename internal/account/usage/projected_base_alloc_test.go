@@ -12,13 +12,18 @@ func appIDAt(n byte) uuid.UUID {
 	return uuid.UUID{n, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
 }
 
-// accountProjectedBase is the account line GetAccountBill publishes, written
-// out independently of the allocator so the test compares two derivations
-// rather than an implementation against itself.
-func accountProjectedBase(shares []AppRecurringFeeShare, baseFeeMicros int64) int64 {
+// accountProjectedBase is the account line GetAccountBill publishes for the
+// current period (accountbill.go: activatedBaseMicros + moduleOverageBlocksMicros
+// + domains), written out independently of the allocator so the test compares
+// two derivations rather than an implementation against itself. Since
+// billing-engine#202 PR-2c module overage is priced per app against that app's
+// OWN plan allowance, never pooled — so the account's block total is Σ each
+// share's OWN ModuleBlockMicros, not ModuleBlockMicros of the summed over-count
+// (that pooled shape no longer exists anywhere in the codebase).
+func accountProjectedBase(shares []AppRecurringFeeShare) int64 {
 	counts := RecurringFeeCountsOf(shares)
-	return int64(counts.Apps)*baseFeeMicros +
-		ModuleBlockMicros(int64(counts.ModuleOverages)) +
+	return activatedBaseMicros(shares) +
+		moduleOverageBlocksMicros(shares) +
 		int64(counts.CustomDomains)*DomainFeeMicros
 }
 
@@ -59,17 +64,20 @@ func TestProjectedBaseFeeByAppSumsToAccountTotal(t *testing.T) {
 			},
 		},
 		{
-			// Two apps two-over each: the ACCOUNT pays one block, so recomputing
-			// ceil() per app would bill two. Distribution cannot.
-			name: "one block split across two apps",
+			// Two apps two-over each: each app prices its OWN block against its
+			// OWN plan allowance (billing-engine#202 PR-2c) — two blocks total,
+			// never pooled into one shared account block.
+			name: "two apps each own their own block",
 			shares: []AppRecurringFeeShare{
 				{AppID: appIDAt(1), Activated: true, OverModuleCount: 2},
 				{AppID: appIDAt(2), Activated: true, OverModuleCount: 2},
 			},
 		},
 		{
-			// An indivisible split: $5 over three apps is 1666666.67 micros each.
-			name: "block indivisible by the over-count",
+			// Three apps one-over each: each still owns a WHOLE block on its own
+			// (ceil(1/5) = 1 per app) — three blocks total, never a fractional
+			// split of one shared block.
+			name: "three small over-counts each still cost a whole block",
 			shares: []AppRecurringFeeShare{
 				{AppID: appIDAt(1), Activated: true, OverModuleCount: 1},
 				{AppID: appIDAt(2), Activated: true, OverModuleCount: 1},
@@ -97,7 +105,7 @@ func TestProjectedBaseFeeByAppSumsToAccountTotal(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			want := accountProjectedBase(tc.shares, BaseFeeMicros)
+			want := accountProjectedBase(tc.shares)
 			got := sumAllocated(projectedBaseFeeByApp(tc.shares))
 			if got != want {
 				t.Fatalf("allocated %d micros, account line is %d", got, want)
@@ -128,21 +136,35 @@ func TestProjectedBaseFeeByAppPricesTheOwnerAccount(t *testing.T) {
 	}
 }
 
-// Distribution, not recomputation: an app's block money must follow its share
-// of the account's over-count, never a per-app ceil() of its own.
-func TestProjectedBaseFeeByAppDistributesRatherThanRecomputesBlocks(t *testing.T) {
+// Recomputation, not distribution (billing-engine#202 PR-2c): an app's block
+// money is ITS OWN ceil() against its OWN plan allowance, never a share of
+// some pooled account over-count. Two apps with equal over-counts bill EQUAL
+// blocks each, and the pair's total is TWO blocks, not the one block the old
+// pooled-account model would have split between them.
+func TestProjectedBaseFeeByAppPricesEachAppsBlocksIndependently(t *testing.T) {
 	first, second := appIDAt(1), appIDAt(2)
 	byApp := projectedBaseFeeByApp([]AppRecurringFeeShare{
 		{AppID: first, OverModuleCount: 2},
 		{AppID: second, OverModuleCount: 2},
 	})
 
-	// 4 over → ONE block ($5) for the account. Per-app ceil() would bill $5 each.
-	if got := byApp[first] + byApp[second]; got != ModuleBlockFeeMicros {
-		t.Fatalf("split 4 over-modules into %d micros, one block is %d", got, ModuleBlockFeeMicros)
+	// Each app's own 2-over costs ceil(2/5) = 1 block ($5) — TWO blocks total,
+	// never pooled into the ONE block the account-wide model would have billed.
+	if got := byApp[first] + byApp[second]; got != 2*ModuleBlockFeeMicros {
+		t.Fatalf("priced 2-over-each apps at %d micros total, want %d (two independent blocks)", got, 2*ModuleBlockFeeMicros)
 	}
 	if byApp[first] != byApp[second] {
-		t.Errorf("equal over-counts split unequally: %d vs %d", byApp[first], byApp[second])
+		t.Errorf("equal over-counts priced unequally: %d vs %d", byApp[first], byApp[second])
+	}
+
+	// Blocks aren't linear in over-count: one app with a 1-over costs the SAME
+	// whole block ($5) as a 5-over on that same app — the free headroom inside
+	// a block (ModuleBlockMicros' doc) — so doubling the over-count inside a
+	// block must never double the price.
+	lowByApp := projectedBaseFeeByApp([]AppRecurringFeeShare{{AppID: first, OverModuleCount: 1}})
+	highByApp := projectedBaseFeeByApp([]AppRecurringFeeShare{{AppID: first, OverModuleCount: 5}})
+	if lowByApp[first] != ModuleBlockFeeMicros || highByApp[first] != ModuleBlockFeeMicros {
+		t.Fatalf("1-over priced %d, 5-over priced %d, want both at the one-block price %d", lowByApp[first], highByApp[first], ModuleBlockFeeMicros)
 	}
 }
 

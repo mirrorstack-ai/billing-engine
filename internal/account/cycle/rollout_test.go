@@ -214,7 +214,10 @@ func TestChargeModuleOverage_RolloutShadowNeverDraws(t *testing.T) {
 		WithIntentProposer(p)
 
 	appID := uuid.New()
-	seedIncluded(store, accountID, appID, overageIncludedInstall, 5)
+	// overageIncludedInstall's doc (wallet_module_overage_test.go): this app's own
+	// DefaultPlan=Pro cutoff is 10 (billing-engine#202 PR-2c), not the retired
+	// account-wide pool of 5.
+	seedIncluded(store, accountID, appID, overageIncludedInstall, 10)
 	timerID := seedTimer(store, accountID, appID, overageInstalled)
 
 	resp, err := svc.SweepModuleOverage(

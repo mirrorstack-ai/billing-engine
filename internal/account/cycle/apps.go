@@ -67,9 +67,9 @@ type RegisterAppRequest struct {
 	// Plan is the plan the app is created ON (core-v2#1412): free | pro |
 	// business, empty = usage.DefaultPlan. A creation that chooses Free lands
 	// on it directly, under the same Free rules SetAppPlan applies (a usable
-	// card, the per-owner cap); business is refused like SetAppPlan refuses
-	// it. Only a genuinely NEW app_id reads it — a retry keeps the first
-	// registration's plan like every other frozen field.
+	// card, the per-owner cap); Business is accepted like every other plan
+	// (billing-engine#202 PR-2c). Only a genuinely NEW app_id reads it — a
+	// retry keeps the first registration's plan like every other frozen field.
 	Plan string `json:"plan,omitempty"`
 }
 
@@ -175,10 +175,6 @@ func (s *Service) RegisterApp(ctx context.Context, req RegisterAppRequest) (*Reg
 		p, ok := usage.ParsePlan(req.Plan)
 		if !ok {
 			return nil, billing.InvalidInput("plan must be one of free, pro, business")
-		}
-		if p == usage.PlanBusiness {
-			return nil, billing.PlanNotAvailable("plan business is not available yet: " +
-				"its per-app module allowance is not billed yet (billing-engine#202 PR-2c)")
 		}
 		plan = p
 	}

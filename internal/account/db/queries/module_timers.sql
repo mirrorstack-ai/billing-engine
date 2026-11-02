@@ -15,24 +15,21 @@ FROM ms_billing.app_module_overage_timers
 WHERE app_id = $1
   AND removed_at IS NULL;
 
--- LiveOverModuleTimerCountForApp attributes the account-wide pooled overage
--- back to one app for GetAppBill's current-period estimate. The charge spine's
--- canonical FIFO rule stays unchanged: rank every live timer across the whole
--- account, skip the first @included_modules rows, then count only the over rows
--- owned by @app_id. This makes the per-app bill reconcile with the account bill
--- without granting a second five-module allowance per app.
+-- LiveOverModuleTimerCountForApp attributes ONE APP'S OWN module overage for
+-- GetAppBill's current-period estimate (billing-engine#202 PR-2c): the app's
+-- live install timers are ranked in FIFO order INSIDE the app alone (never
+-- pooled against any other app on the account), and @included_modules is that
+-- app's own plan allowance (usage.ModulesIncludedCutoff), not the retired
+-- account-wide pool. Because the ranking window is already scoped to one app,
+-- "how many rank past the cutoff" is just the live count past it — no window
+-- function needed: for a single app's own chronological order, the Nth cutoff
+-- always leaves exactly max(0, count − N) rows after it.
 -- name: LiveOverModuleTimerCountForApp :one
-WITH live_fifo AS (
-    SELECT app_id,
-           row_number() OVER (ORDER BY installed_at, id) AS fifo_position
-    FROM ms_billing.app_module_overage_timers
-    WHERE account_id = @account_id::uuid
-      AND removed_at IS NULL
-)
-SELECT COALESCE(count(*), 0)::bigint AS over_count
-FROM live_fifo
-WHERE app_id = @app_id::uuid
-  AND fifo_position > @included_modules::int;
+SELECT GREATEST(COALESCE(count(*), 0)::bigint - @included_modules::int, 0)::bigint AS over_count
+FROM ms_billing.app_module_overage_timers
+WHERE account_id = @account_id::uuid
+  AND app_id = @app_id::uuid
+  AND removed_at IS NULL;
 
 -- InsertModuleOverageTimers inserts N identical install timers for one app, all
 -- anchored at the SAME installed_at / grace_expires_at (RegisterApp's K
@@ -201,16 +198,18 @@ SELECT (
 FROM ms_billing.app_module_overage_timers timer
 WHERE timer.id = $1;
 
--- LiveModuleTimerRankBefore returns how many of the account's currently-live
--- install timers order STRICTLY BEFORE a given (installed_at, id) under the FIFO
--- ordering (installed_at ASC, id ASC) — i.e. the target's 0-based FIFO rank.
--- rank < IncludedModules ⇒ "included"; rank >= IncludedModules ⇒ "over".
--- Computed fresh at every grace-check (never cached). Backed by
--- app_module_overage_timers_live_fifo_idx.
+-- LiveModuleTimerRankBefore returns how many of the APP'S (not the account's)
+-- currently-live install timers order STRICTLY BEFORE a given (installed_at,
+-- id) under the FIFO ordering (installed_at ASC, id ASC) — i.e. the target's
+-- 0-based FIFO rank WITHIN ITS OWN APP (billing-engine#202 PR-2c: the module
+-- allowance is per app, never an account-wide pool). rank < the app's plan
+-- ModulesIncluded ⇒ "included"; rank >= it ⇒ "over". Computed fresh at every
+-- grace-check (never cached). Backed by app_module_overage_timers_live_fifo_idx.
 -- name: LiveModuleTimerRankBefore :one
 SELECT COALESCE(count(*), 0)::bigint AS rank
 FROM ms_billing.app_module_overage_timers
 WHERE account_id = @account_id::uuid
+  AND app_id = @app_id::uuid
   AND removed_at IS NULL
   AND (installed_at < @installed_at::timestamptz
        OR (installed_at = @installed_at::timestamptz AND id < @timer_id::uuid));
@@ -264,13 +263,19 @@ WHERE id = @timer_id::uuid
   AND grace_resolved = false;
 
 -- CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario 6):
--- the count of the account's currently-live install timers that are "over"
--- (live-FIFO rank >= included) AND owed a FULL block precharge for the NEW period
--- [@period_end, next boundary) — ongoing over-modules continuing into it.
--- row_number() over the whole live set gives every live timer its 1-based FIFO
--- rank; rn > @included_modules is exactly the 0-based rank >= included ("over")
--- predicate. "over" is re-derived LIVE, so a charged timer that has since flipped
--- to "included" (an earlier install removed) is not counted.
+-- the count of ONE APP'S (billing-engine#202 PR-2c: never pooled across an
+-- account) currently-live install timers that are "over" (live-FIFO rank
+-- within the app >= that app's plan allowance) AND owed a FULL block precharge
+-- for the NEW period [@period_end, next boundary) — ongoing over-modules
+-- continuing into it. Because the live set here is already scoped to one app,
+-- the "over" count past the included cutoff is just the ongoing count past it
+-- (same reasoning as LiveOverModuleTimerCountForApp: a single app's own
+-- chronological order always leaves exactly max(0, count − N) rows after the
+-- Nth). "over" is re-derived LIVE, so a charged timer that has since flipped
+-- to "included" (an earlier install removed) is not counted. The caller sums
+-- ceil(over_i / ModuleBlockSize) PER APP before pricing blocks — pooling the
+-- raw counts first and blocking the sum would under-bill (block rounding is
+-- not additive across apps).
 --
 -- The coverage contract with the grace legs (review 2026-07-06, tightened in
 -- wave 2 D1) — a timer is "ongoing" for the new period iff BOTH of:
@@ -300,66 +305,51 @@ WHERE id = @timer_id::uuid
 -- over→included between this run and its own sweep keeps the one precharge —
 -- no refund (D1e); the next boundary excludes it by rank.
 -- name: CountOngoingOverModuleTimers :one
-SELECT COALESCE(count(*), 0)::bigint AS over_count
-FROM (
-    SELECT installed_at, grace_expires_at,
-           row_number() OVER (ORDER BY installed_at, id) AS rn
-    FROM ms_billing.app_module_overage_timers
-    WHERE account_id = @account_id::uuid
-      AND removed_at IS NULL
-) ranked
-WHERE rn > @included_modules::int
+SELECT GREATEST(COALESCE(count(*), 0)::bigint - @included_modules::int, 0)::bigint AS over_count
+FROM ms_billing.app_module_overage_timers
+WHERE account_id = @account_id::uuid
+  AND app_id = @app_id::uuid
+  AND removed_at IS NULL
   AND installed_at < @period_end::timestamptz
   AND grace_expires_at < @period_end::timestamptz;
 
 -- CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
 -- ids of the app's live, unresolved install timers whose install instant IS the
--- app's created_at (co-created at app creation) AND that are "over" (live-FIFO
--- rank >= included). Their grace elapses at the SAME instant as the app's own
--- creation grace, so the creation-proration charge folds them onto ONE invoice.
--- The rank window spans ALL the account's live timers (an included module still
--- occupies a FIFO slot), so rn > @included_modules is the 0-based rank >= included
--- "over" predicate; the outer filter keeps only this app's co-created, still-
--- unresolved rows. Ordered (installed_at, id) for a deterministic charge order.
+-- app's created_at (co-created at app creation) AND that are "over" against
+-- THAT APP'S OWN plan allowance (billing-engine#202 PR-2c: live-FIFO rank
+-- WITHIN THE APP, never pooled against any other app on the account). The rank
+-- window is scoped to @app_id alone, so rn > @included_modules is the 0-based
+-- rank >= included "over" predicate for this app's own ordering; the outer
+-- filter keeps only the co-created, still-unresolved rows. Ordered
+-- (installed_at, id) for a deterministic charge order.
 -- name: CoCreatedOverModuleTimers :many
 SELECT id
 FROM (
-    SELECT id, app_id, installed_at, grace_resolved,
+    SELECT id, installed_at, grace_resolved,
            row_number() OVER (ORDER BY installed_at, id) AS rn
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = @account_id::uuid
+      AND app_id = @app_id::uuid
       AND removed_at IS NULL
 ) ranked
-WHERE app_id = @app_id::uuid
-  AND installed_at = @created_at::timestamptz
+WHERE installed_at = @created_at::timestamptz
   AND grace_resolved = false
   AND rn > @included_modules::int
 ORDER BY installed_at, id;
 
--- CountLiveModuleTimersForAccount returns the account's currently-live
--- (removed_at IS NULL) install-timer count — the DISPLAY read behind
--- GetAccountBill's account-overage line under the per-module-instance model
--- (migration 033). The steady-state estimate $5 × ceil(max(0, live − included)/5) counts
--- the live "over" rows (the FIFO tail past the included 5); reading the timer
--- table (the overage model's source of truth) rather than SUM(apps.module_count)
--- keeps the shown overage tied to the rows the charge legs actually tier on.
--- ::bigint keeps the aggregate a non-nullable scalar.
--- name: CountLiveModuleTimersForAccount :one
-SELECT COALESCE(count(*), 0)::bigint AS live_count
-FROM ms_billing.app_module_overage_timers
-WHERE account_id = $1
-  AND removed_at IS NULL;
-
 -- PendingAddonModuleCharges is the pending ADD-ON half of the ListNewCreationCharges
 -- read (本期新建立): the account's live, unresolved install timers still INSIDE
 -- their own grace window as of @now — add-on charges that WILL fire (Leg 1 /
--- cycle/overage.go) but haven't yet — grouped per app. Only timers "over" per
--- the live FIFO rank (rn > @included_modules) are add-on charges at all.
--- Co-created timers (installed_at = the app's created_at) are EXCLUDED: their
--- pending charge is already represented by the app's own pending creation row
--- (the scenario-3 combined invoice bills them together), and a co-created timer
--- is in grace iff its app is — listing both would double-show one upcoming
--- charge. Deleted apps cannot appear (deletion soft-removes every timer).
+-- cycle/overage.go) but haven't yet — grouped per app. Only timers "over"
+-- against THAT APP'S OWN plan allowance (billing-engine#202 PR-2c: per-app
+-- live-FIFO rank, resolved via the @plans/@modules_included lookup —
+-- usage.ModuleAllowanceColumns — never pooled across the account) are add-on
+-- charges at all. Co-created timers (installed_at = the app's created_at) are
+-- EXCLUDED: their pending charge is already represented by the app's own
+-- pending creation row (the scenario-3 combined invoice bills them together),
+-- and a co-created timer is in grace iff its app is — listing both would
+-- double-show one upcoming charge. Deleted apps cannot appear (deletion
+-- soft-removes every timer).
 -- One row per app: the frozen name, the count of pending add-on timers, and the
 -- EARLIEST grace expiry as the charge ETA. Ordered soonest-first, app_id
 -- breaking ties for a deterministic scan.
@@ -370,13 +360,19 @@ SELECT ranked.app_id,
        min(ranked.grace_expires_at)::timestamptz AS charge_eta
 FROM (
     SELECT id, app_id, installed_at, grace_expires_at, grace_resolved,
-           row_number() OVER (ORDER BY installed_at, id) AS rn
+           row_number() OVER (PARTITION BY app_id ORDER BY installed_at, id) AS rn
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = @account_id::uuid
       AND removed_at IS NULL
 ) ranked
 JOIN ms_billing.apps a ON a.app_id = ranked.app_id
-WHERE ranked.rn > @included_modules::int
+JOIN (
+    SELECT p.plan, m.modules_included
+    FROM unnest(@plans::text[]) WITH ORDINALITY AS p(plan, ord)
+    JOIN unnest(@modules_included::int[]) WITH ORDINALITY AS m(modules_included, ord)
+      ON p.ord = m.ord
+) allowance ON allowance.plan = COALESCE(a.plan, 'pro')
+WHERE ranked.rn > allowance.modules_included
   AND ranked.grace_resolved = false
   AND ranked.grace_expires_at > @now::timestamptz
   AND ranked.installed_at <> a.created_at
@@ -408,11 +404,27 @@ ORDER BY min(ranked.grace_expires_at), ranked.app_id;
 -- '': their unit is the module fee, and none counts toward recurring.
 -- name: UnresolvedOneTimeCharges :many
 WITH live_timer_ranks AS (
-    SELECT id,
-           row_number() OVER (ORDER BY installed_at, id) AS rn
-    FROM ms_billing.app_module_overage_timers
-    WHERE account_id = @account_id::uuid
-      AND removed_at IS NULL
+    -- Per-app FIFO (billing-engine#202 PR-2c: never pooled across an
+    -- account) — the window is PARTITIONed BY app_id, and "over" is resolved
+    -- against THAT APP'S OWN plan allowance via the @plans/@modules_included
+    -- lookup (usage.ModuleAllowanceColumns), the one ladder every module-
+    -- overage query reads instead of a second copy embedded here.
+    SELECT ranked.id,
+           (ranked.rn > allowance.modules_included) AS is_over
+    FROM (
+        SELECT id, app_id,
+               row_number() OVER (PARTITION BY app_id ORDER BY installed_at, id) AS rn
+        FROM ms_billing.app_module_overage_timers
+        WHERE account_id = @account_id::uuid
+          AND removed_at IS NULL
+    ) ranked
+    JOIN ms_billing.apps a ON a.app_id = ranked.app_id
+    JOIN (
+        SELECT p.plan, m.modules_included
+        FROM unnest(@plans::text[]) WITH ORDINALITY AS p(plan, ord)
+        JOIN unnest(@modules_included::int[]) WITH ORDINALITY AS m(modules_included, ord)
+          ON p.ord = m.ord
+    ) allowance ON allowance.plan = COALESCE(a.plan, 'pro')
 ),
 frozen_headers AS (
     SELECT attempt.*,
@@ -524,7 +536,7 @@ dynamic_timers AS (
           )
           OR (
               timer.removed_at IS NULL
-              AND rank.rn > @included_modules::int
+              AND COALESCE(rank.is_over, false)
           )
       )
 ),

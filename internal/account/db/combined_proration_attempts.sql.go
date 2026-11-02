@@ -15,14 +15,14 @@ import (
 const coCreatedOverModuleTimersForAttempt = `-- name: CoCreatedOverModuleTimersForAttempt :many
 SELECT id
 FROM (
-    SELECT id, app_id, installed_at, grace_resolved, charge_attempted_at,
+    SELECT id, installed_at, grace_resolved, charge_attempted_at,
            row_number() OVER (ORDER BY installed_at, id) AS rn
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = $1::uuid
+      AND app_id = $2::uuid
       AND removed_at IS NULL
 ) ranked
-WHERE app_id = $2::uuid
-  AND installed_at = $3::timestamptz
+WHERE installed_at = $3::timestamptz
   AND grace_resolved = false
   AND charge_attempted_at IS NULL
   AND rn > $4::int
@@ -39,7 +39,10 @@ type CoCreatedOverModuleTimersForAttemptParams struct {
 // CoCreatedOverModuleTimersForAttempt selects the fresh ownership set at one
 // MVCC statement boundary. It deliberately excludes a timer whose standalone
 // Leg-1 marker already won; the subsequent row-lock/recheck query closes the
-// uncommitted-marker/removal race before the header is inserted.
+// uncommitted-marker/removal race before the header is inserted. The rank
+// window is scoped to @app_id alone (billing-engine#202 PR-2c: per-app live
+// FIFO, never pooled against any other app on the account), and
+// @included_modules is THIS app's own plan allowance (usage.ModulesIncludedCutoff).
 func (q *Queries) CoCreatedOverModuleTimersForAttempt(ctx context.Context, arg CoCreatedOverModuleTimersForAttemptParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, coCreatedOverModuleTimersForAttempt,
 		arg.AccountID,
