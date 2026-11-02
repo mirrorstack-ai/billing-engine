@@ -20,7 +20,7 @@ import (
 // the bill read, one per app, so a kind of "usage" here would double the
 // line on the printed statement.
 func loadFixedLines(path string) ([]statement.Line, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied -lines path, a CLI flag on a read-only local tool
 	if err != nil {
 		return nil, fmt.Errorf("read -lines file %q: %w", path, err)
 	}

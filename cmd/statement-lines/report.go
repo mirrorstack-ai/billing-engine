@@ -49,7 +49,7 @@ func printText(w io.Writer, r Report) {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
 			l.Kind, l.Subject, l.Group, usdString(l.AmountMicros), l.Note)
 	}
-	tw.Flush()
+	_ = tw.Flush()
 
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "USD subtotal:     %s\n", usdString(st.SubtotalUSDMicros))
