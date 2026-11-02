@@ -569,6 +569,22 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			if !priced {
 				return nil, billing.Internal("infra metric "+raw.Metric+" has no seeded price — migration 017 or 018 missing or rolled back", nil)
 			}
+		} else if !priced {
+			// A custom metric's price is the developer's, not the platform's, so
+			// failing the whole cycle over one developer's gap is disproportionate
+			// (billing-engine#121) — this line still bills 0. But the prior
+			// behavior here was fully silent: no log, no field, nothing on any
+			// surface. Surface it both ways — a log line for ops, and a
+			// structured entry on the summary for any caller (console, tests)
+			// that wants to flag it without scraping logs.
+			slog.WarnContext(ctx, "custom metric priced to 0 — no price resolved in module/version/model/catalog, billing this line as 0",
+				"app_id", raw.AppID, "module_id", raw.ModuleID, "metric", raw.Metric, "model", raw.Model)
+			summary.UnpricedCustomMetrics = append(summary.UnpricedCustomMetrics, UnpricedCustomMetric{
+				AppID:    raw.AppID,
+				ModuleID: raw.ModuleID,
+				Metric:   raw.Metric,
+				Model:    raw.Model,
+			})
 		}
 
 		// pricedQuantity is the quantity ACTUALLY fed into raw_cost/charged: for

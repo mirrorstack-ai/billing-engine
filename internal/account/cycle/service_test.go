@@ -2527,6 +2527,39 @@ func TestRollupPeriod_NullPriceZeroCharge(t *testing.T) {
 	require.EqualValues(t, 0, a.ChargedMicros)
 }
 
+func TestRollupPeriod_UnpricedCustomMetricIsDiagnosed(t *testing.T) {
+	// billing-engine#121: an unpriced CUSTOM metric must still bill 0 (failing
+	// the whole cycle over one developer's missing price is disproportionate —
+	// that's reserved-metric territory, see TestRollupPeriod_InfraMissingCatalogErrors),
+	// but it must never again reach charged_micros=0 with NOTHING on any
+	// surface to say so. RollupSummary.UnpricedCustomMetrics is that surface.
+	store := newFakeStore()
+	app, mod := uuid.New(), uuid.New()
+	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindCount, "42")}
+	// no price registered anywhere → unpriced
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, resp.Aggregates[0].ChargedMicros)
+	require.Len(t, resp.UnpricedCustomMetrics, 1, "an unpriced custom metric must be reported, not silently zero-charged")
+	diag := resp.UnpricedCustomMetrics[0]
+	require.Equal(t, app, diag.AppID)
+	require.Equal(t, mod, diag.ModuleID)
+	require.Equal(t, "orders.placed", diag.Metric)
+}
+
+func TestRollupPeriod_PricedCustomMetricIsNotDiagnosed(t *testing.T) {
+	// The backstop must not cry wolf on the ordinary, correctly-priced path.
+	store := newFakeStore()
+	app, mod := uuid.New(), uuid.New()
+	store.raws = []cycle.RawAggregate{rawAgg(app, mod, "orders.placed", usage.KindCount, "42")}
+	store.prices[priceKey(mod, "orders.placed")] = 1_000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	require.Empty(t, resp.UnpricedCustomMetrics)
+}
+
 func TestRollupPeriod_InfraMissingCatalogErrors(t *testing.T) {
 	// A reserved infra metric with NO seeded price (migration 017 missing or
 	// rolled back) MUST fail the cycle loudly — NOT silently price to 0 like an
