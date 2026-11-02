@@ -509,7 +509,7 @@ func httpStatusForError(err error) int {
 			return http.StatusConflict
 		case billing.CodePaymentRequired:
 			return http.StatusPaymentRequired
-		case billing.CodePlanNotAvailable, billing.CodePlanLimit:
+		case billing.CodePlanNotAvailable, billing.CodePlanLimit, billing.CodeCreditRailUnavailable:
 			return http.StatusConflict
 		case billing.CodeNotFound:
 			return http.StatusNotFound

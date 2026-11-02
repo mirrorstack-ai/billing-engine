@@ -47,6 +47,12 @@ const (
 	// this one says the CUSTOMER has used the plan up. api-platform surfaces
 	// it as HTTP 409 plan_limit.
 	CodePlanLimit Code = "PLAN_LIMIT"
+	// CodeCreditRailUnavailable refuses a credit purchase or auto top-up
+	// enable for an owner org linked to a distributor (ms_billing.org_distributors,
+	// migration 053): that org's customer pays the distributor's own store,
+	// never MirrorStack's merchant (core-v2#231 decision 8). See
+	// creditRailFor. api-platform maps it to a 4xx.
+	CodeCreditRailUnavailable Code = "CREDIT_RAIL_UNAVAILABLE"
 )
 
 // Error is the typed error returned by every service method. The RPC
@@ -120,6 +126,14 @@ func PlanNotAvailable(msg string) *Error {
 // moved.
 func PlanLimit(msg string) *Error {
 	return &Error{Code: CodePlanLimit, Message: msg}
+}
+
+// CreditRailUnavailable reports that the owner org cannot use Stripe for
+// credit purchases or auto top-up because it is linked to a distributor (see
+// CodeCreditRailUnavailable). Not retryable until the link is cleared or a
+// per-distributor rail exists.
+func CreditRailUnavailable(msg string) *Error {
+	return &Error{Code: CodeCreditRailUnavailable, Message: msg}
 }
 
 func StripeError(msg string, wrapped error) *Error {

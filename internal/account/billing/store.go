@@ -217,6 +217,10 @@ type Store interface {
 	UpsertOrgDistributor(ctx context.Context, customerOrgID, distributorOrgID uuid.UUID, source string) (string, error)
 	// DeleteOrgDistributor removes the link, reporting whether a row existed.
 	DeleteOrgDistributor(ctx context.Context, customerOrgID uuid.UUID) (bool, error)
+	// OrgDistributor reads the distributor linked to customerOrgID, if any
+	// (migration 053). Used by creditRailFor to refuse Stripe for a customer
+	// org that buys credits through its distributor instead.
+	OrgDistributor(ctx context.Context, customerOrgID uuid.UUID) (distributorOrgID uuid.UUID, found bool, err error)
 
 	// ListDistributorCustomerStates returns wallet snapshots for every related
 	// customer org, sorted deterministically by org id.
@@ -1074,6 +1078,11 @@ func (s *pgxStore) DeleteOrgDistributor(ctx context.Context, customerOrgID uuid.
 		return false, err
 	}
 	return n > 0, nil
+}
+
+func (s *pgxStore) OrgDistributor(ctx context.Context, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {
+	row, err := s.q.GetOrgDistributor(ctx, customerOrgID.String())
+	return uuidRowFound(row.DistributorOrgID, err)
 }
 
 func (s *pgxStore) DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {

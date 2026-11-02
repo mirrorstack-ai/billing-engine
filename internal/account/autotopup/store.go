@@ -71,6 +71,19 @@ func (s *pgxStore) Acquire(
 			return err
 		}
 
+		// A config saved before the org was linked to a distributor must never
+		// charge MirrorStack's own Stripe (core-v2#231 decision 8). Checked
+		// under the same account lock so a link made concurrently with this
+		// evaluation is never missed.
+		if account.OwnerOrgID.Valid {
+			orgID := uuid.UUID(account.OwnerOrgID.Bytes)
+			if _, err := qtx.GetOrgDistributor(ctx, orgID.String()); err == nil {
+				return nil
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+
 		if account.BillingMode != "credits" || account.CreditLimitMicros != 0 {
 			return nil
 		}
