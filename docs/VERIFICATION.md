@@ -510,11 +510,16 @@ amount may reach the executor. 🔴 **This is a countdown, not a wall, and it is
 red.** `internal/architecture/request_fields_allowlist.go` enumerates every
 caller-supplied money or authority field with a verdict: `ceiling` for a number
 that can only reduce what is chargeable, `pending-migration` for one that lets
-the caller decide something the engine must derive. Seven fields carry
+the caller decide something the engine must derive. Eight fields carry
 `pending-migration`, including `GrantCreditsRequest.AmountMicros` and its
 caller-asserted `Actor` (`internal/account/billing/types.go:465-466`, reached
-through `cmd/account-api/main.go:201`) and
-`StartCreditPurchaseRequest.AmountMicros`. `TestCallerSuppliedMoneyDebtOnlyShrinks`
+through `cmd/account-api/main.go:201`),
+`StartCreditPurchaseRequest.AmountMicros`, and
+`SetPayerPriceBasisRequest.PriceBasisBP` (migration 093, billing-engine#258):
+the operator states a payer's plan-fee/seat/add-on basis directly, bounded to
+[1, 10000] and reason-required with an audit row, but not yet derived from a
+reviewable, effective-dated, customer-disclosed policy object.
+`TestCallerSuppliedMoneyDebtOnlyShrinks`
 prevents the count rising. The metering request is the shape to aim at, carrying
 a metric and a value and no money (`internal/account/usage/types.go:72`, with
 `Metric` and `Value` at `:90-91`).

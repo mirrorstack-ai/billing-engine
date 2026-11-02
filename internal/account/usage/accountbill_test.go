@@ -593,6 +593,68 @@ func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 		"un-snapshotted current period estimates the pooled overage from the live pool 8 → 3 over → 1 block → $5")
 }
 
+// --- payer price basis (billing-engine#258) ---------------------------------
+
+// TestGetAccountBill_PayerPriceBasisDiscountsPlanFeeNotUsage pins the
+// fixtures from the issue (basis 6000 = 60%, D8-wholesale-60): a Pro app's
+// $20 base becomes $12, a Business app's $50 becomes $30, usage is untouched,
+// and a payer with NO price_basis row is unaffected even though this test's
+// OTHER store has one set to 6000 — the two never share state.
+func TestGetAccountBill_PayerPriceBasisDiscountsPlanFeeNotUsage(t *testing.T) {
+	proApp, businessApp := seqUUID(1), seqUUID(2)
+	created := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	usageLine := customLine(uuid.New(), "orders.placed", "", 1000)
+
+	buildStore := func() (*fakeStore, uuid.UUID, uuid.UUID) {
+		store := newFakeStore()
+		owner, account := uuid.New(), uuid.New()
+		store.accounts[owner] = account
+		store.appMirrors[proApp] = usage.AppMirrorInfo{Plan: usage.PlanPro, CreatedAt: created}
+		store.appMirrors[businessApp] = usage.AppMirrorInfo{Plan: usage.PlanBusiness, CreatedAt: created}
+		store.appBillRowsByApp[proApp] = []usage.AppMetricUsageRaw{usageLine}
+		return store, owner, account
+	}
+
+	// Control payer: no payer_price_basis row → DefaultPriceBasisBP (10000,
+	// list), byte-identical to pre-258 behavior.
+	listStore, listOwner, _ := buildStore()
+	listResp, err := newService(listStore).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: listOwner})
+	require.NoError(t, err)
+
+	// Discounted payer: 6000bp on ITS OWN account only.
+	discStore, discOwner, discAccount := buildStore()
+	discStore.priceBasisBP[discAccount] = 6000
+	discResp, err := newService(discStore).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: discOwner})
+	require.NoError(t, err)
+
+	byApp := func(resp *usage.GetAccountBillResponse, appID uuid.UUID) usage.AccountAppBill {
+		for _, a := range resp.Apps {
+			if a.AppID == appID {
+				return a
+			}
+		}
+		t.Fatalf("app %s missing from response", appID)
+		return usage.AccountAppBill{}
+	}
+
+	listPro, listBusiness := byApp(listResp, proApp), byApp(listResp, businessApp)
+	discPro, discBusiness := byApp(discResp, proApp), byApp(discResp, businessApp)
+
+	require.EqualValues(t, 20_000_000, listPro.BaseFeeMicros, "control: Pro at list is $20")
+	require.EqualValues(t, 50_000_000, listBusiness.BaseFeeMicros, "control: Business at list is $50")
+	require.EqualValues(t, 12_000_000, discPro.BaseFeeMicros, "Pro 20.00 -> 12.00 at 60%")
+	require.EqualValues(t, 30_000_000, discBusiness.BaseFeeMicros, "Business 50.00 -> 30.00 at 60%")
+
+	// Usage is NEVER multiplied by the basis: identical module-usage total on
+	// both payers for the identical input line.
+	require.Equal(t, listPro.ModuleUsageMicros, discPro.ModuleUsageMicros, "usage lines must be identical at 10000 and 6000")
+	require.NotZero(t, listPro.ModuleUsageMicros, "fixture must actually exercise a usage line")
+
+	// The projected (next-period) base total reflects the same discount.
+	require.Less(t, discResp.ProjectedBaseFeeTotalMicros, listResp.ProjectedBaseFeeTotalMicros,
+		"the discounted payer's projected recurring base must also be payer-adjusted")
+}
+
 func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
 	store := newFakeStore()
 	owner := uuid.New()

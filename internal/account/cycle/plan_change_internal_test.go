@@ -21,23 +21,23 @@ func TestUpgradeDeltaMicros_IsTheDifferenceNotTheNewPrice(t *testing.T) {
 	periodEnd := time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)
 	half := time.Date(2026, 6, 19, 15, 0, 0, 0, time.UTC) // 15 of 30 days left, the 19th inclusive
 
-	got, err := upgradeDeltaMicros(usage.PlanFree, usage.PlanPro, half, periodStart, periodEnd)
+	got, err := upgradeDeltaMicros(usage.PlanFree, usage.PlanPro, half, periodStart, periodEnd, usage.DefaultPriceBasisBP)
 	require.NoError(t, err)
 	require.EqualValues(t, 10_000_000, got, "(20 − 0) × 15/30")
 
-	got, err = upgradeDeltaMicros(usage.PlanPro, usage.PlanBusiness, half, periodStart, periodEnd)
+	got, err = upgradeDeltaMicros(usage.PlanPro, usage.PlanBusiness, half, periodStart, periodEnd, usage.DefaultPriceBasisBP)
 	require.NoError(t, err)
 	require.EqualValues(t, 15_000_000, got, "(50 − 20) × 15/30, not 50 × 15/30 = 25")
 
-	got, err = upgradeDeltaMicros(usage.PlanFree, usage.PlanBusiness, periodStart, periodStart, periodEnd)
+	got, err = upgradeDeltaMicros(usage.PlanFree, usage.PlanBusiness, periodStart, periodStart, periodEnd, usage.DefaultPriceBasisBP)
 	require.NoError(t, err)
 	require.EqualValues(t, 50_000_000, got, "the whole period left: the full difference")
 
-	got, err = upgradeDeltaMicros(usage.PlanFree, usage.PlanPro, periodEnd, periodStart, periodEnd)
+	got, err = upgradeDeltaMicros(usage.PlanFree, usage.PlanPro, periodEnd, periodStart, periodEnd, usage.DefaultPriceBasisBP)
 	require.NoError(t, err)
 	require.Zero(t, got, "nothing left of the period: nothing to charge")
 
-	_, err = upgradeDeltaMicros(usage.PlanPro, usage.PlanFree, half, periodStart, periodEnd)
+	_, err = upgradeDeltaMicros(usage.PlanPro, usage.PlanFree, half, periodStart, periodEnd, usage.DefaultPriceBasisBP)
 	require.Error(t, err, "a downgrade is never priced here")
 }
 
@@ -52,13 +52,13 @@ func TestCreationBaseSegments_ChainsFoldedChanges(t *testing.T) {
 	changed := time.Date(2026, 6, 19, 15, 0, 0, 0, time.UTC)
 	app := AppMirror{CreatedAt: created, Plan: usage.PlanPro}
 
-	segments, err := creationBaseSegments(app, nil)
+	segments, err := creationBaseSegments(app, nil, usage.DefaultPriceBasisBP)
 	require.NoError(t, err)
 	require.Equal(t, []usage.BaseSegment{{From: created, BaseMicros: 20_000_000}}, segments)
 
 	// Created on Free, folded up to Pro: the chain starts on the CREATED plan.
 	createdFree := AppMirror{CreatedAt: created, Plan: usage.PlanPro, CreatedPlan: usage.PlanFree}
-	segments, err = creationBaseSegments(createdFree, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanPro, EffectiveAt: changed}})
+	segments, err = creationBaseSegments(createdFree, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanPro, EffectiveAt: changed}}, usage.DefaultPriceBasisBP)
 	require.NoError(t, err)
 	require.Equal(t, []usage.BaseSegment{{From: created, BaseMicros: 0}, {From: changed, BaseMicros: 20_000_000}}, segments)
 
@@ -68,18 +68,18 @@ func TestCreationBaseSegments_ChainsFoldedChanges(t *testing.T) {
 	// window at Free because that is what apps.plan says now.
 	downgraded := AppMirror{CreatedAt: created, Plan: usage.PlanFree, CreatedPlan: usage.PlanPro}
 	boundary := time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)
-	segments, err = creationBaseSegments(downgraded, []PlanChange{{FromPlan: usage.PlanPro, ToPlan: usage.PlanFree, EffectiveAt: boundary, Kind: PlanChangeDowngrade}})
+	segments, err = creationBaseSegments(downgraded, []PlanChange{{FromPlan: usage.PlanPro, ToPlan: usage.PlanFree, EffectiveAt: boundary, Kind: PlanChangeDowngrade}}, usage.DefaultPriceBasisBP)
 	require.NoError(t, err)
 	require.Equal(t, []usage.BaseSegment{{From: created, BaseMicros: 20_000_000}, {From: boundary, BaseMicros: 0}}, segments)
 
-	_, err = creationBaseSegments(app, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed}})
+	_, err = creationBaseSegments(app, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed}}, usage.DefaultPriceBasisBP)
 	require.Error(t, err, "the chain does not start on the created plan")
-	_, err = creationBaseSegments(createdFree, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed}})
+	_, err = creationBaseSegments(createdFree, []PlanChange{{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed}}, usage.DefaultPriceBasisBP)
 	require.Error(t, err, "the chain ends on business but the row says pro")
 
 	_, err = creationBaseSegments(createdFree, []PlanChange{
 		{FromPlan: usage.PlanFree, ToPlan: usage.PlanBusiness, EffectiveAt: changed},
 		{FromPlan: usage.PlanFree, ToPlan: usage.PlanPro, EffectiveAt: changed.Add(time.Hour)},
-	})
+	}, usage.DefaultPriceBasisBP)
 	require.Error(t, err, "the second change does not start where the first ended")
 }

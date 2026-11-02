@@ -49,6 +49,7 @@ type fakeStore struct {
 	invoiceRows            []usage.InvoiceMirrorRaw             // unordered; ListInvoices applies the SQL contract
 	appMirrors             map[uuid.UUID]usage.AppMirrorInfo    // app_id → ms_billing.apps roster row (migration 027)
 	baseSnapshots          map[string]usage.AppBaseSnapshotInfo // app_id/period_start → charged-base snapshot (migration 028)
+	priceBasisBP           map[uuid.UUID]int32                  // accountID → payer_price_basis.price_basis_bp (migration 093); absent → DefaultPriceBasisBP
 
 	// ListNewCreationCharges fixtures (本期新建立). The Settled/Pending fakes
 	// RE-IMPLEMENT the SQL contract over appMirrors + these parallel maps (as the
@@ -198,6 +199,7 @@ func newFakeStore() *fakeStore {
 		newAppInvoices:              map[string]fakeInvoice{},
 		newAppProrationBase:         map[uuid.UUID]int64{},
 		coCreatedOverTimerCounts:    map[uuid.UUID]int{},
+		priceBasisBP:                map[uuid.UUID]int32{},
 	}
 }
 
@@ -711,6 +713,13 @@ func (f *fakeStore) AccountByOwner(_ context.Context, owner usage.Owner) (uuid.U
 	}
 	id, ok := f.accounts[owner.UserID]
 	return id, ok, nil
+}
+
+func (f *fakeStore) PriceBasisBPForAccount(_ context.Context, accountID uuid.UUID) (int32, error) {
+	if bp, ok := f.priceBasisBP[accountID]; ok {
+		return bp, nil
+	}
+	return usage.DefaultPriceBasisBP, nil
 }
 
 func (f *fakeStore) DefaultCardCountry(_ context.Context, accountID uuid.UUID) (string, bool, error) {

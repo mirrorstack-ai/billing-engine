@@ -102,4 +102,8 @@ var requestFieldVerdicts = map[string]struct {
 		VerdictPendingMigration,
 		"the caller overrides infrastructure prices. Same policy-store gap, and it feeds the 1.2x markup line whose displayed unit price does not reconcile to its charge.",
 	},
+	"SetPayerPriceBasisRequest.PriceBasisBP": {
+		VerdictPendingMigration,
+		"the caller states a payer's plan-fee/seat/add-on price basis directly (migration 093, billing-engine#258). Same policy-store gap as SetMetricVersionPricesRequest/SetInfraPriceOverridesRequest: pricing is not yet one complete, effective-dated, customer-disclosed policy. Bounded to [1, 10000] (never above list) and reason-required with an audit row, but the engine does not yet derive it from a reviewable, disclosed contract object.",
+	},
 }
