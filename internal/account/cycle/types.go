@@ -152,6 +152,27 @@ type RollupSummary struct {
 	// separately so a rollup can never accidentally add it to the bill by
 	// summing one field.
 	DevServedChargedMicros int64
+	// UnpricedCustomMetrics lists every non-reserved metric line that priced
+	// to 0 because MetricPriceMicros resolved no price anywhere in its
+	// fallback chain (billing-engine#121). A RESERVED metric in this state
+	// fails the whole rollup loud (service.go) because it signals a missing
+	// platform seed; a CUSTOM metric's missing price is the developer's and
+	// failing the whole cycle over one developer's gap is disproportionate —
+	// so the line still bills 0, but is reported here (and logged) instead of
+	// vanishing with no diagnostic on any surface.
+	UnpricedCustomMetrics []UnpricedCustomMetric
+}
+
+// UnpricedCustomMetric is one rollup line RollupPeriod could not price: a
+// non-reserved metric whose MetricPriceMicros call returned priced=false.
+// Reported rather than silently zero-charged (billing-engine#121).
+type UnpricedCustomMetric struct {
+	AppID    uuid.UUID
+	ModuleID uuid.UUID
+	Metric   string
+	// Model is set when the event carried the AI pricing dimension; "" for a
+	// plain custom metric with no per-model tier.
+	Model string
 }
 
 // ModuleSettlement is one accrued developer-settlement line — the in-memory

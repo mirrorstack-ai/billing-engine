@@ -718,6 +718,17 @@ func (s *Service) SetMetricDefinitions(ctx context.Context, req SetMetricDefinit
 		if m.Priced && m.UnitPriceMicros < 0 {
 			return nil, billing.InvalidInput("unit_price_micros must be non-negative")
 		}
+		// billing-engine#121: an unpriced custom metric used to bill 0 with no
+		// diagnostic anywhere. This is the declaration-time half of the fix — a
+		// loud-enough-to-notice, not loud-enough-to-block signal, since an
+		// observability-only metric legitimately declares Priced=false on
+		// purpose. The rollup backstop (service.go RollupPeriod) catches the
+		// case this can't: a metric declared Priced=true whose price later goes
+		// missing (model/catalog row deleted or never synced).
+		if !m.Priced {
+			slog.WarnContext(ctx, "metric declared without a price — usage recorded against it will bill 0 until a price is set",
+				"module_id", req.ModuleID, "metric", m.Metric)
+		}
 		defs = append(defs, MetricDeclaration{
 			ModuleID:        req.ModuleID,
 			Metric:          m.Metric,
