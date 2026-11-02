@@ -284,7 +284,7 @@ func ModulesIncludedCutoff(p Plan) int {
 func ModuleAllowanceColumns() (plans []string, modulesIncluded []int32) {
 	for _, p := range []Plan{PlanFree, PlanPro, PlanBusiness} {
 		plans = append(plans, string(p))
-		modulesIncluded = append(modulesIncluded, int32(ModulesIncludedCutoff(p)))
+		modulesIncluded = append(modulesIncluded, int32(ModulesIncludedCutoff(p))) //nolint:gosec // bounded by int32
 	}
 	return plans, modulesIncluded
 }
