@@ -32,6 +32,19 @@
 // is its production caller, and Router.Process (the HMAC path) remains the seam
 // its ~30 behavioural tests drive the handlers through.
 //
+// 🔴 NEWEBPAY'S FIRST ROUTE IS SANDBOX-ONLY, AND IT DOES NOT VERIFY EITHER.
+// Owner decision D515 (docs/newebpay-sandbox-topology.md) puts the first
+// NewebPay notice on POST /newebpay/sandbox/notify — a path chosen by the
+// route, not by anything in the body. This handler does not decrypt
+// TradeInfo, does not check TradeSha, does not hold the HashKey/HashIV, and
+// does not look anything up: it validates only that the required fields are
+// present and hands the raw notice to a NoticeSink (sink.go), which for the
+// real deployment is one SQS SendMessage (notify.go). Verification and
+// settlement belong to the notice worker downstream (N10,
+// billing-engine#296), not to this ingress. The live path, /newebpay/notify,
+// stays unrouted until core-v2#1849 — every request to it still gets the 501
+// below.
+//
 // Transport selection:
 //   - AWS_LAMBDA_FUNCTION_NAME set → lambda.Start(proxyHandler)
 //   - Otherwise → http.ListenAndServe on ACCOUNT_WEBHOOK_PORT (default 8092)
@@ -41,6 +54,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -48,6 +63,8 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/config"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/httputil"
@@ -67,13 +84,15 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 
 	if config.IsLambda() {
-		lambda.Start(proxyHandler())
+		lambda.Start(proxyHandler(newNoticeSink()))
 		return
 	}
 
 	port := config.Port("ACCOUNT_WEBHOOK_PORT", defaultLocalHTTPPort)
 	mux := http.NewServeMux()
-	mux.Handle(webhookPath, httpHandler())
+	sink := newNoticeSink()
+	mux.Handle(webhookPath, httpHandler(sink))
+	mux.Handle(sandboxNotifyPath, httpHandler(sink))
 	slog.Info("local HTTP mode", "port", port, "path", webhookPath)
 	// An explicit Server rather than ListenAndServe: the package-level helper
 	// sets no timeouts at all, so a client that opens a connection and never
@@ -91,17 +110,68 @@ func main() {
 	}
 }
 
+// newNoticeSink builds the NoticeSink this process uses: the real SQS sink
+// under Lambda, where NEWEBPAY_NOTICE_QUEUE_URL is required (provisioned by
+// the infra half of this tracker, mirrorstack-infra#435); an in-memory sink
+// everywhere else, so local runs and tests never touch AWS.
+func newNoticeSink() NoticeSink {
+	if !config.IsLambda() {
+		return &InMemorySink{}
+	}
+	queueURL := config.MustEnv("NEWEBPAY_NOTICE_QUEUE_URL")
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background())
+	if err != nil {
+		slog.Error("account-webhook: load aws config failed", "error", err)
+		os.Exit(1)
+	}
+	return NewSQSSink(awsCfg, queueURL)
+}
+
+// requestID returns req's API Gateway request id, falling back to a
+// generated one on the (untrusted-input, should-not-happen) chance it is
+// empty — every notice needs a request id to correlate send failures against.
+func requestID(req events.APIGatewayProxyRequest) string {
+	if id := req.RequestContext.RequestID; id != "" {
+		return id
+	}
+	return uuid.NewString()
+}
+
 // proxyHandler is the Lambda entrypoint. Uses APIGatewayProxyRequest (REST API
 // / v1 proxy shape) because the HTTP API in front of this function is pinned to
 // payload format 1.0 — see mirrorstack-infra stacks/billing.go.
 //
-// 🔴 501, NOT 404. A 404 says the address is wrong and invites a PSP engineer
-// to go hunting for the right path; 501 says the address is right and the
-// feature is not built yet, which is the true statement. It also keeps the URL
-// answering, so an endpoint registration made ahead of the integration does not
-// have to be re-created later.
-func proxyHandler() func(context.Context, events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+// 🔴 501, NOT 404, FOR EVERY PATH BUT ONE. A 404 says the address is wrong and
+// invites a PSP engineer to go hunting for the right path; 501 says the
+// address is right and the feature is not built yet, which is the true
+// statement for every path except the sandbox NewebPay notify route added by
+// billing-engine#295. It also keeps the URL answering, so an endpoint
+// registration made ahead of the integration does not have to be re-created
+// later.
+func proxyHandler(sink NoticeSink) func(context.Context, events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	return func(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+		if req.HTTPMethod == http.MethodPost && req.Path == sandboxNotifyPath {
+			body := []byte(req.Body)
+			if req.IsBase64Encoded {
+				decoded, err := base64.StdEncoding.DecodeString(req.Body)
+				if err != nil {
+					resp := jsonRouteResponse(http.StatusBadRequest, map[string]string{"error": "malformed body"})
+					return events.APIGatewayProxyResponse{
+						StatusCode: resp.status,
+						Headers:    map[string]string{"Content-Type": "application/json"},
+						Body:       string(resp.body),
+					}, nil
+				}
+				body = decoded
+			}
+			resp := handleSandboxNotify(ctx, sink, body, requestID(req))
+			return events.APIGatewayProxyResponse{
+				StatusCode: resp.status,
+				Headers:    map[string]string{"Content-Type": "application/json"},
+				Body:       string(resp.body),
+			}, nil
+		}
+
 		slog.InfoContext(ctx, "provider webhook received with no provider wired",
 			"path", req.Path, "method", req.HTTPMethod)
 		return events.APIGatewayProxyResponse{
@@ -112,8 +182,21 @@ func proxyHandler() func(context.Context, events.APIGatewayProxyRequest) (events
 	}
 }
 
-func httpHandler() http.Handler {
+func httpHandler(sink NoticeSink) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == sandboxNotifyPath {
+			// io.LimitReader caps what is actually read off the wire at
+			// maxNoticeBodyBytes+1 — an oversize body never gets buffered in
+			// full before computeSandboxNoticeResponse's own length check
+			// turns it into a 413.
+			body, _ := io.ReadAll(io.LimitReader(r.Body, maxNoticeBodyBytes+1))
+			resp := handleSandboxNotify(r.Context(), sink, body, uuid.NewString())
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.status)
+			_, _ = w.Write(resp.body)
+			return
+		}
+
 		slog.InfoContext(r.Context(), "provider webhook received with no provider wired",
 			"path", r.URL.Path, "method", r.Method)
 		httputil.JSON(w, http.StatusNotImplemented, map[string]string{"error": noProviderMessage})

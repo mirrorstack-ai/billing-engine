@@ -19,7 +19,7 @@ import (
 
 func TestHTTPHandler_AnswersNotImplemented(t *testing.T) {
 	rr := httptest.NewRecorder()
-	httpHandler().ServeHTTP(
+	httpHandler(&InMemorySink{}).ServeHTTP(
 		rr,
 		httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(`{"any":"payload"}`)),
 	)
@@ -37,7 +37,7 @@ func TestHTTPHandler_AnswersNotImplemented(t *testing.T) {
 }
 
 func TestProxyHandler_AnswersNotImplemented(t *testing.T) {
-	resp, err := proxyHandler()(context.Background(), events.APIGatewayProxyRequest{
+	resp, err := proxyHandler(&InMemorySink{})(context.Background(), events.APIGatewayProxyRequest{
 		Path:       webhookPath,
 		HTTPMethod: http.MethodPost,
 		Body:       `{"any":"payload"}`,
@@ -67,7 +67,7 @@ func TestStripeSignedDeliveryIsNotHonoured(t *testing.T) {
 	req.Header.Set("Stripe-Signature", "t=1,v1=whatever")
 	rr := httptest.NewRecorder()
 
-	httpHandler().ServeHTTP(rr, req)
+	httpHandler(&InMemorySink{}).ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusNotImplemented {
 		t.Fatalf("status: got %d, want %d — a signed Stripe delivery reached logic", rr.Code, http.StatusNotImplemented)
