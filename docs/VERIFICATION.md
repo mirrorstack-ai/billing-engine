@@ -419,7 +419,7 @@ you can act on. Everything here is **tier A**: clone, `go test`, disagree.
 `.github/workflows/ci.yml` applies and rolls back every migration, then runs
 `go vet ./...` (`:79`), `go build ./...` (`:82`), `go test -race -count=1 ./...`
 (`:92`) and `REQUIRE_DOCKER=1 go test -tags=integration ...` (`:104`).
-`internal/architecture` is an ordinary package of twenty-seven files, so those
+`internal/architecture` is an ordinary package of twenty-nine files, so those
 last two commands run every check below that has one. `REQUIRE_DOCKER` matters:
 without it a runner that lost Docker prints `ok` for a suite that started no
 container.
@@ -433,6 +433,8 @@ container.
 | build stamping | **enforced by the workflow** | `.github/workflows/publish.yml:41-42,57` |
 | database seal on sealed columns | **enforced (needs Docker)** | `internal/architecture/sealed_columns_integration_test.go` |
 | read-only role holds no write privilege | **enforced (needs Docker)** | `internal/architecture/billing_ro_grants_integration_test.go` |
+| cross-rail revenue views: billing_ro readable, evidence_records still not, FX/rail/class/MRR fixtures | **enforced (needs Docker)** | `internal/architecture/rev_views_integration_test.go` |
+| no Go charge path reads rev_fx_rates | **enforced** | `internal/architecture/rev_fx_guard_test.go` |
 | no caller-supplied money field | 🔴 **countdown, not a wall** | `internal/architecture/request_fields_allowlist.go` |
 | write-port isolation | 🔴 **one binary only** | `internal/architecture/shadow_isolation_test.go` |
 | one enclave owner per mutation credential | 🔴 **not built** | — |
