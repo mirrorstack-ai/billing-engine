@@ -119,6 +119,7 @@ func loadTx(ctx context.Context, tx pgx.Tx, rail Rail, railRef string, mode Mode
 		id            uuid.UUID
 		accountID     uuid.UUID
 		sellerID      *uuid.UUID
+		sourceKind    string
 		currency      string
 		netM          int64
 		taxM          int64
@@ -130,19 +131,19 @@ func loadTx(ctx context.Context, tx pgx.Tx, rail Rail, railRef string, mode Mode
 		createdAt     time.Time
 	)
 	err := tx.QueryRow(ctx, `
-		SELECT id, payer_account_id, seller_id, currency,
+		SELECT id, payer_account_id, seller_id, source_kind, currency,
 		       net_amount_micros, tax_amount_micros, gross_amount_micros,
 		       paid_at, buyer_snapshot, invoice_decision, decision_reason, created_at
 		  FROM ms_billing.payment_facts
 		 WHERE rail = $1 AND rail_ref = $2 AND mode = $3`,
 		string(rail), railRef, string(mode),
-	).Scan(&id, &accountID, &sellerID, &currency, &netM, &taxM, &grossM,
+	).Scan(&id, &accountID, &sellerID, &sourceKind, &currency, &netM, &taxM, &grossM,
 		&paidAt, &buyerSnapshot, &decision, &reason, &createdAt)
 	if err != nil {
 		return Fact{}, err
 	}
 	n := New{
-		Rail: rail, RailRef: railRef, Mode: mode,
+		Rail: rail, RailRef: railRef, Mode: mode, SourceKind: SourceKind(sourceKind),
 		PayerAccountID: accountID, SellerID: sellerID, Currency: currency,
 		NetAmountMicros: netM, TaxAmountMicros: taxM, GrossAmountMicros: grossM,
 		PaidAt: paidAt, BuyerSnapshot: buyerSnapshot,
