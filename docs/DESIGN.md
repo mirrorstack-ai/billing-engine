@@ -2038,10 +2038,29 @@ marked and the rest is left open rather than rounded up.
    dispute, chargeback, bad debt, write-off, negative balance, minimum
    collection and small balances. Blocks G2, G3 and G4: §6 cannot say what a
    negative total becomes.
-10. **Invoicing duties, Taiwan and NewebPay.** Invoice and e-invoice issuance,
-    numbering, retention and correction duties; the Taiwan entity, business tax
-    and TWD obligations; and which NewebPay products the merchant agreement
-    permits. Blocks G1 and G3: the second rail cannot be specified without them.
+10. **Invoicing duties.** Invoice and e-invoice issuance, numbering, retention
+    and correction duties; the Taiwan entity, business tax and TWD
+    obligations.
+
+    **The policy half is settled, and it shipped as ADR 0001
+    (billing-engine#285, 2026-11-04):** invoicing is a platform service,
+    separate from every payment rail — no NewebPay-specific or Stripe-specific
+    invoicing mechanism, ever. Each seller issues under its own 統編 and 字軌;
+    MirrorStack operates the system and by default pays the vendor; a payment
+    fact (not a rail) triggers issuance, synchronously, with no callback
+    route. See [`docs/adr/0001-taiwan-einvoice-platform-service.md`](adr/0001-taiwan-einvoice-platform-service.md)
+    for the full decision set, the UNVERIFIED MOF readings it rests on, and
+    `einvoice.EInvoicePolicyRevision`
+    (`internal/account/einvoice/policy.go`), the constant a later invoice row
+    must stamp.
+
+    🔴 **What that does not buy.** ADR 0001 and the buyer invoice profile
+    table (`ms_billing.buyer_invoice_profiles`, migration 093) are data and
+    policy only. No invoice-provider port exists (billing-engine#286), no
+    payment fact exists (billing-engine#313), and no invoice has ever been
+    issued (billing-engine#287) — sandbox and vendor stage only, and only
+    once the Taiwan entity exists. Which NewebPay products the merchant
+    agreement permits remains undecided and still blocks G1 and G3.
 11. **Currency.** Supported currencies, TWD price books, and whether any FX is
     offered as a customer line. Blocks G1, G2 and G4: §8 forbids implicit
     cross-currency entries.
