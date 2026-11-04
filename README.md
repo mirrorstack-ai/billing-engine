@@ -510,7 +510,8 @@ billing-engine/
 │   └── shared/                      auth, buildinfo, config, signing, stripe
 ├── migrations/billing/              the database schema — see its README
 ├── scripts/                         local DB init and read-only SQL probes
-├── docs/                            DESIGN.md, VERIFICATION.md
+├── docs/                            DESIGN.md, VERIFICATION.md,
+│                                     newebpay-sandbox-topology.md
 ├── SECURITY.md
 ├── CLAUDE.md                        contributor and agent working rules
 └── README.md
@@ -561,6 +562,7 @@ what one would have to do.
 | [`docs/VERIFICATION.md`](docs/VERIFICATION.md) | what you can check, how strong each check is, the charge-bundle contract, and what CI enforces against this tree |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | the target specification — invariants, the durable model, intent lifecycle, provider ports, the charge vocabulary, tax, ledger, and the migration gate. Read it as a specification to build, not as a description of production. |
 | [`SECURITY.md`](SECURITY.md) | reporting policy, the adversary model, trust assumptions, and the single register of known current gaps |
+| [`docs/newebpay-sandbox-topology.md`](docs/newebpay-sandbox-topology.md) | the sandbox-only NewebPay notify route: the exact host, who runs it, the flow from POST to settlement, and what is still unproven |
 | [`CLAUDE.md`](CLAUDE.md) | working rules for a contributor editing this repository |
 | [`migrations/billing/`](migrations/billing/) | the schema that exists today, plus its apply order |
 
