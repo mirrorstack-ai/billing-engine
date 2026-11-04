@@ -51,6 +51,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/einvoice"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/intentcutover"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
@@ -81,10 +82,11 @@ type rpcResponseError struct {
 
 // dispatcher is the action → handler dispatch shared by both transports.
 type dispatcher struct {
-	svc       *billing.Service
-	usageSvc  *usage.Service
-	budgetSvc *budget.Service
-	cycleSvc  *cycle.Service
+	svc         *billing.Service
+	usageSvc    *usage.Service
+	budgetSvc   *budget.Service
+	cycleSvc    *cycle.Service
+	einvoiceSvc *einvoice.Service
 }
 
 func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload json.RawMessage) (any, error) {
@@ -474,6 +476,24 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 	case "GetAIEnforcement":
 		return d.budgetSvc.GetAIEnforcement(ctx)
 
+	// Buyer invoice profile (billing-engine#285): rail-neutral 統編/carrier/
+	// 愛心碼 data, platform CONTROL-PLANE calls — api-platform proxies them
+	// (api-platform#1016). Pure data: einvoiceSvc never calls a vendor and
+	// issues nothing (#286, #287 build on top of this table).
+	case "GetBuyerInvoiceProfile":
+		var req einvoice.GetProfileRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.einvoiceSvc.GetProfile(ctx, req)
+
+	case "PutBuyerInvoiceProfile":
+		var req einvoice.PutProfileRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.einvoiceSvc.PutProfile(ctx, req)
+
 	default:
 		return nil, billing.InvalidInput("unknown action: " + action)
 	}
@@ -598,6 +618,7 @@ func buildDispatcher() *dispatcher {
 		))
 
 	budgetSvc := budget.NewService(budget.NewStore(pool))
+	einvoiceSvc := einvoice.NewService(einvoice.NewStore(pool))
 	// The ingest path fires the per-app budget hook best-effort on a fresh
 	// usage event (design §5 / §10).
 	usageStore := usage.NewStore(pool)
@@ -712,7 +733,7 @@ func buildDispatcher() *dispatcher {
 			"env", intentcutover.Env, "needs", intentcutover.Armed)
 	}
 
-	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc}
+	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc, einvoiceSvc: einvoiceSvc}
 }
 
 func buildRouter(d *dispatcher) *chi.Mux {
@@ -859,6 +880,9 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.SetBudget", makeHTTPHandler(d, "SetBudget"))
 		r.Post("/v1/billing.GetBudgetStatus", makeHTTPHandler(d, "GetBudgetStatus"))
 		r.Post("/v1/billing.GetBudgetAlerts", makeHTTPHandler(d, "GetBudgetAlerts"))
+		// Buyer invoice profile (billing-engine#285): data only, no vendor call.
+		r.Post("/v1/billing.GetBuyerInvoiceProfile", makeHTTPHandler(d, "GetBuyerInvoiceProfile"))
+		r.Post("/v1/billing.PutBuyerInvoiceProfile", makeHTTPHandler(d, "PutBuyerInvoiceProfile"))
 	})
 
 	// Meter-secret-gated ingest route. RecordUsage is the high-volume
