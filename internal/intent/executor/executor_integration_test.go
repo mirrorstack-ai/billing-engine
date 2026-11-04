@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
@@ -25,6 +26,14 @@ var (
 )
 
 const kindCycle intent.ChargeKind = intent.KindModuleUsage
+
+// testOrgPayerID is every executor fixture's payer id. It has to be a real
+// UUID string, not the "org-1" placeholder it replaced: billing-engine#313's
+// engine-settlement payment fact resolves the sealed payer to its
+// ms_billing.accounts row (AccountIDForPayer, matching ResolvePayer's own
+// owner_org_id::text = $2 lookup), and a UUID column can never compare equal
+// to a bare word. seedAccountForPayer seeds the matching account row.
+const testOrgPayerID = "11111111-1111-1111-1111-111111111111"
 
 // recordingCollector observes every dispatch, so "the executor did not
 // call the provider" is something the test can see rather than assume.
@@ -80,7 +89,7 @@ func sealedFixture(t *testing.T) intent.ChargeIntent {
 // needs a variant changes one field rather than copying twenty.
 func validExecutorDraft() intent.Draft {
 	return intent.Draft{
-		Payer:             intent.Subject{Kind: "org", ID: "org-1"},
+		Payer:             intent.Subject{Kind: "org", ID: testOrgPayerID},
 		Currency:          "USD",
 		Lines:             []intent.Line{intent.NewLine("quiz.render", "quiz-core", "1.4.0", 1_000, 25)},
 		Kind:              kindCycle,
@@ -100,17 +109,41 @@ func validExecutorDraft() intent.Draft {
 	}
 }
 
+// seedAccountForPayer inserts the ms_billing.accounts row a sealed fixture's
+// payer resolves to, so a settlement that reaches billing-engine#313's payment
+// fact (payer_account_id is a real FK) has somewhere to point.
+func seedAccountForPayer(t *testing.T, pool *pgxpool.Pool, payer intent.Subject) {
+	t.Helper()
+	var err error
+	switch payer.Kind {
+	case "org":
+		_, err = pool.Exec(context.Background(), `
+			INSERT INTO ms_billing.accounts (owner_kind, owner_org_id)
+			VALUES ('org', $1::uuid)
+			ON CONFLICT DO NOTHING`, payer.ID)
+	case "user":
+		_, err = pool.Exec(context.Background(), `
+			INSERT INTO ms_billing.accounts (owner_kind, owner_user_id)
+			VALUES ('user', $1::uuid)
+			ON CONFLICT DO NOTHING`, payer.ID)
+	default:
+		t.Fatalf("seedAccountForPayer: unknown subject kind %q", payer.Kind)
+	}
+	require.NoError(t, err)
+}
+
 // ready seeds an intent that every clause accepts, so each test can
 // break exactly one thing.
-func ready(t *testing.T, s *store.Store) intent.ChargeIntent {
+func ready(t *testing.T, s *store.Store, pool *pgxpool.Pool) intent.ChargeIntent {
 	t.Helper()
 	ctx := context.Background()
 	sealed := sealedFixture(t)
+	seedAccountForPayer(t, pool, sealed.Payer())
 	require.NoError(t, s.SaveIntent(ctx, sealed))
 
 	auth, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
 		ID: "auth-1", Scope: intent.ScopeStanding,
-		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
+		Subject:  intent.Subject{Kind: "org", ID: testOrgPayerID},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindCycle},
 		PerChargeCeiling: 1_000_000, PeriodCeiling: 5_000_000, FrequencyCeiling: 100, NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
 		TermsRevision: "terms-2026-01", PriceBook: "pb-2026-08",
@@ -125,7 +158,7 @@ func ready(t *testing.T, s *store.Store) intent.ChargeIntent {
 	// ClauseAuthorityEvidence refuses, which is the whole point of §12 item
 	// 16 option C piece 2: a standing authorization is not evidence of
 	// consent on its own.
-	issueAndAccept(t, s, auth, intent.Subject{Kind: "org", ID: "org-1"})
+	issueAndAccept(t, s, auth, intent.Subject{Kind: "org", ID: testOrgPayerID})
 
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
@@ -151,7 +184,7 @@ func newExecutor(t *testing.T, s *store.Store, c Collector, env Environment) *Ex
 func TestAPermittedIntentIsCollectedOnce(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "ref-1"}}
 	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(context.Background(), sealed.Digest())
@@ -168,6 +201,41 @@ func TestAPermittedIntentIsCollectedOnce(t *testing.T) {
 	require.Equal(t, "intent-"+sealed.Digest(), collector.calls[0].IdempotencyKey)
 }
 
+// billing-engine#313: a succeeded settlement must write one payment fact in
+// the same transaction as the outcome, so there is never a settled payment
+// without one.
+func TestASucceededSettlementWritesAPaymentFact(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	s := store.New(pool)
+	ctx := context.Background()
+	sealed := ready(t, s, pool)
+
+	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fact_test"}}
+	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
+	require.NoError(t, err)
+	require.True(t, out.Settled)
+
+	var (
+		rail, mode, sourceKind, decision, reason string
+		gross, net, tax                          int64
+	)
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT rail, mode, source_kind, invoice_decision, decision_reason,
+		       gross_amount_micros, net_amount_micros, tax_amount_micros
+		  FROM ms_billing.payment_facts
+		 WHERE rail_ref = $1`, "in_fact_test").
+		Scan(&rail, &mode, &sourceKind, &decision, &reason, &gross, &net, &tax))
+
+	require.Equal(t, "stripe", rail)
+	require.Equal(t, "live", mode)
+	require.Equal(t, "engine_settlement", sourceKind)
+	require.Equal(t, "not_applicable", decision)
+	require.Equal(t, "foreign_seller_usd", reason)
+	require.Equal(t, sealed.ProviderRemainderMicros(), gross)
+	require.Equal(t, sealed.Tax().AmountMicros, tax)
+	require.Equal(t, gross-tax, net)
+}
+
 // docs/DESIGN.md §4: "A refusal here mutates no provider." It must also
 // take no claim — a refused intent that is left claimed can never be
 // retried once the refusal is fixed.
@@ -175,7 +243,7 @@ func TestARefusalTouchesNothing(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
 	ctx := context.Background()
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	env := fullyEvidencedEnv()
 	env.BuildIdentified = false // VERIFICATION §2
@@ -202,7 +270,7 @@ func TestAnAmbiguousResultRetainsTheClaimAndRecordsNothing(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
 	ctx := context.Background()
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	collector := &recordingCollector{result: CollectResult{Ambiguous: true}}
 	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(ctx, sealed.Digest())
@@ -253,7 +321,7 @@ func TestAnAmbiguousResultRetainsTheClaimAndRecordsNothing(t *testing.T) {
 func TestATransportErrorIsTreatedAsAmbiguous(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	collector := &recordingCollector{err: errors.New("connection reset")}
 	out, err := newExecutor(t, s, collector, fullyEvidencedEnv()).Execute(context.Background(), sealed.Digest())
@@ -267,7 +335,7 @@ func TestATransportErrorIsTreatedAsAmbiguous(t *testing.T) {
 func TestConcurrentExecutorsCollectExactlyOnce(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	collector := &recordingCollector{
 		result: CollectResult{Succeeded: true, Reference: "ref"},
@@ -343,7 +411,7 @@ func TestAMissingAuthorizationRefuses(t *testing.T) {
 func TestAnEmptyEnvironmentRefuses(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
 	out, err := newExecutor(t, s, collector, Environment{}).Execute(context.Background(), sealed.Digest())
@@ -360,7 +428,7 @@ func TestATamperedIntentIsNeverEvaluated(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
 	ctx := context.Background()
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	_, err := pool.Exec(ctx,
 		`UPDATE ms_billing.charge_intent_lines SET quantity = 1, amount_micros = 25
@@ -526,7 +594,7 @@ func TestAnAuthorizationWithNoIssuedAcceptanceIsRefused(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	// Remove the challenge the fixture issued, leaving the authorization
 	// otherwise untouched — exactly the state of an authorization minted
@@ -557,7 +625,7 @@ func freshAuthorizationWithoutAcceptance(t *testing.T, s *store.Store) intent.Bi
 	t.Helper()
 	auth, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
 		ID: "auth-no-acceptance", Scope: intent.ScopeStanding,
-		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
+		Subject:  intent.Subject{Kind: "org", ID: testOrgPayerID},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindCycle},
 		PerChargeCeiling: 1_000_000, PeriodCeiling: 500_000_000, FrequencyCeiling: 100,
 		NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
