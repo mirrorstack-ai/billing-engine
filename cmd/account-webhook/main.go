@@ -34,16 +34,21 @@
 //
 // 🔴 NEWEBPAY'S FIRST ROUTE IS SANDBOX-ONLY, AND IT DOES NOT VERIFY EITHER.
 // Owner decision D515 (docs/newebpay-sandbox-topology.md) puts the first
-// NewebPay notice on POST /newebpay/sandbox/notify — a path chosen by the
-// route, not by anything in the body. This handler does not decrypt
-// TradeInfo, does not check TradeSha, does not hold the HashKey/HashIV, and
-// does not look anything up: it validates only that the required fields are
-// present and hands the raw notice to a NoticeSink (sink.go), which for the
-// real deployment is one SQS SendMessage (notify.go). Verification and
-// settlement belong to the notice worker downstream (N10,
-// billing-engine#296), not to this ingress. The live path, /newebpay/notify,
-// stays unrouted until core-v2#1849 — every request to it still gets the 501
-// below.
+// NewebPay notice on POST /newebpay/sandbox/notify, matched through the
+// provider-generic route table in notify.go (method+path -> provider+mode,
+// convention /{provider}/{mode}/notify, D549) rather than one hard-coded
+// path — a route a request matches, never anything in its body. This handler
+// does not decrypt TradeInfo, does not check TradeSha, does not hold the
+// HashKey/HashIV, and does not look anything up: it validates only that the
+// required fields are present and hands the raw notice to a NoticeSink
+// (sink.go), which for the real deployment is one SQS SendMessage. If
+// NEWEBPAY_NOTICE_QUEUE_URL is unset under Lambda — the infra half,
+// mirrorstack-infra#435, not deployed yet — newNoticeSink falls back to an
+// unconfiguredSink instead of exiting, and the route answers the same 501
+// every unwired path gets. Verification and settlement belong to the notice
+// worker downstream (N10, billing-engine#296), not to this ingress. The live
+// path, /newebpay/notify, is not in the route table and stays unrouted until
+// core-v2#1849 — every request to it still gets the 501 below.
 //
 // Transport selection:
 //   - AWS_LAMBDA_FUNCTION_NAME set → lambda.Start(proxyHandler)
@@ -111,14 +116,26 @@ func main() {
 }
 
 // newNoticeSink builds the NoticeSink this process uses: the real SQS sink
-// under Lambda, where NEWEBPAY_NOTICE_QUEUE_URL is required (provisioned by
+// under Lambda, once NEWEBPAY_NOTICE_QUEUE_URL names a queue (provisioned by
 // the infra half of this tracker, mirrorstack-infra#435); an in-memory sink
-// everywhere else, so local runs and tests never touch AWS.
+// for local runs and tests, which never touch AWS.
+//
+// 🔴 NEVER os.Exit ON A MISSING QUEUE URL. mirrorstack-infra#435 and this PR
+// can land in either order (D549 change request on billing-engine#295): if
+// the queue variable is still unset when this Lambda cold-starts, that is an
+// ordinary, expected, reversible state — not a reason to crash-loop the
+// whole billing-webhook Lambda, which answers every other provider's route
+// too. One WARN, and the sandbox notify route degrades to unconfiguredSink,
+// which makes it answer 501 like every other not-yet-wired path.
 func newNoticeSink() NoticeSink {
 	if !config.IsLambda() {
 		return &InMemorySink{}
 	}
-	queueURL := config.MustEnv("NEWEBPAY_NOTICE_QUEUE_URL")
+	queueURL := os.Getenv("NEWEBPAY_NOTICE_QUEUE_URL")
+	if queueURL == "" {
+		slog.Warn("NEWEBPAY_NOTICE_QUEUE_URL not set; sandbox notify route answers 501 until mirrorstack-infra#435 deploys the queue")
+		return unconfiguredSink{}
+	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background())
 	if err != nil {
 		slog.Error("account-webhook: load aws config failed", "error", err)
@@ -150,7 +167,7 @@ func requestID(req events.APIGatewayProxyRequest) string {
 // later.
 func proxyHandler(sink NoticeSink) func(context.Context, events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	return func(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-		if req.HTTPMethod == http.MethodPost && req.Path == sandboxNotifyPath {
+		if route, ok := matchNoticeRoute(req.HTTPMethod, req.Path); ok {
 			body := []byte(req.Body)
 			if req.IsBase64Encoded {
 				decoded, err := base64.StdEncoding.DecodeString(req.Body)
@@ -164,7 +181,7 @@ func proxyHandler(sink NoticeSink) func(context.Context, events.APIGatewayProxyR
 				}
 				body = decoded
 			}
-			resp := handleSandboxNotify(ctx, sink, body, requestID(req))
+			resp := handleNotify(ctx, sink, route, req.Path, body, requestID(req))
 			return events.APIGatewayProxyResponse{
 				StatusCode: resp.status,
 				Headers:    map[string]string{"Content-Type": "application/json"},
@@ -184,13 +201,13 @@ func proxyHandler(sink NoticeSink) func(context.Context, events.APIGatewayProxyR
 
 func httpHandler(sink NoticeSink) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == sandboxNotifyPath {
+		if route, ok := matchNoticeRoute(r.Method, r.URL.Path); ok {
 			// io.LimitReader caps what is actually read off the wire at
 			// maxNoticeBodyBytes+1 — an oversize body never gets buffered in
-			// full before computeSandboxNoticeResponse's own length check
-			// turns it into a 413.
+			// full before computeNoticeResponse's own length check turns it
+			// into a 413.
 			body, _ := io.ReadAll(io.LimitReader(r.Body, maxNoticeBodyBytes+1))
-			resp := handleSandboxNotify(r.Context(), sink, body, uuid.NewString())
+			resp := handleNotify(r.Context(), sink, route, r.URL.Path, body, uuid.NewString())
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(resp.status)
 			_, _ = w.Write(resp.body)

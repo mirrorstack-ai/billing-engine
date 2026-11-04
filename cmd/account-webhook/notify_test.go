@@ -46,6 +46,9 @@ func TestHTTPHandler_SandboxNotify_GoodBody_Answers200AndQueuesOne(t *testing.T)
 	if sink.Notices[0].Mode != "sandbox" {
 		t.Errorf("notice mode: got %q, want %q", sink.Notices[0].Mode, "sandbox")
 	}
+	if sink.Notices[0].Provider != "newebpay" {
+		t.Errorf("notice provider: got %q, want %q", sink.Notices[0].Provider, "newebpay")
+	}
 }
 
 func TestHTTPHandler_SandboxNotify_SinkFails_Answers503AndNoNoticeRecorded(t *testing.T) {
@@ -151,6 +154,62 @@ func TestHTTPHandler_WebhookPath_StillAnswers501(t *testing.T) {
 
 	if rr.Code != http.StatusNotImplemented {
 		t.Fatalf("status: got %d, want %d", rr.Code, http.StatusNotImplemented)
+	}
+}
+
+// --- route table: method+path yields provider and mode, not one hard-coded path ---
+
+func TestMatchNoticeRoute(t *testing.T) {
+	route, ok := matchNoticeRoute(http.MethodPost, sandboxNotifyPath)
+	if !ok {
+		t.Fatalf("expected a route match for %s %s", http.MethodPost, sandboxNotifyPath)
+	}
+	if route.Provider != "newebpay" || route.Mode != "sandbox" {
+		t.Errorf("route: got %+v, want {Provider:newebpay Mode:sandbox}", route)
+	}
+
+	if _, ok := matchNoticeRoute(http.MethodPost, "/newebpay/notify"); ok {
+		t.Error("the live path must not be in the route table yet (core-v2#1849)")
+	}
+	if _, ok := matchNoticeRoute(http.MethodGet, sandboxNotifyPath); ok {
+		t.Error("GET must not match the sandbox notify route")
+	}
+}
+
+// --- unconfigured sink: the notice queue isn't deployed yet ---
+
+func TestHTTPHandler_SandboxNotify_UnconfiguredSink_Answers501WithTodaysBody(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, sandboxNotifyPath, strings.NewReader(goodNoticeBody()))
+
+	httpHandler(unconfiguredSink{}).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status: got %d, want %d", rr.Code, http.StatusNotImplemented)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if body["error"] != noProviderMessage {
+		t.Errorf("error: got %q, want %q (today's body, like every other unwired path)", body["error"], noProviderMessage)
+	}
+}
+
+func TestProxyHandler_SandboxNotify_UnconfiguredSink_Answers501(t *testing.T) {
+	resp, err := proxyHandler(unconfiguredSink{})(context.Background(), events.APIGatewayProxyRequest{
+		Path:       sandboxNotifyPath,
+		HTTPMethod: http.MethodPost,
+		Body:       goodNoticeBody(),
+	})
+	if err != nil {
+		t.Fatalf("proxyHandler returned an error: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status: got %d, want %d — a missing queue URL must never exit or 503, only answer like an unwired path", resp.StatusCode, http.StatusNotImplemented)
+	}
+	if !strings.Contains(resp.Body, noProviderMessage) {
+		t.Errorf("body %q does not carry today's not-wired message", resp.Body)
 	}
 }
 

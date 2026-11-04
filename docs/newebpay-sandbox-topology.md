@@ -17,9 +17,16 @@ A sandbox notice reaches:
 - **who runs it:** MirrorStack. This is the `billing-webhook` Lambda behind a
   plain HTTP API, in the production AWS account. The route is implemented in
   this repo at `cmd/account-webhook` — see the route table in
-  `cmd/account-webhook/main.go` and the handler in
-  `cmd/account-webhook/notify.go`. The coordinator deploys it; nothing here is
-  agent-built infrastructure.
+  `cmd/account-webhook/notify.go` and the handler in the same file. The
+  coordinator deploys it; nothing here is agent-built infrastructure.
+- **port:** https, port 443. The limit this deployment is built against is
+  `mirrorstack-infra#435`'s own statement of it ("https, port 443"), not a
+  fresh reading of NewebPay's manual — the official NewebPay manual was not
+  reachable to confirm its wording ("the port must be 80 or 443") against
+  this deployment's narrower choice. **This is UNVERIFIED against the
+  distributor's own documentation.** Port 443 satisfies either wording, so
+  nothing here is at risk if the broader reading turns out to be the correct
+  one.
 
 Production has no real customers today, and all production use of this route
 is testing: sandbox payment notices are for test organizations only (D524).
@@ -48,13 +55,22 @@ hosts for different purposes, not two names for the same endpoint.
 2. The ingress (`cmd/account-webhook`) validates only that the required
    fields are present, does **not** decrypt `TradeInfo`, does **not** check
    `TradeSha`, and does **not** hold the HashKey/HashIV. It wraps the raw
-   fields in a `Notice{Mode: "sandbox", ...}` and hands it to a `NoticeSink`.
+   fields in a `Notice{Provider: "newebpay", Mode: "sandbox", ...}` — both
+   read from the route table that matched, never from the body — and hands it
+   to a `NoticeSink`. The table is provider-generic (`/{provider}/{mode}/notify`)
+   so a future provider on the same ingress, such as TapPay, is an added row,
+   not a second hard-coded path.
 3. The sink sends one message to a queue (the infra child of this tracker,
-   `mirrorstack-infra#435` — route, queue and ingress role). Until that queue
-   is deployed, this route runs against a fake sink in tests
-   (`cmd/account-webhook/sink.go`'s `InMemorySink`); nothing changes in the
-   ingress code when the real queue lands, only the environment variable that
-   names it.
+   `mirrorstack-infra#435` — route, queue and ingress role), named by the
+   `NEWEBPAY_NOTICE_QUEUE_URL` environment variable. In tests and local runs
+   this route is exercised against a fake sink instead
+   (`cmd/account-webhook/sink.go`'s `InMemorySink`). If this Lambda deploys
+   before `mirrorstack-infra#435` provisions that variable, it does not crash
+   or crash-loop: it logs one WARN at cold start and falls back to a
+   not-configured sink, and the sandbox route answers the same 501 every
+   other unwired path answers today, until the variable is set. Nothing
+   changes in the ingress code when the real queue lands, only that
+   environment variable.
 4. A separate notice worker (N10, billing-engine#296) drains the queue,
    decrypts and verifies the notice through the signing/verification library
    (N6, billing-engine#291) and the per-distributor key broker (N7,

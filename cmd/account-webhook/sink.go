@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,13 +12,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
-// Notice is the payload a NoticeSink forwards. Mode is set from the matched
-// path, never from the body — the ingress does not decrypt, verify, look
-// anything up, or hold any provider credential (see cmd/account-webhook/main.go
-// package doc). Fields carries only the six NewebPay MPG parameters this
-// handler reads: Status, MerchantID, TradeInfo, TradeSha, Version,
-// EncryptType.
+// Notice is the payload a NoticeSink forwards. Provider and Mode are set from
+// the matched route, never from the body — the ingress does not decrypt,
+// verify, look anything up, or hold any provider credential (see
+// cmd/account-webhook/main.go package doc). Fields carries only the six
+// NewebPay MPG parameters this handler reads: Status, MerchantID, TradeInfo,
+// TradeSha, Version, EncryptType.
 type Notice struct {
+	Provider   string            `json:"provider"`
 	Mode       string            `json:"mode"`
 	ReceivedAt time.Time         `json:"received_at"`
 	Fields     map[string]string `json:"fields"`
@@ -96,4 +98,22 @@ func (s *InMemorySink) Count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.Notices)
+}
+
+// errSinkNotConfigured is unconfiguredSink's Send error. The route handler
+// recognizes it and answers 501, the same as every other unwired path,
+// instead of the 503 a real send failure gets.
+var errSinkNotConfigured = errors.New("notice sink not configured")
+
+// unconfiguredSink stands in for the real SQS sink when
+// NEWEBPAY_NOTICE_QUEUE_URL is unset under Lambda — the case before the infra
+// half of this tracker (mirrorstack-infra#435) has deployed the queue. Using
+// config.MustEnv here would os.Exit(1) at cold start and crash-loop the
+// whole billing-webhook Lambda, which answers every other route too; this
+// sink instead lets the process start and the notify route degrade to the
+// same "not wired" answer the route gives for every other path today.
+type unconfiguredSink struct{}
+
+func (unconfiguredSink) Send(context.Context, Notice) error {
+	return errSinkNotConfigured
 }

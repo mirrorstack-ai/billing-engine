@@ -15,6 +15,34 @@ import (
 // the same 501 every other path gets.
 const sandboxNotifyPath = "/newebpay/sandbox/notify"
 
+// noticeRoute is what a route table entry yields: which provider sent the
+// notice and which mode it arrived on. Both are read from the match, never
+// from the request body — see handleNotify.
+type noticeRoute struct {
+	Provider string
+	Mode     string
+}
+
+// noticeRouteKey packs a method and path into the table's lookup key. The
+// convention every entry follows is /{provider}/{mode}/notify (D549).
+func noticeRouteKey(method, path string) string {
+	return method + " " + path
+}
+
+// noticeRoutes is the whole table. Only NewebPay's sandbox route is wired
+// today; TapPay will add its own entry later, once its flows are confirmed
+// (D549) — this table is what makes that an added row, not a second
+// hard-coded path check.
+var noticeRoutes = map[string]noticeRoute{
+	noticeRouteKey(http.MethodPost, sandboxNotifyPath): {Provider: "newebpay", Mode: "sandbox"},
+}
+
+// matchNoticeRoute looks up method and path in the route table.
+func matchNoticeRoute(method, path string) (noticeRoute, bool) {
+	route, ok := noticeRoutes[noticeRouteKey(method, path)]
+	return route, ok
+}
+
 // maxNoticeBodyBytes caps a notify body at 64 KB. A request over the cap is
 // answered 413 without the body being parsed.
 const maxNoticeBodyBytes = 64 * 1024
@@ -44,22 +72,25 @@ func jsonRouteResponse(status int, payload map[string]string) routeResponse {
 	return routeResponse{status: status, body: body}
 }
 
-// handleSandboxNotify is POST /newebpay/sandbox/notify, shared by the Lambda
-// handler and the local HTTP handler so both transports get identical
-// behaviour and identical test coverage.
+// handleNotify is the shared body for every route in noticeRoutes — today
+// only POST /newebpay/sandbox/notify — used by both the Lambda handler and
+// the local HTTP handler so both transports get identical behaviour and
+// identical test coverage.
 //
 // 🔴 NO DECRYPTION, NO VERIFICATION, NO LOOKUP, NO KEY. The ingress only
-// shapes the body into a Notice and hands it to sink. Mode is "sandbox"
-// because the path matched, never because of anything in the body.
-func handleSandboxNotify(ctx context.Context, sink NoticeSink, body []byte, requestID string) routeResponse {
-	resp := computeSandboxNoticeResponse(ctx, sink, body, requestID)
+// shapes the body into a Notice and hands it to sink. Provider and Mode come
+// from the matched route, never from anything in the body.
+func handleNotify(ctx context.Context, sink NoticeSink, route noticeRoute, path string, body []byte, requestID string) routeResponse {
+	resp := computeNoticeResponse(ctx, sink, route, body, requestID)
 	// 🔴 LOG ONLY THESE FIVE FIELDS. Never the body, TradeInfo or TradeSha —
 	// TradeInfo is the encrypted payload and TradeSha is its MAC over a
 	// shared HashKey/HashIV; logging either turns application logs into a
 	// place that shared secret's input leaks from.
-	slog.InfoContext(ctx, "newebpay sandbox notice received",
+	slog.InfoContext(ctx, "payment provider notice received",
+		"provider", route.Provider,
+		"mode", route.Mode,
 		"method", http.MethodPost,
-		"path", sandboxNotifyPath,
+		"path", path,
 		"body_bytes", len(body),
 		"status", resp.status,
 		"request_id", requestID,
@@ -67,7 +98,14 @@ func handleSandboxNotify(ctx context.Context, sink NoticeSink, body []byte, requ
 	return resp
 }
 
-func computeSandboxNoticeResponse(ctx context.Context, sink NoticeSink, body []byte, requestID string) routeResponse {
+func computeNoticeResponse(ctx context.Context, sink NoticeSink, route noticeRoute, body []byte, requestID string) routeResponse {
+	// The notice queue isn't deployed yet in this environment
+	// (mirrorstack-infra#435 not landed, or landed with the variable still
+	// unset): behave like every other not-yet-wired path rather than
+	// pretending the route works. See newNoticeSink and unconfiguredSink.
+	if _, ok := sink.(unconfiguredSink); ok {
+		return jsonRouteResponse(http.StatusNotImplemented, map[string]string{"error": noProviderMessage})
+	}
 	if len(body) > maxNoticeBodyBytes {
 		return jsonRouteResponse(http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds 64KB"})
 	}
@@ -87,7 +125,8 @@ func computeSandboxNoticeResponse(ctx context.Context, sink NoticeSink, body []b
 		}
 	}
 	notice := Notice{
-		Mode:       "sandbox",
+		Provider:   route.Provider,
+		Mode:       route.Mode,
 		ReceivedAt: time.Now().UTC(),
 		Fields:     fields,
 		RequestID:  requestID,
