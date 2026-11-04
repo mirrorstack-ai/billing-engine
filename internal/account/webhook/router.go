@@ -32,6 +32,10 @@ const (
 	StatusInvalidBody  Status = "invalid body"
 	StatusInternal     Status = "internal"
 	StatusDriftWarning Status = "drift_warning"
+	// StatusLivemodeMismatch is returned when the event's Livemode disagrees
+	// with the mode the configured Stripe key authenticates as. See
+	// WithExpectedLivemode.
+	StatusLivemodeMismatch Status = "livemode mismatch"
 )
 
 // Result is the outcome of processing a webhook. Status maps to the
@@ -293,7 +297,10 @@ type Router struct {
 	manualPaid     CreditPaidReconciler     // nil = manual-purchase paid reconciliation disabled
 	creditFailures CreditFailureReconciler  // nil = auto-top-up failure reconciliation disabled
 	manualFailures CreditFailureReconciler  // nil = manual-purchase failure reconciliation disabled
-	log            *slog.Logger
+	// expectedLivemode is the mode the configured Stripe key authenticates
+	// as. nil = the guard is disabled (no WithExpectedLivemode caller).
+	expectedLivemode *bool
+	log              *slog.Logger
 }
 
 // NewRouter wires a Router. All dependencies are required; nil
@@ -363,6 +370,21 @@ func (r *Router) WithManualCreditFailureReconciler(
 	reconciler CreditFailureReconciler,
 ) *Router {
 	r.manualFailures = reconciler
+	return r
+}
+
+// WithExpectedLivemode enables the livemode guard: every event's Livemode
+// must equal live, checked before the idempotency insert (see
+// processVerifiedEvent), or the event is rejected without dispatch. live
+// comes from the configured Stripe key's prefix
+// (billingstripe.ExpectedLivemodeFromKey) — never from the event itself,
+// since the whole point is to catch an event whose mode disagrees with the
+// key the Lambda would use to act on it.
+//
+// Unset (the zero Router), the guard is disabled — existing callers that
+// never call this keep today's behavior.
+func (r *Router) WithExpectedLivemode(live bool) *Router {
+	r.expectedLivemode = &live
 	return r
 }
 
@@ -461,6 +483,23 @@ func (r *Router) ProcessTrusted(ctx context.Context, event stripego.Event) Resul
 // 5xx compensation. Callers are responsible for establishing that event is
 // authentic before calling this.
 func (r *Router) processVerifiedEvent(ctx context.Context, event stripego.Event) Result {
+	// Livemode guard, BEFORE the idempotency insert: a mismatched event must
+	// leave no idempotency row (so it never dedupes a later, correctly-moded
+	// redelivery) and must never reach dispatch. A missing/omitted Livemode
+	// field decodes to false ("test"), which fails closed against a live key
+	// rather than being silently accepted. Never log the payload — only the
+	// envelope fields named below; this exact message is what
+	// mirrorstack-infra#440's alarm matches on.
+	if r.expectedLivemode != nil && event.Livemode != *r.expectedLivemode {
+		r.log.ErrorContext(ctx, "webhook livemode mismatch",
+			"event_id", event.ID,
+			"type", event.Type,
+			"event_livemode", event.Livemode,
+			"expected_livemode", *r.expectedLivemode,
+		)
+		return Result{HTTPStatus: 400, Status: StatusLivemodeMismatch}
+	}
+
 	// Idempotency: insert the event_id FIRST so concurrent duplicate deliveries
 	// of the same event serialize (only one wins the INSERT). A 5xx dispatch
 	// outcome is compensated below so the mark doesn't permanently dedupe an
