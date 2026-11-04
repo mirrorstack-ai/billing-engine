@@ -148,6 +148,38 @@ func (s *Store) PayerForAccount(ctx context.Context, accountID string) (intent.S
 // Only a non-deleted default is returned. Falling back to any card on file
 // would charge an instrument the customer did not choose, and a customer who
 // removed a card removed it.
+// AccountIDForPayer is PayerForAccount's inverse: given a sealed payer, it
+// returns the ms_billing.accounts row that is that payer's own account.
+//
+// A sealed ChargeIntent carries a payer SUBJECT (owner_user_id / owner_org_id
+// — see the header), never an accounts.id, so a writer that needs the account
+// a settlement belongs to (billing-engine#313's payment fact, which is keyed
+// to payer_account_id, a real FK) has to resolve it the same way ResolvePayer
+// resolves a provider identity: by owner column, LIMIT 1. Nothing in this
+// schema makes owner_user_id/owner_org_id unique, so — matching ResolvePayer
+// exactly — an owner with more than one account row resolves to one of them
+// deterministically rather than erroring; that is a pre-existing property of
+// the schema, not one this function introduces.
+func (s *Store) AccountIDForPayer(ctx context.Context, payer intent.Subject) (string, error) {
+	const query = `
+		SELECT a.id
+		  FROM ms_billing.accounts a
+		 WHERE a.owner_kind = $1
+		   AND ((a.owner_kind = 'user' AND a.owner_user_id::text = $2)
+		     OR (a.owner_kind = 'org'  AND a.owner_org_id::text  = $2))
+		 LIMIT 1`
+
+	var accountID string
+	err := s.pool.QueryRow(ctx, query, payer.Kind, payer.ID).Scan(&accountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("%w: %s", ErrNoSuchAccount, payer.String())
+	}
+	if err != nil {
+		return "", fmt.Errorf("account for payer: %w", err)
+	}
+	return accountID, nil
+}
+
 func (s *Store) ResolvePayer(ctx context.Context, payerKind, payerID string) (customerID, paymentMethodID string, err error) {
 	const query = `
 		SELECT a.stripe_customer_id, pm.stripe_payment_method_id

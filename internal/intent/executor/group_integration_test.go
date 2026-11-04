@@ -31,8 +31,8 @@ func TestAGroupSettlesAsOneCollection(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	a := readyN(t, s, 1)
-	b := readyN(t, s, 2)
+	a := readyN(t, s, pool, 1)
+	b := readyN(t, s, pool, 2)
 	require.NoError(t, s.SaveIntentGroup(ctx, "run:1", []string{a.Digest(), b.Digest()}))
 
 	collector := &groupCollector{result: CollectResult{Succeeded: true, Reference: "in_group"}}
@@ -66,8 +66,8 @@ func TestOneRefusedMemberRefusesTheWholeGroup(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	a := readyN(t, s, 3)
-	b := readyN(t, s, 4)
+	a := readyN(t, s, pool, 3)
+	b := readyN(t, s, pool, 4)
 
 	// Break exactly one member: its notice evidence goes away, so
 	// ClauseNoticeDelivered refuses it and nothing else.
@@ -104,8 +104,8 @@ func TestAnAmbiguousGroupRetainsEveryClaim(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	a := readyN(t, s, 5)
-	b := readyN(t, s, 6)
+	a := readyN(t, s, pool, 5)
+	b := readyN(t, s, pool, 6)
 
 	collector := &groupCollector{err: errors.New("timeout after dispatch")}
 	outs, err := newExecutor(t, s, &recordingCollector{}, fullyEvidencedEnv()).
@@ -134,8 +134,8 @@ func TestAnIncompleteGroupIsNotOffered(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	a := readyN(t, s, 7)
-	b := readyN(t, s, 8)
+	a := readyN(t, s, pool, 7)
+	b := readyN(t, s, pool, 8)
 	require.NoError(t, s.SaveIntentGroup(ctx, "run:2", []string{a.Digest(), b.Digest()}))
 
 	groups, err := s.PendingExecutionGrouped(ctx, 10)
@@ -164,7 +164,7 @@ func TestAnUngroupedIntentIsAGroupOfOne(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	solo := readyN(t, s, 9)
+	solo := readyN(t, s, pool, 9)
 
 	groups, err := s.PendingExecutionGrouped(ctx, 10)
 	require.NoError(t, err)
@@ -179,7 +179,7 @@ func TestAnIntentCannotJoinTwoGroups(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	only := readyN(t, s, 10)
+	only := readyN(t, s, pool, 10)
 	require.NoError(t, s.SaveIntentGroup(ctx, "run:3", []string{only.Digest()}))
 	// A second grouping is a no-op, not a second row.
 	require.NoError(t, s.SaveIntentGroup(ctx, "run:4", []string{only.Digest()}))
@@ -197,7 +197,7 @@ func TestAGroupingCannotBeEditedOrDeleted(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	one := readyN(t, s, 11)
+	one := readyN(t, s, pool, 11)
 	require.NoError(t, s.SaveIntentGroup(ctx, "run:5", []string{one.Digest()}))
 
 	for name, stmt := range map[string]string{

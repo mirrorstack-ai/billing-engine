@@ -1576,6 +1576,46 @@ It is created only after the relevant ledger transition commits. The bundle you
 verify against it is defined once, in
 [`VERIFICATION.md` §3](VERIFICATION.md#3-canonical-charge-bundle).
 
+### The payment fact — built, and deliberately a sixth, separate record
+
+🔴 Everything in the table above is this section's target shape, and most rows
+say `(unbuilt)`. `ms_billing.payment_facts` (migration 093,
+`internal/shared/paymentfact`, billing-engine#313) is NOT one of those rows —
+it answers a sixth, narrower question none of the five above is asked to
+answer: **did some rail settle this payment, in a form the invoice layer
+(billing-engine#286/#287) can issue off of without knowing which rail paid?**
+Keep it apart from the other three records that can look similar at a glance:
+
+- **`evidence.KindSettlement`** (`internal/intent/evidence`, built) is the
+  sealed-intent rail's own signed trace of its decision — it exists whether or
+  not the attempt collected, and it is scoped to the intent executor, which
+  `cmd/intent-executor` still refuses to start (CLAUDE.md's banner). A payment
+  fact exists only once money actually moved, and every rail writes one, not
+  only the intent rail.
+- **A `credit_ledger` row** (migration 048, built) is MirrorStack's own
+  balance-sheet entry — a wallet credit or draw. It is keyed on this schema's
+  own `idempotency_key`/`stripe_invoice_id`, which is exactly what a NewebPay
+  or TapPay notice does not carry (billing-engine#296). A payment fact's
+  identity is the RAIL's own reference, so a notice with no event id can still
+  replay into one row.
+- **`LedgerTransaction`** in the table above is this section's TARGET
+  replacement for `credit_ledger`, still unbuilt. A payment fact does not wait
+  for it: it is written off of whatever already records a settled payment by
+  rail with a stable reference (the assumption billing-engine#313 states and
+  this tree currently satisfies via the intent executor's own settlement claim
+  and `credit_ledger`), and it will sit beside `LedgerTransaction` the same way
+  it sits beside `credit_ledger` today.
+
+A payment fact is written in the SAME transaction as the step that makes the
+money real (the intent executor's settle step today; a rail's notice worker or
+an operator's paid-mark once billing-engine#296/#267 land), is unique on
+(`rail`, `rail_ref`, `mode`) so a rail's at-least-once notice replays into one
+row, and is append-only except its `invoice_decision`/`decision_reason` pair,
+which the invoice worker (#287) moves once. It never calls a vendor and
+answers on no public route. Revenue views over the ledger (D548) may read
+facts but must exclude or mark `mode = 'sandbox'` rows (D524) — a sandbox
+payment must never look like revenue.
+
 ### The ledger is append-only, and its writer is not a route
 
 Three properties of a `LedgerTransaction` carry the weight. Its entries' signed
