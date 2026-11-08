@@ -94,6 +94,12 @@ type Notifier struct {
 	owners  OwnerResolver
 	httpc   *http.Client
 	log     *slog.Logger
+
+	// 14-day unpaid notice (billing-engine#330), all behind UNPAID_GRACE: the
+	// episode store, the flag override and the clock. See episodes.go.
+	episodes EpisodeStore
+	grace    *bool
+	now      func() time.Time
 }
 
 // NewNotifier wires a Notifier. baseURL/secret may be empty (disabled mode);
@@ -141,7 +147,7 @@ func NewNotifierFromEnvWithStatus(pool *pgxpool.Pool, status StatusReader, log *
 	if url == "" || secret == "" {
 		log.Info("serving-block notifier disabled (APPLICATIONS_INTERNAL_URL / INTERNAL_SECRET unset) — standing transitions will not push manifest rewrites")
 	}
-	return NewNotifier(url, secret, status, NewStore(pool), log)
+	return NewNotifier(url, secret, status, NewStore(pool), log).WithEpisodes(NewEpisodeStore(pool))
 }
 
 // NotifyStripeCustomer re-evaluates and pushes the verdict for the account
@@ -223,6 +229,10 @@ func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve fu
 		return false, err
 	}
 
+	if n.GraceActive() {
+		n.trackEpisode(ctx, owner, verdict, refKind, refID)
+	}
+
 	body := servingBlockBody{Blocked: verdict.Blocked}
 	if owner.OrgID != uuid.Nil {
 		body.OwnerOrgID = owner.OrgID.String()
@@ -240,11 +250,18 @@ func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve fu
 }
 
 func (n *Notifier) post(ctx context.Context, body servingBlockBody) error {
+	return n.postJSON(ctx, servingBlockPath, body)
+}
+
+// postJSON POSTs a JSON body to an api-platform internal route with the shared
+// secret; any non-2xx is an error (api-platform answers 502 on a send failure so
+// a retry works).
+func (n *Notifier) postJSON(ctx context.Context, path string, body any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.baseURL+servingBlockPath, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -258,7 +275,7 @@ func (n *Notifier) post(ctx context.Context, body servingBlockBody) error {
 	// Drain so the connection can be reused; the body itself is not consumed.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("serving-block endpoint returned %d", resp.StatusCode)
+		return fmt.Errorf("%s returned %d", path, resp.StatusCode)
 	}
 	return nil
 }

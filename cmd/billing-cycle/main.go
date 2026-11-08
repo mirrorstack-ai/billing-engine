@@ -104,9 +104,10 @@ func main() {
 	}
 
 	svc := buildService()
+	unpaid := buildUnpaidSweeper()
 
 	if config.IsLambda() {
-		lambda.Start(handler(svc))
+		lambda.Start(handler(svc, unpaid))
 		return
 	}
 
@@ -309,6 +310,36 @@ func runProrationSweep(ctx context.Context, svc *cycle.Service, at time.Time) bo
 		"as_of", at, "pending", sweep.Pending, "charged", sweep.Charged,
 		"skipped", sweep.Skipped, "failed", sweep.Failed)
 	return sweep.Failed > 0
+}
+
+// unpaidSweeper is the 14-day unpaid-notice enforcement pass
+// (billing-engine#330); *standing.Notifier satisfies it.
+type unpaidSweeper interface {
+	SweepUnpaidEpisodes(ctx context.Context) standing.SweepResult
+}
+
+// buildUnpaidSweeper returns the sweeper, or nil while UNPAID_GRACE is not "on"
+// (the default): flag off builds no pool and does no sweep work. The notifier is
+// the same wallet-less standing graph the webhook path uses.
+func buildUnpaidSweeper() unpaidSweeper {
+	if os.Getenv("UNPAID_GRACE") != "on" {
+		return nil
+	}
+	pool := config.MustPgxPool()
+	status := billing.NewService(billing.NewStore(pool), nil, "")
+	return standing.NewNotifierFromEnvWithStatus(pool, status, slog.Default())
+}
+
+// runUnpaidGraceSweep runs after the cycle: it retries unsent notices and pushes
+// the blocked verdict for episodes whose 14 days are over. Idempotent, batch
+// bounded, never aborts the run (failures are logged inside the sweep).
+func runUnpaidGraceSweep(ctx context.Context, s unpaidSweeper) {
+	if s == nil {
+		return
+	}
+	res := s.SweepUnpaidEpisodes(ctx)
+	slog.InfoContext(ctx, "unpaid-grace sweep complete",
+		"candidates", res.Candidates, "blocked", res.Blocked, "failed", res.Failed)
 }
 
 // buildService wires the pgxpool + Stripe client into the cycle Service. The
@@ -537,7 +568,7 @@ func intentCutoverDecision(flag string) (arm bool, err error) {
 // closes each card-bound account's just-ended ANCHORED period as of the event
 // time. Firing daily is idempotent — an account is only charged on/after its own
 // close day, and never twice for the same period.
-func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) error {
+func handler(svc *cycle.Service, unpaid unpaidSweeper) func(context.Context, events.CloudWatchEvent) error {
 	return func(ctx context.Context, ev events.CloudWatchEvent) error {
 		at := ev.Time
 		if at.IsZero() {
