@@ -129,6 +129,21 @@ type Store interface {
 	// amount_due > 0) mirror invoices — GetServiceStatus's gate-4 signal
 	// (blocked at >= eligibility.MaxUnpaidInvoices).
 	UnpaidInvoiceCount(ctx context.Context, accountID uuid.UUID) (int, error)
+	// OpenUnpaidEpisode returns the account's open unpaid episode (closed_at
+	// IS NULL), found=false when there is none. GetServiceStatus reads it for the
+	// 14-day grace (billing-engine#329); billing-engine#330 writes it.
+	OpenUnpaidEpisode(ctx context.Context, accountID uuid.UUID) (UnpaidEpisode, bool, error)
+	// OpenUnpaidEpisodeIfNone opens an episode started at `at` unless one is
+	// already open (idempotent: the partial unique index allows one per
+	// account) and returns the open one either way.
+	OpenUnpaidEpisodeIfNone(ctx context.Context, accountID uuid.UUID, at time.Time) (UnpaidEpisode, error)
+	// SetUnpaidEpisodeNotice stamps notice_sent_at on the account's open
+	// episode once; changed=false when there is no open episode or a notice is
+	// already recorded.
+	SetUnpaidEpisodeNotice(ctx context.Context, accountID uuid.UUID, at time.Time) (changed bool, err error)
+	// CloseUnpaidEpisode closes the account's open episode (changed=false when
+	// none is open).
+	CloseUnpaidEpisode(ctx context.Context, accountID uuid.UUID, at time.Time) (changed bool, err error)
 
 	// ListUnpaidInvoices returns the account's unpaid mirror invoices
 	// oldest-first (the same predicate as UnpaidInvoiceCount). Empty slice
@@ -572,6 +587,74 @@ func (s *pgxStore) PaymentMethodTargetForOrg(ctx context.Context, orgID, payment
 func (s *pgxStore) UnpaidInvoiceCount(ctx context.Context, accountID uuid.UUID) (int, error) {
 	n, err := s.q.CountUnpaidInvoicesForAccount(ctx, accountID.String())
 	return int(n), err
+}
+
+// UnpaidEpisode is one stretch of an account's unpaid-bill condition
+// (ms_billing.unpaid_episodes, migration 093).
+type UnpaidEpisode struct {
+	ID           uuid.UUID
+	AccountID    uuid.UUID
+	StartedAt    time.Time
+	NoticeSentAt *time.Time // nil until the 14-day notice has been sent
+}
+
+const unpaidEpisodeCols = `id, account_id, started_at, notice_sent_at`
+
+func scanUnpaidEpisode(row pgx.Row) (UnpaidEpisode, error) {
+	var e UnpaidEpisode
+	var notice pgtype.Timestamptz
+	if err := row.Scan(&e.ID, &e.AccountID, &e.StartedAt, &notice); err != nil {
+		return UnpaidEpisode{}, err
+	}
+	if notice.Valid {
+		t := notice.Time
+		e.NoticeSentAt = &t
+	}
+	return e, nil
+}
+
+func (s *pgxStore) OpenUnpaidEpisode(ctx context.Context, accountID uuid.UUID) (UnpaidEpisode, bool, error) {
+	e, err := scanUnpaidEpisode(s.pool.QueryRow(ctx,
+		`SELECT `+unpaidEpisodeCols+` FROM ms_billing.unpaid_episodes
+		  WHERE account_id = $1 AND closed_at IS NULL`, accountID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return UnpaidEpisode{}, false, nil
+	}
+	if err != nil {
+		return UnpaidEpisode{}, false, err
+	}
+	return e, true, nil
+}
+
+func (s *pgxStore) OpenUnpaidEpisodeIfNone(ctx context.Context, accountID uuid.UUID, at time.Time) (UnpaidEpisode, error) {
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO ms_billing.unpaid_episodes (account_id, started_at)
+		 VALUES ($1, $2)
+		 ON CONFLICT (account_id) WHERE closed_at IS NULL DO NOTHING`, accountID, at); err != nil {
+		return UnpaidEpisode{}, err
+	}
+	e, found, err := s.OpenUnpaidEpisode(ctx, accountID)
+	if err != nil {
+		return UnpaidEpisode{}, err
+	}
+	if !found {
+		return UnpaidEpisode{}, errors.New("unpaid episode closed concurrently")
+	}
+	return e, nil
+}
+
+func (s *pgxStore) SetUnpaidEpisodeNotice(ctx context.Context, accountID uuid.UUID, at time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE ms_billing.unpaid_episodes SET notice_sent_at = $2
+		  WHERE account_id = $1 AND closed_at IS NULL AND notice_sent_at IS NULL`, accountID, at)
+	return tag.RowsAffected() > 0, err
+}
+
+func (s *pgxStore) CloseUnpaidEpisode(ctx context.Context, accountID uuid.UUID, at time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE ms_billing.unpaid_episodes SET closed_at = $2
+		  WHERE account_id = $1 AND closed_at IS NULL`, accountID, at)
+	return tag.RowsAffected() > 0, err
 }
 
 func (s *pgxStore) ListUnpaidInvoices(ctx context.Context, accountID uuid.UUID) ([]UnpaidInvoiceRow, error) {
