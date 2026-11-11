@@ -190,7 +190,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	apps := make([]AccountAppBill, 0, len(appIDs))
 	var baseFeeTotal, moduleUsageTotal, infraTotal, deployUsageTotal, usageDeductionTotal int64
 	for _, appID := range appIDs {
-		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd)
+		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -240,7 +240,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	// as an app, but its resolved app base fee is DISCARDED — agent activity is
 	// not an app and never incurs a base fee. Runs unconditionally like the app
 	// loop above: a lazy (!found) owner already returned a zero-Agent bill.
-	agentParts, err := s.computeAppBill(ctx, accountID, found, uuid.Nil, periodStart, periodEnd)
+	agentParts, err := s.computeAppBill(ctx, accountID, found, uuid.Nil, periodStart, periodEnd, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -669,7 +669,7 @@ func (s *Service) AccountUsageAllowanceMicros(ctx context.Context, accountID uui
 		if appID == uuid.Nil {
 			continue
 		}
-		parts, err := s.computeAppBill(ctx, accountID, true, appID, periodStart, periodEnd)
+		parts, err := s.computeAppBill(ctx, accountID, true, appID, periodStart, periodEnd, nil)
 		if err != nil {
 			return 0, err
 		}

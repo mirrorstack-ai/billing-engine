@@ -332,6 +332,7 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 				res.Skipped++
 				slog.DebugContext(ctx, "skipping egress row with unparseable app_id",
 					"app_id", row.AppID, "module_id", row.ModuleID, "window_start", w.start)
+				logRow(ctx, row.AppID, row.ModuleID, "", row.Bytes, w.start, outcomeSkipped)
 				continue
 			}
 
@@ -348,6 +349,7 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 			resp, err := svc.RecordInfraUsage(ctx, usage.RecordInfraUsageRequest{
 				EventID:    egressEventID(metric, appID, row.ModuleID, w.start),
 				AppID:      appID,
+				ModuleID:   egressModuleID(row.ModuleID),
 				Metric:     metric,
 				Value:      value,
 				RecordedAt: w.start, // the window the egress occurred in, not now()
@@ -362,8 +364,10 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 			}
 			if resp.Recorded {
 				res.Recorded++
+				logRow(ctx, appID.String(), row.ModuleID, metric, value, w.start, outcomeRecorded)
 			} else {
 				res.Deduped++
+				logRow(ctx, appID.String(), row.ModuleID, metric, value, w.start, outcomeDeduped)
 			}
 		}
 
@@ -436,6 +440,7 @@ func syncRequestRows(ctx context.Context, svc *usage.Service, w hourWindow, rows
 			resp, err := svc.RecordInfraUsage(ctx, usage.RecordInfraUsageRequest{
 				EventID:    egressEventID(metric, key.appID, key.moduleID, w.start),
 				AppID:      key.appID,
+				ModuleID:   egressModuleID(key.moduleID),
 				Metric:     metric,
 				Value:      count / requestsPerUnit,
 				RecordedAt: w.start,
@@ -447,11 +452,14 @@ func syncRequestRows(ctx context.Context, svc *usage.Service, w hourWindow, rows
 					"window_start", w.start, "count", count, "error", err)
 				return
 			}
+			outcome := outcomeDeduped
 			if resp.Recorded {
 				res.RequestRecorded++
+				outcome = outcomeRecorded
 			} else {
 				res.Deduped++
 			}
+			logRow(ctx, key.appID.String(), key.moduleID, metric, count/requestsPerUnit, w.start, outcome)
 		}
 		record(cdnRequestMetric, t.requests)
 		if t.r2Reads > 0 {
@@ -476,6 +484,25 @@ func egressMetricAndValue(moduleID string, bytesTotal float64) (metric string, v
 		return ssrEgressMetric, bytesTotal / bytesPerGiB
 	}
 	return cdnEgressMetric, bytesTotal / bytesPerGiB
+}
+
+// egressModuleID is the module an egress row is attributed to, from its raw CF
+// blob2 (core-v2#1758 WP14). cdn-worker emits the module UUID (3rd segment of
+// apps/<app>/<module>/...) for a module's own objects, so each module's
+// AbsorbInfra() absorbs the delivery it caused (video-core's HLS, ad-core's
+// mp4s) instead of the app paying it a second time.
+//
+// Anything that is not a UUID — empty (an app's own deploy/static assets, which
+// stay billable at app level), the "ssr" sentinel, or a garbage value — is
+// uuid.Nil, which RecordInfraUsage maps to the platform-infra sentinel exactly
+// as before. The event_id keeps the RAW blob2 string, so ids of existing rows
+// are unchanged and a module row can never collide with the app-level row.
+func egressModuleID(blob2 string) uuid.UUID {
+	id, err := uuid.Parse(blob2)
+	if err != nil || blob2 == ssrModuleIDSentinel {
+		return uuid.Nil
+	}
+	return id
 }
 
 // egressEventID is the DETERMINISTIC idempotency key for one (metric, app,
@@ -514,6 +541,27 @@ func closedHourWindows(at time.Time, count int) []hourWindow {
 		windows = append(windows, hourWindow{start: start, end: start.Add(time.Hour)})
 	}
 	return windows
+}
+
+const (
+	outcomeRecorded = "recorded"
+	outcomeDeduped  = "deduped"
+	outcomeSkipped  = "skipped"
+)
+
+// logRow emits ONE INFO line per egress/request row the sweep handled
+// (core-v2#1758 WP14 evidence: lets an operator see which module a row was
+// attributed to). Ids and numbers only — module is the UUID attributed or
+// "none" (empty / "ssr" / unparseable blob2, i.e. app-level); never an object
+// path, key or customer handle.
+func logRow(ctx context.Context, appID, rawModule, metric string, quantity float64, window time.Time, outcome string) {
+	module := "none"
+	if id := egressModuleID(rawModule); id != uuid.Nil {
+		module = id.String()
+	}
+	slog.InfoContext(ctx, "egress row",
+		"app_id", appID, "module_id", module, "metric", metric,
+		"quantity", quantity, "window", window, "outcome", outcome)
 }
 
 // logResult emits a single structured summary line for the sweep.
