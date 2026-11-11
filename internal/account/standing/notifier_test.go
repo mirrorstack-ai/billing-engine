@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -21,11 +22,15 @@ type fakeStatus struct {
 	blocked bool
 	reason  string
 	err     error
+
+	mu      sync.Mutex // GetServiceStatus runs from concurrent notifier goroutines
 	lastReq billing.GetServiceStatusRequest
 }
 
 func (f *fakeStatus) GetServiceStatus(_ context.Context, req billing.GetServiceStatusRequest) (*billing.GetServiceStatusResponse, error) {
+	f.mu.Lock()
 	f.lastReq = req
+	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
