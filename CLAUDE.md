@@ -41,6 +41,7 @@ cmd/account-webhook/              HTTP ingress for PSPs that cannot reach
 cmd/account-webhook-eventbridge/  Stripe partner EventBridge consumer;
                                   the ONLY path Stripe events arrive on    (published)
 cmd/billing-cycle/                scheduled per-period usage charge driver (published)
+cmd/infra-db-sync/                samples Postgres size per app+module     (published)
 cmd/infra-egress-sync/            pulls CDN egress totals from Cloudflare  (published)
 cmd/infra-ssr-compute-sync/       pulls SSR compute totals from CloudWatch (published)
 cmd/intent-executor/              the only collector on the intent rail;
@@ -58,7 +59,7 @@ migrations/billing/               ms_billing schema, 001..069 up/down
 
 `migrations/billing/` is authoritative. The `ms_billing` schema is documented
 under `db/ms_billing/` in
-[`mirrorstack-ai/mirrorstack-docs`](https://github.com/mirrorstack-ai/mirrorstack-docs).
+[`mirrorstack-ai/mirrorstack-docs-internal`](https://github.com/mirrorstack-ai/mirrorstack-docs-internal).
 If `tables.md` there disagrees with a migration, the migration wins and the doc
 is the bug.
 
