@@ -37,13 +37,13 @@ func TestMigration022_Up_DropsAlias(t *testing.T) {
 	_, _, _, _, ok := metricRow(t, pool, "infra.compute.ms")
 	require.False(t, ok, "022.up must DELETE the deprecated infra.compute.ms alias row")
 
-	// The authoritative walltime row is untouched (sum, ms, placeholder 1 µ$).
+	// The authoritative walltime row is untouched (sum, ms, retired to 0 µ$ by 091).
 	kind, unit, price, active, ok := metricRow(t, pool, "infra.compute.walltime.ms")
 	require.True(t, ok, "infra.compute.walltime.ms must survive 022.up as the primary compute row")
 	require.Equal(t, "sum", kind)
 	require.Equal(t, "millisecond", unit)
 	require.NotNil(t, price)
-	require.EqualValues(t, 1, *price)
+	require.EqualValues(t, 0, *price)
 	require.True(t, active)
 
 	// Exactly one compute row remains (just walltime; no alias).

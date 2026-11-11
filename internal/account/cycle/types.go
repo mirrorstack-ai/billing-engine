@@ -60,8 +60,10 @@ const (
 	customMarkupNum = 10 // custom metric: charge = raw_cost × 10/10 (= 1×)
 	customMarkupDen = 10
 
-	infraMarkupNum = 12 // platform-infra / built-in: charge = cost × 12/10 (= 1.2×)
-	infraMarkupDen = 10
+	// platform-infra / built-in: charge = cost × 12/10 (= 1.2×). The fraction is
+	// defined once, in usage, so the bill's customer unit prices share it.
+	infraMarkupNum = usage.InfraMarkupNum
+	infraMarkupDen = usage.InfraMarkupDen
 )
 
 // Developer margin-share rates (design §4 Axis 3 / §8), as integer fractions

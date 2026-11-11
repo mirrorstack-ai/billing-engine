@@ -1,7 +1,7 @@
 # `ms_billing` migrations
 
 Authoritative source for the `ms_billing` schema. The canonical docs live in
-[`mirrorstack-docs`](https://github.com/mirrorstack-ai/mirrorstack-docs) under
+[`mirrorstack-docs`](https://github.com/mirrorstack-ai/mirrorstack-docs-internal) under
 `db/ms_billing/`; if a doc disagrees with a migration here, **the migration
 wins**.
 

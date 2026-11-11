@@ -40,12 +40,12 @@ func TestSettleDevelopers_Integration_ExcludesInfraFromModuleIncome(t *testing.T
 	// caused the leak. No per-module catalog row is seeded: the rollup resolves
 	// it through the (module, metric) -> (SENTINEL, metric) fallback against
 	// migration 020's seed, then applies the 12/10 reserved markup.
-	seedEvent(t, pool, acct, app, mod, "infra.cron.count", usage.KindCount, 100, "2026-06-10T00:00:00Z")
+	seedEvent(t, pool, acct, app, mod, "infra.mcp.tool_call.count", usage.KindCount, 100, "2026-06-10T00:00:00Z")
 
 	// Residual infra booked against the platform-infra sentinel. It has no
 	// module_visibility row, so unfiltered it settled at the private 30%
 	// default and accrued 70% of residual infra revenue to developer_id = NULL.
-	seedEvent(t, pool, acct, app, usage.PlatformInfraModuleID(), "infra.cron.count", usage.KindCount, 500, "2026-06-10T00:00:00Z")
+	seedEvent(t, pool, acct, app, usage.PlatformInfraModuleID(), "infra.mcp.tool_call.count", usage.KindCount, 500, "2026-06-10T00:00:00Z")
 
 	start, end := mustTime(t, pStart), mustTime(t, pEnd)
 	period, err := svc.RollupPeriod(ctx, acct, start, end)
@@ -61,7 +61,7 @@ func TestSettleDevelopers_Integration_ExcludesInfraFromModuleIncome(t *testing.T
 		  WHERE period_id = $1 AND metric LIKE 'infra.%'`,
 		period.PeriodID.String()).Scan(&infraCharged))
 	require.Equal(t, int64(720), infraCharged,
-		"600 raw µ$ of infra.cron.count must bill at 12/10 = 720; if this is 600 the markup regressed, if 0 nothing rolled up and the exclusion below proves nothing")
+		"600 raw µ$ of infra.mcp.tool_call.count must bill at 12/10 = 720; if this is 600 the markup regressed, if 0 nothing rolled up and the exclusion below proves nothing")
 
 	sum, err := svc.SettleDevelopers(ctx, acct, period.PeriodID)
 	require.NoError(t, err)

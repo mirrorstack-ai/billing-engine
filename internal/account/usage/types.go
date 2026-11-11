@@ -364,6 +364,9 @@ type AppInfraUsage struct {
 	UnitPriceMicros  int64   `json:"unit_price_micros"` // raw COGS (pre-markup)
 	BillableQuantity float64 `json:"billable_quantity"`
 	ChargedMicros    int64   `json:"charged_micros"` // qty × price × 12/10
+	// CustomerUnitPriceMicros is UnitPriceMicros × 12/10, the per-unit price the
+	// customer is charged (fractional, 37 → 44.4). Additive; the raw field stays.
+	CustomerUnitPriceMicros float64 `json:"customer_unit_price_micros"`
 }
 
 // AppModuleInfraUsage is one per-MODULE infrastructure line on the app bill
@@ -407,6 +410,45 @@ type AppModuleInfraUsage struct {
 	// the wire on nil, which the TS mirror reads as "no override" (plain mode).
 	ModuleUnitPriceMicros *int64 `json:"module_unit_price_micros,omitempty"`
 	ChargedMicros         int64  `json:"charged_micros"` // qty × COALESCE(module,default) × 12/10, rounded once
+
+	// CustomerUnitPriceMicros is DefaultUnitPriceMicros × 12/10 and
+	// ModuleCustomerUnitPriceMicros is ModuleUnitPriceMicros × 12/10 (nil iff that
+	// is nil): the price the customer is actually charged per unit, so the page
+	// never re-derives the markup. Fractional by design (37 → 44.4).
+	CustomerUnitPriceMicros       float64  `json:"customer_unit_price_micros"`
+	ModuleCustomerUnitPriceMicros *float64 `json:"module_customer_unit_price_micros,omitempty"`
+	// PriceSource names where the price that bills this (module, metric) comes
+	// from; see PriceSource. Empty only when the catalog read had no row for it.
+	PriceSource PriceSource `json:"price_source,omitempty"`
+}
+
+// PriceSource is the effective source of a per-module infra unit price.
+type PriceSource string
+
+const (
+	// PriceSourceDefault: the module has no stored override; the sentinel default bills.
+	PriceSourceDefault PriceSource = "default"
+	// PriceSourceOverride: the module's stored ms.Price(n) override bills (a
+	// lone explicit zero is an override too).
+	PriceSourceOverride PriceSource = "override"
+	// PriceSourceAbsorbed: the module declares ms.AbsorbInfra() and the stored
+	// price is the absorbed 0. The declaration itself is not persisted, only its
+	// expansion, so it is recognised as "a stored override on EVERY active infra
+	// metric, and this one is 0" — the shape only AbsorbAllInfraPriceOverrides
+	// writes (an explicit named override on top of it stays PriceSourceOverride).
+	PriceSourceAbsorbed PriceSource = "absorbed"
+)
+
+// ModuleInfraCatalogRow is one (module × active sentinel infra metric) cell of
+// ModuleInfraPriceCatalog, with the module's stored override or nil.
+type ModuleInfraCatalogRow struct {
+	ModuleID               uuid.UUID
+	Metric                 string
+	Kind                   Kind
+	Unit                   string
+	Group                  string
+	DefaultUnitPriceMicros int64
+	ModuleUnitPriceMicros  *int64
 }
 
 // GetAppUsageSummaryResponse is the app-owner bill for ONE app in the current
@@ -438,6 +480,12 @@ type GetAppBillRequest struct {
 	// resolves to that closed period's frozen usage_aggregates. Do NOT send an
 	// empty string — omit the field entirely to mean "current".
 	PeriodID uuid.UUID `json:"period_id,omitempty"`
+	// InstalledModuleIDs is OPTIONAL: the modules installed in the app right now,
+	// which billing-engine cannot know (its mirror keeps a count, not a list).
+	// Each one gets a zero-quantity ModuleInfraLines row per active infra metric
+	// it has no usage line for, carrying its stored price and PriceSource. Omit it
+	// and the bill is exactly what it was. At most MaxInstalledModuleIDs.
+	InstalledModuleIDs []uuid.UUID `json:"installed_module_ids,omitempty"`
 }
 
 // GetAppBillResponse is the app-owner's FULL bill for ONE app in ONE period. The
