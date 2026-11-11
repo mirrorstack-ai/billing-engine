@@ -84,6 +84,10 @@ func (stubUsageStore) AppInfraBill(context.Context, uuid.UUID, uuid.UUID, time.T
 	return nil, nil
 }
 
+func (stubUsageStore) ModuleInfraPriceCatalog(context.Context, []uuid.UUID) ([]usage.ModuleInfraCatalogRow, error) {
+	return nil, nil
+}
+
 func (stubUsageStore) AppModuleInfraBill(context.Context, uuid.UUID, uuid.UUID, time.Time, time.Time, bool) ([]usage.AppModuleInfraUsage, error) {
 	return nil, nil
 }

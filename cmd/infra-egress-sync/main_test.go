@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,6 +145,10 @@ func (f *fakeStore) AppInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Ti
 	return nil, nil
 }
 
+func (f *fakeStore) ModuleInfraPriceCatalog(context.Context, []uuid.UUID) ([]usage.ModuleInfraCatalogRow, error) {
+	return nil, nil
+}
+
 func (f *fakeStore) AppModuleInfraBill(_ context.Context, _, _ uuid.UUID, _, _ time.Time, _ bool) ([]usage.AppModuleInfraUsage, error) {
 	return nil, nil
 }
@@ -217,12 +224,17 @@ func TestSyncEgress_AggregatesRowsIntoRecordInfraUsage(t *testing.T) {
 	require.Equal(t, 2, res.Recorded)
 	require.Equal(t, 2, len(store.events))
 
-	// Every event is the CDN egress metric (migration 078), stamped under the
-	// infra sentinel module, with the byte SUM in GiB as the value and
-	// recorded_at = the window start (when the egress occurred), not now().
-	for _, ev := range store.events {
+	// Every event is the CDN egress metric (migration 078), with the byte SUM
+	// in GiB as the value and recorded_at = the window start (when the egress
+	// occurred), not now(). A row with a module UUID in blob2 is stamped under
+	// that module (WP14); an app's own static assets stay on the infra sentinel.
+	for id, ev := range store.events {
 		require.Equal(t, cdnEgressMetric, ev.Metric)
-		require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+		if id == egressEventID(cdnEgressMetric, app1, mod, win) {
+			require.Equal(t, uuid.MustParse(mod), ev.ModuleID)
+		} else {
+			require.Equal(t, usage.PlatformInfraModuleID(), ev.ModuleID)
+		}
 		require.Equal(t, usage.KindSum, ev.Kind)
 		require.True(t, win.Equal(ev.RecordedAt), "recorded_at must be the window start")
 	}
@@ -523,4 +535,115 @@ func TestSyncEgress_RequestPassFoldsTiersPerAppAndBillsPer1k(t *testing.T) {
 	cf3 := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{}, requestErr: errors.New("cf down")}
 	res3 := syncEgress(context.Background(), newSvc(newFakeStore()), cf3, at)
 	require.True(t, res3.Failed, "a request query failure aborts the sweep like an egress one")
+}
+
+// core-v2#1758 WP14: a module's own delivery (video-core HLS, ad-core mp4) is
+// stamped under the module on all three CDN metrics so ms.AbsorbInfra() absorbs
+// it; the app's static assets, the ssr sentinel and a garbage blob2 stay on the
+// platform-infra sentinel (billable at app level, exactly as before).
+func TestSyncEgress_ModuleEgressIsAttributedToTheModule(t *testing.T) {
+	app := uuid.New()
+	video, ads := uuid.New(), uuid.New()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	cf := &fakeCF{
+		rowsByStart: map[time.Time][]cloudflare.EgressRow{win: {
+			{AppID: app.String(), ModuleID: video.String(), Bytes: float64(bytesPerGiB)},
+			{AppID: app.String(), ModuleID: ads.String(), Bytes: float64(bytesPerGiB / 2)},
+			{AppID: app.String(), ModuleID: "", Bytes: float64(bytesPerGiB / 4)},
+			{AppID: app.String(), ModuleID: ssrModuleIDSentinel, Bytes: float64(bytesPerGiB)},
+			{AppID: app.String(), ModuleID: "garbage", Bytes: float64(bytesPerGiB / 8)},
+		}},
+		requestsByStart: map[time.Time][]cloudflare.RequestRow{win: {
+			{AppID: app.String(), ModuleID: video.String(), Tier: "r2-hit", Stage: "prod", Requests: 3000},
+			{AppID: app.String(), ModuleID: video.String(), Tier: "edge-hit", Stage: "prod", Requests: 1000},
+			{AppID: app.String(), ModuleID: "", Tier: "edge-hit", Stage: "prod", Requests: 500},
+		}},
+	}
+	store := newFakeStore()
+
+	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.False(t, res.Failed)
+	require.Equal(t, 0, res.RowErrors)
+
+	at := func(metric string, raw string) usage.UsageEvent {
+		ev, ok := store.events[egressEventID(metric, app, raw, win)]
+		require.True(t, ok, "%s / %q must be recorded under its raw blob2 event id", metric, raw)
+		return ev
+	}
+	// bytes
+	require.Equal(t, video, at(cdnEgressMetric, video.String()).ModuleID)
+	require.Equal(t, ads, at(cdnEgressMetric, ads.String()).ModuleID)
+	require.Equal(t, usage.PlatformInfraModuleID(), at(cdnEgressMetric, "").ModuleID, "app static assets stay billable at app level")
+	require.Equal(t, usage.PlatformInfraModuleID(), at(cdnEgressMetric, "garbage").ModuleID)
+	ssr := at(ssrEgressMetric, ssrModuleIDSentinel)
+	require.Equal(t, usage.PlatformInfraModuleID(), ssr.ModuleID, "ssr stays on the sentinel")
+	// requests + r2 reads follow the same attribution
+	reqVideo := at(cdnRequestMetric, video.String())
+	require.Equal(t, video, reqVideo.ModuleID)
+	require.InDelta(t, 4.0, reqVideo.Value, 1e-9)
+	r2Video := at(cdnR2ReadMetric, video.String())
+	require.Equal(t, video, r2Video.ModuleID)
+	require.InDelta(t, 3.0, r2Video.Value, 1e-9)
+	require.Equal(t, usage.PlatformInfraModuleID(), at(cdnRequestMetric, "").ModuleID)
+	// One event per (metric, module): nothing is recorded twice.
+	require.Equal(t, 5+3, len(store.events), "5 egress rows + video(request,r2) + app(request)")
+}
+
+func TestEgressModuleID(t *testing.T) {
+	id := uuid.New()
+	require.Equal(t, id, egressModuleID(id.String()))
+	require.Equal(t, id, egressModuleID(strings.ToUpper(id.String())))
+	for _, raw := range []string{"", ssrModuleIDSentinel, "m", "not-a-uuid"} {
+		require.Equal(t, uuid.Nil, egressModuleID(raw), raw)
+	}
+}
+
+// captureLogs swaps the default slog for a text handler writing to a buffer.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func TestSyncEgress_LogsOneInfoLinePerRowWithModuleID(t *testing.T) {
+	logs := captureLogs(t)
+	app, ads := uuid.New(), uuid.New()
+	win := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{win: {
+		{AppID: app.String(), ModuleID: ads.String(), Bytes: float64(bytesPerGiB)},
+		{AppID: app.String(), ModuleID: "", Bytes: float64(bytesPerGiB / 2)},
+		{AppID: "garbage", ModuleID: ads.String(), Bytes: 5},
+	}}}
+	store := newFakeStore()
+
+	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	require.Equal(t, 1, res.Skipped)
+	// Re-run: the same rows now dedupe.
+	syncEgress(context.Background(), newSvc(store), cf, at)
+
+	var rowLines []string
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "msg=\"egress row\"") {
+			rowLines = append(rowLines, l)
+		}
+	}
+	// 3 rows x 2 runs
+	require.Len(t, rowLines, 6)
+	joined := strings.Join(rowLines, "\n")
+	require.Contains(t, joined, "module_id="+ads.String())
+	require.Contains(t, joined, "module_id=none")
+	require.Contains(t, joined, "app_id="+app.String())
+	require.Contains(t, joined, "metric="+cdnEgressMetric)
+	require.Contains(t, joined, "quantity=1")
+	require.Contains(t, joined, "outcome=recorded")
+	require.Contains(t, joined, "outcome=deduped")
+	require.Contains(t, joined, "outcome=skipped")
+	require.Contains(t, joined, "window=2026-06-15")
+	// ids and numbers only: never an object path or key.
+	for _, banned := range []string{"apps/", "/ads/", ".mp4", "rendition", "key=", "path="} {
+		require.NotContains(t, joined, banned)
+	}
 }

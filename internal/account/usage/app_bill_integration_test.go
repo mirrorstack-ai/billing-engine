@@ -463,3 +463,126 @@ func TestBillingPeriodWindow_Integration(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, found)
 }
+
+// core-v2#1758 WP14: the infra-egress-sync now stamps a module's own CDN delivery
+// (video-core HLS, ad-core mp4) with the module UUID on all three CDN metrics.
+// This proves the CHARGE side of that attribution against the real SQL: a module
+// that declared ms.AbsorbInfra() pays 0 for the delivery it caused (so an app
+// whose only egress is video shows no infra.egress.cdn.bytes charge), while a
+// module without absorb is still priced by the sentinel default — never free by
+// accident, never charged twice (the module row and the app-level row are
+// distinct (module, metric) rollups).
+func TestAppModuleInfraBill_Integration_ModuleAttributedCDNEgressIsAbsorbed(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	acct := appSeedAccount(t, pool)
+	app := uuid.New()
+	sentinel := usage.PlatformInfraModuleID()
+	// Kinds as migrations 078/080 seed them under the sentinel.
+	kinds := map[string]usage.Kind{
+		"infra.egress.cdn.bytes":  usage.KindSum,
+		"infra.cdn.request.count": usage.KindCount,
+		"infra.cdn.r2.read.count": usage.KindCount,
+	}
+	metrics := []string{"infra.egress.cdn.bytes", "infra.cdn.request.count", "infra.cdn.r2.read.count"}
+
+	for _, m := range metrics {
+		_, err := pool.Exec(ctx,
+			`UPDATE ms_billing.metric_definitions SET unit_price_micros = 20, active = true
+			 WHERE module_id = $1 AND metric = $2`, sentinel.String(), m)
+		require.NoError(t, err)
+	}
+
+	video := uuid.New() // declares ms.AbsorbInfra()
+	plain := uuid.New() // no override: sentinel fallback
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, video, true, nil))
+
+	for _, m := range metrics {
+		appSeedEvent(t, pool, acct, app, video, m, kinds[m], 100, "2026-06-05T00:00:00Z", "", "")
+		appSeedEvent(t, pool, acct, app, plain, m, kinds[m], 100, "2026-06-05T00:00:00Z", "", "")
+		// The app's own static assets stay on the sentinel (residual, billable).
+		appSeedEvent(t, pool, acct, app, sentinel, m, kinds[m], 7, "2026-06-05T00:00:00Z", "", "")
+	}
+
+	lines, err := store.AppModuleInfraBill(ctx, acct, app,
+		appMustTime(t, appPeriodStart), appMustTime(t, appPeriodEnd), false)
+	require.NoError(t, err)
+
+	got := map[uuid.UUID]map[string]usage.AppModuleInfraUsage{}
+	for _, l := range lines {
+		if got[l.ModuleID] == nil {
+			got[l.ModuleID] = map[string]usage.AppModuleInfraUsage{}
+		}
+		got[l.ModuleID][l.Metric] = l
+	}
+	for _, m := range metrics {
+		v, ok := got[video][m]
+		require.True(t, ok, "video-core line for %s must exist (not vacuous)", m)
+		require.NotNil(t, v.ModuleUnitPriceMicros, m)
+		require.EqualValues(t, 0, *v.ModuleUnitPriceMicros, m)
+		require.Zero(t, v.ChargedMicros, "%s: the absorbing module's delivery is free", m)
+
+		p, ok := got[plain][m]
+		require.True(t, ok, m)
+		require.EqualValues(t, 2400, p.ChargedMicros, "%s: no absorb → 100 × 20 × 1.2 sentinel fallback", m)
+
+		_, sentinelIsALine := got[sentinel][m]
+		require.False(t, sentinelIsALine, "%s: the sentinel residual is not a module line", m)
+	}
+}
+
+// ModuleInfraPriceCatalog is ledger-free: a module that never incurred usage still
+// gets one cell per ACTIVE sentinel infra metric, a stored override stays
+// non-NULL (a stored 0 included) and no row stays nil. AbsorbInfra's expansion is
+// full coverage, which is what the service reads as "absorbed".
+func TestModuleInfraPriceCatalog_Integration_CellsForModulesWithNoUsage(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := usage.NewStore(pool)
+	ctx := context.Background()
+
+	var active int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM ms_billing.metric_definitions WHERE module_id = $1 AND active`,
+		usage.PlatformInfraModuleID().String()).Scan(&active))
+	require.Positive(t, active, "precondition: the migrations seed active sentinel infra metrics")
+
+	absorbing, plain, partial := uuid.New(), uuid.New(), uuid.New()
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, absorbing, true, nil))
+	var firstMetric string
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT metric FROM ms_billing.metric_definitions WHERE module_id = $1 AND active ORDER BY metric LIMIT 1`,
+		usage.PlatformInfraModuleID().String()).Scan(&firstMetric))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, partial, false, []usage.InfraPriceOverride{{Metric: firstMetric, UnitPriceMicros: 55}}))
+
+	cells, err := store.ModuleInfraPriceCatalog(ctx, []uuid.UUID{absorbing, plain, partial})
+	require.NoError(t, err)
+	require.Len(t, cells, 3*active, "one cell per (module x active infra metric), no usage needed")
+
+	overridden := map[uuid.UUID]int{}
+	for _, c := range cells {
+		require.NotEmpty(t, c.Unit)
+		require.NotEmpty(t, c.Group)
+		if c.ModuleUnitPriceMicros != nil {
+			overridden[c.ModuleID]++
+		}
+		switch c.ModuleID {
+		case absorbing:
+			require.NotNil(t, c.ModuleUnitPriceMicros, c.Metric)
+			require.Zero(t, *c.ModuleUnitPriceMicros, c.Metric)
+		case partial:
+			if c.Metric == firstMetric {
+				require.NotNil(t, c.ModuleUnitPriceMicros)
+				require.EqualValues(t, 55, *c.ModuleUnitPriceMicros)
+			} else {
+				require.Nil(t, c.ModuleUnitPriceMicros, "%s: no row stays nil, never the default", c.Metric)
+			}
+		case plain:
+			require.Nil(t, c.ModuleUnitPriceMicros, c.Metric)
+		}
+	}
+	require.Equal(t, active, overridden[absorbing], "AbsorbInfra covers EVERY active metric")
+	require.Equal(t, 1, overridden[partial])
+	require.Zero(t, overridden[plain])
+}

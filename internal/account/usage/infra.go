@@ -81,17 +81,19 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 //	infra.ai.cache_write.tokens  additive prompt-cache WRITE tokens        → sum
 //	infra.ai.cache_read.tokens   additive prompt-cache READ tokens         → sum
 //	infra.ai.requests            provider-API-call count                   → count
-//	infra.request.count          per-invocation request fee                → count
+//	infra.request.count          per-invocation request fee (per-1k, 091)  → count
 //	infra.mcp.tool_call.count    MCP routing+auth fixed cost               → count
-//	infra.cron.count             scheduler fire (the tick)                 → count
+//	infra.cron.count             scheduler fire, the tick (per-1k, 091)    → count
 //	infra.event.count            per-subscriber fanout delivery            → count
 //	infra.event.bytes            event-bus payload size (per-GiB)          → sum
 //	infra.egress.api.bytes       non-CDN API egress bytes (per-GiB)        → sum
 //	infra.storage.put.count      S3 tier-1 PUT/COPY ops (per-1k)           → count
 //	infra.storage.list.count     S3 tier-1 LIST ops (per-1k)               → count
 //	infra.storage.gib_hours      S3 stored volume (GiB-hours integral)     → time_weighted
+//	infra.db.gib_hours           Postgres size per app+module (GiB level)  → time_weighted
 //	infra.task.vcpu.hours        Fargate task vCPU-hours                   → sum
 //	infra.task.memory.gib_hours  Fargate task GiB-hours                    → sum
+//	infra.task.ephemeral.gib_hours Fargate ephemeral storage above 20 GiB  → sum
 //	infra.task.gpu.hours         ECS GPU instance-hours                    → sum
 //	infra.compute.ssr.gb_seconds SSR Lambda duration x memory (per app-hr) → sum
 //	infra.compute.ssr.request.count SSR Lambda per-invocation fee (per-1k) → count
@@ -102,8 +104,12 @@ func PlatformInfraModuleID() uuid.UUID { return platformInfraModuleID }
 // names that already exist. Per design §3 rule 5, any per-unit COGS < 1 µ$ is
 // priced in the COARSEST unit ≥ 1 µ$ and the PRODUCER emits the value pre-scaled
 // to that unit — egress/event bytes per GiB (value = bytes/1024^3), event
-// deliveries + storage PUT/LIST per 1k (value = n/1000); request/mcp/cron stay
-// per-unit (≥ 1 µ$). The per-row contract lives in migration 020.
+// deliveries, storage PUT/LIST, requests and cron fires per 1k (value = n/1000);
+// only mcp.tool_call stays per-unit (≥ 1 µ$). infra.request.count and
+// infra.cron.count moved per-unit → per-1k in migration 091 (unit '1k requests' /
+// '1k fires'), so a producer of ANY of these four counts emits n/1000, never n;
+// migration091_integration_test.go asserts the catalog unit + price of each. The
+// per-row contract lives in migrations 020 and 091.
 //
 // The infra.ai.* family is priced PER MODEL: the producer (infra-metrics PR #2,
 // in api-platform cmd/agent) stamps the model on RecordInfraUsageRequest.Model,
@@ -177,13 +183,15 @@ func platformInfraKind(metric string) (Kind, bool) {
 	// the required producer value scaling live in migration 020's per-row comments
 	// (rule-5 contract); the KIND is fixed here.
 	case "infra.request.count":
-		// §2.7 per-invocation APIGW+Lambda request fee. count; value = 1/request.
+		// §2.7 per-invocation APIGW+Lambda request fee. count; priced per-1k since
+		// migration 091 ($1.49/M = 1,490 per 1k) → producer value = requests/1000.
 		return KindCount, true
 	case "infra.mcp.tool_call.count":
 		// §2.7 MCP routing+auth fixed cost. count; value = 1/call.
 		return KindCount, true
 	case "infra.cron.count":
-		// §2.2 scheduler fire (the tick only). count; value = 1/fire.
+		// §2.2 scheduler fire (the tick only). count; priced per-1k since migration
+		// 091 ($1.25/M = 1,250 per 1k) → producer value = fires/1000.
 		return KindCount, true
 	case "infra.event.count":
 		// §2.2 per-subscriber fanout delivery. count; priced per-1k → producer
@@ -200,13 +208,19 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// value = bytes/1024^3.
 		return KindSum, true
 	case "infra.storage.put.count":
-		// §2.4 S3 tier-1 PUT/COPY ops. count; priced per-1k → producer value =
-		// puts/1000 (rule 5; 0.005 µ$/PUT floors per-unit).
+		// §2.4 S3 tier-1 PUT/COPY ops. count; priced per-1k (4,700 µ$ per 1k since
+		// migration 091) → producer value = puts/1000.
 		return KindCount, true
 	case "infra.storage.list.count":
-		// §2.4 S3 tier-1 LIST ops. count; priced per-1k → producer value =
-		// lists/1000 (rule 5; 0.005 µ$/LIST floors per-unit).
+		// §2.4 S3 tier-1 LIST ops. count; priced per-1k (4,700 µ$ per 1k since
+		// migration 091) → producer value = lists/1000.
 		return KindCount, true
+	case "infra.db.gib_hours":
+		// Database size per (app, module) (migration 089, core-v2#1757). The
+		// producer (cmd/infra-db-sync) emits the GiB STANDING at an hour boundary,
+		// not a delta and not an integral: time_weighted, same contract as
+		// infra.storage.gib_hours below.
+		return KindTimeWeighted, true
 	case "infra.storage.gib_hours":
 		// §2.4 S3 stored VOLUME. time_weighted: producer (PR #7) emits the
 		// GiB-hours integral of the stored-bytes gauge (how much × how long), NOT
@@ -221,6 +235,10 @@ func platformInfraKind(metric string) (Kind, bool) {
 		return KindSum, true
 	case "infra.task.memory.gib_hours":
 		// Fargate ARM memory allocation. sum; value = memory_mib/1024 * billed_hours.
+		return KindSum, true
+	case "infra.task.ephemeral.gib_hours":
+		// Fargate ephemeral storage above the included 20 GiB (migration 091).
+		// sum; value = (ephemeral_mib - 20480)/1024 * billed_hours.
 		return KindSum, true
 	case "infra.task.gpu.hours":
 		// ECS GPU host allocation. sum; value = billed instance-hours; Model is
