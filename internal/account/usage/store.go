@@ -278,20 +278,11 @@ type Store interface {
 	// residual ledger rows still enumerate through AppIDsWithUsage).
 	MirroredAppIDs(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) ([]uuid.UUID, error)
 
-	// LiveModuleTimerCountForAccount returns the account's currently-live install-
-	// timer count (removed_at IS NULL) — the DISPLAY input to GetAccountBill's
-	// account-overage line under the per-module-instance overage model (migration
-	// 033), shown as the steady-state estimate $5 × ceil(max(0, live − IncludedModules) / 5)
-	// (usage.AccountOverageMicros). Reads the timer table (the overage model's
-	// source of truth) rather than SUM(apps.module_count), so the shown overage
-	// stays tied to the exact rows the charge legs tier on.
-	LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error)
-
-	// LiveOverModuleTimerCountForApp returns the subset of one app's live
-	// install timers whose account-wide FIFO position falls beyond the shared
-	// included-module allowance. It is the attribution read behind the current
-	// per-app bill; the account pool is ranked once, so this never grants a
-	// second allowance per app.
+	// LiveOverModuleTimerCountForApp returns the subset of one app's OWN live
+	// install timers whose FIFO position WITHIN THAT APP falls beyond its own
+	// plan's included-module allowance (billing-engine#202 PR-2c: never pooled
+	// against any other app on the account). It is the attribution read behind
+	// the current per-app bill.
 	LiveOverModuleTimerCountForApp(ctx context.Context, accountID, appID uuid.UUID, includedModules int) (int, error)
 
 	// LiveDomainCountForAccount returns the account's currently-live custom-
@@ -322,21 +313,25 @@ type Store interface {
 	// ListNewCreationCharges: the account's live, unresolved install timers
 	// (migration 033) still inside their own grace window as of now — add-on
 	// charges Leg 1 WILL fire but hasn't yet — grouped per app. Only timers
-	// "over" per the live FIFO rank count; co-created timers (installed_at ==
-	// the app's created_at) are excluded, as their upcoming charge is already
-	// represented by the app's own pending creation row (the scenario-3
-	// combined invoice). The service issues this ONLY for the current live
-	// window, like PendingNewCreationCharges. Ordered soonest-first by the
-	// per-app earliest grace expiry (the charge ETA), app_id tie-break.
-	PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error)
+	// "over" per that OWN APP'S live FIFO rank against its own plan allowance
+	// count (billing-engine#202 PR-2c: never pooled across the account); co-
+	// created timers (installed_at == the app's created_at) are excluded, as
+	// their upcoming charge is already represented by the app's own pending
+	// creation row (the scenario-3 combined invoice). The service issues this
+	// ONLY for the current live window, like PendingNewCreationCharges. Ordered
+	// soonest-first by the per-app earliest grace expiry (the charge ETA),
+	// app_id tie-break.
+	PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, now time.Time) ([]PendingAddonChargeRaw, error)
 
 	// UnresolvedOneTimeCharges returns every activated-account creation-base and
 	// module-timer unit without a durable terminal verdict in one MVCC snapshot.
 	// It deliberately spans every charge window and both sides of each grace ETA.
-	// The query applies D11 deletion, live FIFO, attempted-charge recovery, and
-	// terminal-guard eligibility; the service applies the immutable D1d amount
-	// shape and de-duplicates any exact overlap with the recurring projection.
-	UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, includedModules, graceHours int) ([]UnresolvedOneTimeChargeRaw, error)
+	// The query applies D11 deletion, per-app live FIFO against each timer's own
+	// app's plan allowance (billing-engine#202 PR-2c), attempted-charge
+	// recovery, and terminal-guard eligibility; the service applies the
+	// immutable D1d amount shape and de-duplicates any exact overlap with the
+	// recurring projection.
+	UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, graceHours int) ([]UnresolvedOneTimeChargeRaw, error)
 
 	// CoCreatedOverModuleTimerCount returns how many of an app's co-created
 	// (installed_at == createdAt) module install timers are "over" per the
@@ -1567,10 +1562,12 @@ func (s *pgxStore) PendingNewCreationCharges(ctx context.Context, accountID uuid
 // PendingAddonModuleCharges reads the in-grace over-module timers grouped per
 // app — see the Store interface doc. Money-free (the service projects the
 // steady flat surcharge per timer).
-func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, includedModules int, now time.Time) ([]PendingAddonChargeRaw, error) {
+func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid.UUID, now time.Time) ([]PendingAddonChargeRaw, error) {
+	plans, modulesIncluded := ModuleAllowanceColumns()
 	rows, err := s.q.PendingAddonModuleCharges(ctx, db.PendingAddonModuleChargesParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
+		Plans:           plans,
+		ModulesIncluded: modulesIncluded,
 		Now:             now,
 	})
 	if err != nil {
@@ -1594,11 +1591,13 @@ func (s *pgxStore) PendingAddonModuleCharges(ctx context.Context, accountID uuid
 
 // UnresolvedOneTimeCharges reads every non-terminal creation-base and eligible
 // module-timer unit in one statement — see the Store interface doc.
-func (s *pgxStore) UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, includedModules, graceHours int) ([]UnresolvedOneTimeChargeRaw, error) {
+func (s *pgxStore) UnresolvedOneTimeCharges(ctx context.Context, accountID uuid.UUID, graceHours int) ([]UnresolvedOneTimeChargeRaw, error) {
+	plans, modulesIncluded := ModuleAllowanceColumns()
 	rows, err := s.q.UnresolvedOneTimeCharges(ctx, db.UnresolvedOneTimeChargesParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules), //nolint:gosec // a plan's included-module count
-		GraceHours:      int32(graceHours),      //nolint:gosec // a configured grace window in hours
+		Plans:           plans,
+		ModulesIncluded: modulesIncluded,
+		GraceHours:      int32(graceHours), //nolint:gosec // a configured grace window in hours
 	})
 	if err != nil {
 		return nil, err
@@ -1664,23 +1663,10 @@ func (s *pgxStore) CoCreatedOverModuleTimerCount(ctx context.Context, accountID,
 	return len(ids), nil
 }
 
-// LiveModuleTimerCountForAccount counts the account's currently-live install
-// timers (removed_at IS NULL) — the live input to GetAccountBill's steady-state
-// account-overage estimate ($5 × ceil(max(0, live − IncludedModules) / 5)). Under the
-// per-module-instance overage model (migration 033) the display reads the timer
-// table (the model's source of truth) instead of SUM(apps.module_count), so the
-// shown overage stays tied to the exact rows the charge legs tier on.
-func (s *pgxStore) LiveModuleTimerCountForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
-	n, err := s.q.CountLiveModuleTimersForAccount(ctx, accountID.String())
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
-}
-
-// LiveOverModuleTimerCountForApp attributes the account-wide FIFO overage to
-// the app that owns each over timer. The underlying query ranks the whole live
-// account pool before filtering by app, matching the charge spine exactly.
+// LiveOverModuleTimerCountForApp attributes ONE APP'S OWN module overage
+// (billing-engine#202 PR-2c): the app's live timers are ranked in FIFO order
+// inside the app alone, never pooled against any other app on the account.
+// includedModules is THAT app's own plan allowance (usage.ModulesIncludedCutoff).
 func (s *pgxStore) LiveOverModuleTimerCountForApp(ctx context.Context, accountID, appID uuid.UUID, includedModules int) (int, error) {
 	n, err := s.q.LiveOverModuleTimerCountForApp(ctx, db.LiveOverModuleTimerCountForAppParams{
 		AccountID:       accountID.String(),
@@ -1703,10 +1689,12 @@ func (s *pgxStore) LiveDomainCountForAccount(ctx context.Context, accountID uuid
 	return int(n), nil
 }
 
-func (s *pgxStore) ActivatedRecurringFeeShares(ctx context.Context, accountID uuid.UUID, includedModules int, periodEnd time.Time) ([]AppRecurringFeeShare, error) {
+func (s *pgxStore) ActivatedRecurringFeeShares(ctx context.Context, accountID uuid.UUID, periodEnd time.Time) ([]AppRecurringFeeShare, error) {
+	plans, modulesIncluded := ModuleAllowanceColumns()
 	rows, err := s.q.ActivatedRecurringFeeShares(ctx, db.ActivatedRecurringFeeSharesParams{
 		AccountID:       accountID.String(),
-		IncludedModules: int32(includedModules), //nolint:gosec // pricing allowance is a small positive constant
+		Plans:           plans,
+		ModulesIncluded: modulesIncluded,
 		PeriodEnd:       periodEnd,
 	})
 	if err != nil {

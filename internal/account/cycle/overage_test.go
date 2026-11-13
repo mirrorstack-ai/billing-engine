@@ -80,9 +80,11 @@ func seedIncluded(store *fakeStore, accountID, appID uuid.UUID, installedAt time
 func TestModuleOverage_IncludedIsPermanentNeverReEvaluated(t *testing.T) {
 	// Once a grace-check finds a module "included", that verdict is permanent
 	// (grace_resolved) — it is never re-checked and never charged, even after the
-	// pool later grows well past the included 5. Monotonicity: a new install
-	// always gets the latest installed_at, so an existing row's rank can only
-	// improve (over→included), never regress (included→over).
+	// pool later grows well past the included 10 (this app carries no Plan, so it
+	// resolves to DefaultPlan=Pro, whose per-app cutoff is 10 — billing-engine#202
+	// PR-2c; never the retired account-wide pool of 5). Monotonicity: a new
+	// install always gets the latest installed_at, so an existing row's rank can
+	// only improve (over→included), never regress (included→over).
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	sc := newFakeStripe()
@@ -91,18 +93,18 @@ func TestModuleOverage_IncludedIsPermanentNeverReEvaluated(t *testing.T) {
 	ctx := context.Background()
 	app := uuid.New()
 
-	// 5 early installs — all "included" (ranks 0-4), initially UNRESOLVED.
+	// 10 early installs — all "included" (ranks 0-9), initially UNRESOLVED.
 	early := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	var earlyIDs []uuid.UUID
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 10; i++ {
 		earlyIDs = append(earlyIDs, seedTimer(store, acct, app, early))
 	}
 
-	// First sweep past their grace → all 5 resolved as included, none charged.
+	// First sweep past their grace → all 10 resolved as included, none charged.
 	res, err := svc.SweepModuleOverage(ctx, early.AddDate(0, 0, 4))
 	require.NoError(t, err)
-	require.Equal(t, 5, res.Pending)
-	require.Equal(t, 5, res.Included)
+	require.Equal(t, 10, res.Pending)
+	require.Equal(t, 10, res.Included)
 	require.Equal(t, 0, res.Charged)
 	require.Empty(t, p.charges, "included modules are never charged, and never sealed either")
 	for _, id := range earlyIDs {
@@ -110,15 +112,15 @@ func TestModuleOverage_IncludedIsPermanentNeverReEvaluated(t *testing.T) {
 		require.False(t, store.timers[id].graceCharged)
 	}
 
-	// Now install 10 MORE modules a month later — the pool jumps to 15, but the 5
-	// early installs keep ranks 0-4 (monotonicity); the newcomers are "over".
+	// Now install 10 MORE modules a month later — the pool jumps to 20, but the 10
+	// early installs keep ranks 0-9 (monotonicity); the newcomers are "over".
 	late := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < 10; i++ {
 		seedTimer(store, acct, app, late)
 	}
 
 	// Second sweep → only the 10 unresolved newcomers are candidates and charged;
-	// the 5 already-included ones are NOT re-evaluated and stay uncharged forever.
+	// the 10 already-included ones are NOT re-evaluated and stay uncharged forever.
 	res2, err := svc.SweepModuleOverage(ctx, late.AddDate(0, 0, 4))
 	require.NoError(t, err)
 	require.Equal(t, 10, res2.Pending, "only the unresolved newcomers are candidates")
@@ -126,7 +128,7 @@ func TestModuleOverage_IncludedIsPermanentNeverReEvaluated(t *testing.T) {
 	require.Empty(t, sc.itemCalls, "a cut-over leg mints no invoice line")
 	for _, id := range earlyIDs {
 		require.False(t, store.timers[id].graceCharged,
-			"an included module is never charged even after the pool grows past 5")
+			"an included module is never charged even after the pool grows past 10")
 		require.True(t, store.timers[id].graceResolved)
 	}
 }
@@ -210,11 +212,13 @@ func TestModuleOverage_D1dStraddleChargesThePostActivationPeriod(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), 5)
-	// Installed May 2 (rank 5, over) — pre-activation, install period
+	app := uuid.New()
+	seedIncluded(store, acct, app, time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), 10)
+	// Installed May 2 (rank 10, over — this app's own cutoff is DefaultPlan=Pro's
+	// 10, billing-engine#202 PR-2c) — pre-activation, install period
 	// [Apr 4, May 4) closed by the May 4 activation — but its grace expires
 	// May 5, INSIDE the first post-activation period [May 4, Jun 4).
-	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC))
+	over := seedTimer(store, acct, app, time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC))
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
@@ -272,9 +276,10 @@ func TestModuleOverage_GraceStraddlingBoundaryCoversStraddledPeriod(t *testing.T
 	ctx := context.Background()
 	app := uuid.New()
 
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
+	seedIncluded(store, acct, app, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 10)
 	// Installed Jul 2 — 2 days before the [Jun 4, Jul 4) period closes — so its
-	// grace elapses Jul 5, INSIDE the next period [Jul 4, Aug 4).
+	// grace elapses Jul 5, INSIDE the next period [Jul 4, Aug 4). Rank 10 (over):
+	// this app's own cutoff is DefaultPlan=Pro's 10 (billing-engine#202 PR-2c).
 	over := seedTimer(store, acct, app, time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC))
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC))
@@ -302,9 +307,11 @@ func TestModuleOverage_GraceInsidePeriodChargesInstallPeriodOnly(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
-	// Installed Jun 10; grace elapses Jun 13, well inside [Jun 4, Jul 4).
-	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	app := uuid.New()
+	seedIncluded(store, acct, app, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 10)
+	// Installed Jun 10 (rank 10, over — this app's own cutoff is DefaultPlan=Pro's
+	// 10); grace elapses Jun 13, well inside [Jun 4, Jul 4).
+	over := seedTimer(store, acct, app, time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
@@ -418,8 +425,9 @@ func TestModuleOverage_AttemptedButNothingOnStripeProposesFresh(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
-	x := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	app := uuid.New()
+	seedIncluded(store, acct, app, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 10)
+	x := seedTimer(store, acct, app, time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 	store.timers[x].chargeAttemptedAt = time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
 	// sc.findByRef stays nil — not found.
 
@@ -473,7 +481,7 @@ func TestModuleOverage_FrozenCombinedChildDefersBeforeRemovedOrImprovedRank(t *t
 	svc := appsSvc(store, sc).WithIntentProposer(p)
 	appID := uuid.New()
 	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	registerMirror(t, svc, user, appID, createdAt, 7)
+	registerMirror(t, svc, user, appID, createdAt, 12) // 12 − Pro's per-app cutoff(10) = 2 co-created over-modules
 
 	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
 	require.Len(t, attempt.TimerIDs, 2)
@@ -510,7 +518,7 @@ func TestModuleOverage_KnownCombinedSetDoesNotCaptureLaterNonChild(t *testing.T)
 	svc := appsSvc(store, sc).WithIntentProposer(p)
 	appID := uuid.New()
 	createdAt := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	registerMirror(t, svc, user, appID, createdAt, 7)
+	registerMirror(t, svc, user, appID, createdAt, 12) // 12 − Pro's per-app cutoff(10) = 2 co-created over-modules
 
 	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
 	require.Len(t, attempt.TimerIDs, 2)
@@ -545,8 +553,9 @@ func TestModuleOverage_PrepaidAccountSkippedNotCharged(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
-	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	app := uuid.New()
+	seedIncluded(store, acct, app, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 10)
+	over := seedTimer(store, acct, app, time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 	sweepAt := time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
 
 	res, err := svc.SweepModuleOverage(ctx, sweepAt)
@@ -587,8 +596,9 @@ func TestModuleOverage_SealFailureLeavesTimerRetryable(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
-	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	app := uuid.New()
+	seedIncluded(store, acct, app, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 10)
+	over := seedTimer(store, acct, app, time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 	sweepAt := time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC)
 
 	res, err := svc.SweepModuleOverage(ctx, sweepAt)
@@ -627,8 +637,8 @@ func TestModuleOverage_NoPMSkipsAndRetries(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
 	app := uuid.New()
+	seedIncluded(store, acct, app, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 10)
 	over := seedTimer(store, acct, app, time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 0, 0, 0, 0, time.UTC))
@@ -675,16 +685,17 @@ func TestModuleOverage_UnactivatedAccountNeverSwept(t *testing.T) {
 // after an over-module's anchored install period already closed ---------------
 
 func TestModuleOverage_NoRetroactiveCatchUpWhenActivatedAfterPeriodClosed(t *testing.T) {
-	// Reproduces the exact failure scenario. An account installs 8 modules on an
+	// Reproduces the exact failure scenario. An account installs 13 modules on an
 	// app while UNACTIVATED (RegisterApp synthesizes the timers regardless of
 	// activation). They sit installed + past-grace for months. Then the owner
 	// finally binds a card — with anchor day 1 (activated Apr 1), the timers'
 	// install-anchored period [Jan 1, Feb 1) is long closed. Pre-fix, the very next
-	// sweep charged the 3 "over" timers (ranks 5-7) a REAL Stripe invoice for that
+	// sweep charged the 3 "over" timers (ranks 10-12) a REAL Stripe invoice for that
 	// historical, never-chargeable January period — exactly the retroactive
 	// catch-up D1d forbids. Fixed: the over timers are resolved terminally WITH NO
 	// charge (period_closed), never resurface, and nothing is billed by any rail;
-	// the 5 included ones resolve as included as usual.
+	// the 10 included ones (this app's own DefaultPlan=Pro cutoff,
+	// billing-engine#202 PR-2c) resolve as included as usual.
 	store := newFakeStore()
 	_, acct := registeredAccount(store)
 	delete(store.activation, acct) // unactivated at install time
@@ -696,7 +707,7 @@ func TestModuleOverage_NoRetroactiveCatchUpWhenActivatedAfterPeriodClosed(t *tes
 
 	installed := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
 	var ids []uuid.UUID
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 13; i++ {
 		ids = append(ids, seedTimer(store, acct, app, installed))
 	}
 
@@ -705,15 +716,15 @@ func TestModuleOverage_NoRetroactiveCatchUpWhenActivatedAfterPeriodClosed(t *tes
 	require.NoError(t, err)
 	require.Equal(t, 0, res0.Pending, "unactivated → excluded from the work list")
 
-	// MONTHS later: the owner binds a card (anchor day 1, Apr 1) + a PM. The 8
+	// MONTHS later: the owner binds a card (anchor day 1, Apr 1) + a PM. The 13
 	// timers' install period [Jan 1, Feb 1) closed long before Apr 1.
 	store.activation[acct] = time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 4, 2, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.Equal(t, 8, res.Pending, "now activated, all 8 past-grace timers are listed")
+	require.Equal(t, 13, res.Pending, "now activated, all 13 past-grace timers are listed")
 	require.Equal(t, 0, res.Charged, "no retroactive catch-up charge for a closed period (D1d)")
-	require.Equal(t, 5, res.Included, "the 5 earliest installs resolve as included")
+	require.Equal(t, 10, res.Included, "the 10 earliest installs resolve as included")
 	require.Equal(t, 3, res.Skipped, "the 3 over installs resolve period_closed (counted as skipped)")
 	require.Empty(t, p.charges,
 		"nothing is sealed for a period the account was never chargeable in — a "+
@@ -743,10 +754,12 @@ func TestModuleOverage_ActivatedBeforePeriodClosesStillBills(t *testing.T) {
 	svc := cycle.NewService(store, sc).WithIntentProposer(p)
 	ctx := context.Background()
 
-	// 5 included + one over-module installed Jun 10 → period [Jun 4, Jul 4), which
-	// opened AFTER activation, so the account was chargeable for the whole window.
-	seedIncluded(store, acct, uuid.New(), time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 5)
-	over := seedTimer(store, acct, uuid.New(), time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
+	// 10 included (this app's own DefaultPlan=Pro cutoff) + one over-module
+	// installed Jun 10 → period [Jun 4, Jul 4), which opened AFTER activation, so
+	// the account was chargeable for the whole window.
+	app := uuid.New()
+	seedIncluded(store, acct, app, time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC), 10)
+	over := seedTimer(store, acct, app, time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC))
 
 	res, err := svc.SweepModuleOverage(ctx, time.Date(2026, 6, 14, 9, 0, 0, 0, time.UTC))
 	require.NoError(t, err)

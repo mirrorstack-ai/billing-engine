@@ -254,18 +254,19 @@ func TestChargeCreationProration_SealsTheFrozenSetAfterRemoval(t *testing.T) {
 	sc := newFakeStripe()
 	svc, p := prorationSvc(store, sc)
 	appID := uuid.New()
-	// Created mid-period with 7 co-created modules → 2 over. Base 15/30 days of
-	// $20 = $10 (1000¢); each overage line 15/30 of the $1.00 amortized
-	// per-module rate = 50¢.
+	// Created mid-period with 12 co-created modules — this app's own
+	// DefaultPlan=Pro cutoff is 10 (billing-engine#202 PR-2c), so 2 are over.
+	// Base 15/30 days of $20 = $10 (1000¢); each overage line 15/30 of the
+	// $1.00 amortized per-module rate = 50¢.
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	registerMirror(t, svc, user, appID, created, 7)
+	registerMirror(t, svc, user, appID, created, 12)
 	_ = acct
 	attempt := freezeCombinedAttemptThenCrash(t, svc, store, sc, p, appID)
 	require.Len(t, attempt.TimerIDs, 2)
 
 	// Between crash and retry one co-created over-module is uninstalled — the
-	// live set shrinks to 1.
-	_, err := svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: appID, ModuleCount: intPtr(6)})
+	// live set shrinks to 11.
+	_, err := svc.SyncAppModules(context.Background(), cycle.SyncAppModulesRequest{AppID: appID, ModuleCount: intPtr(11)})
 	require.NoError(t, err)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
@@ -439,7 +440,9 @@ func TestChargeCreationProration_LateRetryAdoptsFoundInvoice(t *testing.T) {
 	sc := newFakeStripe()
 	svc, p := prorationSvc(store, sc)
 	appID := uuid.New()
-	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
+	// 12 co-created modules − this app's own DefaultPlan=Pro cutoff of 10
+	// (billing-engine#202 PR-2c) = 2 over.
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 12)
 
 	// A prior attempt froze its exact app + two FIFO-over timer identities,
 	// finalized the complete invoice, and crashed before the terminal DB
@@ -646,16 +649,17 @@ func TestChargeCreationProration_ChargesExactlyThePreviewedAmount(t *testing.T) 
 func TestChargeCreationProration_ChargesFlatBaseNotFoldedOverage(t *testing.T) {
 	// Migration 032: module overage is NO LONGER folded into the per-app base —
 	// the creation proration is the FLAT $20 base regardless of module_count (a
-	// 7-module app prorates EXACTLY like a 0-module app). 15 of 30 remaining days
+	// 12-module app prorates EXACTLY like a 0-module app). 15 of 30 remaining days
 	// → 20e6 × 15/30 = 10e6 micros → 1000 cents (NOT the pre-032 26e6 → 1300).
 	// Overage for the modules co-created with the app is a SEPARATE line, added
-	// by the module-overage grace leg (see overage tests).
+	// by the module-overage grace leg (see overage tests). 12 − this app's own
+	// DefaultPlan=Pro cutoff of 10 (billing-engine#202 PR-2c) = 2 over.
 	store := newFakeStore()
 	user, _ := registeredAccount(store)
 	sc := newFakeStripe()
 	svc, p := prorationSvc(store, sc)
 	appID := uuid.New()
-	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 7)
+	registerMirror(t, svc, user, appID, time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC), 12)
 
 	resp, err := svc.ChargeCreationProration(context.Background(), appID)
 	require.NoError(t, err)
