@@ -341,6 +341,14 @@ type Store interface {
 	// proration invoice.
 	AccountActivation(ctx context.Context, accountID uuid.UUID) (activatedAt time.Time, activated bool, err error)
 
+	// PriceBasisBPForAccount is the payer's price basis in basis points
+	// (migration 093, billing-engine#258) for usage.PlanFeeMicros, reached
+	// through accountID's owner_kind/owner_user_id/owner_org_id. Returns
+	// usage.DefaultPriceBasisBP (10000, list) when the account has no
+	// payer_price_basis row — true for every account until an operator sets
+	// one through the SetPayerPriceBasis RPC.
+	PriceBasisBPForAccount(ctx context.Context, accountID uuid.UUID) (int32, error)
+
 	// InsertAppMirror registers a ms_billing.apps roster row idempotently
 	// (ON CONFLICT (app_id) DO NOTHING — a retry never rewrites the original
 	// created_at / module_count / name, which anchor the proration + freeze the
@@ -2408,6 +2416,17 @@ func (s *pgxStore) AccountActivation(ctx context.Context, accountID uuid.UUID) (
 		return time.Time{}, false, nil // never bound a card → never charged (D1d)
 	}
 	return at.Time, true, nil
+}
+
+func (s *pgxStore) PriceBasisBPForAccount(ctx context.Context, accountID uuid.UUID) (int32, error) {
+	bp, err := s.q.PriceBasisBPForAccount(ctx, accountID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usage.DefaultPriceBasisBP, nil // account row itself missing: never charged, never discounted
+	}
+	if err != nil {
+		return 0, err
+	}
+	return bp, nil
 }
 
 func (s *pgxStore) InsertAppMirror(ctx context.Context, appID, accountID, ownerOrgID uuid.UUID, moduleCount, memberCount int, createdAt time.Time, name string, plan usage.Plan) error {

@@ -28,12 +28,17 @@ type fakeStore struct {
 	// plus each link's provenance.
 	orgDistributors       map[uuid.UUID]uuid.UUID
 	orgDistributorSources map[uuid.UUID]string
-	accountsByUser        map[uuid.UUID]fakeAccount
-	hasUsablePM           map[uuid.UUID]bool
-	hasUnpaidInvoice      map[uuid.UUID]bool
-	paymentMethodsBy      map[uuid.UUID][]billing.PaymentMethod
-	serviceSignals        map[uuid.UUID]billing.ServiceSignals
-	addCardRequests       map[uuid.UUID]*fakeAddCardRequest
+	// priceBasis (migration 093, billing-engine#258) keyed "user:<id>" /
+	// "org:<id>"; absent key = no row (the 10000 default). priceBasisAudits
+	// records every Set/Clear call for tests that assert on it.
+	priceBasis       map[string]billing.PriceBasisRow
+	priceBasisAudits []fakePriceBasisAudit
+	accountsByUser   map[uuid.UUID]fakeAccount
+	hasUsablePM      map[uuid.UUID]bool
+	hasUnpaidInvoice map[uuid.UUID]bool
+	paymentMethodsBy map[uuid.UUID][]billing.PaymentMethod
+	serviceSignals   map[uuid.UUID]billing.ServiceSignals
+	addCardRequests  map[uuid.UUID]*fakeAddCardRequest
 
 	// PM-target lookups for detach / set-default, keyed by payment method id.
 	pmTargets map[uuid.UUID]pmTarget
@@ -583,6 +588,60 @@ func (s *fakeStore) DeleteOrgDistributor(_ context.Context, customerOrgID uuid.U
 	}
 	delete(s.orgDistributors, customerOrgID)
 	delete(s.orgDistributorSources, customerOrgID)
+	return true, nil
+}
+
+// fakePriceBasisAudit mirrors one payer_price_basis_audit row (migration 093).
+type fakePriceBasisAudit struct {
+	ownerKey string
+	oldBP    *int32
+	newBP    *int32
+	reason   string
+	setBy    string
+}
+
+func priceBasisOwnerKey(ownerUserID, ownerOrgID uuid.UUID) string {
+	if ownerOrgID != uuid.Nil {
+		return "org:" + ownerOrgID.String()
+	}
+	return "user:" + ownerUserID.String()
+}
+
+func (s *fakeStore) GetPriceBasis(_ context.Context, ownerUserID, ownerOrgID uuid.UUID) (billing.PriceBasisRow, bool, error) {
+	row, ok := s.priceBasis[priceBasisOwnerKey(ownerUserID, ownerOrgID)]
+	return row, ok, nil
+}
+
+func (s *fakeStore) SetPriceBasis(_ context.Context, ownerUserID, ownerOrgID uuid.UUID, priceBasisBP int32, note, reason, setBy string) (billing.PriceBasisRow, error) {
+	if s.priceBasis == nil {
+		s.priceBasis = map[string]billing.PriceBasisRow{}
+	}
+	key := priceBasisOwnerKey(ownerUserID, ownerOrgID)
+	var oldBP *int32
+	if existing, ok := s.priceBasis[key]; ok {
+		v := existing.PriceBasisBP
+		oldBP = &v
+	}
+	newBP := priceBasisBP
+	row := billing.PriceBasisRow{PriceBasisBP: priceBasisBP, Note: note, SetBy: setBy, SetAt: time.Now()}
+	s.priceBasis[key] = row
+	s.priceBasisAudits = append(s.priceBasisAudits, fakePriceBasisAudit{
+		ownerKey: key, oldBP: oldBP, newBP: &newBP, reason: reason, setBy: setBy,
+	})
+	return row, nil
+}
+
+func (s *fakeStore) ClearPriceBasis(_ context.Context, ownerUserID, ownerOrgID uuid.UUID, reason, setBy string) (bool, error) {
+	key := priceBasisOwnerKey(ownerUserID, ownerOrgID)
+	existing, ok := s.priceBasis[key]
+	if !ok {
+		return false, nil
+	}
+	delete(s.priceBasis, key)
+	oldBP := existing.PriceBasisBP
+	s.priceBasisAudits = append(s.priceBasisAudits, fakePriceBasisAudit{
+		ownerKey: key, oldBP: &oldBP, newBP: nil, reason: reason, setBy: setBy,
+	})
 	return true, nil
 }
 

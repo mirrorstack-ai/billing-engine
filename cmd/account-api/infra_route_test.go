@@ -53,6 +53,10 @@ func (stubUsageStore) AccountByOwner(context.Context, usage.Owner) (uuid.UUID, b
 	return uuid.Nil, false, nil
 }
 
+func (stubUsageStore) PriceBasisBPForAccount(context.Context, uuid.UUID) (int32, error) {
+	return usage.DefaultPriceBasisBP, nil
+}
+
 func (stubUsageStore) AppOwnerOrg(context.Context, uuid.UUID) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil
 }

@@ -205,6 +205,27 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.svc.ClearOrgDistributor(ctx, req)
 
+	case "SetPayerPriceBasis":
+		var req billing.SetPayerPriceBasisRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.SetPayerPriceBasis(ctx, req)
+
+	case "ClearPayerPriceBasis":
+		var req billing.ClearPayerPriceBasisRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.ClearPayerPriceBasis(ctx, req)
+
+	case "GetPayerPriceBasis":
+		var req billing.GetPayerPriceBasisRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.svc.GetPayerPriceBasis(ctx, req)
+
 	case "ListDistributorCustomers":
 		var req billing.ListDistributorCustomersRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -748,6 +769,12 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		r.Post("/v1/billing.SetOrgDistributor", makeHTTPHandler(d, "SetOrgDistributor"))
 		r.Post("/v1/billing.ClearOrgDistributor", makeHTTPHandler(d, "ClearOrgDistributor"))
 		r.Post("/v1/billing.ListDistributorCustomers", makeHTTPHandler(d, "ListDistributorCustomers"))
+		// Operator-only: a payer's plan-fee/seat/add-on price basis (migration
+		// 093, billing-engine#258). Same internal-secret credential as every
+		// other control-plane route here; no public route, no console UI.
+		r.Post("/v1/billing.SetPayerPriceBasis", makeHTTPHandler(d, "SetPayerPriceBasis"))
+		r.Post("/v1/billing.ClearPayerPriceBasis", makeHTTPHandler(d, "ClearPayerPriceBasis"))
+		r.Post("/v1/billing.GetPayerPriceBasis", makeHTTPHandler(d, "GetPayerPriceBasis"))
 		r.Post("/v1/billing.GrantCredits", makeHTTPHandler(d, "GrantCredits"))
 		r.Post("/v1/billing.DetachPaymentMethod", makeHTTPHandler(d, "DetachPaymentMethod"))
 		r.Post("/v1/billing.SetDefaultPaymentMethod", makeHTTPHandler(d, "SetDefaultPaymentMethod"))

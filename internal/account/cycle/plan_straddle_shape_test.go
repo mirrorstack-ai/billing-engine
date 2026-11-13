@@ -50,7 +50,7 @@ func TestCombinedProrationChargeShape_StraddleSnapshotsCarryThePlanBase(t *testi
 				CreatedModuleCount: 0,
 				Plan:               usage.PlanBusiness,
 			}
-			shape, err := combinedProrationChargeShape(app, activatedAt, nil)
+			shape, err := combinedProrationChargeShape(app, activatedAt, nil, usage.DefaultPriceBasisBP)
 			if err != nil {
 				t.Fatalf("combinedProrationChargeShape: %v", err)
 			}

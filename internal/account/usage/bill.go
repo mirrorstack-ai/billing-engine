@@ -124,6 +124,37 @@ func resolveBaseFeeMicros(plan Plan) int64 {
 	return TermsFor(plan).BaseFeeMicros
 }
 
+// DefaultPriceBasisBP is "no row" / list price: a payer with no
+// payer_price_basis row (migration 093) pays 100% of list on every plan-fee /
+// seat / add-on line. billing-engine#258.
+const DefaultPriceBasisBP int32 = 10000
+
+// PlanFeeMicros is the ONE place a payer's price basis (basis points,
+// migration 093's payer_price_basis.price_basis_bp; 10000 = list) is applied
+// to a list plan-fee / seat / add-on amount — it extends resolveBaseFeeMicros
+// and every call site that used to read a list fee directly now routes it
+// through this function first (billing-engine#258). It is NEVER applied to
+// usage (module/infra/AI metering) — those lines never call it.
+//
+// priceBasisBP <= 0 (no row; store methods return DefaultPriceBasisBP for
+// that case, but a stray 0 is treated identically, never as free) or >=
+// DefaultPriceBasisBP returns listFeeMicros UNCHANGED — this is what keeps
+// every existing amount byte-identical while no operator has set a row.
+// Otherwise: round_half_up(listFeeMicros × priceBasisBP / 10000), integer
+// micros only, rounded exactly once.
+//
+// For a SEAT line, call this on the UNIT price and multiply by quantity
+// afterward — never on the pre-multiplied total — so unit × quantity equals
+// the line total exactly (the rounding happens once, on the unit).
+func PlanFeeMicros(priceBasisBP int32, listFeeMicros int64) int64 {
+	if priceBasisBP <= 0 || priceBasisBP >= DefaultPriceBasisBP {
+		return listFeeMicros
+	}
+	num := listFeeMicros * int64(priceBasisBP)
+	den := int64(DefaultPriceBasisBP)
+	return (num + den/2) / den
+}
+
 // paasCreditMicros returns the PaaS infra credit that offsets the InfraTotal:
 // round_half_up(infraTotalMicros × PaasCreditPct / 100), a NON-NEGATIVE magnitude
 // the caller SUBTRACTS. The credit is EARNED ONLY through an active SaaS
@@ -221,7 +252,14 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 		return nil, err
 	}
 
-	parts, err := s.computeAppBill(ctx, accountID, found, req.AppID, periodStart, periodEnd, &installedModuleIDs)
+	priceBasisBP := DefaultPriceBasisBP
+	if found {
+		priceBasisBP, err = s.store.PriceBasisBPForAccount(ctx, accountID)
+		if err != nil {
+			return nil, billing.Internal("price basis lookup failed", err)
+		}
+	}
+	parts, err := s.computeAppBill(ctx, accountID, found, req.AppID, periodStart, periodEnd, &installedModuleIDs, priceBasisBP)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +480,11 @@ func clampModelChargesToTotal(lines []AgentModelUsage, limit int64) []AgentModel
 // usage-proxy fallbacks). found=false (no billing account yet) yields the
 // base-fee-only bill: no usage/module-infra reads, but the catalog-anchored
 // infra residual still renders every declared metric at $0.
-func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found bool, appID uuid.UUID, periodStart, periodEnd time.Time, displayInstalled *[]uuid.UUID) (*appBillParts, error) {
+//
+// priceBasisBP is the payer's price basis (billing-engine#258), resolved ONCE
+// by the caller (DefaultPriceBasisBP for a lazy found=false account) rather
+// than re-queried per app.
+func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found bool, appID uuid.UUID, periodStart, periodEnd time.Time, displayInstalled *[]uuid.UUID, priceBasisBP int32) (*appBillParts, error) {
 	// Read the usage lines (empty when no billing account exists yet — the bill is
 	// then base-fee-only).
 	var lines []AppMetricUsageRaw
@@ -638,10 +680,17 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 		return nil, billing.Internal("app base snapshot lookup failed", err)
 	}
 	if snapped {
-		// This period's base was charged: display EXACTLY what was invoiced.
-		// The snapshot alone decides — the mirror only drives the estimate paths.
+		// This period's base was charged: display EXACTLY what was invoiced
+		// (already payer-adjusted at charge time, migration 093 — never
+		// re-derived here). The snapshot alone decides — the mirror only
+		// drives the estimate paths.
 		baseFee = snap.BaseMicros
 	} else {
+		// ESTIMATE paths only: the payer's price basis (billing-engine#258),
+		// passed in by the caller (found=false, lazy/no billing account row,
+		// has no accounts.owner_* to reach a basis row through, so it is
+		// always DefaultPriceBasisBP there — the same posture as every other
+		// lazy-account path in this file).
 		switch {
 		case mirrored && mirror.Deleted:
 			// Deleted → no base will be charged (D1e: deletion stops FUTURE base
@@ -664,12 +713,12 @@ func (s *Service) computeAppBill(ctx context.Context, accountID uuid.UUID, found
 			// one-time "New creation" charge (cycle/proration.go) — applying it
 			// here double-derived it and showed $14.19 for a $20 plan on every
 			// mid-period app (issue #63; the Aug-1 invoice was already correct).
-			baseFee = resolveBaseFeeMicros(plan)
+			baseFee = PlanFeeMicros(priceBasisBP, resolveBaseFeeMicros(plan))
 		default:
 			// No mirror row (pre-backfill): the flat per-app base. The pre-032
 			// usage-proxy overage is gone — overage is pooled at the account
 			// level, so a per-app read never estimates it.
-			baseFee = resolveBaseFeeMicros(plan)
+			baseFee = PlanFeeMicros(priceBasisBP, resolveBaseFeeMicros(plan))
 		}
 	}
 
