@@ -1015,9 +1015,12 @@ type SetInfraPriceOverridesResponse struct {
 
 // AccountBillTax is GetAccountBill's ESTIMATED tax line (core-v2#250).
 //
-// The invoice is where tax becomes a fact (Stripe Tax on the Stripe rail,
-// ezPay 未稅/稅額/含稅 on the NewebPay rail); the bill read only forecasts it
-// from the payer's jurisdiction and the net projection, so the UI can show
+// The invoice is where tax becomes a fact — determined by the rail-neutral
+// TaxResolver (internal/intent/rater.go) and, for a Taiwan buyer, by the
+// platform invoicing service ADR 0001
+// (docs/adr/0001-taiwan-einvoice-platform-service.md), never by which
+// payment rail collected the charge; the bill read only forecasts it from the
+// payer's jurisdiction and the net projection, so the UI can show
 // 小計（未稅）→ 稅額（預估）→ 合計 before the invoice exists.
 type AccountBillTax struct {
 	// Status is TaxStatusEstimated when a rule applied, TaxStatusNotConfigured
