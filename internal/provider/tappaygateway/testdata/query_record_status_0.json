@@ -1,0 +1,13 @@
+{
+  "status": 0,
+  "msg": "Success",
+  "trade_records": [
+    {
+      "rec_trade_id": "D20261104000001",
+      "bank_transaction_id": "btxn_test_000001",
+      "order_number": "ms-payment-test-000001",
+      "amount": 1000,
+      "record_status": 0
+    }
+  ]
+}
