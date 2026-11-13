@@ -276,6 +276,22 @@ func TestRecordInfraUsage_LazyAccountWhenNoBillingAccount(t *testing.T) {
 	_, err := newService(store).RecordInfraUsage(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, uuid.Nil, store.events[req.EventID].AccountID, "lazy infra event records NULL account")
+	require.Equal(t, req.OwnerUserID, store.events[req.EventID].LazyOwnerUserID(),
+		"a lazy user infra row is stamped with its owner for the user sweep (migration 088)")
+}
+
+func TestRecordInfraUsage_OwnerlessLazyRowIsNeverUserStamped(t *testing.T) {
+	// An ownerless sampler row names no user. It is never stamped from the
+	// roster: the roster names the payer, which is not who the usage was
+	// recorded for during a payer re-seat.
+	store := newFakeStore()
+	req := validInfra()
+	req.OwnerUserID, req.OwnerOrgID = uuid.Nil, uuid.Nil
+
+	_, err := newService(store).RecordInfraUsage(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, uuid.Nil, store.events[req.EventID].AccountID)
+	require.Equal(t, uuid.Nil, store.events[req.EventID].LazyOwnerUserID())
 }
 
 func TestRecordInfraUsage_ResolvesAccountFromOwner(t *testing.T) {

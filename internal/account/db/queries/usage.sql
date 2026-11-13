@@ -215,12 +215,18 @@ WHERE module_id = $1 AND metric = $2;
 -- ordinary chargeable usage. The ON CONFLICT (event_id) DO NOTHING idempotency
 -- is UNTOUCHED — dev_served rides along on the insert and, exactly like every
 -- other column, a deduped retry never rewrites it.
+-- owner_user_id is the migration-088 lazy-user stamp: the owner user of a row
+-- written with account_id NULL because that user had no accounts row yet, and
+-- NULL on every other row (usage.UsageEvent.LazyOwnerUserID decides which).
+-- It is not part of the payload fingerprint — it is derived from the owner
+-- the fingerprint already covers and from the account resolution — so it
+-- changes no idempotency answer.
 -- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
     billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
-    dev_served, template_key
+    dev_served, template_key, owner_user_id
 ) VALUES (
     @event_id::text, sqlc.narg(account_id)::uuid, @app_id::uuid,
     @module_id::uuid, @metric::text, @kind::ms_billing.metric_kind,
@@ -230,7 +236,8 @@ INSERT INTO ms_billing.usage_events (
     sqlc.narg(occurred_at)::timestamptz, @billable_at::timestamptz,
     sqlc.narg(aggregation_key)::text,
     @payload_fingerprint::bytea, @occurrence_policy::text,
-    @dev_served::boolean, sqlc.narg(template_key)::text
+    @dev_served::boolean, sqlc.narg(template_key)::text,
+    sqlc.narg(owner_user_id)::uuid
 )
 ON CONFLICT (event_id) DO NOTHING;
 
