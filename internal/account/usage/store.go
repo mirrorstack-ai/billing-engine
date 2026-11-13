@@ -76,7 +76,19 @@ type Store interface {
 	// A metric with no sentinel row (seed drift the service can't catch — it
 	// validates against the in-Go registry, not the DB) affects 0 rows and is
 	// surfaced as an error rather than a silent no-op.
-	SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, absorbAll bool, overrides []InfraPriceOverride) error
+	//
+	// moduleVersion is the OPTIONAL publishing version (issue #219). When set,
+	// EVERY resulting price — the absorbed-to-0 set (read back via
+	// ListActiveSentinelInfraMetrics, the same set step 1 just wrote) and each
+	// explicit override — is ALSO snapshotted into the immutable
+	// ms_billing.metric_version_prices table, mirroring UpsertMetricVersionPrices:
+	// ON CONFLICT DO NOTHING, so a duplicate publish of the same version is a
+	// no-op, and a LATER version's re-price can never retroactively change an
+	// EARLIER version's already-rolled-up charge (cycle.MetricPriceMicros
+	// resolves VERSION-FIRST for any module_version, reserved or not). Empty
+	// moduleVersion writes no snapshot — a version-less override keeps today's
+	// version-blind resolution chain.
+	SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, moduleVersion string, absorbAll bool, overrides []InfraPriceOverride) error
 
 	// InsertUsageEvent writes one raw metered fact, idempotent on
 	// event_id. recorded=false means ON CONFLICT(event_id) DO NOTHING
@@ -905,7 +917,7 @@ func (s *pgxStore) UpsertMetricVersionPrices(ctx context.Context, prices []Metri
 // 🔴 NO EARLY RETURN ON AN EMPTY SET. The predecessor's `if len(overrides) == 0
 // { return nil }` is precisely what made an override unwithdrawable: the one call
 // that means "I declare nothing any more" was the one call that did nothing.
-func (s *pgxStore) SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, absorbAll bool, overrides []InfraPriceOverride) error {
+func (s *pgxStore) SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UUID, moduleVersion string, absorbAll bool, overrides []InfraPriceOverride) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -941,6 +953,46 @@ func (s *pgxStore) SyncInfraPriceOverrides(ctx context.Context, moduleID uuid.UU
 			return fmt.Errorf("no sentinel catalog row for infra metric %q (seed drift): cannot inherit kind/unit for the override", o.Metric)
 		}
 		keep = append(keep, o.Metric)
+
+		// Version-stamp the explicit override at its OWN price (issue #219),
+		// BEFORE the absorbed-0 sweep below. ms_billing.metric_version_prices is
+		// insert-only (ON CONFLICT DO NOTHING), the opposite of metric_definitions'
+		// DO UPDATE: whichever write claims a (module, metric, version) key FIRST
+		// is the one that sticks. Writing the override's own price here, ahead of
+		// the absorb-all snapshot sweep, is what makes the override win the
+		// SNAPSHOT the same way it already wins the LIVE catalog row.
+		if moduleVersion != "" {
+			if _, err := qtx.UpsertMetricVersionPrice(ctx, db.UpsertMetricVersionPriceParams{
+				ModuleID:        moduleID.String(),
+				Metric:          o.Metric,
+				ModuleVersion:   moduleVersion,
+				UnitPriceMicros: o.UnitPriceMicros,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 2b. Version-stamp the absorbed-to-0 set (issue #219), AFTER the explicit
+	//     overrides above have already claimed their own keys. AbsorbAllInfraPriceOverrides
+	//     writes no per-metric price back to Go, so read the same active sentinel
+	//     set back; any metric an explicit override already snapshotted above is a
+	//     harmless no-op here (ON CONFLICT DO NOTHING).
+	if absorbAll && moduleVersion != "" {
+		metrics, err := qtx.ListActiveSentinelInfraMetrics(ctx)
+		if err != nil {
+			return err
+		}
+		for _, metric := range metrics {
+			if _, err := qtx.UpsertMetricVersionPrice(ctx, db.UpsertMetricVersionPriceParams{
+				ModuleID:        moduleID.String(),
+				Metric:          metric,
+				ModuleVersion:   moduleVersion,
+				UnitPriceMicros: 0,
+			}); err != nil {
+				return err
+			}
+		}
 	}
 
 	// 3. Withdraw whatever the manifest no longer declares. Under absorb-all the
