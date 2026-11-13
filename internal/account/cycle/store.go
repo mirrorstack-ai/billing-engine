@@ -17,6 +17,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/db"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
+	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 	"github.com/mirrorstack-ai/billing-engine/internal/meteringlock"
 )
 
@@ -1172,6 +1173,11 @@ type InvoiceMirror struct {
 	// exists only so a later spine mirror racing that webhook can't clear a
 	// latched true (existing OR EXCLUDED) — core#135.
 	EverFailed bool
+	// Tax is the TaxDetermination sealed into the ChargeIntent this invoice
+	// collects (migration 088), recorded verbatim — never computed here. nil
+	// leaves the tax columns NULL, which reads as UNKNOWN: every caller today
+	// adopts an invoice a LEGACY run created, and no intent sealed one for it.
+	Tax *intent.TaxDetermination
 }
 
 // RawAggregate is one per-kind aggregated row from the rollup SELECTs, before
@@ -2173,7 +2179,7 @@ func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {
 	if inv.ChargeFundingAccountID == uuid.Nil || inv.ChargeFundingGeneration == uuid.Nil {
 		return errors.New("invoice mirror requires exact durable funding provenance")
 	}
-	return s.q.UpsertInvoice(ctx, db.UpsertInvoiceParams{
+	p := db.UpsertInvoiceParams{
 		AccountID:               inv.AccountID.String(),
 		StripeInvoiceID:         inv.StripeInvoiceID,
 		Status:                  inv.Status,
@@ -2186,7 +2192,37 @@ func (s *pgxStore) UpsertInvoice(ctx context.Context, inv InvoiceMirror) error {
 		EverFailed:              inv.EverFailed,
 		ChargeFundingAccountID:  inv.ChargeFundingAccountID.String(),
 		ChargeFundingGeneration: inv.ChargeFundingGeneration.String(),
-	})
+	}
+	if err := setInvoiceTax(&p, inv.Tax); err != nil {
+		return err
+	}
+	return s.q.UpsertInvoice(ctx, p)
+}
+
+// setInvoiceTax copies a sealed TaxDetermination onto migration 088's
+// columns, verbatim. nil leaves all four NULL (unknown), never a zero line.
+// The amount lands in whole cents like amount_due; a sub-cent figure or an
+// unresolved / unsealable determination is REFUSED rather than rounded or
+// recorded, because the mirror may only repeat what an intent sealed.
+func setInvoiceTax(p *db.UpsertInvoiceParams, t *intent.TaxDetermination) error {
+	if t == nil {
+		return nil
+	}
+	if !t.Resolved || !intent.TaxVerificationSealable(t.Verification) {
+		return fmt.Errorf("invoice mirror: tax determination is not a sealed one (resolved=%t, verification=%q)", t.Resolved, t.Verification)
+	}
+	if t.AmountMicros < 0 || t.AmountMicros%microsPerCent != 0 {
+		return fmt.Errorf("invoice mirror: tax amount %d micros is not whole non-negative cents", t.AmountMicros)
+	}
+	amount, err := centsNumeric(t.AmountMicros / microsPerCent)
+	if err != nil {
+		return err
+	}
+	p.TaxAmount = amount
+	p.TaxJurisdiction = pgtype.Text{String: t.Jurisdiction, Valid: true}
+	p.TaxRuleRevision = pgtype.Text{String: t.RuleRevision, Valid: true}
+	p.TaxVerification = pgtype.Text{String: string(t.Verification), Valid: true}
+	return nil
 }
 
 func (s *pgxStore) MarkBillingRun(ctx context.Context, runID uuid.UUID, status BillingRunStatus, stripeInvoiceID string, totalCents int64) error {
@@ -2658,7 +2694,7 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 	if err != nil {
 		return 0, "", err
 	}
-	if err := qtx.UpsertInvoice(ctx, db.UpsertInvoiceParams{
+	invParams := db.UpsertInvoiceParams{
 		AccountID:               pc.Invoice.AccountID.String(),
 		ChargeFundingAccountID:  attempt.ChargeFundingAccountID.String(),
 		ChargeFundingGeneration: attempt.ChargeFundingGeneration.String(),
@@ -2674,7 +2710,11 @@ func (s *pgxStore) persistProrationCharge(ctx context.Context, appID uuid.UUID, 
 		// silently write false for every creation/combined invoice.
 		IsLargeAutoCollect: pc.Invoice.IsLargeAutoCollect,
 		EverFailed:         pc.Invoice.EverFailed,
-	}); err != nil {
+	}
+	if err := setInvoiceTax(&invParams, pc.Invoice.Tax); err != nil {
+		return 0, "", err
+	}
+	if err := qtx.UpsertInvoice(ctx, invParams); err != nil {
 		return 0, "", err
 	}
 	if err := qtx.UpsertProrationBaseSnapshot(ctx, db.UpsertProrationBaseSnapshotParams{

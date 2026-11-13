@@ -98,6 +98,23 @@ type InvoiceRow struct {
 	// once; web derives the failed display state from (status, ever_failed) —
 	// core#135. Always present, like is_large_auto_collect.
 	EverFailed bool `json:"ever_failed"`
+
+	// Tax is the invoice's itemized tax line as its sealed ChargeIntent
+	// determined it (migration 088). null = UNKNOWN (a row with no recorded
+	// determination) — never render it as a zero line.
+	Tax *InvoiceTax `json:"tax"`
+}
+
+// InvoiceTax is the tax line recorded on the mirror, repeated not computed.
+// List prices are net, so Inclusive is always false today; it is sent so a
+// client never has to assume. RateBps is null until a TaxPolicyRevision
+// supplies a rate (a not_applicable determination carries none).
+type InvoiceTax struct {
+	AmountMicros int64  `json:"amount_micros"`
+	RateBps      *int32 `json:"rate_bps"`
+	Jurisdiction string `json:"jurisdiction"`
+	Verification string `json:"verification"`
+	Inclusive    bool   `json:"inclusive"`
 }
 
 // ListInvoicesResponse is one page of the invoice history, newest-first.
@@ -190,6 +207,7 @@ func (s *Service) ListInvoices(ctx context.Context, req ListInvoicesRequest) (*L
 			InvoicePDF:         r.InvoicePDF,
 			IsLargeAutoCollect: r.IsLargeAutoCollect,
 			EverFailed:         r.EverFailed,
+			Tax:                r.Tax,
 		})
 	}
 
