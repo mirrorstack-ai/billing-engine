@@ -116,6 +116,7 @@ func main() {
 	// dev cycle is a single batch.
 	at := time.Now().UTC()
 	runOrgAttachSweep(context.Background(), svc, at)
+	runUserAttachSweep(context.Background(), svc, at)
 	runPlanChangeApply(context.Background(), svc, at)
 	res := runCycle(context.Background(), svc, at)
 	// Proration runs BEFORE the overage sweep. A Stripe creation charge resolves
@@ -544,6 +545,7 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			at = time.Now().UTC()
 		}
 		runOrgAttachSweep(ctx, svc, at.UTC())
+		runUserAttachSweep(ctx, svc, at.UTC())
 		runPlanChangeApply(ctx, svc, at.UTC())
 		res := runCycle(ctx, svc, at.UTC())
 		// Proration runs BEFORE the overage sweep (see main): Stripe creations
@@ -785,6 +787,20 @@ func runOrgAttachSweep(ctx context.Context, svc *cycle.Service, at time.Time) {
 	}
 	slog.InfoContext(ctx, "org usage attach sweep complete", "as_of", at,
 		"orgs", summary.Orgs, "swept", summary.Swept, "attached_apps", summary.AttachedApps,
+		"repointed_events", summary.RepointedEvents, "failed", summary.Failed)
+}
+
+// runUserAttachSweep is the org sweep's user twin (core-v2#340), placed beside
+// it for the same reason: rows it repoints bill in the open window, so they
+// must land before runCycle rolls anything up.
+func runUserAttachSweep(ctx context.Context, svc *cycle.Service, at time.Time) {
+	summary, err := svc.SweepUnattachedUserUsage(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "user usage repoint sweep failed", "as_of", at, "error", err)
+		return
+	}
+	slog.InfoContext(ctx, "user usage repoint sweep complete", "as_of", at,
+		"accounts", summary.Accounts, "swept", summary.Swept,
 		"repointed_events", summary.RepointedEvents, "failed", summary.Failed)
 }
 
