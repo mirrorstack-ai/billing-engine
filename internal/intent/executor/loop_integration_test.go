@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"time"
@@ -33,7 +34,7 @@ func TestAPassSettlesAnEligibleIntent(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
 	ctx := context.Background()
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "ref-loop"}}
 	result, err := RunOnce(ctx, s, newExecutor(t, s, collector, fullyEvidencedEnv()), 10, quiet())
@@ -64,7 +65,7 @@ func TestAPassThatRefusesEverythingSaysSoAndNamesTheGate(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
 	ctx := context.Background()
-	ready(t, s)
+	ready(t, s, pool)
 
 	// The honest production Environment: nothing is evidenced.
 	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
@@ -100,7 +101,7 @@ func TestAnUnresolvedIntentIsNotOfferedAgain(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
 	ctx := context.Background()
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	// Ambiguous: the rail errored after the claim was taken.
 	first := &recordingCollector{err: errors.New("timeout after dispatch")}
@@ -133,7 +134,7 @@ func TestASettledIntentIsNotOfferedAgain(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
 	ctx := context.Background()
-	ready(t, s)
+	ready(t, s, pool)
 
 	first := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "ref-1"}}
 	_, err := RunOnce(ctx, s, newExecutor(t, s, first, fullyEvidencedEnv()), 10, quiet())
@@ -156,7 +157,7 @@ func TestAPassIsBounded(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
-		readyN(t, s, i)
+		readyN(t, s, pool, i)
 	}
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
@@ -201,7 +202,7 @@ func TestOneErroringIntentDoesNotStopThePass(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	poisoned := ready(t, s)
+	poisoned := ready(t, s, pool)
 
 	// Rewrite a sealed column so Rehydrate refuses the row. The seal refuses
 	// this, which is the point — reaching it takes a session that has
@@ -217,7 +218,7 @@ func TestOneErroringIntentDoesNotStopThePass(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 2; i++ {
-		readyN(t, s, i)
+		readyN(t, s, pool, i)
 	}
 
 	collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}
@@ -237,12 +238,13 @@ func TestOneErroringIntentDoesNotStopThePass(t *testing.T) {
 // It varies the quantity and the source fact, both of which are inside the
 // digest, so each call produces a genuinely different document rather than a
 // second reference to one.
-func readyN(t *testing.T, s *store.Store, n int) intent.ChargeIntent {
+func readyN(t *testing.T, s *store.Store, pool *pgxpool.Pool, n int) intent.ChargeIntent {
 	t.Helper()
 	ctx := context.Background()
+	seedAccountForPayer(t, pool, intent.Subject{Kind: "org", ID: testOrgPayerID})
 
 	sealed, err := intent.Seal(intent.Draft{
-		Payer:             intent.Subject{Kind: "org", ID: "org-1"},
+		Payer:             intent.Subject{Kind: "org", ID: testOrgPayerID},
 		Currency:          "USD",
 		Lines:             []intent.Line{intent.NewLine("quiz.render", "quiz-core", "1.4.0", int64(1_000+n), 25)},
 		Kind:              kindCycle,
@@ -267,7 +269,7 @@ func readyN(t *testing.T, s *store.Store, n int) intent.ChargeIntent {
 	// its terms; the period ceiling is raised so a batch fits inside it.
 	auth, err := intent.AuthorizeAccepted(intent.AuthorizationGrant{
 		ID: "auth-1", Scope: intent.ScopeStanding,
-		Subject:  intent.Subject{Kind: "org", ID: "org-1"},
+		Subject:  intent.Subject{Kind: "org", ID: testOrgPayerID},
 		Currency: "USD", Kinds: []intent.ChargeKind{kindCycle},
 		PerChargeCeiling: 1_000_000, PeriodCeiling: 500_000_000, FrequencyCeiling: 100,
 		NoticeLeadTime: 24 * time.Hour, Provider: "stripe", MandateReference: "pm_test_1",
@@ -282,7 +284,7 @@ func readyN(t *testing.T, s *store.Store, n int) intent.ChargeIntent {
 	// The engine-issued acceptance the standing gate rests on. readyN builds
 	// its own authorization, so it needs its own challenge — the sibling
 	// helper in executor_integration_test.go issues one for ready()'s.
-	issueAndAccept(t, s, auth, intent.Subject{Kind: "org", ID: "org-1"})
+	issueAndAccept(t, s, auth, intent.Subject{Kind: "org", ID: testOrgPayerID})
 
 	require.NoError(t, s.RecordNotice(ctx, store.NoticeReceipt{
 		IntentDigest: sealed.Digest(), DeliveredDigest: sealed.Digest(),
@@ -323,7 +325,7 @@ func TestATerminalIntentIsNeverOffered(t *testing.T) {
 
 	for _, state := range []string{"voided", "canceled", "expired"} {
 		t.Run(state, func(t *testing.T) {
-			sealed := readyN(t, s, terminalFixtureIndex(state))
+			sealed := readyN(t, s, pool, terminalFixtureIndex(state))
 			require.NoError(t, s.AdvanceState(ctx, sealed.Digest(), "eligible", state))
 
 			collector := &recordingCollector{result: CollectResult{Succeeded: true, Reference: "in_fixture"}}

@@ -160,6 +160,18 @@ func (e *Executor) ExecuteGroup(ctx context.Context, collector GroupCollector, d
 		}
 
 	case result.Succeeded:
+		// 🔴 NOT WIRED TO billing-engine#313's payment fact. Execute's single-
+		// intent path writes one in the same transaction as the outcome
+		// (RecordSettlementWithFact); this group path still calls the plain
+		// RecordOutcomeWithEvidence below. Nothing calls ExecuteGroup today
+		// (see this file's own package doc / the group tests), so nothing is
+		// silently missing a fact in production — but wiring it needs a real
+		// decision this issue did not make: every member shares ONE
+		// provider reference, so a correct fact here is ONE row keyed to that
+		// shared reference, not one per member, and RecordTx's idempotent
+		// insert makes that safe to call per member ONLY if every member
+		// also shares one payer — true of the boundary-close group this
+		// package exists for, but not asserted anywhere a reviewer can pin.
 		for _, m := range members {
 			// Every member of a group settles through the SAME provider object —
 			// one invoice, which is what a group is — so they share the
