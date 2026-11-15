@@ -16,7 +16,9 @@ package cycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +27,12 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
+
+// maxQuoteChangeSteps bounds one request's step list: every distinct app_id
+// costs one store read, and a plan-confirm or install preview is a handful of
+// steps, so the server enforces a cap rather than trusting the transport's
+// body-size limit.
+const maxQuoteChangeSteps = 10
 
 // QuoteChangeStepKind names one step of a hypothetical plan change sequence.
 type QuoteChangeStepKind string
@@ -121,6 +129,10 @@ type QuoteChangeResponse struct {
 // get-or-creates an accounts row for an owner who has none. A store failure
 // never produces a guessed price: every step in that response reports
 // QuoteStandingUnknown and zero amounts instead.
+//
+// Every existing app (app_id) a step names must be a live app of THIS owner —
+// the same account and principal; anything else is NotFound with one message
+// (quoteOwnedAppPlans). At most maxQuoteChangeSteps steps are accepted.
 func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*QuoteChangeResponse, error) {
 	if req.OwnerUserID == uuid.Nil && req.OwnerOrgID == uuid.Nil {
 		return nil, billing.InvalidInput("owner_user_id or owner_org_id required")
@@ -130,6 +142,9 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 	}
 	if len(req.Steps) == 0 {
 		return nil, billing.InvalidInput("steps required")
+	}
+	if len(req.Steps) > maxQuoteChangeSteps {
+		return nil, billing.InvalidInput(fmt.Sprintf("steps exceeds the maximum of %d", maxQuoteChangeSteps))
 	}
 
 	parsedPlan := make([]usage.Plan, len(req.Steps))
@@ -172,6 +187,23 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 	now := s.nowFn().UTC()
 	accountID, activatedAt, standing, err := s.quoteOwnerStanding(ctx, req.OwnerUserID, req.OwnerOrgID)
 	if err != nil {
+		slog.ErrorContext(ctx, "quote change: owner standing read failed; answering unknown",
+			"error", err)
+		return unknownQuoteResponse(req.Steps), nil
+	}
+
+	// Every app_id a step names must be an app THIS owner owns: it is looked up
+	// once per distinct id, refused as NotFound (one message for unregistered,
+	// deleted and foreign, so the answer is no oracle for another tenant's app)
+	// and its current plan seeds set_plan's pricing below.
+	existingAppPlan, err := s.quoteOwnedAppPlans(ctx, req, accountID)
+	if err != nil {
+		var billingErr *billing.Error
+		if errors.As(err, &billingErr) {
+			return nil, err
+		}
+		slog.ErrorContext(ctx, "quote change: app lookup failed; answering unknown",
+			"error", err)
 		return unknownQuoteResponse(req.Steps), nil
 	}
 
@@ -179,6 +211,8 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 	if accountID != uuid.Nil {
 		n, err := s.store.LiveModuleTimerCountForAccount(ctx, accountID)
 		if err != nil {
+			slog.ErrorContext(ctx, "quote change: live module count read failed; answering unknown",
+				"error", err)
 			return unknownQuoteResponse(req.Steps), nil
 		}
 		moduleCount = n
@@ -189,26 +223,13 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 	}
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(now, anchorDay)
 
-	existingAppPlan := make(map[uuid.UUID]usage.Plan)
 	stepAppPlan := make([]usage.Plan, len(req.Steps))
 
-	resolveCurrentPlan := func(step QuoteChangeStep) (usage.Plan, error) {
+	resolveCurrentPlan := func(step QuoteChangeStep) usage.Plan {
 		if step.StepRef != nil {
-			return stepAppPlan[*step.StepRef], nil
+			return stepAppPlan[*step.StepRef]
 		}
-		if p, ok := existingAppPlan[step.AppID]; ok {
-			return p, nil
-		}
-		app, found, err := s.store.AppMirror(ctx, step.AppID)
-		if err != nil {
-			return "", err
-		}
-		plan := usage.DefaultPlan
-		if found {
-			plan = effectivePlan(app)
-		}
-		existingAppPlan[step.AppID] = plan
-		return plan, nil
+		return existingAppPlan[step.AppID]
 	}
 
 	results := make([]QuoteChangeStepResult, len(req.Steps))
@@ -245,10 +266,7 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 
 		case QuoteStepSetPlan:
 			newPlan := parsedPlan[i]
-			current, planErr := resolveCurrentPlan(step)
-			if planErr != nil {
-				return unknownQuoteResponse(req.Steps), nil
-			}
+			current := resolveCurrentPlan(step)
 			terms := usage.TermsFor(newPlan)
 			result.RecurringMicros = terms.BaseFeeMicros
 			result.ModulesIncludedUsed = min(moduleCount, usage.IncludedModules)
@@ -274,6 +292,42 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 	}
 
 	return &QuoteChangeResponse{Steps: results}, nil
+}
+
+// quoteOwnedAppPlans resolves the current plan of every existing app (app_id,
+// not step_ref) the request names, one store read per distinct id, and proves
+// each belongs to the quoted owner: the roster row is registered, not deleted,
+// billed to the SAME account the owner's standing resolved to, and owned by the
+// same principal (the owner's org for an org owner, no org for a user owner —
+// a sponsor user's account can bill an org's app without owning it). Anything
+// else is NotFound with one message, so a quote never prices an app the real
+// SetAppPlan / SyncAppModules would refuse and never reveals another tenant's
+// plan through the prorated upgrade amount. An owner whose account did not
+// resolve (accountID is nil) owns no app. A non-billing error is a store
+// failure, which the caller degrades to an unknown quote.
+func (s *Service) quoteOwnedAppPlans(ctx context.Context, req QuoteChangeRequest, accountID uuid.UUID) (map[uuid.UUID]usage.Plan, error) {
+	plans := make(map[uuid.UUID]usage.Plan)
+	for _, step := range req.Steps {
+		if step.Kind == QuoteStepCreateApp || step.StepRef != nil {
+			continue
+		}
+		if _, seen := plans[step.AppID]; seen {
+			continue
+		}
+		notOwned := billing.NotFound("app not registered or deleted")
+		if accountID == uuid.Nil {
+			return nil, notOwned
+		}
+		app, found, err := s.store.AppMirror(ctx, step.AppID)
+		if err != nil {
+			return nil, err
+		}
+		if !found || app.Deleted || app.AccountID != accountID || app.OwnerOrgID != req.OwnerOrgID {
+			return nil, notOwned
+		}
+		plans[step.AppID] = effectivePlan(app)
+	}
+	return plans, nil
 }
 
 // quoteOwnerStanding mirrors fundedOwnerAccount's checks exactly — the SAME
