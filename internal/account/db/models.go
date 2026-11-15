@@ -918,6 +918,31 @@ type MsBillingOrgDistributor struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// Per-payer price basis (basis points off list, 10000 = list) applied to plan-fee / seat / add-on amounts only, never to usage. No row = 10000. Keyed by owner (user XOR org), same shape as accounts, so a basis can be set before the payer has an account row.
+type MsBillingPayerPriceBasis struct {
+	ID           string      `json:"id"`
+	OwnerKind    string      `json:"owner_kind"`
+	OwnerUserID  pgtype.UUID `json:"owner_user_id"`
+	OwnerOrgID   pgtype.UUID `json:"owner_org_id"`
+	PriceBasisBp int32       `json:"price_basis_bp"`
+	Note         string      `json:"note"`
+	SetBy        string      `json:"set_by"`
+	SetAt        time.Time   `json:"set_at"`
+}
+
+// Append-only log of every SetPayerPriceBasis / ClearPayerPriceBasis call. Never updated or deleted.
+type MsBillingPayerPriceBasisAudit struct {
+	ID              string      `json:"id"`
+	OwnerKind       string      `json:"owner_kind"`
+	OwnerUserID     pgtype.UUID `json:"owner_user_id"`
+	OwnerOrgID      pgtype.UUID `json:"owner_org_id"`
+	OldPriceBasisBp pgtype.Int4 `json:"old_price_basis_bp"`
+	NewPriceBasisBp pgtype.Int4 `json:"new_price_basis_bp"`
+	Reason          string      `json:"reason"`
+	SetBy           string      `json:"set_by"`
+	SetAt           time.Time   `json:"set_at"`
+}
+
 type MsBillingPaymentMethodsMirror struct {
 	ID                    string             `json:"id"`
 	AccountID             string             `json:"account_id"`

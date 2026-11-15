@@ -142,6 +142,14 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		}, nil
 	}
 
+	// The payer's price basis (billing-engine#258), resolved ONCE for the
+	// whole account bill and reused by computeAppBill (per app), the agent
+	// scope, and the recurring-share helpers below — never re-queried per app.
+	priceBasisBP, err := s.store.PriceBasisBPForAccount(ctx, accountID)
+	if err != nil {
+		return nil, billing.Internal("price basis lookup failed", err)
+	}
+
 	// The next-period recurring base, decomposed by owning app. Only the CURRENT
 	// live window forecasts one (a frozen window's projection is each app's plan
 	// base and nothing else), so a historical bill reads no shares and allocates
@@ -159,7 +167,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 			return nil, billing.Internal("activated recurring fee shares failed", err)
 		}
 	}
-	projectedBaseByApp := projectedBaseFeeByApp(recurringShares)
+	projectedBaseByApp := projectedBaseFeeByApp(recurringShares, priceBasisBP)
 
 	usageApps, err := s.store.AppIDsWithUsage(ctx, accountID, periodStart, periodEnd)
 	if err != nil {
@@ -190,7 +198,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	apps := make([]AccountAppBill, 0, len(appIDs))
 	var baseFeeTotal, moduleUsageTotal, infraTotal, deployUsageTotal, usageDeductionTotal int64
 	for _, appID := range appIDs {
-		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd, nil)
+		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd, nil, priceBasisBP)
 		if err != nil {
 			return nil, err
 		}
@@ -240,7 +248,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	// as an app, but its resolved app base fee is DISCARDED — agent activity is
 	// not an app and never incurs a base fee. Runs unconditionally like the app
 	// loop above: a lazy (!found) owner already returned a zero-Agent bill.
-	agentParts, err := s.computeAppBill(ctx, accountID, found, uuid.Nil, periodStart, periodEnd, nil)
+	agentParts, err := s.computeAppBill(ctx, accountID, found, uuid.Nil, periodStart, periodEnd, nil, priceBasisBP)
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +328,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// projection has no member history to read; billing-engine#202 PR-4
 		// adds it. Until then the boundary can exceed this figure by that fee.
 		counts := RecurringFeeCountsOf(recurringShares)
-		projectedBaseFeeTotal = activatedBaseMicros(recurringShares) +
+		projectedBaseFeeTotal = activatedBaseMicros(recurringShares, priceBasisBP) +
 			ModuleBlockMicros(int64(counts.ModuleOverages)) +
 			int64(counts.CustomDomains)*DomainFeeMicros
 		// The current-period base line is the complete activation-gated recurring
@@ -332,7 +340,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// every live app carries exactly the plan base and nothing else.
 		for i := range response.Apps {
 			if !response.Apps[i].IsDeleted {
-				response.Apps[i].ProjectedBaseFeeMicros = resolveBaseFeeMicros(response.Apps[i].Plan)
+				response.Apps[i].ProjectedBaseFeeMicros = PlanFeeMicros(priceBasisBP, resolveBaseFeeMicros(response.Apps[i].Plan))
 			}
 		}
 	}
@@ -415,10 +423,15 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 		return 0, billing.Internal("unresolved one-time charges query failed", err)
 	}
 
+	priceBasisBP, err := s.store.PriceBasisBPForAccount(ctx, accountID)
+	if err != nil {
+		return 0, billing.Internal("price basis lookup failed", err)
+	}
+
 	var total int64
 	for _, charge := range charges {
 		increment, err := unresolvedOneTimeChargeIncrementMicros(
-			charge, projectedPeriodStart,
+			charge, projectedPeriodStart, priceBasisBP,
 		)
 		if err != nil {
 			return 0, err
@@ -458,8 +471,13 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 func unresolvedOneTimeChargeIncrementMicros(
 	charge UnresolvedOneTimeChargeRaw,
 	projectedPeriodStart time.Time,
+	priceBasisBP int32,
 ) (int64, error) {
-	appBaseMicros := resolveBaseFeeMicros(charge.Plan)
+	// The payer's price basis (billing-engine#258) prices the CREATION-BASE
+	// unit only — it is a plan-fee line. ModuleTimer below is module-overage
+	// USAGE, never multiplied by the basis (scope: plan fees/seats/add-ons,
+	// not usage).
+	appBaseMicros := PlanFeeMicros(priceBasisBP, resolveBaseFeeMicros(charge.Plan))
 	var unitMicros int64
 	switch charge.Kind {
 	case UnresolvedOneTimeChargeCreationBase:
@@ -669,7 +687,9 @@ func (s *Service) AccountUsageAllowanceMicros(ctx context.Context, accountID uui
 		if appID == uuid.Nil {
 			continue
 		}
-		parts, err := s.computeAppBill(ctx, accountID, true, appID, periodStart, periodEnd, nil)
+		// priceBasisBP is irrelevant here: only UsageDeductionMicros (never
+		// payer-adjusted — it nets USAGE) is read from parts below.
+		parts, err := s.computeAppBill(ctx, accountID, true, appID, periodStart, periodEnd, nil, DefaultPriceBasisBP)
 		if err != nil {
 			return 0, err
 		}

@@ -100,6 +100,10 @@ func (f *fakeStore) AccountByOwner(_ context.Context, _ usage.Owner) (uuid.UUID,
 	return uuid.Nil, false, nil // egress rows carry no owner → lazy event
 }
 
+func (f *fakeStore) PriceBasisBPForAccount(context.Context, uuid.UUID) (int32, error) {
+	return usage.DefaultPriceBasisBP, nil
+}
+
 func (f *fakeStore) AppOwnerOrg(context.Context, uuid.UUID) (uuid.UUID, bool, error) {
 	return uuid.Nil, false, nil
 }

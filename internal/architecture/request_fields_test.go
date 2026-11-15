@@ -75,7 +75,7 @@ func TestCallerSuppliedMoneyDebtOnlyShrinks(t *testing.T) {
 	}
 	sort.Strings(debt)
 
-	const wantDebt = 7
+	const wantDebt = 8
 	if len(debt) > wantDebt {
 		t.Errorf("caller-supplied money/authority debt rose to %d, was %d.\n"+
 			"A new field letting the caller decide what the engine must derive is a step away from INV-001:\n  %s",

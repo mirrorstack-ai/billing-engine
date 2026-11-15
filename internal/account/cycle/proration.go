@@ -353,6 +353,15 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 		return &ProrationResult{AppID: appID, Status: ProrationStatusUnactivated}, nil
 	}
 
+	// The payer's price basis (billing-engine#258), resolved ONCE for this
+	// app's creation-proration charge and reused by every plan-fee derivation
+	// below (creationBaseSegments, combinedProrationChargeShape, the wallet
+	// rail).
+	priceBasisBP, err := s.store.PriceBasisBPForAccount(ctx, app.AccountID)
+	if err != nil {
+		return nil, billing.Internal("price basis lookup failed", err)
+	}
+
 	// D1d — no retroactive catch-up: derive the anchored period CONTAINING the
 	// app's created_at from the account's (now-known) activation anchor. If the
 	// account only activated AT OR AFTER that period's end, the account was
@@ -399,7 +408,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	if err != nil {
 		return nil, billing.Internal("plan changes lookup failed", err)
 	}
-	segments, err := creationBaseSegments(app, effective)
+	segments, err := creationBaseSegments(app, effective, priceBasisBP)
 	if err != nil {
 		return nil, billing.Internal("creation plan history is inconsistent; retried next sweep", err)
 	}
@@ -418,7 +427,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	// attempted app's frozen header owns its timer set and resolves through
 	// the callback.
 	if !app.ProrationAttempted {
-		preview, perr := combinedProrationChargeShape(app, activatedAt, segments)
+		preview, perr := combinedProrationChargeShape(app, activatedAt, segments, priceBasisBP)
 		if perr != nil {
 			return nil, perr
 		}
@@ -459,7 +468,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			return nil, billing.Internal("wallet route classification failed", err)
 		}
 		if walletAllowed && walletState.Mode == CreditBillingModeCredits {
-			res, deferToStripe, err := s.chargeCreationProrationFromWallet(ctx, app, activatedAt, segments)
+			res, deferToStripe, err := s.chargeCreationProrationFromWallet(ctx, app, activatedAt, segments, priceBasisBP)
 			if err != nil {
 				return nil, err
 			}
@@ -611,7 +620,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 			}
 		} else {
 			var err error
-			candidate, err = combinedProrationChargeShape(locked, activatedAt, segments)
+			candidate, err = combinedProrationChargeShape(locked, activatedAt, segments, priceBasisBP)
 			if err != nil {
 				return nil, err
 			}
@@ -807,7 +816,7 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 	if err != nil {
 		if errors.Is(err, ErrCreditRailRequired) {
 			walletResult, deferToStripe, walletErr :=
-				s.chargeCreationProrationFromWallet(ctx, app, activatedAt, segments)
+				s.chargeCreationProrationFromWallet(ctx, app, activatedAt, segments, priceBasisBP)
 			if walletErr != nil {
 				return nil, walletErr
 			}
@@ -873,15 +882,15 @@ func (s *Service) ChargeCreationProration(ctx context.Context, appID uuid.UUID) 
 // flips apps.plan in the same transaction that writes its row, so a mismatch
 // means the rows moved between the two reads — the caller refuses and the
 // next sweep re-derives, rather than pricing days at a base nobody is on.
-func creationBaseSegments(app AppMirror, effective []PlanChange) ([]usage.BaseSegment, error) {
+func creationBaseSegments(app AppMirror, effective []PlanChange, priceBasisBP int32) ([]usage.BaseSegment, error) {
 	first := createdPlan(app)
-	segments := []usage.BaseSegment{{From: app.CreatedAt.UTC(), BaseMicros: usage.TermsFor(first).BaseFeeMicros}}
+	segments := []usage.BaseSegment{{From: app.CreatedAt.UTC(), BaseMicros: usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(first).BaseFeeMicros)}}
 	last := first
 	for _, c := range effective {
 		if c.FromPlan != last {
 			return nil, fmt.Errorf("plan changes of app %s do not chain: %s → %s after %s", app.AppID, c.FromPlan, c.ToPlan, last)
 		}
-		segments = append(segments, usage.BaseSegment{From: c.EffectiveAt.UTC(), BaseMicros: usage.TermsFor(c.ToPlan).BaseFeeMicros})
+		segments = append(segments, usage.BaseSegment{From: c.EffectiveAt.UTC(), BaseMicros: usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(c.ToPlan).BaseFeeMicros)})
 		last = c.ToPlan
 	}
 	if last != effectivePlan(app) {
@@ -916,9 +925,9 @@ func creationCoverageEnd(createdAt, activatedAt time.Time) time.Time {
 // period — when the grace crosses the boundary — is priced the same way over
 // its own window, which for an app that changed plan before the boundary is
 // the new plan's full base.
-func combinedProrationChargeShape(app AppMirror, activatedAt time.Time, segments []usage.BaseSegment) (CombinedProrationChargeShape, error) {
+func combinedProrationChargeShape(app AppMirror, activatedAt time.Time, segments []usage.BaseSegment, priceBasisBP int32) (CombinedProrationChargeShape, error) {
 	if len(segments) == 0 {
-		segments = []usage.BaseSegment{{From: app.CreatedAt.UTC(), BaseMicros: usage.TermsFor(effectivePlan(app)).BaseFeeMicros}}
+		segments = []usage.BaseSegment{{From: app.CreatedAt.UTC(), BaseMicros: usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(effectivePlan(app)).BaseFeeMicros)}}
 	}
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(
 		app.CreatedAt.UTC(),
@@ -1247,12 +1256,12 @@ func (s *Service) adoptFinalizedProrationInvoice(
 // a mismatch (ProrationWalletLockedStale); the next sweep re-derives. Never
 // re-price from the locked row here: the row carries only the plan NOW, not
 // when each day was.
-func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app AppMirror, activatedAt time.Time, segments []usage.BaseSegment) (*ProrationResult, bool, error) {
+func (s *Service) chargeCreationProrationFromWallet(ctx context.Context, app AppMirror, activatedAt time.Time, segments []usage.BaseSegment, priceBasisBP int32) (*ProrationResult, bool, error) {
 	// The app's plan history over the window (creationBaseSegments) prices its
 	// creation charge by day — one segment at the app's own plan base
 	// (migration 075) when it never changed plan.
 	if len(segments) == 0 {
-		segments = []usage.BaseSegment{{From: app.CreatedAt.UTC(), BaseMicros: usage.TermsFor(effectivePlan(app)).BaseFeeMicros}}
+		segments = []usage.BaseSegment{{From: app.CreatedAt.UTC(), BaseMicros: usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(effectivePlan(app)).BaseFeeMicros)}}
 	}
 	// Window = the anchored period CONTAINING created_at (ADR 0005), derived from
 	// created_at never from now — identical to the Stripe callback.

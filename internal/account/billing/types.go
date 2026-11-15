@@ -585,3 +585,60 @@ type ClearOrgDistributorRequest struct {
 type ClearOrgDistributorResponse struct {
 	Removed bool `json:"removed"`
 }
+
+// SetPayerPriceBasisRequest sets one payer's plan-fee/seat/add-on price basis
+// (migration 093, billing-engine#258). Exactly one of OwnerUserID/OwnerOrgID,
+// the same rule ms_billing.accounts enforces. PriceBasisBP is basis points off
+// list (10000 = list; never above it). Reason is required — this is a hand-
+// operated, audited row, never a default.
+type SetPayerPriceBasisRequest struct {
+	OwnerUserID  uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID   uuid.UUID `json:"owner_org_id,omitempty"`
+	PriceBasisBP int32     `json:"price_basis_bp"`
+	Note         string    `json:"note,omitempty"`
+	Reason       string    `json:"reason"`
+	SetBy        string    `json:"set_by"`
+}
+
+// SetPayerPriceBasisResponse echoes the stored row.
+type SetPayerPriceBasisResponse struct {
+	OwnerUserID  uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID   uuid.UUID `json:"owner_org_id,omitempty"`
+	PriceBasisBP int32     `json:"price_basis_bp"`
+	Note         string    `json:"note"`
+	SetBy        string    `json:"set_by"`
+	SetAt        time.Time `json:"set_at"`
+}
+
+// ClearPayerPriceBasisRequest reverts a payer to the 10000 (list) default.
+type ClearPayerPriceBasisRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+	Reason      string    `json:"reason"`
+	SetBy       string    `json:"set_by"`
+}
+
+// ClearPayerPriceBasisResponse reports whether a row was actually removed, so
+// a caller can distinguish "cleared" from "was never set" instead of reading
+// success into a no-op. No audit row is written for a no-op clear.
+type ClearPayerPriceBasisResponse struct {
+	Removed bool `json:"removed"`
+}
+
+// GetPayerPriceBasisRequest reads one payer's current basis.
+type GetPayerPriceBasisRequest struct {
+	OwnerUserID uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID  uuid.UUID `json:"owner_org_id,omitempty"`
+}
+
+// GetPayerPriceBasisResponse reports the EFFECTIVE basis: IsSet=false means no
+// row exists and PriceBasisBP is the 10000 default, not a stored value.
+type GetPayerPriceBasisResponse struct {
+	OwnerUserID  uuid.UUID `json:"owner_user_id,omitempty"`
+	OwnerOrgID   uuid.UUID `json:"owner_org_id,omitempty"`
+	PriceBasisBP int32     `json:"price_basis_bp"`
+	Note         string    `json:"note,omitempty"`
+	SetBy        string    `json:"set_by,omitempty"`
+	SetAt        time.Time `json:"set_at,omitempty"`
+	IsSet        bool      `json:"is_set"`
+}

@@ -19,6 +19,15 @@ import (
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
+// PriceBasisRow is one payer's stored price basis (migration 093,
+// billing-engine#258).
+type PriceBasisRow struct {
+	PriceBasisBP int32
+	Note         string
+	SetBy        string
+	SetAt        time.Time
+}
+
 // Store is the persistence interface Service depends on. The shape
 // is narrow on purpose — every method maps to a specific RPC need —
 // so tests can satisfy it with a small fake (see service_test.go).
@@ -217,6 +226,19 @@ type Store interface {
 	UpsertOrgDistributor(ctx context.Context, customerOrgID, distributorOrgID uuid.UUID, source string) (string, error)
 	// DeleteOrgDistributor removes the link, reporting whether a row existed.
 	DeleteOrgDistributor(ctx context.Context, customerOrgID uuid.UUID) (bool, error)
+
+	// GetPriceBasis reads one payer's price basis row (migration 093,
+	// billing-engine#258), keyed owner_user_id XOR owner_org_id. found=false
+	// means no row exists — the payer is at the 10000 (list) default.
+	GetPriceBasis(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (PriceBasisRow, bool, error)
+	// SetPriceBasis upserts the payer's basis and writes an audit row (old →
+	// new) in the SAME transaction as the write. reason/setBy are never empty
+	// (the Service validates before calling).
+	SetPriceBasis(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID, priceBasisBP int32, note, reason, setBy string) (PriceBasisRow, error)
+	// ClearPriceBasis removes the payer's row (reverting to 10000) and writes
+	// an audit row, both in one transaction. removed=false (no row existed)
+	// writes NO audit row — a no-op is not a change.
+	ClearPriceBasis(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID, reason, setBy string) (removed bool, err error)
 
 	// ListDistributorCustomerStates returns wallet snapshots for every related
 	// customer org, sorted deterministically by org id.
@@ -1074,6 +1096,109 @@ func (s *pgxStore) DeleteOrgDistributor(ctx context.Context, customerOrgID uuid.
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// priceBasisOwnerArgs derives the (owner_kind, owner_user_id, owner_org_id)
+// triple the payer_price_basis queries key on, mirroring the exactly-one-of
+// rule the Service validates before calling (ownerOrgID != uuid.Nil → org).
+func priceBasisOwnerArgs(ownerUserID, ownerOrgID uuid.UUID) (kind string, userArg, orgArg pgtype.UUID) {
+	if ownerOrgID != uuid.Nil {
+		return "org", pgtype.UUID{}, pgtype.UUID{Bytes: ownerOrgID, Valid: true}
+	}
+	return "user", pgtype.UUID{Bytes: ownerUserID, Valid: true}, pgtype.UUID{}
+}
+
+func (s *pgxStore) GetPriceBasis(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID) (PriceBasisRow, bool, error) {
+	kind, userArg, orgArg := priceBasisOwnerArgs(ownerUserID, ownerOrgID)
+	row, err := s.q.GetPriceBasisRow(ctx, db.GetPriceBasisRowParams{OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PriceBasisRow{}, false, nil
+	}
+	if err != nil {
+		return PriceBasisRow{}, false, err
+	}
+	return PriceBasisRow{PriceBasisBP: row.PriceBasisBp, Note: row.Note, SetBy: row.SetBy, SetAt: row.SetAt}, true, nil
+}
+
+func (s *pgxStore) SetPriceBasis(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID, priceBasisBP int32, note, reason, setBy string) (PriceBasisRow, error) {
+	kind, userArg, orgArg := priceBasisOwnerArgs(ownerUserID, ownerOrgID)
+	var result PriceBasisRow
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		var oldBP pgtype.Int4
+		existing, err := qtx.GetPriceBasisRow(ctx, db.GetPriceBasisRowParams{OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			if err := qtx.InsertPriceBasisRow(ctx, db.InsertPriceBasisRowParams{
+				OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg,
+				PriceBasisBp: priceBasisBP, Note: note, SetBy: setBy,
+			}); err != nil {
+				return err
+			}
+		case err != nil:
+			return err
+		default:
+			oldBP = pgtype.Int4{Int32: existing.PriceBasisBp, Valid: true}
+			if _, err := qtx.UpdatePriceBasisRow(ctx, db.UpdatePriceBasisRowParams{
+				PriceBasisBp: priceBasisBP, Note: note, SetBy: setBy,
+				OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg,
+			}); err != nil {
+				return err
+			}
+		}
+		if err := qtx.InsertPriceBasisAudit(ctx, db.InsertPriceBasisAuditParams{
+			OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg,
+			OldPriceBasisBp: oldBP,
+			NewPriceBasisBp: pgtype.Int4{Int32: priceBasisBP, Valid: true},
+			Reason:          reason,
+			SetBy:           setBy,
+		}); err != nil {
+			return err
+		}
+		stored, err := qtx.GetPriceBasisRow(ctx, db.GetPriceBasisRowParams{OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg})
+		if err != nil {
+			return err
+		}
+		result = PriceBasisRow{PriceBasisBP: stored.PriceBasisBp, Note: stored.Note, SetBy: stored.SetBy, SetAt: stored.SetAt}
+		return nil
+	})
+	if err != nil {
+		return PriceBasisRow{}, err
+	}
+	return result, nil
+}
+
+func (s *pgxStore) ClearPriceBasis(ctx context.Context, ownerUserID, ownerOrgID uuid.UUID, reason, setBy string) (bool, error) {
+	kind, userArg, orgArg := priceBasisOwnerArgs(ownerUserID, ownerOrgID)
+	removed := false
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		qtx := s.q.WithTx(tx)
+		existing, err := qtx.GetPriceBasisRow(ctx, db.GetPriceBasisRowParams{OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // nothing to clear — a no-op, no audit row
+		}
+		if err != nil {
+			return err
+		}
+		n, err := qtx.DeletePriceBasisRow(ctx, db.DeletePriceBasisRowParams{OwnerKind: kind, OwnerUserID: userArg, OwnerOrgID: orgArg})
+		if err != nil {
+			return err
+		}
+		removed = n > 0
+		return qtx.InsertPriceBasisAudit(ctx, db.InsertPriceBasisAuditParams{
+			OwnerKind:       kind,
+			OwnerUserID:     userArg,
+			OwnerOrgID:      orgArg,
+			OldPriceBasisBp: pgtype.Int4{Int32: existing.PriceBasisBp, Valid: true},
+			NewPriceBasisBp: pgtype.Int4{}, // NULL = reverted to the 10000 default
+			Reason:          reason,
+			SetBy:           setBy,
+		})
+	})
+	if err != nil {
+		return false, err
+	}
+	return removed, nil
 }
 
 func (s *pgxStore) DistributorCustomerAccount(ctx context.Context, distributorOrgID, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {

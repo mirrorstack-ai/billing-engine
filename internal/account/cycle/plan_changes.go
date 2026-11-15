@@ -553,6 +553,10 @@ func (s *Service) upgradeNow(
 	if !activated {
 		return nil, billing.PaymentRequired("billing account not activated: add a payment card before changing the plan")
 	}
+	priceBasisBP, err := s.store.PriceBasisBPForAccount(ctx, app.AccountID)
+	if err != nil {
+		return nil, billing.Internal("price basis lookup failed", err)
+	}
 	anchorDay := billingperiod.AnchorDay(activatedAt)
 	periodStart, periodEnd := billingperiod.AnchoredPeriodWindow(now, anchorDay)
 	creationStart, creationEnd := billingperiod.AnchoredPeriodWindow(app.CreatedAt.UTC(), anchorDay)
@@ -563,7 +567,7 @@ func (s *Service) upgradeNow(
 
 	// The difference between the bases for the remaining days, the change day
 	// inclusive at the NEW plan (split by day, like the fold).
-	amount, err := upgradeDeltaMicros(from, to, now, periodStart, periodEnd)
+	amount, err := upgradeDeltaMicros(from, to, now, periodStart, periodEnd, priceBasisBP)
 	if err != nil {
 		return nil, billing.Internal("upgrade delta derivation failed", err)
 	}
@@ -826,8 +830,8 @@ func (s *Service) settlePlanChange(ctx context.Context, change PlanChange) (Plan
 // days twice. Free → Pro at half period = $10, Pro → Business at half period =
 // $15 — the pure helper is pinned on both so the second cannot regress while
 // business is still refused at the RPC.
-func upgradeDeltaMicros(from, to usage.Plan, at, periodStart, periodEnd time.Time) (int64, error) {
-	delta := usage.TermsFor(to).BaseFeeMicros - usage.TermsFor(from).BaseFeeMicros
+func upgradeDeltaMicros(from, to usage.Plan, at, periodStart, periodEnd time.Time, priceBasisBP int32) (int64, error) {
+	delta := usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(to).BaseFeeMicros) - usage.PlanFeeMicros(priceBasisBP, usage.TermsFor(from).BaseFeeMicros)
 	if delta < 0 {
 		return 0, fmt.Errorf("upgrade %s → %s has a negative base difference %d", from, to, delta)
 	}

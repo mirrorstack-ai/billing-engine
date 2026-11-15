@@ -93,9 +93,9 @@ func TestUnresolvedOneTimeChargeIncrement_StraddlePricesThePlan(t *testing.T) {
 		}
 	}
 
-	pro, err := unresolvedOneTimeChargeIncrementMicros(raw(PlanPro), projectedStart)
+	pro, err := unresolvedOneTimeChargeIncrementMicros(raw(PlanPro), projectedStart, DefaultPriceBasisBP)
 	require.NoError(t, err)
-	business, err := unresolvedOneTimeChargeIncrementMicros(raw(PlanBusiness), projectedStart)
+	business, err := unresolvedOneTimeChargeIncrementMicros(raw(PlanBusiness), projectedStart, DefaultPriceBasisBP)
 	require.NoError(t, err)
 
 	require.Positive(t, pro, "the fixture must forecast something, or it cannot discriminate")

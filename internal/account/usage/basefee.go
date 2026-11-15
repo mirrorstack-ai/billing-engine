@@ -273,7 +273,7 @@ func wholeDaysUTC(from, to time.Time) int64 {
 // An account with all its over-modules on one app (the common shape) gives that
 // app every block, which is the intuitive answer and falls out of the general
 // rule rather than being special-cased.
-func projectedBaseFeeByApp(shares []AppRecurringFeeShare) map[uuid.UUID]int64 {
+func projectedBaseFeeByApp(shares []AppRecurringFeeShare, priceBasisBP int32) map[uuid.UUID]int64 {
 	if len(shares) == 0 {
 		return nil
 	}
@@ -282,7 +282,7 @@ func projectedBaseFeeByApp(shares []AppRecurringFeeShare) map[uuid.UUID]int64 {
 	for _, share := range shares {
 		var micros int64
 		if share.Activated {
-			micros += resolveBaseFeeMicros(share.Plan)
+			micros += PlanFeeMicros(priceBasisBP, resolveBaseFeeMicros(share.Plan))
 		}
 		micros += int64(share.CustomDomainCount) * DomainFeeMicros
 		byApp[share.AppID] = micros
@@ -326,11 +326,11 @@ func projectedBaseFeeByApp(shares []AppRecurringFeeShare) map[uuid.UUID]int64 {
 // activatedBaseMicros is Σ of every activated share's plan base fee — the base
 // term of the projected recurring total, priced per app from its own plan so it
 // and Σ projectedBaseFeeByApp stay one row set added up two ways.
-func activatedBaseMicros(shares []AppRecurringFeeShare) int64 {
+func activatedBaseMicros(shares []AppRecurringFeeShare, priceBasisBP int32) int64 {
 	var total int64
 	for _, share := range shares {
 		if share.Activated {
-			total += resolveBaseFeeMicros(share.Plan)
+			total += PlanFeeMicros(priceBasisBP, resolveBaseFeeMicros(share.Plan))
 		}
 	}
 	return total

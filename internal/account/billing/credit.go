@@ -865,3 +865,106 @@ func (s *Service) ClearOrgDistributor(ctx context.Context, req ClearOrgDistribut
 	}
 	return &ClearOrgDistributorResponse{Removed: removed}, nil
 }
+
+// listPriceBasisBP mirrors usage.DefaultPriceBasisBP: this package cannot
+// import usage (usage imports billing), so the "no row = list" constant is
+// duplicated here, in basis points, by definition — never a tunable.
+const listPriceBasisBP int32 = 10000
+
+// validatePriceBasisOwner enforces the exactly-one-of rule ms_billing.accounts
+// uses (migration 093 copies it): exactly one of OwnerUserID/OwnerOrgID set.
+func validatePriceBasisOwner(ownerUserID, ownerOrgID uuid.UUID) error {
+	if ownerUserID == uuid.Nil && ownerOrgID == uuid.Nil {
+		return InvalidInput("owner_user_id or owner_org_id required")
+	}
+	if ownerUserID != uuid.Nil && ownerOrgID != uuid.Nil {
+		return InvalidInput("owner_user_id and owner_org_id are mutually exclusive")
+	}
+	return nil
+}
+
+// SetPayerPriceBasis sets or overwrites one payer's plan-fee/seat/add-on price
+// basis (migration 093, billing-engine#258) — operator-only, same
+// internal-secret route group as every other control-plane RPC
+// (cmd/account-api/main.go). NEVER applied to usage. Writes an audit row
+// (who, reason, old, new) in the same transaction as the write.
+//
+// 🔴 NEVER ABOVE LIST, NEVER ZERO. price_basis_bp must be in [1, 10000]: above
+// 10000 would charge MORE than list, which this function was never built to
+// do, and 0 would be free, which must go through a credit/grant, never a
+// silent price change (D8-wholesale-60: the first distributor is 60%, not 0%).
+func (s *Service) SetPayerPriceBasis(ctx context.Context, req SetPayerPriceBasisRequest) (*SetPayerPriceBasisResponse, error) {
+	if err := validatePriceBasisOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
+		return nil, err
+	}
+	if req.PriceBasisBP < 1 || req.PriceBasisBP > listPriceBasisBP {
+		return nil, InvalidInput("price_basis_bp must be between 1 and 10000")
+	}
+	if req.Reason == "" {
+		return nil, InvalidInput("reason required")
+	}
+	if req.SetBy == "" {
+		return nil, InvalidInput("set_by required")
+	}
+	stored, err := s.store.SetPriceBasis(ctx, req.OwnerUserID, req.OwnerOrgID, req.PriceBasisBP, req.Note, req.Reason, req.SetBy)
+	if err != nil {
+		return nil, Internal("write payer price basis failed", err)
+	}
+	return &SetPayerPriceBasisResponse{
+		OwnerUserID:  req.OwnerUserID,
+		OwnerOrgID:   req.OwnerOrgID,
+		PriceBasisBP: stored.PriceBasisBP,
+		Note:         stored.Note,
+		SetBy:        stored.SetBy,
+		SetAt:        stored.SetAt,
+	}, nil
+}
+
+// ClearPayerPriceBasis reverts a payer to the 10000 (list) default. Removed is
+// false when there was nothing to clear, so the caller never reads a no-op as
+// a successful change; no audit row is written for a no-op.
+func (s *Service) ClearPayerPriceBasis(ctx context.Context, req ClearPayerPriceBasisRequest) (*ClearPayerPriceBasisResponse, error) {
+	if err := validatePriceBasisOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
+		return nil, err
+	}
+	if req.Reason == "" {
+		return nil, InvalidInput("reason required")
+	}
+	if req.SetBy == "" {
+		return nil, InvalidInput("set_by required")
+	}
+	removed, err := s.store.ClearPriceBasis(ctx, req.OwnerUserID, req.OwnerOrgID, req.Reason, req.SetBy)
+	if err != nil {
+		return nil, Internal("clear payer price basis failed", err)
+	}
+	return &ClearPayerPriceBasisResponse{Removed: removed}, nil
+}
+
+// GetPayerPriceBasis reads a payer's EFFECTIVE price basis: IsSet=false means
+// no row exists and PriceBasisBP is the 10000 default, never a stored value.
+func (s *Service) GetPayerPriceBasis(ctx context.Context, req GetPayerPriceBasisRequest) (*GetPayerPriceBasisResponse, error) {
+	if err := validatePriceBasisOwner(req.OwnerUserID, req.OwnerOrgID); err != nil {
+		return nil, err
+	}
+	row, found, err := s.store.GetPriceBasis(ctx, req.OwnerUserID, req.OwnerOrgID)
+	if err != nil {
+		return nil, Internal("read payer price basis failed", err)
+	}
+	if !found {
+		return &GetPayerPriceBasisResponse{
+			OwnerUserID:  req.OwnerUserID,
+			OwnerOrgID:   req.OwnerOrgID,
+			PriceBasisBP: listPriceBasisBP,
+			IsSet:        false,
+		}, nil
+	}
+	return &GetPayerPriceBasisResponse{
+		OwnerUserID:  req.OwnerUserID,
+		OwnerOrgID:   req.OwnerOrgID,
+		PriceBasisBP: row.PriceBasisBP,
+		Note:         row.Note,
+		SetBy:        row.SetBy,
+		SetAt:        row.SetAt,
+		IsSet:        true,
+	}, nil
+}
