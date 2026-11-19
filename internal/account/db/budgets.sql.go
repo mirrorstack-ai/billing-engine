@@ -62,6 +62,39 @@ func (q *Queries) AccountPeriodAISpendMicros(ctx context.Context, arg AccountPer
 	return total_raw_cost_micros, err
 }
 
+const accountPeriodSandboxSpendMicros = `-- name: AccountPeriodSandboxSpendMicros :one
+SELECT COALESCE(SUM(value * stamped_price_micros), 0)::numeric AS total_raw_cost_micros
+FROM ms_billing.usage_events
+WHERE account_id = $1
+  AND source = 'sandbox_trial'
+  AND COALESCE(billable_at, recorded_at) >= $2
+  AND COALESCE(billable_at, recorded_at) <  $3
+`
+
+type AccountPeriodSandboxSpendMicrosParams struct {
+	AccountID    pgtype.UUID        `json:"account_id"`
+	BillableAt   pgtype.Timestamptz `json:"billable_at"`
+	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+}
+
+// AccountPeriodSandboxSpendMicros is the spend the `sandbox` budget category
+// measures (migration 095): every event of ONE account whose source is
+// sandbox_trial, compute (infra.sandbox.*) and model tokens (infra.ai.*)
+// together, in [start, end). Each event is priced at the unit price STAMPED on
+// it at ingest, never at the live catalog, so a price edit made afterwards
+// cannot move the cap. The price is the raw cost basis, the same basis as the
+// ai budget queries above (the infra markup is applied at rollup, never here),
+// which makes the cap a statement about what MirrorStack really pays.
+// An event without the tag is not counted, and the account filter means one
+// org's cap never sees another org's events. A NULL stamped price counts 0 only
+// because the DB CHECK makes it impossible on a tagged row.
+func (q *Queries) AccountPeriodSandboxSpendMicros(ctx context.Context, arg AccountPeriodSandboxSpendMicrosParams) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, accountPeriodSandboxSpendMicros, arg.AccountID, arg.BillableAt, arg.BillableAt_2)
+	var total_raw_cost_micros pgtype.Numeric
+	err := row.Scan(&total_raw_cost_micros)
+	return total_raw_cost_micros, err
+}
+
 const accountPeriodSpendMicros = `-- name: AccountPeriodSpendMicros :one
 WITH base_events AS (
     SELECT

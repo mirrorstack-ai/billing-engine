@@ -215,12 +215,14 @@ WHERE module_id = $1 AND metric = $2;
 -- ordinary chargeable usage. The ON CONFLICT (event_id) DO NOTHING idempotency
 -- is UNTOUCHED — dev_served rides along on the insert and, exactly like every
 -- other column, a deduped retry never rewrites it.
+-- source / run_id / stamped_price_micros are migration 095's sandbox trial tag
+-- (NULL on ordinary events); a tagged event is stored dev_served (a DB CHECK).
 -- name: InsertUsageEvent :execrows
 INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
     billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
-    dev_served, template_key
+    dev_served, template_key, source, run_id, stamped_price_micros
 ) VALUES (
     @event_id::text, sqlc.narg(account_id)::uuid, @app_id::uuid,
     @module_id::uuid, @metric::text, @kind::ms_billing.metric_kind,
@@ -230,7 +232,9 @@ INSERT INTO ms_billing.usage_events (
     sqlc.narg(occurred_at)::timestamptz, @billable_at::timestamptz,
     sqlc.narg(aggregation_key)::text,
     @payload_fingerprint::bytea, @occurrence_policy::text,
-    @dev_served::boolean, sqlc.narg(template_key)::text
+    @dev_served::boolean, sqlc.narg(template_key)::text,
+    sqlc.narg(source)::text, sqlc.narg(run_id)::text,
+    sqlc.narg(stamped_price_micros)::bigint
 )
 ON CONFLICT (event_id) DO NOTHING;
 

@@ -612,6 +612,11 @@ type UsageEvent struct {
 	// RecordUsageRequest.DevServed for why it is stored on the fact and why it
 	// is excluded from the payload fingerprint.
 	DevServed bool
+	// Source, RunID and StampedPriceMicros are migration 095's sandbox trial tag
+	// (NULL on ordinary events); see sandbox_trial.go.
+	Source             string
+	RunID              string
+	StampedPriceMicros *int64
 }
 
 // MetricUsageRaw is one grouped row from the live current-period query.
@@ -1026,6 +1031,9 @@ func (s *pgxStore) InsertUsageEvent(ctx context.Context, ev UsageEvent) (bool, e
 		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
 		OccurrencePolicy:   string(ev.OccurrencePolicy),
 		DevServed:          ev.DevServed,
+		Source:             nullableText(ev.Source),
+		RunID:              nullableText(ev.RunID),
+		StampedPriceMicros: nullableInt8(ev.StampedPriceMicros),
 	})
 	if err != nil {
 		return false, err
@@ -1277,6 +1285,9 @@ func (s *pgxStore) InsertUsageObservation(
 		PayloadFingerprint: append([]byte(nil), ev.PayloadFingerprint...),
 		OccurrencePolicy:   string(ev.OccurrencePolicy),
 		DevServed:          ev.DevServed,
+		Source:             nullableText(ev.Source),
+		RunID:              nullableText(ev.RunID),
+		StampedPriceMicros: nullableInt8(ev.StampedPriceMicros),
 	})
 	if err != nil {
 		return false, 0, err
@@ -2323,6 +2334,13 @@ func nullableText(value string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgtype.Text{String: value, Valid: true}
+}
+
+func nullableInt8(value *int64) pgtype.Int8 {
+	if value == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *value, Valid: true}
 }
 
 func nullableTime(value time.Time) pgtype.Timestamptz {
