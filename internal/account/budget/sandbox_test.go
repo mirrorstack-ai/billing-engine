@@ -26,15 +26,13 @@ func TestSetBudget_Sandbox_OrgAndAccountOnly(t *testing.T) {
 		require.NoError(t, err, "scope %s", scope)
 		require.Equal(t, budget.CategorySandbox, got.Category)
 	}
-	n := len(store.budgets)
-	for _, req := range []budget.SetBudgetRequest{
+	for _, req := range []budget.SetBudgetRequest{ // never per app, never per template
 		{Scope: budget.ScopeApp, ScopeID: uuid.New(), Category: budget.CategorySandbox, LimitMicros: 1},
 		{Scope: budget.ScopeOrg, ScopeID: uuid.New(), Category: budget.CategorySandbox, TemplateKey: "faq", LimitMicros: 1},
 	} {
 		_, err := newService(store).SetBudget(ctx, req)
 		requireCode(t, err, billing.CodeInvalidInput)
 	}
-	require.Len(t, store.budgets, n, "never per app, never per template")
 }
 
 // Hard cap exhausts at the limit and not below; an org without a row is

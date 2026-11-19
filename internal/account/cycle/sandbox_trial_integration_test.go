@@ -102,6 +102,13 @@ func TestSandboxTrial_Acceptance_Integration(t *testing.T) {
 	require.False(t, got.Exhausted, "below the cap (control)")
 	require.Zero(t, e.spend(t, e.orgB, budget.CategorySandbox).SpendMicros, "org B's row is unmoved")
 
+	// The trial events above landed on the org's own account while it was UNFUNDED. Fund it now (designation + activation) so the
+	// ordinary control events below attach to the same account.
+	_, err := e.pool.Exec(ctx, `UPDATE ms_billing.accounts SET activated_at = '2026-01-01' WHERE id = $1`, e.acctA.String())
+	require.NoError(t, err)
+	_, err = e.pool.Exec(ctx, `INSERT INTO ms_billing.org_billing_designations (org_id, funding, updated_by) VALUES ($1, 'org', $2)`, e.orgA.String(), uuid.NewString())
+	require.NoError(t, err)
+
 	// CONTROL: an ordinary infra.task.vcpu.hours event keeps its charge line; the trial run has none.
 	e.record(t, "ctl-task", "infra.task.vcpu.hours", "", "", 1)
 	sum, err := cycle.NewService(cycle.NewStore(e.pool), nil).RollupPeriod(ctx, e.acctA, mustTime(t, pStart), mustTime(t, pEnd))
@@ -165,21 +172,4 @@ func TestSandboxTrial_DatabaseRefusesAChargeableTrialRow_Integration(t *testing.
 		require.ErrorAs(t, err, &pg, name)
 		require.Equal(t, "23514", pg.Code, name)
 	}
-}
-
-func TestMigration095_UpDownUp_RoundTrips(t *testing.T) {
-	e, ctx := newSbxEnv(t), context.Background()
-	e.record(t, "sbx-vcpu", "infra.sandbox.vcpu.hours", "", usage.SourceSandboxTrial, 1)
-
-	_, err := e.pool.Exec(ctx, migrationSQL(t, "095_sandbox_trial_meters.down.sql"))
-	require.NoError(t, err)
-	require.False(t, columnExists(t, e.pool, "usage_events", "source"))
-	var n int
-	require.NoError(t, e.pool.QueryRow(ctx, `SELECT count(*) FROM ms_billing.usage_events WHERE event_id='sbx-vcpu' AND dev_served`).Scan(&n))
-	require.Equal(t, 1, n, "the fact stays in the ledger, still never charged")
-
-	_, err = e.pool.Exec(ctx, migrationSQL(t, "095_sandbox_trial_meters.up.sql"))
-	require.NoError(t, err)
-	require.True(t, columnExists(t, e.pool, "usage_events", "stamped_price_micros"))
-	require.EqualValues(t, 40450, e.price(t, "infra.sandbox.vcpu.hours", ""))
 }

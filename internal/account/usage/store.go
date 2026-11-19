@@ -1367,6 +1367,13 @@ func (s *pgxStore) AccountByOwner(ctx context.Context, owner Owner) (uuid.UUID, 
 	return parsed, true, nil
 }
 
+// OrgOwnAccount resolves an org's own billing account whether or not it is
+// funded (migration 095): the same account the org-scoped sandbox cap reads.
+func (s *pgxStore) OrgOwnAccount(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
+	id, err := s.q.BudgetOrgAccountID(ctx, pgtype.UUID{Bytes: orgID, Valid: true})
+	return uuidRowFound(id, err)
+}
+
 func (s *pgxStore) AppOwnerOrg(ctx context.Context, appID uuid.UUID) (uuid.UUID, bool, error) {
 	orgID, err := s.q.AppOwnerOrg(ctx, appID.String())
 	if errors.Is(err, pgx.ErrNoRows) {

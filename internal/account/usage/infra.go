@@ -36,6 +36,11 @@ func IsAdmittedTaskGPUModel(model string) bool {
 	return model == TaskGPUModelG5GXlarge
 }
 
+// orgAccountLookup resolves an org's own account without the funding gate (sandbox_trial ingest only).
+type orgAccountLookup interface {
+	OrgOwnAccount(context.Context, uuid.UUID) (uuid.UUID, bool, error)
+}
+
 // modelPriceLookup is required only for task GPU admission.
 type modelPriceLookup interface {
 	LookupModelPrice(context.Context, string, string) (ModelPrice, bool, error)
@@ -528,6 +533,15 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	// frozen on the event here, once.
 	var stampedPrice *int64
 	if req.Source != "" {
+		if lookup, ok := s.store.(orgAccountLookup); ok && accountID == uuid.Nil && req.OwnerOrgID != uuid.Nil {
+			id, found, err := lookup.OrgOwnAccount(ctx, req.OwnerOrgID)
+			if err != nil {
+				return nil, billing.Internal("org account lookup failed", err)
+			}
+			if found {
+				accountID = id
+			}
+		}
 		if accountID == uuid.Nil {
 			return nil, billing.InvalidInput("a sandbox_trial event needs an owner with a billing account")
 		}
