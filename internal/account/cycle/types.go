@@ -152,6 +152,24 @@ type RollupSummary struct {
 	// separately so a rollup can never accidentally add it to the bill by
 	// summing one field.
 	DevServedChargedMicros int64
+	// UnpricedCustomMetrics lists, once per distinct (module, metric,
+	// module_version), every CUSTOM metric this rollup priced at 0 because no
+	// price resolved anywhere: no version snapshot, no per-model row, no catalog
+	// price (billing-engine#121). The line is still written and still charges 0
+	// (one developer's missing price must not fail the whole cycle), but it is
+	// never silent: RollupPeriod logs a warning per entry and cmd/billing-cycle
+	// totals the count into its run summary. A deliberate ms.Price(0) resolves
+	// priced=true and is NOT listed here. A reserved metric never appears: an
+	// unpriced reserved metric fails the rollup instead.
+	UnpricedCustomMetrics []UnpricedMetric
+}
+
+// UnpricedMetric names one custom metric a rollup priced at 0 for want of any
+// price — see RollupSummary.UnpricedCustomMetrics.
+type UnpricedMetric struct {
+	ModuleID      uuid.UUID
+	Metric        string
+	ModuleVersion string
 }
 
 // ModuleSettlement is one accrued developer-settlement line — the in-memory
