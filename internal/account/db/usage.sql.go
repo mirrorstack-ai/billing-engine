@@ -1239,7 +1239,7 @@ INSERT INTO ms_billing.usage_events (
     event_id, account_id, app_id, module_id, metric, kind, value, recorded_at,
     model, module_version, observation_version, subject, metadata, occurred_at,
     billable_at, aggregation_key, payload_fingerprint, occurrence_policy,
-    dev_served, template_key
+    dev_served, template_key, source, run_id, stamped_price_micros
 ) VALUES (
     $1::text, $2::uuid, $3::uuid,
     $4::uuid, $5::text, $6::ms_billing.metric_kind,
@@ -1249,7 +1249,9 @@ INSERT INTO ms_billing.usage_events (
     $14::timestamptz, $15::timestamptz,
     $16::text,
     $17::bytea, $18::text,
-    $19::boolean, $20::text
+    $19::boolean, $20::text,
+    $21::text, $22::text,
+    $23::bigint
 )
 ON CONFLICT (event_id) DO NOTHING
 `
@@ -1275,6 +1277,9 @@ type InsertUsageEventParams struct {
 	OccurrencePolicy   string              `json:"occurrence_policy"`
 	DevServed          bool                `json:"dev_served"`
 	TemplateKey        pgtype.Text         `json:"template_key"`
+	Source             pgtype.Text         `json:"source"`
+	RunID              pgtype.Text         `json:"run_id"`
+	StampedPriceMicros pgtype.Int8         `json:"stamped_price_micros"`
 }
 
 // InsertUsageEvent writes one raw metered fact, idempotent on event_id.
@@ -1293,6 +1298,10 @@ type InsertUsageEventParams struct {
 // ordinary chargeable usage. The ON CONFLICT (event_id) DO NOTHING idempotency
 // is UNTOUCHED — dev_served rides along on the insert and, exactly like every
 // other column, a deduped retry never rewrites it.
+// source / run_id / stamped_price_micros are migration 095's sandbox trial
+// tag: NULL on every ordinary event. A sandbox_trial event is stored with
+// dev_served = true (the DB CHECK demands it), so it is recorded and priced and
+// never charged; stamped_price_micros freezes its raw unit price at ingest.
 func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertUsageEvent,
 		arg.EventID,
@@ -1315,6 +1324,9 @@ func (q *Queries) InsertUsageEvent(ctx context.Context, arg InsertUsageEventPara
 		arg.OccurrencePolicy,
 		arg.DevServed,
 		arg.TemplateKey,
+		arg.Source,
+		arg.RunID,
+		arg.StampedPriceMicros,
 	)
 	if err != nil {
 		return 0, err

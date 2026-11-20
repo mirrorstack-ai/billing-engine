@@ -37,6 +37,9 @@ type BudgetEvaluator interface {
 	// EvaluateAccountBudget re-evaluates the account-scoped AI caps (and the
 	// owning org's) after an infra.ai.* event landed on an account.
 	EvaluateAccountBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error)
+	// EvaluateSandboxBudget re-evaluates the account's and the owning org's
+	// `sandbox` trial cap after a sandbox_trial event landed (migration 095).
+	EvaluateSandboxBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error)
 }
 
 // Service implements the RecordUsage / GetUsageSummary /

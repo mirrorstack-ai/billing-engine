@@ -79,6 +79,11 @@ const (
 	// account (migration 085) so budget_alerts can record crossings of the
 	// risk-exposure pool. Never accepted from a caller.
 	CategoryExposure Category = "exposure"
+	// CategorySandbox is the org-wide authoring-sandbox TRIAL cap (migration 095):
+	// every source = sandbox_trial event (infra.sandbox.* compute and infra.ai.*
+	// tokens) at the unit price stamped on it at ingest. Org or account scope
+	// only. Those events are dev_served, so 'all' and 'ai' never see them.
+	CategorySandbox Category = "sandbox"
 )
 
 // normalizeCategory maps the wire value (empty = the pre-084 default) onto a
@@ -89,6 +94,8 @@ func normalizeCategory(c Category) (Category, bool) {
 		return CategoryAll, true
 	case CategoryAI:
 		return CategoryAI, true
+	case CategorySandbox:
+		return CategorySandbox, true
 	}
 	return "", false
 }
