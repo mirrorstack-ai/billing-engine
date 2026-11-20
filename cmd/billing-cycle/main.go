@@ -133,6 +133,7 @@ func main() {
 		"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
 		"unactivated_candidates", res.UnactivatedCandidates, "unactivated_rolled_up", res.UnactivatedRolledUp,
 		"unactivated_failed", res.UnactivatedFailed,
+		"unpriced_custom_metrics", res.UnpricedCustomMetrics,
 		"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
 		"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed,
 		"domain_candidates", res.DomainCandidates, "domain_charged", res.DomainCharged,
@@ -560,6 +561,7 @@ func handler(svc *cycle.Service) func(context.Context, events.CloudWatchEvent) e
 			"already_run", res.AlreadyRun, "failed_runs", res.FailedRuns, "failed", res.Failed,
 			"unactivated_candidates", res.UnactivatedCandidates, "unactivated_rolled_up", res.UnactivatedRolledUp,
 			"unactivated_failed", res.UnactivatedFailed,
+			"unpriced_custom_metrics", res.UnpricedCustomMetrics,
 			"overage_candidates", res.OverageCandidates, "overage_charged", res.OverageCharged,
 			"overage_skipped", res.OverageSkipped, "overage_failed", res.OverageFailed,
 			"domain_candidates", res.DomainCandidates, "domain_charged", res.DomainCharged,
@@ -587,6 +589,11 @@ type cycleResult struct {
 	UnactivatedCandidates int // card-less accounts considered for rollup only
 	UnactivatedRolledUp   int // card-less accounts whose calendar-month rollup completed
 	UnactivatedFailed     int // card-less list or per-account rollup errors
+	// UnpricedCustomMetrics totals RollupSummary.UnpricedCustomMetrics across
+	// every rollup this run made (card-bound and card-less): distinct (module,
+	// metric, module_version) custom lines per account that billed 0 for want of
+	// any price (billing-engine#121). Each is also logged where it was rolled up.
+	UnpricedCustomMetrics int
 
 	// Mid-period per-module overage grace sweep (migration 033, Leg 1).
 	OverageCandidates int // install timers past their grace window this sweep evaluated
@@ -674,6 +681,7 @@ func runCycle(ctx context.Context, svc *cycle.Service, at time.Time) cycleResult
 			res.Failed++
 			continue
 		}
+		res.UnpricedCustomMetrics += len(summary.UnpricedCustomMetrics)
 		if len(summary.Aggregates) == 0 {
 			hasApps, err := svc.AccountHasLiveApps(ctx, a.ID, end)
 			if err != nil {
@@ -763,13 +771,15 @@ func runUnactivatedRollup(ctx context.Context, svc unactivatedRoller, at time.Ti
 		if skip[accountID] {
 			continue
 		}
-		if _, err := svc.RollupPeriod(ctx, accountID, start, end); err != nil {
+		summary, err := svc.RollupPeriod(ctx, accountID, start, end)
+		if err != nil {
 			slog.ErrorContext(ctx, "unactivated account rollup failed", "account_id", accountID,
 				"period_start", start, "period_end", end, "error", err)
 			res.UnactivatedFailed++
 			res.Failed++
 			continue
 		}
+		res.UnpricedCustomMetrics += len(summary.UnpricedCustomMetrics)
 		res.UnactivatedRolledUp++
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -1996,6 +1997,45 @@ func TestSetMetricDefinitions_SyncsCatalog(t *testing.T) {
 
 	unpriced := store.defs[defKey(mod, "myapp.objects.bytes")]
 	require.False(t, unpriced.Priced, "unpriced metric stays unpriced")
+	require.Equal(t, []string{"myapp.objects.bytes"}, resp.UnpricedMetrics)
+}
+
+// billing-engine#121 publish-time diagnostic: every declared metric with no
+// price is named (sorted) in the response and logged; a deliberate price of 0
+// is priced and is NOT named; the sync itself still succeeds.
+func TestSetMetricDefinitions_NamesUnpricedMetrics(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	store := newFakeStore()
+	mod := uuid.New()
+	resp, err := newService(store).SetMetricDefinitions(context.Background(), usage.SetMetricDefinitionsRequest{
+		ModuleID: mod,
+		Metrics: []usage.MetricDef{
+			{Metric: "zeta.events", Kind: usage.KindCount, Active: true},                                   // unpriced
+			{Metric: "free.events", Kind: usage.KindCount, UnitPriceMicros: 0, Priced: true, Active: true}, // ms.Price(0)
+			{Metric: "alpha.events", Kind: usage.KindSum, Active: true},                                    // unpriced
+			{Metric: "paid.events", Kind: usage.KindCount, UnitPriceMicros: 7, Priced: true, Active: true},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, resp.Synced)
+	require.Equal(t, []string{"alpha.events", "zeta.events"}, resp.UnpricedMetrics)
+	require.Contains(t, logs.String(), "module declared metrics with no price")
+	require.Contains(t, logs.String(), mod.String())
+	require.Contains(t, logs.String(), "alpha.events")
+
+	logs.Reset()
+	resp, err = newService(store).SetMetricDefinitions(context.Background(), usage.SetMetricDefinitionsRequest{
+		ModuleID: mod,
+		Metrics:  []usage.MetricDef{{Metric: "paid.events", Kind: usage.KindCount, UnitPriceMicros: 7, Priced: true, Active: true}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp.UnpricedMetrics, "an all-priced sync reports an empty list, not null")
+	require.Empty(t, resp.UnpricedMetrics)
+	require.Empty(t, logs.String(), "an all-priced sync warns nothing")
 }
 
 func TestSetMetricDefinitions_SubjectAggregationIsPeakOnly(t *testing.T) {
