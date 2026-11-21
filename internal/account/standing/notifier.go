@@ -29,6 +29,13 @@
 // the sponsored orgs are not re-notified until one of their own invoice
 // events fires (or a stage activate re-consults). Acceptable for the
 // best-effort contract; a designation-fanout follow-up can close it.
+//
+// Suspension mail (billing-engine#331, notice.go): the verdict is also
+// remembered per owner (ms_billing.standing_state) so the one automatic
+// suspension in the platform, the service-block, sends the customer an email
+// with the reason ONCE per eligible -> blocked transition, through
+// api-platform's standing-notice route. Flag-gated off by default
+// (SuspensionNoticeEnvFlag) and best-effort like the push above.
 package standing
 
 import (
@@ -52,6 +59,20 @@ import (
 // servingBlockPath is api-platform's internal endpoint (C6), joined onto
 // APPLICATIONS_INTERNAL_URL.
 const servingBlockPath = "/internal/apps/serving-block"
+
+// standingNoticePath is api-platform's service-suspended mail route
+// (api-platform#1090), joined onto APPLICATIONS_INTERNAL_URL.
+const standingNoticePath = "/internal/apps/standing-notice"
+
+// SuspensionNoticeEnvFlag turns the once-per-transition "service suspended"
+// mail on. Fail-closed: only "1"/"true" enable it. State is recorded either
+// way (silently), so enabling the flag later does not mail every account that
+// was already blocked.
+const SuspensionNoticeEnvFlag = "STANDING_SUSPENSION_NOTICE_ENABLED"
+
+// reasonNoUsableCard is the verdict of an account that has not added a card
+// yet. First seen, it is a new account, not a suspension: no mail.
+const reasonNoUsableCard = "NO_USABLE_CARD"
 
 // headerInternalSecret is the shared internal-secret header both directions
 // of the api-platform ↔ billing-engine trust boundary use (see
@@ -94,6 +115,20 @@ type Notifier struct {
 	owners  OwnerResolver
 	httpc   *http.Client
 	log     *slog.Logger
+
+	// Suspension notice (billing-engine#331). state == nil leaves the notifier
+	// exactly as before; noticeOn gates only the mail, not the recording.
+	state    StateStore
+	noticeOn bool
+	now      func() time.Time
+}
+
+// WithSuspensionNotice wires the transition memory and the mail switch. A nil
+// store disables both. Returns n for chaining.
+func (n *Notifier) WithSuspensionNotice(state StateStore, enabled bool) *Notifier {
+	n.state = state
+	n.noticeOn = enabled
+	return n
 }
 
 // NewNotifier wires a Notifier. baseURL/secret may be empty (disabled mode);
@@ -111,6 +146,7 @@ func NewNotifier(baseURL, secret string, status StatusReader, owners OwnerResolv
 		// must never stall Stripe deliveries.
 		httpc: &http.Client{Timeout: 5 * time.Second},
 		log:   log,
+		now:   time.Now,
 	}
 }
 
@@ -141,7 +177,13 @@ func NewNotifierFromEnvWithStatus(pool *pgxpool.Pool, status StatusReader, log *
 	if url == "" || secret == "" {
 		log.Info("serving-block notifier disabled (APPLICATIONS_INTERNAL_URL / INTERNAL_SECRET unset) — standing transitions will not push manifest rewrites")
 	}
-	return NewNotifier(url, secret, status, NewStore(pool), log)
+	n := NewNotifier(url, secret, status, NewStore(pool), log)
+	on := false
+	switch os.Getenv(SuspensionNoticeEnvFlag) {
+	case "1", "true", "TRUE", "True":
+		on = true
+	}
+	return n.WithSuspensionNotice(NewStateStore(pool), on)
 }
 
 // NotifyStripeCustomer re-evaluates and pushes the verdict for the account
@@ -229,6 +271,13 @@ func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve fu
 	} else {
 		body.OwnerUserID = owner.UserID.String()
 	}
+	// Decide the suspension mail BEFORE the push (the state row is the
+	// transition memory) but send it AFTER, whatever the push did: the two are
+	// independent best-effort deliveries.
+	notice, send := n.observeTransition(ctx, owner, verdict.Blocked, verdict.Reason)
+	if send {
+		defer n.sendSuspensionNotice(ctx, notice)
+	}
 	if err := n.post(ctx, body); err != nil {
 		n.log.ErrorContext(ctx, "serving-block notify: post failed (best-effort, skipped)",
 			refKind, refID, "blocked", verdict.Blocked, "error", err)
@@ -240,11 +289,15 @@ func (n *Notifier) notify(ctx context.Context, refKind, refID string, resolve fu
 }
 
 func (n *Notifier) post(ctx context.Context, body servingBlockBody) error {
+	return n.postJSON(ctx, servingBlockPath, body)
+}
+
+func (n *Notifier) postJSON(ctx context.Context, path string, body any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.baseURL+servingBlockPath, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -258,7 +311,7 @@ func (n *Notifier) post(ctx context.Context, body servingBlockBody) error {
 	// Drain so the connection can be reused; the body itself is not consumed.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("serving-block endpoint returned %d", resp.StatusCode)
+		return fmt.Errorf("%s endpoint returned %d", strings.TrimPrefix(path, "/internal/apps/"), resp.StatusCode)
 	}
 	return nil
 }
