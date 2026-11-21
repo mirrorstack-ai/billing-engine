@@ -659,6 +659,23 @@ type MsBillingBudgetAlert struct {
 	FiredAt     time.Time `json:"fired_at"`
 }
 
+// Rail-neutral buyer invoice profile (統編, carrier, 愛心碼), one per billing account. Snapshotted (copied, not referenced) onto each payment fact and invoice row when those tables exist (#313, #287) so an edit here never changes an issued invoice.
+type MsBillingBuyerInvoiceProfile struct {
+	AccountID string `json:"account_id"`
+	// personal or company — who the invoice document names. Never the seller's tax-bureau document kind (#312).
+	Kind        string      `json:"kind"`
+	TaxID       pgtype.Text `json:"tax_id"`
+	CompanyName pgtype.Text `json:"company_name"`
+	Address     pgtype.Text `json:"address"`
+	Email       pgtype.Text `json:"email"`
+	// Neutral enum (mobile_barcode | citizen_cert | vendor_member); each vendor adapter (#286) maps it to its own codes.
+	CarrierType  pgtype.Text `json:"carrier_type"`
+	CarrierNum   pgtype.Text `json:"carrier_num"`
+	DonationCode pgtype.Text `json:"donation_code"`
+	CreatedAt    time.Time   `json:"created_at"`
+	UpdatedAt    time.Time   `json:"updated_at"`
+}
+
 type MsBillingChargeIntent struct {
 	// Identity of the exact sealed document, over the canonical encoding in internal/intent/canonical.go. Also what a disclosure is bound to and what an acceptance receipt references.
 	Digest                  string      `json:"digest"`
