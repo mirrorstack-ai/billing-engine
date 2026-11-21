@@ -41,6 +41,11 @@ type Store interface {
 	// the console agent billed to a personal or org account).
 	AccountPeriodAISpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
 
+	// AccountPeriodSandboxSpendMicros is the `sandbox` trial cap's spend: the
+	// account's source=sandbox_trial events at their STAMPED unit price
+	// (migration 095), compute and model tokens together.
+	AccountPeriodSandboxSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+
 	// OrgAccountID resolves an org to its own billing account; found=false
 	// for a lazy org with no account yet (its AI spend is 0).
 	OrgAccountID(ctx context.Context, orgID uuid.UUID) (uuid.UUID, bool, error)
@@ -184,6 +189,18 @@ func (s *pgxStore) AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, ca
 
 func (s *pgxStore) AccountPeriodAISpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
 	n, err := s.q.AccountPeriodAISpendMicros(ctx, db.AccountPeriodAISpendMicrosParams{
+		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return usage.MicrosFromNumeric(n)
+}
+
+func (s *pgxStore) AccountPeriodSandboxSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	n, err := s.q.AccountPeriodSandboxSpendMicros(ctx, db.AccountPeriodSandboxSpendMicrosParams{
 		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
 		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
 		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},

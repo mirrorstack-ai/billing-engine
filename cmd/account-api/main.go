@@ -387,6 +387,13 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 		}
 		return d.cycleSvc.SetAppPlan(ctx, req)
 
+	case "QuoteChange":
+		var req cycle.QuoteChangeRequest
+		if err := json.Unmarshal(requestPayload, &req); err != nil {
+			return nil, billing.InvalidInput("malformed request payload: " + err.Error())
+		}
+		return d.cycleSvc.QuoteChange(ctx, req)
+
 	case "RegisterDomain":
 		var req cycle.RegisterDomainRequest
 		if err := json.Unmarshal(requestPayload, &req); err != nil {
@@ -826,6 +833,11 @@ func buildRouter(d *dispatcher) *chi.Mux {
 		// endpoint. Same group, same wrapper, same envelope as the mirror RPCs.
 		r.Post("/v1/billing.GetAppPlan", makeHTTPHandler(d, "GetAppPlan"))
 		r.Post("/v1/billing.SetAppPlan", makeHTTPHandler(d, "SetAppPlan"))
+		// QuoteChange (billing-engine#255) prices a sequence of hypothetical
+		// plan steps read-only — no write, no accounts row created — so
+		// api-platform can show a price before the owner commits to any of
+		// RegisterApp / SyncAppModules / SetAppPlan. Same group, same wrapper.
+		r.Post("/v1/billing.QuoteChange", makeHTTPHandler(d, "QuoteChange"))
 		// TransferApp moves an app's billing account to another owner. Same
 		// group, same wrapper, therefore the SAME auth and the same
 		// {ok, response|error} envelope as RegisterApp — api-platform's client

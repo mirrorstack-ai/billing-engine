@@ -177,6 +177,7 @@ type fakeUnactivatedRoller struct {
 	candidates []uuid.UUID
 	calls      map[uuid.UUID][][2]time.Time
 	fail       map[uuid.UUID]error
+	unpriced   map[uuid.UUID][]cycle.UnpricedMetric
 }
 
 func (f *fakeUnactivatedRoller) UnactivatedAccountsWithUsage(context.Context, time.Time, time.Time) ([]uuid.UUID, error) {
@@ -191,7 +192,29 @@ func (f *fakeUnactivatedRoller) RollupPeriod(_ context.Context, id uuid.UUID, st
 	if err := f.fail[id]; err != nil {
 		return nil, err
 	}
-	return &cycle.RollupSummary{}, nil
+	return &cycle.RollupSummary{UnpricedCustomMetrics: f.unpriced[id]}, nil
+}
+
+// billing-engine#121: an unpriced custom line a card-less rollup priced at 0
+// reaches the run summary's count — summed across accounts, and never from an
+// account whose rollup failed.
+func TestRunUnactivatedRollup_TotalsUnpricedCustomMetrics(t *testing.T) {
+	a, b, bad := uuid.New(), uuid.New(), uuid.New()
+	mod := uuid.New()
+	fake := &fakeUnactivatedRoller{
+		candidates: []uuid.UUID{a, b, bad},
+		fail:       map[uuid.UUID]error{bad: errors.New("boom")},
+		unpriced: map[uuid.UUID][]cycle.UnpricedMetric{
+			a:   {{ModuleID: mod, Metric: "orders.placed", ModuleVersion: "1.0.0"}, {ModuleID: mod, Metric: "orders.placed", ModuleVersion: "1.1.0"}},
+			b:   {{ModuleID: mod, Metric: "orders.placed", ModuleVersion: "1.1.0"}},
+			bad: {{ModuleID: mod, Metric: "never.counted"}},
+		},
+	}
+	res := cycleResult{}
+	runUnactivatedRollup(context.Background(), fake, time.Now().UTC(), nil, &res)
+	require.Equal(t, 3, res.UnpricedCustomMetrics)
+	require.Equal(t, 2, res.UnactivatedRolledUp)
+	require.Equal(t, 1, res.UnactivatedFailed)
 }
 
 func TestRunUnactivatedRollup_RollsUpEveryCandidateAndNeverCharges(t *testing.T) {

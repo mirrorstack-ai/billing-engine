@@ -918,8 +918,18 @@ type SetMetricDefinitionsRequest struct {
 }
 
 // SetMetricDefinitionsResponse reports how many declarations were synced.
+//
+// UnpricedMetrics is the publish-time diagnostic of billing-engine#121: the
+// sorted names of every declared metric that carries NO price (priced=false).
+// The sync still succeeds — metered-but-unpriced is a legal declaration — but
+// usage on such a metric bills 0 unless an event resolves a price some other
+// way (a per-model metric_model_prices row for the event's model), and the
+// rollup then warns per (module, metric, module_version). Always present, an
+// empty list when every declared metric is priced. A deliberate price of 0
+// (priced=true, unit_price_micros=0) is priced and is NOT listed.
 type SetMetricDefinitionsResponse struct {
-	Synced int `json:"synced"`
+	Synced          int      `json:"synced"`
+	UnpricedMetrics []string `json:"unpriced_metrics"`
 }
 
 // MetricVersionPriceDef is one (metric, module_version) price snapshot in a

@@ -1,11 +1,14 @@
 package cycle_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,6 +173,11 @@ type fakeStore struct {
 	// cardCount overrides UsableNonFraudCardCount per account (the create
 	// gate's card predicate); absent → derived from the usable-PM state above.
 	cardCount map[uuid.UUID]int
+
+	// liveModuleCountByAccount seeds LiveModuleTimerCountForAccount (the
+	// QuoteChange install_modules pool input); absent → 0.
+	liveModuleCountByAccount     map[uuid.UUID]int
+	errLiveModuleCountForAccount error
 
 	// org-billing state (migration 041). accountsByOrg models the
 	// EnsureOrgAccount get-or-create; orgDesignations the designation rows;
@@ -419,6 +427,7 @@ func newFakeStore() *fakeStore {
 		planChangeDraws:           map[uuid.UUID]int64{},
 		memberHistory:             map[uuid.UUID][]fakeMemberCount{},
 		combinedProrationAttempts: map[uuid.UUID]cycle.CombinedProrationAttempt{},
+		liveModuleCountByAccount:  map[uuid.UUID]int{},
 		accountsByUser:            map[uuid.UUID]uuid.UUID{},
 		activation:                map[uuid.UUID]time.Time{},
 		baseSnapshots:             map[snapKey]fakeBaseSnapshot{},
@@ -1795,6 +1804,13 @@ func (f *fakeStore) InsertAdvanceBaseSnapshot(_ context.Context, snap cycle.AppB
 
 // --- per-module install-timer fake (migration 033) --------------------------
 
+func (f *fakeStore) LiveModuleTimerCountForAccount(_ context.Context, accountID uuid.UUID) (int, error) {
+	if f.errLiveModuleCountForAccount != nil {
+		return 0, f.errLiveModuleCountForAccount
+	}
+	return f.liveModuleCountByAccount[accountID], nil
+}
+
 func (f *fakeStore) LiveModuleTimerCountForApp(_ context.Context, appID uuid.UUID) (int, error) {
 	if f.errLiveTimerCount != nil {
 		return 0, f.errLiveTimerCount
@@ -2525,6 +2541,72 @@ func TestRollupPeriod_NullPriceZeroCharge(t *testing.T) {
 	require.EqualValues(t, 0, a.UnitPriceMicros)
 	require.EqualValues(t, 0, a.RawCostMicros)
 	require.EqualValues(t, 0, a.ChargedMicros)
+	// billing-engine#121: the 0 is never silent — the line is named.
+	require.Equal(t, []cycle.UnpricedMetric{{ModuleID: mod, Metric: "orders.placed"}}, resp.UnpricedCustomMetrics)
+}
+
+// billing-engine#121: an unpriced CUSTOM metric never reaches charged_micros = 0
+// without a warning and a summary entry. Exactly one per distinct (module,
+// metric, module_version) per rollup, however many apps / dev_served rows share
+// it; the other lines of the account still roll up and bill; a deliberate
+// price of 0, a version snapshot and a catalog price are all PRICED and never
+// named.
+func TestRollupPeriod_UnpricedCustomMetricWarnsOncePerVersion(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	store := newFakeStore()
+	app1, app2, mod, other := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	devServed := rawAggVersion(app1, mod, "orders.placed", usage.KindCount, "1.0.0", "3")
+	devServed.DevServed = true
+	store.raws = []cycle.RawAggregate{
+		rawAggVersion(app1, mod, "orders.placed", usage.KindCount, "1.0.0", "42"), // unpriced v1.0.0
+		rawAggVersion(app2, mod, "orders.placed", usage.KindCount, "1.0.0", "8"),  // same key, other app
+		devServed, // same key, tunnel row
+		rawAggVersion(app1, mod, "orders.placed", usage.KindCount, "1.1.0", "5"),   // unpriced v1.1.0
+		rawAggVersion(app1, mod, "orders.snapshot", usage.KindCount, "1.1.0", "5"), // version snapshot → priced
+		rawAgg(app1, other, "free.events", usage.KindCount, "100"),                 // deliberate ms.Price(0)
+		rawAgg(app1, other, "paid.events", usage.KindCount, "2"),                   // catalog-priced
+	}
+	store.versionPrices[versionPriceKey(mod, "orders.snapshot", "1.1.0")] = 4
+	store.prices[priceKey(other, "free.events")] = 0
+	store.prices[priceKey(other, "paid.events")] = 1_000
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err, "one developer's missing price must not fail the account's cycle")
+	require.Len(t, resp.Aggregates, 7, "every line, unpriced or not, is still written")
+	require.EqualValues(t, 5*4+2*1_000, resp.TotalChargedMicros, "the priced lines still bill")
+
+	require.Equal(t, []cycle.UnpricedMetric{
+		{ModuleID: mod, Metric: "orders.placed", ModuleVersion: "1.0.0"},
+		{ModuleID: mod, Metric: "orders.placed", ModuleVersion: "1.1.0"},
+	}, resp.UnpricedCustomMetrics)
+
+	out := logs.String()
+	require.Equal(t, 2, strings.Count(out, "unpriced custom metric billed 0"), out)
+	require.Contains(t, out, "module_version=1.0.0")
+	require.Contains(t, out, "module_version=1.1.0")
+	require.Contains(t, out, "module_id="+mod.String())
+	require.NotContains(t, out, "free.events")
+	require.NotContains(t, out, "orders.snapshot")
+}
+
+// A fully-priced rollup, custom and reserved lines alike, names nothing.
+func TestRollupPeriod_PricedRollupNamesNoUnpricedMetric(t *testing.T) {
+	store := newFakeStore()
+	app, mod := uuid.New(), uuid.New()
+	store.raws = []cycle.RawAggregate{
+		rawAgg(app, mod, "orders.placed", usage.KindCount, "2"),
+		rawAgg(app, usage.PlatformInfraModuleID(), "infra.compute.ms", usage.KindSum, "10"),
+	}
+	store.prices[priceKey(mod, "orders.placed")] = 5
+	store.prices[priceKey(usage.PlatformInfraModuleID(), "infra.compute.ms")] = 1
+
+	resp, err := cycle.NewService(store, nil).RollupPeriod(context.Background(), uuid.New(), periodStart, periodEnd)
+	require.NoError(t, err)
+	require.Empty(t, resp.UnpricedCustomMetrics)
 }
 
 func TestRollupPeriod_InfraMissingCatalogErrors(t *testing.T) {
