@@ -3,7 +3,9 @@ package billing
 import (
 	"context"
 	"log/slog"
+	"os"
 	"slices"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -35,6 +37,39 @@ type Service struct {
 	proposer          receivableProposer
 	creditRecovery    *creditrecovery.RuntimeCapability
 	autoTopUpRecovery AutoTopUpRecovery
+	// unpaidGrace overrides the UNPAID_GRACE env flag (tests, explicit wiring);
+	// nil reads the env. now is the service clock handed to eligibility.
+	unpaidGrace *bool
+	now         func() time.Time
+}
+
+// WithUnpaidGrace pins the unpaid-bill grace (billing-engine#329) on or off,
+// overriding the UNPAID_GRACE env flag. Returns the Service for chaining.
+func (s *Service) WithUnpaidGrace(enabled bool) *Service {
+	s.unpaidGrace = &enabled
+	return s
+}
+
+// WithClock replaces the service clock (default time.Now). Tests only.
+func (s *Service) WithClock(now func() time.Time) *Service {
+	s.now = now
+	return s
+}
+
+// unpaidGraceEnabled: UNPAID_GRACE=on enables the grace; unset or anything else
+// is off (the default) and performs no extra query.
+func (s *Service) unpaidGraceEnabled() bool {
+	if s.unpaidGrace != nil {
+		return *s.unpaidGrace
+	}
+	return os.Getenv("UNPAID_GRACE") == "on"
+}
+
+func (s *Service) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 // NewService wires a Service. store and stripe are required; passing
@@ -497,12 +532,28 @@ func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequ
 	if err != nil {
 		return nil, Internal("unpaid invoice count read failed", err)
 	}
-	verdict := eligibility.Evaluate(eligibility.Signals{
+	signals := eligibility.Signals{
 		UsableNonFraudCardCount: sig.UsableCardCount,
 		FirstCharge:             firstChargeState(sig.FirstChargeStatus),
 		FailedChargeStreak:      sig.FailedChargeStreak,
 		UnpaidInvoiceCount:      unpaid,
-	})
+	}
+	verdict := eligibility.Evaluate(signals)
+	if verdict.Blocked && s.unpaidGraceEnabled() {
+		// 14-day unpaid-bill grace (billing-engine#329): only a blocked verdict
+		// can change, so an eligible account costs no extra read. The episode is
+		// on the account the invoice-derived signals use.
+		signals.GraceEnabled = true
+		signals.Now = s.clock()
+		ep, open, err := s.store.OpenUnpaidEpisode(ctx, accountID)
+		if err != nil {
+			return nil, Internal("unpaid episode read failed", err)
+		}
+		if open {
+			signals.UnpaidNoticeSentAt = ep.NoticeSentAt
+		}
+		verdict = eligibility.Evaluate(signals)
+	}
 	if s.walletEnabled && s.creditGate != nil {
 		out := false
 		var gateErr error
@@ -522,6 +573,7 @@ func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequ
 			if !verdict.Blocked {
 				verdict.Blocked = true
 				verdict.Reason = eligibility.ReasonOutOfCredits
+				verdict.GraceEndsAt = nil // the wallet gate blocks at once, no grace end
 			}
 			verdict.Reasons = append(verdict.Reasons, eligibility.ReasonOutOfCredits)
 		}
@@ -554,12 +606,16 @@ func serviceStatusResponse(v eligibility.Verdict) *GetServiceStatusResponse {
 	for i, r := range v.Reasons {
 		reasons[i] = string(r)
 	}
-	return &GetServiceStatusResponse{
+	resp := &GetServiceStatusResponse{
 		Blocked:     v.Blocked,
 		Reason:      string(v.Reason),
 		Reasons:     reasons,
 		BlockReason: blockReason(v.Reason),
 	}
+	if v.GraceEndsAt != nil {
+		resp.GraceEndsAt = v.GraceEndsAt.UTC().Format(time.RFC3339)
+	}
+	return resp
 }
 
 func blockReason(reason eligibility.Reason) string {

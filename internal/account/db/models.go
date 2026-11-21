@@ -962,6 +962,15 @@ type MsBillingRiskRampConfig struct {
 	UpdatedAt           time.Time          `json:"updated_at"`
 }
 
+type MsBillingUnpaidEpisode struct {
+	ID           string             `json:"id"`
+	AccountID    string             `json:"account_id"`
+	StartedAt    time.Time          `json:"started_at"`
+	NoticeSentAt pgtype.Timestamptz `json:"notice_sent_at"`
+	ClosedAt     pgtype.Timestamptz `json:"closed_at"`
+	CreatedAt    time.Time          `json:"created_at"`
+}
+
 type MsBillingUsageAggregate struct {
 	ID                string              `json:"id"`
 	PeriodID          string              `json:"period_id"`
