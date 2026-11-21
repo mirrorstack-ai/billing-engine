@@ -78,6 +78,15 @@ func buildRouter() *webhook.Router {
 	// restricted rk_* needs charges:read and customers:write). Still inside
 	// the billing-engine trust boundary (CLAUDE.md).
 	stripeKey := config.MustEnv("STRIPE_SECRET_KEY")
+	// The expected mode is derived from the key itself, never from an
+	// incoming event — the guard exists to catch an event whose mode
+	// disagrees with what this Lambda's key can act on. An unrecognized
+	// prefix refuses to start rather than guessing a mode (billingstripe#316).
+	expectedLivemode, err := billingstripe.ExpectedLivemodeFromKey(stripeKey)
+	if err != nil {
+		slog.Error("stripe key has no recognized test/live prefix; refusing to start", "error", err)
+		os.Exit(1)
+	}
 	pool := config.MustPgxPool()
 
 	verifier := billingstripe.NewVerifier(webhookSecret)
@@ -184,7 +193,8 @@ func buildRouter() *webhook.Router {
 		WithCreditPaidReconciler(guardedAutoTopUpRecovery).
 		WithManualCreditPaidReconciler(guardedManualPurchaseRecovery).
 		WithCreditFailureReconciler(guardedAutoTopUpRecovery).
-		WithManualCreditFailureReconciler(guardedManualPurchaseRecovery)
+		WithManualCreditFailureReconciler(guardedManualPurchaseRecovery).
+		WithExpectedLivemode(expectedLivemode)
 	if coordinator != nil {
 		router.WithCreditSettlementObserver(
 			rollout.NewSettlementObserver(controller, coordinator),
@@ -199,11 +209,19 @@ func buildRouter() *webhook.Router {
 // path) and calls router.ProcessTrusted — no signature verification, trust
 // comes from the transport (see package doc).
 //
-// A non-nil error is returned ONLY when the result is a genuine 5xx, so
-// EventBridge's own per-target retry policy + DLQ kicks in. A malformed /
-// undecodable Detail is logged and acked with a nil error: there is no
-// reason to let EventBridge retry forever on a payload that will never
-// parse.
+// EventBridge invokes this Lambda ASYNCHRONOUSLY, not through a Rule-level
+// retry/DLQ: a non-nil error here is retried by Lambda's own asynchronous
+// invocation retry policy (up to 2 retries) and, once those are exhausted,
+// delivered to the function's on-failure destination
+// (mirrorstack-infra#440) — that destination's alarm, not an EventBridge
+// Rule DLQ, is what covers a dispatch failure. A non-nil error is returned
+// ONLY when the result is a genuine 5xx: router.go's processVerifiedEvent
+// deletes the idempotency row first on a 5xx (router.go ~488-490), so the
+// retried delivery re-enters dispatch instead of deduping as a seen event.
+// A malformed / undecodable Detail is logged and acked with a nil error:
+// there is no reason to retry a payload that will never parse. A livemode
+// mismatch (router.go, StatusLivemodeMismatch) is a non-5xx Result for the
+// same reason — retrying never makes a wrong-mode event right.
 func eventBridgeHandler(router *webhook.Router) func(context.Context, events.EventBridgeEvent) error {
 	return func(ctx context.Context, evt events.EventBridgeEvent) error {
 		var event stripego.Event

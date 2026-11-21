@@ -1,9 +1,11 @@
 package webhook_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/google/uuid"
@@ -108,6 +110,13 @@ func newRouter(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore) *webhook.R
 
 func newRouterWithCharges(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore, c *webhooktest.FakeChargeRetriever) *webhook.Router {
 	return webhook.NewRouter(v, s, c, c, webhooktest.SilentLogger())
+}
+
+// newRouterWithLivemode builds a router with the livemode guard enabled,
+// expecting the given mode from its (fake) configured key.
+func newRouterWithLivemode(v *webhooktest.FakeVerifier, s *webhooktest.FakeStore, expectedLive bool) *webhook.Router {
+	c := &webhooktest.FakeChargeRetriever{}
+	return webhook.NewRouter(v, s, c, c, webhooktest.SilentLogger()).WithExpectedLivemode(expectedLive)
 }
 
 // --- tests ----------------------------------------------------------------
@@ -1762,4 +1771,161 @@ func TestProcess_InvoiceEvents_MoveTheDemerit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- livemode guard ---------------------------------------------------
+
+// TestProcess_Livemode_MatchingModeIsProcessedOnce covers both Process and
+// ProcessTrusted: an event whose Livemode agrees with the router's
+// configured expectation is dispatched exactly once, and a redelivery of
+// the same event id still dedupes.
+func TestProcess_Livemode_MatchingModeIsProcessedOnce(t *testing.T) {
+	t.Run("Process", func(t *testing.T) {
+		event := customerEvent("evt_live_match", "customer.created", "cus_x", "")
+		event.Livemode = true
+		v := &webhooktest.FakeVerifier{Event: event}
+		s := webhooktest.NewFakeStore()
+		r := newRouterWithLivemode(v, s, true)
+
+		res := r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, webhook.StatusOK, res.Status)
+		require.True(t, s.Processed["evt_live_match"])
+
+		// Redelivery of the same event id still dedupes as today.
+		res = r.Process(context.Background(), []byte(`{}`), "sig")
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, webhook.StatusDuplicate, res.Status)
+	})
+
+	t.Run("ProcessTrusted", func(t *testing.T) {
+		event := customerEvent("evt_live_match_trusted", "customer.created", "cus_x", "")
+		event.Livemode = false
+		s := webhooktest.NewFakeStore()
+		r := newRouterWithLivemode(&webhooktest.FakeVerifier{}, s, false)
+
+		res := r.ProcessTrusted(context.Background(), event)
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, webhook.StatusOK, res.Status)
+		require.True(t, s.Processed["evt_live_match_trusted"])
+
+		res = r.ProcessTrusted(context.Background(), event)
+		require.Equal(t, 200, res.HTTPStatus)
+		require.Equal(t, webhook.StatusDuplicate, res.Status)
+	})
+}
+
+// TestProcess_Livemode_MismatchRejectedBeforeIdempotency covers the two
+// mismatch directions for both entry points: a test-mode event reaching a
+// live-key router, and a live-mode event reaching a test-key router. Either
+// way the event must be rejected with zero store calls (no idempotency row,
+// no handler side effect) and no retry-triggering status.
+func TestProcess_Livemode_MismatchRejectedBeforeIdempotency(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		eventLive    bool
+		expectedLive bool
+	}{
+		{"test event on live-key router", false, true},
+		{"live event on test-key router", true, false},
+	} {
+		t.Run(tc.name+"/Process", func(t *testing.T) {
+			event := customerEvent("evt_mismatch_"+tc.name, "customer.created", "cus_x", "")
+			event.Livemode = tc.eventLive
+			v := &webhooktest.FakeVerifier{Event: event}
+			s := webhooktest.NewFakeStore()
+			c := &webhooktest.FakeChargeRetriever{}
+			r := webhook.NewRouter(v, s, c, c, webhooktest.SilentLogger()).WithExpectedLivemode(tc.expectedLive)
+
+			res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+			require.Equal(t, webhook.StatusLivemodeMismatch, res.Status)
+			require.Less(t, res.HTTPStatus, 500, "a mode mismatch must never trigger a retry")
+			require.Empty(t, s.Processed, "no idempotency row for a rejected event")
+			require.Empty(t, s.Inserts)
+			require.Empty(t, s.DefaultsSet)
+			require.Empty(t, s.AppliedInvoices)
+		})
+
+		t.Run(tc.name+"/ProcessTrusted", func(t *testing.T) {
+			event := customerEvent("evt_mismatch_trusted_"+tc.name, "customer.created", "cus_x", "")
+			event.Livemode = tc.eventLive
+			s := webhooktest.NewFakeStore()
+			c := &webhooktest.FakeChargeRetriever{}
+			r := webhook.NewRouter(&webhooktest.FakeVerifier{}, s, c, c, webhooktest.SilentLogger()).
+				WithExpectedLivemode(tc.expectedLive)
+
+			res := r.ProcessTrusted(context.Background(), event)
+
+			require.Equal(t, webhook.StatusLivemodeMismatch, res.Status)
+			require.Less(t, res.HTTPStatus, 500, "a mode mismatch must never trigger a retry")
+			require.Empty(t, s.Processed, "no idempotency row for a rejected event")
+			require.Empty(t, s.Inserts)
+		})
+	}
+}
+
+// TestProcess_Livemode_MissingFieldIsTestMode pins the Stripe decode
+// behavior the guard relies on: an event whose Livemode field is absent
+// from the payload decodes to false, which is a mismatch (and therefore
+// rejected) against a live-key router.
+func TestProcess_Livemode_MissingFieldIsTestMode(t *testing.T) {
+	event := customerEvent("evt_missing_livemode", "customer.created", "cus_x", "")
+	// event.Livemode left at its zero value, as if Stripe omitted the field.
+	v := &webhooktest.FakeVerifier{Event: event}
+	s := webhooktest.NewFakeStore()
+	r := newRouterWithLivemode(v, s, true)
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusLivemodeMismatch, res.Status)
+	require.Empty(t, s.Processed)
+}
+
+// TestProcess_Livemode_MismatchNeverLogsPayload plants payload strings a
+// real Stripe event would never carry innocuously (customer email, card
+// data) and asserts a mismatched event's log line never contains them —
+// only the envelope fields the guard is specified to log.
+func TestProcess_Livemode_MismatchNeverLogsPayload(t *testing.T) {
+	const plantedSecret = "super-secret-customer-detail-should-never-be-logged"
+	payload, _ := json.Marshal(map[string]any{
+		"id":    "cus_planted",
+		"email": plantedSecret,
+	})
+	event := stripego.Event{
+		ID:       "evt_planted",
+		Type:     stripego.EventTypeCustomerCreated,
+		Livemode: false,
+		Data:     &stripego.EventData{Raw: payload},
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	c := &webhooktest.FakeChargeRetriever{}
+	s := webhooktest.NewFakeStore()
+	r := webhook.NewRouter(&webhooktest.FakeVerifier{}, s, c, c, logger).WithExpectedLivemode(true)
+
+	res := r.ProcessTrusted(context.Background(), event)
+
+	require.Equal(t, webhook.StatusLivemodeMismatch, res.Status)
+	logged := buf.String()
+	require.Contains(t, logged, "webhook livemode mismatch")
+	require.Contains(t, logged, "evt_planted")
+	require.NotContains(t, logged, plantedSecret)
+	require.NotContains(t, logged, string(payload))
+	require.NotContains(t, logged, "cus_planted")
+}
+
+// TestProcess_Livemode_GuardDisabledWhenUnset pins the default: a router
+// that never calls WithExpectedLivemode processes events regardless of
+// Livemode, which is what every pre-existing caller (including the
+// eventBridgeHandler tests, which never set it) relies on.
+func TestProcess_Livemode_GuardDisabledWhenUnset(t *testing.T) {
+	event := customerEvent("evt_no_guard", "customer.created", "cus_x", "")
+	event.Livemode = true
+	r := newRouter(&webhooktest.FakeVerifier{Event: event}, webhooktest.NewFakeStore())
+
+	res := r.Process(context.Background(), []byte(`{}`), "sig")
+
+	require.Equal(t, webhook.StatusOK, res.Status)
 }
