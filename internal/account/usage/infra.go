@@ -365,12 +365,15 @@ type RecordInfraUsageRequest struct {
 	// 測試模組使用量 and is never billed.
 	DevServed bool `json:"dev_served,omitempty"`
 
-	// Source is SourceSandboxTrial for the authoring sandbox's capped trial paid
-	// by MirrorStack (migration 095): platform-asserted, never an SDK hint. A
-	// tagged event is RECORDED and PRICED, stored dev_served so it is NEVER
-	// CHARGED, and counted only by the org's `sandbox` budget.
+	// Source is one of KnownSources (migrations 095 and 096): platform-asserted,
+	// never an SDK hint. SourceSandboxTrial is the authoring sandbox's capped
+	// trial paid by MirrorStack: RECORDED and PRICED, stored dev_served so it is
+	// NEVER CHARGED, and counted only by the org's `sandbox` budget.
+	// SourcePlatformSidebar, SourceMember and SourceModule are ORDINARY usage:
+	// charged and budgeted exactly as the same event with no source.
 	Source string `json:"source,omitempty"`
-	// RunID is the author run a tagged event belongs to; required with Source.
+	// RunID is the author run a sandbox_trial event belongs to; required with
+	// SourceSandboxTrial and refused with any other source.
 	RunID string `json:"run_id,omitempty"`
 
 	// Value is the platform-MEASURED quantity (ms / bytes). Authoritative and
@@ -530,9 +533,11 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 
 	// A sandbox_trial event counts against its account's trial cap; one with no
 	// account would be invisible to every cap, so it is refused. The price is
-	// frozen on the event here, once.
+	// frozen on the event here, once. An ordinary source (platform_sidebar,
+	// member, module) takes none of this: it is the same event as one with no
+	// source.
 	var stampedPrice *int64
-	if req.Source != "" {
+	if req.Source == SourceSandboxTrial {
 		if lookup, ok := s.store.(orgAccountLookup); ok && accountID == uuid.Nil && req.OwnerOrgID != uuid.Nil {
 			id, found, err := lookup.OrgOwnAccount(ctx, req.OwnerOrgID)
 			if err != nil {
@@ -606,7 +611,7 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		//
 		// A sandbox_trial event is ALWAYS stored dev_served (migration 095): every
 		// charging filter already honours the flag.
-		DevServed:          req.DevServed || req.Source != "",
+		DevServed:          req.DevServed || req.Source == SourceSandboxTrial,
 		Source:             req.Source,
 		RunID:              req.RunID,
 		StampedPriceMicros: stampedPrice,
