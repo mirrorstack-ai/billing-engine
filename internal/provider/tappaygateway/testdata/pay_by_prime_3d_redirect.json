@@ -1,0 +1,9 @@
+{
+  "status": 0,
+  "msg": "Success",
+  "rec_trade_id": "D20261104000002",
+  "bank_transaction_id": "btxn_test_000002",
+  "order_number": "ms-payment-test-000002",
+  "amount": 2500,
+  "payment_url": "https://sandbox.tappaysdk.com/tpc/3d-secure/redirect/example"
+}
