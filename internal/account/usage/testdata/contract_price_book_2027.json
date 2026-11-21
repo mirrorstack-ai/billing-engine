@@ -1,0 +1,514 @@
+{
+  "_comment": "billing-engine#269 / core-v2#1843. List prices only, before tax, from the unsigned Annex 1/2 text (D507/D508). Public repo: no distributor price or name here (billing-engine#258 owns that). TestContractPriceBook_* in internal/account/usage pins every engine row against code and every cost-linked (deploy + storage) row against a migrated ms_billing.metric_definitions. known_diff and pending_rows may only shrink.",
+  "contract": {
+    "name": "MirrorStack Annex 1/2 price lock",
+    "effective_from": "2027-01-01",
+    "term_months": 12,
+    "cost_linked_cumulative_cap_pct_per_year": 20,
+    "notice_days": 45
+  },
+  "entries": [
+    {
+      "id": "app-plan-free",
+      "article": "annex1 - app plans",
+      "unit": "per app per month",
+      "contract_price_usd": 0,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": true,
+      "source": "engine",
+      "plan": "free",
+      "allowances": {
+        "modules_included": 4,
+        "domains_included": 0,
+        "members_included": 3,
+        "usage_allowance_usd": 1,
+        "usage_allowance_micros": 1000000,
+        "max_apps_per_org": 1
+      },
+      "note": "art 3 para 4: free plans and free features stay free for the whole term"
+    },
+    {
+      "id": "app-plan-pro",
+      "article": "annex1 - app plans",
+      "unit": "per app per month",
+      "contract_price_usd": 20,
+      "charged_micros_per_unit": 20000000,
+      "cost_linked": false,
+      "free": false,
+      "source": "engine",
+      "plan": "pro",
+      "allowances": {
+        "modules_included": 10,
+        "domains_included": 1,
+        "members_included": 10,
+        "usage_allowance_usd": 5,
+        "usage_allowance_micros": 5000000,
+        "max_apps_per_org": -1
+      }
+    },
+    {
+      "id": "app-plan-business",
+      "article": "annex1 - app plans",
+      "unit": "per app per month",
+      "contract_price_usd": 50,
+      "charged_micros_per_unit": 50000000,
+      "cost_linked": false,
+      "free": false,
+      "source": "engine",
+      "plan": "business",
+      "allowances": {
+        "modules_included": -1,
+        "domains_included": 2,
+        "members_included": 25,
+        "usage_allowance_usd": 15,
+        "usage_allowance_micros": 15000000,
+        "max_apps_per_org": -1
+      }
+    },
+    {
+      "id": "addon-extra-modules",
+      "article": "annex1 - app plans",
+      "unit": "per block of 5 extra modules per app per month, rounded up to 5",
+      "contract_price_usd": 5,
+      "charged_micros_per_unit": 5000000,
+      "cost_linked": false,
+      "free": false,
+      "source": "engine",
+      "block_size": 5
+    },
+    {
+      "id": "addon-extra-domain",
+      "article": "annex1 - app plans",
+      "unit": "per extra custom domain per app per month",
+      "contract_price_usd": 2,
+      "charged_micros_per_unit": 2000000,
+      "cost_linked": false,
+      "free": false,
+      "source": "engine"
+    },
+    {
+      "id": "addon-extra-member",
+      "article": "annex1 - app plans",
+      "unit": "per extra app member per app per month",
+      "contract_price_usd": 2,
+      "charged_micros_per_unit": 2000000,
+      "cost_linked": false,
+      "free": false,
+      "source": "engine"
+    },
+    {
+      "id": "deploy-dynamic-requests",
+      "article": "annex2 art3 p1",
+      "unit": "per 1,000,000 dynamic page requests",
+      "contract_price_usd": 0.24,
+      "charged_micros_per_unit": 240000,
+      "cost_linked": true,
+      "free": false,
+      "source": "engine",
+      "metric": "infra.compute.ssr.request.count",
+      "db_unit": "1k requests",
+      "scale_from_db_unit": 1000
+    },
+    {
+      "id": "deploy-dynamic-compute",
+      "article": "annex2 art3 p1",
+      "unit": "per 1,000 GB-seconds dynamic compute",
+      "contract_price_usd": 0.0156,
+      "charged_micros_per_unit": 15600,
+      "cost_linked": true,
+      "free": false,
+      "source": "engine",
+      "metric": "infra.compute.ssr.gb_seconds",
+      "db_unit": "GB-second",
+      "scale_from_db_unit": 1000
+    },
+    {
+      "id": "deploy-dynamic-outbound",
+      "article": "annex2 art3 p1",
+      "unit": "per GiB dynamic outbound",
+      "contract_price_usd": 0.1469,
+      "charged_micros_per_unit": 146887,
+      "cost_linked": true,
+      "free": false,
+      "source": "engine",
+      "metric": "infra.compute.ssr.egress.bytes",
+      "db_unit": "GiB",
+      "scale_from_db_unit": 1,
+      "known_diff_ref": "deploy-dynamic-outbound"
+    },
+    {
+      "id": "deploy-static-requests",
+      "article": "annex2 art3 p1",
+      "unit": "per 1,000,000 static file requests",
+      "contract_price_usd": 0.36,
+      "charged_micros_per_unit": 360000,
+      "cost_linked": true,
+      "free": false,
+      "source": "engine",
+      "metric": "infra.cdn.request.count",
+      "db_unit": "1k requests",
+      "scale_from_db_unit": 1000
+    },
+    {
+      "id": "deploy-static-reads",
+      "article": "annex2 art3 p1",
+      "unit": "per 1,000,000 static file reads",
+      "contract_price_usd": 0.432,
+      "charged_micros_per_unit": 432000,
+      "cost_linked": true,
+      "free": false,
+      "source": "engine",
+      "metric": "infra.cdn.r2.read.count",
+      "db_unit": "1k reads",
+      "scale_from_db_unit": 1000
+    },
+    {
+      "id": "storage-video",
+      "article": "annex2 art2 p1",
+      "unit": "per GiB-month",
+      "contract_price_usd": 0.0324,
+      "charged_micros_per_unit": 32412,
+      "cost_linked": true,
+      "free": false,
+      "source": "engine",
+      "metric": "infra.storage.gib_hours",
+      "db_unit": "GiB-hour",
+      "scale_from_db_unit": 730,
+      "known_diff_ref": "storage-video",
+      "note": "owner D507: video storage is cost-linked; billed through the platform infra storage sentinel (video-core/declare/meter.go ms.Price(37))"
+    },
+    {
+      "id": "storage-ad-asset",
+      "article": "annex2 art2 p1",
+      "unit": "per GiB-month",
+      "contract_price_usd": 0.0324,
+      "charged_micros_per_unit": 32412,
+      "cost_linked": true,
+      "free": false,
+      "source": "engine",
+      "metric": "infra.storage.gib_hours",
+      "db_unit": "GiB-hour",
+      "scale_from_db_unit": 730,
+      "known_diff_ref": "storage-ad-asset",
+      "note": "owner D507: ad asset storage is cost-linked; billed through the platform infra storage sentinel (ad-core/declare/meter.go PriceInfraStorageMicros)"
+    },
+    {
+      "id": "module-member-core-mau",
+      "article": "annex2 art2 p1",
+      "unit": "per user per month (monthly active user)",
+      "contract_price_usd": 0.02,
+      "charged_micros_per_unit": 20000,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "user-core",
+      "metric": "user.mau"
+    },
+    {
+      "id": "module-credit-records",
+      "article": "annex2 art2 p1",
+      "unit": "per record",
+      "contract_price_usd": 0.0001,
+      "charged_micros_per_unit": 100,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "credit-core",
+      "metric": "credit.record"
+    },
+    {
+      "id": "module-video-playback",
+      "article": "annex2 art2 p1",
+      "unit": "per hour watched",
+      "contract_price_usd": 0.03,
+      "charged_micros_per_unit": 30000,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-core",
+      "metric": "video.playback.hours"
+    },
+    {
+      "id": "module-video-watch-analytics",
+      "article": "annex2 art2 p1",
+      "unit": "per 1,000 views",
+      "contract_price_usd": 0.60,
+      "charged_micros_per_unit": 600000,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-core",
+      "metric": "video.watch.views"
+    },
+    {
+      "id": "module-ad-impressions",
+      "article": "annex2 art2 p1",
+      "unit": "per 1,000 impressions",
+      "contract_price_usd": 0.15,
+      "charged_micros_per_unit": 150000,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "ad-core",
+      "metric": "ad.impression"
+    },
+    {
+      "id": "module-certificate-issued",
+      "article": "annex2 art2 p1",
+      "unit": "per certificate",
+      "contract_price_usd": 1.50,
+      "charged_micros_per_unit": 1500000,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "certificate-core",
+      "metric": "certificate.issued"
+    },
+    {
+      "id": "module-quiz-submission",
+      "article": "annex2 art2 p1",
+      "unit": "per paper",
+      "contract_price_usd": 0.0001,
+      "charged_micros_per_unit": 100,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "quiz-core",
+      "metric": "quiz.submission"
+    },
+    {
+      "id": "transcode-h264-fast",
+      "article": "annex2 art2 p2",
+      "unit": "per 1080p-equivalent hour",
+      "contract_price_usd": 0.1506,
+      "charged_micros_per_unit": 150600,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-transcode",
+      "metric": "transcode.h264.fast"
+    },
+    {
+      "id": "transcode-h264-standard",
+      "article": "annex2 art2 p2",
+      "unit": "per 1080p-equivalent hour",
+      "contract_price_usd": 0.3012,
+      "charged_micros_per_unit": 301200,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-transcode",
+      "metric": "transcode.h264.standard"
+    },
+    {
+      "id": "transcode-h264-high",
+      "article": "annex2 art2 p2",
+      "unit": "per 1080p-equivalent hour",
+      "contract_price_usd": 0.9036,
+      "charged_micros_per_unit": 903600,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-transcode",
+      "metric": "transcode.h264.high"
+    },
+    {
+      "id": "transcode-h265-standard",
+      "article": "annex2 art2 p2",
+      "unit": "per 1080p-equivalent hour",
+      "contract_price_usd": 0.8132,
+      "charged_micros_per_unit": 813240,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-transcode",
+      "metric": "transcode.h265.standard",
+      "known_diff_ref": "transcode-h265-standard"
+    },
+    {
+      "id": "transcode-h265-high",
+      "article": "annex2 art2 p2",
+      "unit": "per 1080p-equivalent hour",
+      "contract_price_usd": 2.4397,
+      "charged_micros_per_unit": 2439720,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-transcode",
+      "metric": "transcode.h265.high",
+      "known_diff_ref": "transcode-h265-high"
+    },
+    {
+      "id": "transcode-av1-standard",
+      "article": "annex2 art2 p2",
+      "unit": "per 1080p-equivalent hour",
+      "contract_price_usd": 0.6024,
+      "charged_micros_per_unit": 602400,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-transcode",
+      "metric": "transcode.av1.standard"
+    },
+    {
+      "id": "transcode-av1-high",
+      "article": "annex2 art2 p2",
+      "unit": "per 1080p-equivalent hour",
+      "contract_price_usd": 1.8072,
+      "charged_micros_per_unit": 1807200,
+      "cost_linked": false,
+      "free": false,
+      "source": "module",
+      "module": "video-transcode",
+      "metric": "transcode.av1.high"
+    }
+  ],
+  "pending_rows": [
+    {
+      "id": "org-plan-base-seat",
+      "article": "annex1 - org plans",
+      "unit": "per paid seat per month",
+      "contract_price_usd": 4,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "min 3 paid seats, 1 free viewer per 3 paid seats",
+      "blocked_by": ["billing-engine#228", "billing-engine#258"]
+    },
+    {
+      "id": "org-plan-pro-seat",
+      "article": "annex1 - org plans",
+      "unit": "per paid seat per month",
+      "contract_price_usd": 9,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "min 3 paid seats, 1 free viewer per 3 paid seats",
+      "blocked_by": ["billing-engine#228", "billing-engine#258"]
+    },
+    {
+      "id": "org-plan-enterprise-seat",
+      "article": "annex1 - org plans",
+      "unit": "per paid seat per month",
+      "contract_price_usd": 19,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "min 5 paid seats, 1 free viewer per 3 paid seats",
+      "blocked_by": ["billing-engine#228", "billing-engine#258"]
+    },
+    {
+      "id": "org-ai-credit-base",
+      "article": "annex1 - org plans",
+      "unit": "per paid seat per month",
+      "contract_price_usd": 1,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "platform agent sidebar only (D508); module usage including ai-template and ai-assistant bills on the app meter at list price x1.2 and is not this row",
+      "blocked_by": ["billing-engine#228", "billing-engine#258"]
+    },
+    {
+      "id": "org-ai-credit-pro",
+      "article": "annex1 - org plans",
+      "unit": "per paid seat per month",
+      "contract_price_usd": 2.5,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "platform agent sidebar only (D508)",
+      "blocked_by": ["billing-engine#228", "billing-engine#258"]
+    },
+    {
+      "id": "org-ai-credit-enterprise",
+      "article": "annex1 - org plans",
+      "unit": "per paid seat per month",
+      "contract_price_usd": 5,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "platform agent sidebar only (D508)",
+      "blocked_by": ["billing-engine#228", "billing-engine#258"]
+    },
+    {
+      "id": "platform-fee-monthly",
+      "article": "annex1 - platform fee",
+      "unit": "per distributor per month",
+      "contract_price_usd": 200,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "list price; the first distributor's own price is a separate row owned by billing-engine#258 and is not in this public fixture",
+      "blocked_by": ["billing-engine#258"]
+    },
+    {
+      "id": "platform-fee-yearly",
+      "article": "annex1 - platform fee",
+      "unit": "per distributor per year",
+      "contract_price_usd": 2000,
+      "charged_micros_per_unit": 0,
+      "cost_linked": false,
+      "free": false,
+      "source": "pending",
+      "note": "list price; the first distributor's own price is a separate row owned by billing-engine#258 and is not in this public fixture",
+      "blocked_by": ["billing-engine#258"]
+    }
+  ],
+  "known_diff": [
+    {
+      "id": "deploy-dynamic-outbound",
+      "contract_micros": 146900,
+      "engine_exact_micros": 146887.2,
+      "engine_stored_micros": 146887,
+      "reason": "122406 raw x 1.2 = 146887.2 (migration 046); the contract's 0.1469 is that value rounded to 4dp, so the printed price is slightly above the exact engine charge"
+    },
+    {
+      "id": "storage-video",
+      "contract_micros": 32400,
+      "engine_exact_micros": 32412,
+      "engine_stored_micros": 32412,
+      "reason": "37 raw x 1.2 x 730h/month = 32412 (migration 051's 37, 730h convention from migration 090); the contract's 0.0324 rounds that down at 4dp, so the engine charges 12 micros/GiB-month above the printed price"
+    },
+    {
+      "id": "storage-ad-asset",
+      "contract_micros": 32400,
+      "engine_exact_micros": 32412,
+      "engine_stored_micros": 32412,
+      "reason": "same sentinel row and math as storage-video (ad-core and video-core both price their storage meter at the platform's raw 37)"
+    },
+    {
+      "id": "transcode-h265-standard",
+      "contract_micros": 813200,
+      "engine_exact_micros": 813240,
+      "engine_stored_micros": 813240,
+      "reason": "video-transcode/declare/meter.go:121 prices this row at x2.7 of the H.264 standard tier (301200 x 2.7 = 813240); the contract prints 0.8132, 40 micros below the code"
+    },
+    {
+      "id": "transcode-h265-high",
+      "contract_micros": 2439700,
+      "engine_exact_micros": 2439720,
+      "engine_stored_micros": 2439720,
+      "reason": "video-transcode/declare/meter.go:122 prices this row at x2.7 of the H.264 high tier (903600 x 2.7 = 2439720); the contract prints 2.4397, 20 micros below the code"
+    }
+  ],
+  "priced_outside_table": [
+    {
+      "id": "ai-model-usage",
+      "reference": "billing-engine#253",
+      "note": "AI model usage rows, priced by D435, pinned separately and not part of this contract table"
+    },
+    {
+      "id": "ai-template-module-usage",
+      "reference": "core-v2#1816",
+      "note": "future ai-template module usage rows; referenced here, not priced here"
+    }
+  ]
+}
