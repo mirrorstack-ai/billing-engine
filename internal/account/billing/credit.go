@@ -193,6 +193,11 @@ func (s *Service) StartCreditPurchase(ctx context.Context, req StartCreditPurcha
 	if !s.creditEnabledFor(accountID) {
 		return nil, Unavailable("credit wallet is not enabled for this account")
 	}
+	if req.OwnerOrgID != uuid.Nil {
+		if _, err := s.creditRailFor(ctx, req.OwnerOrgID); err != nil {
+			return nil, err
+		}
+	}
 
 	if existing, found, err := s.store.CreditLedgerByIdempotencyKey(ctx, req.IdempotencyKey); err != nil {
 		return nil, Internal("credit purchase idempotency lookup failed", err)
@@ -432,6 +437,11 @@ func (s *Service) SetAutoTopUp(ctx context.Context, req SetAutoTopUpRequest) (*S
 	if !s.creditEnabledFor(accountID) {
 		return nil, Unavailable("credit wallet is not enabled for this account")
 	}
+	if req.Enabled && req.OwnerOrgID != uuid.Nil {
+		if _, err := s.creditRailFor(ctx, req.OwnerOrgID); err != nil {
+			return nil, err
+		}
+	}
 	if req.PaymentMethodID != "" {
 		_, _, _, owned, err := s.paymentMethodTarget(ctx, req.OwnerUserID, req.OwnerOrgID, paymentMethodID)
 		if err != nil {
@@ -665,6 +675,29 @@ func (s *Service) observeCreditMutation(ctx context.Context, accountID uuid.UUID
 		slog.ErrorContext(ctx, "credit mutation committed; standing observation failed",
 			"account_id", accountID, "error", err)
 	}
+}
+
+// creditRailFor resolves which payment rail a credit purchase or auto top-up
+// enable may use for an org owner. A personal account never reaches this
+// function (it cannot have a distributor link); an org with no distributor
+// row keeps the existing Stripe path unchanged.
+//
+// An org linked to a distributor (ms_billing.org_distributors, migration 053)
+// must never pay MirrorStack's own Stripe merchant — core-v2#231 decision 8
+// says that customer pays the distributor's own store. There is no
+// per-distributor NewebPay rail yet (that's mirrorstack-ai/mirrorstack-core-v2#1851,
+// NewebPay plan N7/N9), so every linked org is refused outright today; once a
+// distributor has an active NewebPay rail, this is the one function that
+// extends to return "newebpay" for it.
+func (s *Service) creditRailFor(ctx context.Context, ownerOrgID uuid.UUID) (string, error) {
+	_, found, err := s.store.OrgDistributor(ctx, ownerOrgID)
+	if err != nil {
+		return "", Internal("org distributor lookup failed", err)
+	}
+	if found {
+		return "", CreditRailUnavailable("this organization buys credits from its distributor")
+	}
+	return "stripe", nil
 }
 
 func validateCreditOwner(userID, orgID uuid.UUID) error {

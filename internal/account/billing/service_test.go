@@ -586,6 +586,14 @@ func (s *fakeStore) DeleteOrgDistributor(_ context.Context, customerOrgID uuid.U
 	return true, nil
 }
 
+func (s *fakeStore) OrgDistributor(_ context.Context, customerOrgID uuid.UUID) (uuid.UUID, bool, error) {
+	distributorOrgID, ok := s.orgDistributors[customerOrgID]
+	if !ok {
+		return uuid.Nil, false, nil
+	}
+	return distributorOrgID, true, nil
+}
+
 func (s *fakeStore) AccountByOrg(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {
 	a, ok := s.accountsByOrg[orgID]
 	if !ok {
