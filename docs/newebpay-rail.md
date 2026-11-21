@@ -297,25 +297,26 @@ assuming one extends to the other.
 
 ## 8 · Migration numbers
 
-`main` ends at `092_ai_model_prices_claude5_roster` as of this note (commit
-`b1ff705`, 2026-11-02). Two PRs are open against `088`: `#234` and `#236`.
-Plan item B37 moves `#236` to `093`. **So the first NewebPay migration is
-`094`, unless that changes before a NewebPay PR actually lands** — each PR
-takes the next free number at PR-open time, not at design time, and this
-table is a plan, not a reservation.
+`main` ends at `095_sandbox_trial_meters` as of the last refresh of this note
+(commit `186b46b`, 2026-11-21; `093` and `094` are not on `main`). Open PRs
+already claim `093` (`#299`, `#320`, `#321`, `#322`, `#332`, `#333`) and `094`
+(`#325`, `#334`); `#234` and `#236` still sit on `088`. **So the first NewebPay
+migration is `096` at the earliest, unless that changes before a NewebPay PR
+actually lands** — each PR takes the next free number at PR-open time, not at
+design time, and this table is a plan, not a reservation.
 
 | order | content | number (planned) |
 |---|---|---|
-| 1 | per-distributor NewebPay settings (merchant id, mode, key-blob reference — no key material) | 094 |
-| 2 | TWD amount / presentment columns (N8) | 095 |
-| 3 | NewebPay payment record table (N9/N10): `mode`, `merchant_id`, `merchant_order_no`, `amt`, status, unique key | 096 |
-| 4 | test-account / sandbox-vs-live marker table (N29) | 097 |
+| 1 | per-distributor NewebPay settings (merchant id, mode, key-blob reference — no key material) | 096 |
+| 2 | TWD amount / presentment columns (N8) | 097 |
+| 3 | NewebPay payment record table (N9/N10): `mode`, `merchant_id`, `merchant_order_no`, `amt`, status, unique key | 098 |
+| 4 | test-account / sandbox-vs-live marker table (N29) | 099 |
 
 **Two open NewebPay PRs must not claim the same number.** Whoever opens the
 second concurrent NewebPay migration PR re-numbers against whatever `main`
-actually ends at, the same way `#236` is re-numbering against `#234` today —
-this table is the intended order, not a guarantee that these exact numbers
-are still free when each PR opens.
+actually ends at, the same way the `093` and `094` PRs above must re-number
+against each other — this table is the intended order, not a guarantee that
+these exact numbers are still free when each PR opens.
 
 ---
 
