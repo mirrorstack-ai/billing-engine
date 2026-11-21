@@ -36,6 +36,11 @@ type TradeInfoRequest struct {
 	ItemDesc        string
 	NotifyURL       string
 	ReturnURL       string
+	// LangType and Credit are optional: written after ReturnURL only when
+	// set, so a request without them serializes to the same bytes as
+	// before they existed (the known-answer vectors in testdata).
+	LangType string
+	Credit   bool
 }
 
 // BuildTradeInfo serializes r as the URL-encoded query string NewebPay
@@ -56,6 +61,12 @@ func BuildTradeInfo(r TradeInfoRequest) string {
 	parts := make([]string, 0, len(tradeInfoFieldOrder))
 	for _, name := range tradeInfoFieldOrder {
 		parts = append(parts, name+"="+url.QueryEscape(values[name]))
+	}
+	if r.LangType != "" {
+		parts = append(parts, "LangType="+url.QueryEscape(r.LangType))
+	}
+	if r.Credit {
+		parts = append(parts, "CREDIT=1")
 	}
 	return strings.Join(parts, "&")
 }
