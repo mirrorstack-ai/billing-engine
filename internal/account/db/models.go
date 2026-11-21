@@ -1011,7 +1011,7 @@ type MsBillingUsageEvent struct {
 	DevServed bool `json:"dev_served"`
 	// ai-assistant template an infra.ai.* event was produced under (stamped by api-platform from the conversation); NULL for every other event.
 	TemplateKey pgtype.Text `json:"template_key"`
-	// Migration 095: NULL (ordinary usage) or sandbox_trial (a capped trial run MirrorStack pays for, D441). Recorded and priced, never charged: the CHECK forces dev_served, so every charging filter excludes it, and only the sandbox budget counts it.
+	// Migrations 095/096: NULL (no source) or one of platform_sidebar, member, module (ordinary usage: chargeable, priced live at rollup, counted by the AI budgets exactly like an event with no source) or sandbox_trial (a capped trial run MirrorStack pays for, D441: recorded and priced, never charged — the CHECK forces dev_served, so every charging filter excludes it, and only the sandbox budget counts it).
 	Source pgtype.Text `json:"source"`
 	// Migration 095: the author run a sandbox_trial event belongs to, so a spend line traces to one run.
 	RunID pgtype.Text `json:"run_id"`

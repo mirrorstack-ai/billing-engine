@@ -403,9 +403,12 @@ func observationFingerprint(event UsageEvent) []byte {
 	writeFingerprintField(event.Subject)
 	writeFingerprintField(string(event.Metadata))
 	writeFingerprintField(occurredAt)
-	// Migration 095: the tag is part of the event's identity, appended ONLY when
-	// set so every untagged event keeps the fingerprint already stored.
-	if event.Source != "" || event.RunID != "" {
+	// Migration 095: a sandbox_trial tag is part of the event's identity, appended
+	// ONLY then so every other event keeps the fingerprint already stored. An
+	// ordinary source (platform_sidebar, member, module; migration 096) is left out
+	// on purpose: it changes nothing the event is charged, so a retry of an event
+	// first stored without a source (or with another ordinary one) still dedupes.
+	if event.Source == SourceSandboxTrial || event.RunID != "" {
 		writeFingerprintField(event.Source)
 		writeFingerprintField(event.RunID)
 	}
