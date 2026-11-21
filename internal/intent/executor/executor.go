@@ -23,10 +23,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/evidence"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/predicate"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/store"
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/paymentfact"
 )
 
 // Collector moves money for one sealed intent.
@@ -437,12 +440,72 @@ func (e *Executor) Execute(ctx context.Context, digest string) (Outcome, error) 
 		return Outcome{Permitted: true, Unresolved: true}, nil
 
 	case result.Succeeded:
-		if err := e.store.RecordOutcomeWithEvidence(ctx, e.recorder, digest, "succeeded", result.Reference, evidence.Event{
+		// billing-engine#313: a settled payment must write one rail-neutral
+		// payment fact in the SAME transaction as the outcome, so there is
+		// never a settled payment without one. The fact needs the payer's
+		// OWN account (payment_facts.payer_account_id is a real FK), which a
+		// sealed intent does not carry — only the owner subject does — so it
+		// is resolved here, the same way ResolvePayer resolves a provider
+		// identity from that subject.
+		accountID, acctErr := e.store.AccountIDForPayer(ctx, sealed.Payer())
+		if acctErr != nil {
+			return Outcome{Permitted: true, Settled: true, Reference: result.Reference},
+				fmt.Errorf("collected but could not resolve the payer's account for its payment fact: %w", acctErr)
+		}
+		payerAccountID, parseErr := uuid.Parse(accountID)
+		if parseErr != nil {
+			return Outcome{Permitted: true, Settled: true, Reference: result.Reference},
+				fmt.Errorf("collected but the resolved account id %q does not parse: %w", accountID, parseErr)
+		}
+
+		// 🔴 gross is the PROVIDER REMAINDER, not TotalMicros — the same
+		// quantity just handed to the collector above, and for the same
+		// reason (fundingFor's comment): they are equal only because wallet
+		// allocation is hardcoded to zero today. tax is a component of the
+		// SEALED total, which is why this guards rather than assumes
+		// tax <= gross: a future non-zero wallet split would collect less at
+		// the rail than the sealed tax, and a fact with a negative net would
+		// misstate what this settlement actually moved.
+		gross := funding.ProviderRemainderMicros
+		tax := sealed.Tax().AmountMicros
+		if tax > gross {
+			return Outcome{Permitted: true, Settled: true, Reference: result.Reference},
+				fmt.Errorf("collected but the sealed tax %d exceeds the provider remainder %d; refusing to write a payment fact with a negative net", tax, gross)
+		}
+
+		if err := e.store.RecordSettlementWithFact(ctx, e.recorder, digest, result.Reference, evidence.Event{
 			Kind:         evidence.KindSettlement,
 			Subject:      sealed.Payer(),
 			IntentDigest: digest,
 			Detail:       "succeeded",
 			OccurredAt:   e.now(),
+		}, paymentfact.New{
+			// 🔴 HARDCODED TO STRIPE. internal/provider/stripeadapter is the
+			// only Collector this tree has, so every executor settlement is a
+			// Stripe one today. The day a second rail implements Collector,
+			// this has to come from the collector's own answer, not from
+			// here — CollectResult carries no rail field yet.
+			Rail:    paymentfact.RailStripe,
+			RailRef: result.Reference,
+			// 🔴 HARDCODED TO LIVE. Nothing in this tree marks an intent as a
+			// sandbox payment yet (billing-engine#297); until it does, every
+			// engine settlement fact is written 'live', which states what is
+			// true today rather than silently defaulting it.
+			Mode:              paymentfact.ModeLive,
+			SourceKind:        paymentfact.SourceEngineSettlement,
+			PayerAccountID:    payerAccountID,
+			Currency:          sealed.Currency(),
+			NetAmountMicros:   gross - tax,
+			TaxAmountMicros:   tax,
+			GrossAmountMicros: gross,
+			PaidAt:            e.now(),
+			// 🔴 Every Collector in this tree charges the US C-corp's Stripe
+			// account in USD, which cannot produce a 統一發票 (no FX in v1,
+			// and a Taiwan invoice is NT$ only — see billing-engine#313) — so
+			// this is decided here rather than left 'pending' for the
+			// invoice worker.
+			InvoiceDecision: paymentfact.DecisionNotApplicable,
+			DecisionReason:  "foreign_seller_usd",
 		}); err != nil {
 			// The money moved. Failing to write that down is bad, but
 			// it is not a reason to say it did not happen.
