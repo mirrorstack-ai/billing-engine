@@ -59,7 +59,7 @@ func TestSyncInfraPriceOverrides_AbsorbAllExpandsFromTheSeededCatalog(t *testing
 	store := overrideStore(t, pool)
 	mod := uuid.New()
 
-	require.NoError(t, store.SyncInfraPriceOverrides(context.Background(), mod, true, nil))
+	require.NoError(t, store.SyncInfraPriceOverrides(context.Background(), mod, "", true, nil))
 
 	// The expansion is the SEEDED sentinel catalog — the caller named nothing.
 	var active int
@@ -90,7 +90,7 @@ func TestSyncInfraPriceOverrides_ExplicitOverrideBeatsAbsorbAll(t *testing.T) {
 	store := overrideStore(t, pool)
 	mod := uuid.New()
 
-	require.NoError(t, store.SyncInfraPriceOverrides(context.Background(), mod, true,
+	require.NoError(t, store.SyncInfraPriceOverrides(context.Background(), mod, "", true,
 		[]usage.InfraPriceOverride{{Metric: "infra.egress.api.bytes", UnitPriceMicros: 120_000}}))
 
 	egress, ok := moduleOverride(t, pool, mod, "infra.egress.api.bytes")
@@ -108,13 +108,13 @@ func TestSyncInfraPriceOverrides_EmptyPayloadWithdrawsEverything(t *testing.T) {
 	ctx := context.Background()
 	mod := uuid.New()
 
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, false,
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, "", false,
 		[]usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5}}))
 	require.Equal(t, 1, countModuleReserved(t, pool, mod))
 
 	// The author deletes the declaration and republishes. An empty keep-array
 	// must delete — see the file header on = ANY('{}') vs = ANY(NULL).
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, false, nil))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, "", false, nil))
 	require.Equal(t, 0, countModuleReserved(t, pool, mod),
 		"the withdrawn override is gone; the line reverts to the platform default")
 }
@@ -130,12 +130,12 @@ func TestSyncInfraPriceOverrides_WithdrawalIsScopedToTheModuleAndTheReservedName
 		ModuleID: mine, Metric: "video.publish", Kind: usage.KindCount, Unit: "video",
 		UnitPriceMicros: 30_000, Priced: true, Active: true,
 	}}))
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, other, false,
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, other, "", false,
 		[]usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 7}}))
 
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mine, false,
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mine, "", false,
 		[]usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 5}}))
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mine, false, nil))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mine, "", false, nil))
 
 	// My custom metric survives — it belongs to SetMetricDefinitions, not here.
 	var customPrice int64
@@ -157,13 +157,92 @@ func TestSyncInfraPriceOverrides_WithdrawalIsScopedToTheModuleAndTheReservedName
 	require.Positive(t, sentinel)
 }
 
+// metricVersionPrice reads back one metric_version_prices snapshot, if any.
+func metricVersionPrice(t *testing.T, pool *pgxpool.Pool, mod uuid.UUID, metric, version string) (int64, bool) {
+	t.Helper()
+	var price int64
+	err := pool.QueryRow(context.Background(),
+		`SELECT unit_price_micros FROM ms_billing.metric_version_prices
+		 WHERE module_id = $1 AND metric = $2 AND module_version = $3`,
+		mod.String(), metric, version).Scan(&price)
+	if err != nil {
+		return 0, false
+	}
+	return price, true
+}
+
+// A version-less call (moduleVersion == "") must write no snapshot at all —
+// this is "version-less events keep today's chain" from issue #219: nothing
+// changes for a caller that doesn't opt in.
+func TestSyncInfraPriceOverrides_NoModuleVersion_WritesNoSnapshot(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := overrideStore(t, pool)
+	mod := uuid.New()
+
+	require.NoError(t, store.SyncInfraPriceOverrides(context.Background(), mod, "", true,
+		[]usage.InfraPriceOverride{{Metric: "infra.egress.api.bytes", UnitPriceMicros: 120_000}}))
+
+	_, ok := metricVersionPrice(t, pool, mod, "infra.egress.api.bytes", "")
+	require.False(t, ok, "a version-less publish must not write a metric_version_prices row")
+}
+
+// A publish that carries a module_version snapshots BOTH the absorbed-to-0 set
+// and the explicit override into the immutable metric_version_prices table
+// (issue #219's fix direction), and the override's OWN price wins the snapshot
+// exactly as it wins the live metric_definitions row — proving the write order
+// fix: metric_version_prices is insert-only, so without writing the override
+// BEFORE the absorb-all sweep, the absorbed 0 would have silently claimed the
+// key first.
+func TestSyncInfraPriceOverrides_ModuleVersion_SnapshotsAbsorbAndOverride(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := overrideStore(t, pool)
+	mod := uuid.New()
+
+	require.NoError(t, store.SyncInfraPriceOverrides(context.Background(), mod, "1.0.0", true,
+		[]usage.InfraPriceOverride{{Metric: "infra.egress.api.bytes", UnitPriceMicros: 120_000}}))
+
+	egress, ok := metricVersionPrice(t, pool, mod, "infra.egress.api.bytes", "1.0.0")
+	require.True(t, ok, "the explicit override must be snapshotted")
+	require.Equal(t, int64(120_000), egress, "the override's OWN price wins the snapshot, not the absorbed 0")
+
+	compute, ok := metricVersionPrice(t, pool, mod, "infra.compute.walltime.ms", "1.0.0")
+	require.True(t, ok, "the absorbed-to-0 set must be snapshotted too")
+	require.Equal(t, int64(0), compute)
+}
+
+// The immutable snapshot table is ON CONFLICT DO NOTHING: a LATER publish at a
+// NEW version must not touch an EARLIER version's already-written snapshot,
+// and a re-publish of the SAME version must not change its own snapshot
+// either, even if the live catalog price has since moved on.
+func TestSyncInfraPriceOverrides_ModuleVersion_LaterPublishNeverRewritesEarlierSnapshot(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := overrideStore(t, pool)
+	ctx := context.Background()
+	mod := uuid.New()
+
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, "1.0.0", false,
+		[]usage.InfraPriceOverride{{Metric: "infra.compute.walltime.ms", UnitPriceMicros: 100}}))
+
+	// A later publish re-prices the SAME module at a NEW version — the exact
+	// shape of an ms.AbsorbInfra() adoption landing mid-cycle.
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, "2.0.0", true, nil))
+
+	v1, ok := metricVersionPrice(t, pool, mod, "infra.compute.walltime.ms", "1.0.0")
+	require.True(t, ok)
+	require.Equal(t, int64(100), v1, "v1's snapshot is untouched by v2's later absorb")
+
+	v2, ok := metricVersionPrice(t, pool, mod, "infra.compute.walltime.ms", "2.0.0")
+	require.True(t, ok)
+	require.Equal(t, int64(0), v2, "v2 gets its own snapshot at the absorbed price")
+}
+
 func TestSyncInfraPriceOverrides_AbsorbAllSweepsARetiredMetric(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := overrideStore(t, pool)
 	ctx := context.Background()
 	mod := uuid.New()
 
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, true, nil))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, "", true, nil))
 	_, ok := moduleOverride(t, pool, mod, "infra.cron.count")
 	require.True(t, ok, "precondition: absorbed")
 
@@ -173,7 +252,7 @@ func TestSyncInfraPriceOverrides_AbsorbAllSweepsARetiredMetric(t *testing.T) {
 		 WHERE module_id = '00000000-0000-0000-0000-000000000000' AND metric = 'infra.cron.count'`)
 	require.NoError(t, err)
 
-	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, true, nil))
+	require.NoError(t, store.SyncInfraPriceOverrides(ctx, mod, "", true, nil))
 	_, still := moduleOverride(t, pool, mod, "infra.cron.count")
 	require.False(t, still, "a retired metric is neither re-absorbed nor left behind")
 }
