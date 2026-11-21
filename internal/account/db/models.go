@@ -639,7 +639,7 @@ type MsBillingBudget struct {
 	Active        bool                 `json:"active"`
 	CreatedAt     time.Time            `json:"created_at"`
 	UpdatedAt     time.Time            `json:"updated_at"`
-	// Which spend the cap measures: all (every usage event), ai (infra.ai.* only, priced per model), or exposure (the SYSTEM row billing-engine maintains per PaaS account so budget_alerts can record crossings of the risk-exposure pool; never written by a customer).
+	// Which spend the cap measures: all, ai (infra.ai.* per model), exposure (system row, PaaS risk pool) or sandbox (every source = sandbox_trial event, compute and tokens, at its stamped price; org or account scope).
 	Category string `json:"category"`
 	// ai-assistant template this AI cap is for; '' = the scope's AI-wide row. Text key as the module stores it.
 	TemplateKey string `json:"template_key"`
@@ -1011,6 +1011,12 @@ type MsBillingUsageEvent struct {
 	DevServed bool `json:"dev_served"`
 	// ai-assistant template an infra.ai.* event was produced under (stamped by api-platform from the conversation); NULL for every other event.
 	TemplateKey pgtype.Text `json:"template_key"`
+	// Migration 095: NULL (ordinary usage) or sandbox_trial (a capped trial run MirrorStack pays for, D441). Recorded and priced, never charged: the CHECK forces dev_served, so every charging filter excludes it, and only the sandbox budget counts it.
+	Source pgtype.Text `json:"source"`
+	// Migration 095: the author run a sandbox_trial event belongs to, so a spend line traces to one run.
+	RunID pgtype.Text `json:"run_id"`
+	// Migration 095: the raw (cost-basis) unit price in micro-dollars, resolved once at ingest and never recomputed, so a later price edit cannot change what a sandbox_trial event counts against the cap. NULL on ordinary events, which price live at rollup as before.
+	StampedPriceMicros pgtype.Int8 `json:"stamped_price_micros"`
 }
 
 type MsBillingUsageObservationRejection struct {
