@@ -1,0 +1,10 @@
+{
+  "unit": "micro-USD per 1k tokens = USD per 1M tokens x 1000; raw provider list price, NOT x1.2",
+  "markup": { "num": 12, "den": 10 },
+  "models": {
+    "anthropic.claude-haiku-5-5":  { "infra.ai.input.tokens": 100,   "infra.ai.output.tokens": 500,   "infra.ai.cache_write.tokens": 125,   "infra.ai.cache_read.tokens": 10 },
+    "anthropic.claude-sonnet-5-5": { "infra.ai.input.tokens": 2000,  "infra.ai.output.tokens": 10000, "infra.ai.cache_write.tokens": 2500,  "infra.ai.cache_read.tokens": 100 },
+    "anthropic.claude-opus-5-5":   { "infra.ai.input.tokens": 4000,  "infra.ai.output.tokens": 20000, "infra.ai.cache_write.tokens": 5000,  "infra.ai.cache_read.tokens": 200 },
+    "anthropic.claude-fable-5-1":  { "infra.ai.input.tokens": 10000, "infra.ai.output.tokens": 50000, "infra.ai.cache_write.tokens": 12500, "infra.ai.cache_read.tokens": 250 }
+  }
+}
