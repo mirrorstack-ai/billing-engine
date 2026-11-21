@@ -130,14 +130,14 @@ func (q *Queries) ArmModuleTimerStripeCharge(ctx context.Context, arg ArmModuleT
 const coCreatedOverModuleTimers = `-- name: CoCreatedOverModuleTimers :many
 SELECT id
 FROM (
-    SELECT id, app_id, installed_at, grace_resolved,
+    SELECT id, installed_at, grace_resolved,
            row_number() OVER (ORDER BY installed_at, id) AS rn
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = $1::uuid
+      AND app_id = $2::uuid
       AND removed_at IS NULL
 ) ranked
-WHERE app_id = $2::uuid
-  AND installed_at = $3::timestamptz
+WHERE installed_at = $3::timestamptz
   AND grace_resolved = false
   AND rn > $4::int
 ORDER BY installed_at, id
@@ -152,13 +152,13 @@ type CoCreatedOverModuleTimersParams struct {
 
 // CoCreatedOverModuleTimers backs the scenario-3 combined creation invoice: the
 // ids of the app's live, unresolved install timers whose install instant IS the
-// app's created_at (co-created at app creation) AND that are "over" (live-FIFO
-// rank >= included). Their grace elapses at the SAME instant as the app's own
-// creation grace, so the creation-proration charge folds them onto ONE invoice.
-// The rank window spans ALL the account's live timers (an included module still
-// occupies a FIFO slot), so rn > @included_modules is the 0-based rank >= included
-// "over" predicate; the outer filter keeps only this app's co-created, still-
-// unresolved rows. Ordered (installed_at, id) for a deterministic charge order.
+// app's created_at (co-created at app creation) AND that are "over" against
+// THAT APP'S OWN plan allowance (billing-engine#202 PR-2c: live-FIFO rank
+// WITHIN THE APP, never pooled against any other app on the account). The rank
+// window is scoped to @app_id alone, so rn > @included_modules is the 0-based
+// rank >= included "over" predicate for this app's own ordering; the outer
+// filter keeps only the co-created, still-unresolved rows. Ordered
+// (installed_at, id) for a deterministic charge order.
 func (q *Queries) CoCreatedOverModuleTimers(ctx context.Context, arg CoCreatedOverModuleTimersParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, coCreatedOverModuleTimers,
 		arg.AccountID,
@@ -184,56 +184,37 @@ func (q *Queries) CoCreatedOverModuleTimers(ctx context.Context, arg CoCreatedOv
 	return items, nil
 }
 
-const countLiveModuleTimersForAccount = `-- name: CountLiveModuleTimersForAccount :one
-SELECT COALESCE(count(*), 0)::bigint AS live_count
-FROM ms_billing.app_module_overage_timers
-WHERE account_id = $1
-  AND removed_at IS NULL
-`
-
-// CountLiveModuleTimersForAccount returns the account's currently-live
-// (removed_at IS NULL) install-timer count — the DISPLAY read behind
-// GetAccountBill's account-overage line under the per-module-instance model
-// (migration 033). The steady-state estimate $5 × ceil(max(0, live − included)/5) counts
-// the live "over" rows (the FIFO tail past the included 5); reading the timer
-// table (the overage model's source of truth) rather than SUM(apps.module_count)
-// keeps the shown overage tied to the rows the charge legs actually tier on.
-// ::bigint keeps the aggregate a non-nullable scalar.
-func (q *Queries) CountLiveModuleTimersForAccount(ctx context.Context, accountID string) (int64, error) {
-	row := q.db.QueryRow(ctx, countLiveModuleTimersForAccount, accountID)
-	var live_count int64
-	err := row.Scan(&live_count)
-	return live_count, err
-}
-
 const countOngoingOverModuleTimers = `-- name: CountOngoingOverModuleTimers :one
-SELECT COALESCE(count(*), 0)::bigint AS over_count
-FROM (
-    SELECT installed_at, grace_expires_at,
-           row_number() OVER (ORDER BY installed_at, id) AS rn
-    FROM ms_billing.app_module_overage_timers
-    WHERE account_id = $1::uuid
-      AND removed_at IS NULL
-) ranked
-WHERE rn > $2::int
-  AND installed_at < $3::timestamptz
-  AND grace_expires_at < $3::timestamptz
+SELECT GREATEST(COALESCE(count(*), 0)::bigint - $1::int, 0)::bigint AS over_count
+FROM ms_billing.app_module_overage_timers
+WHERE account_id = $2::uuid
+  AND app_id = $3::uuid
+  AND removed_at IS NULL
+  AND installed_at < $4::timestamptz
+  AND grace_expires_at < $4::timestamptz
 `
 
 type CountOngoingOverModuleTimersParams struct {
-	AccountID       string    `json:"account_id"`
 	IncludedModules int32     `json:"included_modules"`
+	AccountID       string    `json:"account_id"`
+	AppID           string    `json:"app_id"`
 	PeriodEnd       time.Time `json:"period_end"`
 }
 
 // CountOngoingOverModuleTimers is Leg 2's boundary-precharge input (scenario 6):
-// the count of the account's currently-live install timers that are "over"
-// (live-FIFO rank >= included) AND owed a FULL block precharge for the NEW period
-// [@period_end, next boundary) — ongoing over-modules continuing into it.
-// row_number() over the whole live set gives every live timer its 1-based FIFO
-// rank; rn > @included_modules is exactly the 0-based rank >= included ("over")
-// predicate. "over" is re-derived LIVE, so a charged timer that has since flipped
-// to "included" (an earlier install removed) is not counted.
+// the count of ONE APP'S (billing-engine#202 PR-2c: never pooled across an
+// account) currently-live install timers that are "over" (live-FIFO rank
+// within the app >= that app's plan allowance) AND owed a FULL block precharge
+// for the NEW period [@period_end, next boundary) — ongoing over-modules
+// continuing into it. Because the live set here is already scoped to one app,
+// the "over" count past the included cutoff is just the ongoing count past it
+// (same reasoning as LiveOverModuleTimerCountForApp: a single app's own
+// chronological order always leaves exactly max(0, count − N) rows after the
+// Nth). "over" is re-derived LIVE, so a charged timer that has since flipped
+// to "included" (an earlier install removed) is not counted. The caller sums
+// ceil(over_i / ModuleBlockSize) PER APP before pricing blocks — pooling the
+// raw counts first and blocking the sum would under-bill (block rounding is
+// not additive across apps).
 //
 // The coverage contract with the grace legs (review 2026-07-06, tightened in
 // wave 2 D1) — a timer is "ongoing" for the new period iff BOTH of:
@@ -263,7 +244,12 @@ type CountOngoingOverModuleTimersParams struct {
 // over→included between this run and its own sweep keeps the one precharge —
 // no refund (D1e); the next boundary excludes it by rank.
 func (q *Queries) CountOngoingOverModuleTimers(ctx context.Context, arg CountOngoingOverModuleTimersParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countOngoingOverModuleTimers, arg.AccountID, arg.IncludedModules, arg.PeriodEnd)
+	row := q.db.QueryRow(ctx, countOngoingOverModuleTimers,
+		arg.IncludedModules,
+		arg.AccountID,
+		arg.AppID,
+		arg.PeriodEnd,
+	)
 	var over_count int64
 	err := row.Scan(&over_count)
 	return over_count, err
@@ -328,58 +314,63 @@ const liveModuleTimerRankBefore = `-- name: LiveModuleTimerRankBefore :one
 SELECT COALESCE(count(*), 0)::bigint AS rank
 FROM ms_billing.app_module_overage_timers
 WHERE account_id = $1::uuid
+  AND app_id = $2::uuid
   AND removed_at IS NULL
-  AND (installed_at < $2::timestamptz
-       OR (installed_at = $2::timestamptz AND id < $3::uuid))
+  AND (installed_at < $3::timestamptz
+       OR (installed_at = $3::timestamptz AND id < $4::uuid))
 `
 
 type LiveModuleTimerRankBeforeParams struct {
 	AccountID   string    `json:"account_id"`
+	AppID       string    `json:"app_id"`
 	InstalledAt time.Time `json:"installed_at"`
 	TimerID     string    `json:"timer_id"`
 }
 
-// LiveModuleTimerRankBefore returns how many of the account's currently-live
-// install timers order STRICTLY BEFORE a given (installed_at, id) under the FIFO
-// ordering (installed_at ASC, id ASC) — i.e. the target's 0-based FIFO rank.
-// rank < IncludedModules ⇒ "included"; rank >= IncludedModules ⇒ "over".
-// Computed fresh at every grace-check (never cached). Backed by
-// app_module_overage_timers_live_fifo_idx.
+// LiveModuleTimerRankBefore returns how many of the APP'S (not the account's)
+// currently-live install timers order STRICTLY BEFORE a given (installed_at,
+// id) under the FIFO ordering (installed_at ASC, id ASC) — i.e. the target's
+// 0-based FIFO rank WITHIN ITS OWN APP (billing-engine#202 PR-2c: the module
+// allowance is per app, never an account-wide pool). rank < the app's plan
+// ModulesIncluded ⇒ "included"; rank >= it ⇒ "over". Computed fresh at every
+// grace-check (never cached). Backed by app_module_overage_timers_live_fifo_idx.
 func (q *Queries) LiveModuleTimerRankBefore(ctx context.Context, arg LiveModuleTimerRankBeforeParams) (int64, error) {
-	row := q.db.QueryRow(ctx, liveModuleTimerRankBefore, arg.AccountID, arg.InstalledAt, arg.TimerID)
+	row := q.db.QueryRow(ctx, liveModuleTimerRankBefore,
+		arg.AccountID,
+		arg.AppID,
+		arg.InstalledAt,
+		arg.TimerID,
+	)
 	var rank int64
 	err := row.Scan(&rank)
 	return rank, err
 }
 
 const liveOverModuleTimerCountForApp = `-- name: LiveOverModuleTimerCountForApp :one
-WITH live_fifo AS (
-    SELECT app_id,
-           row_number() OVER (ORDER BY installed_at, id) AS fifo_position
-    FROM ms_billing.app_module_overage_timers
-    WHERE account_id = $3::uuid
-      AND removed_at IS NULL
-)
-SELECT COALESCE(count(*), 0)::bigint AS over_count
-FROM live_fifo
-WHERE app_id = $1::uuid
-  AND fifo_position > $2::int
+SELECT GREATEST(COALESCE(count(*), 0)::bigint - $1::int, 0)::bigint AS over_count
+FROM ms_billing.app_module_overage_timers
+WHERE account_id = $2::uuid
+  AND app_id = $3::uuid
+  AND removed_at IS NULL
 `
 
 type LiveOverModuleTimerCountForAppParams struct {
-	AppID           string `json:"app_id"`
 	IncludedModules int32  `json:"included_modules"`
 	AccountID       string `json:"account_id"`
+	AppID           string `json:"app_id"`
 }
 
-// LiveOverModuleTimerCountForApp attributes the account-wide pooled overage
-// back to one app for GetAppBill's current-period estimate. The charge spine's
-// canonical FIFO rule stays unchanged: rank every live timer across the whole
-// account, skip the first @included_modules rows, then count only the over rows
-// owned by @app_id. This makes the per-app bill reconcile with the account bill
-// without granting a second five-module allowance per app.
+// LiveOverModuleTimerCountForApp attributes ONE APP'S OWN module overage for
+// GetAppBill's current-period estimate (billing-engine#202 PR-2c): the app's
+// live install timers are ranked in FIFO order INSIDE the app alone (never
+// pooled against any other app on the account), and @included_modules is that
+// app's own plan allowance (usage.ModulesIncludedCutoff), not the retired
+// account-wide pool. Because the ranking window is already scoped to one app,
+// "how many rank past the cutoff" is just the live count past it — no window
+// function needed: for a single app's own chronological order, the Nth cutoff
+// always leaves exactly max(0, count − N) rows after it.
 func (q *Queries) LiveOverModuleTimerCountForApp(ctx context.Context, arg LiveOverModuleTimerCountForAppParams) (int64, error) {
-	row := q.db.QueryRow(ctx, liveOverModuleTimerCountForApp, arg.AppID, arg.IncludedModules, arg.AccountID)
+	row := q.db.QueryRow(ctx, liveOverModuleTimerCountForApp, arg.IncludedModules, arg.AccountID, arg.AppID)
 	var over_count int64
 	err := row.Scan(&over_count)
 	return over_count, err
@@ -546,15 +537,21 @@ SELECT ranked.app_id,
        min(ranked.grace_expires_at)::timestamptz AS charge_eta
 FROM (
     SELECT id, app_id, installed_at, grace_expires_at, grace_resolved,
-           row_number() OVER (ORDER BY installed_at, id) AS rn
+           row_number() OVER (PARTITION BY app_id ORDER BY installed_at, id) AS rn
     FROM ms_billing.app_module_overage_timers
     WHERE account_id = $1::uuid
       AND removed_at IS NULL
 ) ranked
 JOIN ms_billing.apps a ON a.app_id = ranked.app_id
-WHERE ranked.rn > $2::int
+JOIN (
+    SELECT p.plan, m.modules_included
+    FROM unnest($2::text[]) WITH ORDINALITY AS p(plan, ord)
+    JOIN unnest($3::int[]) WITH ORDINALITY AS m(modules_included, ord)
+      ON p.ord = m.ord
+) allowance ON allowance.plan = COALESCE(a.plan, 'pro')
+WHERE ranked.rn > allowance.modules_included
   AND ranked.grace_resolved = false
-  AND ranked.grace_expires_at > $3::timestamptz
+  AND ranked.grace_expires_at > $4::timestamptz
   AND ranked.installed_at <> a.created_at
 GROUP BY ranked.app_id, a.name
 ORDER BY min(ranked.grace_expires_at), ranked.app_id
@@ -562,7 +559,8 @@ ORDER BY min(ranked.grace_expires_at), ranked.app_id
 
 type PendingAddonModuleChargesParams struct {
 	AccountID       string    `json:"account_id"`
-	IncludedModules int32     `json:"included_modules"`
+	Plans           []string  `json:"plans"`
+	ModulesIncluded []int32   `json:"modules_included"`
 	Now             time.Time `json:"now"`
 }
 
@@ -576,18 +574,26 @@ type PendingAddonModuleChargesRow struct {
 // PendingAddonModuleCharges is the pending ADD-ON half of the ListNewCreationCharges
 // read (本期新建立): the account's live, unresolved install timers still INSIDE
 // their own grace window as of @now — add-on charges that WILL fire (Leg 1 /
-// cycle/overage.go) but haven't yet — grouped per app. Only timers "over" per
-// the live FIFO rank (rn > @included_modules) are add-on charges at all.
-// Co-created timers (installed_at = the app's created_at) are EXCLUDED: their
-// pending charge is already represented by the app's own pending creation row
-// (the scenario-3 combined invoice bills them together), and a co-created timer
-// is in grace iff its app is — listing both would double-show one upcoming
-// charge. Deleted apps cannot appear (deletion soft-removes every timer).
+// cycle/overage.go) but haven't yet — grouped per app. Only timers "over"
+// against THAT APP'S OWN plan allowance (billing-engine#202 PR-2c: per-app
+// live-FIFO rank, resolved via the @plans/@modules_included lookup —
+// usage.ModuleAllowanceColumns — never pooled across the account) are add-on
+// charges at all. Co-created timers (installed_at = the app's created_at) are
+// EXCLUDED: their pending charge is already represented by the app's own
+// pending creation row (the scenario-3 combined invoice bills them together),
+// and a co-created timer is in grace iff its app is — listing both would
+// double-show one upcoming charge. Deleted apps cannot appear (deletion
+// soft-removes every timer).
 // One row per app: the frozen name, the count of pending add-on timers, and the
 // EARLIEST grace expiry as the charge ETA. Ordered soonest-first, app_id
 // breaking ties for a deterministic scan.
 func (q *Queries) PendingAddonModuleCharges(ctx context.Context, arg PendingAddonModuleChargesParams) ([]PendingAddonModuleChargesRow, error) {
-	rows, err := q.db.Query(ctx, pendingAddonModuleCharges, arg.AccountID, arg.IncludedModules, arg.Now)
+	rows, err := q.db.Query(ctx, pendingAddonModuleCharges,
+		arg.AccountID,
+		arg.Plans,
+		arg.ModulesIncluded,
+		arg.Now,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -696,11 +702,27 @@ func (q *Queries) SoftRemoveNewestModuleTimers(ctx context.Context, arg SoftRemo
 
 const unresolvedOneTimeCharges = `-- name: UnresolvedOneTimeCharges :many
 WITH live_timer_ranks AS (
-    SELECT id,
-           row_number() OVER (ORDER BY installed_at, id) AS rn
-    FROM ms_billing.app_module_overage_timers
-    WHERE account_id = $1::uuid
-      AND removed_at IS NULL
+    -- Per-app FIFO (billing-engine#202 PR-2c: never pooled across an
+    -- account) — the window is PARTITIONed BY app_id, and "over" is resolved
+    -- against THAT APP'S OWN plan allowance via the @plans/@modules_included
+    -- lookup (usage.ModuleAllowanceColumns), the one ladder every module-
+    -- overage query reads instead of a second copy embedded here.
+    SELECT ranked.id,
+           (ranked.rn > allowance.modules_included) AS is_over
+    FROM (
+        SELECT id, app_id,
+               row_number() OVER (PARTITION BY app_id ORDER BY installed_at, id) AS rn
+        FROM ms_billing.app_module_overage_timers
+        WHERE account_id = $1::uuid
+          AND removed_at IS NULL
+    ) ranked
+    JOIN ms_billing.apps a ON a.app_id = ranked.app_id
+    JOIN (
+        SELECT p.plan, m.modules_included
+        FROM unnest($2::text[]) WITH ORDINALITY AS p(plan, ord)
+        JOIN unnest($3::int[]) WITH ORDINALITY AS m(modules_included, ord)
+          ON p.ord = m.ord
+    ) allowance ON allowance.plan = COALESCE(a.plan, 'pro')
 ),
 frozen_headers AS (
     SELECT attempt.app_id, attempt.account_id, attempt.attempted_at, attempt.currency, attempt.base_charge_micros, attempt.base_charge_cents, attempt.module_charge_micros, attempt.module_charge_cents, attempt.timer_count, attempt.coverage_start, attempt.coverage_end, attempt.base_description, attempt.module_description, attempt.snapshot_period_start, attempt.snapshot_period_end, attempt.snapshot_base_micros, attempt.snapshot_module_count, attempt.straddle_period_start, attempt.straddle_period_end, attempt.straddle_base_micros, attempt.resolved_at, attempt.resolved_invoice_id, attempt.charge_funding_account_id, attempt.charge_funding_generation, attempt.charge_funding_legacy_unresolved,
@@ -718,7 +740,7 @@ dynamic_creations AS (
            app.app_id AS charge_id,
            app.app_id,
            app.created_at AS charge_at,
-           app.created_at + make_interval(hours => $2::int) AS grace_expires_at,
+           app.created_at + make_interval(hours => $4::int) AS grace_expires_at,
            account.activated_at,
            false AS counts_toward_recurring,
            false AS frozen,
@@ -761,7 +783,7 @@ dynamic_creations AS (
               app.proration_skipped_at IS NULL
               AND (
                   app.deleted_at IS NULL
-                  OR app.deleted_at >= app.created_at + make_interval(hours => $2::int)
+                  OR app.deleted_at >= app.created_at + make_interval(hours => $4::int)
               )
           )
       )
@@ -812,7 +834,7 @@ dynamic_timers AS (
           )
           OR (
               timer.removed_at IS NULL
-              AND rank.rn > $3::int
+              AND COALESCE(rank.is_over, false)
           )
       )
 ),
@@ -821,7 +843,7 @@ frozen_bases AS (
            frozen.app_id AS charge_id,
            frozen.app_id,
            app.created_at AS charge_at,
-           app.created_at + make_interval(hours => $2::int) AS grace_expires_at,
+           app.created_at + make_interval(hours => $4::int) AS grace_expires_at,
            account.activated_at,
            false AS counts_toward_recurring,
            true AS frozen,
@@ -950,9 +972,10 @@ ORDER BY charge_at, charge_kind, charge_id
 `
 
 type UnresolvedOneTimeChargesParams struct {
-	AccountID       string `json:"account_id"`
-	GraceHours      int32  `json:"grace_hours"`
-	IncludedModules int32  `json:"included_modules"`
+	AccountID       string   `json:"account_id"`
+	Plans           []string `json:"plans"`
+	ModulesIncluded []int32  `json:"modules_included"`
+	GraceHours      int32    `json:"grace_hours"`
 }
 
 type UnresolvedOneTimeChargesRow struct {
@@ -1003,7 +1026,12 @@ type UnresolvedOneTimeChargesRow struct {
 // forecast prices each creation at its own plan base. Module-timer rows carry
 // ”: their unit is the module fee, and none counts toward recurring.
 func (q *Queries) UnresolvedOneTimeCharges(ctx context.Context, arg UnresolvedOneTimeChargesParams) ([]UnresolvedOneTimeChargesRow, error) {
-	rows, err := q.db.Query(ctx, unresolvedOneTimeCharges, arg.AccountID, arg.GraceHours, arg.IncludedModules)
+	rows, err := q.db.Query(ctx, unresolvedOneTimeCharges,
+		arg.AccountID,
+		arg.Plans,
+		arg.ModulesIncluded,
+		arg.GraceHours,
+	)
 	if err != nil {
 		return nil, err
 	}

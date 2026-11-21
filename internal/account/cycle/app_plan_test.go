@@ -39,10 +39,12 @@ func registeredPlanApp(t *testing.T) (*fakeStore, *cycle.Service, uuid.UUID) {
 	return store, svc, appID
 }
 
-// TestSetAppPlan_BusinessStillRefused pins the one deliberate refusal left:
-// business waits for its per-app module allowance (PR-2c). Free is accepted
-// now (plan_change_test.go), and the current plan is a no-op.
-func TestSetAppPlan_BusinessStillRefused(t *testing.T) {
+// TestSetAppPlan_BusinessIsAccepted pins that every plan on the ladder,
+// Business included, is reachable from SetAppPlan (billing-engine#202 PR-2c
+// lifted the earlier refusal once the module allowance went per-app). The
+// upgrade-pricing scenario lives in plan_change_test.go; this just confirms
+// the plan actually moves and the current plan stays a no-op.
+func TestSetAppPlan_BusinessIsAccepted(t *testing.T) {
 	store, svc, appID := registeredPlanApp(t)
 
 	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "pro"})
@@ -51,10 +53,11 @@ func TestSetAppPlan_BusinessStillRefused(t *testing.T) {
 	require.Nil(t, resp.Change, "asking for the current plan changes nothing")
 	require.Equal(t, usage.PlanPro, store.apps[appID].Plan)
 
-	_, err = svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "business"})
-	requirePlanErrCode(t, err, billing.CodePlanNotAvailable)
-	require.Equal(t, usage.PlanPro, store.apps[appID].Plan, "a refused change moves nothing")
-	require.Empty(t, store.planChanges, "a refused change writes no ledger row")
+	resp, err = svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "business"})
+	require.NoError(t, err)
+	require.Equal(t, usage.TermsFor(usage.PlanBusiness), resp.Terms)
+	require.Equal(t, usage.PlanBusiness, store.apps[appID].Plan)
+	require.Len(t, store.planChanges, 1)
 }
 
 func TestSetAppPlan_RejectsUnknownPlansAndAbsentApps(t *testing.T) {

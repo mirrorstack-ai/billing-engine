@@ -149,12 +149,12 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	var recurringShares []AppRecurringFeeShare
 	if periodID == "" {
 		store, ok := s.store.(interface {
-			ActivatedRecurringFeeShares(context.Context, uuid.UUID, int, time.Time) ([]AppRecurringFeeShare, error)
+			ActivatedRecurringFeeShares(context.Context, uuid.UUID, time.Time) ([]AppRecurringFeeShare, error)
 		})
 		if !ok {
 			return nil, billing.Internal("activated recurring fee share store unavailable", nil)
 		}
-		recurringShares, err = store.ActivatedRecurringFeeShares(ctx, accountID, IncludedModules, periodEnd)
+		recurringShares, err = store.ActivatedRecurringFeeShares(ctx, accountID, periodEnd)
 		if err != nil {
 			return nil, billing.Internal("activated recurring fee shares failed", err)
 		}
@@ -188,11 +188,32 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 	})
 
 	apps := make([]AccountAppBill, 0, len(appIDs))
-	var baseFeeTotal, moduleUsageTotal, infraTotal, deployUsageTotal, usageDeductionTotal int64
+	var baseFeeTotal, moduleUsageTotal, infraTotal, deployUsageTotal, usageDeductionTotal, moduleOverageTotal int64
 	for _, appID := range appIDs {
 		parts, err := s.computeAppBill(ctx, accountID, found, appID, periodStart, periodEnd, nil)
 		if err != nil {
 			return nil, err
+		}
+		// LIVE per-app module overage (billing-engine#202 PR-2c) — the SAME
+		// shared read GetAppBill attributes, so a drill-down into one app's
+		// bill and its row here never disagree. Computed for every app
+		// (current-state read, independent of which window is displayed) so
+		// AccountOverageMicros below stays meaningful on a historical bill
+		// too, but only FOLDED into this period's own total when periodID=="":
+		// a historical period keeps its exact base snapshot, with no frozen
+		// per-timer allocation ledger to attribute from. Never pooled across
+		// apps any more, so Σ apps[].TotalMicros reconciles to the CURRENT
+		// period's account total with no separate account-wide line.
+		if !parts.IsDeleted {
+			overCount, err := s.store.LiveOverModuleTimerCountForApp(ctx, accountID, appID, ModulesIncludedCutoff(parts.Plan))
+			if err != nil {
+				return nil, billing.Internal("app module overage attribution failed", err)
+			}
+			moduleOverage := int64(overCount) * ModuleOverageFeeMicros
+			moduleOverageTotal += moduleOverage
+			if periodID == "" {
+				parts.BaseFeeMicros += moduleOverage
+			}
 		}
 		// gross is what the app accrued; total is what it owes after the plan's
 		// 用量減免 (PR-4). The row-drop rule below reads GROSS: a deleted app
@@ -251,20 +272,11 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		Models:            agentParts.ModelLines,
 	}
 
-	// Account overage line (migration 033): the steady-state monthly estimate
-	// from the CURRENT live install timers — $5 × ceil(max(0, live − IncludedModules) / 5).
-	// Under the per-module-instance model overage is billed per install on its own
-	// grace timer (Leg 1) / at the boundary (Leg 2); the display sums the live
-	// "over" timer rows and prices them in whole $5 blocks — the timer
-	// table is the overage model's source of truth. The display does not prorate
-	// (the charge legs own proration), so this is an estimate of the period's
-	// overage, not a per-line replay of the exact prorated amounts invoiced (that
-	// would need a per-timer charged-micros column — a follow-up). It is an
-	// ACCOUNT line, never allocated back per app.
-	accountOverage, err := s.accountOverageMicros(ctx, accountID)
-	if err != nil {
-		return nil, err
-	}
+	// AccountOverageMicros is now Σ of the per-app LIVE attributions folded
+	// into apps[] above (billing-engine#202 PR-2c) — informational display
+	// only; it is NOT added again into TotalMicros below (each app's own
+	// BaseFeeMicros already carries its share, for the current period).
+	accountOverage := moduleOverageTotal
 	customDomains, err := s.customDomainsMicros(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -297,7 +309,13 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		AccountOverageMicros:      accountOverage,
 		CustomDomainsMicros:       customDomains,
 		PaasCreditMicros:          paasCredit,
-		TotalMicros:               baseFeeTotal + moduleUsageTotal + infraTotal + accountOverage + customDomains + agent.TotalMicros - usageDeductionTotal - paasCredit,
+		// accountOverage is NOT a term here (billing-engine#202 PR-2c): for the
+		// current period it is already inside baseFeeTotal (folded per app
+		// above), and a historical period's baseFeeTotal is the exact frozen
+		// snapshot, which never included it either. Adding it here would
+		// double-count the current period and leak today's state into a past
+		// one — either way breaking "the account total is Σ its apps".
+		TotalMicros: baseFeeTotal + moduleUsageTotal + infraTotal + customDomains + agent.TotalMicros - usageDeductionTotal - paasCredit,
 	}
 
 	var projectedBaseFeeTotal int64
@@ -321,7 +339,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// adds it. Until then the boundary can exceed this figure by that fee.
 		counts := RecurringFeeCountsOf(recurringShares)
 		projectedBaseFeeTotal = activatedBaseMicros(recurringShares) +
-			ModuleBlockMicros(int64(counts.ModuleOverages)) +
+			moduleOverageBlocksMicros(recurringShares) +
 			int64(counts.CustomDomains)*DomainFeeMicros
 		// The current-period base line is the complete activation-gated recurring
 		// forecast, so module/domain units are folded into it exactly once.
@@ -409,7 +427,7 @@ func (s *Service) unresolvedOneTimeChargeMicros(
 	projectedPeriodStart time.Time,
 ) (int64, error) {
 	charges, err := s.store.UnresolvedOneTimeCharges(
-		ctx, accountID, IncludedModules, GraceDays*24,
+		ctx, accountID, GraceDays*24,
 	)
 	if err != nil {
 		return 0, billing.Internal("unresolved one-time charges query failed", err)
@@ -598,22 +616,6 @@ func (s *Service) ProjectedCreditCharge(ctx context.Context, ownerUserID, ownerO
 		PeriodStart:  bill.PeriodStart,
 		PeriodEnd:    bill.PeriodEnd,
 	}, nil
-}
-
-// accountOverageMicros resolves the account overage shown on the bill: the
-// steady-state monthly estimate AccountOverageMicros(live timer count) = $5 × ceil(…/5) of
-// max(0, live − IncludedModules), where `live` is the count of the account's
-// currently-live install timers (migration 033) — the overage model's source of
-// truth. The first IncludedModules live timers (by FIFO) are "included"; the rest
-// are "over", so max(0, live − included) is exactly the live over-count the charge
-// legs tier on. The PaaS credit never offsets it (overage rides ON TOP, like the
-// base fee), so it is resolved outside the credit math.
-func (s *Service) accountOverageMicros(ctx context.Context, accountID uuid.UUID) (int64, error) {
-	live, err := s.store.LiveModuleTimerCountForAccount(ctx, accountID)
-	if err != nil {
-		return 0, billing.Internal("live module timer count lookup failed", err)
-	}
-	return AccountOverageMicros(live), nil
 }
 
 // customDomainsMicros resolves the account's steady-state custom-domain line:

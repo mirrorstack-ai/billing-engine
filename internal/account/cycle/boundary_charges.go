@@ -8,8 +8,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
-
-	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent"
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 )
@@ -228,8 +226,7 @@ func advanceLines(b boundaryComponents) []proposer.ChargeLine {
 	}
 	if b.AdvanceOverageMicros > 0 {
 		lines = append(lines, proposer.ChargeLine{
-			Description: fmt.Sprintf("Module capacity above the included %d — next period",
-				usage.IncludedModules),
+			Description:  "Module capacity above each app's plan allowance — next period",
 			SourceRef:    "advance:capacity",
 			AmountMicros: b.AdvanceOverageMicros,
 		})

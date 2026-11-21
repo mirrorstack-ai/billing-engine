@@ -13,40 +13,42 @@ func day(y int, m time.Month, d int) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
-// --- AccountOverageMicros: account-wide POOLED overage tier boundaries -------
+// --- per-app module overage tier boundaries (billing-engine#202 PR-2c) ------
 
-func TestAccountOverageMicros_PooledBoundaries(t *testing.T) {
-	// Owner spec 2026-08-27 (supersedes the 2026-07-05 per-module rate):
-	// $5 × ceil(max(0, pooledCount − 5) / 5), where pooledCount is Σ live-app
-	// module_count for the WHOLE account. The boundary cases pin BOTH edges that
-	// matter: the allowance edge (≤5 pooled costs nothing, the 6th opens a block)
-	// and the BLOCK edges — every count inside one block costs the same, so a
-	// module split inside a block is free, and the price only steps at
-	// included + k×blockSize + 1.
+// TestModuleBlockMicros_PerPlanModuleAllowanceBoundaries pins the acceptance
+// matrix: module overage is priced in $5 blocks of 5 against EACH APP'S OWN
+// plan allowance (Free 4, Pro 10, Business unlimited), never a pooled
+// account-wide count. The boundary cases pin both edges that matter: the
+// allowance edge (exactly included costs nothing, one more opens a block) and
+// the BLOCK edges — every count inside one block costs the same, so a module
+// split inside a block is free, and the price only steps at
+// included + k×blockSize + 1.
+func TestModuleBlockMicros_PerPlanModuleAllowanceBoundaries(t *testing.T) {
 	blk := usage.ModuleBlockFeeMicros
 	for _, tc := range []struct {
-		name   string
-		pooled int
-		want   int64
+		name        string
+		plan        usage.Plan
+		moduleCount int
+		want        int64
 	}{
-		{"zero pooled → no overage", 0, 0},
-		{"under pool (3) → no overage", 3, 0},
-		{"exactly included (5) → no overage", usage.IncludedModules, 0},
-		{"included+1 (6) → opens block 1", usage.IncludedModules + 1, blk},
-		// Free headroom: 7, 8, 9, 10 all ride block 1 at the same price.
-		{"included+2 (7) → still block 1", usage.IncludedModules + 2, blk},
-		{"included+4 (9) → still block 1", usage.IncludedModules + 4, blk},
-		{"included+blockSize (10) → block 1 exactly full", usage.IncludedModules + usage.ModuleBlockSize, blk},
-		{"included+blockSize+1 (11) → opens block 2", usage.IncludedModules + usage.ModuleBlockSize + 1, 2 * blk},
-		// twkpa-edu's real shape: 13 installed modules → 8 over → 2 blocks = $10,
-		// so the whole app bills $20 base + $10 = $30/period.
-		{"13 pooled (twkpa-edu) → 2 blocks", 13, 2 * blk},
-		{"15 pooled → block 2 exactly full", 15, 2 * blk},
-		{"16 pooled → opens block 3", 16, 3 * blk},
-		{"included+2×blockSize (15) → two blocks", usage.IncludedModules + 2*usage.ModuleBlockSize, 2 * blk},
+		{"free: zero modules → no overage", usage.PlanFree, 0, 0},
+		{"free: under allowance (3) → no overage", usage.PlanFree, 3, 0},
+		{"free: exactly included (4) → no overage", usage.PlanFree, 4, 0},
+		{"free: included+1 (5) → opens block 1", usage.PlanFree, 5, blk},
+		{"pro: under allowance (9) → no overage", usage.PlanPro, 9, 0},
+		{"pro: exactly included (10) → no overage", usage.PlanPro, 10, 0},
+		{"pro: included+1 (11) → opens block 1", usage.PlanPro, 11, blk},
+		// twkpa-edu's real shape: 18 installed modules on Pro → 8 over → 2
+		// blocks = $10, so the whole app bills $20 base + $10 = $30/period.
+		{"pro: 18 modules → 8 over → 2 blocks", usage.PlanPro, 18, 2 * blk},
+		{"pro: included+blockSize (15) → block 1 exactly full", usage.PlanPro, 15, blk},
+		{"pro: included+blockSize+1 (16) → opens block 2", usage.PlanPro, 16, 2 * blk},
+		{"business: unlimited, 50 modules → no overage", usage.PlanBusiness, 50, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, usage.AccountOverageMicros(tc.pooled))
+			cutoff := usage.ModulesIncludedCutoff(tc.plan)
+			overCount := max(0, tc.moduleCount-cutoff)
+			require.Equal(t, tc.want, usage.ModuleBlockMicros(int64(overCount)))
 		})
 	}
 }
