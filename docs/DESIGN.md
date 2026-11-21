@@ -1975,6 +1975,16 @@ once no row carries an unresolved one they find nothing. The consequence is
 worth saying rather than discovering: the intent rail's first real collection
 will be its first, and step 9's review is all that stands before it.
 
+**A read-only statement composer is not a step in this gate.**
+`internal/account/statement` and `cmd/statement-lines` (billing-engine#263)
+print a payer's monthly statement — fixed fees plus the previous month's
+usage, converted once to a whole-NT$ total — for the owner to send by hand
+(D493, distributor contract art 12). `Compose` has no I/O, no clock and no
+provider client; `cmd/statement-lines` opens only a read-only transaction and
+links no provider client. Neither creates an intent, notifies anyone, or
+collects anything, so neither counts toward `Capabilities.LegacyMoneyPaths`
+or appears in `internal/architecture/allowlist.go`.
+
 ---
 
 ## 12 · What we have not decided
