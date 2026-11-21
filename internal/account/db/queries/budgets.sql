@@ -168,6 +168,21 @@ LEFT JOIN ms_billing.metric_model_prices mp
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric;
 
+-- AccountPeriodSandboxSpendMicros is the spend the `sandbox` budget category
+-- measures (migration 095): one account's source = sandbox_trial events (compute
+-- and model tokens together) in [start, end), each at the unit price STAMPED on
+-- it at ingest, so a later price edit cannot move the cap. Raw cost basis, like
+-- the ai queries above (the markup is applied at rollup): what MirrorStack really
+-- pays. Untagged events are not counted, and the account filter keeps one org's
+-- cap blind to another's events.
+-- name: AccountPeriodSandboxSpendMicros :one
+SELECT COALESCE(SUM(value * stamped_price_micros), 0)::numeric AS total_raw_cost_micros
+FROM ms_billing.usage_events
+WHERE account_id = $1
+  AND source = 'sandbox_trial'
+  AND COALESCE(billable_at, recorded_at) >= $2
+  AND COALESCE(billable_at, recorded_at) <  $3;
+
 -- BudgetOrgAccountID resolves an org-scoped budget to the org's own billing
 -- account (the account whose events the console agent bills in an org-context
 -- conversation). No row = the org has no account yet (a lazy org): its AI

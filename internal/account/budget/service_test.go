@@ -37,6 +37,7 @@ type fakeStore struct {
 
 	spendBy      map[string]int64        // "category/template" → spend (overrides spend)
 	accountSpend int64                   // AccountPeriodAISpendMicros result
+	sandboxSpend map[uuid.UUID]int64     // account → AccountPeriodSandboxSpendMicros result
 	orgAccounts  map[uuid.UUID]uuid.UUID // org id → its billing account
 
 	// exposure pool (085)
@@ -118,6 +119,13 @@ func (f *fakeStore) AccountPeriodAISpendMicros(_ context.Context, accountID uuid
 		return 0, f.errSpend
 	}
 	return f.accountSpend, nil
+}
+
+func (f *fakeStore) AccountPeriodSandboxSpendMicros(_ context.Context, accountID uuid.UUID, _, _ time.Time) (int64, error) {
+	if f.errSpend != nil {
+		return 0, f.errSpend
+	}
+	return f.sandboxSpend[accountID], nil
 }
 
 func (f *fakeStore) OrgAccountID(_ context.Context, orgID uuid.UUID) (uuid.UUID, bool, error) {

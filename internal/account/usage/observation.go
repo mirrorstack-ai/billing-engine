@@ -403,5 +403,11 @@ func observationFingerprint(event UsageEvent) []byte {
 	writeFingerprintField(event.Subject)
 	writeFingerprintField(string(event.Metadata))
 	writeFingerprintField(occurredAt)
+	// Migration 095: the tag is part of the event's identity, appended ONLY when
+	// set so every untagged event keeps the fingerprint already stored.
+	if event.Source != "" || event.RunID != "" {
+		writeFingerprintField(event.Source)
+		writeFingerprintField(event.RunID)
+	}
 	return hash.Sum(nil)
 }

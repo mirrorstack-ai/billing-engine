@@ -53,9 +53,12 @@ func resolveScope(scope Scope, category Category, templateKey string) (Category,
 	}
 	switch scope {
 	case ScopeApp:
+		if cat == CategorySandbox {
+			return "", billing.InvalidInput("the 'sandbox' budget is per org or account, never per app")
+		}
 	case ScopeOrg, ScopeAccount:
-		if cat != CategoryAI {
-			return "", billing.InvalidInput("budget scope " + string(scope) + " supports category 'ai' only")
+		if cat != CategoryAI && cat != CategorySandbox {
+			return "", billing.InvalidInput("budget scope " + string(scope) + " supports categories 'ai' and 'sandbox' only")
 		}
 	default:
 		return "", billing.InvalidInput("invalid budget scope: " + string(scope))
@@ -239,6 +242,9 @@ func (s *Service) spendFor(ctx context.Context, b Budget, start, end time.Time) 
 	}
 	if !found {
 		return 0, nil
+	}
+	if b.Category == CategorySandbox {
+		return s.store.AccountPeriodSandboxSpendMicros(ctx, acct, start, end)
 	}
 	return s.store.AccountPeriodAISpendMicros(ctx, acct, start, end)
 }
@@ -641,6 +647,45 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 		if !spendSet {
 			spend, err = s.store.AccountPeriodAISpendMicros(ctx, accountID, periodStart, periodEnd)
 			if err != nil {
+				return fired, err
+			}
+			spendSet = true
+		}
+		got, err := s.recordCrossings(ctx, b, spend, periodStart)
+		if err != nil {
+			return fired, err
+		}
+		fired = append(fired, got...)
+	}
+	return fired, nil
+}
+
+// EvaluateSandboxBudget is EvaluateAccountBudget's twin for the `sandbox` trial
+// cap (migration 095): after a sandbox_trial event landed on an account, the
+// account's 'sandbox' row and its org's row record any newly crossed threshold.
+// Best-effort like its twin; the cap itself is enforced by GetBudgetStatus.
+func (s *Service) EvaluateSandboxBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error) {
+	var (
+		fired    []int
+		spend    int64
+		spendSet bool
+	)
+	for _, t := range []struct {
+		scope Scope
+		id    uuid.UUID
+	}{{ScopeAccount, accountID}, {ScopeOrg, ownerOrgID}} {
+		if t.id == uuid.Nil {
+			continue
+		}
+		b, found, err := s.store.GetBudget(ctx, t.scope, t.id, CategorySandbox, "")
+		if err != nil {
+			return fired, err
+		}
+		if !found || !b.Active {
+			continue
+		}
+		if !spendSet {
+			if spend, err = s.store.AccountPeriodSandboxSpendMicros(ctx, accountID, periodStart, periodEnd); err != nil {
 				return fired, err
 			}
 			spendSet = true
