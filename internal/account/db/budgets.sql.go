@@ -501,7 +501,7 @@ func (q *Queries) ExposureSignals(ctx context.Context, id string) (ExposureSigna
 }
 
 const getBudget = `-- name: GetBudget :one
-SELECT id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage
+SELECT id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage, spend_window
 FROM ms_billing.budgets
 WHERE scope = $1 AND scope_id = $2 AND category = $3 AND template_key = $4
 `
@@ -538,6 +538,7 @@ func (q *Queries) GetBudget(ctx context.Context, arg GetBudgetParams) (MsBilling
 		&i.TemplateKey,
 		&i.HardCap,
 		&i.AllowOverage,
+		&i.SpendWindow,
 	)
 	return i, err
 }
@@ -708,9 +709,9 @@ func (q *Queries) SetAIEnforcementPaused(ctx context.Context, arg SetAIEnforceme
 const upsertBudget = `-- name: UpsertBudget :one
 
 INSERT INTO ms_billing.budgets (
-    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage
+    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage, spend_window
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 )
 ON CONFLICT (scope, scope_id, category, template_key)
 DO UPDATE SET
@@ -719,8 +720,9 @@ DO UPDATE SET
     alert_percents = EXCLUDED.alert_percents,
     active         = EXCLUDED.active,
     hard_cap       = EXCLUDED.hard_cap,
-    allow_overage  = EXCLUDED.allow_overage
-RETURNING id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage
+    allow_overage  = EXCLUDED.allow_overage,
+    spend_window   = EXCLUDED.spend_window
+RETURNING id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage, spend_window
 `
 
 type UpsertBudgetParams struct {
@@ -734,6 +736,7 @@ type UpsertBudgetParams struct {
 	Active        bool                 `json:"active"`
 	HardCap       bool                 `json:"hard_cap"`
 	AllowOverage  bool                 `json:"allow_overage"`
+	SpendWindow   string               `json:"spend_window"`
 }
 
 // Queries backing internal/account/budget.pgxStore (the per-app budget
@@ -744,7 +747,7 @@ type UpsertBudgetParams struct {
 // ms_billing SQL directly (trust boundary). v1 wires scope='app' only; the
 // enum carries 'org'/'account' for forward-compat (rejected in Go for now).
 // UpsertBudget writes one budget, keyed (scope, scope_id). SetBudget calls
-// it; a re-set updates limit/alert_percents/active in place (account_id is
+// it; a re-set updates limit/alert_percents/active/spend_window in place (account_id is
 // updated too so a lazy budget backfills its account on conversion). Returns
 // the row so the caller can echo the persisted (deduped+sorted) percents.
 func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) (MsBillingBudget, error) {
@@ -759,6 +762,7 @@ func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) (MsB
 		arg.Active,
 		arg.HardCap,
 		arg.AllowOverage,
+		arg.SpendWindow,
 	)
 	var i MsBillingBudget
 	err := row.Scan(
@@ -775,6 +779,7 @@ func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) (MsB
 		&i.TemplateKey,
 		&i.HardCap,
 		&i.AllowOverage,
+		&i.SpendWindow,
 	)
 	return i, err
 }

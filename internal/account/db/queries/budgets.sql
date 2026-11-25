@@ -7,14 +7,14 @@
 -- enum carries 'org'/'account' for forward-compat (rejected in Go for now).
 
 -- UpsertBudget writes one budget, keyed (scope, scope_id). SetBudget calls
--- it; a re-set updates limit/alert_percents/active in place (account_id is
+-- it; a re-set updates limit/alert_percents/active/spend_window in place (account_id is
 -- updated too so a lazy budget backfills its account on conversion). Returns
 -- the row so the caller can echo the persisted (deduped+sorted) percents.
 -- name: UpsertBudget :one
 INSERT INTO ms_billing.budgets (
-    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage
+    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage, spend_window
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 )
 ON CONFLICT (scope, scope_id, category, template_key)
 DO UPDATE SET
@@ -23,7 +23,8 @@ DO UPDATE SET
     alert_percents = EXCLUDED.alert_percents,
     active         = EXCLUDED.active,
     hard_cap       = EXCLUDED.hard_cap,
-    allow_overage  = EXCLUDED.allow_overage
+    allow_overage  = EXCLUDED.allow_overage,
+    spend_window   = EXCLUDED.spend_window
 RETURNING *;
 
 -- GetBudget resolves the budget for a (scope, scope_id), or no row when none
