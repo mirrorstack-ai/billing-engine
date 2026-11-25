@@ -647,6 +647,8 @@ type MsBillingBudget struct {
 	HardCap bool `json:"hard_cap"`
 	// Customer opt-out of a hard cap: alerts still fire, exhausted stays false. Never lifts the risk-graded exposure limit.
 	AllowOverage bool `json:"allow_overage"`
+	// The span the cap measures spend over: period (the scope's anchored billing period, the default) or day (the UTC calendar day, resetting at 00:00 UTC).
+	SpendWindow string `json:"spend_window"`
 }
 
 type MsBillingBudgetAlert struct {

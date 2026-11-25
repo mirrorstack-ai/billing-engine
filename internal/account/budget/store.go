@@ -19,9 +19,9 @@ import (
 // every method maps to a specific RPC / hook need — so tests satisfy it with
 // a small in-memory fake (see service_test.go).
 type Store interface {
-	// UpsertBudget writes one budget keyed (scope, scope_id, category); a
-	// re-set updates limit/alert_percents/active/hard_cap/account_id in
-	// place. Returns the persisted row.
+	// UpsertBudget writes one budget keyed (scope, scope_id, category,
+	// template_key); a re-set updates limit/alert_percents/active/hard_cap/
+	// allow_overage/spend_window/account_id in place. Returns the persisted row.
 	UpsertBudget(ctx context.Context, b Budget) (Budget, error)
 
 	// GetBudget resolves the budget for a (scope, scope_id, category,
@@ -132,6 +132,7 @@ func (s *pgxStore) UpsertBudget(ctx context.Context, b Budget) (Budget, error) {
 		Active:        b.Active,
 		HardCap:       b.HardCap,
 		AllowOverage:  b.AllowOverage,
+		SpendWindow:   string(b.window()),
 	})
 	if err != nil {
 		return Budget{}, err
@@ -405,6 +406,7 @@ func budgetFromRow(row db.MsBillingBudget) (Budget, error) {
 		Active:        row.Active,
 		HardCap:       row.HardCap,
 		AllowOverage:  row.AllowOverage,
+		Window:        Window(row.SpendWindow),
 	}, nil
 }
 

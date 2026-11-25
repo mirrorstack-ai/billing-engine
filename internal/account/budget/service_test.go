@@ -46,6 +46,11 @@ type fakeStore struct {
 	signals         map[uuid.UUID]budget.ExposureSignals // account → curve inputs ("" mode = not paas)
 	rampCfg         budget.RiskRampConfig
 
+	// events, when non-nil, is the spend TIMELINE: every spend read sums the
+	// events inside its [start, end) instead of answering a fixed figure, so a
+	// window test can tell a UTC day from the period (migration 097).
+	events []spendEvent
+
 	errGet    error
 	errUpsert error
 	errSpend  error
@@ -64,6 +69,26 @@ func newFakeStore() *fakeStore {
 		signals:     map[uuid.UUID]budget.ExposureSignals{},
 		rampCfg:     budget.RiskRampConfig{NoCardMicros: 5_000_000, CardBaseMicros: 10_000_000, CeilingMicros: 1_000_000_000, RangeMicros: 990_000_000, Shape: budget.ShapeSigmoid, A: 0.6, K0: 10, KMax: 24, Tau: 5, DemeritPerUnpaidCycle: 2, DemeritRecovery: 1, DemeritMax: 12}, // migration 085's seed: S2
 	}
+}
+
+// spendEvent is one priced usage event on the fake's timeline.
+type spendEvent struct {
+	at     time.Time
+	micros int64
+}
+
+// timeline sums the events in [start, end); ok=false when no timeline is set.
+func (f *fakeStore) timeline(start, end time.Time) (int64, bool) {
+	if f.events == nil {
+		return 0, false
+	}
+	var sum int64
+	for _, e := range f.events {
+		if !e.at.Before(start) && e.at.Before(end) {
+			sum += e.micros
+		}
+	}
+	return sum, true
 }
 
 func budgetKey(scope budget.Scope, scopeID uuid.UUID, cat budget.Category, tpl string) string {
@@ -106,6 +131,9 @@ func (f *fakeStore) AppPeriodSpendMicros(_ context.Context, _ uuid.UUID, cat bud
 	if f.errSpend != nil {
 		return 0, f.errSpend
 	}
+	if v, ok := f.timeline(start, end); ok {
+		return v, nil
+	}
 	if v, ok := f.spendBy[string(cat)+"/"+tpl]; ok {
 		return v, nil
 	}
@@ -118,12 +146,18 @@ func (f *fakeStore) AccountPeriodAISpendMicros(_ context.Context, accountID uuid
 	if f.errSpend != nil {
 		return 0, f.errSpend
 	}
+	if v, ok := f.timeline(start, end); ok {
+		return v, nil
+	}
 	return f.accountSpend, nil
 }
 
-func (f *fakeStore) AccountPeriodSandboxSpendMicros(_ context.Context, accountID uuid.UUID, _, _ time.Time) (int64, error) {
+func (f *fakeStore) AccountPeriodSandboxSpendMicros(_ context.Context, accountID uuid.UUID, start, end time.Time) (int64, error) {
 	if f.errSpend != nil {
 		return 0, f.errSpend
+	}
+	if v, ok := f.timeline(start, end); ok {
+		return v, nil
 	}
 	return f.sandboxSpend[accountID], nil
 }
