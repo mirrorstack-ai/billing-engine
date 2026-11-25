@@ -19,7 +19,7 @@ import (
 
 func TestHTTPHandler_AnswersNotImplemented(t *testing.T) {
 	rr := httptest.NewRecorder()
-	httpHandler().ServeHTTP(
+	httpHandler(&InMemorySink{}).ServeHTTP(
 		rr,
 		httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(`{"any":"payload"}`)),
 	)
@@ -37,7 +37,7 @@ func TestHTTPHandler_AnswersNotImplemented(t *testing.T) {
 }
 
 func TestProxyHandler_AnswersNotImplemented(t *testing.T) {
-	resp, err := proxyHandler()(context.Background(), events.APIGatewayProxyRequest{
+	resp, err := proxyHandler(&InMemorySink{})(context.Background(), events.APIGatewayProxyRequest{
 		Path:       webhookPath,
 		HTTPMethod: http.MethodPost,
 		Body:       `{"any":"payload"}`,
@@ -56,6 +56,22 @@ func TestProxyHandler_AnswersNotImplemented(t *testing.T) {
 	}
 }
 
+// 🔴 A MISSING QUEUE URL MUST NEVER EXIT. mirrorstack-infra#435 (the queue)
+// and this PR can land in either order (D549 change request on
+// billing-engine#295) — a Lambda cold start with the variable still unset is
+// an ordinary, reversible state, not a reason to crash-loop the whole
+// billing-webhook Lambda, which answers every other provider's route too.
+func TestNewNoticeSink_LambdaWithoutQueueURL_UsesUnconfiguredSink(t *testing.T) {
+	t.Setenv("AWS_LAMBDA_FUNCTION_NAME", "billing-webhook")
+	t.Setenv("NEWEBPAY_NOTICE_QUEUE_URL", "")
+
+	sink := newNoticeSink()
+
+	if _, ok := sink.(unconfiguredSink); !ok {
+		t.Fatalf("sink: got %T, want unconfiguredSink — a missing queue URL must degrade, not os.Exit", sink)
+	}
+}
+
 // 🔴 A SIGNED STRIPE DELIVERY MUST NOT BE HONOURED HERE EITHER. The leaked
 // whsec_ in web-ui-kit's history was inert only because the deployed secret
 // slot was empty — a fail-closed default, not a decision. This asserts the
@@ -67,7 +83,7 @@ func TestStripeSignedDeliveryIsNotHonoured(t *testing.T) {
 	req.Header.Set("Stripe-Signature", "t=1,v1=whatever")
 	rr := httptest.NewRecorder()
 
-	httpHandler().ServeHTTP(rr, req)
+	httpHandler(&InMemorySink{}).ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusNotImplemented {
 		t.Fatalf("status: got %d, want %d — a signed Stripe delivery reached logic", rr.Code, http.StatusNotImplemented)
