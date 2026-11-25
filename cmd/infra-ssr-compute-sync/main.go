@@ -58,6 +58,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/awslambdainv"
@@ -155,6 +156,7 @@ func buildDeps() (*usage.Service, lambdaLister, metricsQuerier, idleChecker) {
 			))
 
 			status := billing.NewService(standingStore, nil, "").
+				WithPlatformOrgs(platformfunded.FromProcessEnv()).
 				WithCreditWallet(true).
 				WithCreditAccess(creditAccess).
 				WithCreditCoordinator(rollout.NewGate(controller, shadow, coordinator), coordinator)

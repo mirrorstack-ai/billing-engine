@@ -22,7 +22,11 @@
 // about itself.
 package capabilities
 
-import "github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
+import (
+	"strings"
+
+	"github.com/mirrorstack-ai/billing-engine/internal/shared/buildinfo"
+)
 
 // LegacyMoneyPaths is the number of call sites in this tree that can
 // take money from a stored payment method without passing through an
@@ -69,6 +73,40 @@ type Report struct {
 	// §2 says an executor whose build identity reads "unknown" must
 	// refuse to execute.
 	IntentExecutionReady bool `json:"intent_execution_ready"`
+
+	// StripeMode is the mode of the provider credential this deployment
+	// holds: "test", "live", "unset" or "unknown" (see StripeModeOf). It is
+	// the read-only answer to "which Stripe does this environment talk to",
+	// asked before a funding rule is chosen for it. It is derived from the
+	// credential's public prefix and NEVER carries any part of the key.
+	// Omitted when the caller did not supply one.
+	StripeMode string `json:"stripe_mode,omitempty"`
+}
+
+// The Stripe key prefixes StripeModeOf recognises. Anything else, most
+// importantly a prefix nobody anticipated, is "unknown", never "test".
+const (
+	StripeModeTest    = "test"
+	StripeModeLive    = "live"
+	StripeModeUnset   = "unset"
+	StripeModeUnknown = "unknown"
+)
+
+// StripeModeOf names the mode of a Stripe credential from its prefix alone:
+// sk_test_ / rk_test_ is test, sk_live_ / rk_live_ is live, empty is unset.
+// A prefix allow-list in both directions, so an unrecognised credential
+// reads "unknown" and can never be mistaken for the safe answer.
+func StripeModeOf(key string) string {
+	switch {
+	case key == "":
+		return StripeModeUnset
+	case strings.HasPrefix(key, "sk_test_"), strings.HasPrefix(key, "rk_test_"):
+		return StripeModeTest
+	case strings.HasPrefix(key, "sk_live_"), strings.HasPrefix(key, "rk_live_"):
+		return StripeModeLive
+	default:
+		return StripeModeUnknown
+	}
 }
 
 // Current returns this deployment's capability report.
