@@ -11,6 +11,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/eligibility"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
 )
 
@@ -22,6 +23,7 @@ type Service struct {
 	stripe        billingstripe.Client
 	returnURL     string
 	walletEnabled bool
+	platformOrgs  platformfunded.Set // PORG; the zero set is empty
 	// creditAccess is the account-scoped rollout mutation gate. Production
 	// roots install it from the API controller before any public credit RPC can
 	// name a wallet object. A nil selector preserves the component-test
@@ -43,6 +45,14 @@ type Service struct {
 // billing page); elements mode requires it.
 func NewService(store Store, stripe billingstripe.Client, returnURL string) *Service {
 	return &Service{store: store, stripe: stripe, returnURL: returnURL}
+}
+
+// WithPlatformOrgs installs PORG (internal/account/platformfunded). The default
+// empty set changes nothing; GetServiceStatus consults it only for an org with
+// no resolved funding.
+func (s *Service) WithPlatformOrgs(set platformfunded.Set) *Service {
+	s.platformOrgs = set
+	return s
 }
 
 // WithCreditWallet enables access to the migration-048 credit-wallet schema.
@@ -464,6 +474,13 @@ func (s *Service) GetServiceStatus(ctx context.Context, req GetServiceStatusRequ
 		return nil, Internal("account lookup failed", err)
 	}
 	if !found {
+		// PORG (platformfunded): an org with no resolved funding that the
+		// platform carries is NOT blocked on the card gate; an org outside
+		// PORG takes the blocked verdict below, unchanged.
+		if req.OrgID != uuid.Nil && s.platformOrgs.Funded(req.OrgID) {
+			platformfunded.Audit(ctx, platformfunded.GateServiceState, req.OrgID)
+			return serviceStatusResponse(eligibility.Verdict{Reason: eligibility.ReasonEligible}), nil
+		}
 		// No account (or unfunded org) ⇒ no card ⇒ blocked on the
 		// (unconditional) card gate.
 		return serviceStatusResponse(eligibility.Verdict{

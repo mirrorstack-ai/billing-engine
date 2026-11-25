@@ -58,6 +58,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/intentcutover"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/legacyrestamp"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
@@ -152,7 +153,8 @@ func buildLegacyRestampRunner() legacyRestampRunner {
 	// Intentionally fresh and wallet-disabled: GetServiceStatus evaluates only
 	// legacy card/invoice standing even if an account's stale billing_mode still
 	// says credits. NotifyOwner performs the existing idempotent status+POST.
-	legacyStatus := billing.NewService(billing.NewStore(pool), nil, "")
+	legacyStatus := billing.NewService(billing.NewStore(pool), nil, "").
+		WithPlatformOrgs(platformfunded.FromProcessEnv())
 	notifier := standing.NewNotifierFromEnvWithStatus(
 		pool,
 		legacyStatus,
@@ -366,6 +368,7 @@ func buildService() *cycle.Service {
 			))
 
 			standingSvc := billing.NewService(standingStore, nil, "").
+				WithPlatformOrgs(platformfunded.FromProcessEnv()).
 				WithCreditWallet(true).
 				WithCreditAccess(creditAccess).
 				WithCreditCoordinator(rollout.NewGate(controller, nil, coordinator), coordinator)

@@ -93,3 +93,37 @@ func TestCapabilitiesNeedsNoDependencies(t *testing.T) {
 		t.Fatalf("Capabilities must answer from a bare dispatcher, got: %v", err)
 	}
 }
+
+// The Stripe mode (TB-FUND reads it before choosing a funding rule) comes from
+// the credential's PREFIX alone, an unrecognised credential reads "unknown",
+// and no part of the key is ever on the wire.
+func TestStripeModeOfReadsThePrefixAndNothingElse(t *testing.T) {
+	for key, want := range map[string]string{
+		"":             capabilities.StripeModeUnset,
+		"sk_test_abc":  capabilities.StripeModeTest,
+		"rk_test_abc":  capabilities.StripeModeTest,
+		"sk_live_abc":  capabilities.StripeModeLive,
+		"rk_live_abc":  capabilities.StripeModeLive,
+		"sk_prod_abc":  capabilities.StripeModeUnknown, // a prefix nobody anticipated is never "test"
+		" sk_test_abc": capabilities.StripeModeUnknown,
+	} {
+		if got := capabilities.StripeModeOf(key); got != want {
+			t.Errorf("StripeModeOf(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestCapabilitiesActionReportsTheStripeModeWithoutTheKey(t *testing.T) {
+	d := &dispatcher{stripeMode: capabilities.StripeModeOf("sk_live_NEVER_ON_THE_WIRE")}
+	out, err := d.dispatch(context.Background(), "Capabilities", nil)
+	if err != nil {
+		t.Fatalf("Capabilities dispatch failed: %v", err)
+	}
+	wire, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wire), `"stripe_mode":"live"`) || strings.Contains(string(wire), "NEVER_ON_THE_WIRE") {
+		t.Errorf("want stripe_mode live and no key material, got: %s", wire)
+	}
+}

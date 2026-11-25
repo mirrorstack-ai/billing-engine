@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 )
@@ -196,7 +197,11 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 	// once per distinct id, refused as NotFound (one message for unregistered,
 	// deleted and foreign, so the answer is no oracle for another tenant's app)
 	// and its current plan seeds set_plan's pricing below.
-	existingAppPlan, err := s.quoteOwnedAppPlans(ctx, req, accountID)
+	// A platform-funded org (PORG) answers "ok" with no account: its apps are
+	// the UNBILLED roster rows (account_id NULL) it registered itself, owned by
+	// the org. Nothing else resolves to "ok" without an account.
+	unbilledOwner := accountID == uuid.Nil && standing == QuoteStandingOK
+	existingAppPlan, err := s.quoteOwnedAppPlans(ctx, req, accountID, unbilledOwner)
 	if err != nil {
 		var billingErr *billing.Error
 		if errors.As(err, &billingErr) {
@@ -305,7 +310,7 @@ func (s *Service) QuoteChange(ctx context.Context, req QuoteChangeRequest) (*Quo
 // plan through the prorated upgrade amount. An owner whose account did not
 // resolve (accountID is nil) owns no app. A non-billing error is a store
 // failure, which the caller degrades to an unknown quote.
-func (s *Service) quoteOwnedAppPlans(ctx context.Context, req QuoteChangeRequest, accountID uuid.UUID) (map[uuid.UUID]usage.Plan, error) {
+func (s *Service) quoteOwnedAppPlans(ctx context.Context, req QuoteChangeRequest, accountID uuid.UUID, unbilledOwner bool) (map[uuid.UUID]usage.Plan, error) {
 	plans := make(map[uuid.UUID]usage.Plan)
 	for _, step := range req.Steps {
 		if step.Kind == QuoteStepCreateApp || step.StepRef != nil {
@@ -315,7 +320,7 @@ func (s *Service) quoteOwnedAppPlans(ctx context.Context, req QuoteChangeRequest
 			continue
 		}
 		notOwned := billing.NotFound("app not registered or deleted")
-		if accountID == uuid.Nil {
+		if accountID == uuid.Nil && !unbilledOwner {
 			return nil, notOwned
 		}
 		app, found, err := s.store.AppMirror(ctx, step.AppID)
@@ -361,6 +366,14 @@ func (s *Service) quoteOwnerStanding(ctx context.Context, ownerUserID, ownerOrgI
 			return uuid.Nil, time.Time{}, QuoteStandingUnknown, e
 		}
 		if !funded {
+			// PORG (platformfunded): "ok" with a NIL account, the shape
+			// fundedOwnerAccount gives RegisterApp. Never a new standing value:
+			// api-platform's money gate reads only ok and funding_required. The
+			// amounts stay the list prices; none of them is collected.
+			if s.platformOrgs.Funded(ownerOrgID) {
+				platformfunded.Audit(ctx, platformfunded.GateQuoteChange, ownerOrgID)
+				return uuid.Nil, time.Time{}, QuoteStandingOK, nil
+			}
 			return uuid.Nil, time.Time{}, QuoteStandingFundingRequired, nil
 		}
 		at, activated, e := s.store.AccountActivation(ctx, id)

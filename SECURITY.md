@@ -336,6 +336,22 @@ no intent has executed.
 
 ---
 
+### The platform-funded attribute fills one gap and creates nothing
+
+`platform_funded` lets the platform's own orgs (PORG, config key
+`PLATFORM_ORG_IDS`, `internal/account/platformfunded`) create apps and stay
+served without a card. It is derived, not stored: membership is a pure function
+of that config list, so no column, route, RPC or operator can grant it, and a
+malformed list fails closed to empty (`platformfunded.Parse`). It applies only
+where an org has no resolved funding (`fundedOwnerAccount`,
+`quoteOwnerStanding`, `GetServiceStatus`). It opens no account and writes no
+charge: the app registers as an unbilled roster row (`account_id` NULL) that the
+charge legs skip (`AppsPendingProration` filters `account_id IS NOT NULL`;
+module timers need an account). Each use logs the event `platform_funded.used`
+with gate and org id; that log line is the whole audit trail, not a durable
+table. If a PORG org later designates funding, the attach sweep bills its
+unbilled apps from that instant, as for any org.
+
 ## 5 · What we assume, and what breaks when the assumption is wrong
 
 An honest threat model is mostly a list of assumptions. Each of these names what

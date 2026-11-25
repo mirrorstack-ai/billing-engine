@@ -15,6 +15,7 @@ import (
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -26,8 +27,9 @@ import (
 // injectable for deterministic tests (RegisterApp windows "now" into the
 // account's current anchored period).
 type Service struct {
-	store  Store
-	stripe billingstripe.Client
+	store        Store
+	stripe       billingstripe.Client
+	platformOrgs platformfunded.Set // PORG; the zero set is empty
 	// proposer, when set, cuts a charge leg over to the intent path:
 	// the leg derives the same amount it always did, seals it, stores
 	// it, and STOPS. Something holding the write port decides whether
@@ -239,6 +241,14 @@ func (s *Service) CloseDemerit(ctx context.Context, accountID uuid.UUID, closeAt
 
 func (s *Service) WithNow(now func() time.Time) *Service {
 	s.nowFn = now
+	return s
+}
+
+// WithPlatformOrgs installs PORG (internal/account/platformfunded). The default
+// empty set changes nothing; a set only fills the "org has no resolved funding"
+// gap in RegisterApp and QuoteChange.
+func (s *Service) WithPlatformOrgs(set platformfunded.Set) *Service {
+	s.platformOrgs = set
 	return s
 }
 

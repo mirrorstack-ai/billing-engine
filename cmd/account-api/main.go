@@ -52,6 +52,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/cycle"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/intentcutover"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/auth"
@@ -85,6 +86,9 @@ type dispatcher struct {
 	usageSvc  *usage.Service
 	budgetSvc *budget.Service
 	cycleSvc  *cycle.Service
+	// stripeMode is capabilities.StripeModeOf of the provider credential,
+	// computed once at startup so Capabilities never holds the key itself.
+	stripeMode string
 }
 
 func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload json.RawMessage) (any, error) {
@@ -98,7 +102,9 @@ func (d *dispatcher) dispatch(ctx context.Context, action string, requestPayload
 	// account context — it is a statement about the build, not about a
 	// customer.
 	case "Capabilities":
-		return capabilities.Current(), nil
+		report := capabilities.Current()
+		report.StripeMode = d.stripeMode
+		return report, nil
 
 	case "Ensure":
 		var req billing.EnsureRequest
@@ -592,6 +598,7 @@ func buildDispatcher() *dispatcher {
 		},
 	)
 	svc := billing.NewService(store, stripeClient, returnURL).
+		WithPlatformOrgs(platformfunded.FromProcessEnv()).
 		WithCreditWallet(walletEnabled).
 		WithCreditAccess(creditAccess).
 		WithCreditPurchaseExecutor(creditrecovery.GuardManualPurchaseExecutor(
@@ -695,6 +702,7 @@ func buildDispatcher() *dispatcher {
 	// spine (usage.Service.GetAccountBill) — one audited pricing path, no
 	// second rollup — so the cycle Service borrows the usage Service here.
 	cycleSvc := cycle.NewService(cycle.NewStore(pool), stripeClient).
+		WithPlatformOrgs(platformfunded.FromProcessEnv()).
 		WithAccountBill(usageSvc).
 		WithCreditWallet(walletEnabled).
 		WithCreditRollout(controller)
@@ -719,7 +727,8 @@ func buildDispatcher() *dispatcher {
 			"env", intentcutover.Env, "needs", intentcutover.Armed)
 	}
 
-	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc}
+	return &dispatcher{svc: svc, usageSvc: usageSvc, budgetSvc: budgetSvc, cycleSvc: cycleSvc,
+		stripeMode: capabilities.StripeModeOf(stripeKey)}
 }
 
 func buildRouter(d *dispatcher) *chi.Mux {
