@@ -1291,6 +1291,31 @@ func TestGetAccountBill_LazyAccountZeroBill(t *testing.T) {
 	// The plan stub still renders (the card shows Hobby even pre-activation).
 	require.Equal(t, usage.PlanStubName, resp.Plan.Name)
 	require.True(t, resp.Plan.RenewsAt.Equal(resp.PeriodEnd))
+	require.False(t, resp.HasBillingAccount, "no ms_billing.accounts row → has_billing_account false")
+
+	// The flag is the one signal that tells this zero bill apart from an
+	// existing account's zero bill, so false must be ON THE WIRE, never omitted.
+	encoded, err := json.Marshal(resp)
+	require.NoError(t, err)
+	var wire map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &wire))
+	require.Contains(t, wire, "has_billing_account")
+	require.Equal(t, false, wire["has_billing_account"])
+}
+
+func TestGetAccountBill_ExistingAccountWithNothingBilledHasBillingAccount(t *testing.T) {
+	// An account row with no card, no usage, no invoice: every figure is the
+	// same zero the lazy owner gets, and only the flag says the account exists
+	// (the case a client-side card||invoice||activity heuristic gets wrong).
+	store := newFakeStore()
+	owner := uuid.New()
+	store.accounts[owner] = uuid.New()
+
+	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
+	require.NoError(t, err)
+	require.True(t, resp.HasBillingAccount)
+	require.Zero(t, resp.TotalMicros)
+	require.Empty(t, resp.Apps)
 }
 
 func TestGetAccountBill_AgentModelsJSONContract(t *testing.T) {

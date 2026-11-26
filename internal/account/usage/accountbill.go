@@ -133,12 +133,13 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		// rows without an account), so every total is 0 and Apps is empty
 		// (never nil), matching GetBillingPeriods' lazy posture.
 		return &GetAccountBillResponse{
-			PeriodID:    periodID,
-			PeriodStart: periodStart,
-			PeriodEnd:   periodEnd,
-			Plan:        planStub,
-			Agent:       AccountAgentBill{Models: []AgentModelUsage{}},
-			Apps:        []AccountAppBill{},
+			PeriodID:          periodID,
+			PeriodStart:       periodStart,
+			PeriodEnd:         periodEnd,
+			HasBillingAccount: false,
+			Plan:              planStub,
+			Agent:             AccountAgentBill{Models: []AgentModelUsage{}},
+			Apps:              []AccountAppBill{},
 		}, nil
 	}
 
@@ -286,6 +287,7 @@ func (s *Service) GetAccountBill(ctx context.Context, req GetAccountBillRequest)
 		PeriodID:                  periodID,
 		PeriodStart:               periodStart,
 		PeriodEnd:                 periodEnd,
+		HasBillingAccount:         true,
 		Plan:                      planStub,
 		Apps:                      apps,
 		Agent:                     agent,
