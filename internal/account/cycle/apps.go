@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 )
 
@@ -397,6 +398,13 @@ func (s *Service) fundedOwnerAccount(ctx context.Context, ownerUserID, ownerOrgI
 			return uuid.Nil, billing.Internal("org account resolution failed", err)
 		}
 		if !funded {
+			// PORG (platformfunded): the app registers UNBILLED (account_id
+			// NULL, a shape no charge leg picks up): no account, card or charge
+			// is opened. An org outside PORG falls through to the refusal below.
+			if s.platformOrgs.Funded(ownerOrgID) {
+				platformfunded.Audit(ctx, platformfunded.GateRegisterApp, ownerOrgID)
+				return uuid.Nil, nil
+			}
 			return uuid.Nil, billing.PaymentRequired("organization has no funding: designate funding before creating an app")
 		}
 		accountID = id

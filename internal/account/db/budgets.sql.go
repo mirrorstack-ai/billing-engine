@@ -62,6 +62,39 @@ func (q *Queries) AccountPeriodAISpendMicros(ctx context.Context, arg AccountPer
 	return total_raw_cost_micros, err
 }
 
+const accountPeriodSandboxSpendMicros = `-- name: AccountPeriodSandboxSpendMicros :one
+SELECT COALESCE(SUM(value * stamped_price_micros), 0)::numeric AS total_raw_cost_micros
+FROM ms_billing.usage_events
+WHERE account_id = $1
+  AND source = 'sandbox_trial'
+  AND COALESCE(billable_at, recorded_at) >= $2
+  AND COALESCE(billable_at, recorded_at) <  $3
+`
+
+type AccountPeriodSandboxSpendMicrosParams struct {
+	AccountID    pgtype.UUID        `json:"account_id"`
+	BillableAt   pgtype.Timestamptz `json:"billable_at"`
+	BillableAt_2 pgtype.Timestamptz `json:"billable_at_2"`
+}
+
+// AccountPeriodSandboxSpendMicros is the spend the `sandbox` budget category
+// measures (migration 095): every event of ONE account whose source is
+// sandbox_trial, compute (infra.sandbox.*) and model tokens (infra.ai.*)
+// together, in [start, end). Each event is priced at the unit price STAMPED on
+// it at ingest, never at the live catalog, so a price edit made afterwards
+// cannot move the cap. The price is the raw cost basis, the same basis as the
+// ai budget queries above (the infra markup is applied at rollup, never here),
+// which makes the cap a statement about what MirrorStack really pays.
+// An event without the tag is not counted, and the account filter means one
+// org's cap never sees another org's events. A NULL stamped price counts 0 only
+// because the DB CHECK makes it impossible on a tagged row.
+func (q *Queries) AccountPeriodSandboxSpendMicros(ctx context.Context, arg AccountPeriodSandboxSpendMicrosParams) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, accountPeriodSandboxSpendMicros, arg.AccountID, arg.BillableAt, arg.BillableAt_2)
+	var total_raw_cost_micros pgtype.Numeric
+	err := row.Scan(&total_raw_cost_micros)
+	return total_raw_cost_micros, err
+}
+
 const accountPeriodSpendMicros = `-- name: AccountPeriodSpendMicros :one
 WITH base_events AS (
     SELECT
@@ -468,7 +501,7 @@ func (q *Queries) ExposureSignals(ctx context.Context, id string) (ExposureSigna
 }
 
 const getBudget = `-- name: GetBudget :one
-SELECT id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage
+SELECT id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage, spend_window
 FROM ms_billing.budgets
 WHERE scope = $1 AND scope_id = $2 AND category = $3 AND template_key = $4
 `
@@ -505,6 +538,7 @@ func (q *Queries) GetBudget(ctx context.Context, arg GetBudgetParams) (MsBilling
 		&i.TemplateKey,
 		&i.HardCap,
 		&i.AllowOverage,
+		&i.SpendWindow,
 	)
 	return i, err
 }
@@ -675,9 +709,9 @@ func (q *Queries) SetAIEnforcementPaused(ctx context.Context, arg SetAIEnforceme
 const upsertBudget = `-- name: UpsertBudget :one
 
 INSERT INTO ms_billing.budgets (
-    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage
+    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage, spend_window
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 )
 ON CONFLICT (scope, scope_id, category, template_key)
 DO UPDATE SET
@@ -686,8 +720,9 @@ DO UPDATE SET
     alert_percents = EXCLUDED.alert_percents,
     active         = EXCLUDED.active,
     hard_cap       = EXCLUDED.hard_cap,
-    allow_overage  = EXCLUDED.allow_overage
-RETURNING id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage
+    allow_overage  = EXCLUDED.allow_overage,
+    spend_window   = EXCLUDED.spend_window
+RETURNING id, scope, scope_id, account_id, limit_micros, alert_percents, active, created_at, updated_at, category, template_key, hard_cap, allow_overage, spend_window
 `
 
 type UpsertBudgetParams struct {
@@ -701,6 +736,7 @@ type UpsertBudgetParams struct {
 	Active        bool                 `json:"active"`
 	HardCap       bool                 `json:"hard_cap"`
 	AllowOverage  bool                 `json:"allow_overage"`
+	SpendWindow   string               `json:"spend_window"`
 }
 
 // Queries backing internal/account/budget.pgxStore (the per-app budget
@@ -711,7 +747,7 @@ type UpsertBudgetParams struct {
 // ms_billing SQL directly (trust boundary). v1 wires scope='app' only; the
 // enum carries 'org'/'account' for forward-compat (rejected in Go for now).
 // UpsertBudget writes one budget, keyed (scope, scope_id). SetBudget calls
-// it; a re-set updates limit/alert_percents/active in place (account_id is
+// it; a re-set updates limit/alert_percents/active/spend_window in place (account_id is
 // updated too so a lazy budget backfills its account on conversion). Returns
 // the row so the caller can echo the persisted (deduped+sorted) percents.
 func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) (MsBillingBudget, error) {
@@ -726,6 +762,7 @@ func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) (MsB
 		arg.Active,
 		arg.HardCap,
 		arg.AllowOverage,
+		arg.SpendWindow,
 	)
 	var i MsBillingBudget
 	err := row.Scan(
@@ -742,6 +779,7 @@ func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) (MsB
 		&i.TemplateKey,
 		&i.HardCap,
 		&i.AllowOverage,
+		&i.SpendWindow,
 	)
 	return i, err
 }

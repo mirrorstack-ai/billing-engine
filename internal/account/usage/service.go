@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -37,6 +38,9 @@ type BudgetEvaluator interface {
 	// EvaluateAccountBudget re-evaluates the account-scoped AI caps (and the
 	// owning org's) after an infra.ai.* event landed on an account.
 	EvaluateAccountBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error)
+	// EvaluateSandboxBudget re-evaluates the account's and the owning org's
+	// `sandbox` trial cap after a sandbox_trial event landed (migration 095).
+	EvaluateSandboxBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error)
 }
 
 // Service implements the RecordUsage / GetUsageSummary /
@@ -732,7 +736,21 @@ func (s *Service) SetMetricDefinitions(ctx context.Context, req SetMetricDefinit
 	if err := s.store.UpsertMetricDefinitions(ctx, defs); err != nil {
 		return nil, billing.Internal("upsert metric definitions failed", err)
 	}
-	return &SetMetricDefinitionsResponse{Synced: len(req.Metrics)}, nil
+	// billing-engine#121 publish-time diagnostic: name every declared metric
+	// with no price, so a forgotten ms.Price is visible at publish rather than
+	// as a silent 0 at the first rollup. Reported, never rejected.
+	unpriced := []string{}
+	for _, d := range defs {
+		if !d.Priced {
+			unpriced = append(unpriced, d.Metric)
+		}
+	}
+	slices.Sort(unpriced)
+	if len(unpriced) > 0 {
+		slog.WarnContext(ctx, "module declared metrics with no price: their usage bills 0",
+			"module_id", req.ModuleID, "unpriced_metrics", unpriced)
+	}
+	return &SetMetricDefinitionsResponse{Synced: len(req.Metrics), UnpricedMetrics: unpriced}, nil
 }
 
 // SetMetricVersionPrices syncs a version's immutable per-metric price

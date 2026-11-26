@@ -8,12 +8,14 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/intent/proposer"
 	"log/slog"
 	"math/big"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/billingperiod"
 	billingstripe "github.com/mirrorstack-ai/billing-engine/internal/shared/stripe"
@@ -25,8 +27,9 @@ import (
 // injectable for deterministic tests (RegisterApp windows "now" into the
 // account's current anchored period).
 type Service struct {
-	store  Store
-	stripe billingstripe.Client
+	store        Store
+	stripe       billingstripe.Client
+	platformOrgs platformfunded.Set // PORG; the zero set is empty
 	// proposer, when set, cuts a charge leg over to the intent path:
 	// the leg derives the same amount it always did, seals it, stores
 	// it, and STOPS. Something holding the write port decides whether
@@ -238,6 +241,14 @@ func (s *Service) CloseDemerit(ctx context.Context, accountID uuid.UUID, closeAt
 
 func (s *Service) WithNow(now func() time.Time) *Service {
 	s.nowFn = now
+	return s
+}
+
+// WithPlatformOrgs installs PORG (internal/account/platformfunded). The default
+// empty set changes nothing; a set only fills the "org has no resolved funding"
+// gap in RegisterApp and QuoteChange.
+func (s *Service) WithPlatformOrgs(set platformfunded.Set) *Service {
+	s.platformOrgs = set
 	return s
 }
 
@@ -561,13 +572,28 @@ func (s *Service) RollupPeriod(ctx context.Context, accountID uuid.UUID, periodS
 			num, den = infraMarkupNum, infraMarkupDen
 			// An infra event in the rollup MUST resolve a seeded cost (migration
 			// 017's sentinel metric_definitions rows). A custom metric with no
-			// catalog price legitimately prices to 0 (metered-but-unpriced); a
+			// catalog price prices to 0 with a warning (the else branch below); a
 			// RESERVED metric with no price means migration 017 is missing or was
 			// rolled back without re-seeding — the platform incurred the cloud cost
 			// but would bill 0 (a silent revenue leak that still marks the cycle
 			// invoiced). Fail loud instead so ops catches it, never zero-charge it.
 			if !priced {
 				return nil, billing.Internal("infra metric "+raw.Metric+" has no seeded price — migration 017 or 018 missing or rolled back", nil)
+			}
+		} else if !priced {
+			// billing-engine#121: a CUSTOM metric with no price anywhere still
+			// bills 0 — failing the whole cycle on one developer's missing price
+			// would hold every other line of this account hostage — but it is
+			// never silent. One warning and one summary entry per distinct
+			// (module, metric, module_version) per rollup; cmd/billing-cycle
+			// totals them into the run summary.
+			key := UnpricedMetric{ModuleID: raw.ModuleID, Metric: raw.Metric, ModuleVersion: raw.ModuleVersion}
+			if !slices.Contains(summary.UnpricedCustomMetrics, key) {
+				summary.UnpricedCustomMetrics = append(summary.UnpricedCustomMetrics, key)
+				slog.WarnContext(ctx, "unpriced custom metric billed 0: no version snapshot, per-model or catalog price resolved",
+					"account_id", accountID, "period_id", periodID, "module_id", raw.ModuleID,
+					"metric", raw.Metric, "module_version", raw.ModuleVersion,
+					"billable_quantity", raw.BillableQuantity)
 			}
 		}
 

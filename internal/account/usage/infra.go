@@ -36,6 +36,11 @@ func IsAdmittedTaskGPUModel(model string) bool {
 	return model == TaskGPUModelG5GXlarge
 }
 
+// orgAccountLookup resolves an org's own account without the funding gate (sandbox_trial ingest only).
+type orgAccountLookup interface {
+	OrgOwnAccount(context.Context, uuid.UUID) (uuid.UUID, bool, error)
+}
+
 // modelPriceLookup is required only for task GPU admission.
 type modelPriceLookup interface {
 	LookupModelPrice(context.Context, string, string) (ModelPrice, bool, error)
@@ -245,6 +250,11 @@ func platformInfraKind(metric string) (Kind, bool) {
 		// the required EC2 instance-type pricing dimension.
 		return KindSum, true
 
+	// --- Authoring-sandbox trial compute (migration 095): infra.task.* semantics
+	// on a separate pair of meters, accepted ONLY with source sandbox_trial.
+	case "infra.sandbox.vcpu.hours", "infra.sandbox.memory.gib_hours":
+		return KindSum, true
+
 	// --- SSR compute metering (migration 045, docs-temp/app-hosting/
 	// ssr-metering-design.md §1/§4). Producer: cmd/infra-ssr-compute-sync, a
 	// CloudWatch/Lambda puller mirroring cmd/infra-egress-sync's dual-transport,
@@ -355,6 +365,17 @@ type RecordInfraUsageRequest struct {
 	// 測試模組使用量 and is never billed.
 	DevServed bool `json:"dev_served,omitempty"`
 
+	// Source is one of KnownSources (migrations 095 and 096): platform-asserted,
+	// never an SDK hint. SourceSandboxTrial is the authoring sandbox's capped
+	// trial paid by MirrorStack: RECORDED and PRICED, stored dev_served so it is
+	// NEVER CHARGED, and counted only by the org's `sandbox` budget.
+	// SourcePlatformSidebar, SourceMember and SourceModule are ORDINARY usage:
+	// charged and budgeted exactly as the same event with no source.
+	Source string `json:"source,omitempty"`
+	// RunID is the author run a sandbox_trial event belongs to; required with
+	// SourceSandboxTrial and refused with any other source.
+	RunID string `json:"run_id,omitempty"`
+
 	// Value is the platform-MEASURED quantity (ms / bytes). Authoritative and
 	// non-zeroable — it comes from the platform's chokepoint, never an SDK hint.
 	//
@@ -434,6 +455,11 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		return nil, billing.InvalidInput("unknown platform-infra metric: " + req.Metric)
 	}
 
+	// The sandbox trial tag (migration 095): shape, family and run id.
+	if err := validateSandboxTag(req); err != nil {
+		return nil, err
+	}
+
 	// Model is migration 018's pricing dimension. Reject it outside the two
 	// dimensioned families: a stray model on, say,
 	// infra.compute.walltime.ms would persist as a non-NULL usage_events.model and then
@@ -505,6 +531,32 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		}
 	}
 
+	// A sandbox_trial event counts against its account's trial cap; one with no
+	// account would be invisible to every cap, so it is refused. The price is
+	// frozen on the event here, once. An ordinary source (platform_sidebar,
+	// member, module) takes none of this: it is the same event as one with no
+	// source.
+	var stampedPrice *int64
+	if req.Source == SourceSandboxTrial {
+		if lookup, ok := s.store.(orgAccountLookup); ok && accountID == uuid.Nil && req.OwnerOrgID != uuid.Nil {
+			id, found, err := lookup.OrgOwnAccount(ctx, req.OwnerOrgID)
+			if err != nil {
+				return nil, billing.Internal("org account lookup failed", err)
+			}
+			if found {
+				accountID = id
+			}
+		}
+		if accountID == uuid.Nil {
+			return nil, billing.InvalidInput("a sandbox_trial event needs an owner with a billing account")
+		}
+		price, err := s.stampSandboxUnitPrice(ctx, req.Metric, req.Model)
+		if err != nil {
+			return nil, err
+		}
+		stampedPrice = &price
+	}
+
 	recordedAt := req.RecordedAt
 	if recordedAt.IsZero() {
 		recordedAt = s.nowFn().UTC()
@@ -556,7 +608,13 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 		// The charging queries already exclude flagged rows, so this field is
 		// the whole of the change: the event is still recorded in full and now
 		// declines to be billed.
-		DevServed: req.DevServed,
+		//
+		// A sandbox_trial event is ALWAYS stored dev_served (migration 095): every
+		// charging filter already honours the flag.
+		DevServed:          req.DevServed || req.Source == SourceSandboxTrial,
+		Source:             req.Source,
+		RunID:              req.RunID,
+		StampedPriceMicros: stampedPrice,
 	}
 	event.PayloadFingerprint = observationFingerprint(event)
 	recorded, err := s.store.InsertUsageEvent(ctx, event)
@@ -600,7 +658,21 @@ func (s *Service) RecordInfraUsage(ctx context.Context, req RecordInfraUsageRequ
 	// the credit hook above: alerts are recorded, the ingest never fails.
 	// The window is the payer's anchored period (calendar month while lazy),
 	// the same one GetBudgetStatus reads.
-	if recorded && s.budget != nil && strings.HasPrefix(req.Metric, "infra.ai.") {
+	//
+	// A sandbox_trial event feeds ONLY the `sandbox` cap (the AI caps exclude
+	// dev_served rows).
+	if recorded && s.budget != nil && req.Source == SourceSandboxTrial {
+		anchorDay, anchorErr := s.store.AccountAnchorDay(ctx, accountID)
+		if anchorErr != nil {
+			slog.Error("anchor day lookup failed (sandbox budget hook uses the calendar month)", "account_id", accountID, "error", anchorErr)
+			anchorDay = billingperiod.DefaultAnchorDay
+		}
+		start, end := billingperiod.AnchoredPeriodWindow(recordedAt.UTC(), anchorDay)
+		if _, err := s.budget.EvaluateSandboxBudget(ctx, accountID, req.OwnerOrgID, start, end); err != nil {
+			slog.Error("sandbox budget evaluation failed (usage still recorded)",
+				"account_id", accountID, "run_id", req.RunID, "metric", req.Metric, "error", err)
+		}
+	} else if recorded && s.budget != nil && strings.HasPrefix(req.Metric, "infra.ai.") {
 		anchorDay := billingperiod.DefaultAnchorDay
 		if accountID != uuid.Nil {
 			if day, anchorErr := s.store.AccountAnchorDay(ctx, accountID); anchorErr != nil {

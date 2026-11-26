@@ -41,6 +41,14 @@
 // 2: the console operator agent, billed to the org of an org-context
 // conversation or to the personal account). CategoryAll stays 'app' only.
 //
+// WINDOW (migration 097): the span a budget measures its spend over. Window
+// period (the default, and every pre-097 row) is the scope's anchored billing
+// period; Window day is the UTC calendar day, so the spend, the exhausted
+// verdict and the alert marks restart at 00:00 UTC. Each row composes on its
+// OWN window: a template's day cap and the app's period cap are each measured
+// over their own span. The PaaS exposure pool is not a customer budget and
+// stays on the period.
+//
 // Money is BIGINT micro-dollars (1e-6 USD), never float — the spend SUM is
 // decoded through the same single-rounding-point helper the usage package
 // uses (usage.MicrosFromNumeric).
@@ -79,6 +87,11 @@ const (
 	// account (migration 085) so budget_alerts can record crossings of the
 	// risk-exposure pool. Never accepted from a caller.
 	CategoryExposure Category = "exposure"
+	// CategorySandbox is the org-wide authoring-sandbox TRIAL cap (migration 095):
+	// every source = sandbox_trial event (infra.sandbox.* compute and infra.ai.*
+	// tokens) at the unit price stamped on it at ingest. Org or account scope
+	// only. Those events are dev_served, so 'all' and 'ai' never see them.
+	CategorySandbox Category = "sandbox"
 )
 
 // normalizeCategory maps the wire value (empty = the pre-084 default) onto a
@@ -89,8 +102,43 @@ func normalizeCategory(c Category) (Category, bool) {
 		return CategoryAll, true
 	case CategoryAI:
 		return CategoryAI, true
+	case CategorySandbox:
+		return CategorySandbox, true
 	}
 	return "", false
+}
+
+// Window is the span a budget measures its spend over (migration 097).
+type Window string
+
+const (
+	// WindowPeriod is the scope's anchored billing period — the meaning of
+	// every budget before 097, and the default when a request omits it.
+	WindowPeriod Window = "period"
+	// WindowDay is the UTC calendar day [00:00 UTC, next 00:00 UTC).
+	WindowDay Window = "day"
+)
+
+// normalizeWindow maps the wire value (empty = the pre-097 default) onto a
+// known Window, or reports it unknown. The list is closed and exact: "Day" or
+// "daily" is refused, never guessed.
+func normalizeWindow(w Window) (Window, bool) {
+	switch w {
+	case "", WindowPeriod:
+		return WindowPeriod, true
+	case WindowDay:
+		return WindowDay, true
+	}
+	return "", false
+}
+
+// utcDayWindow is the UTC calendar day containing t: [00:00 UTC, next 00:00
+// UTC). t's own location is irrelevant — a day budget resets at 00:00 UTC
+// wherever the caller's clock is.
+func utcDayWindow(t time.Time) (time.Time, time.Time) {
+	u := t.UTC()
+	start := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+	return start, start.AddDate(0, 0, 1)
 }
 
 // SetBudgetRequest is the payload of the SetBudget RPC — a platform
@@ -122,6 +170,10 @@ type SetBudgetRequest struct {
 	// 2026-09-14, scenario 2): alerts still fire, Exhausted stays false. It
 	// never lifts the account's risk-graded exposure limit.
 	AllowOverage bool `json:"allow_overage,omitempty"`
+	// Window is the span the cap measures spend over: "period" (default when
+	// empty — every pre-097 caller) or "day" (the UTC calendar day). Like
+	// every other field a re-set replaces it: omitting it stores "period".
+	Window Window `json:"window,omitempty"`
 }
 
 // SetBudgetResponse echoes the persisted budget, including the deduped+sorted
@@ -134,6 +186,7 @@ type SetBudgetResponse struct {
 	Active        bool     `json:"active"`
 	HardCap       bool     `json:"hard_cap"`
 	AllowOverage  bool     `json:"allow_overage"`
+	Window        Window   `json:"window"`
 }
 
 // GetBudgetStatusRequest selects the budget whose live status to read. For
@@ -300,8 +353,11 @@ type GetBudgetStatusResponse struct {
 	DecidedBy   DecidedBy `json:"decided_by"`
 	TemplateKey string    `json:"template_key"`
 
-	// PeriodStart / PeriodEnd bound the spend window (current calendar month —
-	// the same window GetUsageSummary shows).
+	// Window is the reported row's span; PeriodStart / PeriodEnd bound the
+	// spend inside it: the scope's current anchored billing period for
+	// "period", the current UTC day for "day". SpendMicros, PercentUsed,
+	// Crossed and Exhausted all read the spend in [PeriodStart, PeriodEnd).
+	Window      Window    `json:"window,omitempty"`
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
 
@@ -335,9 +391,10 @@ type GetBudgetStatusResponse struct {
 	Pool *Pool `json:"pool,omitempty"`
 }
 
-// GetBudgetAlertsRequest selects the recorded crossings for a budget + period.
-// PeriodStart must be the first-of-month 00:00 UTC anchor (the evaluation
-// window start); zero means "the current period".
+// GetBudgetAlertsRequest selects the recorded crossings for a budget + window.
+// PeriodStart must be the start of the budget's window the evaluation recorded
+// under (the anchored period start, or 00:00 UTC of the day for a day budget);
+// zero means "the current window".
 type GetBudgetAlertsRequest struct {
 	Scope       Scope     `json:"scope"`
 	ScopeID     uuid.UUID `json:"scope_id"`
@@ -374,6 +431,17 @@ type Budget struct {
 	Active        bool
 	HardCap       bool
 	AllowOverage  bool
+	// Window is WindowPeriod or WindowDay; the zero value reads as period.
+	Window Window
+}
+
+// window is the row's span with the zero value read as WindowPeriod (a row
+// built in Go without one, like the system exposure row, is a period row).
+func (b Budget) window() Window {
+	if b.Window == WindowDay {
+		return WindowDay
+	}
+	return WindowPeriod
 }
 
 // templateKeyShape is the module's own template-key grammar (ai-assistant

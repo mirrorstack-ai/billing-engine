@@ -53,9 +53,12 @@ func resolveScope(scope Scope, category Category, templateKey string) (Category,
 	}
 	switch scope {
 	case ScopeApp:
+		if cat == CategorySandbox {
+			return "", billing.InvalidInput("the 'sandbox' budget is per org or account, never per app")
+		}
 	case ScopeOrg, ScopeAccount:
-		if cat != CategoryAI {
-			return "", billing.InvalidInput("budget scope " + string(scope) + " supports category 'ai' only")
+		if cat != CategoryAI && cat != CategorySandbox {
+			return "", billing.InvalidInput("budget scope " + string(scope) + " supports categories 'ai' and 'sandbox' only")
 		}
 	default:
 		return "", billing.InvalidInput("invalid budget scope: " + string(scope))
@@ -76,7 +79,8 @@ func resolveScope(scope Scope, category Category, templateKey string) (Category,
 // + each percent (1..100), then dedupes + sorts the thresholds before
 // persisting so a re-set is stable. CategoryAI rows may carry a template
 // key (an ai-assistant template's own cap), a hard cap and the customer's
-// overage opt-out (migration 084).
+// overage opt-out (migration 084). Any row may measure a UTC day instead of
+// the period (Window, migration 097); an omitted window stores "period".
 func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudgetResponse, error) {
 	cat, err := resolveScope(req.Scope, req.Category, req.TemplateKey)
 	if err != nil {
@@ -87,6 +91,10 @@ func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudg
 	}
 	if req.LimitMicros < 0 {
 		return nil, billing.InvalidInput("limit_micros must be non-negative")
+	}
+	window, ok := normalizeWindow(req.Window)
+	if !ok {
+		return nil, billing.InvalidInput("invalid budget window: " + string(req.Window) + " (want 'period' or 'day')")
 	}
 
 	percents := req.AlertPercents
@@ -109,6 +117,7 @@ func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudg
 		Active:        req.Active,
 		HardCap:       req.HardCap,
 		AllowOverage:  req.AllowOverage,
+		Window:        window,
 	})
 	if err != nil {
 		return nil, billing.Internal("upsert budget failed", err)
@@ -121,14 +130,17 @@ func (s *Service) SetBudget(ctx context.Context, req SetBudgetRequest) (*SetBudg
 		Active:        saved.Active,
 		HardCap:       saved.HardCap,
 		AllowOverage:  saved.AllowOverage,
+		Window:        saved.window(),
 	}, nil
 }
 
-// candidate is one budget row a status read consults, with its spend.
+// candidate is one budget row a status read consults, with its spend over its
+// own window [start, end).
 type candidate struct {
-	b         Budget
-	decidedBy DecidedBy
-	spend     int64
+	b          Budget
+	decidedBy  DecidedBy
+	spend      int64
+	start, end time.Time
 }
 
 // candidates lists the rows a status read COMPOSES, most specific first. For
@@ -139,8 +151,9 @@ type candidate struct {
 // let a caller escape both caps by naming the roomier template; composing
 // them keeps a more specific budget able to say LESS than the general one,
 // never more (94, review of billing-engine#221). Every other scope has one
-// row. Spend is read per row: the template's events for its row, the whole
-// app for the AI-wide row.
+// row. Spend is read per row over that row's own window: the template's
+// events for its row, the whole app for the AI-wide row; a day row the
+// current UTC day, a period row the [start, end) period passed in.
 func (s *Service) candidates(ctx context.Context, scope Scope, scopeID uuid.UUID, cat Category, templateKey string, start, end time.Time) ([]candidate, error) {
 	var out []candidate
 	add := func(tpl string, decidedBy DecidedBy) error {
@@ -148,11 +161,12 @@ func (s *Service) candidates(ctx context.Context, scope Scope, scopeID uuid.UUID
 		if err != nil || !found {
 			return err
 		}
-		spend, err := s.spendFor(ctx, b, start, end)
+		ws, we := s.span(b, start, end)
+		spend, err := s.spendFor(ctx, b, ws, we)
 		if err != nil {
 			return err
 		}
-		out = append(out, candidate{b: b, decidedBy: decidedBy, spend: spend})
+		out = append(out, candidate{b: b, decidedBy: decidedBy, spend: spend, start: ws, end: we})
 		return nil
 	}
 	if templateKey != "" {
@@ -228,6 +242,39 @@ func (s *Service) windowFor(ctx context.Context, scope Scope, scopeID uuid.UUID)
 	return start, end, nil
 }
 
+// span is the [start, end) a budget row measures its spend over: the period
+// window passed in (the scope's anchored period, derived by the caller), or —
+// for a day row — the UTC calendar day of the service clock, so the spend and
+// the verdict restart at 00:00 UTC.
+func (s *Service) span(b Budget, periodStart, periodEnd time.Time) (time.Time, time.Time) {
+	if b.window() == WindowDay {
+		return utcDayWindow(s.nowFn())
+	}
+	return periodStart, periodEnd
+}
+
+// spanSpend returns a reader of one spend figure per window, memoised across
+// the rows of ONE evaluation: two rows on the same window read the store once,
+// a day row and a period row each read their own. It returns the spend and the
+// window start the row's crossings are recorded under.
+func (s *Service) spanSpend(read func(start, end time.Time) (int64, error)) func(b Budget, periodStart, periodEnd time.Time) (int64, time.Time, error) {
+	type key struct{ start, end int64 }
+	memo := map[key]int64{}
+	return func(b Budget, periodStart, periodEnd time.Time) (int64, time.Time, error) {
+		start, end := s.span(b, periodStart, periodEnd)
+		k := key{start.UnixNano(), end.UnixNano()}
+		if v, ok := memo[k]; ok {
+			return v, start, nil
+		}
+		v, err := read(start, end)
+		if err != nil {
+			return 0, start, err
+		}
+		memo[k] = v
+		return v, start, nil
+	}
+}
+
 // spendFor sums the spend a budget row governs in [start, end).
 func (s *Service) spendFor(ctx context.Context, b Budget, start, end time.Time) (int64, error) {
 	if b.Scope == ScopeApp {
@@ -239,6 +286,9 @@ func (s *Service) spendFor(ctx context.Context, b Budget, start, end time.Time) 
 	}
 	if !found {
 		return 0, nil
+	}
+	if b.Category == CategorySandbox {
+		return s.store.AccountPeriodSandboxSpendMicros(ctx, acct, start, end)
 	}
 	return s.store.AccountPeriodAISpendMicros(ctx, acct, start, end)
 }
@@ -407,7 +457,9 @@ func exhausted(b Budget, spendMicros int64) bool {
 // spend has crossed, and — for a hard cap — whether the consumer must refuse
 // further work. No budget configured → Exists=false with a nil error (the
 // caller renders "no budget", not an error). An app's AI request with a
-// template resolves template row → AI-wide row (DecidedBy says which).
+// template resolves template row → AI-wide row (DecidedBy says which). Each
+// row is measured over its own window (a day row: the current UTC day); the
+// PaaS exposure pool always over the anchored period.
 func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusRequest) (*GetBudgetStatusResponse, error) {
 	cat, err := resolveScope(req.Scope, req.Category, req.TemplateKey)
 	if err != nil {
@@ -478,8 +530,9 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 		Category:        b.Category,
 		DecidedBy:       decidedBy,
 		TemplateKey:     b.TemplateKey,
-		PeriodStart:     start,
-		PeriodEnd:       end,
+		Window:          b.window(),
+		PeriodStart:     c.start,
+		PeriodEnd:       c.end,
 		LimitMicros:     b.LimitMicros,
 		SpendMicros:     spend,
 		PercentUsed:     percentUsed(spend, b.LimitMicros),
@@ -494,7 +547,8 @@ func (s *Service) GetBudgetStatus(ctx context.Context, req GetBudgetStatusReques
 }
 
 // GetBudgetAlerts returns the recorded threshold crossings for a scope's
-// budget in a period. PeriodStart zero defaults to the current period. No
+// budget in a window. PeriodStart zero defaults to the row's current window
+// (the anchored period, or today's 00:00 UTC for a day row). No
 // budget configured → an empty Alerts slice with a nil error. Reads exactly
 // the requested row (no template precedence: alerts belong to the row that
 // recorded them).
@@ -525,6 +579,8 @@ func (s *Service) GetBudgetAlerts(ctx context.Context, req GetBudgetAlertsReques
 		if err != nil {
 			return nil, billing.Internal("anchor day lookup failed", err)
 		}
+		// A day row records its crossings under the day's start.
+		periodStart, _ = s.span(b, periodStart, time.Time{})
 	} else {
 		periodStart = periodStart.UTC()
 	}
@@ -537,7 +593,7 @@ func (s *Service) GetBudgetAlerts(ctx context.Context, req GetBudgetAlertsReques
 }
 
 // EvaluateAppBudget is the ingest-path hook (design §5 / §10). After a usage
-// event is inserted, it recomputes the app's current-period spend for every
+// event is inserted, it recomputes the app's spend over each row's window for every
 // budget row the event can move — the app's 'all' row, its AI-wide row, and
 // (for an infra.ai.* event stamped with a template) that template's row —
 // and records any newly-crossed threshold in budget_alerts (idempotent per
@@ -552,7 +608,8 @@ func (s *Service) GetBudgetAlerts(ctx context.Context, req GetBudgetAlertsReques
 // store wraps the inserts in one transaction).
 //
 // periodStart/periodEnd are passed in so evaluation uses the EXACT window the
-// caller already derived for the event.
+// caller already derived for the event; a day row reads (and records under)
+// the current UTC day instead.
 func (s *Service) EvaluateAppBudget(ctx context.Context, appID uuid.UUID, templateKey string, periodStart, periodEnd time.Time) ([]int, error) {
 	rows := []struct {
 		cat Category
@@ -573,11 +630,12 @@ func (s *Service) EvaluateAppBudget(ctx context.Context, appID uuid.UUID, templa
 		if !found || !b.Active {
 			continue
 		}
-		spend, err := s.store.AppPeriodSpendMicros(ctx, appID, r.cat, r.tpl, periodStart, periodEnd)
+		start, end := s.span(b, periodStart, periodEnd)
+		spend, err := s.store.AppPeriodSpendMicros(ctx, appID, r.cat, r.tpl, start, end)
 		if err != nil {
 			return fired, err
 		}
-		got, err := s.recordCrossings(ctx, b, spend, periodStart)
+		got, err := s.recordCrossings(ctx, b, spend, start)
 		if err != nil {
 			return fired, err
 		}
@@ -589,7 +647,7 @@ func (s *Service) EvaluateAppBudget(ctx context.Context, appID uuid.UUID, templa
 // EvaluateAccountBudget is EvaluateAppBudget's twin for the account-scoped
 // AI caps (scenario 2): after an infra.ai.* event landed on an account, the
 // account's own 'ai' row and, if the account is an org's, the org's 'ai' row
-// are re-evaluated. Same best-effort contract.
+// are re-evaluated, each over its own window. Same best-effort contract.
 func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error) {
 	var fired []int
 	targets := []struct {
@@ -626,10 +684,9 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 			fired = append(fired, got...)
 		}
 	}
-	var (
-		spend    int64
-		spendSet bool
-	)
+	spendIn := s.spanSpend(func(start, end time.Time) (int64, error) {
+		return s.store.AccountPeriodAISpendMicros(ctx, accountID, start, end)
+	})
 	for _, t := range targets {
 		b, found, err := s.store.GetBudget(ctx, t.scope, t.id, CategoryAI, "")
 		if err != nil {
@@ -638,14 +695,47 @@ func (s *Service) EvaluateAccountBudget(ctx context.Context, accountID, ownerOrg
 		if !found || !b.Active {
 			continue
 		}
-		if !spendSet {
-			spend, err = s.store.AccountPeriodAISpendMicros(ctx, accountID, periodStart, periodEnd)
-			if err != nil {
-				return fired, err
-			}
-			spendSet = true
+		spend, start, err := spendIn(b, periodStart, periodEnd)
+		if err != nil {
+			return fired, err
 		}
-		got, err := s.recordCrossings(ctx, b, spend, periodStart)
+		got, err := s.recordCrossings(ctx, b, spend, start)
+		if err != nil {
+			return fired, err
+		}
+		fired = append(fired, got...)
+	}
+	return fired, nil
+}
+
+// EvaluateSandboxBudget is EvaluateAccountBudget's twin for the `sandbox` trial
+// cap (migration 095): after a sandbox_trial event landed on an account, the
+// account's 'sandbox' row and its org's row record any newly crossed threshold.
+// Best-effort like its twin; the cap itself is enforced by GetBudgetStatus.
+func (s *Service) EvaluateSandboxBudget(ctx context.Context, accountID, ownerOrgID uuid.UUID, periodStart, periodEnd time.Time) ([]int, error) {
+	var fired []int
+	spendIn := s.spanSpend(func(start, end time.Time) (int64, error) {
+		return s.store.AccountPeriodSandboxSpendMicros(ctx, accountID, start, end)
+	})
+	for _, t := range []struct {
+		scope Scope
+		id    uuid.UUID
+	}{{ScopeAccount, accountID}, {ScopeOrg, ownerOrgID}} {
+		if t.id == uuid.Nil {
+			continue
+		}
+		b, found, err := s.store.GetBudget(ctx, t.scope, t.id, CategorySandbox, "")
+		if err != nil {
+			return fired, err
+		}
+		if !found || !b.Active {
+			continue
+		}
+		spend, start, err := spendIn(b, periodStart, periodEnd)
+		if err != nil {
+			return fired, err
+		}
+		got, err := s.recordCrossings(ctx, b, spend, start)
 		if err != nil {
 			return fired, err
 		}

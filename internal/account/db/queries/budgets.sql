@@ -7,14 +7,14 @@
 -- enum carries 'org'/'account' for forward-compat (rejected in Go for now).
 
 -- UpsertBudget writes one budget, keyed (scope, scope_id). SetBudget calls
--- it; a re-set updates limit/alert_percents/active in place (account_id is
+-- it; a re-set updates limit/alert_percents/active/spend_window in place (account_id is
 -- updated too so a lazy budget backfills its account on conversion). Returns
 -- the row so the caller can echo the persisted (deduped+sorted) percents.
 -- name: UpsertBudget :one
 INSERT INTO ms_billing.budgets (
-    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage
+    scope, scope_id, category, template_key, account_id, limit_micros, alert_percents, active, hard_cap, allow_overage, spend_window
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 )
 ON CONFLICT (scope, scope_id, category, template_key)
 DO UPDATE SET
@@ -23,7 +23,8 @@ DO UPDATE SET
     alert_percents = EXCLUDED.alert_percents,
     active         = EXCLUDED.active,
     hard_cap       = EXCLUDED.hard_cap,
-    allow_overage  = EXCLUDED.allow_overage
+    allow_overage  = EXCLUDED.allow_overage,
+    spend_window   = EXCLUDED.spend_window
 RETURNING *;
 
 -- GetBudget resolves the budget for a (scope, scope_id), or no row when none
@@ -167,6 +168,21 @@ LEFT JOIN ms_billing.metric_model_prices mp
     ON mp.metric = e.metric AND mp.model = e.model AND e.model <> ''
 LEFT JOIN ms_billing.metric_definitions md
     ON md.module_id = e.module_id AND md.metric = e.metric;
+
+-- AccountPeriodSandboxSpendMicros is the spend the `sandbox` budget category
+-- measures (migration 095): one account's source = sandbox_trial events (compute
+-- and model tokens together) in [start, end), each at the unit price STAMPED on
+-- it at ingest, so a later price edit cannot move the cap. Raw cost basis, like
+-- the ai queries above (the markup is applied at rollup): what MirrorStack really
+-- pays. Untagged events are not counted, and the account filter keeps one org's
+-- cap blind to another's events.
+-- name: AccountPeriodSandboxSpendMicros :one
+SELECT COALESCE(SUM(value * stamped_price_micros), 0)::numeric AS total_raw_cost_micros
+FROM ms_billing.usage_events
+WHERE account_id = $1
+  AND source = 'sandbox_trial'
+  AND COALESCE(billable_at, recorded_at) >= $2
+  AND COALESCE(billable_at, recorded_at) <  $3;
 
 -- BudgetOrgAccountID resolves an org-scoped budget to the org's own billing
 -- account (the account whose events the console agent bills in an org-context

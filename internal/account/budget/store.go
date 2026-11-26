@@ -19,9 +19,9 @@ import (
 // every method maps to a specific RPC / hook need — so tests satisfy it with
 // a small in-memory fake (see service_test.go).
 type Store interface {
-	// UpsertBudget writes one budget keyed (scope, scope_id, category); a
-	// re-set updates limit/alert_percents/active/hard_cap/account_id in
-	// place. Returns the persisted row.
+	// UpsertBudget writes one budget keyed (scope, scope_id, category,
+	// template_key); a re-set updates limit/alert_percents/active/hard_cap/
+	// allow_overage/spend_window/account_id in place. Returns the persisted row.
 	UpsertBudget(ctx context.Context, b Budget) (Budget, error)
 
 	// GetBudget resolves the budget for a (scope, scope_id, category,
@@ -40,6 +40,11 @@ type Store interface {
 	// AccountPeriodAISpendMicros is the account-level AI spend (scenario 2:
 	// the console agent billed to a personal or org account).
 	AccountPeriodAISpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
+
+	// AccountPeriodSandboxSpendMicros is the `sandbox` trial cap's spend: the
+	// account's source=sandbox_trial events at their STAMPED unit price
+	// (migration 095), compute and model tokens together.
+	AccountPeriodSandboxSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error)
 
 	// OrgAccountID resolves an org to its own billing account; found=false
 	// for a lazy org with no account yet (its AI spend is 0).
@@ -127,6 +132,7 @@ func (s *pgxStore) UpsertBudget(ctx context.Context, b Budget) (Budget, error) {
 		Active:        b.Active,
 		HardCap:       b.HardCap,
 		AllowOverage:  b.AllowOverage,
+		SpendWindow:   string(b.window()),
 	})
 	if err != nil {
 		return Budget{}, err
@@ -184,6 +190,18 @@ func (s *pgxStore) AppPeriodSpendMicros(ctx context.Context, appID uuid.UUID, ca
 
 func (s *pgxStore) AccountPeriodAISpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
 	n, err := s.q.AccountPeriodAISpendMicros(ctx, db.AccountPeriodAISpendMicrosParams{
+		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
+		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
+		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return usage.MicrosFromNumeric(n)
+}
+
+func (s *pgxStore) AccountPeriodSandboxSpendMicros(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (int64, error) {
+	n, err := s.q.AccountPeriodSandboxSpendMicros(ctx, db.AccountPeriodSandboxSpendMicrosParams{
 		AccountID:    pgtype.UUID{Bytes: accountID, Valid: true},
 		BillableAt:   pgtype.Timestamptz{Time: periodStart, Valid: true},
 		BillableAt_2: pgtype.Timestamptz{Time: periodEnd, Valid: true},
@@ -388,6 +406,7 @@ func budgetFromRow(row db.MsBillingBudget) (Budget, error) {
 		Active:        row.Active,
 		HardCap:       row.HardCap,
 		AllowOverage:  row.AllowOverage,
+		Window:        Window(row.SpendWindow),
 	}, nil
 }
 

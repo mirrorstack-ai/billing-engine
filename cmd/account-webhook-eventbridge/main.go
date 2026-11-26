@@ -43,6 +43,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditledger"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditpurchase"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/creditrecovery"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/webhook"
@@ -121,6 +122,7 @@ func buildRouter() *webhook.Router {
 
 	standingStore := billing.NewStore(pool)
 	status := billing.NewService(standingStore, nil, "").
+		WithPlatformOrgs(platformfunded.FromProcessEnv()).
 		WithCreditWallet(walletEnabled).
 		WithCreditAccess(creditAccess)
 
