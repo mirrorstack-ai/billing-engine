@@ -19,7 +19,29 @@
 // If any gate fails, the account is BLOCKED. The four gates map one-for-one to
 // the four Signals fields; see Evaluate for the exact boolean logic and the
 // grace edges (a brand-new account with no charge yet is graced, not blocked).
+//
+// UNPAID-BILL GRACE (billing-engine#329, Terms: "14 days' notice by email before
+// we limit or suspend paid features"). Gates 2, 3 and 4 are the unpaid-bill
+// blocks. When Signals.GraceEnabled is set and ONLY those gates fail, the
+// account is not blocked until 14 days after the notice email left
+// (UnpaidNoticeSentAt + UnpaidNoticeDays); with no notice sent yet it is not
+// blocked at all (fail toward service). Gate 1 (no usable card) and the wallet
+// gate (applied by the billing service after Evaluate) never get a grace. The
+// grace is pure like everything else here: the caller passes Now and the notice
+// time (read from ms_billing.unpaid_episodes); with GraceEnabled false Evaluate
+// is exactly the four-gate rule above. The flag is the UNPAID_GRACE env var,
+// read by the billing service.
 package eligibility
+
+import "time"
+
+// UnpaidNoticeDays is the notice period the Terms promise before an unpaid-bill
+// block takes effect. Exported so other overdue policies (e.g. bank-transfer
+// statements, billing-engine#268) share one number.
+const UnpaidNoticeDays = 14
+
+// UnpaidNoticePeriod is UnpaidNoticeDays as a duration.
+const UnpaidNoticePeriod = UnpaidNoticeDays * 24 * time.Hour
 
 // MaxFailedChargeStreak is the consecutive failed-charge count at which services
 // are blocked. The spec is "< 2 failed" (2 excluded), so a streak of 0 or 1
@@ -76,6 +98,16 @@ type Signals struct {
 	// amount_due > 0) invoices on the account's mirror. Gate 4 blocks at
 	// >= MaxUnpaidInvoices.
 	UnpaidInvoiceCount int
+
+	// GraceEnabled turns the unpaid-bill grace on (flag UNPAID_GRACE). False
+	// leaves Evaluate byte-for-byte the four-gate rule; Now and
+	// UnpaidNoticeSentAt are then ignored.
+	GraceEnabled bool
+	// Now is the caller's clock. This package never reads one.
+	Now time.Time
+	// UnpaidNoticeSentAt is when the 14-day unpaid notice was sent for the
+	// account's open unpaid episode; nil when no notice has gone out.
+	UnpaidNoticeSentAt *time.Time
 }
 
 // Reason is a stable, machine-readable code for a Verdict — the primary block
@@ -101,6 +133,10 @@ const (
 	// Keeping it out of Evaluate preserves those gates' semantics byte-for-byte
 	// for accounts that do not use the credit wallet.
 	ReasonOutOfCredits Reason = "OUT_OF_CREDITS"
+	// ReasonGrace: only unpaid-bill gates (2-4) fail and the 14-day notice
+	// period has not run out (or no notice has been sent): NOT blocked. Reasons
+	// still lists the failing gates.
+	ReasonGrace Reason = "GRACE"
 )
 
 // Verdict is the gate's decision. Blocked is the single field a caller must read
@@ -111,6 +147,9 @@ type Verdict struct {
 	Blocked bool
 	Reason  Reason
 	Reasons []Reason
+	// GraceEndsAt is when the unpaid-bill grace ends and the block starts; set
+	// only for a ReasonGrace verdict whose notice has been sent.
+	GraceEndsAt *time.Time
 }
 
 // Evaluate applies the four gates in a fixed priority order and returns the
@@ -152,5 +191,23 @@ func Evaluate(s Signals) Verdict {
 	if len(reasons) == 0 {
 		return Verdict{Blocked: false, Reason: ReasonEligible}
 	}
+	if s.GraceEnabled && !hasReason(reasons, ReasonNoUsableCard) {
+		// Every failing gate is an unpaid-bill gate (2-4).
+		if s.UnpaidNoticeSentAt == nil {
+			return Verdict{Blocked: false, Reason: ReasonGrace, Reasons: reasons}
+		}
+		if end := s.UnpaidNoticeSentAt.Add(UnpaidNoticePeriod); s.Now.Before(end) {
+			return Verdict{Blocked: false, Reason: ReasonGrace, Reasons: reasons, GraceEndsAt: &end}
+		}
+	}
 	return Verdict{Blocked: true, Reason: reasons[0], Reasons: reasons}
+}
+
+func hasReason(reasons []Reason, r Reason) bool {
+	for _, x := range reasons {
+		if x == r {
+			return true
+		}
+	}
+	return false
 }

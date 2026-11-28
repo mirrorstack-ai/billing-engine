@@ -25,7 +25,9 @@ const (
 	// (open/uncollectible) invoice. The delinquency is DERIVED from the
 	// invoices mirror (reconciled by the invoice.* webhooks), not a stored
 	// flag. This wires the SIGNAL only — the enforcement POLICY
-	// (grace/suspend/prepaid, risk-graded collection) is PR #9.
+	// (grace/suspend/prepaid, risk-graded collection) is PR #9. The unpaid-bill
+	// service-block grace (14-day notice, flag UNPAID_GRACE) lives in
+	// internal/account/eligibility and GetServiceStatus, not here.
 	RequireNotDelinquent Capability = "not_delinquent"
 )
 
@@ -261,6 +263,10 @@ type GetServiceStatusResponse struct {
 	Reason      string   `json:"reason"`
 	Reasons     []string `json:"reasons,omitempty"`
 	BlockReason string   `json:"block_reason,omitempty"`
+	// GraceEndsAt (RFC3339) is when the 14-day unpaid-bill grace ends and the
+	// block starts. Additive: set only with reason "GRACE" after the notice was
+	// sent, and only behind the UNPAID_GRACE flag (default off).
+	GraceEndsAt string `json:"grace_ends_at,omitempty"`
 }
 
 // BillingMode is the universal-wallet policy stored on a billing account.

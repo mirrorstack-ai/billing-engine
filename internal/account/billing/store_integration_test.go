@@ -455,3 +455,70 @@ func TestPgxStore_CreditStandingProjectsLatestAutoTopUpOutcome(t *testing.T) {
 	require.NotNil(t, standing.AutoTopUp.PendingUntil)
 	require.True(t, pendingAt.Add(10*time.Minute).Equal(*standing.AutoTopUp.PendingUntil))
 }
+
+// TestPgxStore_UnpaidEpisodes pins migration 093 (billing-engine#329): one open
+// episode per account, a closed one can be followed by a new open one, notice is
+// stamped once, and ON DELETE CASCADE follows the account.
+func TestPgxStore_UnpaidEpisodes(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := billing.NewStore(pool)
+	ctx := context.Background()
+	acct := seedAccount(t, pool, "cus_episode_1")
+	other := seedAccount(t, pool, "cus_episode_2")
+	t0 := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+
+	_, found, err := store.OpenUnpaidEpisode(ctx, acct)
+	require.NoError(t, err)
+	require.False(t, found)
+
+	first, err := store.OpenUnpaidEpisodeIfNone(ctx, acct, t0)
+	require.NoError(t, err)
+	again, err := store.OpenUnpaidEpisodeIfNone(ctx, acct, t0.Add(time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, first.ID, again.ID, "idempotent: a second open returns the same episode")
+	require.True(t, first.StartedAt.Equal(t0))
+	require.Nil(t, first.NoticeSentAt)
+
+	// The partial unique index itself refuses a second open row.
+	_, err = pool.Exec(ctx, `INSERT INTO ms_billing.unpaid_episodes (account_id, started_at) VALUES ($1, now())`, acct)
+	require.Error(t, err, "one open episode per account")
+	// Another account is independent.
+	_, err = store.OpenUnpaidEpisodeIfNone(ctx, other, t0)
+	require.NoError(t, err)
+
+	changed, err := store.SetUnpaidEpisodeNotice(ctx, acct, t0.Add(2*time.Hour))
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, err = store.SetUnpaidEpisodeNotice(ctx, acct, t0.Add(3*time.Hour))
+	require.NoError(t, err)
+	require.False(t, changed, "notice is stamped once")
+	got, found, err := store.OpenUnpaidEpisode(ctx, acct)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotNil(t, got.NoticeSentAt)
+	require.True(t, got.NoticeSentAt.Equal(t0.Add(2*time.Hour)))
+
+	changed, err = store.CloseUnpaidEpisode(ctx, acct, t0.Add(4*time.Hour))
+	require.NoError(t, err)
+	require.True(t, changed)
+	_, found, err = store.OpenUnpaidEpisode(ctx, acct)
+	require.NoError(t, err)
+	require.False(t, found, "closed episodes are not open")
+	changed, err = store.CloseUnpaidEpisode(ctx, acct, t0.Add(5*time.Hour))
+	require.NoError(t, err)
+	require.False(t, changed)
+
+	next, err := store.OpenUnpaidEpisodeIfNone(ctx, acct, t0.Add(24*time.Hour))
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, next.ID, "a closed episode is followed by a new open one")
+	require.Nil(t, next.NoticeSentAt)
+
+	var n int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM ms_billing.unpaid_episodes WHERE account_id = $1`, acct).Scan(&n))
+	require.Equal(t, 2, n)
+
+	_, err = pool.Exec(ctx, `DELETE FROM ms_billing.accounts WHERE id = $1`, acct)
+	require.NoError(t, err)
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM ms_billing.unpaid_episodes WHERE account_id = $1`, acct).Scan(&n))
+	require.Zero(t, n, "ON DELETE CASCADE follows the account")
+}

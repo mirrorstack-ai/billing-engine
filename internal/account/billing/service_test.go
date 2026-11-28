@@ -105,11 +105,16 @@ type fakeStore struct {
 	errSetSetupIntent       error
 	errGetAddCardRequest    error
 	errUnpaidCount          error
-	errListUnpaid           error
-	errInvoiceForPayment    error
-	errHasUsableDefPM       error
-	errAccountStripeCust    error
-	errSyncInvoiceMirror    error
+	// unpaidEpisodes: the open episode per account (billing-engine#329);
+	// episodeReads counts OpenUnpaidEpisode calls.
+	unpaidEpisodes       map[uuid.UUID]billing.UnpaidEpisode
+	errEpisode           error
+	episodeReads         int
+	errListUnpaid        error
+	errInvoiceForPayment error
+	errHasUsableDefPM    error
+	errAccountStripeCust error
+	errSyncInvoiceMirror error
 }
 
 // fakePayTarget models one invoices-mirror row for InvoiceForPayment: the
@@ -408,6 +413,7 @@ func newFakeStore() *fakeStore {
 		fundingOf:                  map[uuid.UUID]uuid.UUID{},
 		orgPMTargets:               map[uuid.UUID]pmTarget{},
 		unpaidCount:                map[uuid.UUID]int{},
+		unpaidEpisodes:             map[uuid.UUID]billing.UnpaidEpisode{},
 		unpaidInvoices:             map[uuid.UUID][]billing.UnpaidInvoiceRow{},
 		payTargets:                 map[uuid.UUID]fakePayTarget{},
 		hasUsableDefPM:             map[uuid.UUID]bool{},
@@ -629,6 +635,40 @@ func (s *fakeStore) UnpaidInvoiceCount(_ context.Context, accountID uuid.UUID) (
 		return 0, s.errUnpaidCount
 	}
 	return s.unpaidCount[accountID], nil
+}
+
+func (s *fakeStore) OpenUnpaidEpisode(_ context.Context, accountID uuid.UUID) (billing.UnpaidEpisode, bool, error) {
+	s.episodeReads++
+	if s.errEpisode != nil {
+		return billing.UnpaidEpisode{}, false, s.errEpisode
+	}
+	e, ok := s.unpaidEpisodes[accountID]
+	return e, ok, nil
+}
+
+func (s *fakeStore) OpenUnpaidEpisodeIfNone(_ context.Context, accountID uuid.UUID, at time.Time) (billing.UnpaidEpisode, error) {
+	if e, ok := s.unpaidEpisodes[accountID]; ok {
+		return e, nil
+	}
+	e := billing.UnpaidEpisode{ID: uuid.New(), AccountID: accountID, StartedAt: at}
+	s.unpaidEpisodes[accountID] = e
+	return e, nil
+}
+
+func (s *fakeStore) SetUnpaidEpisodeNotice(_ context.Context, accountID uuid.UUID, at time.Time) (bool, error) {
+	e, ok := s.unpaidEpisodes[accountID]
+	if !ok || e.NoticeSentAt != nil {
+		return false, nil
+	}
+	e.NoticeSentAt = &at
+	s.unpaidEpisodes[accountID] = e
+	return true, nil
+}
+
+func (s *fakeStore) CloseUnpaidEpisode(_ context.Context, accountID uuid.UUID, _ time.Time) (bool, error) {
+	_, ok := s.unpaidEpisodes[accountID]
+	delete(s.unpaidEpisodes, accountID)
+	return ok, nil
 }
 
 func (s *fakeStore) ListUnpaidInvoices(_ context.Context, accountID uuid.UUID) ([]billing.UnpaidInvoiceRow, error) {
