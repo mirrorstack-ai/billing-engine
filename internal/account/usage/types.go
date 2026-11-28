@@ -771,6 +771,13 @@ type GetAccountBillResponse struct {
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
 
+	// HasBillingAccount states whether the owner has an ms_billing.accounts row
+	// at all — the one wire signal for billing-account existence (#92). Every
+	// other field degrades to a zero bill when the row is absent, so a client
+	// cannot tell "no billing account" from "an account with nothing billed"
+	// without it. Always emitted (false for a lazy owner, never omitted).
+	HasBillingAccount bool `json:"has_billing_account"`
+
 	// Plan is the v1 plan stub (see AccountPlan — billing-engine consts, the
 	// single source of truth replacing api-platform's hardcode).
 	Plan AccountPlan `json:"plan"`
