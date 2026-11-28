@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -81,7 +84,122 @@ func TestPrefixSizes_SumsPerModuleAcrossPages(t *testing.T) {
 	require.Equal(t, 2, lister.calls, "pagination must be followed, not truncated")
 	require.EqualValues(t, 123, sizes[prefixKey{app: appA, module: modA}])
 	require.EqualValues(t, 7, sizes[prefixKey{app: appA, module: modB}])
-	require.Equal(t, 2, skipped, "the platform-owned and malformed keys are skipped, not attributed")
+	require.Equal(t, 1, skipped.SkippedNotModule, "artifacts/junk is outside the module layout")
+	require.Equal(t, 1, skipped.SkippedMalformed, "apps/bad/x/y has the module shape and an id that is not a uuid")
+	require.Equal(t, "apps/bad/x/y", skipped.FirstMalformed)
+}
+
+func TestPrefixSizes_SplitsSkipsByWhatTheyMean(t *testing.T) {
+	// 🔴 billing-engine#226: one "skipped" read 13 on every healthy prod run, so
+	// a real malformed key could never show. Each key runs ALONE so a swapped
+	// classification fails both rows, not cancels out in a mixed total. Fixed
+	// ids keep the subtest names stable for -run.
+	app := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	mod := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	for _, tc := range []struct {
+		key       string
+		malformed bool
+	}{
+		// Routine: never an alarm, on a healthy bucket forever.
+		{"apps/" + app.String() + "/uploads/cover/n1/01J.jpg", false}, // app branding (prod today)
+		{"apps/" + app.String() + "/uploads/icon/01J.png", false},
+		{"apps/" + app.String() + "/" + mod.String() + "/", false}, // bare folder marker, not an object
+		{"apps/" + app.String() + "/icon.png", false},              // app-level, not module-shaped
+		{"apps/", false},
+		// Alarm: shaped like a module object, not metered.
+		{"apps/" + app.String() + "/not-a-uuid/x", true},
+		{"apps/not-a-uuid/" + mod.String() + "/x", true},
+		{"apps/" + app.String() + "/" + mod.String()[:35] + "/x", true}, // truncated module id
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			lister := &fakeLister{pages: [][]s3types.Object{{obj(tc.key, 42)}}}
+			sizes, skipped, err := prefixSizes(context.Background(), lister, "bucket")
+			require.NoError(t, err)
+			require.Empty(t, sizes, "classification must never meter a rejected key")
+			if tc.malformed {
+				require.Equal(t, skipTally{SkippedMalformed: 1, FirstMalformed: tc.key}, skipped)
+			} else {
+				require.Equal(t, skipTally{SkippedNotModule: 1}, skipped)
+			}
+		})
+	}
+}
+
+func TestPrefixSizes_EveryKeyLandsInExactlyOneBucket(t *testing.T) {
+	// Reporting changed, metering did not: metered + not_module + malformed is
+	// every listed key, once — nothing double-counted, nothing dropped.
+	app, mod := uuid.New(), uuid.New()
+	good := "apps/" + app.String() + "/" + mod.String() + "/"
+	lister := &fakeLister{pages: [][]s3types.Object{
+		{obj(good+"a.mp4", 10), obj("apps/"+app.String()+"/uploads/icon/x.png", 3), obj("apps/"+app.String()+"/nope/x", 5)},
+		{obj(good+"b.mp4", 20), obj("apps/"+app.String()+"/uploads/cover/y.jpg", 4)},
+	}}
+	sizes, skipped, err := prefixSizes(context.Background(), lister, "bucket")
+	require.NoError(t, err)
+	require.Equal(t, map[prefixKey]int64{{app: app, module: mod}: 30}, sizes)
+	require.Equal(t, 5, 2+skipped.SkippedNotModule+skipped.SkippedMalformed)
+	require.Equal(t, skipTally{SkippedNotModule: 2, SkippedMalformed: 1, FirstMalformed: "apps/" + app.String() + "/nope/x"}, skipped)
+}
+
+// captureWarnings swaps the default logger for the test and returns the WARN
+// records syncStorage emitted.
+func captureWarnings(t *testing.T) func() []map[string]any {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return func() []map[string]any {
+		var warns []map[string]any
+		for _, line := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
+			var rec map[string]any
+			require.NoError(t, json.Unmarshal(line, &rec))
+			if rec["level"] == "WARN" {
+				warns = append(warns, rec)
+			}
+		}
+		return warns
+	}
+}
+
+func TestSyncStorage_WarnsTheFirstMalformedKeyOncePerRun(t *testing.T) {
+	app := uuid.New()
+	first := "apps/" + app.String() + "/not-a-uuid/a"
+	lister := &fakeLister{pages: [][]s3types.Object{
+		{obj("apps/"+app.String()+"/uploads/icon/x.png", 1), obj(first, 1), obj("apps/"+app.String()+"/not-a-uuid/b", 1)},
+		{obj("apps/zzz/"+uuid.NewString()+"/c", 1)},
+	}}
+	warnings := captureWarnings(t)
+
+	// No key parses, so no prefix is recorded and the service is never reached.
+	res := syncStorage(context.Background(), nil, lister, "bucket", time.Now())
+
+	require.False(t, res.Failed)
+	require.Equal(t, 3, res.SkippedMalformed)
+	require.Equal(t, 1, res.SkippedNotModule)
+	warns := warnings()
+	require.Len(t, warns, 1, "one WARN per run, however many malformed keys and pages")
+	require.Equal(t, first, warns[0]["first_key"], "the WARN carries the first offending key")
+	require.EqualValues(t, 3, warns[0]["skipped_malformed"])
+}
+
+func TestSyncStorage_AHealthyBucketDoesNotWarn(t *testing.T) {
+	// Today's prod shape: only app branding is skipped. That must stay silent,
+	// or the WARN becomes the next signal that reads the same fine or broken.
+	app := uuid.New()
+	lister := &fakeLister{pages: [][]s3types.Object{{
+		obj("apps/"+app.String()+"/uploads/cover/n1/x.jpg", 1),
+		obj("apps/"+app.String()+"/uploads/icon/y.png", 1),
+	}}}
+	warnings := captureWarnings(t)
+
+	res := syncStorage(context.Background(), nil, lister, "bucket", time.Now())
+
+	require.Equal(t, skipTally{SkippedNotModule: 2}, res.skipTally)
+	require.Empty(t, warnings())
 }
 
 func TestPrefixSizes_ListingErrorIsReturnedNotSwallowed(t *testing.T) {

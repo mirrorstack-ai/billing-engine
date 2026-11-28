@@ -252,7 +252,8 @@ func handler(svc *usage.Service, lister objectLister, bucket string) func(contex
 func logResult(ctx context.Context, msg string, res syncResult) {
 	slog.InfoContext(ctx, msg,
 		"samples", res.Samples, "prefixes", res.Prefixes, "recorded", res.Recorded,
-		"deduped", res.Deduped, "skipped", res.Skipped, "row_errors", res.RowErrors,
+		"deduped", res.Deduped, "skipped_not_module", res.SkippedNotModule,
+		"skipped_malformed", res.SkippedMalformed, "row_errors", res.RowErrors,
 		"failed", res.Failed)
 }
 

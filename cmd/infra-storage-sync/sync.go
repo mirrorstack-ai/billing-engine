@@ -28,10 +28,63 @@ type syncResult struct {
 	Prefixes  int // distinct (app, module) prefixes found
 	Recorded  int // events newly inserted
 	Deduped   int // events that hit ON CONFLICT (already recorded)
-	Skipped   int // keys skipped: not a module prefix, or unparseable ids
 	RowErrors int // per-row RecordInfraUsage errors (logged, non-fatal)
 	Failed    bool
 	Err       error
+	skipTally
+}
+
+// skipTally splits the keys prefixSizes did not meter by what that MEANS.
+//
+// 🔴 ONE COUNTER COULD NOT TELL FINE FROM BROKEN (billing-engine#226). App
+// branding under apps/<app>/uploads/ is skipped on every run and grows with the
+// number of apps, so a single "skipped" never read zero on a healthy bucket and
+// a real malformed key hid inside it. NotModule is routine and never alarms;
+// Malformed is an object shaped like a module's runtime object that is not
+// metered — customer bytes nobody is billed for — so any value above zero is
+// the alarm, and FirstMalformed is the one example that makes it actionable.
+type skipTally struct {
+	SkippedNotModule int
+	SkippedMalformed int
+	FirstMalformed   string
+}
+
+// platformAppNamespaces are the second segments under apps/<app_id>/ that the
+// PLATFORM writes, never a module: api-platform's upload service keys app
+// branding as "<ownerPrefix>/uploads/<asset>/<file>" (internal/shared/upload).
+// A new platform-owned namespace that is not listed here reports as malformed
+// until it is — loud by design, never silently billed.
+var platformAppNamespaces = map[string]bool{"uploads": true}
+
+// skippedIsMalformed classifies a key parseModulePrefix REJECTED. It never
+// changes what is metered — only which counter a rejection lands in.
+//
+// Malformed means the key has the module-object SHAPE — apps/<seg>/<seg>/<rest>,
+// all three non-empty — under a segment the platform does not own, and still
+// failed to parse: one of the two ids that must be UUIDs is not. Anything with
+// fewer segments (apps/, an app-level object, a bare apps/<a>/<m>/ folder
+// marker) or under a platform namespace is not a module object at all.
+func skippedIsMalformed(key string) bool {
+	rest, ok := strings.CutPrefix(key, modulePrefixRoot)
+	if !ok {
+		return false
+	}
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return false
+	}
+	return !platformAppNamespaces[parts[1]]
+}
+
+func (t *skipTally) skip(key string) {
+	if !skippedIsMalformed(key) {
+		t.SkippedNotModule++
+		return
+	}
+	if t.SkippedMalformed == 0 {
+		t.FirstMalformed = key
+	}
+	t.SkippedMalformed++
 }
 
 // prefixKey identifies one module's storage root.
@@ -86,9 +139,9 @@ func parseModulePrefix(key string) (prefixKey, bool) {
 // This is the ONLY part that changes when the bucket outgrows a full listing:
 // an S3 Inventory manifest produces the same map from a daily Parquet file, and
 // nothing downstream of here can tell the difference.
-func prefixSizes(ctx context.Context, lister objectLister, bucket string) (map[prefixKey]int64, int, error) {
+func prefixSizes(ctx context.Context, lister objectLister, bucket string) (map[prefixKey]int64, skipTally, error) {
 	sizes := map[prefixKey]int64{}
-	skipped := 0
+	var skipped skipTally
 	var token *string
 	for {
 		out, err := lister.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -101,12 +154,12 @@ func prefixSizes(ctx context.Context, lister objectLister, bucket string) (map[p
 		}
 		for _, obj := range out.Contents {
 			if obj.Key == nil {
-				skipped++
+				skipped.SkippedNotModule++
 				continue
 			}
 			pk, ok := parseModulePrefix(*obj.Key)
 			if !ok {
-				skipped++
+				skipped.skip(*obj.Key)
 				continue
 			}
 			if obj.Size != nil {
@@ -144,7 +197,13 @@ func syncStorage(ctx context.Context, svc *usage.Service, lister objectLister, b
 	res := syncResult{}
 
 	sizes, skipped, err := prefixSizes(ctx, lister, bucket)
-	res.Skipped = skipped
+	res.skipTally = skipped
+	// Once per run, whatever the count: the key is the actionable part.
+	if skipped.SkippedMalformed > 0 {
+		slog.WarnContext(ctx, "infra-storage-sync: module-shaped object not metered",
+			"bucket", bucket, "first_key", skipped.FirstMalformed,
+			"skipped_malformed", skipped.SkippedMalformed)
+	}
 	if err != nil {
 		res.Failed, res.Err = true, err
 		slog.ErrorContext(ctx, "infra-storage-sync: listing failed", "bucket", bucket, "error", err)
@@ -218,4 +277,3 @@ func isStaleReplayConflict(err error, instant, newest time.Time) bool {
 	}
 	return instant.Before(newest)
 }
-
