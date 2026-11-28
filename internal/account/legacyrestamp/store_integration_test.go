@@ -58,6 +58,11 @@ func TestSourceIntegration_AllOwnersKeysetSchema047AndSessionMutex(t *testing.T)
 	// Rehearse the exact schema-047 state. The restamp source must still work
 	// after every 048/049 object is gone because its SQL names accounts owner
 	// columns only.
+	//
+	// 094 added ms_billing.rev_credits_deferred, a view over credit_ledger, so
+	// dropping credit_ledger now requires rolling that view back first — the
+	// same ordering a real migration-down run would require.
+	applyDownMigration(t, pool, "094_cross_rail_revenue_views.down.sql")
 	applyDownMigration(t, pool, "049_credit_auto_topup_attempts.down.sql")
 	applyDownMigration(t, pool, "048_credit_wallet.down.sql")
 	var (
