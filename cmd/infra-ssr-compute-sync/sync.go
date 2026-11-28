@@ -8,6 +8,7 @@ import (
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/infrasync"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/awslambdainv"
 )
@@ -22,15 +23,13 @@ const (
 	ssrRequestCountMetric = "infra.compute.ssr.request.count"
 )
 
-// ssrLookbackHours mirrors infra-egress-sync's lookbackHours contract: each
-// run sweeps the last N CLOSED hour windows (after the propagationLag
-// margin), so a missed/late run catches up and the deterministic event_id
-// makes the overlap a no-op.
-//
-// SAFE SCHEDULE INTERVAL: same constraint as egress — the EventBridge
-// schedule MUST be <= ssrLookbackHours-1 hours (hourly, per the design doc's
-// CDK snippet), kept in sync with the IaC.
-const ssrLookbackHours = 3
+// watermarkSource is this puller's row in ms_billing.infra_sync_watermarks and
+// the Source dimension of its WatermarkLagSeconds metric (billing-engine#225).
+// Each run sweeps from the watermark — at most seven days back, always the
+// newest three sweepable hours, capped per run — instead of a fixed 3-hour
+// lookback that lost every window of a longer outage (the 2026-09-13 403s had
+// to be backfilled by hand).
+const watermarkSource = "ssr-compute"
 
 // lambdaLister is the AWS Lambda inventory surface the sync job depends on.
 // awslambdainv.Client satisfies this; tests use a fake.
@@ -57,6 +56,28 @@ type ssrSyncResult struct {
 	RowErrors   int  // per-row RecordInfraUsage errors (logged, non-fatal)
 	Failed      bool // ListFunctions (enumeration) failed — no inventory, nothing else can proceed
 	Err         error
+	// Confirmed holds the start of every window the run fully recorded: the
+	// inventory answered, no batch failed, every function's metrics were
+	// Complete, and no row of that window errored. A batch error or a
+	// not-ready function spans the whole queried range, so it confirms
+	// nothing — the watermark stays and the next run asks again.
+	Confirmed map[time.Time]bool
+}
+
+// runSSR sweeps the windows the watermark plans for `at` (closed hours aged
+// past propagationLag) and advances the watermark over the ones the sweep
+// confirmed.
+func runSSR(ctx context.Context, svc *usage.Service, lister lambdaLister, querier metricsQuerier, idle idleChecker, tracker infrasync.Tracker, at time.Time) ssrSyncResult {
+	var res ssrSyncResult
+	tracker.Run(ctx, sweepableEnd(at, propagationLag), func(planned []infrasync.Window) func(infrasync.Window) bool {
+		windows := make([]hourWindow, len(planned))
+		for i, w := range planned {
+			windows[i] = hourWindow{start: w.Start, end: w.End}
+		}
+		res = syncSSR(ctx, svc, lister, querier, idle, windows)
+		return func(w infrasync.Window) bool { return res.Confirmed[w.Start] }
+	})
+	return res
 }
 
 // allWindowsConfirmedIdle reports whether EVERY window in this run's batch
@@ -96,9 +117,9 @@ func allWindowsConfirmedIdle(ctx context.Context, idle idleChecker, fn awslambda
 }
 
 // syncSSR enumerates the ms-apphost-* Lambda fleet, pre-filters confirmed-
-// idle functions, batches the rest into GetMetricData calls across the
-// lookback's closed hour windows, and records BOTH SSR compute metrics per
-// (function, window) via RecordInfraUsage with a deterministic event_id.
+// idle functions, batches the rest into GetMetricData calls across the given
+// closed hour windows, and records BOTH SSR compute metrics per (function,
+// window) via RecordInfraUsage with a deterministic event_id.
 //
 // Enumeration failure is FATAL (no inventory, nothing else can run — mirrors
 // egress's CF-query-error policy). A single batch's GetMetricData error is
@@ -106,8 +127,8 @@ func allWindowsConfirmedIdle(ctx context.Context, idle idleChecker, fn awslambda
 // (design doc §8 MEDIUM "fatal-whole-run doesn't scale with inventory" — the
 // fix egress's smaller usage-bounded row set didn't need). A per-row
 // RecordInfraUsage error is logged + counted, never aborts the batch.
-func syncSSR(ctx context.Context, svc *usage.Service, lister lambdaLister, querier metricsQuerier, idle idleChecker, at time.Time) ssrSyncResult {
-	var res ssrSyncResult
+func syncSSR(ctx context.Context, svc *usage.Service, lister lambdaLister, querier metricsQuerier, idle idleChecker, windows []hourWindow) ssrSyncResult {
+	res := ssrSyncResult{Confirmed: map[time.Time]bool{}}
 
 	fns, err := lister.ListSSRFunctions(ctx)
 	if err != nil {
@@ -118,9 +139,11 @@ func syncSSR(ctx context.Context, svc *usage.Service, lister lambdaLister, queri
 	}
 	res.Functions = len(fns)
 
-	windows := closedHourWindowsWithLag(at, ssrLookbackHours, propagationLag)
 	res.Windows = len(windows)
+	failedWindows := map[time.Time]bool{}
 	if len(fns) == 0 || len(windows) == 0 {
+		// An empty fleet has nothing to record: every window is confirmed.
+		confirmWindows(&res, windows, failedWindows)
 		return res
 	}
 
@@ -149,11 +172,30 @@ func syncSSR(ctx context.Context, svc *usage.Service, lister lambdaLister, queri
 		}
 
 		for _, row := range rows {
+			before := res.RowErrors
 			recordSSRWindow(ctx, svc, row, &res)
+			if res.RowErrors != before {
+				failedWindows[row.WindowStart] = true
+			}
 		}
 	}
 
+	confirmWindows(&res, windows, failedWindows)
 	return res
+}
+
+// confirmWindows marks every window confirmed unless the run hit a batch error
+// or a not-ready function (both span the whole queried range) or a row of that
+// window failed to record.
+func confirmWindows(res *ssrSyncResult, windows []hourWindow, failedWindows map[time.Time]bool) {
+	if res.BatchErrors > 0 || res.NotReady > 0 {
+		return
+	}
+	for _, w := range windows {
+		if !failedWindows[w.start] {
+			res.Confirmed[w.start] = true
+		}
+	}
 }
 
 // recordSSRWindow prices one (function, window) usage row into the two SSR

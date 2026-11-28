@@ -10,6 +10,7 @@ import (
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/google/uuid"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/infrasync"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/awslambdainv"
 )
@@ -221,7 +222,7 @@ func TestSyncSSR_RecordsBothMetricsPerFunctionWindow(t *testing.T) {
 	store := newFakeStore()
 	lister := &fakeLister{fns: []awslambdainv.SSRFunction{fn}}
 
-	windows := closedHourWindowsWithLag(at, ssrLookbackHours, propagationLag)
+	windows := closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag)
 	ts := windows[0].start
 	querier := &fakeQuerier{resultsByCall: map[int][]cwtypes.MetricDataResult{
 		0: {
@@ -233,7 +234,7 @@ func TestSyncSSR_RecordsBothMetricsPerFunctionWindow(t *testing.T) {
 	}}
 	idle := &fakeIdle{idle: map[string]bool{}}
 
-	res := syncSSR(context.Background(), newSvc(store), lister, querier, idle, at)
+	res := syncSSR(context.Background(), newSvc(store), lister, querier, idle, closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag))
 	if res.Failed {
 		t.Fatalf("res.Failed = true, err=%v", res.Err)
 	}
@@ -269,7 +270,7 @@ func TestSyncSSR_IdlePrefilterSkipsConfirmedIdleFunctions(t *testing.T) {
 	activeFn := testFn("ms-apphost-active", 512)
 	lister := &fakeLister{fns: []awslambdainv.SSRFunction{idleFn, activeFn}}
 
-	windows := closedHourWindowsWithLag(at, ssrLookbackHours, propagationLag)
+	windows := closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag)
 	// A function is only pre-filtered out when EVERY window's own
 	// immediately-preceding hour is confirmed idle — not just window[0]'s.
 	// window[1]'s preceding hour is window[0] itself, window[2]'s is
@@ -290,7 +291,7 @@ func TestSyncSSR_IdlePrefilterSkipsConfirmedIdleFunctions(t *testing.T) {
 		},
 	}}
 
-	res := syncSSR(context.Background(), newSvc(newFakeStore()), lister, querier, idle, at)
+	res := syncSSR(context.Background(), newSvc(newFakeStore()), lister, querier, idle, closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag))
 	if res.SkippedIdle != 1 {
 		t.Errorf("SkippedIdle = %d, want 1", res.SkippedIdle)
 	}
@@ -329,7 +330,7 @@ func TestSyncSSR_IdleThenResumeAcrossRuns(t *testing.T) {
 	// in exactly that earliest window and stays active through the rest of
 	// the batch. ---
 	run1At := at
-	windows1 := closedHourWindowsWithLag(run1At, ssrLookbackHours, propagationLag)
+	windows1 := closedHourWindowsWithLag(run1At, infrasync.RecentWindows, propagationLag)
 	longIdleHour := windows1[0].start.Add(-time.Hour)
 	priorEventID := ssrEventID(ssrRequestCountMetric, fn.AppID, fn.Env, longIdleHour)
 	if _, err := store.InsertUsageEvent(context.Background(), usage.UsageEvent{
@@ -351,7 +352,7 @@ func TestSyncSSR_IdleThenResumeAcrossRuns(t *testing.T) {
 		},
 	}}
 
-	res1 := syncSSR(context.Background(), newSvc(store), lister, querier1, idle, run1At)
+	res1 := syncSSR(context.Background(), newSvc(store), lister, querier1, idle, closedHourWindowsWithLag(run1At, infrasync.RecentWindows, propagationLag))
 	if res1.SkippedIdle != 0 {
 		t.Fatalf("run1 SkippedIdle = %d, want 0 — the function must NOT be skipped: window[1]/window[2]'s own preceding hours (window[0]/window[1]) have no recorded history yet, so they cannot be confirmed idle", res1.SkippedIdle)
 	}
@@ -373,7 +374,7 @@ func TestSyncSSR_IdleThenResumeAcrossRuns(t *testing.T) {
 	// data is still intact (nothing about run 2 should retroactively lose
 	// it). ---
 	run2At := run1At.Add(time.Hour)
-	windows2 := closedHourWindowsWithLag(run2At, ssrLookbackHours, propagationLag)
+	windows2 := closedHourWindowsWithLag(run2At, infrasync.RecentWindows, propagationLag)
 	if windows2[0].start != windows1[1].start {
 		t.Fatalf("test setup assumption broken: windows2[0]=%v, want windows1[1]=%v", windows2[0].start, windows1[1].start)
 	}
@@ -389,7 +390,7 @@ func TestSyncSSR_IdleThenResumeAcrossRuns(t *testing.T) {
 		},
 	}}
 
-	res2 := syncSSR(context.Background(), newSvc(store), lister, querier2, idle, run2At)
+	res2 := syncSSR(context.Background(), newSvc(store), lister, querier2, idle, closedHourWindowsWithLag(run2At, infrasync.RecentWindows, propagationLag))
 	if res2.SkippedIdle != 0 {
 		t.Fatalf("run2 SkippedIdle = %d, want 0 — the function is genuinely active", res2.SkippedIdle)
 	}
@@ -423,7 +424,7 @@ func TestSyncSSR_BatchErrorIsolatesRemainingBatches(t *testing.T) {
 	}
 	lister := &fakeLister{fns: fns}
 
-	windows := closedHourWindowsWithLag(at, ssrLookbackHours, propagationLag)
+	windows := closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag)
 	ts := windows[0].start
 	querier := &fakeQuerier{
 		errByCall: map[int]error{0: errors.New("throttled")},
@@ -436,7 +437,7 @@ func TestSyncSSR_BatchErrorIsolatesRemainingBatches(t *testing.T) {
 	}
 	idle := &fakeIdle{idle: map[string]bool{}}
 
-	res := syncSSR(context.Background(), newSvc(newFakeStore()), lister, querier, idle, at)
+	res := syncSSR(context.Background(), newSvc(newFakeStore()), lister, querier, idle, closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag))
 	if res.Failed {
 		t.Fatalf("res.Failed = true — a single batch error must NOT fail the whole run")
 	}
@@ -456,7 +457,7 @@ func TestSyncSSR_EnumerationFailureIsFatal(t *testing.T) {
 	querier := &fakeQuerier{}
 	idle := &fakeIdle{}
 
-	res := syncSSR(context.Background(), newSvc(newFakeStore()), lister, querier, idle, at)
+	res := syncSSR(context.Background(), newSvc(newFakeStore()), lister, querier, idle, closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag))
 	if !res.Failed {
 		t.Error("res.Failed = false, want true when ListSSRFunctions errors")
 	}
@@ -468,7 +469,7 @@ func TestSyncSSR_EnumerationFailureIsFatal(t *testing.T) {
 func TestSyncSSR_RowErrorIsNonFatalAndCounted(t *testing.T) {
 	fn := testFn("ms-apphost-x", 512)
 	store := newFakeStore()
-	windows := closedHourWindowsWithLag(at, ssrLookbackHours, propagationLag)
+	windows := closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag)
 	ts := windows[0].start
 	store.insertErr = errors.New("transient db error")
 	store.failEventID = ssrEventID(ssrGBSecondsMetric, fn.AppID, fn.Env, ts)
@@ -482,7 +483,7 @@ func TestSyncSSR_RowErrorIsNonFatalAndCounted(t *testing.T) {
 	}}
 	idle := &fakeIdle{idle: map[string]bool{}}
 
-	res := syncSSR(context.Background(), newSvc(store), lister, querier, idle, at)
+	res := syncSSR(context.Background(), newSvc(store), lister, querier, idle, closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag))
 	if res.Failed {
 		t.Fatalf("res.Failed = true, want false (a row error is never fatal)")
 	}
@@ -544,5 +545,76 @@ func TestClosedHourWindowsWithLag_IncludesWindowOnceLagElapses(t *testing.T) {
 	wantLastStart := time.Date(2026, 7, 12, 11, 0, 0, 0, time.UTC)
 	if !last.start.Equal(wantLastStart) {
 		t.Errorf("last window start = %v, want %v", last.start, wantLastStart)
+	}
+}
+
+// closedHourWindowsWithLag is the pre-#225 fixed sweep, kept as a fixture: the
+// last `count` closed hour buckets ending at sweepableEnd(at, lag).
+func closedHourWindowsWithLag(at time.Time, count int, lag time.Duration) []hourWindow {
+	end := sweepableEnd(at, lag)
+	windows := make([]hourWindow, 0, count)
+	for i := count; i >= 1; i-- {
+		start := end.Add(time.Duration(-i) * time.Hour)
+		windows = append(windows, hourWindow{start: start, end: start.Add(time.Hour)})
+	}
+	return windows
+}
+
+// billing-engine#225: a run whose GetMetricData batch failed confirms nothing,
+// so the watermark holds; the next healthy run sweeps from it — including a
+// window the old fixed 3-hour lookback would already have dropped.
+func TestRunSSR_BatchFailureHoldsTheWatermarkUntilAHealthyRun(t *testing.T) {
+	fn := testFn("ms-apphost-x", 512)
+	lister := &fakeLister{fns: []awslambdainv.SSRFunction{fn}}
+	idle := &fakeIdle{idle: map[string]bool{}}
+	end := sweepableEnd(at, propagationLag)
+	from := end.Add(-5 * time.Hour)
+
+	wm := infrasync.NewMemoryStore()
+	wm.Set(watermarkSource, from)
+	tracker := infrasync.Tracker{Store: wm, Source: watermarkSource}
+	store := newFakeStore()
+
+	failing := &fakeQuerier{errByCall: map[int]error{0: errors.New("AccessDenied")}}
+	res := runSSR(context.Background(), newSvc(store), lister, failing, idle, tracker, at)
+	if res.BatchErrors != 1 || len(res.Confirmed) != 0 {
+		t.Fatalf("BatchErrors = %d, Confirmed = %v; want 1 and none", res.BatchErrors, res.Confirmed)
+	}
+	if got, _ := wm.Watermark(context.Background(), watermarkSource); !got.Equal(from) {
+		t.Fatalf("watermark = %v after a failed batch, want it held at %v", got, from)
+	}
+
+	healthy := &fakeQuerier{resultsByCall: map[int][]cwtypes.MetricDataResult{
+		0: {
+			{Id: aws.String("d0"), StatusCode: cwtypes.StatusCodeComplete, Timestamps: []time.Time{from}, Values: []float64{1000}},
+			{Id: aws.String("i0"), StatusCode: cwtypes.StatusCodeComplete, Timestamps: []time.Time{from}, Values: []float64{1000}},
+		},
+	}}
+	res = runSSR(context.Background(), newSvc(store), lister, healthy, idle, tracker, at)
+	if res.Windows != 5 {
+		t.Fatalf("Windows = %d, want 5 (from the watermark, not the newest 3)", res.Windows)
+	}
+	if _, ok := store.events[ssrEventID(ssrRequestCountMetric, fn.AppID, fn.Env, from)]; !ok {
+		t.Fatalf("window %v (outside a fixed 3-hour lookback) was not recorded", from)
+	}
+	if got, _ := wm.Watermark(context.Background(), watermarkSource); !got.Equal(end) {
+		t.Fatalf("watermark = %v after a healthy run, want %v", got, end)
+	}
+}
+
+// A function whose metrics are not Complete spans the whole queried range, so
+// the run confirms no window.
+func TestSyncSSR_NotReadyConfirmsNothing(t *testing.T) {
+	fn := testFn("ms-apphost-x", 512)
+	querier := &fakeQuerier{resultsByCall: map[int][]cwtypes.MetricDataResult{
+		0: {
+			{Id: aws.String("d0"), StatusCode: cwtypes.StatusCodePartialData},
+			{Id: aws.String("i0"), StatusCode: cwtypes.StatusCodeComplete},
+		},
+	}}
+	res := syncSSR(context.Background(), newSvc(newFakeStore()), &fakeLister{fns: []awslambdainv.SSRFunction{fn}},
+		querier, &fakeIdle{idle: map[string]bool{}}, closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag))
+	if res.NotReady != 1 || len(res.Confirmed) != 0 {
+		t.Fatalf("NotReady = %d, Confirmed = %v; want 1 and none", res.NotReady, res.Confirmed)
 	}
 }

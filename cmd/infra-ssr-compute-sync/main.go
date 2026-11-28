@@ -8,7 +8,9 @@
 // all. This binary closes that gap by PULLING usage back out of AWS itself:
 // it enumerates the ms-apphost-* fleet via lambda:ListFunctions, queries
 // cloudwatch:GetMetricData for each function's Duration/Invocations sums over
-// the last few FULLY-CLOSED hour windows, and for each (app, env, window)
+// the FULLY-CLOSED hour windows its durable watermark plans (billing-engine#225:
+// from the last window confirmed recorded, at most seven days back, always the
+// newest three — internal/account/infrasync), and for each (app, env, window)
 // calls billing-engine's RecordInfraUsage. Direction is billing-engine → AWS
 // (an outbound pull, read-only) — mirrors cmd/infra-egress-sync's
 // Cloudflare-pull shape exactly, substituting AWS CloudWatch/Lambda for
@@ -58,6 +60,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/infrasync"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
@@ -67,16 +70,16 @@ import (
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-	svc, lister, querier, idle := buildDeps()
+	svc, lister, querier, idle, tracker := buildDeps()
 
 	if config.IsLambda() {
-		lambda.Start(handler(svc, lister, querier, idle))
+		lambda.Start(handler(svc, lister, querier, idle, tracker))
 		return
 	}
 
-	// Local one-shot run: sweep the closed windows ending at the current
-	// hour (minus the propagation-lag margin), then exit.
-	res := syncSSR(context.Background(), svc, lister, querier, idle, time.Now().UTC())
+	// Local one-shot run: sweep from the watermark to the current hour (minus
+	// the propagation-lag margin), then exit.
+	res := runSSR(context.Background(), svc, lister, querier, idle, tracker, time.Now().UTC())
 	logResult(context.Background(), "infra-ssr-compute-sync local run complete", res)
 	if res.Failed {
 		os.Exit(1)
@@ -86,7 +89,7 @@ func main() {
 // buildDeps wires the pgxpool-backed usage.Service, the AWS Lambda/CloudWatch
 // client (internal/shared/awslambdainv), and the idle-prefilter's direct
 // pgxpool lookup, from config/the ambient AWS SDK credential chain.
-func buildDeps() (*usage.Service, lambdaLister, metricsQuerier, idleChecker) {
+func buildDeps() (*usage.Service, lambdaLister, metricsQuerier, idleChecker, infrasync.Tracker) {
 	pool := config.MustPgxPool()
 	candidate := rollout.FromEnv(rollout.ComponentWorker, true)
 	schemaReady := false
@@ -182,19 +185,24 @@ func buildDeps() (*usage.Service, lambdaLister, metricsQuerier, idleChecker) {
 	}
 	client := awslambdainv.NewClient(awsCfg)
 
-	return svc, client, client, newPgxIdleChecker(pool)
+	tracker := infrasync.Tracker{
+		Store:   infrasync.NewPgStore(pool),
+		Source:  watermarkSource,
+		Metrics: os.Stdout,
+	}
+	return svc, client, client, newPgxIdleChecker(pool), tracker
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation.
 // The CloudWatchEvent carries no window (the scheduler fires on a cron), so
-// the handler derives the closed-hour lookback from the event time.
-func handler(svc *usage.Service, lister lambdaLister, querier metricsQuerier, idle idleChecker) func(context.Context, events.CloudWatchEvent) error {
+// the handler sweeps from the watermark up to the event time's sweepable end.
+func handler(svc *usage.Service, lister lambdaLister, querier metricsQuerier, idle idleChecker, tracker infrasync.Tracker) func(context.Context, events.CloudWatchEvent) error {
 	return func(ctx context.Context, ev events.CloudWatchEvent) error {
 		at := ev.Time
 		if at.IsZero() {
 			at = time.Now().UTC()
 		}
-		res := syncSSR(ctx, svc, lister, querier, idle, at.UTC())
+		res := runSSR(ctx, svc, lister, querier, idle, tracker, at.UTC())
 		logResult(ctx, "infra-ssr-compute-sync lambda run complete", res)
 		// Enumeration failure fails the run (surfaces for EventBridge
 		// retry/alerting); per-row errors are logged + counted but never abort
@@ -208,9 +216,9 @@ func handler(svc *usage.Service, lister lambdaLister, querier metricsQuerier, id
 		// DOES leave that batch's windows unrecorded this run. Returning a
 		// retryable error here — even though res.Failed is false — lets
 		// EventBridge Scheduler's own retry policy (short in-hour backoff)
-		// give the failed batch more chances before its data ages out of the
-		// lookback window, rather than waiting a full hour for the next
-		// scheduled run. Safe to retry the whole invocation: every recorded
+		// give the failed batch more chances in-hour rather than waiting a full
+		// hour for the next scheduled run (the watermark keeps the window
+		// either way; this only shortens the lag). Safe to retry the whole invocation: every recorded
 		// event is idempotent (ON CONFLICT DO NOTHING on the deterministic
 		// event_id), so redundantly reprocessing already-succeeded batches on
 		// retry is a no-op cost, not a correctness risk.

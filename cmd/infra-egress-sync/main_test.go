@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/infrasync"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/cloudflare"
 )
@@ -219,7 +220,7 @@ func TestSyncEgress_AggregatesRowsIntoRecordInfraUsage(t *testing.T) {
 	}}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.False(t, res.Failed)
 	require.Equal(t, 2, res.Recorded)
 	require.Equal(t, 2, len(store.events))
@@ -253,13 +254,13 @@ func TestSyncEgress_DeterministicEventIDIsIdempotent(t *testing.T) {
 	store := newFakeStore()
 	svc := newSvc(store)
 
-	first := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, at)
+	first := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, closedHourWindows(at, infrasync.RecentWindows))
 	require.Equal(t, 1, first.Recorded)
 	require.Equal(t, 0, first.Deduped)
 
 	// Re-run the SAME window: deterministic event_id → ON CONFLICT dedupes,
 	// nothing double-recorded.
-	second := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, at)
+	second := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, closedHourWindows(at, infrasync.RecentWindows))
 	require.Equal(t, 0, second.Recorded)
 	require.Equal(t, 1, second.Deduped)
 	require.Equal(t, 1, len(store.events), "re-run must not double-write")
@@ -282,10 +283,11 @@ func TestEgressEventID_StableAndDistinct(t *testing.T) {
 
 func TestSyncEgress_OnlyClosedWindowsQueried(t *testing.T) {
 	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{}}
-	syncEgress(context.Background(), newSvc(newFakeStore()), cf, at)
+	runEgress(context.Background(), newSvc(newFakeStore()), cf,
+		infrasync.Tracker{Store: infrasync.NewMemoryStore(), Source: watermarkSource}, at)
 
 	require.Equal(t, egressDataset, cf.dataset)
-	require.Len(t, cf.queried, lookbackHours)
+	require.Len(t, cf.queried, infrasync.RecentWindows)
 	// The current partial hour [12:00, 13:00) must NEVER be queried — every
 	// queried window ends at or before the top of the trigger hour.
 	currentHourStart := at.Truncate(time.Hour) // 12:00
@@ -313,7 +315,7 @@ func TestSyncEgress_SkipsUnparseableAppID(t *testing.T) {
 	}}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.False(t, res.Failed)
 	require.Equal(t, 3, res.Skipped)
 	require.Equal(t, 1, res.Recorded)
@@ -335,7 +337,7 @@ func TestSyncEgress_RowErrorIsNonFatal(t *testing.T) {
 	store.insertErr = errors.New("transient db error")
 	store.failEventID = egressEventID(cdnEgressMetric, bad, mod, win)
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	// A per-row RecordInfraUsage error is logged + counted but never aborts the
 	// sweep — the run is NOT marked Failed and the good row still records.
 	require.False(t, res.Failed)
@@ -350,7 +352,7 @@ func TestSyncEgress_CFQueryErrorFailsCleanly(t *testing.T) {
 	cf := &fakeCF{err: wantErr}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.True(t, res.Failed)
 	require.ErrorIs(t, res.Err, wantErr)
 	// Abort on the FIRST window's error — no partial double-write.
@@ -370,7 +372,7 @@ func TestSyncEgress_SSRRowRecordsUnderNewMetricInGiB(t *testing.T) {
 	}}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.False(t, res.Failed)
 	require.Equal(t, 1, res.Recorded)
 	require.Equal(t, 1, len(store.events))
@@ -403,7 +405,7 @@ func TestSyncEgress_StaticFileRowsRecordUnderTheCDNKeyInGiB(t *testing.T) {
 	}}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.False(t, res.Failed)
 	require.Equal(t, 3, res.Recorded)
 	require.Equal(t, 3, len(store.events))
@@ -443,7 +445,7 @@ func TestSyncEgress_SSRAndStaticEventIDsNeverCollide(t *testing.T) {
 	store := newFakeStore()
 	svc := newSvc(store)
 
-	first := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, at)
+	first := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, closedHourWindows(at, infrasync.RecentWindows))
 	require.Equal(t, 2, first.Recorded)
 	require.Equal(t, 0, first.Deduped)
 	require.Equal(t, 2, len(store.events), "the static and ssr rows must record as TWO distinct events")
@@ -456,7 +458,7 @@ func TestSyncEgress_SSRAndStaticEventIDsNeverCollide(t *testing.T) {
 
 	// Re-run the SAME window: both dedupe via ON CONFLICT, neither
 	// double-records, and no cross-metric collision is introduced.
-	second := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, at)
+	second := syncEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, closedHourWindows(at, infrasync.RecentWindows))
 	require.Equal(t, 0, second.Recorded)
 	require.Equal(t, 2, second.Deduped)
 	require.Equal(t, 2, len(store.events), "re-run must not double-write either metric")
@@ -498,7 +500,7 @@ func TestSyncEgress_RequestPassFoldsTiersPerAppAndBillsPer1k(t *testing.T) {
 	}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.False(t, res.Failed)
 	require.Equal(t, 6, res.RequestRows)
 	require.Equal(t, 3, res.RequestSkipped, "dev, pre-#58 and unattributable rows")
@@ -516,7 +518,7 @@ func TestSyncEgress_RequestPassFoldsTiersPerAppAndBillsPer1k(t *testing.T) {
 	require.InDelta(t, 0.4, r2.Value, 1e-9, "400 / 1000 — the r2-hit rows only")
 
 	// Idempotent: the same window again dedupes both.
-	again := syncEgress(context.Background(), newSvc(store), cf, at)
+	again := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.Equal(t, 0, again.RequestRecorded)
 	require.Equal(t, 2, again.Deduped)
 	require.Equal(t, 2, len(store.events))
@@ -526,14 +528,14 @@ func TestSyncEgress_RequestPassFoldsTiersPerAppAndBillsPer1k(t *testing.T) {
 	cf2 := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{}, requestsByStart: map[time.Time][]cloudflare.RequestRow{
 		win: {{AppID: app.String(), ModuleID: "m", Tier: "edge-hit", Stage: "prod", Requests: 250}},
 	}}
-	res2 := syncEgress(context.Background(), newSvc(store2), cf2, at)
+	res2 := syncEgress(context.Background(), newSvc(store2), cf2, closedHourWindows(at, infrasync.RecentWindows))
 	require.Equal(t, 1, res2.RequestRecorded)
 	_, hasR2 := store2.events[egressEventID(cdnR2ReadMetric, app, "m", win)]
 	require.False(t, hasR2)
 	require.InDelta(t, 0.25, store2.events[egressEventID(cdnRequestMetric, app, "m", win)].Value, 1e-9)
 
 	cf3 := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{}, requestErr: errors.New("cf down")}
-	res3 := syncEgress(context.Background(), newSvc(newFakeStore()), cf3, at)
+	res3 := syncEgress(context.Background(), newSvc(newFakeStore()), cf3, closedHourWindows(at, infrasync.RecentWindows))
 	require.True(t, res3.Failed, "a request query failure aborts the sweep like an egress one")
 }
 
@@ -561,7 +563,7 @@ func TestSyncEgress_ModuleEgressIsAttributedToTheModule(t *testing.T) {
 	}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.False(t, res.Failed)
 	require.Equal(t, 0, res.RowErrors)
 
@@ -619,10 +621,10 @@ func TestSyncEgress_LogsOneInfoLinePerRowWithModuleID(t *testing.T) {
 	}}}
 	store := newFakeStore()
 
-	res := syncEgress(context.Background(), newSvc(store), cf, at)
+	res := syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 	require.Equal(t, 1, res.Skipped)
 	// Re-run: the same rows now dedupe.
-	syncEgress(context.Background(), newSvc(store), cf, at)
+	syncEgress(context.Background(), newSvc(store), cf, closedHourWindows(at, infrasync.RecentWindows))
 
 	var rowLines []string
 	for _, l := range strings.Split(logs.String(), "\n") {
@@ -646,4 +648,78 @@ func TestSyncEgress_LogsOneInfoLinePerRowWithModuleID(t *testing.T) {
 	for _, banned := range []string{"apps/", "/ads/", ".mp4", "rendition", "key=", "path="} {
 		require.NotContains(t, joined, banned)
 	}
+}
+
+// closedHourWindows is the pre-#225 fixed sweep, kept as a fixture: the last
+// `count` FULLY-CLOSED hour buckets ending at the top of the hour containing
+// `at` (the current partial hour excluded).
+// e.g. at=12:37, count=3 → [09:00,10:00), [10:00,11:00), [11:00,12:00).
+func closedHourWindows(at time.Time, count int) []hourWindow {
+	topOfHour := at.UTC().Truncate(time.Hour)
+	windows := make([]hourWindow, 0, count)
+	for i := count; i >= 1; i-- {
+		start := topOfHour.Add(time.Duration(-i) * time.Hour)
+		windows = append(windows, hourWindow{start: start, end: start.Add(time.Hour)})
+	}
+	return windows
+}
+
+// billing-engine#225, the 2026-09-13 shape: Cloudflare answered 401 for five
+// hourly runs. The old fixed 3-hour sweep came back asking for the newest three
+// windows only, so the oldest broken hours were never asked for again. With the
+// watermark, every failed run leaves it where it was and the first healthy run
+// sweeps from it.
+func TestRunEgress_OutageLongerThanTheOldLookbackIsRecovered(t *testing.T) {
+	app := uuid.New()
+	top := at.Truncate(time.Hour)
+	lost := top.Add(-6 * time.Hour)
+	require.NotContains(t, closedHourWindows(at, 3), hourWindow{start: lost, end: lost.Add(time.Hour)},
+		"precondition: a fixed 3-hour sweep at recovery never asks for this window")
+
+	wm := infrasync.NewMemoryStore()
+	wm.Set(watermarkSource, lost)
+	var metrics bytes.Buffer
+	tracker := infrasync.Tracker{Store: wm, Source: watermarkSource, Metrics: &metrics}
+	store := newFakeStore()
+	svc := newSvc(store)
+
+	for h := 5; h >= 1; h-- {
+		res := runEgress(context.Background(), svc, &fakeCF{err: errors.New("cloudflare sql query status 401")},
+			tracker, at.Add(time.Duration(-h)*time.Hour))
+		require.True(t, res.Failed)
+	}
+	held, err := wm.Watermark(context.Background(), watermarkSource)
+	require.NoError(t, err)
+	require.Equal(t, lost, held, "failed runs must not move the watermark")
+
+	rows := map[time.Time][]cloudflare.EgressRow{lost: {{AppID: app.String(), Bytes: 4096}}}
+	res := runEgress(context.Background(), svc, &fakeCF{rowsByStart: rows}, tracker, at)
+	require.False(t, res.Failed)
+	require.Equal(t, 1, res.Recorded)
+	require.Contains(t, store.events, egressEventID(cdnEgressMetric, app, "", lost))
+
+	caughtUp, err := wm.Watermark(context.Background(), watermarkSource)
+	require.NoError(t, err)
+	require.Equal(t, top, caughtUp)
+	lines := strings.Split(strings.TrimSpace(metrics.String()), "\n")
+	require.Len(t, lines, 6, "one lag datapoint per run, failed runs included")
+	require.Contains(t, lines[4], `"WatermarkLagSeconds":18000`, "five hours behind before recovery")
+	require.Contains(t, lines[5], `"WatermarkLagSeconds":0`)
+}
+
+// A failed request pass leaves its window unconfirmed: the watermark stays
+// before it even though the byte pass of the same window recorded.
+func TestRunEgress_RequestPassFailureHoldsTheWatermark(t *testing.T) {
+	top := at.Truncate(time.Hour)
+	wm := infrasync.NewMemoryStore()
+	wm.Set(watermarkSource, top.Add(-3*time.Hour))
+	cf := &fakeCF{rowsByStart: map[time.Time][]cloudflare.EgressRow{}, requestErr: errors.New("boom")}
+
+	res := runEgress(context.Background(), newSvc(newFakeStore()), cf,
+		infrasync.Tracker{Store: wm, Source: watermarkSource}, at)
+	require.True(t, res.Failed)
+	require.Empty(t, res.Confirmed)
+	got, err := wm.Watermark(context.Background(), watermarkSource)
+	require.NoError(t, err)
+	require.Equal(t, top.Add(-3*time.Hour), got)
 }
