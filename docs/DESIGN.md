@@ -1430,6 +1430,17 @@ Adapters must not calculate or alter your tax. If a provider-hosted flow needs
 tax configuration, or returns a total differing from the sealed intent, the
 attempt is refused or quarantined and the discrepancy recorded.
 
+The invoice mirror repeats the sealed determination; it never computes one.
+`migrations/billing/088_invoice_tax_line.up.sql` gives `ms_billing.invoices`
+nullable tax columns that `UpsertInvoice` fills from `InvoiceMirror.Tax`
+(`setInvoiceTax` refuses anything a `Seal` would refuse), and the invoice
+history returns them as a `tax` object. NULL is `unknown`, never zero, and it is
+the only state written today: every current mirror writer adopts an invoice a
+legacy run created, which no intent sealed. `tax_inclusive` is pinned false,
+because list prices are net. A non-zero line — the Stripe rail, or ezPay's 5%
+營業稅 (core-v2#240) — still needs the `TaxPolicyRevision` above. The mirror
+only records it.
+
 ### The rule artifact is a table, not a program
 
 A `TaxPolicyRevision` is append-only and content-addressed. Four parts decide
