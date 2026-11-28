@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 
+	"github.com/mirrorstack-ai/billing-engine/internal/account/infrasync"
 	"github.com/mirrorstack-ai/billing-engine/internal/shared/awslambdainv"
 )
 
@@ -30,7 +31,7 @@ func TestHandler_BatchErrorsReturnRetryableError(t *testing.T) {
 	idle := &fakeIdle{idle: map[string]bool{}}
 	svc := newSvc(newFakeStore())
 
-	h := handler(svc, lister, querier, idle)
+	h := handler(svc, lister, querier, idle, infrasync.Tracker{Store: infrasync.NewMemoryStore(), Source: watermarkSource})
 	err := h(context.Background(), events.CloudWatchEvent{Time: at})
 	if err == nil {
 		t.Fatal("handler returned nil error, want a retryable error when a GetMetricData batch failed")
@@ -43,7 +44,7 @@ func TestHandler_BatchErrorsReturnRetryableError(t *testing.T) {
 func TestHandler_NoBatchErrorsReturnsNil(t *testing.T) {
 	fn := testFn("ms-apphost-ok", 512)
 	lister := &fakeLister{fns: []awslambdainv.SSRFunction{fn}}
-	windows := closedHourWindowsWithLag(at, ssrLookbackHours, propagationLag)
+	windows := closedHourWindowsWithLag(at, infrasync.RecentWindows, propagationLag)
 	ts := windows[0].start
 	querier := &fakeQuerier{resultsByCall: map[int][]cwtypes.MetricDataResult{
 		0: {
@@ -54,7 +55,7 @@ func TestHandler_NoBatchErrorsReturnsNil(t *testing.T) {
 	idle := &fakeIdle{idle: map[string]bool{}}
 	svc := newSvc(newFakeStore())
 
-	h := handler(svc, lister, querier, idle)
+	h := handler(svc, lister, querier, idle, infrasync.Tracker{Store: infrasync.NewMemoryStore(), Source: watermarkSource})
 	if err := h(context.Background(), events.CloudWatchEvent{Time: at}); err != nil {
 		t.Fatalf("handler returned error %v, want nil for a clean run", err)
 	}
@@ -69,7 +70,7 @@ func TestHandler_EnumerationFailureStillReturnsError(t *testing.T) {
 	idle := &fakeIdle{}
 	svc := newSvc(newFakeStore())
 
-	h := handler(svc, lister, querier, idle)
+	h := handler(svc, lister, querier, idle, infrasync.Tracker{Store: infrasync.NewMemoryStore(), Source: watermarkSource})
 	if err := h(context.Background(), events.CloudWatchEvent{Time: at}); err == nil {
 		t.Fatal("handler returned nil error, want an error when ListSSRFunctions fails")
 	}

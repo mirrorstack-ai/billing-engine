@@ -38,10 +38,15 @@
 //   - Otherwise → a one-shot local run (make dev-egress-sync / go run .), so dev
 //     never needs Lambda or a scheduler.
 //
-// Lookback: each run sweeps the last `lookbackHours` CLOSED hour buckets ending
-// at the top of the hour containing the trigger time. The lookback (> the
-// schedule interval) bounds catch-up after a missed run; the deterministic
-// event_id makes the overlap free (already-recorded windows dedupe).
+// Watermark (billing-engine#225): each run sweeps from this puller's durable
+// watermark — the last hour window confirmed recorded — back to at most seven
+// days, always including the newest three closed hours, capped per run
+// (internal/account/infrasync). A window is confirmed only when both Cloudflare
+// queries answered and every row recorded; anything else stays behind the
+// watermark and is re-swept next run, which the deterministic event_id makes
+// free. Before this, a fixed 3-hour lookback meant an outage longer than 3 h
+// lost its windows for good (2026-09-13 04:00-05:00Z). Each run emits
+// WatermarkLagSeconds; the infra stack alarms on it.
 //
 // Spec: docs-temp/milestone-d-meter/design.md §3a / §5 (cdn-worker + module
 // runtime) / §6 build order PR #10c.
@@ -61,6 +66,7 @@ import (
 	"github.com/mirrorstack-ai/billing-engine/internal/account/billing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/credit/rollout"
+	"github.com/mirrorstack-ai/billing-engine/internal/account/infrasync"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/platformfunded"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/standing"
 	"github.com/mirrorstack-ai/billing-engine/internal/account/usage"
@@ -131,30 +137,22 @@ const billedStage = "prod"
 // (infra.egress.api.bytes / infra.event.bytes, migration 020).
 const bytesPerGiB = 1024 * 1024 * 1024
 
-// lookbackHours is how many CLOSED hour buckets each run sweeps, ending at the
-// top of the trigger hour. Chosen > the schedule interval so a missed/late run
-// catches up; the deterministic event_id makes the overlap a no-op (re-ingested
-// windows dedupe via ON CONFLICT DO NOTHING).
-//
-// SAFE SCHEDULE INTERVAL: this value only bounds catch-up if it covers at least
-// one missed run, so the EventBridge schedule MUST be <= lookbackHours-1 hours
-// (i.e. with lookbackHours=3 the schedule must be hourly or 2-hourly; a 3h+
-// cadence leaves a permanent gap on any single missed invocation). The schedule
-// interval is committed alongside this binary in the IaC — keep the two in sync.
-const lookbackHours = 3
+// watermarkSource is this puller's row in ms_billing.infra_sync_watermarks and
+// the Source dimension of its WatermarkLagSeconds metric.
+const watermarkSource = "cdn-egress"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-	svc, cf := buildDeps()
+	svc, cf, tracker := buildDeps()
 
 	if config.IsLambda() {
-		lambda.Start(handler(svc, cf))
+		lambda.Start(handler(svc, cf, tracker))
 		return
 	}
 
-	// Local one-shot run: sweep the closed windows ending at the current hour,
-	// then exit. No HTTP listener — the sync is a single batch invocation.
-	res := syncEgress(context.Background(), svc, cf, time.Now().UTC())
+	// Local one-shot run: sweep from the watermark to the current hour, then
+	// exit. No HTTP listener — the sync is a single batch invocation.
+	res := runEgress(context.Background(), svc, cf, tracker, time.Now().UTC())
 	logResult(context.Background(), "infra-egress-sync local run complete", res)
 	if res.Failed {
 		os.Exit(1)
@@ -165,7 +163,7 @@ func main() {
 // client from config. CF_ANALYTICS_API_TOKEN is the READ-ONLY CF token (held
 // only here, never at the edge); CF_ACCOUNT_ID scopes the dataset. Both are
 // required — a missing one exits at startup (config.MustEnv), never mid-run.
-func buildDeps() (*usage.Service, cloudflare.AnalyticsQuerier) {
+func buildDeps() (*usage.Service, cloudflare.AnalyticsQuerier, infrasync.Tracker) {
 	pool := config.MustPgxPool()
 	candidate := rollout.FromEnv(rollout.ComponentWorker, true)
 	schemaReady := false
@@ -257,19 +255,24 @@ func buildDeps() (*usage.Service, cloudflare.AnalyticsQuerier) {
 		config.MustEnv("CF_ANALYTICS_API_TOKEN"),
 		config.MustEnv("CF_ACCOUNT_ID"),
 	)
-	return svc, cf
+	tracker := infrasync.Tracker{
+		Store:   infrasync.NewPgStore(pool),
+		Source:  watermarkSource,
+		Metrics: os.Stdout,
+	}
+	return svc, cf, tracker
 }
 
 // handler is the Lambda entrypoint for an EventBridge-scheduled invocation. The
 // CloudWatchEvent carries no window (the scheduler fires on a cron), so the
-// handler derives the closed-hour lookback from the event time.
-func handler(svc *usage.Service, cf cloudflare.AnalyticsQuerier) func(context.Context, events.CloudWatchEvent) error {
+// handler sweeps from the watermark up to the top of the event time's hour.
+func handler(svc *usage.Service, cf cloudflare.AnalyticsQuerier, tracker infrasync.Tracker) func(context.Context, events.CloudWatchEvent) error {
 	return func(ctx context.Context, ev events.CloudWatchEvent) error {
 		at := ev.Time
 		if at.IsZero() {
 			at = time.Now().UTC()
 		}
-		res := syncEgress(ctx, svc, cf, at.UTC())
+		res := runEgress(ctx, svc, cf, tracker, at.UTC())
 		logResult(ctx, "infra-egress-sync lambda run complete", res)
 		// A CF query error fails the run (so the exit code / Lambda error
 		// surfaces it for retry); per-row record errors are logged + counted
@@ -297,21 +300,44 @@ type syncResult struct {
 	RequestSkipped  int
 	Failed          bool  // a CF query error aborted a window (run exits non-zero)
 	Err             error // the first fatal (CF query) error, for the Lambda return
+	// Confirmed holds the start of every window whose two CF queries answered
+	// and whose every row recorded (or deduped) — the only windows the
+	// watermark may move past.
+	Confirmed map[time.Time]bool
 }
 
-// syncEgress sweeps the last lookbackHours CLOSED hour windows ending at the top
-// of the hour containing `at`, queries Cloudflare per window, and records each
-// (app, module) egress total via RecordInfraUsage with a deterministic event_id.
+// runEgress sweeps the windows the watermark plans for `at` (the closed hours
+// up to the top of the hour containing it — never the current partial hour,
+// whose SUM is still growing) and advances the watermark over the
+// ones the sweep confirmed.
+func runEgress(ctx context.Context, svc *usage.Service, cf cloudflare.AnalyticsQuerier, tracker infrasync.Tracker, at time.Time) syncResult {
+	var res syncResult
+	tracker.Run(ctx, at.UTC().Truncate(time.Hour), func(planned []infrasync.Window) func(infrasync.Window) bool {
+		windows := make([]hourWindow, len(planned))
+		for i, w := range planned {
+			windows[i] = hourWindow{start: w.Start, end: w.End}
+		}
+		res = syncEgress(ctx, svc, cf, windows)
+		return func(w infrasync.Window) bool { return res.Confirmed[w.Start] }
+	})
+	return res
+}
+
+// syncEgress queries Cloudflare for each given CLOSED hour window and records
+// each (app, module) egress total via RecordInfraUsage with a deterministic
+// event_id.
 //
 // A CF query error for a window is FATAL (returns immediately with Failed) so a
 // partial sweep never half-records — the next run re-sweeps the same windows and
 // the deterministic event_id dedupes whatever did land. A per-row record error
 // is logged + counted but never aborts the window (one bad row mustn't drop the
-// rest of the batch).
-func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.AnalyticsQuerier, at time.Time) syncResult {
-	var res syncResult
+// rest of the batch); it does leave the window unconfirmed, so the watermark
+// stops there and the next run asks again.
+func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.AnalyticsQuerier, windows []hourWindow) syncResult {
+	res := syncResult{Confirmed: map[time.Time]bool{}}
 
-	for _, w := range closedHourWindows(at, lookbackHours) {
+	for _, w := range windows {
+		rowErrorsBefore := res.RowErrors
 		rows, err := cf.QueryEgressWindow(ctx, egressDataset, w.start, w.end)
 		if err != nil {
 			// Fatal: abort the sweep cleanly. No partial double-write — the
@@ -387,6 +413,9 @@ func syncEgress(ctx context.Context, svc *usage.Service, cf cloudflare.Analytics
 			return res
 		}
 		syncRequestRows(ctx, svc, w, requestRows, &res)
+		if res.RowErrors == rowErrorsBefore {
+			res.Confirmed[w.start] = true
+		}
 	}
 	return res
 }
@@ -528,21 +557,6 @@ func egressEventID(metric string, appID uuid.UUID, moduleID string, windowStart 
 type hourWindow struct {
 	start time.Time
 	end   time.Time
-}
-
-// closedHourWindows returns the last `count` FULLY-CLOSED hour buckets ending at
-// the top of the hour containing `at`. The current (partial) hour is EXCLUDED —
-// its SUM is still growing, so recording it now then again next run would
-// under-then-over count even with the deterministic id (the value would differ).
-// e.g. at=12:37, count=3 → [09:00,10:00), [10:00,11:00), [11:00,12:00).
-func closedHourWindows(at time.Time, count int) []hourWindow {
-	topOfHour := at.UTC().Truncate(time.Hour) // start of the current partial hour = end of the last closed hour
-	windows := make([]hourWindow, 0, count)
-	for i := count; i >= 1; i-- {
-		start := topOfHour.Add(time.Duration(-i) * time.Hour)
-		windows = append(windows, hourWindow{start: start, end: start.Add(time.Hour)})
-	}
-	return windows
 }
 
 const (
