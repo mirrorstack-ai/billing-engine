@@ -26,16 +26,21 @@ const (
 
 type m092Key struct{ metric, model string }
 
-// µ$ per 1k tokens = USD per 1M tokens x 1000.
-var m092Want = map[m092Key]int64{
-	{mIn, "anthropic.claude-haiku-5-5"}: 100, {mOut, "anthropic.claude-haiku-5-5"}: 500,
-	{mCW, "anthropic.claude-haiku-5-5"}: 125, {mCR, "anthropic.claude-haiku-5-5"}: 10,
-	{mIn, "anthropic.claude-sonnet-5-5"}: 2000, {mOut, "anthropic.claude-sonnet-5-5"}: 10000,
-	{mCW, "anthropic.claude-sonnet-5-5"}: 2500, {mCR, "anthropic.claude-sonnet-5-5"}: 100,
-	{mIn, "anthropic.claude-opus-5-5"}: 4000, {mOut, "anthropic.claude-opus-5-5"}: 20000,
-	{mCW, "anthropic.claude-opus-5-5"}: 5000, {mCR, "anthropic.claude-opus-5-5"}: 200,
-	{mIn, "anthropic.claude-fable-5-1"}: 10000, {mOut, "anthropic.claude-fable-5-1"}: 50000,
-	{mCW, "anthropic.claude-fable-5-1"}: 12500, {mCR, "anthropic.claude-fable-5-1"}: 250,
+// m092Want reads the shared fixture (internal/account/cycle/testdata/ai_model_prices.json,
+// loaded by loadAIModelPriceFixture in ai_model_prices_integration_test.go) so
+// this repo keeps exactly one copy of the 16 seeded numbers (µ$ per 1k tokens =
+// USD per 1M tokens x 1000) instead of a second hand-copied table that could
+// drift from it.
+func m092Want(t *testing.T) map[m092Key]int64 {
+	t.Helper()
+	fixture := loadAIModelPriceFixture(t)
+	want := make(map[m092Key]int64, 16)
+	for model, prices := range fixture.Models {
+		for metric, price := range prices {
+			want[m092Key{metric, model}] = price
+		}
+	}
+	return want
 }
 
 func m092Read(t *testing.T, pool *pgxpool.Pool, k m092Key) (price int64, active, ok bool) {
@@ -48,8 +53,9 @@ func m092Read(t *testing.T, pool *pgxpool.Pool, k m092Key) (price int64, active,
 
 func m092Assert(t *testing.T, pool *pgxpool.Pool, why string) {
 	t.Helper()
-	require.Len(t, m092Want, 16)
-	for k, want := range m092Want {
+	prices := m092Want(t)
+	require.Len(t, prices, 16)
+	for k, want := range prices {
 		got, active, ok := m092Read(t, pool, k)
 		require.True(t, ok, "%s: %v row", why, k)
 		require.True(t, active, "%s: %v active", why, k)
@@ -67,6 +73,7 @@ func TestMigration092_RowsAfterTheChainRerunIsANoOpAndDownRemovesOnlyThem(t *tes
 	pool := testutil.NewTestDB(t) // the FULL chain, 092 included
 	up := migrationSQL(t, "092_ai_model_prices_claude5_roster.up.sql")
 	down := migrationSQL(t, "092_ai_model_prices_claude5_roster.down.sql")
+	prices := m092Want(t)
 
 	m092Assert(t, pool, "after the chain")
 
@@ -80,7 +87,7 @@ func TestMigration092_RowsAfterTheChainRerunIsANoOpAndDownRemovesOnlyThem(t *tes
 	got, _, _ := m092Read(t, pool, edited)
 	require.EqualValues(t, 61000, got, "a finance UPDATE is never overwritten")
 	m092Exec(t, pool, up)
-	for k, want := range m092Want {
+	for k, want := range prices {
 		if k == edited {
 			continue
 		}
@@ -97,7 +104,7 @@ func TestMigration092_RowsAfterTheChainRerunIsANoOpAndDownRemovesOnlyThem(t *tes
 	require.Positive(t, before)
 
 	m092Exec(t, pool, down)
-	for k := range m092Want {
+	for k := range prices {
 		_, _, ok := m092Read(t, pool, k)
 		require.False(t, ok, "down removes %v", k)
 	}
