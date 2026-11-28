@@ -66,7 +66,7 @@ func priorAttempt(t *testing.T, s *store.Store, micros int64) {
 func TestThePeriodCeilingCountsWhatWasAlreadyCollected(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	priorSettlement(t, s, 5_000_000)
 
@@ -98,7 +98,7 @@ func TestThePeriodCeilingCountsWhatWasAlreadyCollected(t *testing.T) {
 func TestThePeriodCeilingStillAdmitsAChargeThatFits(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	s := store.New(pool)
-	sealed := ready(t, s)
+	sealed := ready(t, s, pool)
 
 	priorSettlement(t, s, 1_000_000)
 
@@ -118,7 +118,7 @@ func TestAFailedAttemptConsumesFrequencyButNotSpend(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	ready(t, s)
+	ready(t, s, pool)
 	priorAttempt(t, s, 4_000_000)
 
 	prior, err := s.PriorUseFor(ctx, "auth-1", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
@@ -137,7 +137,7 @@ func TestAnInFlightClaimIsAnUnresolvedAttempt(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	ready(t, s)
+	ready(t, s, pool)
 	inflight := sealKind(t, kindCycle, 2_000_000)
 	require.NoError(t, s.SaveIntent(ctx, inflight))
 	require.NoError(t, s.ClaimSettlement(ctx, inflight.Digest(), "prior-use-test"))
@@ -159,7 +159,7 @@ func TestPriorUseDoesNotLeakAcrossAuthorizations(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	ready(t, s)
+	ready(t, s, pool)
 	priorSettlement(t, s, 3_000_000)
 
 	other, err := s.PriorUseFor(ctx, "auth-somebody-else", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
@@ -179,7 +179,7 @@ func TestPriorUseIgnoresSettlementsBeforeTheWindow(t *testing.T) {
 	s := store.New(pool)
 	ctx := context.Background()
 
-	ready(t, s)
+	ready(t, s, pool)
 	priorSettlement(t, s, 3_000_000)
 
 	future := time.Now().UTC().Add(24 * time.Hour)
