@@ -30,9 +30,9 @@ owns that boundary with its citations.
 
 ## Layout
 
-Ten binaries. Eight are built and uploaded per commit — the `for pair in` list in
-`.github/workflows/publish.yml`. `pm-default-backfill` and `signing-keygen` are
-not, and are run by hand.
+Thirteen binaries. Ten are built and uploaded per commit — the `for pair in`
+list in `.github/workflows/publish.yml`. `pm-default-backfill`,
+`signing-keygen` and `statement-lines` are not, and are run by hand.
 
 ```text
 cmd/account-api/                  internal RPC Lambda; local HTTP :8091    (published)
@@ -44,11 +44,13 @@ cmd/billing-cycle/                scheduled per-period usage charge driver (publ
 cmd/infra-db-sync/                samples Postgres size per app+module     (published)
 cmd/infra-egress-sync/            pulls CDN egress totals from Cloudflare  (published)
 cmd/infra-ssr-compute-sync/       pulls SSR compute totals from CloudWatch (published)
+cmd/infra-storage-sync/           samples object-storage bytes per app+module (published)
 cmd/intent-executor/              the only collector on the intent rail;
                                   refuses to start, see the banner above   (published)
 cmd/intent-shadow/                read-only shadow rater, no money path    (published)
 cmd/pm-default-backfill/          one-shot Stripe default-PM repair        (by hand)
 cmd/signing-keygen/               mints one signing key; PRINTS THE SEED   (by hand)
+cmd/statement-lines/              read-only statement composer, CLI only   (by hand)
 internal/{account,architecture,billingperiod,intent,
           meteringlock,provider,shared}/           324 Go files
 migrations/billing/               ms_billing schema, 001..069 up/down
