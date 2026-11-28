@@ -147,6 +147,20 @@ DO UPDATE SET
     aggregation_key   = EXCLUDED.aggregation_key,
     active            = true;
 
+-- ListActiveSentinelInfraMetrics names every ACTIVE platform-infra metric in
+-- the sentinel catalog — the same set AbsorbAllInfraPriceOverrides expands
+-- against. SyncInfraPriceOverrides calls this ONLY when the publish carries a
+-- module_version, to snapshot the absorbed-to-0 price onto each metric in
+-- ms_billing.metric_version_prices (issue #219): absorb-all writes no
+-- per-metric price in Go, so without this list a version-stamped absorb could
+-- not be snapshotted metric-by-metric alongside the explicit overrides.
+-- name: ListActiveSentinelInfraMetrics :many
+SELECT metric
+FROM ms_billing.metric_definitions
+WHERE module_id = '00000000-0000-0000-0000-000000000000'
+  AND active
+ORDER BY metric;
+
 -- DeleteInfraPriceOverridesNotIn makes a module's reserved-metric override set
 -- AUTHORITATIVE: whatever the manifest no longer declares stops applying.
 --

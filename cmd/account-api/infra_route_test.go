@@ -30,7 +30,7 @@ func (stubUsageStore) UpsertMetricDefinitions(context.Context, []usage.MetricDec
 func (stubUsageStore) UpsertMetricVersionPrices(context.Context, []usage.MetricVersionPrice) error {
 	return nil
 }
-func (stubUsageStore) SyncInfraPriceOverrides(context.Context, uuid.UUID, bool, []usage.InfraPriceOverride) error {
+func (stubUsageStore) SyncInfraPriceOverrides(context.Context, uuid.UUID, string, bool, []usage.InfraPriceOverride) error {
 	return nil
 }
 func (s *stubUsageStore) DefaultCardCountry(context.Context, uuid.UUID) (string, bool, error) {
