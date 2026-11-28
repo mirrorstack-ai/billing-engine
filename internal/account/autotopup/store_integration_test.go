@@ -125,6 +125,31 @@ func TestStoreAcquire_ThresholdModePolicyAndSelectedCardGates(t *testing.T) {
 	})
 }
 
+// A config saved before the org was linked to a distributor must never
+// authorize a new attempt: core-v2#231 decision 8 says a distributor's
+// customer pays the distributor's own store, never MirrorStack's merchant.
+func TestStoreAcquire_RefusesNewAttemptForOrgLinkedToDistributor(t *testing.T) {
+	pool := testutil.NewTestDB(t)
+	store := autotopup.NewStore(pool)
+	ctx := context.Background()
+	now := time.Date(2026, time.July, 25, 11, 0, 0, 0, time.UTC)
+
+	customerOrgID, distributorOrgID := uuid.New(), uuid.New()
+	accountID := seedAutoOrgAccount(t, pool, customerOrgID)
+	paymentMethodID := seedAutoPaymentMethod(t, pool, accountID, false)
+	seedAutoConfig(t, pool, accountID, paymentMethodID, 9_000_000, true)
+	seedSettledGrant(t, pool, accountID, 10_000_000)
+	seedOrgDistributor(t, pool, customerOrgID, distributorOrgID)
+
+	attempt, kind, err := store.Acquire(ctx, accountID, 2_000_000, now)
+
+	require.NoError(t, err)
+	require.Equal(t, autotopup.AcquireNone, kind)
+	require.Equal(t, autotopup.Attempt{}, attempt)
+	require.Zero(t, countAutoTopUps(t, pool, accountID),
+		"a linked org's config must never authorize a Stripe-bound attempt")
+}
+
 func TestStoreAcquire_RejectsUnavailableOrWrongOwnerSelectedCard(t *testing.T) {
 	pool := testutil.NewTestDB(t)
 	store := autotopup.NewStore(pool)
@@ -426,6 +451,34 @@ func seedAutoAccount(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	)
 	require.NoError(t, err)
 	return accountID
+}
+
+// seedAutoOrgAccount is seedAutoAccount's org-owned twin: the account belongs
+// to orgID rather than a synthetic user, so a row in ms_billing.org_distributors
+// keyed on orgID can be exercised against it.
+func seedAutoOrgAccount(t *testing.T, pool *pgxpool.Pool, orgID uuid.UUID) uuid.UUID {
+	t.Helper()
+	accountID := uuid.New()
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO ms_billing.accounts
+		   (id, owner_kind, owner_org_id, stripe_customer_id, billing_mode, credit_limit_micros)
+		 VALUES ($1, 'org', $2, $3, 'credits', 0)`,
+		accountID,
+		orgID,
+		"cus_"+accountID.String(),
+	)
+	require.NoError(t, err)
+	return accountID
+}
+
+func seedOrgDistributor(t *testing.T, pool *pgxpool.Pool, customerOrgID, distributorOrgID uuid.UUID) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO ms_billing.org_distributors (customer_org_id, distributor_org_id, source)
+		 VALUES ($1, $2, 'manual')`,
+		customerOrgID, distributorOrgID,
+	)
+	require.NoError(t, err)
 }
 
 func seedAutoPaymentMethod(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, deleted bool) uuid.UUID {

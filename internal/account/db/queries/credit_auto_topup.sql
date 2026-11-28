@@ -6,7 +6,7 @@
 -- status transitions on existing journal rows for the transaction.
 
 -- name: LockAutoTopUpAccount :one
-SELECT billing_mode, credit_limit_micros
+SELECT billing_mode, credit_limit_micros, owner_org_id
 FROM ms_billing.accounts
 WHERE id = sqlc.arg(account_id)::uuid
 FOR UPDATE;
