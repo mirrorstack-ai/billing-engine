@@ -129,10 +129,10 @@ func (stubUsageStore) SettledNewCreationCharges(context.Context, uuid.UUID, time
 func (stubUsageStore) PendingNewCreationCharges(context.Context, uuid.UUID, time.Time, time.Time, time.Time) ([]usage.PendingNewCreationChargeRaw, error) {
 	return nil, nil
 }
-func (stubUsageStore) PendingAddonModuleCharges(context.Context, uuid.UUID, int, time.Time) ([]usage.PendingAddonChargeRaw, error) {
+func (stubUsageStore) PendingAddonModuleCharges(context.Context, uuid.UUID, time.Time) ([]usage.PendingAddonChargeRaw, error) {
 	return nil, nil
 }
-func (stubUsageStore) UnresolvedOneTimeCharges(context.Context, uuid.UUID, int, int) ([]usage.UnresolvedOneTimeChargeRaw, error) {
+func (stubUsageStore) UnresolvedOneTimeCharges(context.Context, uuid.UUID, int) ([]usage.UnresolvedOneTimeChargeRaw, error) {
 	return nil, nil
 }
 func (stubUsageStore) CoCreatedOverModuleTimerCount(context.Context, uuid.UUID, uuid.UUID, time.Time, int) (int, error) {

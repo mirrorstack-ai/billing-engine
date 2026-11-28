@@ -253,7 +253,7 @@ func (s *Service) GetAppBill(ctx context.Context, req GetAppBillRequest) (*GetAp
 	baseFee := parts.BaseFeeMicros
 	var moduleOverage int64
 	if req.PeriodID == uuid.Nil && found && !parts.IsDeleted {
-		overCount, err := s.store.LiveOverModuleTimerCountForApp(ctx, accountID, req.AppID, IncludedModules)
+		overCount, err := s.store.LiveOverModuleTimerCountForApp(ctx, accountID, req.AppID, ModulesIncludedCutoff(parts.Plan))
 		if err != nil {
 			return nil, billing.Internal("app module overage attribution failed", err)
 		}

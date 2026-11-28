@@ -85,7 +85,9 @@ func TestChargeCreationProration_CreditModeDrawsBaseOnlyAndLeavesOverageForLeg1(
 
 	created := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	appID := uuid.New()
-	registerMirror(t, svc, user, appID, created, 7)
+	// 12 co-created modules − this app's own DefaultPlan=Pro cutoff of 10
+	// (billing-engine#202 PR-2c) = 2 over, 10 included.
+	registerMirror(t, svc, user, appID, created, 12)
 	want := creationBaseMicros(store, acct, created)
 	require.Positive(t, want, "a survived app owes a positive prorated base")
 
@@ -119,12 +121,12 @@ func TestChargeCreationProration_CreditModeDrawsBaseOnlyAndLeavesOverageForLeg1(
 	require.Equal(t, "proration", snap.source)
 
 	// The synthetic guard stops Leg 1's defer-to-combined rule. Its ordinary
-	// sweep now resolves the five included timers and charges the two overage
+	// sweep now resolves the ten included timers and charges the two overage
 	// timers independently, proving the overage was not silently dropped.
 	overage, err := svc.SweepModuleOverage(context.Background(), created.AddDate(0, 0, 4))
 	require.NoError(t, err)
 	require.Equal(t, 2, overage.Charged)
-	require.Equal(t, 5, overage.Included)
+	require.Equal(t, 10, overage.Included)
 }
 
 // (2) standard mode stays on Stripe even with enough gifted credit to cover the

@@ -281,13 +281,20 @@ func (s *Service) ChargeModuleOverage(ctx context.Context, cand ModuleOverageCan
 		}
 	}
 
-	// LIVE FIFO determination, computed fresh (never cached): this install's rank
-	// among the account's currently-live timers ordered (installed_at, id).
-	rank, err := s.store.LiveModuleTimerRankBefore(ctx, cand.AccountID, cand.ID, cand.InstalledAt)
+	// LIVE FIFO determination, computed fresh (never cached): this install's
+	// rank among ITS OWN APP'S currently-live timers ordered (installed_at, id)
+	// — never pooled against any other app on the account (billing-engine#202
+	// PR-2c) — compared against THAT APP'S OWN plan allowance.
+	timerApp, _, err := s.store.AppMirror(ctx, cand.AppID)
+	if err != nil {
+		return nil, billing.Internal("app mirror lookup failed (module overage rank)", err)
+	}
+	included := usage.ModulesIncludedCutoff(effectivePlan(timerApp))
+	rank, err := s.store.LiveModuleTimerRankBefore(ctx, cand.AccountID, cand.AppID, cand.ID, cand.InstalledAt)
 	if err != nil {
 		return nil, billing.Internal("module timer FIFO rank lookup failed", err)
 	}
-	if rank < usage.IncludedModules {
+	if rank < included {
 		// Included → PERMANENT verdict (monotonicity: an existing row's rank only
 		// ever improves over→included, never the reverse). Mark resolved, never
 		// charge, never re-check.

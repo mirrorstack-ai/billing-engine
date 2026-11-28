@@ -52,14 +52,16 @@ func sumModelCharges(models []usage.AgentModelUsage) int64 {
 func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	// Three apps, one per enumeration class:
 	//   appA — usage-only, UNMIRRORED (pre-backfill): enumerated via the usage
-	//          half; base = legacy flat + usage-proxy overage (1 module → flat).
+	//          half; base = legacy flat (within its plan's module bundle).
 	//   appB — mirror-only, ZERO usage (just created, nothing metered): must
 	//          still appear with its full base (created long before the period).
-	//   appC — both halves: synced count 7 → FLAT $20 base (overage is pooled,
-	//          migration 032); usage + module-attributed infra.
-	// The account-wide pool is 0 (appB) + 7 (appC) = 7 → 2 over → $6 pooled
-	// overage on the ACCOUNT (not on any app). Every per-app number is exactly
-	// what GetAppBill would return for that app.
+	//   appC — both halves: FLAT $20 base; usage + module-attributed infra; 2
+	//          live modules over ITS OWN plan allowance (billing-engine#202
+	//          PR-2c: never pooled across the account) — priced at the $1
+	//          amortized stub rate, informational only on this FROZEN period
+	//          (it is not folded into any app's base, and is not part of
+	//          TotalMicros, which stays the exact charged snapshot).
+	// Every per-app number is exactly what GetAppBill would return for that app.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -69,6 +71,7 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	store.usageAppIDs = []uuid.UUID{appC, appA} // deliberately unsorted
 	store.appMirrors[appB] = usage.AppMirrorInfo{ModuleCount: 0, CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
 	store.appMirrors[appC] = usage.AppMirrorInfo{ModuleCount: 7, CreatedAt: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
+	store.liveOverTimerCounts[appC] = 2
 
 	store.appBillRowsByApp[appA] = []usage.AppMetricUsageRaw{customLine(uuid.New(), "orders.placed", "", 1000)}
 	store.appInfraBillRowsByApp[appA] = []usage.AppInfraUsage{appInfraLine("infra.egress.api.bytes", "network", 100, 2, 200)}
@@ -102,8 +105,9 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.EqualValues(t, 200, resp.Apps[1].InfraMicros)
 	require.Equal(t, usage.BaseFeeMicros+1200, resp.Apps[1].TotalMicros)
 
-	// appC: synced count 7 → FLAT base (overage is pooled, not per-app);
-	// module-attributed infra folds in.
+	// appC: FLAT base on this frozen period — its 2 live over-modules are NOT
+	// folded in (the fold-in only applies to the current, un-snapshotted
+	// window); module-attributed infra folds in regardless.
 	require.Equal(t, usage.BaseFeeMicros, resp.Apps[2].BaseFeeMicros)
 	require.EqualValues(t, 500, resp.Apps[2].ModuleUsageMicros)
 	require.EqualValues(t, 24, resp.Apps[2].InfraMicros)
@@ -114,23 +118,29 @@ func TestGetAccountBill_AggregatesUsageMirrorAndBothApps(t *testing.T) {
 	require.Zero(t, resp.Apps[1].UsageDeductionMicros)
 	require.Equal(t, usage.BaseFeeMicros+524-500, resp.Apps[2].TotalMicros)
 
-	// Account totals are the column sums plus the account-wide POOLED overage.
-	// All three apps are flat, so BaseFeeTotal = 3 × $20. Pool 7 → 2 over → 1 block → $5.
+	// Account totals are the column sums; AccountOverageMicros is the
+	// informational Σ of each app's OWN live over-count at the $1 amortized
+	// stub rate (billing-engine#202 PR-2c) — appC's 2 over-modules, nobody
+	// else's. All three apps are flat, so BaseFeeTotal = 3 × $20.
 	require.Equal(t, 3*usage.BaseFeeMicros, resp.BaseFeeTotalMicros)
 	require.EqualValues(t, 1500, resp.ModuleUsageTotalMicros)
 	require.EqualValues(t, 224, resp.InfraTotalMicros)
-	require.Equal(t, usage.AccountOverageMicros(7), resp.AccountOverageMicros)
-	require.EqualValues(t, 5_000_000, resp.AccountOverageMicros) // 2 over → ceil(2/5) = 1 block × $5
+	require.EqualValues(t, 2*usage.ModuleOverageFeeMicros, resp.AccountOverageMicros)
+	require.EqualValues(t, 2_000_000, resp.AccountOverageMicros) // 2 over × $1 amortized stub rate
 	require.EqualValues(t, 3*usage.DomainFeeMicros, resp.CustomDomainsMicros)
 	require.EqualValues(t, 6_000_000, resp.CustomDomainsMicros) // 3 domains × $2
 	require.Zero(t, resp.PaasCreditMicros)
 	require.EqualValues(t, 500, resp.UsageDeductionTotalMicros, "Σ apps[].usage_deduction_micros (PR-4)")
+	// A frozen period's TotalMicros never includes AccountOverageMicros: it is
+	// a LIVE display-only estimate (billing-engine#202 PR-2c), while the base
+	// fee total above is the exact charged snapshot.
 	require.Equal(t,
 		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
-			resp.AccountOverageMicros+resp.CustomDomainsMicros-resp.UsageDeductionTotalMicros,
+			resp.CustomDomainsMicros-resp.UsageDeductionTotalMicros,
 		resp.TotalMicros)
-	// apps[].total_micros are the app plane only: agent, pooled overage, and
-	// account credit are never allocated back into these rows.
+	// apps[].total_micros are the app plane only: agent, the informational
+	// overage display, and account credit are never allocated back into these
+	// rows.
 	var perApp int64
 	for _, a := range resp.Apps {
 		perApp += a.TotalMicros
@@ -474,12 +484,14 @@ func TestGetAccountBill_MixedAppsAndAgentReconcileExactly(t *testing.T) {
 	require.Equal(t, resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros-resp.UsageDeductionTotalMicros, perApp,
 		"Σ apps[].total == base fee total + module usage total + infra total − 用量減免")
 	require.EqualValues(t, 1000, resp.UsageDeductionTotalMicros, "both apps' module usage (700 + 300) sits inside their Pro allowance (PR-4)")
+	require.Zero(t, resp.AccountOverageMicros, "no app's live over-count was fixtured")
 	require.Equal(t,
 		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+
-			resp.AccountOverageMicros+resp.CustomDomainsMicros+
+			resp.CustomDomainsMicros+
 			resp.Agent.TotalMicros-resp.UsageDeductionTotalMicros-resp.PaasCreditMicros,
 		resp.TotalMicros,
-		"agent spend is included exactly once alongside the app plane; 用量減免 subtracted once")
+		"agent spend is included exactly once alongside the app plane; 用量減免 subtracted once; "+
+			"AccountOverageMicros is a display-only per-app attribution (billing-engine#202 PR-2c), never a TotalMicros term")
 }
 
 func TestGetAccountBill_AgentBucketDiscardsDefaultAppBaseFee(t *testing.T) {
@@ -564,10 +576,11 @@ func TestGetAccountBill_MirrorLifecycleAcrossTheWindow(t *testing.T) {
 
 func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 	// The account bill inherits GetAppBill's snapshot-first PER-APP base: the May
-	// period was CHARGED at a flat $20 snapshot, then SyncAppModules moved the
-	// mirror to 8. The per-app base is flat in both periods (overage is pooled).
-	// The CURRENT (un-snapshotted) period's account-wide overage estimates from
-	// the live pool 8 → 3 over → $9.
+	// period was CHARGED at a flat $20 snapshot. A FROZEN period never folds in
+	// module overage — only the live (un-snapshotted) current period does
+	// (billing-engine#202 PR-2c: the app's own live over-count, never pooled
+	// across the account), from app's own live attribution — here 3 over, at
+	// the $1 amortized stub rate.
 	store := newFakeStore()
 	owner := uuid.New()
 	store.accounts[owner] = uuid.New()
@@ -577,20 +590,23 @@ func TestGetAccountBill_SnapshotBaseFlowsThroughChargedPeriod(t *testing.T) {
 	store.baseSnapshots[baseSnapKey(app, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))] = usage.AppBaseSnapshotInfo{
 		BaseMicros: usage.BaseFeeMicros,
 	}
+	store.liveOverTimerCounts[app] = 3
 
 	resp, err := newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{
 		OwnerUserID: owner, PeriodID: pid.String(),
 	})
 	require.NoError(t, err)
 	require.Len(t, resp.Apps, 1)
-	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "charged period shows the invoiced flat snapshot")
+	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "charged period shows the invoiced flat snapshot, never the live overage")
 
 	resp, err = newService(store).GetAccountBill(context.Background(), usage.GetAccountBillRequest{OwnerUserID: owner})
 	require.NoError(t, err)
 	require.Len(t, resp.Apps, 1)
-	require.Equal(t, usage.BaseFeeMicros, resp.Apps[0].BaseFeeMicros, "per-app base is flat regardless of count")
-	require.EqualValues(t, 5_000_000, resp.AccountOverageMicros,
-		"un-snapshotted current period estimates the pooled overage from the live pool 8 → 3 over → 1 block → $5")
+	require.Equal(t, usage.BaseFeeMicros+3*usage.ModuleOverageFeeMicros, resp.Apps[0].BaseFeeMicros,
+		"the current period folds the app's own live over-count into its own base")
+	require.EqualValues(t, 3_000_000, resp.Apps[0].BaseFeeMicros-usage.BaseFeeMicros)
+	require.EqualValues(t, 3_000_000, resp.AccountOverageMicros,
+		"the display total is the same per-app attribution — 3 over × $1 amortized stub rate")
 }
 
 func TestGetAccountBill_ProjectsFullBaseForLiveApps(t *testing.T) {
@@ -1532,8 +1548,9 @@ func TestGetAccountBill_UsageDeductionNetsTheUsagePlaneByPlan(t *testing.T) {
 	require.EqualValues(t, byApp[proApp].BaseFeeMicros+300_000+200_000-500_000, byApp[proApp].TotalMicros)
 	require.EqualValues(t, byApp[bizApp].BaseFeeMicros+20_000_000-15_000_000, byApp[bizApp].TotalMicros)
 	require.EqualValues(t, 16_500_000, resp.UsageDeductionTotalMicros, "Σ apps[].usage_deduction_micros")
+	require.Zero(t, resp.AccountOverageMicros, "no app's live over-count was fixtured")
 	require.Equal(t,
-		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+resp.AccountOverageMicros+resp.CustomDomainsMicros-resp.UsageDeductionTotalMicros-resp.PaasCreditMicros,
+		resp.BaseFeeTotalMicros+resp.ModuleUsageTotalMicros+resp.InfraTotalMicros+resp.CustomDomainsMicros-resp.UsageDeductionTotalMicros-resp.PaasCreditMicros,
 		resp.TotalMicros)
 	// The boundary nets the same figure the bill shows.
 	allowance, err := newService(store).AccountUsageAllowanceMicros(context.Background(), acct, resp.PeriodStart, resp.PeriodEnd)

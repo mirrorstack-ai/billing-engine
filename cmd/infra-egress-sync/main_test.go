@@ -191,10 +191,10 @@ func (f *fakeStore) PendingNewCreationCharges(_ context.Context, _ uuid.UUID, _,
 	return nil, nil
 }
 
-func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, _ int, _ time.Time) ([]usage.PendingAddonChargeRaw, error) {
+func (f *fakeStore) PendingAddonModuleCharges(_ context.Context, _ uuid.UUID, _ time.Time) ([]usage.PendingAddonChargeRaw, error) {
 	return nil, nil
 }
-func (f *fakeStore) UnresolvedOneTimeCharges(_ context.Context, _ uuid.UUID, _, _ int) ([]usage.UnresolvedOneTimeChargeRaw, error) {
+func (f *fakeStore) UnresolvedOneTimeCharges(_ context.Context, _ uuid.UUID, _ int) ([]usage.UnresolvedOneTimeChargeRaw, error) {
 	return nil, nil
 }
 func (f *fakeStore) CoCreatedOverModuleTimerCount(_ context.Context, _, _ uuid.UUID, _ time.Time, _ int) (int, error) {

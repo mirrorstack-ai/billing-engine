@@ -49,7 +49,10 @@ func TestCreditsModeOverageBypassesTheCutoverEntirely(t *testing.T) {
 		WithIntentProposer(p) // ARMED, and it will make no difference
 
 	app := uuid.New()
-	seedIncluded(store, acct, app, overageIncludedInstall, 5)
+	// overageIncludedInstall's doc (wallet_module_overage_test.go): this app's own
+	// DefaultPlan=Pro cutoff is 10 (billing-engine#202 PR-2c), not the retired
+	// account-wide pool of 5.
+	seedIncluded(store, acct, app, overageIncludedInstall, 10)
 	over := seedTimer(store, acct, app, overageInstalled)
 
 	res, err := svc.SweepModuleOverage(context.Background(), overageInstalled.AddDate(0, 0, 4))

@@ -81,11 +81,12 @@ func TestRegisterApp_OnFreeAppliesTheFreeRules(t *testing.T) {
 	require.Equal(t, usage.PlanFree, store.apps[appID].Plan, "created ON free, no fold needed")
 	require.Equal(t, 2, store.apps[appID].MemberCount)
 
-	// Unknown and business plans are refused at creation like at a change.
+	// Unknown plans are refused at creation like at a change; business is
+	// accepted (billing-engine#202 PR-2c).
 	_, err := svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{OwnerUserID: user, AppID: uuid.New(), Plan: "hobby"})
 	requirePlanErrCode(t, err, billing.CodeInvalidInput)
-	_, err = svc.RegisterApp(context.Background(), cycle.RegisterAppRequest{OwnerUserID: user, AppID: uuid.New(), Plan: "business"})
-	requirePlanErrCode(t, err, billing.CodePlanNotAvailable)
+	bizAppID := registerOnPlan(t, svc, user, usage.PlanBusiness, 0)
+	require.Equal(t, usage.PlanBusiness, store.apps[bizAppID].Plan)
 
 	// The personal cap: 3 Free apps per personal account (owner 2026-09-13).
 	registerOnPlan(t, svc, user, usage.PlanFree, 0)
@@ -182,6 +183,34 @@ func TestSetAppPlan_UpgradeChargesTheDifferenceProratedAtOnce(t *testing.T) {
 	require.Nil(t, resp.Change)
 	require.Len(t, p.charges, 1)
 	require.Len(t, store.planChanges, 1)
+}
+
+// Business is a normal rung on the ladder (billing-engine#202 PR-2c): an
+// upgrade onto it is charged its prorated difference at once, exactly like
+// Free → Pro.
+func TestSetAppPlan_UpgradeToBusinessChargesTheDifferenceProratedAtOnce(t *testing.T) {
+	store := newFakeStore()
+	user, acct := registeredAccount(store)
+	svc, p := planSvc(store, pcChangeAt)
+	appID := registerOnPlan(t, svc, user, usage.PlanPro, 0)
+	armCreationCharge(store, appID)
+
+	resp, err := svc.SetAppPlan(context.Background(), cycle.SetAppPlanRequest{AppID: appID, Plan: "business"})
+	require.NoError(t, err)
+	require.Equal(t, usage.PlanBusiness, store.apps[appID].Plan, "an upgrade takes effect at once")
+	require.Equal(t, usage.TermsFor(usage.PlanBusiness), resp.Terms)
+
+	change := onlyPlanChange(t, store, appID)
+	require.Equal(t, cycle.PlanChangeUpgrade, change.Kind)
+	require.Equal(t, cycle.PlanChangeSettled, change.Status)
+	require.EqualValues(t, 15_000_000, change.AmountMicros, "(50 − 20) × 15/30")
+	require.EqualValues(t, 15_000_000, change.CardMicros)
+
+	require.Len(t, p.charges, 1, "one intent for the delta")
+	c := p.charges[0]
+	require.EqualValues(t, 15_000_000, c.TotalMicros())
+	require.Equal(t, acct.String(), c.AccountID)
+	require.Contains(t, c.Lines[0].Description, "pro → business")
 }
 
 // An upgrade on the last day of the period, when the prorated delta is under

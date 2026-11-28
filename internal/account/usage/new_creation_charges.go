@@ -127,10 +127,13 @@ type NewCreationCharge struct {
 }
 
 // addonModuleCount is the count of CHARGED add-on modules for an app: those
-// installed beyond the account's bundled IncludedModules allowance. Reuses the
-// single IncludedModules const (bill.go) rather than hardcoding the threshold.
-func addonModuleCount(createdModuleCount int) int {
-	if n := createdModuleCount - IncludedModules; n > 0 {
+// installed beyond ITS OWN plan's module allowance (billing-engine#202 PR-2c:
+// never the retired account-wide pool). SettledNewCreationChargeRaw carries no
+// plan (a pre-existing gap: the settled read was never widened to join it), so
+// the settled call site passes DefaultPlan — an approximation for a HISTORICAL,
+// already-settled row's display decomposition only; no money moves on it.
+func addonModuleCount(createdModuleCount int, plan Plan) int {
+	if n := createdModuleCount - ModulesIncludedCutoff(plan); n > 0 {
 		return n
 	}
 	return 0
@@ -222,7 +225,7 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			InvoiceID:        invoiceID,
 			Name:             r.Name,
 			BaseFeeMicros:    r.BaseMicros,
-			AddonModuleCount: addonModuleCount(r.CreatedModuleCount),
+			AddonModuleCount: addonModuleCount(r.CreatedModuleCount, DefaultPlan),
 			AddonMicros:      r.AmountDueMicros - r.BaseMicros,
 		})
 	}
@@ -296,7 +299,7 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 			// the sweep runs; billing-engine#202 PR-2c prices it from the
 			// ledger. No money moves on this figure.
 			projected := CreationChargeBaseMicros(resolveBaseFeeMicros(r.Plan), r.CreatedAt, periodStart, periodEnd)
-			overCount, err := s.store.CoCreatedOverModuleTimerCount(ctx, accountID, r.AppID, r.CreatedAt, IncludedModules)
+			overCount, err := s.store.CoCreatedOverModuleTimerCount(ctx, accountID, r.AppID, r.CreatedAt, ModulesIncludedCutoff(r.Plan))
 			if err != nil {
 				return nil, billing.Internal("co-created over-module timer count query failed", err)
 			}
@@ -316,7 +319,7 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 				ChargeETA:            &eta,
 				Name:                 r.Name,
 				BaseFeeMicros:        projected,
-				AddonModuleCount:     addonModuleCount(r.CreatedModuleCount),
+				AddonModuleCount:     addonModuleCount(r.CreatedModuleCount, r.Plan),
 				AddonMicros:          0,
 				ProjectedAddonMicros: projectedAddon,
 			})
@@ -328,7 +331,7 @@ func (s *Service) ListNewCreationCharges(ctx context.Context, req ListNewCreatio
 		// exact proration is the sweep's to mint), base 0, ETA = the earliest
 		// timer expiry. An app past ITS creation grace can still surface here —
 		// installing a 6th+ module later mints a new upcoming charge.
-		addons, err := s.store.PendingAddonModuleCharges(ctx, accountID, IncludedModules, now)
+		addons, err := s.store.PendingAddonModuleCharges(ctx, accountID, now)
 		if err != nil {
 			return nil, billing.Internal("pending add-on module charges query failed", err)
 		}

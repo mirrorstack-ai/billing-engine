@@ -329,15 +329,21 @@ func (s *Service) RunBillingCycle(ctx context.Context, accountID uuid.UUID, peri
 	// D1d period-closed posture, which forgives only the pre-activation install
 	// period, never the periods after; the old grace_charged_at proxy exempted
 	// those modules from ALL overage billing forever). Empty/pre-backfill → 0.
-	overCount, err := s.store.CountOngoingOverModuleTimers(ctx, accountID, usage.IncludedModules, periodEnd)
-	if err != nil {
-		return nil, billing.Internal("ongoing over-module timer count failed", err)
+	// Per-app (billing-engine#202 PR-2c): each app's ongoing over-count is
+	// priced in WHOLE BLOCKS against its OWN plan allowance, then summed —
+	// pooling the raw counts first and blocking the sum would under-bill,
+	// since block rounding is not additive across apps (ceil(2/5)+ceil(2/5) =
+	// 2 blocks, not ceil(4/5) = 1). The one-time grace legs stay per-module at
+	// the amortized rate — see usage.ModuleOverageFeeMicros for why the split
+	// is by leg.
+	var advanceOverage int64
+	for _, a := range apps {
+		overCount, err := s.store.CountOngoingOverModuleTimers(ctx, accountID, a.AppID, usage.ModulesIncludedCutoff(a.Plan), periodEnd)
+		if err != nil {
+			return nil, billing.Internal("ongoing over-module timer count failed", err)
+		}
+		advanceOverage += usage.ModuleBlockMicros(int64(overCount))
 	}
-	// RECURRING leg → priced in WHOLE BLOCKS (usage.ModuleBlockMicros), never
-	// per module: this is the customer-visible monthly overage. The one-time
-	// grace legs stay per-module at the amortized rate — see
-	// usage.ModuleOverageFeeMicros for why the split is by leg.
-	advanceOverage := usage.ModuleBlockMicros(int64(overCount))
 
 	// ADVANCE DOMAINS leg: every live custom domain activated before the new
 	// period opened contributes one full $2 fee for that new period. Deliberately

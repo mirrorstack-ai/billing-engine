@@ -14,18 +14,26 @@ import (
 
 const activatedRecurringFeeShares = `-- name: ActivatedRecurringFeeShares :many
 WITH live_timer_fifo AS (
-    SELECT app_id,
-           grace_charged_at,
-           grace_resolved,
-           row_number() OVER (ORDER BY installed_at, id) AS fifo_position
-    FROM ms_billing.app_module_overage_timers
-    WHERE account_id = $1::uuid
-      AND removed_at IS NULL
+    SELECT t.app_id,
+           t.grace_charged_at,
+           t.grace_resolved,
+           row_number() OVER (PARTITION BY t.app_id ORDER BY t.installed_at, t.id) AS fifo_position,
+           allowance.modules_included
+    FROM ms_billing.app_module_overage_timers t
+    JOIN ms_billing.apps a ON a.app_id = t.app_id
+    JOIN (
+        SELECT p.plan, m.modules_included
+        FROM unnest($1::text[]) WITH ORDINALITY AS p(plan, ord)
+        JOIN unnest($2::int[]) WITH ORDINALITY AS m(modules_included, ord)
+          ON p.ord = m.ord
+    ) allowance ON allowance.plan = COALESCE(a.plan, 'pro')
+    WHERE t.account_id = $3::uuid
+      AND t.removed_at IS NULL
 ),
 activated_apps AS (
     SELECT app.app_id
     FROM ms_billing.apps app
-    WHERE app.account_id = $1::uuid
+    WHERE app.account_id = $3::uuid
       AND app.deleted_at IS NULL
       AND (
           app.proration_invoice_id IS NOT NULL
@@ -47,7 +55,7 @@ activated_apps AS (
 over_timers AS (
     SELECT app_id, count(*)::bigint AS over_count
     FROM live_timer_fifo
-    WHERE fifo_position > $2::int
+    WHERE fifo_position > modules_included
       -- Durably RESOLVED, not merely charged. CountOngoingOverModuleTimers (the
       -- boundary precharge input) reads no resolution state at all, so a timer
       -- resolved with no charge under D1d is billed at every subsequent boundary
@@ -66,9 +74,9 @@ live_domains AS (
     -- billed $2/domain while this forecast said $0.
     SELECT app_id, count(*)::bigint AS domain_count
     FROM ms_billing.app_custom_domains
-    WHERE account_id = $1::uuid
+    WHERE account_id = $3::uuid
       AND removed_at IS NULL
-      AND activated_at < $3::timestamptz
+      AND activated_at < $4::timestamptz
     GROUP BY app_id
 ),
 app_universe AS (
@@ -97,8 +105,9 @@ ORDER BY universe.app_id
 `
 
 type ActivatedRecurringFeeSharesParams struct {
+	Plans           []string  `json:"plans"`
+	ModulesIncluded []int32   `json:"modules_included"`
 	AccountID       string    `json:"account_id"`
-	IncludedModules int32     `json:"included_modules"`
 	PeriodEnd       time.Time `json:"period_end"`
 }
 
@@ -137,12 +146,20 @@ type ActivatedRecurringFeeSharesRow struct {
 // needs an app to land on. `activated` is therefore a per-row FLAG, not a
 // filter — an app can contribute surcharges while contributing no base fee.
 //
-// The FIFO window is account-wide by design (migration 033: ONE included pool
-// for the whole account, ordered installed_at ASC, id ASC across every app), so
-// WHICH app owns the free five is decided globally here and the per-app
-// over-count falls out of that one ordering.
+// The FIFO window is PER APP (billing-engine#202 PR-2c: each app's installed
+// modules rank only against its own live timers, ordered installed_at ASC, id
+// ASC INSIDE the app), so which modules are included falls out of that app's
+// own ordering and its own plan allowance — never pooled across the account.
+// The allowance is resolved per row from the @plans/@modules_included lookup
+// (usage.ModuleAllowanceColumns), the one ladder every module-overage query
+// reads instead of a second copy embedded here.
 func (q *Queries) ActivatedRecurringFeeShares(ctx context.Context, arg ActivatedRecurringFeeSharesParams) ([]ActivatedRecurringFeeSharesRow, error) {
-	rows, err := q.db.Query(ctx, activatedRecurringFeeShares, arg.AccountID, arg.IncludedModules, arg.PeriodEnd)
+	rows, err := q.db.Query(ctx, activatedRecurringFeeShares,
+		arg.Plans,
+		arg.ModulesIncluded,
+		arg.AccountID,
+		arg.PeriodEnd,
+	)
 	if err != nil {
 		return nil, err
 	}

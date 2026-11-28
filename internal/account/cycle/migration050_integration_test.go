@@ -206,7 +206,7 @@ func TestCombinedProrationAttempt_Integration_FrozenSetSurvivesRankAndRemoval(t 
 	)
 	require.NoError(t, err)
 	for _, timerID := range attempt.TimerIDs {
-		rank, err := store.LiveModuleTimerRankBefore(ctx, accountID, timerID, createdAt)
+		rank, err := store.LiveModuleTimerRankBefore(ctx, accountID, appID, timerID, createdAt)
 		require.NoError(t, err)
 		require.Less(t, rank, usage.IncludedModules, "the fixture must actually exercise over→included rank drift")
 		owner, err := store.TimerHasUnresolvedCombinedProrationOwner(ctx, timerID)

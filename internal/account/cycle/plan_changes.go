@@ -345,10 +345,10 @@ func (s *Service) planResponse(ctx context.Context, app AppMirror, change *PlanC
 // and retries it fire-and-forget: a retry finds the app's open change and
 // resumes it, so the same request can never charge twice.
 //
-// 🔴 `business` IS STILL REFUSED, DELIBERATELY. Its per-app included-module
-// pool is not billed yet (the module legs still price the account-wide pool
-// of usage.IncludedModules, usage/bill.go), so a Business app would be billed
-// module overage its plan includes. PR-2c of billing-engine#202 lifts it.
+// Business is accepted like every other plan (billing-engine#202 PR-2c): the
+// module-overage legs price each app's own live FIFO rank against its own
+// plan's ModulesIncluded, never an account-wide pool, so a Business app's
+// unlimited allowance is honored rather than billed overage its plan covers.
 //
 // Outcomes, in the order they are decided:
 //
@@ -370,10 +370,6 @@ func (s *Service) SetAppPlan(ctx context.Context, req SetAppPlanRequest) (*AppPl
 	plan, ok := usage.ParsePlan(req.Plan)
 	if !ok {
 		return nil, billing.InvalidInput("plan must be one of free, pro, business")
-	}
-	if plan == usage.PlanBusiness {
-		return nil, billing.PlanNotAvailable("plan business is not available yet: " +
-			"its per-app module allowance is not billed yet (billing-engine#202 PR-2c)")
 	}
 	app, found, err := s.store.AppMirror(ctx, req.AppID)
 	if err != nil {
